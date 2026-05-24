@@ -1,37 +1,37 @@
 {
-  "name": "govproxy",
-  "version": "0.1.0",
-  "description": "AI adoption intelligence platform for engineering teams",
-  "main": "dist/server.js",
-  "bin": {
-    "govproxy": "./bin/index.js"
-  },
-  "scripts": {
-    "dev": "tsx src/server.ts",
-    "build": "tsc",
-    "test": "vitest run",
-    "lint": "eslint src tests --ext .ts",
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "ajv": "^8.17.1",
-    "better-sqlite3": "^11.5.0",
-    "commander": "^12.1.0",
-    "fastify": "^5.2.1",
-    "js-yaml": "^4.1.0",
-    "node-cron": "^3.0.3"
-  },
-  "devDependencies": {
-    "@types/better-sqlite3": "^7.6.11",
-    "@types/js-yaml": "^4.0.9",
-    "@types/node": "^22.10.0",
-    "@types/node-cron": "^3.0.11",
-    "@typescript-eslint/eslint-plugin": "^7.18.0",
-    "@typescript-eslint/parser": "^7.18.0",
-    "eslint": "^8.57.0",
-    "prettier": "^3.4.2",
-    "tsx": "^4.19.1",
-    "typescript": "^5.7.2",
-    "vitest": "^2.1.8"
-  }
+    "name": "govproxy",
+    "version": "0.1.0",
+    "description": "AI adoption intelligence platform for engineering teams",
+    "main": "dist/server.js",
+    "bin": {
+        "govproxy": "./bin/index.js"
+    },
+    "scripts": {
+        "dev": "tsx src/server.ts",
+        "build": "tsc",
+        "test": "vitest run",
+        "lint": "eslint src tests --ext .ts",
+        "typecheck": "tsc --noEmit"
+    },
+    "dependencies": {
+        "ajv": "^8.17.1",
+        "better-sqlite3": "^11.5.0",
+        "commander": "^12.1.0",
+        "fastify": "^5.2.1",
+        "js-yaml": "^4.1.0",
+        "node-cron": "^3.0.3"
+    },
+    "devDependencies": {
+        "@types/better-sqlite3": "^7.6.11",
+        "@types/js-yaml": "^4.0.9",
+        "@types/node": "^22.10.0",
+        "@types/node-cron": "^3.0.11",
+        "@typescript-eslint/eslint-plugin": "^7.18.0",
+        "@typescript-eslint/parser": "^7.18.0",
+        "eslint": "^8.57.0",
+        "prettier": "^3.4.2",
+        "tsx": "^4.19.1",
+        "typescript": "^5.7.2",
+        "vitest": "^2.1.8"
+    }
 }
