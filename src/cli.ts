@@ -99,7 +99,12 @@ function openRegistryDb(configPath: string): ReturnType<typeof openDb> {
     const config = loadConfig(configPath);
     const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
     const db = openDb(dbPath);
-    runMigrations(db, MIGRATIONS_DIR);
+    try {
+        runMigrations(db, MIGRATIONS_DIR);
+    } catch (err) {
+        db.close();
+        throw err;
+    }
     return db;
 }
 
@@ -284,4 +289,7 @@ devCommand
         },
     );
 
-program.parse();
+program.parseAsync().catch((err: unknown) => {
+    console.error(err instanceof Error ? err.message : err);
+    process.exit(1);
+});
