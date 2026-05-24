@@ -1,0 +1,101 @@
+server:
+  port: 8080
+  host: "0.0.0.0"
+
+storage:
+  type: "sqlite"
+  sqlite_path: "./data/govproxy.db"
+
+connectors:
+  copilot:
+    enabled: true
+    github_org: "your-org"
+    api_token: "${GITHUB_API_TOKEN}"
+    sync_interval: "daily"
+    sync_time: "02:00"
+
+  claude_code:
+    enabled: true
+    org_id: "your-anthropic-org-id"
+    api_key: "${ANTHROPIC_ADMIN_API_KEY}"
+    sync_interval: "daily"
+    sync_time: "02:30"
+
+  windsurf:
+    enabled: true
+    service_key: "${WINDSURF_SERVICE_KEY}"
+    sync_interval: "daily"
+    sync_time: "03:00"
+
+  git:
+    enabled: true
+    provider: "github"
+    org: "your-org"
+    api_token: "${GIT_API_TOKEN}"
+    repos: []
+    sync_interval: "daily"
+    sync_time: "03:00"
+    analysis:
+      churn_window_hours: 48
+      ai_signature_enabled: true
+
+expenses:
+  import_path: "./data/expenses/"
+  subscription_defaults:
+    copilot_business: 19
+    copilot_enterprise: 39
+    cursor_pro: 20
+    cursor_business: 40
+    claude_code_pro: 20
+    claude_code_max: 200
+    windsurf_pro: 20
+    windsurf_teams: 40
+
+aggregation:
+  weekly:
+    day: "monday"
+    time: "04:00"
+  monthly:
+    day: 1
+    time: "04:30"
+  quarterly:
+    time: "05:00"
+  daily_retention_days: 90
+
+summaries:
+  enabled: false
+  model:
+    type: "anthropic"
+    model_name: "claude-haiku-4-5-20251001"
+    api_key: "${SUMMARY_MODEL_API_KEY}"
+  weekly:
+    enabled: true
+    auto_generate: true
+  monthly:
+    enabled: true
+    auto_generate: true
+    model_name: "claude-sonnet-4-20250514"
+  quarterly:
+    enabled: true
+    auto_generate: true
+    model_name: "claude-sonnet-4-20250514"
+
+alerts:
+  slack:
+    enabled: false
+    webhook_url: "${SLACK_WEBHOOK_URL}"
+  waste_threshold: 14
+
+dashboard:
+  enabled: true
+  auth:
+    type: "basic"
+    admin_password: "${DASHBOARD_PASSWORD}"
+
+teams:
+  - name: "frontend"
+    department: "engineering"
+    manager: "goran"
+  - name: "backend"
+    department: "engineering"
+    manager: "goran"

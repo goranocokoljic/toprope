@@ -1,0 +1,21 @@
+server:
+  port: 9090
+  host: "127.0.0.1"
+storage:
+  type: "sqlite"
+  sqlite_path: "./data/test.db"
+connectors:
+  copilot:
+    enabled: false
+  claude_code:
+    enabled: false
+  windsurf:
+    enabled: false
+  git:
+    enabled: false
+expenses: {}
+aggregation: {}
+summaries: {}
+alerts: {}
+dashboard: {}
+teams: []
