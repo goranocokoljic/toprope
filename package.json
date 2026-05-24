@@ -8,7 +8,7 @@
     },
     "scripts": {
         "dev": "tsx src/server.ts",
-        "build": "tsc",
+        "build": "tsc && node -e \"require('fs').cpSync('src/storage/migrations','dist/storage/migrations',{recursive:true})\"",
         "test": "vitest run",
         "lint": "eslint src tests --ext .ts",
         "typecheck": "tsc --noEmit"
