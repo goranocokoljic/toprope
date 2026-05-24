@@ -25,9 +25,10 @@ function httpsGet(url: string, token: string): Promise<unknown> {
         };
         https.get(url, options, (res) => {
             let data = '';
-            res.on('data', (chunk: string) => {
-                data += chunk;
+            res.on('data', (chunk: Buffer) => {
+                data += chunk.toString('utf8');
             });
+            res.on('error', reject);
             res.on('end', () => {
                 if (res.statusCode && res.statusCode >= 400) {
                     reject(new Error(`GitHub API error ${res.statusCode}: ${data}`));

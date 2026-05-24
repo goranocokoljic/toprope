@@ -28,6 +28,9 @@ program
         try {
             runMigrations(db, path.resolve(__dirname, 'storage/migrations'));
             seedTeamsFromConfig(db, config.teams ?? []);
+        } catch (err) {
+            console.error('Failed to initialize database:', err);
+            process.exit(1);
         } finally {
             db.close();
         }
@@ -92,11 +95,12 @@ dbCommand
         }
     });
 
-function openRegistryDb(configPath: string): {db: ReturnType<typeof openDb>; dbPath: string} {
+function openRegistryDb(configPath: string): ReturnType<typeof openDb> {
     const config = loadConfig(configPath);
     const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
     const db = openDb(dbPath);
-    return {db, dbPath};
+    runMigrations(db, MIGRATIONS_DIR);
+    return db;
 }
 
 const teamCommand = program.command('team').description('Manage teams');
@@ -110,7 +114,7 @@ teamCommand
     .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
     .action((options: {name: string; department?: string; manager?: string; config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
-        const {db} = openRegistryDb(configPath);
+        const db = openRegistryDb(configPath);
         try {
             if (teamExists(db, options.name)) {
                 console.warn(`Warning: team '${options.name}' already exists.`);
@@ -129,7 +133,7 @@ teamCommand
     .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
     .action((options: {config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
-        const {db} = openRegistryDb(configPath);
+        const db = openRegistryDb(configPath);
         try {
             const teams = listTeams(db);
             if (teams.length === 0) {
@@ -161,7 +165,7 @@ devCommand
     .action(
         (options: {name: string; team: string; email?: string; github?: string; config: string}) => {
             const configPath = path.resolve(process.cwd(), options.config);
-            const {db} = openRegistryDb(configPath);
+            const db = openRegistryDb(configPath);
             try {
                 if (!teamExists(db, options.team)) {
                     console.error(`Error: team '${options.team}' does not exist.`);
@@ -191,7 +195,7 @@ devCommand
     .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
     .action((options: {team?: string; config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
-        const {db} = openRegistryDb(configPath);
+        const db = openRegistryDb(configPath);
         try {
             const devs = listDevelopers(db, options.team);
             if (devs.length === 0) {
@@ -221,7 +225,7 @@ devCommand
     .action(
         (options: {id: string; copilot?: string; claude?: string; windsurf?: string; config: string}) => {
             const configPath = path.resolve(process.cwd(), options.config);
-            const {db} = openRegistryDb(configPath);
+            const db = openRegistryDb(configPath);
             try {
                 if (!options.copilot && !options.claude && !options.windsurf) {
                     console.error('Error: at least one of --copilot, --claude, or --windsurf must be provided.');
@@ -261,7 +265,7 @@ devCommand
                 process.exit(1);
             }
             const configPath = path.resolve(process.cwd(), options.config);
-            const {db} = openRegistryDb(configPath);
+            const db = openRegistryDb(configPath);
             try {
                 console.log(`Discovering members of GitHub org '${options.org}'...`);
                 const result = await discoverOrgMembers(db, options.org, token, options.team);
