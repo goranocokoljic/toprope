@@ -18,7 +18,12 @@ program
     const configPath = path.resolve(process.cwd(), options.config);
     const config = loadConfig(configPath);
     const app = buildServer(config);
-    await app.listen({ port: config.server.port, host: config.server.host });
+    try {
+      await app.listen({ port: config.server.port, host: config.server.host });
+    } catch (err) {
+      console.error('Failed to start server:', err);
+      process.exit(1);
+    }
   });
 
 program.parse();

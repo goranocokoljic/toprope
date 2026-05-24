@@ -55,7 +55,7 @@ export function loadConfig(configPath: string): GovProxyConfig {
   const raw = fs.readFileSync(configPath, 'utf-8');
   const parsed = yaml.load(raw) as Record<string, unknown>;
 
-  if (parsed === null || typeof parsed !== 'object') {
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new Error('Invalid config: file must contain a YAML object');
   }
 

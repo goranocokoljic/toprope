@@ -8,7 +8,7 @@ export const configSchema: Record<string, unknown> = {
       type: 'object',
       required: ['port', 'host'],
       properties: {
-        port: { type: 'number' },
+        port: { type: 'integer', minimum: 1, maximum: 65535 },
         host: { type: 'string' },
       },
     },
