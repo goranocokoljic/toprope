@@ -1,0 +1,21 @@
+server:
+  port: "not-a-number"
+  host: "0.0.0.0"
+storage:
+  type: "sqlite"
+  sqlite_path: "./data/govproxy.db"
+connectors:
+  copilot:
+    enabled: true
+  claude_code:
+    enabled: true
+  windsurf:
+    enabled: true
+  git:
+    enabled: true
+expenses: {}
+aggregation: {}
+summaries: {}
+alerts: {}
+dashboard: {}
+teams: []

@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  govproxy:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
+      - ./govproxy.config.yaml:/app/govproxy.config.yaml:ro
+    environment:
+      - GITHUB_API_TOKEN=${GITHUB_API_TOKEN}
+      - ANTHROPIC_ADMIN_API_KEY=${ANTHROPIC_ADMIN_API_KEY}
+      - WINDSURF_SERVICE_KEY=${WINDSURF_SERVICE_KEY}
+      - GIT_API_TOKEN=${GIT_API_TOKEN}
+      - SUMMARY_MODEL_API_KEY=${SUMMARY_MODEL_API_KEY}
+      - DASHBOARD_PASSWORD=${DASHBOARD_PASSWORD}
+    restart: unless-stopped
