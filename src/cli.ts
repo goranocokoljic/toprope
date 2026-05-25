@@ -20,6 +20,12 @@ import {
     getOrgCostSummary,
     detectDuplicates,
 } from './expenses/subscription-tracker';
+import {
+    runWasteDetection,
+    listActiveAlerts,
+    getWasteSummaryByTeam,
+    resolveAlert,
+} from './expenses/waste-detector';
 
 const program = new Command();
 
@@ -523,6 +529,172 @@ expensesCommand
                 for (const alert of relevantDuplicates) {
                     console.warn(`  ⚠  ${alert.message}`);
                 }
+            }
+        } finally {
+            db.close();
+        }
+    });
+
+const wasteCommand = program.command('waste').description('Waste detection and management');
+
+wasteCommand
+    .command('show')
+    .description('Run waste detection and list active alerts grouped by type')
+    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .action((options: {config: string}) => {
+        const configPath = path.resolve(process.cwd(), options.config);
+        const config = loadConfig(configPath);
+        const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
+        const db = openDb(dbPath);
+        try {
+            runMigrations(db, MIGRATIONS_DIR);
+
+            const wasteThreshold = config.alerts?.waste_threshold ?? 14;
+            const result = runWasteDetection(db, {inactivity_threshold_days: wasteThreshold});
+            if (result.created > 0) {
+                console.log(`Detected ${result.created} new waste alert(s).`);
+            }
+
+            const alerts = listActiveAlerts(db);
+            if (alerts.length === 0) {
+                console.log('No active waste alerts.');
+                return;
+            }
+
+            const LINE_WIDTH = 80;
+            const col = (s: string, width: number): string => s.padEnd(width).slice(0, width);
+
+            // Group by type
+            const byType = new Map<string, typeof alerts>();
+            for (const alert of alerts) {
+                const list = byType.get(alert.alert_type) ?? [];
+                list.push(alert);
+                byType.set(alert.alert_type, list);
+            }
+
+            const typeLabels: Record<string, string> = {
+                unused_seat: 'Unused Seats',
+                underutilized: 'Underutilized Seats',
+                duplicate_tool: 'Duplicate Tools',
+                cost_outlier: 'Cost Outliers',
+            };
+
+            let totalWaste = 0;
+            for (const [type, typeAlerts] of byType) {
+                const label = typeLabels[type] ?? type;
+                console.log('');
+                console.log(`${label}:`);
+                console.log('─'.repeat(LINE_WIDTH));
+                console.log(
+                    `${col('ID', 12)}${col('Developer', 22)}${col('Team', 16)}${col('Tool', 12)}Waste/mo`,
+                );
+                console.log('─'.repeat(LINE_WIDTH));
+                for (const alert of typeAlerts) {
+                    const devName = alert.developer_name ?? '(team)';
+                    const tool = alert.tool ?? '—';
+                    const waste =
+                        alert.monthly_waste != null ? `$${alert.monthly_waste.toFixed(2)}` : '—';
+                    console.log(
+                        `${col(alert.id.slice(0, 8), 12)}${col(devName, 22)}${col(alert.team, 16)}${col(tool, 12)}${waste}`,
+                    );
+                    if (alert.details.note) {
+                        console.log(`             ↳ ${alert.details.note}`);
+                    }
+                    totalWaste += alert.monthly_waste ?? 0;
+                }
+            }
+
+            console.log('');
+            console.log('─'.repeat(LINE_WIDTH));
+            console.log(
+                `Total: ${alerts.length} alert(s)  |  Estimated waste: $${totalWaste.toFixed(2)}/month`,
+            );
+            console.log('');
+            console.log('Use `govproxy waste resolve <id> --reason <text>` to dismiss an alert.');
+        } finally {
+            db.close();
+        }
+    });
+
+wasteCommand
+    .command('summary')
+    .description('Show waste summary grouped by team')
+    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .action((options: {config: string}) => {
+        const configPath = path.resolve(process.cwd(), options.config);
+        const config = loadConfig(configPath);
+        const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
+        const db = openDb(dbPath);
+        try {
+            runMigrations(db, MIGRATIONS_DIR);
+
+            const summary = getWasteSummaryByTeam(db);
+            if (summary.length === 0) {
+                console.log('No active waste alerts.');
+                return;
+            }
+
+            const LINE_WIDTH = 80;
+            const col = (s: string, width: number): string => s.padEnd(width).slice(0, width);
+
+            console.log('Waste Summary by Team:');
+            console.log('─'.repeat(LINE_WIDTH));
+            console.log(`${col('Team', 22)}${col('Alerts', 10)}${col('Waste/mo', 14)}Types`);
+            console.log('─'.repeat(LINE_WIDTH));
+
+            let totalAlerts = 0;
+            let totalWaste = 0;
+
+            for (const row of summary) {
+                const types = Object.keys(row.alerts_by_type).join(', ');
+                console.log(
+                    `${col(row.team, 22)}${col(String(row.alert_count), 10)}${col(`$${row.total_monthly_waste.toFixed(2)}`, 14)}${types}`,
+                );
+                totalAlerts += row.alert_count;
+                totalWaste += row.total_monthly_waste;
+            }
+
+            console.log('─'.repeat(LINE_WIDTH));
+            console.log(
+                `${'TOTAL'.padEnd(22)}${col(String(totalAlerts), 10)}$${totalWaste.toFixed(2)}/month`,
+            );
+        } finally {
+            db.close();
+        }
+    });
+
+wasteCommand
+    .command('resolve <alert-id>')
+    .description('Resolve a waste alert with a reason')
+    .requiredOption('--reason <text>', 'Reason for dismissing the alert')
+    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .action((alertId: string, options: {reason: string; config: string}) => {
+        const configPath = path.resolve(process.cwd(), options.config);
+        const config = loadConfig(configPath);
+        const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
+        const db = openDb(dbPath);
+        try {
+            runMigrations(db, MIGRATIONS_DIR);
+
+            // Support partial ID (first 8 chars shown in `waste show`)
+            let resolvedId = alertId;
+            if (alertId.length < 36) {
+                const row = db
+                    .prepare(`SELECT id FROM waste_alerts WHERE id LIKE ? AND resolved_at IS NULL LIMIT 1`)
+                    .get(`${alertId}%`) as {id: string} | undefined;
+                if (!row) {
+                    console.error(`No active alert found matching id: ${alertId}`);
+                    process.exit(1);
+                }
+                resolvedId = row.id;
+            }
+
+            const ok = resolveAlert(db, resolvedId, options.reason);
+            if (ok) {
+                console.log(`Alert ${resolvedId.slice(0, 8)} resolved: ${options.reason}`);
+            } else {
+                console.error(`Alert not found or already resolved: ${alertId}`);
+                process.exit(1);
             }
         } finally {
             db.close();
