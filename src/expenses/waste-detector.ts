@@ -120,12 +120,13 @@ function findUnusedSeats(db: Database.Database, thresholdDays: number): WasteCon
              FROM subscriptions s
              JOIN developers d ON d.id = s.developer_id
              WHERE s.seat_revoked_at IS NULL
+               AND s.monthly_cost IS NOT NULL
                AND NOT EXISTS (
                    SELECT 1 FROM tool_snapshots ts
                    WHERE ts.developer_id = s.developer_id
                      AND ts.tool = s.tool
                      AND ts.is_active = 1
-                     AND ts.date >= date('now', '-' || ? || ' days')
+                     AND ts.date > date('now', '-' || ? || ' days')
                )`,
         )
         .all(thresholdDays) as {
@@ -161,7 +162,7 @@ function findUnderutilized(
                     AVG(ts.interaction_count) as avg_interactions
              FROM tool_snapshots ts
              JOIN developers d ON d.id = ts.developer_id
-             WHERE ts.date >= date('now', '-' || ? || ' days')
+             WHERE ts.date > date('now', '-' || ? || ' days')
                AND ts.is_active = 1
              GROUP BY ts.developer_id, ts.tool`,
         )
@@ -179,7 +180,7 @@ function findUnderutilized(
                     AVG(ts.interaction_count) as team_avg_interactions
              FROM tool_snapshots ts
              JOIN developers d ON d.id = ts.developer_id
-             WHERE ts.date >= date('now', '-' || ? || ' days')
+             WHERE ts.date > date('now', '-' || ? || ' days')
                AND ts.is_active = 1
              GROUP BY d.team, ts.tool`,
         )
@@ -313,7 +314,7 @@ function findCostOutliers(
                     SUM(gs.prs_merged) as total_prs
              FROM git_snapshots gs
              JOIN developers d ON d.id = gs.developer_id
-             WHERE gs.date >= date('now', '-' || ? || ' days')
+             WHERE gs.date > date('now', '-' || ? || ' days')
              GROUP BY gs.developer_id`,
         )
         .all(lookbackDays) as {

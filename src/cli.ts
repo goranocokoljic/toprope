@@ -673,6 +673,7 @@ wasteCommand
         const config = loadConfig(configPath);
         const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
         const db = openDb(dbPath);
+        let exitCode = 0;
         try {
             runMigrations(db, MIGRATIONS_DIR);
 
@@ -684,21 +685,25 @@ wasteCommand
                     .get(`${alertId}%`) as {id: string} | undefined;
                 if (!row) {
                     console.error(`No active alert found matching id: ${alertId}`);
-                    process.exit(1);
+                    exitCode = 1;
+                } else {
+                    resolvedId = row.id;
                 }
-                resolvedId = row.id;
             }
 
-            const ok = resolveAlert(db, resolvedId, options.reason);
-            if (ok) {
-                console.log(`Alert ${resolvedId.slice(0, 8)} resolved: ${options.reason}`);
-            } else {
-                console.error(`Alert not found or already resolved: ${alertId}`);
-                process.exit(1);
+            if (exitCode === 0) {
+                const ok = resolveAlert(db, resolvedId, options.reason);
+                if (ok) {
+                    console.log(`Alert ${resolvedId.slice(0, 8)} resolved: ${options.reason}`);
+                } else {
+                    console.error(`Alert not found or already resolved: ${alertId}`);
+                    exitCode = 1;
+                }
             }
         } finally {
             db.close();
         }
+        if (exitCode !== 0) process.exit(exitCode);
     });
 
 program.parseAsync().catch((err: unknown) => {
