@@ -42,6 +42,8 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
         return {status: 'ok'};
     });
 
+    app.addHook('onClose', () => db.close());
+
     registerOverviewRoutes(app, db);
     registerTeamRoutes(app, db);
     registerDeveloperRoutes(app, db);

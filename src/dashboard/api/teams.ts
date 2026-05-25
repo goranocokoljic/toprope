@@ -157,8 +157,10 @@ export function registerTeamRoutes(app: FastifyInstance, db: Database.Database):
             const costRow = db
                 .prepare(
                     `SELECT COALESCE(SUM(monthly_cost), 0) as cost
-                     FROM subscriptions
-                     WHERE developer_id = ? AND seat_revoked_at IS NULL`,
+                     FROM (SELECT MAX(monthly_cost) as monthly_cost
+                           FROM subscriptions
+                           WHERE developer_id = ? AND seat_revoked_at IS NULL
+                           GROUP BY tool)`,
                 )
                 .get(dev.id) as {cost: number};
 
@@ -185,10 +187,12 @@ export function registerTeamRoutes(app: FastifyInstance, db: Database.Database):
 
         const costRow = db
             .prepare(
-                `SELECT COALESCE(SUM(s.monthly_cost), 0) as total_cost
-                 FROM subscriptions s
-                 JOIN developers d ON d.id = s.developer_id
-                 WHERE d.team = ? AND s.seat_revoked_at IS NULL`,
+                `SELECT COALESCE(SUM(monthly_cost), 0) as total_cost
+                 FROM (SELECT MAX(s.monthly_cost) as monthly_cost
+                       FROM subscriptions s
+                       JOIN developers d ON d.id = s.developer_id
+                       WHERE d.team = ? AND s.seat_revoked_at IS NULL
+                       GROUP BY s.developer_id, s.tool)`,
             )
             .get(teamName) as {total_cost: number};
 

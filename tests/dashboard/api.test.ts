@@ -299,7 +299,7 @@ describe('API Endpoints', () => {
 
         it('CSV has correct header row', async () => {
             const res = await app.inject({method: 'GET', url: '/api/export?format=csv'});
-            const lines = res.payload.split('\n');
+            const lines = res.payload.split(/\r?\n/);
             const header = lines[0];
             expect(header).toContain('developer_id');
             expect(header).toContain('tool');
