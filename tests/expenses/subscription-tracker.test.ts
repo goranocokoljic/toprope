@@ -300,6 +300,7 @@ describe('detectDuplicates', () => {
 
         const alerts = detectDuplicates(db);
         expect(alerts).toHaveLength(1);
+        expect(alerts[0].developer_id).toBe(devIds.jane);
         expect(alerts[0].developer_name).toBe('Jane Doe');
         expect(alerts[0].tools).toHaveLength(2);
         expect(alerts[0].message).toContain('Jane Doe');

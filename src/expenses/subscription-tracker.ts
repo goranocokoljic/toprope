@@ -52,6 +52,7 @@ export interface OrgCostSummary {
 }
 
 export interface DuplicateAlert {
+    developer_id: string;
     developer_name: string;
     developer_email: string | null;
     tools: Array<{tool: string; plan: string | null; monthly_cost: number | null}>;
@@ -73,50 +74,52 @@ const TOOL_CATEGORIES: Record<string, string> = {
 export function upsertSubscription(db: Database.Database, data: UpsertData): Subscription {
     const now = new Date().toISOString();
 
-    const existing = db
-        .prepare(
-            'SELECT * FROM subscriptions WHERE developer_id = ? AND tool = ? AND seat_revoked_at IS NULL',
-        )
-        .get(data.developer_id, data.tool) as Subscription | undefined;
+    return db.transaction((): Subscription => {
+        const existing = db
+            .prepare(
+                'SELECT * FROM subscriptions WHERE developer_id = ? AND tool = ? AND seat_revoked_at IS NULL',
+            )
+            .get(data.developer_id, data.tool) as Subscription | undefined;
 
-    if (existing) {
+        if (existing) {
+            db.prepare(
+                'UPDATE subscriptions SET plan = ?, billing_model = ?, monthly_cost = ?, data_source = ? WHERE id = ?',
+            ).run(data.plan, data.billing_model, data.monthly_cost, data.data_source, existing.id);
+            return {
+                ...existing,
+                plan: data.plan,
+                billing_model: data.billing_model,
+                monthly_cost: data.monthly_cost,
+                data_source: data.data_source,
+            };
+        }
+
+        const id = randomUUID();
         db.prepare(
-            'UPDATE subscriptions SET plan = ?, billing_model = ?, monthly_cost = ?, data_source = ? WHERE id = ?',
-        ).run(data.plan, data.billing_model, data.monthly_cost, data.data_source, existing.id);
+            'INSERT INTO subscriptions (id, developer_id, tool, plan, billing_model, monthly_cost, seat_assigned_at, seat_revoked_at, data_source) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)',
+        ).run(
+            id,
+            data.developer_id,
+            data.tool,
+            data.plan,
+            data.billing_model,
+            data.monthly_cost,
+            now,
+            data.data_source,
+        );
+
         return {
-            ...existing,
+            id,
+            developer_id: data.developer_id,
+            tool: data.tool,
             plan: data.plan,
             billing_model: data.billing_model,
             monthly_cost: data.monthly_cost,
+            seat_assigned_at: now,
+            seat_revoked_at: null,
             data_source: data.data_source,
         };
-    }
-
-    const id = randomUUID();
-    db.prepare(
-        'INSERT INTO subscriptions (id, developer_id, tool, plan, billing_model, monthly_cost, seat_assigned_at, seat_revoked_at, data_source) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)',
-    ).run(
-        id,
-        data.developer_id,
-        data.tool,
-        data.plan,
-        data.billing_model,
-        data.monthly_cost,
-        now,
-        data.data_source,
-    );
-
-    return {
-        id,
-        developer_id: data.developer_id,
-        tool: data.tool,
-        plan: data.plan,
-        billing_model: data.billing_model,
-        monthly_cost: data.monthly_cost,
-        seat_assigned_at: now,
-        seat_revoked_at: null,
-        data_source: data.data_source,
-    };
+    })();
 }
 
 export function listSubscriptions(
@@ -232,6 +235,7 @@ export function detectDuplicates(db: Database.Database): DuplicateAlert[] {
             });
 
             alerts.push({
+                developer_id: first.developer_id,
                 developer_name: first.developer_name,
                 developer_email: first.developer_email,
                 tools: catSubs.map((s) => ({

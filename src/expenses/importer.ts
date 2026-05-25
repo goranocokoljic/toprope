@@ -140,85 +140,90 @@ export function importCsv(
     let dataLineNum = 0;
     let originalLineNum = 0;
 
-    for (let i = 0; i < lines.length; i++) {
-        if (lines[i].trim().length === 0) continue;
-        originalLineNum = i + 1;
-        if (dataLineNum === 0) {
+    // Wrap all upserts in a single transaction so the entire import is atomic.
+    // better-sqlite3 promotes nested db.transaction() calls to savepoints, so
+    // upsertSubscription's own transaction still protects standalone callers.
+    db.transaction(() => {
+        for (let i = 0; i < lines.length; i++) {
+            if (lines[i].trim().length === 0) continue;
+            originalLineNum = i + 1;
+            if (dataLineNum === 0) {
+                dataLineNum++;
+                continue; // skip header
+            }
             dataLineNum++;
-            continue; // skip header
-        }
-        dataLineNum++;
 
-        const row = parseCsvLine(lines[i]);
+            const row = parseCsvLine(lines[i]);
 
-        const email = (row[fieldIndex['developer_email']] ?? '').trim();
-        const tool = (row[fieldIndex['tool']] ?? '').trim();
+            const email = (row[fieldIndex['developer_email']] ?? '').trim();
+            const tool = (row[fieldIndex['tool']] ?? '').trim();
 
-        if (!email || !tool) {
-            warnings.push(
-                `Line ${originalLineNum}: missing required field(s) (email='${email}', tool='${tool}'), skipping`,
-            );
-            skipped++;
-            continue;
-        }
+            if (!email || !tool) {
+                warnings.push(
+                    `Line ${originalLineNum}: missing required field(s) (email='${email}', tool='${tool}'), skipping`,
+                );
+                skipped++;
+                continue;
+            }
 
-        const dev = devsByEmail.get(email.toLowerCase());
-        if (!dev) {
-            warnings.push(
-                `Line ${originalLineNum}: no developer with email '${email}' found, skipping`,
-            );
-            skipped++;
-            continue;
-        }
+            const dev = devsByEmail.get(email.toLowerCase());
+            if (!dev) {
+                warnings.push(
+                    `Line ${originalLineNum}: no developer with email '${email}' found, skipping`,
+                );
+                skipped++;
+                continue;
+            }
 
-        const planRaw =
-            fieldIndex['plan'] !== undefined ? (row[fieldIndex['plan']] ?? '').trim() : '';
-        const plan = planRaw || null;
+            const planRaw =
+                fieldIndex['plan'] !== undefined ? (row[fieldIndex['plan']] ?? '').trim() : '';
+            const plan = planRaw || null;
 
-        let monthlyCost: number | null = null;
-        if (fieldIndex['monthly_cost'] !== undefined) {
-            const costStr = (row[fieldIndex['monthly_cost']] ?? '').trim();
-            if (costStr) {
-                const parsed = parseFloat(costStr.replace(/[$,]/g, ''));
-                if (!isNaN(parsed)) {
-                    monthlyCost = parsed;
-                } else {
-                    warnings.push(
-                        `Line ${originalLineNum}: invalid monthly_cost '${costStr}', using default`,
-                    );
+            let monthlyCost: number | null = null;
+            if (fieldIndex['monthly_cost'] !== undefined) {
+                const costStr = (row[fieldIndex['monthly_cost']] ?? '').trim();
+                if (costStr) {
+                    const parsed = parseFloat(costStr.replace(/[$,]/g, ''));
+                    if (!isNaN(parsed)) {
+                        monthlyCost = parsed;
+                    } else {
+                        warnings.push(
+                            `Line ${originalLineNum}: invalid monthly_cost '${costStr}', using default`,
+                        );
+                    }
                 }
             }
-        }
 
-        if (monthlyCost === null) {
-            monthlyCost = lookupDefaultCost(tool, plan ?? undefined, defaults);
-        }
+            if (monthlyCost === null) {
+                monthlyCost = lookupDefaultCost(tool, plan ?? undefined, defaults);
+            }
 
-        let billingModel = 'unknown';
-        if (fieldIndex['billing_model'] !== undefined) {
-            const bmRaw = (row[fieldIndex['billing_model']] ?? '').trim();
-            if (bmRaw) {
-                billingModel = normalizeBillingModel(bmRaw);
+            let billingModel = 'unknown';
+            if (fieldIndex['billing_model'] !== undefined) {
+                const bmRaw = (row[fieldIndex['billing_model']] ?? '').trim();
+                if (bmRaw) {
+                    billingModel = normalizeBillingModel(bmRaw);
+                }
+            }
+
+            try {
+                upsertSubscription(db, {
+                    developer_id: dev.id,
+                    tool,
+                    plan,
+                    billing_model: billingModel,
+                    monthly_cost: monthlyCost,
+                    data_source: 'expense_import',
+                });
+                imported++;
+            } catch (err) {
+                warnings.push(
+                    `Line ${originalLineNum}: failed to save subscription: ${err instanceof Error ? err.message : String(err)}`,
+                );
+                skipped++;
             }
         }
-
-        try {
-            upsertSubscription(db, {
-                developer_id: dev.id,
-                tool,
-                plan,
-                billing_model: billingModel,
-                monthly_cost: monthlyCost,
-                data_source: 'expense_import',
-            });
-            imported++;
-        } catch (err) {
-            warnings.push(
-                `Line ${originalLineNum}: failed to save subscription: ${err instanceof Error ? err.message : String(err)}`,
-            );
-            skipped++;
-        }
-    }
+    })();
 
     return {imported, skipped, warnings};
 }

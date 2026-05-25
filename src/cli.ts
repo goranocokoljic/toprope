@@ -513,7 +513,7 @@ expensesCommand
             const duplicates = detectDuplicates(db);
             const relevantDuplicates = options.team
                 ? duplicates.filter((d) =>
-                      subs.some((s) => s.developer_name === d.developer_name),
+                      subs.some((s) => s.developer_id === d.developer_id),
                   )
                 : duplicates;
 
