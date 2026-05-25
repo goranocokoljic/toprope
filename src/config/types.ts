@@ -59,9 +59,18 @@ export interface SubscriptionDefaultsConfig {
     windsurf_teams?: number;
 }
 
+export interface ColumnMappingConfig {
+    developer_email?: string;
+    tool?: string;
+    plan?: string;
+    monthly_cost?: string;
+    billing_model?: string;
+}
+
 export interface ExpensesConfig {
     import_path?: string;
     subscription_defaults?: SubscriptionDefaultsConfig;
+    column_mapping?: ColumnMappingConfig;
 }
 
 export interface AggregationScheduleConfig {

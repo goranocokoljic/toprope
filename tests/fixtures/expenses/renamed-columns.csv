@@ -1,0 +1,3 @@
+email,ai_tool,subscription_tier,cost_usd,payment_method
+alice@example.com,claude_code,max,200,company_managed
+bob@example.com,windsurf,pro,20,reimbursed

@@ -12,6 +12,14 @@ import {CopilotSync} from './connectors/copilot/sync';
 import {ClaudeCodeSync} from './connectors/claude-code/sync';
 import {WindsurfSync} from './connectors/windsurf/sync';
 import {GitSync} from './connectors/git/sync';
+import {importCsv} from './expenses/importer';
+import {
+    listSubscriptions,
+    getDeveloperCostSummaries,
+    getTeamCostSummaries,
+    getOrgCostSummary,
+    detectDuplicates,
+} from './expenses/subscription-tracker';
 
 const program = new Command();
 
@@ -409,6 +417,116 @@ syncCommand
             db.close();
         }
         if (hasErrors) process.exit(1);
+    });
+
+const expensesCommand = program.command('expenses').description('Manage expense and subscription data');
+
+expensesCommand
+    .command('import <file>')
+    .description('Import subscriptions from a CSV file')
+    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .action((file: string, options: {config: string}) => {
+        const configPath = path.resolve(process.cwd(), options.config);
+        const config = loadConfig(configPath);
+        const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
+        const db = openDb(dbPath);
+        try {
+            runMigrations(db, MIGRATIONS_DIR);
+            const filePath = path.resolve(process.cwd(), file);
+            const result = importCsv(db, filePath, config.expenses);
+            console.log(`Import complete: ${result.imported} imported, ${result.skipped} skipped`);
+            for (const warning of result.warnings) {
+                console.warn(`  ⚠  ${warning}`);
+            }
+        } finally {
+            db.close();
+        }
+    });
+
+expensesCommand
+    .command('show')
+    .description('Show current subscriptions with costs')
+    .option('--team <name>', 'Filter by team name')
+    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .action((options: {team?: string; config: string}) => {
+        const configPath = path.resolve(process.cwd(), options.config);
+        const config = loadConfig(configPath);
+        const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
+        const db = openDb(dbPath);
+        try {
+            runMigrations(db, MIGRATIONS_DIR);
+            const subs = listSubscriptions(db, options.team);
+
+            if (subs.length === 0) {
+                console.log('No active subscriptions found.');
+                return;
+            }
+
+            const col = (s: string, width: number): string => s.padEnd(width).slice(0, width);
+            const LINE_WIDTH = 80;
+
+            console.log('Subscriptions:');
+            console.log('─'.repeat(LINE_WIDTH));
+            console.log(
+                `${col('Developer', 22)}${col('Tool', 14)}${col('Plan', 12)}${col('Cost/mo', 10)}Billing`,
+            );
+            console.log('─'.repeat(LINE_WIDTH));
+
+            for (const s of subs) {
+                const cost = s.monthly_cost != null ? `$${s.monthly_cost.toFixed(2)}` : '—';
+                console.log(
+                    `${col(s.developer_name, 22)}${col(s.tool, 14)}${col(s.plan ?? '—', 12)}${col(cost, 10)}${s.billing_model}`,
+                );
+            }
+
+            console.log('─'.repeat(LINE_WIDTH));
+
+            const devSummaries = getDeveloperCostSummaries(db, options.team);
+            const orgSummary = options.team
+                ? {
+                      total_monthly_cost: devSummaries.reduce(
+                          (acc, d) => acc + d.total_monthly_cost,
+                          0,
+                      ),
+                      developer_count: devSummaries.length,
+                      subscription_count: subs.length,
+                  }
+                : getOrgCostSummary(db);
+
+            console.log(
+                `Total: $${orgSummary.total_monthly_cost.toFixed(2)}/month  |  ${orgSummary.subscription_count} subscriptions  |  ${orgSummary.developer_count} developers`,
+            );
+
+            if (!options.team) {
+                const teamSummaries = getTeamCostSummaries(db);
+                if (teamSummaries.length > 1) {
+                    console.log('');
+                    console.log('By Team:');
+                    for (const t of teamSummaries) {
+                        console.log(
+                            `  ${t.team.padEnd(20)} $${t.total_monthly_cost.toFixed(2)}/mo  (${t.developer_count} devs, ${t.subscription_count} subs)`,
+                        );
+                    }
+                }
+            }
+
+            const duplicates = detectDuplicates(db);
+            const relevantDuplicates = options.team
+                ? duplicates.filter((d) =>
+                      subs.some((s) => s.developer_name === d.developer_name),
+                  )
+                : duplicates;
+
+            if (relevantDuplicates.length > 0) {
+                console.log('');
+                console.log('Duplicate Tool Alerts:');
+                for (const alert of relevantDuplicates) {
+                    console.warn(`  ⚠  ${alert.message}`);
+                }
+            }
+        } finally {
+            db.close();
+        }
     });
 
 program.parseAsync().catch((err: unknown) => {

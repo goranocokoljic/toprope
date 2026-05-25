@@ -1,0 +1,5 @@
+developer_email,tool,plan,monthly_cost,billing_model
+alice@example.com,copilot,business,19,company_managed
+bob@example.com,cursor,pro,20,personal
+jane@example.com,cursor,pro,20,reimbursed
+jane@example.com,copilot,business,19,company_managed
