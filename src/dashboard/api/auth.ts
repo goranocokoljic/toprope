@@ -26,7 +26,10 @@ export function registerAuthMiddleware(app: FastifyInstance, adminPassword: stri
 
         const decoded = Buffer.from(credentials, 'base64').toString('utf-8');
         const colonIdx = decoded.indexOf(':');
-        const password = colonIdx >= 0 ? decoded.slice(colonIdx + 1) : decoded;
+        if (colonIdx < 0) {
+            return reply.status(401).send({error: 'Unauthorized', message: 'Basic authentication required'});
+        }
+        const password = decoded.slice(colonIdx + 1);
 
         const candidateBuf = Buffer.from(password);
         const lengthsMatch = candidateBuf.length === expectedBuf.length;

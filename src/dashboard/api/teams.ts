@@ -51,6 +51,10 @@ export function registerTeamRoutes(app: FastifyInstance, db: Database.Database):
             .prepare('SELECT name, department, manager FROM teams ORDER BY name LIMIT ? OFFSET ?')
             .all(pagination.limit, offset) as {name: string; department: string | null; manager: string | null}[];
 
+        if (pageTeams.length === 0) {
+            return buildPaginatedResponse([], total, pagination);
+        }
+
         const devCountRows = db
             .prepare(
                 `SELECT team, COUNT(*) as cnt FROM developers

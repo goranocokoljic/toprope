@@ -55,20 +55,23 @@ export function registerExportRoutes(app: FastifyInstance, db: Database.Database
                 params.push(team);
             }
 
-            sql += ' ORDER BY ts.date, d.name, ts.tool LIMIT 50000';
+            const EXPORT_LIMIT = 50000;
+            sql += ` ORDER BY ts.date, d.name, ts.tool LIMIT ${EXPORT_LIMIT + 1}`;
 
-            const rows = db.prepare(sql).all(...params) as ExportRow[];
+            const allRows = db.prepare(sql).all(...params) as ExportRow[];
+            const truncated = allRows.length > EXPORT_LIMIT;
+            const rows = truncated ? allRows.slice(0, EXPORT_LIMIT) : allRows;
 
             if (format === 'csv') {
-                return sendCsv(reply, rows);
+                return sendCsv(reply, rows, truncated);
             }
 
-            return reply.send({data: rows, total: rows.length});
+            return reply.send({data: rows, total: rows.length, truncated});
         },
     );
 }
 
-function sendCsv(reply: FastifyReply, rows: ExportRow[]): FastifyReply {
+function sendCsv(reply: FastifyReply, rows: ExportRow[], truncated: boolean): FastifyReply {
     const headers = [
         'developer_id',
         'developer_name',
@@ -106,7 +109,10 @@ function sendCsv(reply: FastifyReply, rows: ExportRow[]): FastifyReply {
 
     void reply.header('Content-Type', 'text/csv; charset=utf-8');
     void reply.header('Content-Disposition', 'attachment; filename="govproxy-export.csv"');
-    return reply.send(lines.join('\n'));
+    if (truncated) {
+        void reply.header('X-Truncated', 'true');
+    }
+    return reply.send(lines.join('\r\n'));
 }
 
 function csvEscape(value: string | null | undefined): string {

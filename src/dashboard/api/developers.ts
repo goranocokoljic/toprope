@@ -84,28 +84,30 @@ export function registerDeveloperRoutes(app: FastifyInstance, db: Database.Datab
             return reply.status(404).send({error: 'Not Found', message: `Developer '${id}' not found`});
         }
 
+        const snapshotCutoff = new Date();
+        snapshotCutoff.setFullYear(snapshotCutoff.getFullYear() - 1);
+        const snapshotCutoffDate = snapshotCutoff.toISOString().slice(0, 10);
+
         const toolSnapshots = db
             .prepare(
                 `SELECT id, date, tool, data_source, data_quality, is_active,
                         interaction_count, acceptance_count, acceptance_rate,
                         features_used, models_used, estimated_cost, tokens_consumed
                  FROM tool_snapshots
-                 WHERE developer_id = ?
-                 ORDER BY date DESC, tool
-                 LIMIT 365`,
+                 WHERE developer_id = ? AND date >= ?
+                 ORDER BY date DESC, tool`,
             )
-            .all(id) as ToolSnapshotRow[];
+            .all(id, snapshotCutoffDate) as ToolSnapshotRow[];
 
         const gitSnapshots = db
             .prepare(
                 `SELECT id, date, commits, lines_added, lines_removed, files_changed,
                         prs_opened, prs_merged, ai_signature_score, code_churn_rate
                  FROM git_snapshots
-                 WHERE developer_id = ?
-                 ORDER BY date DESC
-                 LIMIT 365`,
+                 WHERE developer_id = ? AND date >= ?
+                 ORDER BY date DESC`,
             )
-            .all(id) as GitSnapshotRow[];
+            .all(id, snapshotCutoffDate) as GitSnapshotRow[];
 
         const subscriptions = db
             .prepare(
