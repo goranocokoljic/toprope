@@ -185,6 +185,37 @@ describe('unused seat detection', () => {
         expect(listActiveAlerts(db)[0].alert_type).toBe('unused_seat');
     });
 
+    it('flags developer with activity exactly at threshold boundary (14 days = 14 days inactive)', () => {
+        upsertSubscription(db, {
+            developer_id: devIds.alice,
+            tool: 'copilot',
+            plan: 'business',
+            billing_model: 'company_managed',
+            monthly_cost: 19,
+            data_source: 'expense_import',
+        });
+        // Active exactly 14 days ago — on the boundary: 14 days of inactivity → should flag
+        insertToolSnapshot(db, devIds.alice, daysAgo(14), 'copilot', true);
+
+        const result = runWasteDetection(db, {inactivity_threshold_days: 14});
+        expect(result.created).toBe(1);
+    });
+
+    it('does not flag developer active 13 days ago (one day inside threshold)', () => {
+        upsertSubscription(db, {
+            developer_id: devIds.alice,
+            tool: 'copilot',
+            plan: 'business',
+            billing_model: 'company_managed',
+            monthly_cost: 19,
+            data_source: 'expense_import',
+        });
+        insertToolSnapshot(db, devIds.alice, daysAgo(13), 'copilot', true);
+
+        const result = runWasteDetection(db, {inactivity_threshold_days: 14});
+        expect(result.created).toBe(0);
+    });
+
     it('does not flag inactive snapshots within threshold (is_active=false)', () => {
         upsertSubscription(db, {
             developer_id: devIds.alice,
@@ -573,6 +604,54 @@ describe('deduplication', () => {
         const third = runWasteDetection(db, {inactivity_threshold_days: 14});
         expect(third.created).toBe(0);
         expect(listActiveAlerts(db)).toHaveLength(0);
+    });
+
+    it('deduplicates cost_outlier alerts (null tool) on re-run', () => {
+        addDeveloper(db, 'Charlie Green', 'engineering', 'charlie@example.com');
+        addDeveloper(db, 'Dave White', 'engineering', 'dave@example.com');
+
+        const devs = db
+            .prepare("SELECT id, name FROM developers WHERE team = 'engineering'")
+            .all() as {id: string; name: string}[];
+
+        const aliceDev = devs.find((d) => d.name === 'Alice Smith')!;
+        const others = devs.filter((d) => d.name !== 'Alice Smith');
+
+        upsertSubscription(db, {
+            developer_id: aliceDev.id,
+            tool: 'copilot',
+            plan: 'business',
+            billing_model: 'company_managed',
+            monthly_cost: 500,
+            data_source: 'expense_import',
+        });
+        for (const dev of others) {
+            upsertSubscription(db, {
+                developer_id: dev.id,
+                tool: 'copilot',
+                plan: 'business',
+                billing_model: 'company_managed',
+                monthly_cost: 20,
+                data_source: 'expense_import',
+            });
+        }
+        insertGitSnapshot(db, aliceDev.id, daysAgo(5), 1);
+        for (const dev of others) {
+            insertGitSnapshot(db, dev.id, daysAgo(5), 20);
+        }
+
+        runWasteDetection(db, {cost_outlier_multiplier: 3, lookback_days: 30});
+        const outlierCount = listActiveAlerts(db).filter(
+            (a) => a.alert_type === 'cost_outlier',
+        ).length;
+        expect(outlierCount).toBeGreaterThanOrEqual(1);
+
+        // Re-run — cost_outlier (tool=null) alerts must not duplicate
+        const second = runWasteDetection(db, {cost_outlier_multiplier: 3, lookback_days: 30});
+        expect(second.skipped).toBeGreaterThanOrEqual(1);
+
+        const afterRerun = listActiveAlerts(db).filter((a) => a.alert_type === 'cost_outlier');
+        expect(afterRerun).toHaveLength(outlierCount);
     });
 });
 
