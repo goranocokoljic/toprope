@@ -30,8 +30,12 @@ export function registerExportRoutes(app: FastifyInstance, db: Database.Database
                        s.monthly_cost as subscription_monthly_cost
                 FROM tool_snapshots ts
                 JOIN developers d ON d.id = ts.developer_id
-                LEFT JOIN subscriptions s ON s.developer_id = ts.developer_id
-                    AND s.tool = ts.tool AND s.seat_revoked_at IS NULL
+                LEFT JOIN (
+                    SELECT developer_id, tool, MAX(monthly_cost) as monthly_cost
+                    FROM subscriptions
+                    WHERE seat_revoked_at IS NULL
+                    GROUP BY developer_id, tool
+                ) s ON s.developer_id = ts.developer_id AND s.tool = ts.tool
                 WHERE 1=1`;
 
             const params: unknown[] = [];
@@ -51,7 +55,7 @@ export function registerExportRoutes(app: FastifyInstance, db: Database.Database
                 params.push(team);
             }
 
-            sql += ' ORDER BY ts.date, d.name, ts.tool';
+            sql += ' ORDER BY ts.date, d.name, ts.tool LIMIT 50000';
 
             const rows = db.prepare(sql).all(...params) as ExportRow[];
 

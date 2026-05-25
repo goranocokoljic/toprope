@@ -1,12 +1,16 @@
+import crypto from 'crypto';
 import type {FastifyRequest, FastifyReply, FastifyInstance} from 'fastify';
 
 export function registerAuthMiddleware(app: FastifyInstance, adminPassword: string | undefined): void {
     if (!adminPassword) {
+        app.log.warn('No dashboard.auth.admin_password configured — all API endpoints are publicly accessible');
         return;
     }
 
+    const expectedBuf = Buffer.from(adminPassword);
+
     app.addHook('onRequest', async (request: FastifyRequest, reply: FastifyReply) => {
-        if (request.url === '/health') {
+        if (request.url === '/health' || request.url.startsWith('/health?') || request.url.startsWith('/health/')) {
             return;
         }
 
@@ -24,7 +28,12 @@ export function registerAuthMiddleware(app: FastifyInstance, adminPassword: stri
         const colonIdx = decoded.indexOf(':');
         const password = colonIdx >= 0 ? decoded.slice(colonIdx + 1) : decoded;
 
-        if (password !== adminPassword) {
+        const candidateBuf = Buffer.from(password);
+        const lengthsMatch = candidateBuf.length === expectedBuf.length;
+        const compareBuf = lengthsMatch ? candidateBuf : Buffer.alloc(expectedBuf.length);
+        const equal = crypto.timingSafeEqual(compareBuf, expectedBuf) && lengthsMatch;
+
+        if (!equal) {
             return reply.status(401).send({error: 'Unauthorized', message: 'Invalid credentials'});
         }
     });

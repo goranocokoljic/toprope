@@ -91,7 +91,8 @@ export function registerDeveloperRoutes(app: FastifyInstance, db: Database.Datab
                         features_used, models_used, estimated_cost, tokens_consumed
                  FROM tool_snapshots
                  WHERE developer_id = ?
-                 ORDER BY date DESC, tool`,
+                 ORDER BY date DESC, tool
+                 LIMIT 365`,
             )
             .all(id) as ToolSnapshotRow[];
 
@@ -101,7 +102,8 @@ export function registerDeveloperRoutes(app: FastifyInstance, db: Database.Datab
                         prs_opened, prs_merged, ai_signature_score, code_churn_rate
                  FROM git_snapshots
                  WHERE developer_id = ?
-                 ORDER BY date DESC`,
+                 ORDER BY date DESC
+                 LIMIT 365`,
             )
             .all(id) as GitSnapshotRow[];
 

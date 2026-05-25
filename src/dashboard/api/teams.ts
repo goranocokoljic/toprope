@@ -40,68 +40,76 @@ export function registerTeamRoutes(app: FastifyInstance, db: Database.Database):
     app.get<{Querystring: {page?: string; limit?: string}}>('/api/teams', async (request) => {
         const pagination = parsePagination(request.query as Record<string, unknown>);
 
-        const teams = db
-            .prepare('SELECT name, department, manager FROM teams ORDER BY name')
-            .all() as {name: string; department: string | null; manager: string | null}[];
-
         const cutoff = new Date();
         cutoff.setDate(cutoff.getDate() - 30);
         const cutoffDate = cutoff.toISOString().slice(0, 10);
 
-        const summaries: TeamSummary[] = teams.map((team) => {
-            const devCount = (
-                db
-                    .prepare('SELECT COUNT(*) as cnt FROM developers WHERE team = ?')
-                    .get(team.name) as {cnt: number}
-            ).cnt;
+        const total = (db.prepare('SELECT COUNT(*) as cnt FROM teams').get() as {cnt: number}).cnt;
 
-            const activeCount = (
-                db
-                    .prepare(
-                        `SELECT COUNT(DISTINCT ts.developer_id) as cnt
-                         FROM tool_snapshots ts
-                         JOIN developers d ON d.id = ts.developer_id
-                         WHERE d.team = ? AND ts.is_active = 1 AND ts.date >= ?`,
-                    )
-                    .get(team.name, cutoffDate) as {cnt: number}
-            ).cnt;
+        const offset = (pagination.page - 1) * pagination.limit;
+        const pageTeams = db
+            .prepare('SELECT name, department, manager FROM teams ORDER BY name LIMIT ? OFFSET ?')
+            .all(pagination.limit, offset) as {name: string; department: string | null; manager: string | null}[];
 
-            const toolRows = db
-                .prepare(
-                    `SELECT DISTINCT ts.tool
-                     FROM tool_snapshots ts
-                     JOIN developers d ON d.id = ts.developer_id
-                     WHERE d.team = ? AND ts.is_active = 1 AND ts.date >= ?
-                     ORDER BY ts.tool`,
-                )
-                .all(team.name, cutoffDate) as {tool: string}[];
+        const devCountRows = db
+            .prepare(
+                `SELECT team, COUNT(*) as cnt FROM developers
+                 WHERE team IN (${pageTeams.map(() => '?').join(',')})
+                 GROUP BY team`,
+            )
+            .all(...pageTeams.map((t) => t.name)) as {team: string; cnt: number}[];
 
-            const costRow = db
-                .prepare(
-                    `SELECT COALESCE(SUM(s.monthly_cost), 0) as total_cost
-                     FROM subscriptions s
-                     JOIN developers d ON d.id = s.developer_id
-                     WHERE d.team = ? AND s.seat_revoked_at IS NULL`,
-                )
-                .get(team.name) as {total_cost: number};
+        const activeCountRows = db
+            .prepare(
+                `SELECT d.team, COUNT(DISTINCT ts.developer_id) as cnt
+                 FROM tool_snapshots ts
+                 JOIN developers d ON d.id = ts.developer_id
+                 WHERE d.team IN (${pageTeams.map(() => '?').join(',')}) AND ts.is_active = 1 AND ts.date >= ?
+                 GROUP BY d.team`,
+            )
+            .all(...pageTeams.map((t) => t.name), cutoffDate) as {team: string; cnt: number}[];
 
+        const toolMixRows = db
+            .prepare(
+                `SELECT d.team, GROUP_CONCAT(DISTINCT ts.tool) as tools
+                 FROM tool_snapshots ts
+                 JOIN developers d ON d.id = ts.developer_id
+                 WHERE d.team IN (${pageTeams.map(() => '?').join(',')}) AND ts.is_active = 1 AND ts.date >= ?
+                 GROUP BY d.team`,
+            )
+            .all(...pageTeams.map((t) => t.name), cutoffDate) as {team: string; tools: string | null}[];
+
+        const costRows = db
+            .prepare(
+                `SELECT d.team, COALESCE(SUM(s.monthly_cost), 0) as total_cost
+                 FROM subscriptions s
+                 JOIN developers d ON d.id = s.developer_id
+                 WHERE d.team IN (${pageTeams.map(() => '?').join(',')}) AND s.seat_revoked_at IS NULL
+                 GROUP BY d.team`,
+            )
+            .all(...pageTeams.map((t) => t.name)) as {team: string; total_cost: number}[];
+
+        const devCountMap = new Map(devCountRows.map((r) => [r.team, r.cnt]));
+        const activeCountMap = new Map(activeCountRows.map((r) => [r.team, r.cnt]));
+        const toolMixMap = new Map(toolMixRows.map((r) => [r.team, r.tools ? r.tools.split(',').filter(Boolean) : []]));
+        const costMap = new Map(costRows.map((r) => [r.team, r.total_cost]));
+
+        const summaries: TeamSummary[] = pageTeams.map((team) => {
+            const devCount = devCountMap.get(team.name) ?? 0;
+            const activeCount = activeCountMap.get(team.name) ?? 0;
             return {
                 name: team.name,
                 department: team.department,
                 manager: team.manager,
                 developer_count: devCount,
                 active_count: activeCount,
-                tool_mix: toolRows.map((r) => r.tool),
-                total_monthly_cost: costRow.total_cost,
+                tool_mix: toolMixMap.get(team.name) ?? [],
+                total_monthly_cost: costMap.get(team.name) ?? 0,
                 utilization_rate: devCount > 0 ? activeCount / devCount : 0,
             };
         });
 
-        const total = summaries.length;
-        const offset = (pagination.page - 1) * pagination.limit;
-        const paginated = summaries.slice(offset, offset + pagination.limit);
-
-        return buildPaginatedResponse(paginated, total, pagination);
+        return buildPaginatedResponse(summaries, total, pagination);
     });
 
     app.get<{Params: {team: string}}>('/api/teams/:team', async (request, reply) => {
