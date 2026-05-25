@@ -8,6 +8,7 @@ import {addTeam, listTeams, teamExists} from './registry/teams';
 import {addDeveloper, listDevelopers, getDeveloperById, linkDeveloper, findByGithubUsername} from './registry/developers';
 import {discoverOrgMembers} from './registry/discovery';
 import {seedTeamsFromConfig} from './registry/config-seeder';
+import {CopilotSync} from './connectors/copilot/sync';
 
 const program = new Command();
 
@@ -288,6 +289,37 @@ devCommand
             }
         },
     );
+
+const syncCommand = program.command('sync').description('Sync data from connectors');
+
+syncCommand
+    .command('copilot')
+    .description('Pull data from GitHub Copilot Metrics API')
+    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .action(async (options: {config: string}) => {
+        const configPath = path.resolve(process.cwd(), options.config);
+        const config = loadConfig(configPath);
+        const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
+        const db = openDb(dbPath);
+        let hasErrors = false;
+        try {
+            runMigrations(db, MIGRATIONS_DIR);
+            const syncer = new CopilotSync(config.connectors.copilot);
+            const result = await syncer.sync(db);
+            console.log(
+                `[copilot] sync complete — ${result.snapshotsWritten} written, ${result.snapshotsSkipped} skipped`,
+            );
+            if (result.errors.length > 0) {
+                for (const e of result.errors) {
+                    console.error(`[copilot] error: ${e}`);
+                }
+                hasErrors = true;
+            }
+        } finally {
+            db.close();
+        }
+        if (hasErrors) process.exit(1);
+    });
 
 program.parseAsync().catch((err: unknown) => {
     console.error(err instanceof Error ? err.message : err);
