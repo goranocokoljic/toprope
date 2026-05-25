@@ -1,6 +1,10 @@
 import {describe, it, expect} from 'vitest';
 import {aggregateDailyMetrics} from '../../../src/connectors/git/analyzer';
-import type {GitCommit, GitPullRequest} from '../../../src/connectors/git/client';
+import type {
+    GitCommit,
+    GitPullRequest,
+    GitReviewComment,
+} from '../../../src/connectors/git/client';
 
 function makeCommit(overrides: Partial<GitCommit> = {}): GitCommit {
     return {
@@ -173,5 +177,88 @@ describe('aggregateDailyMetrics - PR metrics', () => {
         const pr = makePR({author_login: null});
         const result = aggregateDailyMetrics([], [pr]);
         expect(result.size).toBe(0);
+    });
+});
+
+describe('aggregateDailyMetrics - cross-day churn', () => {
+    function fooCommit(sha: string, date: string, additions: number): GitCommit {
+        return makeCommit({
+            sha,
+            author_date: date,
+            additions,
+            deletions: 0,
+            files_changed: 1,
+            files: [
+                {filename: 'src/foo.ts', additions, deletions: 0, changes: additions, status: 'modified'},
+            ],
+        });
+    }
+
+    it('detects churn when a file is re-touched on the next day within the window', () => {
+        const commits = [
+            fooCommit('c1', '2024-01-15T10:00:00Z', 100),
+            fooCommit('c2', '2024-01-16T06:00:00Z', 50), // 20h later — within 48h, next day
+        ];
+        const result = aggregateDailyMetrics(commits, [], 48);
+        const day2 = result.get('alice')!.get('2024-01-16')!;
+        expect(day2.code_churn_rate).toBeGreaterThan(0);
+    });
+
+    it('does not flag cross-day churn outside the window', () => {
+        const commits = [
+            fooCommit('c1', '2024-01-15T10:00:00Z', 100),
+            fooCommit('c2', '2024-01-18T10:00:00Z', 50), // 72h later — outside 48h
+        ];
+        const result = aggregateDailyMetrics(commits, [], 48);
+        const day2 = result.get('alice')!.get('2024-01-18')!;
+        expect(day2.code_churn_rate).toBe(0);
+    });
+});
+
+describe('aggregateDailyMetrics - cross-midnight burst', () => {
+    it('detects a burst that spans midnight, attributed to the first commit day', () => {
+        const commits = [
+            makeCommit({sha: 'c1', author_date: '2024-01-15T23:52:00Z'}),
+            makeCommit({sha: 'c2', author_date: '2024-01-15T23:57:00Z'}),
+            makeCommit({sha: 'c3', author_date: '2024-01-16T00:03:00Z'}),
+        ];
+        const result = aggregateDailyMetrics(commits, []);
+        const alice = result.get('alice')!;
+        expect(alice.get('2024-01-15')!.commit_burst_count).toBeGreaterThan(0);
+        expect(alice.get('2024-01-16')!.commit_burst_count).toBe(0);
+    });
+});
+
+describe('aggregateDailyMetrics - review comments given', () => {
+    function makeReviewComment(overrides: Partial<GitReviewComment> = {}): GitReviewComment {
+        return {
+            pr_number: 1,
+            author_login: 'bob',
+            created_at: '2024-01-15T10:00:00Z',
+            ...overrides,
+        };
+    }
+
+    it('attributes review comments to the commenter on the comment day', () => {
+        const comments = [
+            makeReviewComment(),
+            makeReviewComment({created_at: '2024-01-15T14:00:00Z'}),
+        ];
+        const result = aggregateDailyMetrics([], [], 48, comments);
+        expect(result.get('bob')!.get('2024-01-15')!.review_comments_given).toBe(2);
+    });
+
+    it('skips review comments with null author_login', () => {
+        const result = aggregateDailyMetrics([], [], 48, [makeReviewComment({author_login: null})]);
+        expect(result.size).toBe(0);
+    });
+
+    it('counts the reviewer, not the PR author', () => {
+        const pr = makePR({author_login: 'alice'});
+        const comment = makeReviewComment({author_login: 'bob', created_at: '2024-01-15T12:00:00Z'});
+        const result = aggregateDailyMetrics([], [pr], 48, [comment]);
+        expect(result.get('bob')!.get('2024-01-15')!.review_comments_given).toBe(1);
+        // Alice (PR author) is not credited with giving the review comment
+        expect(result.get('alice')!.get('2024-01-15')?.review_comments_given ?? 0).toBe(0);
     });
 });

@@ -1,5 +1,5 @@
 import {describe, it, expect} from 'vitest';
-import {calculateChurnRate} from '../../../src/connectors/git/churn';
+import {calculateChurnRate, calculateDailyChurnRates} from '../../../src/connectors/git/churn';
 import type {GitCommit} from '../../../src/connectors/git/client';
 
 function makeCommit(overrides: Partial<GitCommit> & {files?: GitCommit['files']} = {}): GitCommit {
@@ -131,5 +131,44 @@ describe('calculateChurnRate', () => {
         expect(result.total_lines_changed).toBe(200);
         expect(result.lines_rechurned).toBe(100);
         expect(result.churn_rate).toBeCloseTo(0.5, 5);
+    });
+});
+
+describe('calculateDailyChurnRates', () => {
+    it('attributes cross-day re-churn to the later commit day', () => {
+        const commits = [
+            makeCommit({
+                sha: 'c1',
+                author_date: '2024-01-15T10:00:00Z',
+                files: [{filename: 'src/foo.ts', additions: 100, deletions: 0, changes: 100, status: 'modified'}],
+            }),
+            makeCommit({
+                sha: 'c2',
+                author_date: '2024-01-16T06:00:00Z', // 20h later — within 48h, next day
+                files: [{filename: 'src/foo.ts', additions: 50, deletions: 0, changes: 50, status: 'modified'}],
+            }),
+        ];
+
+        const rates = calculateDailyChurnRates(commits, 48);
+        expect(rates.get('2024-01-15')).toBe(0); // first touch, nothing prior
+        expect(rates.get('2024-01-16')).toBe(1); // 50 of 50 lines re-touch foo.ts within window
+    });
+
+    it('does not flag re-touch outside the window', () => {
+        const commits = [
+            makeCommit({
+                sha: 'c1',
+                author_date: '2024-01-15T10:00:00Z',
+                files: [{filename: 'src/foo.ts', additions: 100, deletions: 0, changes: 100, status: 'modified'}],
+            }),
+            makeCommit({
+                sha: 'c2',
+                author_date: '2024-01-18T10:00:00Z', // 72h later — outside 48h
+                files: [{filename: 'src/foo.ts', additions: 50, deletions: 0, changes: 50, status: 'modified'}],
+            }),
+        ];
+
+        const rates = calculateDailyChurnRates(commits, 48);
+        expect(rates.get('2024-01-18')).toBe(0);
     });
 });

@@ -32,6 +32,12 @@ export interface GitPullRequest {
     review_comments: number;
 }
 
+export interface GitReviewComment {
+    pr_number: number;
+    author_login: string | null;
+    created_at: string;
+}
+
 export interface GitRepo {
     full_name: string;
     name: string;
@@ -171,12 +177,18 @@ interface RawPullRequest {
     state: string;
     user: {login: string} | null;
     created_at: string;
+    updated_at: string;
     merged_at: string | null;
     closed_at: string | null;
     additions: number;
     deletions: number;
     changed_files: number;
     review_comments: number;
+}
+
+interface RawReviewComment {
+    user: {login: string} | null;
+    created_at: string;
 }
 
 interface RawRepo {
@@ -246,11 +258,18 @@ export class GitClient {
                 const detailRes = await fetchWithRetry(detailUrl, this.headers);
                 const detail = (await detailRes.json()) as RawCommitDetail;
 
+                const authorDate = detail.commit.author?.date;
+                if (!authorDate) {
+                    // No author date (e.g. some bot/merge commits) — cannot bucket
+                    // into a daily snapshot without fabricating a date, so skip it.
+                    continue;
+                }
+
                 commits.push({
                     sha: detail.sha,
                     author_login: detail.author?.login ?? null,
                     author_email: detail.commit.author?.email ?? null,
-                    author_date: detail.commit.author?.date ?? new Date().toISOString(),
+                    author_date: authorDate,
                     message: detail.commit.message,
                     additions: detail.stats?.additions ?? 0,
                     deletions: detail.stats?.deletions ?? 0,
@@ -290,7 +309,11 @@ export class GitClient {
 
             let reachedSince = false;
             for (const pr of page) {
-                if (sinceDate && new Date(pr.created_at) < sinceDate) {
+                // The list is sorted by updated_at desc, so updated_at is the
+                // correct pagination cutoff. Breaking on created_at would miss
+                // PRs created after `since` whose last update predates a
+                // recently-touched older PR earlier in the page.
+                if (sinceDate && new Date(pr.updated_at) < sinceDate) {
                     reachedSince = true;
                     break;
                 }
@@ -313,5 +336,33 @@ export class GitClient {
         }
 
         return prs;
+    }
+
+    async getReviewComments(
+        repo: string,
+        prNumber: number,
+        since?: string,
+    ): Promise<GitReviewComment[]> {
+        const params = new URLSearchParams({per_page: '100'});
+        if (since) params.set('since', since);
+
+        const comments: GitReviewComment[] = [];
+        let nextUrl: string | null =
+            `${this.baseUrl}/repos/${this.org}/${repo}/pulls/${prNumber}/comments?${params.toString()}`;
+
+        while (nextUrl) {
+            const res = await fetchWithRetry(nextUrl, this.headers);
+            const page = (await res.json()) as RawReviewComment[];
+            for (const c of page) {
+                comments.push({
+                    pr_number: prNumber,
+                    author_login: c.user?.login ?? null,
+                    created_at: c.created_at,
+                });
+            }
+            nextUrl = parseNextLinkUrl(res.headers.get('link'));
+        }
+
+        return comments;
     }
 }

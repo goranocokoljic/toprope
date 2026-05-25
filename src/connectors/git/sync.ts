@@ -1,6 +1,7 @@
 import type Database from 'better-sqlite3';
 import {randomUUID} from 'crypto';
 import {GitClient} from './client';
+import type {GitCommit, GitPullRequest, GitReviewComment} from './client';
 import {aggregateDailyMetrics} from './analyzer';
 import type {ConnectorInterface, SyncResult} from '../types';
 import type {GitConnectorConfig} from '../../config/types';
@@ -193,10 +194,15 @@ export class GitSync implements ConnectorInterface {
 
         let writeError = false;
 
-        for (const repoName of reposToSync) {
-            let commits: import('./client').GitCommit[] = [];
-            let prs: import('./client').GitPullRequest[] = [];
+        // Accumulate across all repos, then aggregate once. Aggregating and
+        // upserting per repo would have each repo's write overwrite the same
+        // developer+day row, dropping earlier repos' contributions.
+        const allCommits: GitCommit[] = [];
+        const allPrs: GitPullRequest[] = [];
+        const allReviewComments: GitReviewComment[] = [];
 
+        for (const repoName of reposToSync) {
+            let commits: GitCommit[] = [];
             try {
                 commits = await client.getCommits(repoName, since);
             } catch (err) {
@@ -206,6 +212,7 @@ export class GitSync implements ConnectorInterface {
                 continue;
             }
 
+            let prs: GitPullRequest[] = [];
             try {
                 prs = await client.getPullRequests(repoName, since);
             } catch (err) {
@@ -215,10 +222,40 @@ export class GitSync implements ConnectorInterface {
                 // Continue with commits-only data
             }
 
-            // Skip repos with zero activity — no errors, just nothing to write
-            if (commits.length === 0 && prs.length === 0) continue;
+            // Namespace file paths by repo so churn detection never collides two
+            // different repos' identically-named files into false re-churn.
+            for (const commit of commits) {
+                allCommits.push({
+                    ...commit,
+                    files: commit.files.map((f) => ({
+                        ...f,
+                        filename: `${repoName}/${f.filename}`,
+                    })),
+                });
+            }
+            allPrs.push(...prs);
 
-            const metricsMap = aggregateDailyMetrics(commits, prs, churnWindowHours);
+            // Fetch review comments only for PRs that have any, to limit API calls.
+            for (const pr of prs) {
+                if (pr.review_comments <= 0) continue;
+                try {
+                    const comments = await client.getReviewComments(repoName, pr.number, since);
+                    allReviewComments.push(...comments);
+                } catch (err) {
+                    errors.push(
+                        `[${repoName}] Failed to fetch review comments for PR #${pr.number}: ${err instanceof Error ? err.message : String(err)}`,
+                    );
+                }
+            }
+        }
+
+        if (allCommits.length > 0 || allPrs.length > 0 || allReviewComments.length > 0) {
+            const metricsMap = aggregateDailyMetrics(
+                allCommits,
+                allPrs,
+                churnWindowHours,
+                allReviewComments,
+            );
 
             const insertMany = db.transaction(() => {
                 for (const [login, byDate] of metricsMap) {
@@ -255,7 +292,7 @@ export class GitSync implements ConnectorInterface {
             } catch (err) {
                 writeError = true;
                 errors.push(
-                    `[${repoName}] Failed to write snapshots: ${err instanceof Error ? err.message : String(err)}`,
+                    `Failed to write snapshots: ${err instanceof Error ? err.message : String(err)}`,
                 );
             }
         }

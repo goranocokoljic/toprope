@@ -1,5 +1,5 @@
-import type {GitCommit, GitPullRequest} from './client';
-import {calculateChurnRate} from './churn';
+import type {GitCommit, GitPullRequest, GitReviewComment} from './client';
+import {calculateDailyChurnRates} from './churn';
 import {scoreAiSignature} from './ai-signature';
 
 export interface DailyGitMetrics {
@@ -26,19 +26,23 @@ function toDateString(isoDate: string): string {
     return isoDate.slice(0, 10);
 }
 
-function detectBursts(commits: GitCommit[]): number {
-    if (commits.length < COMMIT_BURST_MIN_COUNT) return 0;
+// Detect bursts across a developer's full commit stream (so bursts spanning
+// midnight are not split), attributing each burst to the day of its first
+// commit. Returns burst counts keyed by date.
+function detectBurstsByDate(commits: GitCommit[]): Map<string, number> {
+    const burstsByDate = new Map<string, number>();
+    if (commits.length < COMMIT_BURST_MIN_COUNT) return burstsByDate;
 
-    const times = commits
-        .map((c) => new Date(c.author_date).getTime())
-        .sort((a, b) => a - b);
-
+    const sorted = [...commits].sort(
+        (a, b) => new Date(a.author_date).getTime() - new Date(b.author_date).getTime(),
+    );
+    const times = sorted.map((c) => new Date(c.author_date).getTime());
     const windowMs = COMMIT_BURST_WINDOW_MINUTES * 60 * 1_000;
-    let burstCount = 0;
 
     for (let i = 0; i <= times.length - COMMIT_BURST_MIN_COUNT; i++) {
         if (times[i + COMMIT_BURST_MIN_COUNT - 1] - times[i] <= windowMs) {
-            burstCount++;
+            const day = toDateString(sorted[i].author_date);
+            burstsByDate.set(day, (burstsByDate.get(day) ?? 0) + 1);
             // Skip past all commits in this burst to avoid double-counting overlapping windows
             const burstEnd = times[i] + windowMs;
             while (i < times.length && times[i] <= burstEnd) i++;
@@ -46,13 +50,33 @@ function detectBursts(commits: GitCommit[]): number {
         }
     }
 
-    return burstCount;
+    return burstsByDate;
+}
+
+function emptyMetrics(login: string, date: string): DailyGitMetrics {
+    return {
+        developer_login: login,
+        date,
+        commits: 0,
+        lines_added: 0,
+        lines_removed: 0,
+        files_changed: 0,
+        prs_opened: 0,
+        prs_merged: 0,
+        review_comments_given: 0,
+        avg_time_to_merge_hours: null,
+        code_churn_rate: 0,
+        ai_signature_score: 0,
+        avg_commit_size: 0,
+        commit_burst_count: 0,
+    };
 }
 
 export function aggregateDailyMetrics(
     commits: GitCommit[],
     pullRequests: GitPullRequest[],
     churnWindowHours = 48,
+    reviewComments: GitReviewComment[] = [],
 ): Map<string, Map<string, DailyGitMetrics>> {
     // Map: login -> date -> metrics
     const result = new Map<string, Map<string, DailyGitMetrics>>();
@@ -70,7 +94,8 @@ export function aggregateDailyMetrics(
         byDate.get(date)!.push(commit);
     }
 
-    // Group all commits per login for burst detection (across all dates)
+    // Group all commits per login for burst detection and windowed churn
+    // (both need the full cross-day commit stream, not just one day's commits)
     const allCommitsByLogin = new Map<string, GitCommit[]>();
     for (const commit of commits) {
         const login = commit.author_login;
@@ -79,10 +104,18 @@ export function aggregateDailyMetrics(
         allCommitsByLogin.get(login)!.push(commit);
     }
 
+    // Churn must consider the window across days, so compute per-day rates from
+    // each developer's full commit history up front.
+    const churnByLogin = new Map<string, Map<string, number>>();
+    for (const [login, all] of allCommitsByLogin) {
+        churnByLogin.set(login, calculateDailyChurnRates(all, churnWindowHours));
+    }
+
     // Process commit metrics per login and date
     for (const [login, byDate] of commitsByLoginDate) {
         if (!result.has(login)) result.set(login, new Map());
         const devMetrics = result.get(login)!;
+        const churnByDate = churnByLogin.get(login);
 
         for (const [date, dayCommits] of byDate) {
             const totalAdded = dayCommits.reduce((s, c) => s + c.additions, 0);
@@ -90,7 +123,7 @@ export function aggregateDailyMetrics(
             const totalFiles = dayCommits.reduce((s, c) => s + c.files_changed, 0);
             const avgCommitSize = dayCommits.length > 0 ? (totalAdded + totalRemoved) / dayCommits.length : 0;
 
-            const {churn_rate} = calculateChurnRate(dayCommits, churnWindowHours);
+            const churnRate = churnByDate?.get(date) ?? 0;
             const aiScores = dayCommits.map((c) => scoreAiSignature(c).estimated_score);
             const avgAiScore = aiScores.length > 0
                 ? aiScores.reduce((s, v) => s + v, 0) / aiScores.length
@@ -108,7 +141,7 @@ export function aggregateDailyMetrics(
                 prs_merged: existing?.prs_merged ?? 0,
                 review_comments_given: existing?.review_comments_given ?? 0,
                 avg_time_to_merge_hours: existing?.avg_time_to_merge_hours ?? null,
-                code_churn_rate: churn_rate,
+                code_churn_rate: churnRate,
                 ai_signature_score: avgAiScore,
                 avg_commit_size: avgCommitSize,
                 commit_burst_count: 0, // filled below
@@ -116,23 +149,15 @@ export function aggregateDailyMetrics(
         }
     }
 
-    // Compute burst counts per login per day using all-login commits
+    // Compute burst counts across each developer's full commit stream so a
+    // burst spanning midnight is counted (attributed to its first commit's day).
     for (const [login, allCommits] of allCommitsByLogin) {
-        const commitsByDate = new Map<string, GitCommit[]>();
-        for (const commit of allCommits) {
-            const date = toDateString(commit.author_date);
-            if (!commitsByDate.has(date)) commitsByDate.set(date, []);
-            commitsByDate.get(date)!.push(commit);
-        }
-
         const devMetrics = result.get(login);
         if (!devMetrics) continue;
 
-        for (const [date, dayCommits] of commitsByDate) {
+        for (const [date, count] of detectBurstsByDate(allCommits)) {
             const metrics = devMetrics.get(date);
-            if (metrics) {
-                metrics.commit_burst_count = detectBursts(dayCommits);
-            }
+            if (metrics) metrics.commit_burst_count = count;
         }
     }
 
@@ -150,22 +175,9 @@ export function aggregateDailyMetrics(
         if (openedMetrics) {
             openedMetrics.prs_opened++;
         } else {
-            devMetrics.set(openedDate, {
-                developer_login: login,
-                date: openedDate,
-                commits: 0,
-                lines_added: 0,
-                lines_removed: 0,
-                files_changed: 0,
-                prs_opened: 1,
-                prs_merged: 0,
-                review_comments_given: 0,
-                avg_time_to_merge_hours: null,
-                code_churn_rate: 0,
-                ai_signature_score: 0,
-                avg_commit_size: 0,
-                commit_burst_count: 0,
-            });
+            const m = emptyMetrics(login, openedDate);
+            m.prs_opened = 1;
+            devMetrics.set(openedDate, m);
         }
 
         // prs_merged and time-to-merge on merged date
@@ -176,22 +188,7 @@ export function aggregateDailyMetrics(
                 (1000 * 3600);
 
             if (!devMetrics.has(mergedDate)) {
-                devMetrics.set(mergedDate, {
-                    developer_login: login,
-                    date: mergedDate,
-                    commits: 0,
-                    lines_added: 0,
-                    lines_removed: 0,
-                    files_changed: 0,
-                    prs_opened: 0,
-                    prs_merged: 0,
-                    review_comments_given: 0,
-                    avg_time_to_merge_hours: null,
-                    code_churn_rate: 0,
-                    ai_signature_score: 0,
-                    avg_commit_size: 0,
-                    commit_burst_count: 0,
-                });
+                devMetrics.set(mergedDate, emptyMetrics(login, mergedDate));
             }
 
             const mergedMetrics = devMetrics.get(mergedDate)!;
@@ -207,6 +204,24 @@ export function aggregateDailyMetrics(
                     mergedMetrics.prs_merged;
             }
         }
+    }
+
+    // Attribute review comments to the developer who wrote them, on the day
+    // the comment was made (a reviewer's activity, not the PR author's).
+    for (const comment of reviewComments) {
+        const login = comment.author_login;
+        if (!login) continue;
+
+        const date = toDateString(comment.created_at);
+        if (!result.has(login)) result.set(login, new Map());
+        const devMetrics = result.get(login)!;
+
+        let metrics = devMetrics.get(date);
+        if (!metrics) {
+            metrics = emptyMetrics(login, date);
+            devMetrics.set(date, metrics);
+        }
+        metrics.review_comments_given++;
     }
 
     return result;

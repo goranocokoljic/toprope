@@ -211,6 +211,7 @@ describe('GitSync', () => {
         vi.spyOn(GitClient.prototype, 'listRepos').mockResolvedValue([makeRepo('myrepo')]);
         vi.spyOn(GitClient.prototype, 'getCommits').mockResolvedValue([]);
         vi.spyOn(GitClient.prototype, 'getPullRequests').mockResolvedValue([makePR(devLogin)]);
+        vi.spyOn(GitClient.prototype, 'getReviewComments').mockResolvedValue([]);
 
         const syncer = new GitSync(makeConfig());
         await syncer.sync(db);
@@ -223,6 +224,63 @@ describe('GitSync', () => {
 
         expect(row).toBeDefined();
         expect(row!.prs_opened).toBe(1);
+    });
+
+    it('attributes review_comments_given to the reviewer, not the PR author', async () => {
+        seedDev(db, 'alice'); // PR author
+        seedDev(db, 'bob'); // reviewer
+
+        const {GitClient} = await import('../../../src/connectors/git/client');
+        vi.spyOn(GitClient.prototype, 'listRepos').mockResolvedValue([makeRepo('myrepo')]);
+        vi.spyOn(GitClient.prototype, 'getCommits').mockResolvedValue([]);
+        vi.spyOn(GitClient.prototype, 'getPullRequests').mockResolvedValue([makePR('alice')]);
+        vi.spyOn(GitClient.prototype, 'getReviewComments').mockResolvedValue([
+            {pr_number: 1, author_login: 'bob', created_at: '2024-01-15T10:00:00Z'},
+            {pr_number: 1, author_login: 'bob', created_at: '2024-01-15T11:00:00Z'},
+        ]);
+
+        const syncer = new GitSync(makeConfig());
+        const result = await syncer.sync(db);
+        expect(result.errors).toHaveLength(0);
+
+        const bobId = db
+            .prepare(`SELECT id FROM developers WHERE external_ids = '{"github":"bob"}'`)
+            .get() as {id: string};
+        const row = db
+            .prepare(
+                `SELECT review_comments_given FROM git_snapshots WHERE developer_id = ? AND date = '2024-01-15'`,
+            )
+            .get(bobId.id) as {review_comments_given: number} | undefined;
+
+        expect(row).toBeDefined();
+        expect(row!.review_comments_given).toBe(2);
+    });
+
+    it('aggregates same developer+day across multiple repos without overwriting', async () => {
+        seedDev(db, 'alice');
+
+        const {GitClient} = await import('../../../src/connectors/git/client');
+        vi.spyOn(GitClient.prototype, 'listRepos').mockResolvedValue([
+            makeRepo('repo-a'),
+            makeRepo('repo-b'),
+        ]);
+        // 1 commit (50 additions) per repo, same developer, same day
+        vi.spyOn(GitClient.prototype, 'getCommits').mockImplementation(async () => [
+            makeCommit('alice', '2024-01-15T10:00:00Z'),
+        ]);
+        vi.spyOn(GitClient.prototype, 'getPullRequests').mockResolvedValue([]);
+
+        const syncer = new GitSync(makeConfig());
+        await syncer.sync(db);
+
+        const row = db
+            .prepare(`SELECT commits, lines_added FROM git_snapshots WHERE date = '2024-01-15'`)
+            .get() as {commits: number; lines_added: number} | undefined;
+
+        expect(row).toBeDefined();
+        // Both repos' commits must be summed, not overwritten by the last repo
+        expect(row!.commits).toBe(2);
+        expect(row!.lines_added).toBe(100);
     });
 
     it('records error when listRepos fails and returns early', async () => {
