@@ -9,6 +9,7 @@ import {addDeveloper, listDevelopers, getDeveloperById, linkDeveloper, findByGit
 import {discoverOrgMembers} from './registry/discovery';
 import {seedTeamsFromConfig} from './registry/config-seeder';
 import {CopilotSync} from './connectors/copilot/sync';
+import {ClaudeCodeSync} from './connectors/claude-code/sync';
 
 const program = new Command();
 
@@ -312,6 +313,35 @@ syncCommand
             if (result.errors.length > 0) {
                 for (const e of result.errors) {
                     console.error(`[copilot] error: ${e}`);
+                }
+                hasErrors = true;
+            }
+        } finally {
+            db.close();
+        }
+        if (hasErrors) process.exit(1);
+    });
+
+syncCommand
+    .command('claude-code')
+    .description('Pull data from Anthropic Enterprise Analytics API')
+    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .action(async (options: {config: string}) => {
+        const configPath = path.resolve(process.cwd(), options.config);
+        const config = loadConfig(configPath);
+        const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
+        const db = openDb(dbPath);
+        let hasErrors = false;
+        try {
+            runMigrations(db, MIGRATIONS_DIR);
+            const syncer = new ClaudeCodeSync(config.connectors.claude_code);
+            const result = await syncer.sync(db);
+            console.log(
+                `[claude-code] sync complete — ${result.snapshotsWritten} written, ${result.snapshotsSkipped} skipped`,
+            );
+            if (result.errors.length > 0) {
+                for (const e of result.errors) {
+                    console.error(`[claude-code] error: ${e}`);
                 }
                 hasErrors = true;
             }
