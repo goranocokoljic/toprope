@@ -48,7 +48,12 @@ export function transformMetrics(
         }
 
         const isActive =
-            interactionCount > 0 || entry.cascade_sessions > 0 || entry.chat_messages > 0 ? 1 : 0;
+            interactionCount > 0 ||
+            entry.cascade_sessions > 0 ||
+            entry.chat_messages > 0 ||
+            entry.flows_run > 0
+                ? 1
+                : 0;
 
         snapshots.push({
             id: randomUUID(),

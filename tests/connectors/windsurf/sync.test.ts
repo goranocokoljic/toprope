@@ -294,6 +294,28 @@ describe('WindsurfSync', () => {
         expect(result.snapshotsWritten).toBe(1);
     });
 
+    it('ext.windsurf key does not overwrite a prior email-fallback mapping', async () => {
+        addTeam(db, 'eng4');
+        const devB = addDeveloper(db, 'Bob', 'eng4', 'shared@example.com');
+        const devA = addDeveloper(db, 'Alice', 'eng4', 'alice@example.com');
+        linkDeveloper(db, devA.id, {windsurf: 'shared@example.com'});
+
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async () =>
+                makeOkResponse(makeUsageResponse([makeEntry('shared@example.com')])),
+            ),
+        );
+
+        const result = await new WindsurfSync(makeConfig()).sync(db);
+
+        expect(result.snapshotsWritten).toBe(1);
+        const snap = db
+            .prepare('SELECT developer_id FROM tool_snapshots')
+            .get() as {developer_id: string};
+        expect([devA.id, devB.id]).toContain(snap.developer_id);
+    });
+
     it('passes start_date as YYYY-MM-DD from last sync ISO timestamp', async () => {
         const capturedBodies: Record<string, unknown>[] = [];
         vi.stubGlobal('fetch', vi.fn(async (_url: string, options: RequestInit) => {

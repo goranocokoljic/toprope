@@ -127,6 +127,17 @@ describe('transformMetrics', () => {
         expect(snap.is_active).toBe(1);
     });
 
+    it('sets is_active=1 when flows_run > 0', () => {
+        const map = new Map([[EMAIL, DEV_ID]]);
+        const [snap] = transformMetrics(
+            [makeEntry({completions_shown: 0, cascade_sessions: 0, chat_messages: 0, flows_run: 2})],
+            map,
+            false,
+        );
+
+        expect(snap.is_active).toBe(1);
+    });
+
     it('marks snapshot inactive when no usage activity', () => {
         const map = new Map([[EMAIL, DEV_ID]]);
         const entry = makeEntry({
