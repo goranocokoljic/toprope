@@ -78,7 +78,8 @@ function buildLoginToDevIdMap(db: Database.Database): Map<string, string> {
         try {
             const ext = JSON.parse(row.external_ids) as Record<string, string | undefined>;
             if (ext.copilot) map.set(ext.copilot, row.id);
-            if (ext.github) map.set(ext.github, row.id);
+            // Only add github key if it won't overwrite an explicit copilot mapping
+            if (ext.github && !map.has(ext.github)) map.set(ext.github, row.id);
         } catch {
             // malformed external_ids — skip
         }
@@ -133,7 +134,9 @@ export class CopilotSync implements ConnectorInterface {
             errors.push(`Failed to fetch seats: ${err instanceof Error ? err.message : String(err)}`);
         }
 
-        const since = getLastSyncTime(db) ?? undefined;
+        const sinceRaw = getLastSyncTime(db);
+        // GitHub Copilot Metrics API expects YYYY-MM-DD, not a full ISO timestamp
+        const since = sinceRaw ? sinceRaw.slice(0, 10) : undefined;
 
         let metrics;
         try {
@@ -161,9 +164,11 @@ export class CopilotSync implements ConnectorInterface {
             }
         });
 
+        let snapshotWriteFailed = false;
         try {
             insertMany(snapshots);
         } catch (err) {
+            snapshotWriteFailed = true;
             errors.push(
                 `Failed to write snapshots: ${err instanceof Error ? err.message : String(err)}`,
             );
@@ -176,12 +181,16 @@ export class CopilotSync implements ConnectorInterface {
             );
         }
 
-        try {
-            setLastSyncTime(db, now);
-        } catch (err) {
-            errors.push(
-                `Failed to update sync state: ${err instanceof Error ? err.message : String(err)}`,
-            );
+        // Only advance the cursor when snapshots were fully written; a failed write
+        // would otherwise permanently skip that window on the next sync.
+        if (!snapshotWriteFailed) {
+            try {
+                setLastSyncTime(db, now);
+            } catch (err) {
+                errors.push(
+                    `Failed to update sync state: ${err instanceof Error ? err.message : String(err)}`,
+                );
+            }
         }
 
         return {

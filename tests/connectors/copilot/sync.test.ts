@@ -54,6 +54,20 @@ function makeSeat(login: string, lastActivity: string | null = null): CopilotSea
     };
 }
 
+// Produces a Response-like object that includes headers.get('link') = null (no next page)
+function makeOkResponse(body: unknown) {
+    return {
+        ok: true,
+        status: 200,
+        headers: {get: (_: string) => null},
+        json: async () => body,
+    };
+}
+
+function makeSeatsOkResponse(seats: CopilotSeat[] = []) {
+    return makeOkResponse({total_seats: seats.length, seats} satisfies CopilotSeatsResponse);
+}
+
 function seedDev(db: Database.Database, login: string): string {
     addTeam(db, 'eng');
     const dev = addDeveloper(db, 'Alice', 'eng', 'alice@test.com', login);
@@ -96,17 +110,9 @@ describe('CopilotSync', () => {
             'fetch',
             vi.fn(async (url: string) => {
                 if (String(url).includes('billing/seats')) {
-                    return {
-                        ok: true,
-                        status: 200,
-                        json: async () => ({total_seats: 1, seats: [makeSeat(login, new Date().toISOString())]} satisfies CopilotSeatsResponse),
-                    };
+                    return makeSeatsOkResponse([makeSeat(login, new Date().toISOString())]);
                 }
-                return {
-                    ok: true,
-                    status: 200,
-                    json: async () => [makeMetrics(login)],
-                };
+                return makeOkResponse([makeMetrics(login)]);
             }),
         );
 
@@ -122,21 +128,15 @@ describe('CopilotSync', () => {
         const login = 'alice';
         seedDev(db, login);
 
-        const fakeFetch = vi.fn(async (url: string) => {
-            if (String(url).includes('billing/seats')) {
-                return {
-                    ok: true,
-                    status: 200,
-                    json: async () => ({total_seats: 1, seats: [makeSeat(login, new Date().toISOString())]} satisfies CopilotSeatsResponse),
-                };
-            }
-            return {
-                ok: true,
-                status: 200,
-                json: async () => [makeMetrics(login, '2024-01-15')],
-            };
-        });
-        vi.stubGlobal('fetch', fakeFetch);
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async (url: string) => {
+                if (String(url).includes('billing/seats')) {
+                    return makeSeatsOkResponse([makeSeat(login, new Date().toISOString())]);
+                }
+                return makeOkResponse([makeMetrics(login, '2024-01-15')]);
+            }),
+        );
 
         const syncer = new CopilotSync(makeConfig());
         await syncer.sync(db);
@@ -150,13 +150,9 @@ describe('CopilotSync', () => {
             'fetch',
             vi.fn(async (url: string) => {
                 if (String(url).includes('billing/seats')) {
-                    return {ok: true, status: 200, json: async () => ({total_seats: 0, seats: []})};
+                    return makeSeatsOkResponse();
                 }
-                return {
-                    ok: true,
-                    status: 200,
-                    json: async () => [makeMetrics('unknown-user')],
-                };
+                return makeOkResponse([makeMetrics('unknown-user')]);
             }),
         );
 
@@ -172,9 +168,9 @@ describe('CopilotSync', () => {
             'fetch',
             vi.fn(async (url: string) => {
                 if (String(url).includes('billing/seats')) {
-                    return {ok: true, status: 200, json: async () => ({total_seats: 0, seats: []})};
+                    return makeSeatsOkResponse();
                 }
-                return {ok: true, status: 200, json: async () => []};
+                return makeOkResponse([]);
             }),
         );
 
@@ -193,9 +189,10 @@ describe('CopilotSync', () => {
             'fetch',
             vi.fn(async (url: string) => {
                 if (String(url).includes('billing/seats')) {
-                    return {ok: true, status: 200, json: async () => ({total_seats: 1, seats: [makeSeat(login)]})};
+                    return makeSeatsOkResponse([makeSeat(login)]);
                 }
-                return {ok: false, status: 500, text: async () => 'Internal Server Error'};
+                // Always return 500 — exhausts all retries
+                return {ok: false, status: 500, headers: {get: () => null}};
             }),
         );
 
@@ -205,6 +202,35 @@ describe('CopilotSync', () => {
         expect(result.errors.length).toBeGreaterThan(0);
         expect(result.errors[0]).toContain('500');
         expect(countSnapshots(db)).toBe(0);
+    }, 10_000);
+
+    it('retries on transient 5xx and succeeds', async () => {
+        const login = 'alice';
+        seedDev(db, login);
+
+        let metricsCallCount = 0;
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async (url: string) => {
+                if (String(url).includes('billing/seats')) {
+                    return makeSeatsOkResponse();
+                }
+                metricsCallCount++;
+                if (metricsCallCount === 1) {
+                    return {ok: false, status: 503, headers: {get: () => null}};
+                }
+                return makeOkResponse([makeMetrics(login)]);
+            }),
+        );
+
+        vi.useFakeTimers();
+        const syncPromise = new CopilotSync(makeConfig()).sync(db);
+        await vi.runAllTimersAsync();
+        const result = await syncPromise;
+        vi.useRealTimers();
+
+        expect(result.snapshotsWritten).toBe(1);
+        expect(metricsCallCount).toBeGreaterThanOrEqual(2);
     });
 
     it('retries on 429 rate limit response', async () => {
@@ -216,7 +242,7 @@ describe('CopilotSync', () => {
             'fetch',
             vi.fn(async (url: string) => {
                 if (String(url).includes('billing/seats')) {
-                    return {ok: true, status: 200, json: async () => ({total_seats: 0, seats: []})};
+                    return makeSeatsOkResponse();
                 }
                 callCount++;
                 if (callCount === 1) {
@@ -224,10 +250,9 @@ describe('CopilotSync', () => {
                         ok: false,
                         status: 429,
                         headers: {get: () => '0'},
-                        json: async () => ({}),
                     };
                 }
-                return {ok: true, status: 200, json: async () => [makeMetrics(login)]};
+                return makeOkResponse([makeMetrics(login)]);
             }),
         );
 
@@ -243,13 +268,9 @@ describe('CopilotSync', () => {
             'fetch',
             vi.fn(async (url: string) => {
                 if (String(url).includes('billing/seats')) {
-                    return {ok: true, status: 200, json: async () => ({total_seats: 0, seats: []})};
+                    return makeSeatsOkResponse();
                 }
-                return {
-                    ok: true,
-                    status: 200,
-                    json: async () => [{login: 'alice', date: '2024-01-15'}],
-                };
+                return makeOkResponse([{login: 'alice', date: '2024-01-15'}]);
             }),
         );
 
@@ -266,14 +287,37 @@ describe('CopilotSync', () => {
         expect(result.errors[0]).toContain('Missing required config');
     });
 
+    it('does not advance lastSyncTime when snapshot write fails', async () => {
+        const login = 'alice';
+        seedDev(db, login);
+
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async (url: string) => {
+                if (String(url).includes('billing/seats')) {
+                    return makeSeatsOkResponse();
+                }
+                return makeOkResponse([makeMetrics(login)]);
+            }),
+        );
+
+        // Break the DB so snapshot writes fail
+        db.prepare('DROP TABLE tool_snapshots').run();
+        const syncer = new CopilotSync(makeConfig());
+        await syncer.sync(db);
+
+        // Cursor must not have advanced
+        expect(syncer.getLastSyncTime(db)).toBeNull();
+    });
+
     it('updates lastSyncTime after successful sync', async () => {
         vi.stubGlobal(
             'fetch',
             vi.fn(async (url: string) => {
                 if (String(url).includes('billing/seats')) {
-                    return {ok: true, status: 200, json: async () => ({total_seats: 0, seats: []})};
+                    return makeSeatsOkResponse();
                 }
-                return {ok: true, status: 200, json: async () => []};
+                return makeOkResponse([]);
             }),
         );
 
@@ -285,6 +329,56 @@ describe('CopilotSync', () => {
         expect(syncer.getLastSyncTime(db)).not.toBeNull();
     });
 
+    it('passes since as YYYY-MM-DD not full ISO timestamp', async () => {
+        const capturedUrls: string[] = [];
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async (url: string) => {
+                capturedUrls.push(String(url));
+                if (String(url).includes('billing/seats')) {
+                    return makeSeatsOkResponse();
+                }
+                return makeOkResponse([]);
+            }),
+        );
+
+        // Set a stored ISO timestamp as the last sync time
+        db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+            'copilot_last_sync',
+            '2024-01-15T10:30:00.123Z',
+        );
+
+        const syncer = new CopilotSync(makeConfig());
+        await syncer.sync(db);
+
+        const metricsUrl = capturedUrls.find((u) => u.includes('/copilot/metrics'));
+        expect(metricsUrl).toBeDefined();
+        expect(metricsUrl).toContain('since=2024-01-15');
+        expect(metricsUrl).not.toContain('T10%3A30');
+    });
+
+    it('matches developer via ext.github when ext.copilot is not set', async () => {
+        addTeam(db, 'eng2');
+        const dev = addDeveloper(db, 'Bob', 'eng2', 'bob@test.com', 'bob-gh');
+        // No copilot link — only github
+        expect(dev.external_ids.copilot).toBeUndefined();
+
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async (url: string) => {
+                if (String(url).includes('billing/seats')) {
+                    return makeSeatsOkResponse();
+                }
+                return makeOkResponse([makeMetrics('bob-gh')]);
+            }),
+        );
+
+        const syncer = new CopilotSync(makeConfig());
+        const result = await syncer.sync(db);
+
+        expect(result.snapshotsWritten).toBe(1);
+    });
+
     it('correctly calculates acceptance_rate in written snapshot', async () => {
         const login = 'alice';
         seedDev(db, login);
@@ -293,13 +387,9 @@ describe('CopilotSync', () => {
             'fetch',
             vi.fn(async (url: string) => {
                 if (String(url).includes('billing/seats')) {
-                    return {ok: true, status: 200, json: async () => ({total_seats: 1, seats: [makeSeat(login, new Date().toISOString())]})};
+                    return makeSeatsOkResponse([makeSeat(login, new Date().toISOString())]);
                 }
-                return {
-                    ok: true,
-                    status: 200,
-                    json: async () => [makeMetrics(login)],
-                };
+                return makeOkResponse([makeMetrics(login)]);
             }),
         );
 

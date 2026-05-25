@@ -92,7 +92,7 @@ export function detectInactiveSeats(seats: CopilotSeat[], asOf: Date = new Date(
 
         if (!lastActivity) {
             inactive.push({
-                login: seat.assignee.login,
+                login: seat.assignee?.login ?? seat.login,
                 last_activity_at: null,
                 days_inactive: Infinity,
             });
@@ -104,7 +104,7 @@ export function detectInactiveSeats(seats: CopilotSeat[], asOf: Date = new Date(
 
         if (daysInactive >= INACTIVE_THRESHOLD_DAYS) {
             inactive.push({
-                login: seat.assignee.login,
+                login: seat.assignee?.login ?? seat.login,
                 last_activity_at: seat.last_activity_at,
                 days_inactive: daysInactive,
             });

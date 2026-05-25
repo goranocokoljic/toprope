@@ -186,4 +186,15 @@ describe('detectInactiveSeats', () => {
     it('returns empty array for no seats', () => {
         expect(detectInactiveSeats([])).toHaveLength(0);
     });
+
+    it('falls back to seat.login when assignee is null', () => {
+        const seat = {
+            ...makeSeat({last_activity_at: null}),
+            assignee: null as unknown as {login: string},
+        };
+        const inactive = detectInactiveSeats([seat]);
+
+        expect(inactive).toHaveLength(1);
+        expect(inactive[0].login).toBe(LOGIN);
+    });
 });

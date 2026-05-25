@@ -301,21 +301,24 @@ syncCommand
         const config = loadConfig(configPath);
         const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
         const db = openDb(dbPath);
+        let hasErrors = false;
         try {
             runMigrations(db, MIGRATIONS_DIR);
             const syncer = new CopilotSync(config.connectors.copilot);
             const result = await syncer.sync(db);
+            console.log(
+                `[copilot] sync complete — ${result.snapshotsWritten} written, ${result.snapshotsSkipped} skipped`,
+            );
             if (result.errors.length > 0) {
                 for (const e of result.errors) {
                     console.error(`[copilot] error: ${e}`);
                 }
+                hasErrors = true;
             }
-            console.log(
-                `[copilot] sync complete — ${result.snapshotsWritten} written, ${result.snapshotsSkipped} skipped`,
-            );
         } finally {
             db.close();
         }
+        if (hasErrors) process.exit(1);
     });
 
 program.parseAsync().catch((err: unknown) => {

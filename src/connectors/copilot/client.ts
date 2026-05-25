@@ -48,8 +48,20 @@ export interface CopilotClientConfig {
 const DEFAULT_BASE_URL = 'https://api.github.com';
 const RATE_LIMIT_MAX_RETRIES = 3;
 
+function parseNextLinkUrl(linkHeader: string | null): string | null {
+    if (!linkHeader) return null;
+    const match = linkHeader.match(/<([^>]+)>;\s*rel="next"/);
+    return match?.[1] ?? null;
+}
+
 async function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parseRetryAfterMs(header: string | null, attempt: number): number {
+    if (!header) return 60_000 * (attempt + 1);
+    const seconds = parseFloat(header);
+    return !isNaN(seconds) && seconds >= 0 ? Math.ceil(seconds) * 1000 : 60_000 * (attempt + 1);
 }
 
 async function fetchWithRetry(
@@ -61,17 +73,37 @@ async function fetchWithRetry(
     let attempt = 0;
 
     while (attempt <= retries) {
-        const res = await fetch(url, {headers});
+        let res: Response;
+        try {
+            res = await fetch(url, {headers});
+        } catch (networkErr) {
+            lastError = networkErr instanceof Error ? networkErr : new Error(String(networkErr));
+            if (attempt < retries) {
+                await sleep(1_000 * (attempt + 1));
+                attempt++;
+                continue;
+            }
+            throw lastError;
+        }
 
         if (res.status === 429) {
-            const retryAfter = res.headers.get('retry-after');
-            const delayMs = retryAfter ? parseInt(retryAfter, 10) * 1000 : 60_000 * (attempt + 1);
+            const delayMs = parseRetryAfterMs(res.headers.get('retry-after'), attempt);
             if (attempt < retries) {
                 await sleep(delayMs);
                 attempt++;
                 continue;
             }
             throw new Error(`Rate limit exceeded after ${retries} retries: ${url}`);
+        }
+
+        if (res.status >= 500) {
+            lastError = new Error(`GitHub API server error ${res.status} for ${url}`);
+            if (attempt < retries) {
+                await sleep(1_000 * (attempt + 1));
+                attempt++;
+                continue;
+            }
+            throw lastError;
         }
 
         if (!res.ok) {
@@ -104,10 +136,19 @@ export class CopilotClient {
         if (since) params.set('since', since);
         if (until) params.set('until', until);
         const query = params.toString() ? `?${params.toString()}` : '';
-        const url = `${this.baseUrl}/orgs/${this.org}/copilot/metrics${query}`;
+        const initialUrl = `${this.baseUrl}/orgs/${this.org}/copilot/metrics${query}`;
 
-        const res = await fetchWithRetry(url, this.headers);
-        return (await res.json()) as CopilotUserMetrics[];
+        const allMetrics: CopilotUserMetrics[] = [];
+        let nextUrl: string | null = initialUrl;
+
+        while (nextUrl) {
+            const res = await fetchWithRetry(nextUrl, this.headers);
+            const page = (await res.json()) as CopilotUserMetrics[];
+            allMetrics.push(...page);
+            nextUrl = parseNextLinkUrl(res.headers.get('link'));
+        }
+
+        return allMetrics;
     }
 
     async getSeats(): Promise<CopilotSeat[]> {
