@@ -4,6 +4,8 @@ import {loadConfig} from './config/loader';
 import {buildServer} from './server';
 import {openDb} from './storage/db';
 import {runMigrations, getMigrationStatus} from './storage/migrator';
+import {printStatus} from './cli/status';
+import {runDoctor} from './cli/doctor';
 import {addTeam, listTeams, teamExists} from './registry/teams';
 import {addDeveloper, listDevelopers, getDeveloperById, linkDeveloper, findByGithubUsername} from './registry/developers';
 import {discoverOrgMembers} from './registry/discovery';
@@ -704,6 +706,42 @@ wasteCommand
             db.close();
         }
         if (exitCode !== 0) process.exit(exitCode);
+    });
+
+program
+    .command('status')
+    .description('Show a unified summary of developers, connectors, subscriptions, and waste')
+    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .action((options: {config: string}) => {
+        const configPath = path.resolve(process.cwd(), options.config);
+        const config = loadConfig(configPath);
+        const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
+        const db = openDb(dbPath);
+        try {
+            runMigrations(db, MIGRATIONS_DIR);
+            printStatus(db, config);
+        } finally {
+            db.close();
+        }
+    });
+
+program
+    .command('doctor')
+    .description('Validate the entire GovProxy setup: config, database, and API tokens')
+    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .action(async (options: {config: string}) => {
+        const configPath = path.resolve(process.cwd(), options.config);
+        const config = loadConfig(configPath);
+        const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
+        const db = openDb(dbPath);
+        let passed = false;
+        try {
+            runMigrations(db, MIGRATIONS_DIR);
+            passed = await runDoctor(db, config, configPath, MIGRATIONS_DIR);
+        } finally {
+            db.close();
+        }
+        if (!passed) process.exit(1);
     });
 
 program.parseAsync().catch((err: unknown) => {
