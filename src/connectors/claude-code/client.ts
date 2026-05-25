@@ -40,10 +40,13 @@ async function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const RETRY_AFTER_MAX_MS = 60_000;
+
 function parseRetryAfterMs(header: string | null, attempt: number): number {
-    if (!header) return 60_000 * (attempt + 1);
+    if (!header) return Math.min(60_000 * (attempt + 1), RETRY_AFTER_MAX_MS);
     const seconds = parseFloat(header);
-    return !isNaN(seconds) && seconds >= 0 ? Math.ceil(seconds) * 1000 : 60_000 * (attempt + 1);
+    const ms = !isNaN(seconds) && seconds >= 0 ? Math.ceil(seconds) * 1000 : 60_000 * (attempt + 1);
+    return Math.min(ms, RETRY_AFTER_MAX_MS);
 }
 
 async function fetchWithRetry(
@@ -131,7 +134,10 @@ export class ClaudeCodeClient {
             const body = (await res.json()) as ClaudeCodeUsageResponse;
 
             all.push(...body.data);
-            nextToken = body.has_more ? (body.next_token ?? null) : null;
+            if (body.has_more && !body.next_token) {
+                throw new Error('Pagination error: has_more=true but next_token is missing');
+            }
+            nextToken = body.has_more ? body.next_token : null;
         } while (nextToken);
 
         return all;

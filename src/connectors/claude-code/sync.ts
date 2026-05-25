@@ -42,9 +42,15 @@ function setLastSyncTime(db: Database.Database, time: string): void {
 }
 
 function upsertSnapshot(db: Database.Database, snap: ToolSnapshot): 'written' | 'skipped' {
-    const result = db
-        .prepare(
-            `INSERT INTO tool_snapshots
+    const alreadyExists =
+        db
+            .prepare(
+                'SELECT 1 FROM tool_snapshots WHERE developer_id = ? AND date = ? AND tool = ?',
+            )
+            .get(snap.developer_id, snap.date, snap.tool) != null;
+
+    db.prepare(
+        `INSERT INTO tool_snapshots
              (id, developer_id, date, tool, data_source, data_quality, is_active,
               interaction_count, acceptance_count, acceptance_rate, features_used,
               models_used, estimated_cost, tokens_consumed, raw_data)
@@ -59,26 +65,25 @@ function upsertSnapshot(db: Database.Database, snap: ToolSnapshot): 'written' | 
                estimated_cost = excluded.estimated_cost,
                tokens_consumed = excluded.tokens_consumed,
                raw_data = excluded.raw_data`,
-        )
-        .run(
-            snap.id,
-            snap.developer_id,
-            snap.date,
-            snap.tool,
-            snap.data_source,
-            snap.data_quality,
-            snap.is_active,
-            snap.interaction_count,
-            snap.acceptance_count,
-            snap.acceptance_rate,
-            snap.features_used,
-            snap.models_used,
-            snap.estimated_cost,
-            snap.tokens_consumed,
-            snap.raw_data,
-        );
+    ).run(
+        snap.id,
+        snap.developer_id,
+        snap.date,
+        snap.tool,
+        snap.data_source,
+        snap.data_quality,
+        snap.is_active,
+        snap.interaction_count,
+        snap.acceptance_count,
+        snap.acceptance_rate,
+        snap.features_used,
+        snap.models_used,
+        snap.estimated_cost,
+        snap.tokens_consumed,
+        snap.raw_data,
+    );
 
-    return result.changes > 0 ? 'written' : 'skipped';
+    return alreadyExists ? 'skipped' : 'written';
 }
 
 function buildEmailToDevIdMap(db: Database.Database): Map<string, string> {

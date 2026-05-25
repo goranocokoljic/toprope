@@ -115,10 +115,13 @@ describe('ClaudeCodeSync', () => {
             makeOkResponse(makeUsageResponse([makeEntry(email, {date: '2024-01-15'})]))));
 
         const syncer = new ClaudeCodeSync(makeConfig());
-        await syncer.sync(db);
-        await syncer.sync(db);
+        const first = await syncer.sync(db);
+        const second = await syncer.sync(db);
 
         expect(countSnapshots(db)).toBe(1);
+        expect(first.snapshotsWritten).toBe(1);
+        expect(second.snapshotsWritten).toBe(0);
+        expect(second.snapshotsSkipped).toBe(1);
     });
 
     it('skips entries for unknown developers', async () => {
@@ -194,6 +197,19 @@ describe('ClaudeCodeSync', () => {
 
         expect(result.snapshotsWritten).toBe(2);
         expect(callCount).toBe(2);
+    });
+
+    it('records error when API returns has_more=true with null next_token', async () => {
+        const email = 'alice@company.com';
+        seedDev(db, email);
+
+        vi.stubGlobal('fetch', vi.fn(async () =>
+            makeOkResponse({data: [makeEntry(email)], has_more: true, next_token: null})));
+
+        const result = await new ClaudeCodeSync(makeConfig()).sync(db);
+
+        expect(result.errors.length).toBeGreaterThan(0);
+        expect(result.errors[0]).toContain('Pagination error');
     });
 
     it('returns error when org_id or api_key is missing', async () => {
