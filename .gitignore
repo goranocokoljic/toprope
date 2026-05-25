@@ -16,3 +16,7 @@ reviews/
 
 # Logs
 *.log
+
+# Local dev-cycle wrapper (personal workflow helper, not part of the package)
+run-issues.ps1
+dev-cycle-logs/
