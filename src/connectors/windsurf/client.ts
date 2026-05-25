@@ -122,8 +122,11 @@ export class WindsurfClient {
             const res = await postWithRetry(url, reqBody);
             const data = (await res.json()) as WindsurfUsageResponse;
 
-            all.push(...data.users);
-            cursor = data.has_more && data.next_cursor ? data.next_cursor : null;
+            all.push(...(data.users ?? []));
+            if (data.has_more && !data.next_cursor) {
+                throw new Error('Windsurf API pagination error: has_more=true but next_cursor is missing');
+            }
+            cursor = data.has_more ? (data.next_cursor ?? null) : null;
         } while (cursor);
 
         return all;

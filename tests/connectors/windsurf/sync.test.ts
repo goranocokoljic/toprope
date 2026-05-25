@@ -311,6 +311,29 @@ describe('WindsurfSync', () => {
         expect(capturedBodies[0].start_date).toBe('2024-01-20');
     });
 
+    it('records error when API returns has_more=true with null next_cursor', async () => {
+        const email = 'alice@company.com';
+        seedDev(db, email);
+
+        vi.stubGlobal('fetch', vi.fn(async () =>
+            makeOkResponse({users: [makeEntry(email)], has_more: true, next_cursor: null})));
+
+        const result = await new WindsurfSync(makeConfig()).sync(db);
+
+        expect(result.errors.length).toBeGreaterThan(0);
+        expect(result.errors[0]).toContain('pagination error');
+    });
+
+    it('handles response with missing users field gracefully', async () => {
+        vi.stubGlobal('fetch', vi.fn(async () =>
+            makeOkResponse({has_more: false})));
+
+        const result = await new WindsurfSync(makeConfig()).sync(db);
+
+        expect(result.errors).toHaveLength(0);
+        expect(result.snapshotsWritten).toBe(0);
+    });
+
     it('sends service_key in request body, not headers', async () => {
         const capturedBodies: Record<string, unknown>[] = [];
         const capturedHeaders: Record<string, string>[] = [];

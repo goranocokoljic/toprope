@@ -43,48 +43,34 @@ function setLastSyncTime(db: Database.Database, time: string): void {
 }
 
 function upsertSnapshot(db: Database.Database, snap: ToolSnapshot): 'written' | 'skipped' {
-    const alreadyExists =
-        db
-            .prepare(
-                'SELECT 1 FROM tool_snapshots WHERE developer_id = ? AND date = ? AND tool = ?',
-            )
-            .get(snap.developer_id, snap.date, snap.tool) != null;
-
-    db.prepare(
-        `INSERT INTO tool_snapshots
+    const result = db
+        .prepare(
+            `INSERT INTO tool_snapshots
              (id, developer_id, date, tool, data_source, data_quality, is_active,
               interaction_count, acceptance_count, acceptance_rate, features_used,
               models_used, estimated_cost, tokens_consumed, raw_data)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(developer_id, date, tool) DO UPDATE SET
-               is_active = excluded.is_active,
-               interaction_count = excluded.interaction_count,
-               acceptance_count = excluded.acceptance_count,
-               acceptance_rate = excluded.acceptance_rate,
-               features_used = excluded.features_used,
-               models_used = excluded.models_used,
-               estimated_cost = excluded.estimated_cost,
-               tokens_consumed = excluded.tokens_consumed,
-               raw_data = excluded.raw_data`,
-    ).run(
-        snap.id,
-        snap.developer_id,
-        snap.date,
-        snap.tool,
-        snap.data_source,
-        snap.data_quality,
-        snap.is_active,
-        snap.interaction_count,
-        snap.acceptance_count,
-        snap.acceptance_rate,
-        snap.features_used,
-        snap.models_used,
-        snap.estimated_cost,
-        snap.tokens_consumed,
-        snap.raw_data,
-    );
+             ON CONFLICT(developer_id, date, tool) DO NOTHING`,
+        )
+        .run(
+            snap.id,
+            snap.developer_id,
+            snap.date,
+            snap.tool,
+            snap.data_source,
+            snap.data_quality,
+            snap.is_active,
+            snap.interaction_count,
+            snap.acceptance_count,
+            snap.acceptance_rate,
+            snap.features_used,
+            snap.models_used,
+            snap.estimated_cost,
+            snap.tokens_consumed,
+            snap.raw_data,
+        );
 
-    return alreadyExists ? 'skipped' : 'written';
+    return result.changes > 0 ? 'written' : 'skipped';
 }
 
 function buildEmailToDevIdMap(db: Database.Database): Map<string, string> {
@@ -173,17 +159,22 @@ export class WindsurfSync implements ConnectorInterface {
 
         const snapshots = transformMetrics(metrics, emailToDevId, storeRawData);
 
-        const insertMany = db.transaction((snaps: ToolSnapshot[]) => {
+        const insertMany = db.transaction((snaps: ToolSnapshot[]): {written: number; skipped: number} => {
+            let written = 0;
+            let skipped = 0;
             for (const snap of snaps) {
                 const outcome = upsertSnapshot(db, snap);
-                if (outcome === 'written') snapshotsWritten++;
-                else snapshotsSkipped++;
+                if (outcome === 'written') written++;
+                else skipped++;
             }
+            return {written, skipped};
         });
 
         let snapshotWriteFailed = false;
         try {
-            insertMany(snapshots);
+            const counts = insertMany(snapshots);
+            snapshotsWritten = counts.written;
+            snapshotsSkipped = counts.skipped;
         } catch (err) {
             snapshotWriteFailed = true;
             errors.push(
