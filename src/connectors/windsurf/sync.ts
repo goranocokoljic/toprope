@@ -82,8 +82,10 @@ function buildEmailToDevIdMap(db: Database.Database): Map<string, string> {
         if (row.external_ids) {
             try {
                 const ext = JSON.parse(row.external_ids) as Record<string, string | undefined>;
-                if (ext.windsurf && !map.has(ext.windsurf)) {
-                    map.set(ext.windsurf, row.id);
+                if (ext.windsurf) {
+                    if (!map.has(ext.windsurf)) {
+                        map.set(ext.windsurf, row.id);
+                    }
                     continue;
                 }
             } catch {
