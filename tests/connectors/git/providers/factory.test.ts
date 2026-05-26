@@ -126,4 +126,18 @@ describe('createGitProvider', () => {
             ).toThrow('Unsupported git provider type: "azure"');
         });
     });
+
+    describe('unimplemented provider methods', () => {
+        it('listRepos returns a rejected Promise, not a synchronous throw', async () => {
+            const provider = createGitProvider(validGitHub);
+            await expect(provider.listRepos()).rejects.toThrow('github provider not yet implemented');
+        });
+
+        it('getCommits returns a rejected Promise', async () => {
+            const provider = createGitProvider(validGitHub);
+            await expect(provider.getCommits('repo', '2024-01-01', '2024-01-31')).rejects.toThrow(
+                'github provider not yet implemented',
+            );
+        });
+    });
 });
