@@ -14,6 +14,7 @@ import {CopilotSync} from './connectors/copilot/sync';
 import {ClaudeCodeSync} from './connectors/claude-code/sync';
 import {WindsurfSync} from './connectors/windsurf/sync';
 import {GitSync} from './connectors/git/sync';
+import {runPipeline} from './scheduler/sync-pipeline';
 import {importCsv} from './expenses/importer';
 import {
     listSubscriptions,
@@ -310,6 +311,38 @@ devCommand
     );
 
 const syncCommand = program.command('sync').description('Sync data from connectors');
+
+syncCommand
+    .command('all')
+    .description('Run full sync pipeline: Copilot → Claude Code → Windsurf → Git')
+    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .action(async (options: {config: string}) => {
+        const configPath = path.resolve(process.cwd(), options.config);
+        const config = loadConfig(configPath);
+        const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
+        const db = openDb(dbPath);
+        try {
+            runMigrations(db, MIGRATIONS_DIR);
+            const connectors = [
+                new CopilotSync(config.connectors.copilot),
+                new ClaudeCodeSync(config.connectors.claude_code),
+                new WindsurfSync(config.connectors.windsurf),
+                new GitSync(config.connectors.git),
+            ];
+            const results = await runPipeline(db, connectors);
+            for (const {connector, result, retried} of results) {
+                const retry = retried ? ' (retried)' : '';
+                console.log(
+                    `[${connector}] sync complete${retry} — ${result.snapshotsWritten} written, ${result.snapshotsSkipped} skipped`,
+                );
+                for (const e of result.errors) {
+                    console.error(`[${connector}] error: ${e}`);
+                }
+            }
+        } finally {
+            db.close();
+        }
+    });
 
 syncCommand
     .command('copilot')

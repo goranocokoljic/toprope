@@ -11,6 +11,7 @@ import {registerDeveloperRoutes} from './dashboard/api/developers';
 import {registerWasteRoutes} from './dashboard/api/waste';
 import {registerSnapshotRoutes} from './dashboard/api/snapshots';
 import {registerExportRoutes} from './dashboard/api/export';
+import {startScheduler} from './scheduler/scheduler';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, './storage/migrations');
 
@@ -50,6 +51,10 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
     registerWasteRoutes(app, db);
     registerSnapshotRoutes(app, db);
     registerExportRoutes(app, db);
+
+    if (config.connectors && dbPath !== ':memory:') {
+        startScheduler(config as GovProxyConfig, dbPath);
+    }
 
     return app;
 }

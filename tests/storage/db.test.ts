@@ -22,9 +22,9 @@ describe('runMigrations', () => {
         db.close();
     });
 
-    it('applies all 7 migrations on a fresh database', () => {
+    it('applies all 8 migrations on a fresh database', () => {
         const count = runMigrations(db, MIGRATIONS_DIR);
-        expect(count).toBe(7);
+        expect(count).toBe(8);
     });
 
     it('is idempotent — running twice applies nothing the second time', () => {
@@ -53,13 +53,13 @@ describe('getMigrationStatus', () => {
         db.close();
     });
 
-    it('returns 7 entries after all migrations are applied', () => {
+    it('returns 8 entries after all migrations are applied', () => {
         runMigrations(db, MIGRATIONS_DIR);
         const statuses = getMigrationStatus(db, MIGRATIONS_DIR);
-        expect(statuses).toHaveLength(7);
+        expect(statuses).toHaveLength(8);
     });
 
-    it('marks all 7 migrations as applied', () => {
+    it('marks all 8 migrations as applied', () => {
         runMigrations(db, MIGRATIONS_DIR);
         const statuses = getMigrationStatus(db, MIGRATIONS_DIR);
         expect(statuses.every((s) => s.applied)).toBe(true);
