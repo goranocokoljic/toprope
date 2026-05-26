@@ -68,13 +68,7 @@ function collectStatus(db: Database.Database, config: GovProxyConfig): StatusDat
 
     const devsPerToolMap = new Map(devsPerTool.map((r) => [r.tool, r.cnt]));
 
-    const gitRepoCount = (
-        db
-            .prepare(
-                "SELECT COUNT(DISTINCT developer_id) as cnt FROM git_snapshots WHERE date >= ?",
-            )
-            .get(cutoffDate) as {cnt: number}
-    ).cnt;
+    const gitRepoCount = config.connectors.git.repos?.length ?? 0;
 
     const connectors: ConnectorStatus[] = [
         {

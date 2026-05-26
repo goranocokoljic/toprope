@@ -127,7 +127,7 @@ async function checkCopilotAccess(config: GovProxyConfig): Promise<CheckResult> 
 
     try {
         const res = await fetch(
-            `https://api.github.com/orgs/${org}/copilot/billing`,
+            `https://api.github.com/orgs/${org}/copilot/billing/seats?per_page=1`,
             {
                 headers: {
                     Authorization: `Bearer ${token}`,
@@ -174,14 +174,14 @@ async function checkAnthropicKey(config: GovProxyConfig): Promise<CheckResult> {
         return pass('Anthropic API key', 'Claude Code connector disabled — skipped');
     }
 
-    const apiKey = claude_code.api_key ?? process.env.ANTHROPIC_API_KEY ?? '';
+    const apiKey = claude_code.api_key ?? process.env.ANTHROPIC_ADMIN_API_KEY ?? '';
     const orgId = claude_code.org_id ?? process.env.ANTHROPIC_ORG_ID ?? '';
 
     if (!apiKey) {
         return fail(
             'Anthropic API key',
             'No API key configured',
-            'Set connectors.claude_code.api_key in config or export ANTHROPIC_API_KEY=<key>',
+            'Set connectors.claude_code.api_key in config or export ANTHROPIC_ADMIN_API_KEY=<key>',
         );
     }
     if (!orgId) {
@@ -317,8 +317,9 @@ async function checkGitRepos(config: GovProxyConfig): Promise<CheckResult> {
         );
     }
 
+    const checked = repos.slice(0, 5);
     const unreachable: string[] = [];
-    for (const repo of repos.slice(0, 5)) {
+    for (const repo of checked) {
         try {
             const res = await fetch(`https://api.github.com/repos/${repo}`, {
                 headers: {
@@ -343,19 +344,27 @@ async function checkGitRepos(config: GovProxyConfig): Promise<CheckResult> {
             'Verify repo names and that the token has repo read access.',
         );
     }
-    return pass('Git repos', `${repos.length} repo(s) configured and reachable`);
+    const suffix = repos.length > checked.length ? ` (first ${checked.length} checked)` : '';
+    return pass('Git repos', `${repos.length} repo(s) configured and reachable${suffix}`);
 }
 
 async function checkSummaryModel(config: GovProxyConfig): Promise<CheckResult> {
     const {summaries} = config;
-    if (!summaries?.enabled || !summaries.model?.api_key) {
-        return pass('Summary model', 'Summaries disabled or unconfigured — skipped');
+    if (!summaries?.enabled) {
+        return pass('Summary model', 'Summaries disabled — skipped');
     }
 
-    const modelType = summaries.model.type ?? 'anthropic';
-    const apiKey = summaries.model.api_key;
+    const modelType = summaries.model?.type ?? 'anthropic';
+    const apiKey = summaries.model?.api_key;
 
     if (modelType === 'anthropic') {
+        if (!apiKey) {
+            return fail(
+                'Summary model',
+                'No API key configured for Anthropic summary model',
+                'Set summaries.model.api_key in config.',
+            );
+        }
         try {
             const res = await fetch('https://api.anthropic.com/v1/models', {
                 headers: {
@@ -378,7 +387,7 @@ async function checkSummaryModel(config: GovProxyConfig): Promise<CheckResult> {
                     'Verify summaries.model.api_key is valid.',
                 );
             }
-            return pass('Summary model', `Anthropic endpoint reachable (${summaries.model.model_name ?? 'default'})`);
+            return pass('Summary model', `Anthropic endpoint reachable (${summaries.model?.model_name ?? 'default'})`);
         } catch (err) {
             return fail(
                 'Summary model',

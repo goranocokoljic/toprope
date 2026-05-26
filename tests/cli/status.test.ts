@@ -191,9 +191,10 @@ describe('printStatus', () => {
         expect(combined).toContain('LOW:');
     });
 
-    it('shows git repo count instead of dev count for git connector', () => {
+    it('shows configured repo count for git connector, not developer count', () => {
         addTeam(db, 'engineering');
         const dev = addDeveloper(db, 'Alice', 'engineering', 'alice@example.com');
+        addDeveloper(db, 'Bob', 'engineering', 'bob@example.com');
         db.prepare(
             `INSERT INTO git_snapshots
              (id, developer_id, date, commits, lines_added, lines_removed, files_changed,
@@ -205,9 +206,15 @@ describe('printStatus', () => {
             `INSERT INTO sync_state (key, value) VALUES ('git_last_sync', ?)`,
         ).run(new Date().toISOString());
 
-        printStatus(db, baseConfig());
+        const configWithRepos = baseConfig();
+        (configWithRepos.connectors.git as {enabled: boolean; repos: string[]}).repos = [
+            'org/repo1',
+            'org/repo2',
+        ];
+        printStatus(db, configWithRepos);
 
         const combined = output.join('\n');
-        expect(combined).toContain('repos');
+        expect(combined).toContain('2 repos');
+        expect(combined).not.toContain('1 repos');
     });
 });

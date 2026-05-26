@@ -146,8 +146,8 @@ describe('runDoctor', () => {
         (config.connectors.claude_code as {enabled: boolean; org_id: string}).enabled = true;
         (config.connectors.claude_code as {enabled: boolean; org_id: string}).org_id = 'org-123';
 
-        const savedKey = process.env.ANTHROPIC_API_KEY;
-        delete process.env.ANTHROPIC_API_KEY;
+        const savedKey = process.env.ANTHROPIC_ADMIN_API_KEY;
+        delete process.env.ANTHROPIC_ADMIN_API_KEY;
 
         try {
             const result = await runDoctor(db, config, tmpConfigPath, MIGRATIONS_DIR);
@@ -156,7 +156,7 @@ describe('runDoctor', () => {
             expect(allOutput).toContain('Anthropic API key');
             expect(allOutput).toContain('No API key');
         } finally {
-            if (savedKey !== undefined) process.env.ANTHROPIC_API_KEY = savedKey;
+            if (savedKey !== undefined) process.env.ANTHROPIC_ADMIN_API_KEY = savedKey;
         }
     });
 
