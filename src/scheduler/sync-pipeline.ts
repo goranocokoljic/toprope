@@ -21,13 +21,25 @@ async function runConnectorWithRetry(
 ): Promise<{result: SyncResult; retried: boolean}> {
     const logId = startSyncLog(db, connector.getName());
 
-    let result = await connector.sync(db);
+    let result: SyncResult;
     let retried = false;
 
-    if (result.errors.length > 0) {
-        await sleep(retryDelayMs);
+    try {
         result = await connector.sync(db);
-        retried = true;
+
+        if (result.errors.length > 0) {
+            await sleep(retryDelayMs);
+            result = await connector.sync(db);
+            retried = true;
+        }
+    } catch (err) {
+        result = {
+            connector: connector.getName(),
+            snapshotsWritten: 0,
+            snapshotsSkipped: 0,
+            errors: [err instanceof Error ? err.message : String(err)],
+            lastSyncTime: new Date().toISOString(),
+        };
     }
 
     finishSyncLog(db, logId, {

@@ -53,7 +53,10 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
     registerExportRoutes(app, db);
 
     if (config.connectors && dbPath !== ':memory:') {
-        startScheduler(config as GovProxyConfig, dbPath);
+        const tasks = startScheduler(config as GovProxyConfig, dbPath);
+        app.addHook('onClose', () => {
+            for (const task of tasks) task.stop();
+        });
     }
 
     return app;

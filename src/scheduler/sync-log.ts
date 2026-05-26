@@ -59,7 +59,7 @@ export function finishSyncLog(
 
 export function getRecentSyncLogs(db: Database.Database, limit = 50): SyncLog[] {
     const rows = db
-        .prepare('SELECT * FROM sync_logs ORDER BY started_at DESC LIMIT ?')
+        .prepare('SELECT * FROM sync_logs ORDER BY started_at DESC, rowid DESC LIMIT ?')
         .all(limit) as SyncLogRow[];
     return rows.map((r) => ({
         ...r,

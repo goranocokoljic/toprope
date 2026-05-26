@@ -114,6 +114,12 @@ describe('runPipeline', () => {
 
         expect(results[0].result.errors[0]).toContain('copilot threw unexpectedly');
         expect(results[1].result.snapshotsWritten).toBe(3);
+
+        // Verify the throwing connector's log is finalized (not left 'running')
+        const logs = getRecentSyncLogs(db);
+        const copilotLog = logs.find((l) => l.connector === 'copilot');
+        expect(copilotLog?.status).toBe('error');
+        expect(copilotLog?.finished_at).not.toBeNull();
     });
 
     it('retries failed connector once', async () => {

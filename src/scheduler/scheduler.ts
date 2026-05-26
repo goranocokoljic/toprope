@@ -57,15 +57,19 @@ export function buildConnectorSchedule(config: GovProxyConfig): ScheduledConnect
     ];
 }
 
-export function startScheduler(config: GovProxyConfig, dbPath: string): void {
+export function startScheduler(
+    config: GovProxyConfig,
+    dbPath: string,
+): ReturnType<typeof cron.schedule>[] {
     const schedule = buildConnectorSchedule(config);
+    const tasks: ReturnType<typeof cron.schedule>[] = [];
 
     for (const entry of schedule) {
         if (!entry.enabled) continue;
 
         const cronExpr = parseSyncTimeToCron(entry.syncTime);
 
-        cron.schedule(
+        const task = cron.schedule(
             cronExpr,
             async () => {
                 const db = openDb(dbPath);
@@ -80,5 +84,8 @@ export function startScheduler(config: GovProxyConfig, dbPath: string): void {
             },
             {timezone: 'UTC'},
         );
+        tasks.push(task);
     }
+
+    return tasks;
 }

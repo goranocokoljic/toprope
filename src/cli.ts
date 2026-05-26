@@ -321,6 +321,7 @@ syncCommand
         const config = loadConfig(configPath);
         const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
         const db = openDb(dbPath);
+        let hasErrors = false;
         try {
             runMigrations(db, MIGRATIONS_DIR);
             const connectors = [
@@ -337,11 +338,13 @@ syncCommand
                 );
                 for (const e of result.errors) {
                     console.error(`[${connector}] error: ${e}`);
+                    hasErrors = true;
                 }
             }
         } finally {
             db.close();
         }
+        if (hasErrors) process.exit(1);
     });
 
 syncCommand
