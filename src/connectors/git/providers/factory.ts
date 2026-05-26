@@ -5,29 +5,34 @@ import type {
     BitbucketProviderConfig,
     BitbucketAppPasswordAuth,
     GitLabProviderConfig,
+    GitRepo,
+    GitCommit,
+    GitPR,
+    GitReviewComment,
+    GitFileDiff,
 } from './types.js';
 
 class NotImplementedProvider {
     constructor(public readonly name: GitProvider['name']) {}
 
-    listRepos(): never {
-        throw new Error(`${this.name} provider not yet implemented`);
+    listRepos(): Promise<GitRepo[]> {
+        return Promise.reject(new Error(`${this.name} provider not yet implemented`));
     }
 
-    getCommits(): never {
-        throw new Error(`${this.name} provider not yet implemented`);
+    getCommits(): Promise<GitCommit[]> {
+        return Promise.reject(new Error(`${this.name} provider not yet implemented`));
     }
 
-    getPullRequests(): never {
-        throw new Error(`${this.name} provider not yet implemented`);
+    getPullRequests(): Promise<GitPR[]> {
+        return Promise.reject(new Error(`${this.name} provider not yet implemented`));
     }
 
-    getReviewComments(): never {
-        throw new Error(`${this.name} provider not yet implemented`);
+    getReviewComments(): Promise<GitReviewComment[]> {
+        return Promise.reject(new Error(`${this.name} provider not yet implemented`));
     }
 
-    getCommitDiff(): never {
-        throw new Error(`${this.name} provider not yet implemented`);
+    getCommitDiff(): Promise<GitFileDiff[]> {
+        return Promise.reject(new Error(`${this.name} provider not yet implemented`));
     }
 }
 
@@ -70,13 +75,13 @@ export function createGitProvider(config: GitProviderConfig): GitProvider {
     switch (config.type) {
         case 'github':
             validateGitHub(config);
-            return new NotImplementedProvider('github') as unknown as GitProvider;
+            return new NotImplementedProvider('github');
         case 'bitbucket':
             validateBitbucket(config);
-            return new NotImplementedProvider('bitbucket') as unknown as GitProvider;
+            return new NotImplementedProvider('bitbucket');
         case 'gitlab':
             validateGitLab(config);
-            return new NotImplementedProvider('gitlab') as unknown as GitProvider;
+            return new NotImplementedProvider('gitlab');
         default: {
             const exhaustive: never = config;
             throw new Error(
