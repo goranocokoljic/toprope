@@ -69,19 +69,20 @@ export async function runPipeline(
     const results: PipelineResult[] = [];
 
     for (const connector of connectors) {
+        const name = connector.getName();
         try {
             const {result, retried} = await runConnectorWithRetry(db, connector, retryDelayMs);
-            results.push({connector: connector.getName(), result, retried});
+            results.push({connector: name, result, retried});
         } catch (err) {
-            // Unexpected throw — log as persistent failure, continue pipeline
+            // Unexpected throw (e.g. startSyncLog or finishSyncLog DB error) — continue pipeline
             const errorResult: SyncResult = {
-                connector: connector.getName(),
+                connector: name,
                 snapshotsWritten: 0,
                 snapshotsSkipped: 0,
                 errors: [err instanceof Error ? err.message : String(err)],
                 lastSyncTime: new Date().toISOString(),
             };
-            results.push({connector: connector.getName(), result: errorResult, retried: false});
+            results.push({connector: name, result: errorResult, retried: false});
         }
     }
 
