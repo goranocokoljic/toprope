@@ -26,12 +26,6 @@ async function runConnectorWithRetry(
 
     try {
         result = await connector.sync(db);
-
-        if (result.errors.length > 0) {
-            await sleep(retryDelayMs);
-            result = await connector.sync(db);
-            retried = true;
-        }
     } catch (err) {
         result = {
             connector: connector.getName(),
@@ -40,6 +34,22 @@ async function runConnectorWithRetry(
             errors: [err instanceof Error ? err.message : String(err)],
             lastSyncTime: new Date().toISOString(),
         };
+    }
+
+    if (result.errors.length > 0) {
+        await sleep(retryDelayMs);
+        retried = true;
+        try {
+            result = await connector.sync(db);
+        } catch (err) {
+            result = {
+                connector: connector.getName(),
+                snapshotsWritten: 0,
+                snapshotsSkipped: 0,
+                errors: [err instanceof Error ? err.message : String(err)],
+                lastSyncTime: new Date().toISOString(),
+            };
+        }
     }
 
     finishSyncLog(db, logId, {

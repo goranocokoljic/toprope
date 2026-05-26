@@ -122,6 +122,27 @@ describe('runPipeline', () => {
         expect(copilotLog?.finished_at).not.toBeNull();
     });
 
+    it('retries a throwing connector (throw counts as failure)', async () => {
+        let calls = 0;
+        const connector: ConnectorInterface = {
+            getName: () => 'copilot',
+            getLastSyncTime: () => null,
+            sync: async () => {
+                calls++;
+                if (calls === 1) throw new Error('transient throw');
+                return {connector: 'copilot', snapshotsWritten: 2, snapshotsSkipped: 0, errors: [], lastSyncTime: new Date().toISOString()};
+            },
+        };
+        const promise = runPipeline(db, [connector], 100);
+        await vi.runAllTimersAsync();
+        const results = await promise;
+
+        expect(calls).toBe(2);
+        expect(results[0].retried).toBe(true);
+        expect(results[0].result.errors).toHaveLength(0);
+        expect(results[0].result.snapshotsWritten).toBe(2);
+    });
+
     it('retries failed connector once', async () => {
         const connector = makeFailThenSucceedConnector('copilot', 2);
         const promise = runPipeline(db, [connector], 100);

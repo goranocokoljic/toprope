@@ -32,26 +32,26 @@ export function buildConnectorSchedule(config: GovProxyConfig): ScheduledConnect
     return [
         {
             name: 'copilot',
-            enabled: config.connectors.copilot.enabled,
-            syncTime: config.connectors.copilot.sync_time ?? '02:00',
+            enabled: config.connectors.copilot?.enabled ?? false,
+            syncTime: config.connectors.copilot?.sync_time ?? '02:00',
             makeConnector: () => new CopilotSync(config.connectors.copilot),
         },
         {
             name: 'claude_code',
-            enabled: config.connectors.claude_code.enabled,
-            syncTime: config.connectors.claude_code.sync_time ?? '02:30',
+            enabled: config.connectors.claude_code?.enabled ?? false,
+            syncTime: config.connectors.claude_code?.sync_time ?? '02:30',
             makeConnector: () => new ClaudeCodeSync(config.connectors.claude_code),
         },
         {
             name: 'windsurf',
-            enabled: config.connectors.windsurf.enabled,
-            syncTime: config.connectors.windsurf.sync_time ?? '03:00',
+            enabled: config.connectors.windsurf?.enabled ?? false,
+            syncTime: config.connectors.windsurf?.sync_time ?? '03:00',
             makeConnector: () => new WindsurfSync(config.connectors.windsurf),
         },
         {
             name: 'git',
-            enabled: config.connectors.git.enabled,
-            syncTime: config.connectors.git.sync_time ?? '03:30',
+            enabled: config.connectors.git?.enabled ?? false,
+            syncTime: config.connectors.git?.sync_time ?? '03:30',
             makeConnector: () => new GitSync(config.connectors.git),
         },
     ];
