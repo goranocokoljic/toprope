@@ -1,0 +1,418 @@
+import type {
+    GitProvider,
+    GitProviderType,
+    GitRepo,
+    GitCommit,
+    GitPR,
+    GitReviewComment,
+    GitFileDiff,
+    GitAuthor,
+    GitLabProviderConfig,
+} from './types.js';
+
+const DEFAULT_BASE_URL = 'https://gitlab.com/api/v4';
+const MAX_RETRIES = 3;
+const PER_PAGE = 100;
+
+async function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function buildAuthHeaders(auth: GitLabProviderConfig['auth']): Record<string, string> {
+    if (auth.type === 'personal_access_token') {
+        return {'PRIVATE-TOKEN': auth.token};
+    }
+    if (auth.type === 'job_token') {
+        return {'JOB-TOKEN': auth.token};
+    }
+    return {Authorization: `Bearer ${auth.token}`};
+}
+
+async function fetchGitLab(url: string, headers: Record<string, string>): Promise<Response> {
+    let attempt = 0;
+
+    while (attempt <= MAX_RETRIES) {
+        let res: Response;
+        try {
+            res = await fetch(url, {headers});
+        } catch (err) {
+            if (attempt < MAX_RETRIES) {
+                await sleep(1_000 * (attempt + 1));
+                attempt++;
+                continue;
+            }
+            throw err instanceof Error ? err : new Error(String(err));
+        }
+
+        if (res.status === 429) {
+            const retryAfter = res.headers.get('retry-after') ?? res.headers.get('ratelimit-reset');
+            const delayMs = retryAfter ? parseFloat(retryAfter) * 1_000 : 60_000 * (attempt + 1);
+            if (attempt < MAX_RETRIES) {
+                await sleep(delayMs);
+                attempt++;
+                continue;
+            }
+            throw new Error(`Rate limit exceeded after ${MAX_RETRIES} retries: ${url}`);
+        }
+
+        if (res.status >= 500) {
+            if (attempt < MAX_RETRIES) {
+                await sleep(1_000 * (attempt + 1));
+                attempt++;
+                continue;
+            }
+            throw new Error(`GitLab API server error ${res.status}: ${url}`);
+        }
+
+        if (!res.ok) {
+            throw new Error(`GitLab API error ${res.status}: ${url}`);
+        }
+
+        return res;
+    }
+
+    throw new Error(`Request failed after ${MAX_RETRIES} retries: ${url}`);
+}
+
+function parseDiffHunks(diff: string): {additions: number; deletions: number} {
+    let additions = 0;
+    let deletions = 0;
+    for (const line of diff.split('\n')) {
+        if (line.startsWith('+') && !line.startsWith('+++')) {
+            additions++;
+        } else if (line.startsWith('-') && !line.startsWith('---')) {
+            deletions++;
+        }
+    }
+    return {additions, deletions};
+}
+
+function normalizeMRState(state: string): string {
+    switch (state) {
+        case 'opened':
+        case 'locked':
+            return 'open';
+        case 'merged':
+            return 'merged';
+        case 'closed':
+            return 'closed';
+        default:
+            return state;
+    }
+}
+
+function globMatch(pattern: string, str: string): boolean {
+    const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+    const regexStr = escaped.replace(/\*/g, '.*').replace(/\?/g, '.');
+    return new RegExp(`^${regexStr}$`, 'i').test(str);
+}
+
+// Raw API shapes
+
+interface RawProject {
+    id: number;
+    name: string;
+    path: string;
+    path_with_namespace: string;
+    default_branch: string;
+    archived: boolean;
+}
+
+interface RawCommit {
+    id: string;
+    author_name: string;
+    author_email: string;
+    authored_date: string;
+    message: string;
+}
+
+interface RawDiffEntry {
+    old_path: string;
+    new_path: string;
+    new_file: boolean;
+    renamed_file: boolean;
+    deleted_file: boolean;
+    diff: string;
+}
+
+interface RawMRAuthor {
+    username: string;
+    name: string;
+    email?: string;
+}
+
+interface RawMR {
+    iid: number;
+    title: string;
+    author: RawMRAuthor | null;
+    state: string;
+    created_at: string;
+    merged_at: string | null;
+    closed_at: string | null;
+    reviewers?: RawMRAuthor[];
+}
+
+interface RawNote {
+    author: RawMRAuthor | null;
+    body: string;
+    created_at: string;
+    type: string | null;
+    system: boolean;
+}
+
+export class GitLabProvider implements GitProvider {
+    readonly name: GitProviderType = 'gitlab';
+    private readonly group: string;
+    private readonly baseUrl: string;
+    private readonly authHeaders: Record<string, string>;
+    private readonly includeRepos: string[];
+    private readonly includeSubgroups: boolean;
+
+    constructor(config: GitLabProviderConfig) {
+        this.group = config.group;
+        const rawUrl = (config.url ?? DEFAULT_BASE_URL).replace(/\/$/, '');
+        this.baseUrl = rawUrl.includes('/api/') ? rawUrl : `${rawUrl}/api/v4`;
+        this.authHeaders = buildAuthHeaders(config.auth);
+        this.includeRepos = config.repos ?? [];
+        this.includeSubgroups = config.include_subgroups ?? false;
+    }
+
+    private shouldInclude(pathWithNamespace: string): boolean {
+        if (this.includeRepos.length === 0) return true;
+        const shortPath = pathWithNamespace.split('/').pop() ?? pathWithNamespace;
+        return this.includeRepos.some(
+            (p) =>
+                p === pathWithNamespace ||
+                p === shortPath ||
+                globMatch(p, pathWithNamespace) ||
+                globMatch(p, shortPath),
+        );
+    }
+
+    private encodedGroup(): string {
+        return encodeURIComponent(this.group);
+    }
+
+    private projectPath(repo: string): string {
+        return encodeURIComponent(repo);
+    }
+
+    async listRepos(): Promise<GitRepo[]> {
+        let baseUrl = `${this.baseUrl}/groups/${this.encodedGroup()}/projects?include_archived=false&per_page=${PER_PAGE}`;
+        if (this.includeSubgroups) {
+            baseUrl += '&include_subgroups=true';
+        }
+
+        const repos: GitRepo[] = [];
+        let page = 1;
+
+        while (true) {
+            const res = await fetchGitLab(`${baseUrl}&page=${page}`, this.authHeaders);
+            const projects = (await res.json()) as RawProject[];
+
+            for (const p of projects) {
+                if (p.archived) continue;
+                if (!this.shouldInclude(p.path_with_namespace)) continue;
+                repos.push({
+                    id: String(p.id),
+                    name: p.path_with_namespace,
+                    fullName: p.path_with_namespace,
+                    defaultBranch: p.default_branch ?? 'main',
+                    isArchived: false,
+                });
+            }
+
+            const nextPage = res.headers.get('x-next-page');
+            if (!nextPage || nextPage === '') break;
+            page = parseInt(nextPage, 10);
+        }
+
+        return repos;
+    }
+
+    async getCommits(repo: string, since: string, until: string): Promise<GitCommit[]> {
+        const params = new URLSearchParams({per_page: String(PER_PAGE)});
+        if (since) params.set('since', since);
+        if (until) params.set('until', until);
+
+        const raw: RawCommit[] = [];
+        let page = 1;
+
+        while (true) {
+            params.set('page', String(page));
+            const url = `${this.baseUrl}/projects/${this.projectPath(repo)}/repository/commits?${params.toString()}`;
+            const res = await fetchGitLab(url, this.authHeaders);
+            const data = (await res.json()) as RawCommit[];
+            raw.push(...data);
+
+            const nextPage = res.headers.get('x-next-page');
+            if (!nextPage || nextPage === '') break;
+            page = parseInt(nextPage, 10);
+        }
+
+        const commits: GitCommit[] = [];
+        let lastDiffError: Error | null = null;
+        for (const c of raw) {
+            let diffs: GitFileDiff[] = [];
+            try {
+                diffs = await this.getCommitDiff(repo, c.id);
+            } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                if (!msg.includes(' 404:')) {
+                    lastDiffError = err instanceof Error ? err : new Error(msg);
+                    throw lastDiffError;
+                }
+            }
+
+            commits.push({
+                sha: c.id,
+                author: {
+                    name: c.author_name,
+                    email: c.author_email,
+                    username: '',
+                },
+                date: c.authored_date,
+                message: c.message,
+                additions: diffs.reduce((s, d) => s + d.additions, 0),
+                deletions: diffs.reduce((s, d) => s + d.deletions, 0),
+                filesChanged: diffs.map((d) => d.path),
+            });
+        }
+
+        return commits;
+    }
+
+    async getPullRequests(repo: string, state: string, since: string): Promise<GitPR[]> {
+        let glState: string;
+        switch (state) {
+            case 'open':
+                glState = 'opened';
+                break;
+            case 'merged':
+                glState = 'merged';
+                break;
+            case 'closed':
+                glState = 'closed';
+                break;
+            default:
+                glState = 'all';
+                break;
+        }
+
+        const params = new URLSearchParams({
+            per_page: String(PER_PAGE),
+            order_by: 'updated_at',
+            sort: 'desc',
+            state: glState,
+        });
+        if (since) params.set('updated_after', since);
+
+        const prs: GitPR[] = [];
+        let page = 1;
+
+        while (true) {
+            params.set('page', String(page));
+            const url = `${this.baseUrl}/projects/${this.projectPath(repo)}/merge_requests?${params.toString()}`;
+            const res = await fetchGitLab(url, this.authHeaders);
+            const data = (await res.json()) as RawMR[];
+
+            for (const mr of data) {
+                const normalizedState = normalizeMRState(mr.state);
+                const author: GitAuthor = {
+                    name: mr.author?.name ?? '',
+                    email: mr.author?.email ?? '',
+                    username: mr.author?.username ?? '',
+                };
+                const reviewers: GitAuthor[] = (mr.reviewers ?? []).map((r) => ({
+                    name: r.name,
+                    email: r.email ?? '',
+                    username: r.username,
+                }));
+
+                prs.push({
+                    id: String(mr.iid),
+                    title: mr.title,
+                    author,
+                    state: normalizedState,
+                    createdAt: mr.created_at,
+                    mergedAt: mr.merged_at,
+                    closedAt: mr.closed_at,
+                    reviewers,
+                    additions: 0,
+                    deletions: 0,
+                });
+            }
+
+            const nextPage = res.headers.get('x-next-page');
+            if (!nextPage || nextPage === '') break;
+            page = parseInt(nextPage, 10);
+        }
+
+        return prs;
+    }
+
+    async getReviewComments(repo: string, prId: string): Promise<GitReviewComment[]> {
+        const notes: RawNote[] = [];
+        let page = 1;
+
+        while (true) {
+            const url = `${this.baseUrl}/projects/${this.projectPath(repo)}/merge_requests/${prId}/notes?per_page=${PER_PAGE}&page=${page}`;
+            const res = await fetchGitLab(url, this.authHeaders);
+            const data = (await res.json()) as RawNote[];
+            notes.push(...data);
+
+            const nextPage = res.headers.get('x-next-page');
+            if (!nextPage || nextPage === '') break;
+            page = parseInt(nextPage, 10);
+        }
+
+        return notes
+            .filter((n) => n.type === 'DiffNote' && !n.system)
+            .map((n) => ({
+                author: {
+                    name: n.author?.name ?? '',
+                    email: n.author?.email ?? '',
+                    username: n.author?.username ?? '',
+                },
+                body: n.body,
+                createdAt: n.created_at,
+                prId,
+            }));
+    }
+
+    async getCommitDiff(repo: string, commitSha: string): Promise<GitFileDiff[]> {
+        const diffs: RawDiffEntry[] = [];
+        let page = 1;
+
+        while (true) {
+            const url = `${this.baseUrl}/projects/${this.projectPath(repo)}/repository/commits/${commitSha}/diff?per_page=${PER_PAGE}&page=${page}`;
+            const res = await fetchGitLab(url, this.authHeaders);
+            const data = (await res.json()) as RawDiffEntry[];
+            diffs.push(...data);
+
+            const nextPage = res.headers.get('x-next-page');
+            if (!nextPage || nextPage === '') break;
+            page = parseInt(nextPage, 10);
+        }
+
+        return diffs.map((e) => {
+            const {additions, deletions} = parseDiffHunks(e.diff ?? '');
+            let status: string;
+            if (e.new_file) {
+                status = 'added';
+            } else if (e.deleted_file) {
+                status = 'deleted';
+            } else if (e.renamed_file) {
+                status = 'renamed';
+            } else {
+                status = 'modified';
+            }
+            return {
+                path: e.new_path || e.old_path,
+                additions,
+                deletions,
+                status,
+            };
+        });
+    }
+}

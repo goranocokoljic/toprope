@@ -117,6 +117,24 @@ describe('createGitProvider', () => {
                 }),
             ).toThrow('GitLab provider requires auth.token');
         });
+
+        it('creates with oauth auth', () => {
+            const provider = createGitProvider({
+                type: 'gitlab',
+                group: 'grp',
+                auth: {type: 'oauth', token: 'oauth-tok'},
+            });
+            expect(provider.name).toBe('gitlab');
+        });
+
+        it('creates with job_token auth', () => {
+            const provider = createGitProvider({
+                type: 'gitlab',
+                group: 'grp',
+                auth: {type: 'job_token', token: 'job-tok'},
+            });
+            expect(provider.name).toBe('gitlab');
+        });
     });
 
     describe('invalid provider type', () => {
@@ -146,9 +164,13 @@ describe('createGitProvider', () => {
             expect(typeof provider.getCommitDiff).toBe('function');
         });
 
-        it('gitlab provider listRepos returns a rejected Promise', async () => {
+        it('gitlab provider exposes all required GitProvider methods', () => {
             const provider = createGitProvider(validGitLab);
-            await expect(provider.listRepos()).rejects.toThrow('gitlab provider not yet implemented');
+            expect(typeof provider.listRepos).toBe('function');
+            expect(typeof provider.getCommits).toBe('function');
+            expect(typeof provider.getPullRequests).toBe('function');
+            expect(typeof provider.getReviewComments).toBe('function');
+            expect(typeof provider.getCommitDiff).toBe('function');
         });
     });
 });

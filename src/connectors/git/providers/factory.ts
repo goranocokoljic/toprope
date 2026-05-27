@@ -5,38 +5,10 @@ import type {
     BitbucketProviderConfig,
     BitbucketAppPasswordAuth,
     GitLabProviderConfig,
-    GitRepo,
-    GitCommit,
-    GitPR,
-    GitReviewComment,
-    GitFileDiff,
 } from './types.js';
 import {GitHubProvider} from './github.js';
 import {BitbucketProvider} from './bitbucket.js';
-
-class NotImplementedProvider {
-    constructor(public readonly name: GitProvider['name']) {}
-
-    listRepos(): Promise<GitRepo[]> {
-        return Promise.reject(new Error(`${this.name} provider not yet implemented`));
-    }
-
-    getCommits(): Promise<GitCommit[]> {
-        return Promise.reject(new Error(`${this.name} provider not yet implemented`));
-    }
-
-    getPullRequests(): Promise<GitPR[]> {
-        return Promise.reject(new Error(`${this.name} provider not yet implemented`));
-    }
-
-    getReviewComments(): Promise<GitReviewComment[]> {
-        return Promise.reject(new Error(`${this.name} provider not yet implemented`));
-    }
-
-    getCommitDiff(): Promise<GitFileDiff[]> {
-        return Promise.reject(new Error(`${this.name} provider not yet implemented`));
-    }
-}
+import {GitLabProvider} from './gitlab.js';
 
 function validateGitHub(config: GitHubProviderConfig): void {
     if (!config.org) {
@@ -83,7 +55,7 @@ export function createGitProvider(config: GitProviderConfig): GitProvider {
             return new BitbucketProvider(config);
         case 'gitlab':
             validateGitLab(config);
-            return new NotImplementedProvider('gitlab');
+            return new GitLabProvider(config);
         default: {
             const exhaustive: never = config;
             throw new Error(
