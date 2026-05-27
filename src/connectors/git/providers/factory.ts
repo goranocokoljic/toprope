@@ -5,38 +5,10 @@ import type {
     BitbucketProviderConfig,
     BitbucketAppPasswordAuth,
     GitLabProviderConfig,
-    GitRepo,
-    GitCommit,
-    GitPR,
-    GitReviewComment,
-    GitFileDiff,
 } from './types.js';
 import {GitHubProvider} from './github.js';
 import {BitbucketProvider} from './bitbucket.js';
-
-class NotImplementedProvider {
-    constructor(public readonly name: GitProvider['name']) {}
-
-    listRepos(): Promise<GitRepo[]> {
-        return Promise.reject(new Error(`${this.name} provider not yet implemented`));
-    }
-
-    getCommits(): Promise<GitCommit[]> {
-        return Promise.reject(new Error(`${this.name} provider not yet implemented`));
-    }
-
-    getPullRequests(): Promise<GitPR[]> {
-        return Promise.reject(new Error(`${this.name} provider not yet implemented`));
-    }
-
-    getReviewComments(): Promise<GitReviewComment[]> {
-        return Promise.reject(new Error(`${this.name} provider not yet implemented`));
-    }
-
-    getCommitDiff(): Promise<GitFileDiff[]> {
-        return Promise.reject(new Error(`${this.name} provider not yet implemented`));
-    }
-}
+import {GitLabProvider} from './gitlab.js';
 
 function validateGitHub(config: GitHubProviderConfig): void {
     if (!config.org) {
@@ -71,6 +43,17 @@ function validateGitLab(config: GitLabProviderConfig): void {
     if (!config.auth?.token) {
         throw new Error('GitLab provider requires auth.token');
     }
+    if (config.url !== undefined) {
+        let parsed: URL;
+        try {
+            parsed = new URL(config.url);
+        } catch {
+            throw new Error('GitLab provider url must be a valid URL');
+        }
+        if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+            throw new Error('GitLab provider url must use http or https scheme');
+        }
+    }
 }
 
 export function createGitProvider(config: GitProviderConfig): GitProvider {
@@ -83,7 +66,7 @@ export function createGitProvider(config: GitProviderConfig): GitProvider {
             return new BitbucketProvider(config);
         case 'gitlab':
             validateGitLab(config);
-            return new NotImplementedProvider('gitlab');
+            return new GitLabProvider(config);
         default: {
             const exhaustive: never = config;
             throw new Error(
