@@ -425,6 +425,39 @@ describe('BitbucketProvider', () => {
 
             expect(commits).toEqual([]);
         });
+
+        it('still returns commits when diffstat endpoint returns 404 (merge commits)', async () => {
+            const hash = 'abc123';
+            let callCount = 0;
+            vi.stubGlobal('fetch', vi.fn().mockImplementation(() => {
+                callCount++;
+                if (callCount === 1) {
+                    return Promise.resolve({
+                        ok: true,
+                        status: 200,
+                        headers: new Headers(),
+                        json: () => Promise.resolve(pagedResponse([makeCommitFixture(hash)])),
+                        text: () => Promise.resolve(''),
+                    } as unknown as Response);
+                }
+                // diffstat returns 404 (e.g. merge commit)
+                return Promise.resolve({
+                    ok: false,
+                    status: 404,
+                    headers: new Headers(),
+                    json: () => Promise.resolve({}),
+                    text: () => Promise.resolve('not found'),
+                } as unknown as Response);
+            }));
+
+            const commits = await provider.getCommits('my-repo', '2024-01-01T00:00:00Z', '2024-01-31T23:59:59Z');
+
+            expect(commits).toHaveLength(1);
+            expect(commits[0].sha).toBe(hash);
+            expect(commits[0].additions).toBe(0);
+            expect(commits[0].deletions).toBe(0);
+            expect(commits[0].filesChanged).toEqual([]);
+        });
     });
 
     // --- getPullRequests ---
@@ -527,6 +560,16 @@ describe('BitbucketProvider', () => {
             const prs = await provider.getPullRequests('my-repo', 'all', '2024-01-01T00:00:00Z');
 
             expect(prs).toEqual([]);
+        });
+
+        it('requests sort=-updated_on to ensure consistent cutoff across all states', async () => {
+            const fetchMock = makeFetchMock([{body: pagedResponse([])}]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            await provider.getPullRequests('my-repo', 'all', '2024-01-01T00:00:00Z');
+
+            const [url] = fetchMock.mock.calls[0] as [string];
+            expect(url).toContain('sort=-updated_on');
         });
 
         it('handles PR with null author', async () => {

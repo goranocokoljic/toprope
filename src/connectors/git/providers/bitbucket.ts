@@ -261,7 +261,12 @@ export class BitbucketProvider implements GitProvider {
         for (const raw of collected) {
             const {name, email} = parseRawAuthor(raw.author.raw);
             const username = raw.author.user?.nickname ?? raw.author.user?.account_id ?? '';
-            const diffs = await this.getCommitDiff(repo, raw.hash);
+            let diffs: GitFileDiff[] = [];
+            try {
+                diffs = await this.getCommitDiff(repo, raw.hash);
+            } catch {
+                // diffstat unavailable for this commit (e.g. merge commits); record with zero stats
+            }
             commits.push({
                 sha: raw.hash,
                 author: {name, email, username},
@@ -283,7 +288,7 @@ export class BitbucketProvider implements GitProvider {
         const prs: GitPR[] = [];
 
         let nextUrl: string | null =
-            `${BASE_URL}/repositories/${this.workspace}/${repo}/pullrequests?pagelen=50&${stateParams}`;
+            `${BASE_URL}/repositories/${this.workspace}/${repo}/pullrequests?pagelen=50&sort=-updated_on&${stateParams}`;
 
         while (nextUrl) {
             const res = await fetchBitbucket(nextUrl, this.authHeaders);
