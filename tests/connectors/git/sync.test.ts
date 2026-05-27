@@ -96,6 +96,7 @@ function makeMockProvider(overrides: Partial<GitProvider> = {}): GitProvider {
         getPullRequests: vi.fn().mockResolvedValue([]),
         getReviewComments: vi.fn().mockResolvedValue([]),
         getCommitDiff: vi.fn().mockResolvedValue([]),
+        checkAccess: vi.fn().mockResolvedValue(undefined),
         ...overrides,
     };
 }

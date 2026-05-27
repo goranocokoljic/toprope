@@ -87,13 +87,24 @@ export function getDeveloperById(db: Database.Database, id: string): Developer |
     return row ? rowToDeveloper(row) : null;
 }
 
-export function findByGithubUsername(db: Database.Database, github: string): Developer | null {
+// Find a developer whose external_ids[provider] equals value. Used to prevent
+// two developers from sharing a git-attribution identity (which would make
+// commit attribution ambiguous).
+export function findByExternalId(
+    db: Database.Database,
+    provider: 'github' | 'bitbucket' | 'gitlab',
+    value: string,
+): Developer | null {
     const rows = db.prepare('SELECT * FROM developers').all() as DeveloperRow[];
     for (const row of rows) {
         const ext = parseExternalIds(row.external_ids);
-        if (ext.github === github) return rowToDeveloper(row);
+        if (ext[provider] === value) return rowToDeveloper(row);
     }
     return null;
+}
+
+export function findByGithubUsername(db: Database.Database, github: string): Developer | null {
+    return findByExternalId(db, 'github', github);
 }
 
 export interface LinkUpdates {

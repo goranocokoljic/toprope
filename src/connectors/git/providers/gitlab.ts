@@ -193,6 +193,13 @@ export class GitLabProvider implements GitProvider {
         return encodeURIComponent(repo);
     }
 
+    async checkAccess(): Promise<void> {
+        await fetchGitLab(
+            `${this.baseUrl}/groups/${encodeURIComponent(this.group)}/projects?per_page=1`,
+            this.authHeaders,
+        );
+    }
+
     async listRepos(): Promise<GitRepo[]> {
         // the name is path_with_namespace (e.g. "group/repo") rather than the short slug so that
         // getCommits/getPullRequests etc. can URL-encode the full path and reach subgroup projects.

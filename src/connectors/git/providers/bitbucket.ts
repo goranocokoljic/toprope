@@ -216,6 +216,13 @@ export class BitbucketProvider implements GitProvider {
         return results;
     }
 
+    async checkAccess(): Promise<void> {
+        await fetchBitbucket(
+            `${BASE_URL}/repositories/${this.workspace}?role=member&pagelen=1`,
+            this.authHeaders,
+        );
+    }
+
     async listRepos(): Promise<GitRepo[]> {
         const repos = await this.fetchPaged<RawRepo>(
             `${BASE_URL}/repositories/${this.workspace}?role=member&pagelen=100`,

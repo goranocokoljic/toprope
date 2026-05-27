@@ -337,8 +337,8 @@ async function checkOneGitProvider(pc: GitProviderConfig): Promise<CheckResult> 
         return fail(label, msg, gitProviderFixHint(pc.type));
     }
     try {
-        const repos = await provider.listRepos();
-        return pass(label, `${gitProviderIdentifier(pc)} reachable (${repos.length} repo(s))`);
+        await provider.checkAccess();
+        return pass(label, `${gitProviderIdentifier(pc)} reachable`);
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return fail(label, msg, gitProviderFixHint(pc.type, msg));

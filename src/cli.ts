@@ -7,7 +7,7 @@ import {runMigrations, getMigrationStatus} from './storage/migrator';
 import {printStatus} from './cli/status';
 import {runDoctor} from './cli/doctor';
 import {addTeam, listTeams, teamExists} from './registry/teams';
-import {addDeveloper, listDevelopers, getDeveloperById, linkDeveloper, findByGithubUsername} from './registry/developers';
+import {addDeveloper, listDevelopers, getDeveloperById, linkDeveloper, findByExternalId} from './registry/developers';
 import {discoverOrgMembers} from './registry/discovery';
 import {seedTeamsFromConfig} from './registry/config-seeder';
 import {CopilotSync} from './connectors/copilot/sync';
@@ -214,11 +214,17 @@ devCommand
                     console.error(`Error: team '${options.team}' does not exist.`);
                     process.exit(1);
                 }
-                if (options.github) {
-                    const duplicate = findByGithubUsername(db, options.github);
+                const idChecks: Array<{provider: 'github' | 'bitbucket' | 'gitlab'; value?: string}> = [
+                    {provider: 'github', value: options.github},
+                    {provider: 'bitbucket', value: options.bitbucket},
+                    {provider: 'gitlab', value: options.gitlab},
+                ];
+                for (const {provider, value} of idChecks) {
+                    if (!value) continue;
+                    const duplicate = findByExternalId(db, provider, value);
                     if (duplicate) {
                         console.warn(
-                            `Warning: developer with GitHub username '${options.github}' already exists (id: ${duplicate.id}, name: ${duplicate.name}).`,
+                            `Warning: developer with ${provider} identity '${value}' already exists (id: ${duplicate.id}, name: ${duplicate.name}).`,
                         );
                         return;
                     }
@@ -306,6 +312,21 @@ devCommand
                         'Error: at least one of --copilot, --claude, --windsurf, --github, --bitbucket, --gitlab, or --git-email must be provided.',
                     );
                     process.exit(1);
+                }
+                const conflictChecks: Array<{provider: 'github' | 'bitbucket' | 'gitlab'; value?: string}> = [
+                    {provider: 'github', value: options.github},
+                    {provider: 'bitbucket', value: options.bitbucket},
+                    {provider: 'gitlab', value: options.gitlab},
+                ];
+                for (const {provider, value} of conflictChecks) {
+                    if (!value) continue;
+                    const conflict = findByExternalId(db, provider, value);
+                    if (conflict && conflict.id !== options.id) {
+                        console.error(
+                            `Error: ${provider} identity '${value}' is already linked to developer '${conflict.name}' (id: ${conflict.id}).`,
+                        );
+                        process.exit(1);
+                    }
                 }
                 const dev = linkDeveloper(db, options.id, {
                     copilot: options.copilot,

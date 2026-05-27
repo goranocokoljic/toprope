@@ -9,6 +9,7 @@ import {
     getDeveloperById,
     linkDeveloper,
     findByGithubUsername,
+    findByExternalId,
 } from '../../src/registry/developers';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../src/storage/migrations');
@@ -244,6 +245,34 @@ describe('linkDeveloper', () => {
         linkDeveloper(db, dev.id, {gitEmails: ['Alice@Personal.com', 'alice@work.com']});
         const updated = getDeveloperById(db, dev.id);
         expect(updated!.external_ids.git_emails).toBe('alice@work.com,alice@personal.com');
+    });
+});
+
+describe('findByExternalId', () => {
+    let db: Database.Database;
+
+    beforeEach(() => {
+        db = makeDb();
+        seedTeam(db);
+    });
+
+    afterEach(() => {
+        db.close();
+    });
+
+    it('finds a developer by bitbucket and gitlab identity', () => {
+        addDeveloper(db, 'Alice', 'frontend', undefined, undefined, {
+            bitbucket: 'alice-bb',
+            gitlab: 'alice-gl',
+        });
+        expect(findByExternalId(db, 'bitbucket', 'alice-bb')!.name).toBe('Alice');
+        expect(findByExternalId(db, 'gitlab', 'alice-gl')!.name).toBe('Alice');
+    });
+
+    it('returns null when no developer has that identity', () => {
+        addDeveloper(db, 'Alice', 'frontend', undefined, undefined, {bitbucket: 'alice-bb'});
+        expect(findByExternalId(db, 'bitbucket', 'someone-else')).toBeNull();
+        expect(findByExternalId(db, 'gitlab', 'alice-bb')).toBeNull();
     });
 });
 
