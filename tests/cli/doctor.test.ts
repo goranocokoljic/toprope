@@ -4,8 +4,9 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import {runMigrations} from '../../src/storage/migrator';
-import {runDoctor} from '../../src/cli/doctor';
+import {runDoctor, exactConfiguredRepos, findMissingRepos} from '../../src/cli/doctor';
 import type {GovProxyConfig} from '../../src/config/types';
+import type {GitProviderConfig} from '../../src/connectors/git/providers/types';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../src/storage/migrations');
 
@@ -251,5 +252,36 @@ describe('runDoctor', () => {
     it('returns true when all connectors disabled and config valid', async () => {
         const result = await runDoctor(db, disabledConfig(), tmpConfigPath, MIGRATIONS_DIR);
         expect(result).toBe(true);
+    });
+});
+
+describe('configured repo verification helpers', () => {
+    function bitbucket(repos?: string[]): GitProviderConfig {
+        return {
+            type: 'bitbucket',
+            workspace: 'ws',
+            auth: {type: 'app_password', username: 'u', app_password: 'p'},
+            repos,
+        };
+    }
+
+    it('extracts exact include slugs, skipping globs and exclude entries', () => {
+        expect(exactConfiguredRepos(bitbucket(['a', 'team-*', 'include:b', 'exclude:c']))).toEqual([
+            'a',
+            'b',
+        ]);
+    });
+
+    it('returns empty when no repos configured', () => {
+        expect(exactConfiguredRepos(bitbucket())).toEqual([]);
+        expect(findMissingRepos([], ['anything'])).toEqual([]);
+    });
+
+    it('flags configured slugs absent from the repo list', () => {
+        expect(findMissingRepos(['good', 'typo'], ['good', 'other'])).toEqual(['typo']);
+    });
+
+    it('matches a short slug against a namespaced repo name (GitLab)', () => {
+        expect(findMissingRepos(['myrepo'], ['group/myrepo'])).toEqual([]);
     });
 });

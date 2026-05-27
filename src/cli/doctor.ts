@@ -327,6 +327,29 @@ function gitProviderFixHint(type: GitProviderConfig['type'], message?: string): 
     }
 }
 
+// Exact (non-glob) repo slugs configured as includes for a provider. Glob
+// patterns and `exclude:` entries are skipped — only literal slugs can be
+// verified to exist.
+export function exactConfiguredRepos(pc: GitProviderConfig): string[] {
+    const exact: string[] = [];
+    for (const entry of pc.repos ?? []) {
+        if (entry.startsWith('exclude:')) continue;
+        const pattern = entry.startsWith('include:') ? entry.slice('include:'.length) : entry;
+        if (pattern && !pattern.includes('*') && !pattern.includes('?')) exact.push(pattern);
+    }
+    return exact;
+}
+
+// Configured slugs that don't appear in the provider's repo list. Matches a
+// slug against the full name and the last path segment so GitLab short names
+// (e.g. "repo" vs "group/repo") are handled.
+export function findMissingRepos(configured: string[], repoNames: string[]): string[] {
+    if (configured.length === 0) return [];
+    const names = new Set(repoNames);
+    const shortNames = new Set(repoNames.map((n) => n.split('/').pop() ?? n));
+    return configured.filter((slug) => !names.has(slug) && !shortNames.has(slug));
+}
+
 async function checkOneGitProvider(pc: GitProviderConfig): Promise<CheckResult> {
     const label = `Git: ${pc.type}`;
     let provider: GitProvider;
@@ -338,11 +361,36 @@ async function checkOneGitProvider(pc: GitProviderConfig): Promise<CheckResult> 
     }
     try {
         await provider.checkAccess();
-        return pass(label, `${gitProviderIdentifier(pc)} reachable`);
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return fail(label, msg, gitProviderFixHint(pc.type, msg));
     }
+
+    // Only enumerate repos when an explicit slug list is configured — then we
+    // can confirm the slugs exist (a typo'd slug otherwise syncs nothing).
+    // With no list (monitor-all), the cheap checkAccess() probe is enough.
+    const configured = exactConfiguredRepos(pc);
+    if (configured.length === 0) {
+        return pass(label, `${gitProviderIdentifier(pc)} reachable`);
+    }
+
+    let repoNames: string[];
+    try {
+        repoNames = (await provider.listRepos()).map((r) => r.name);
+    } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return fail(label, msg, gitProviderFixHint(pc.type, msg));
+    }
+
+    const missing = findMissingRepos(configured, repoNames);
+    if (missing.length > 0) {
+        return fail(
+            label,
+            `${gitProviderIdentifier(pc)} reachable, but configured repo(s) not found: ${missing.join(', ')}`,
+            `Check the configured repo slug(s) — they must match repositories in ${gitProviderIdentifier(pc)}.`,
+        );
+    }
+    return pass(label, `${gitProviderIdentifier(pc)} reachable (${configured.length} configured repo(s) verified)`);
 }
 
 async function checkGitProviders(config: GovProxyConfig): Promise<CheckResult[]> {
