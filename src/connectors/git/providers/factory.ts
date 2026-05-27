@@ -11,6 +11,7 @@ import type {
     GitReviewComment,
     GitFileDiff,
 } from './types.js';
+import {GitHubProvider} from './github.js';
 
 class NotImplementedProvider {
     constructor(public readonly name: GitProvider['name']) {}
@@ -75,7 +76,7 @@ export function createGitProvider(config: GitProviderConfig): GitProvider {
     switch (config.type) {
         case 'github':
             validateGitHub(config);
-            return new NotImplementedProvider('github');
+            return new GitHubProvider(config);
         case 'bitbucket':
             validateBitbucket(config);
             return new NotImplementedProvider('bitbucket');
