@@ -12,6 +12,7 @@ import type {
     GitFileDiff,
 } from './types.js';
 import {GitHubProvider} from './github.js';
+import {BitbucketProvider} from './bitbucket.js';
 
 class NotImplementedProvider {
     constructor(public readonly name: GitProvider['name']) {}
@@ -79,7 +80,7 @@ export function createGitProvider(config: GitProviderConfig): GitProvider {
             return new GitHubProvider(config);
         case 'bitbucket':
             validateBitbucket(config);
-            return new NotImplementedProvider('bitbucket');
+            return new BitbucketProvider(config);
         case 'gitlab':
             validateGitLab(config);
             return new NotImplementedProvider('gitlab');
