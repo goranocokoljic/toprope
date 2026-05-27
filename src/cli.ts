@@ -7,7 +7,7 @@ import {runMigrations, getMigrationStatus} from './storage/migrator';
 import {printStatus} from './cli/status';
 import {runDoctor} from './cli/doctor';
 import {addTeam, listTeams, teamExists} from './registry/teams';
-import {addDeveloper, listDevelopers, getDeveloperById, linkDeveloper, findByGithubUsername} from './registry/developers';
+import {addDeveloper, listDevelopers, getDeveloperById, linkDeveloper, findByExternalId, findByEmail} from './registry/developers';
 import {discoverOrgMembers} from './registry/discovery';
 import {seedTeamsFromConfig} from './registry/config-seeder';
 import {CopilotSync} from './connectors/copilot/sync';
@@ -29,6 +29,11 @@ import {
     getWasteSummaryByTeam,
     resolveAlert,
 } from './expenses/waste-detector';
+
+// Commander option collector for repeatable flags (e.g. --git-email).
+function collectValue(value: string, previous: string[]): string[] {
+    return previous.concat([value]);
+}
 
 const program = new Command();
 
@@ -187,9 +192,21 @@ devCommand
     .requiredOption('--team <team>', 'Team name')
     .option('--email <email>', 'Email address')
     .option('--github <username>', 'GitHub username')
+    .option('--bitbucket <username>', 'Bitbucket username/nickname')
+    .option('--gitlab <username>', 'GitLab username')
+    .option('--git-email <email>', 'Additional git commit email (repeatable)', collectValue, [])
     .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
     .action(
-        (options: {name: string; team: string; email?: string; github?: string; config: string}) => {
+        (options: {
+            name: string;
+            team: string;
+            email?: string;
+            github?: string;
+            bitbucket?: string;
+            gitlab?: string;
+            gitEmail: string[];
+            config: string;
+        }) => {
             const configPath = path.resolve(process.cwd(), options.config);
             const db = openRegistryDb(configPath);
             try {
@@ -197,16 +214,38 @@ devCommand
                     console.error(`Error: team '${options.team}' does not exist.`);
                     process.exit(1);
                 }
-                if (options.github) {
-                    const duplicate = findByGithubUsername(db, options.github);
+                const idChecks: Array<{provider: 'github' | 'bitbucket' | 'gitlab'; value?: string}> = [
+                    {provider: 'github', value: options.github},
+                    {provider: 'bitbucket', value: options.bitbucket},
+                    {provider: 'gitlab', value: options.gitlab},
+                ];
+                for (const {provider, value} of idChecks) {
+                    if (!value) continue;
+                    const duplicate = findByExternalId(db, provider, value);
                     if (duplicate) {
                         console.warn(
-                            `Warning: developer with GitHub username '${options.github}' already exists (id: ${duplicate.id}, name: ${duplicate.name}).`,
+                            `Warning: developer with ${provider} identity '${value}' already exists (id: ${duplicate.id}, name: ${duplicate.name}).`,
                         );
                         return;
                     }
                 }
-                const dev = addDeveloper(db, options.name, options.team, options.email, options.github);
+                const emailChecks = [options.email, ...options.gitEmail].filter(
+                    (e): e is string => !!e,
+                );
+                for (const email of emailChecks) {
+                    const duplicate = findByEmail(db, email);
+                    if (duplicate) {
+                        console.warn(
+                            `Warning: developer with email '${email}' already exists (id: ${duplicate.id}, name: ${duplicate.name}).`,
+                        );
+                        return;
+                    }
+                }
+                const dev = addDeveloper(db, options.name, options.team, options.email, options.github, {
+                    bitbucket: options.bitbucket,
+                    gitlab: options.gitlab,
+                    gitEmails: options.gitEmail,
+                });
                 console.log(`Developer '${dev.name}' created with id: ${dev.id}`);
             } finally {
                 db.close();
@@ -232,8 +271,13 @@ devCommand
             console.log('─'.repeat(60));
             for (const d of devs) {
                 const email = d.email ? `  <${d.email}>` : '';
-                const gh = d.external_ids.github ? `  github: ${d.external_ids.github}` : '';
-                console.log(`  [${d.id}] ${d.name}${email}  team: ${d.team}${gh}`);
+                const ids: string[] = [];
+                if (d.external_ids.github) ids.push(`github: ${d.external_ids.github}`);
+                if (d.external_ids.bitbucket) ids.push(`bitbucket: ${d.external_ids.bitbucket}`);
+                if (d.external_ids.gitlab) ids.push(`gitlab: ${d.external_ids.gitlab}`);
+                if (d.external_ids.git_emails) ids.push(`git-emails: ${d.external_ids.git_emails}`);
+                const idStr = ids.length > 0 ? `  ${ids.join('  ')}` : '';
+                console.log(`  [${d.id}] ${d.name}${email}  team: ${d.team}${idStr}`);
             }
         } finally {
             db.close();
@@ -242,25 +286,77 @@ devCommand
 
 devCommand
     .command('link')
-    .description('Link developer to external tool identities')
+    .description('Link developer to external tool and git provider identities')
     .requiredOption('--id <dev-id>', 'Developer ID')
     .option('--copilot <username>', 'GitHub Copilot username')
     .option('--claude <email>', 'Claude Code email')
     .option('--windsurf <email>', 'Windsurf email')
+    .option('--github <username>', 'GitHub username')
+    .option('--bitbucket <username>', 'Bitbucket username/nickname')
+    .option('--gitlab <username>', 'GitLab username')
+    .option('--git-email <email>', 'Additional git commit email (repeatable)', collectValue, [])
     .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
     .action(
-        (options: {id: string; copilot?: string; claude?: string; windsurf?: string; config: string}) => {
+        (options: {
+            id: string;
+            copilot?: string;
+            claude?: string;
+            windsurf?: string;
+            github?: string;
+            bitbucket?: string;
+            gitlab?: string;
+            gitEmail: string[];
+            config: string;
+        }) => {
             const configPath = path.resolve(process.cwd(), options.config);
             const db = openRegistryDb(configPath);
             try {
-                if (!options.copilot && !options.claude && !options.windsurf) {
-                    console.error('Error: at least one of --copilot, --claude, or --windsurf must be provided.');
+                const hasUpdate =
+                    options.copilot ||
+                    options.claude ||
+                    options.windsurf ||
+                    options.github ||
+                    options.bitbucket ||
+                    options.gitlab ||
+                    options.gitEmail.length > 0;
+                if (!hasUpdate) {
+                    console.error(
+                        'Error: at least one of --copilot, --claude, --windsurf, --github, --bitbucket, --gitlab, or --git-email must be provided.',
+                    );
                     process.exit(1);
+                }
+                const conflictChecks: Array<{provider: 'github' | 'bitbucket' | 'gitlab'; value?: string}> = [
+                    {provider: 'github', value: options.github},
+                    {provider: 'bitbucket', value: options.bitbucket},
+                    {provider: 'gitlab', value: options.gitlab},
+                ];
+                for (const {provider, value} of conflictChecks) {
+                    if (!value) continue;
+                    const conflict = findByExternalId(db, provider, value);
+                    if (conflict && conflict.id !== options.id) {
+                        console.error(
+                            `Error: ${provider} identity '${value}' is already linked to developer '${conflict.name}' (id: ${conflict.id}).`,
+                        );
+                        process.exit(1);
+                    }
+                }
+                for (const email of options.gitEmail) {
+                    const conflict = findByEmail(db, email);
+                    if (conflict && conflict.id !== options.id) {
+                        console.error(
+                            `Error: email '${email}' is already linked to developer '${conflict.name}' (id: ${conflict.id}).`,
+                        );
+                        process.exit(1);
+                    }
                 }
                 const dev = linkDeveloper(db, options.id, {
                     copilot: options.copilot,
                     claude: options.claude,
                     windsurf: options.windsurf,
+                    github: options.github,
+                    bitbucket: options.bitbucket,
+                    gitlab: options.gitlab,
+                    gitEmails: options.gitEmail,
                 });
                 if (!dev) {
                     console.error(`Error: developer with id '${options.id}' not found.`);

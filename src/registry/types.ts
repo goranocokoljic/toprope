@@ -10,6 +10,11 @@ export interface ExternalIds {
     copilot?: string;
     claude?: string;
     windsurf?: string;
+    bitbucket?: string;
+    gitlab?: string;
+    // Comma-separated list of additional git commit emails used to match
+    // commits to this developer (beyond the primary `email` column).
+    git_emails?: string;
     [key: string]: string | undefined;
 }
 

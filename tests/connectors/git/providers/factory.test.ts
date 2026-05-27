@@ -179,6 +179,7 @@ describe('createGitProvider', () => {
             expect(typeof provider.getPullRequests).toBe('function');
             expect(typeof provider.getReviewComments).toBe('function');
             expect(typeof provider.getCommitDiff).toBe('function');
+            expect(typeof provider.checkAccess).toBe('function');
         });
 
         it('bitbucket provider exposes all required GitProvider methods', () => {
@@ -188,6 +189,7 @@ describe('createGitProvider', () => {
             expect(typeof provider.getPullRequests).toBe('function');
             expect(typeof provider.getReviewComments).toBe('function');
             expect(typeof provider.getCommitDiff).toBe('function');
+            expect(typeof provider.checkAccess).toBe('function');
         });
 
         it('gitlab provider exposes all required GitProvider methods', () => {
@@ -197,6 +199,7 @@ describe('createGitProvider', () => {
             expect(typeof provider.getPullRequests).toBe('function');
             expect(typeof provider.getReviewComments).toBe('function');
             expect(typeof provider.getCommitDiff).toBe('function');
+            expect(typeof provider.checkAccess).toBe('function');
         });
     });
 });

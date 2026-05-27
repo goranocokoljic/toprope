@@ -58,6 +58,10 @@ export interface GitProvider {
     getPullRequests(repo: string, state: string, since: string): Promise<GitPR[]>;
     getReviewComments(repo: string, prId: string): Promise<GitReviewComment[]>;
     getCommitDiff(repo: string, commitSha: string): Promise<GitFileDiff[]>;
+    // Cheap reachability/auth probe — fetches a single page, resolves on success
+    // and throws on auth/network failure. Used by `govproxy doctor` to validate
+    // a provider without enumerating every repo.
+    checkAccess(): Promise<void>;
 }
 
 // Provider-specific auth configs
