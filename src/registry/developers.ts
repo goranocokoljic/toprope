@@ -107,6 +107,25 @@ export function findByGithubUsername(db: Database.Database, github: string): Dev
     return findByExternalId(db, 'github', github);
 }
 
+// Find a developer who already owns a git commit email — either as their
+// primary `email` or in their `git_emails`. Matching is case-insensitive.
+// Used to keep an email from mapping to two developers (which would make
+// commit attribution ambiguous).
+export function findByEmail(db: Database.Database, email: string): Developer | null {
+    const target = email.trim().toLowerCase();
+    if (!target) return null;
+    const rows = db.prepare('SELECT * FROM developers').all() as DeveloperRow[];
+    for (const row of rows) {
+        const dev = rowToDeveloper(row);
+        if (dev.email && dev.email.toLowerCase() === target) return dev;
+        const gitEmails = dev.external_ids.git_emails;
+        if (gitEmails && gitEmails.split(',').some((e) => e.trim().toLowerCase() === target)) {
+            return dev;
+        }
+    }
+    return null;
+}
+
 export interface LinkUpdates {
     github?: string;
     copilot?: string;

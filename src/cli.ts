@@ -7,7 +7,7 @@ import {runMigrations, getMigrationStatus} from './storage/migrator';
 import {printStatus} from './cli/status';
 import {runDoctor} from './cli/doctor';
 import {addTeam, listTeams, teamExists} from './registry/teams';
-import {addDeveloper, listDevelopers, getDeveloperById, linkDeveloper, findByExternalId} from './registry/developers';
+import {addDeveloper, listDevelopers, getDeveloperById, linkDeveloper, findByExternalId, findByEmail} from './registry/developers';
 import {discoverOrgMembers} from './registry/discovery';
 import {seedTeamsFromConfig} from './registry/config-seeder';
 import {CopilotSync} from './connectors/copilot/sync';
@@ -229,6 +229,18 @@ devCommand
                         return;
                     }
                 }
+                const emailChecks = [options.email, ...options.gitEmail].filter(
+                    (e): e is string => !!e,
+                );
+                for (const email of emailChecks) {
+                    const duplicate = findByEmail(db, email);
+                    if (duplicate) {
+                        console.warn(
+                            `Warning: developer with email '${email}' already exists (id: ${duplicate.id}, name: ${duplicate.name}).`,
+                        );
+                        return;
+                    }
+                }
                 const dev = addDeveloper(db, options.name, options.team, options.email, options.github, {
                     bitbucket: options.bitbucket,
                     gitlab: options.gitlab,
@@ -324,6 +336,15 @@ devCommand
                     if (conflict && conflict.id !== options.id) {
                         console.error(
                             `Error: ${provider} identity '${value}' is already linked to developer '${conflict.name}' (id: ${conflict.id}).`,
+                        );
+                        process.exit(1);
+                    }
+                }
+                for (const email of options.gitEmail) {
+                    const conflict = findByEmail(db, email);
+                    if (conflict && conflict.id !== options.id) {
+                        console.error(
+                            `Error: email '${email}' is already linked to developer '${conflict.name}' (id: ${conflict.id}).`,
                         );
                         process.exit(1);
                     }

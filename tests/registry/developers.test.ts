@@ -10,6 +10,7 @@ import {
     linkDeveloper,
     findByGithubUsername,
     findByExternalId,
+    findByEmail,
 } from '../../src/registry/developers';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../src/storage/migrations');
@@ -273,6 +274,36 @@ describe('findByExternalId', () => {
         addDeveloper(db, 'Alice', 'frontend', undefined, undefined, {bitbucket: 'alice-bb'});
         expect(findByExternalId(db, 'bitbucket', 'someone-else')).toBeNull();
         expect(findByExternalId(db, 'gitlab', 'alice-bb')).toBeNull();
+    });
+});
+
+describe('findByEmail', () => {
+    let db: Database.Database;
+
+    beforeEach(() => {
+        db = makeDb();
+        seedTeam(db);
+    });
+
+    afterEach(() => {
+        db.close();
+    });
+
+    it('matches the primary email case-insensitively', () => {
+        addDeveloper(db, 'Alice', 'frontend', 'Alice@Example.com');
+        expect(findByEmail(db, 'alice@example.com')!.name).toBe('Alice');
+    });
+
+    it('matches a secondary git email', () => {
+        addDeveloper(db, 'Alice', 'frontend', 'alice@example.com', undefined, {
+            gitEmails: ['alice@work.com'],
+        });
+        expect(findByEmail(db, 'alice@work.com')!.name).toBe('Alice');
+    });
+
+    it('returns null when no developer owns the email', () => {
+        addDeveloper(db, 'Alice', 'frontend', 'alice@example.com');
+        expect(findByEmail(db, 'bob@example.com')).toBeNull();
     });
 });
 
