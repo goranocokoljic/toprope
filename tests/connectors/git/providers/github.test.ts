@@ -55,11 +55,10 @@ function makePRFixture(overrides: Record<string, unknown> = {}): Record<string, 
         user: {login: 'alice'},
         state: 'open',
         created_at: '2024-01-15T09:00:00Z',
+        updated_at: '2024-01-15T09:00:00Z',
         merged_at: null,
         closed_at: null,
         requested_reviewers: [{login: 'bob'}],
-        additions: 40,
-        deletions: 10,
         ...overrides,
     };
 }
@@ -277,7 +276,10 @@ describe('GitHubProvider', () => {
             expect(commits).toEqual([]);
         });
 
-        it('skips individual commit when detail fetch fails with non-retryable error', async () => {
+        it('surfaces error when all per-commit detail fetches fail (no partial success)', async () => {
+            // When every detail fetch fails (systemic error), getCommits throws rather
+            // than silently returning []. If some succeed and some fail, the successes
+            // are returned and the failing commits are individually skipped.
             const sha = 'abc123';
             let callCount = 0;
             vi.stubGlobal('fetch', vi.fn().mockImplementation(() => {
@@ -291,7 +293,46 @@ describe('GitHubProvider', () => {
                         text: () => Promise.resolve(''),
                     } as unknown as Response);
                 }
-                // 404 is non-retryable — fetchGitHub throws immediately
+                return Promise.resolve({
+                    ok: false,
+                    status: 404,
+                    headers: new Headers(),
+                    text: () => Promise.resolve('not found'),
+                } as unknown as Response);
+            }));
+
+            await expect(
+                provider.getCommits('my-repo', '2024-01-01T00:00:00Z', '2024-01-31T23:59:59Z'),
+            ).rejects.toThrow('GitHub API error 404');
+        });
+
+        it('skips individual failing commits when some succeed', async () => {
+            const sha1 = 'aaa111';
+            const sha2 = 'bbb222';
+            let callCount = 0;
+            vi.stubGlobal('fetch', vi.fn().mockImplementation(() => {
+                callCount++;
+                if (callCount === 1) {
+                    // Commit list with two entries
+                    return Promise.resolve({
+                        ok: true,
+                        status: 200,
+                        headers: new Headers(),
+                        json: () => Promise.resolve([makeCommitListFixture(sha1), makeCommitListFixture(sha2)]),
+                        text: () => Promise.resolve(''),
+                    } as unknown as Response);
+                }
+                if (callCount === 2) {
+                    // First detail succeeds
+                    return Promise.resolve({
+                        ok: true,
+                        status: 200,
+                        headers: new Headers(),
+                        json: () => Promise.resolve(makeCommitDetailFixture(sha1)),
+                        text: () => Promise.resolve(''),
+                    } as unknown as Response);
+                }
+                // Second detail fails — but first succeeded, so no throw
                 return Promise.resolve({
                     ok: false,
                     status: 404,
@@ -302,7 +343,36 @@ describe('GitHubProvider', () => {
 
             const commits = await provider.getCommits('my-repo', '2024-01-01T00:00:00Z', '2024-01-31T23:59:59Z');
 
-            expect(commits).toEqual([]);
+            // sha1 succeeded, sha2 was silently skipped
+            expect(commits).toHaveLength(1);
+            expect(commits[0].sha).toBe(sha1);
+        });
+
+        it('throws when all per-commit detail fetches fail (systemic error)', async () => {
+            const sha = 'abc123';
+            let callCount = 0;
+            vi.stubGlobal('fetch', vi.fn().mockImplementation(() => {
+                callCount++;
+                if (callCount === 1) {
+                    return Promise.resolve({
+                        ok: true,
+                        status: 200,
+                        headers: new Headers(),
+                        json: () => Promise.resolve([makeCommitListFixture(sha)]),
+                        text: () => Promise.resolve(''),
+                    } as unknown as Response);
+                }
+                return Promise.resolve({
+                    ok: false,
+                    status: 401,
+                    headers: new Headers(),
+                    text: () => Promise.resolve('unauthorized'),
+                } as unknown as Response);
+            }));
+
+            await expect(
+                provider.getCommits('my-repo', '2024-01-01T00:00:00Z', '2024-01-31T23:59:59Z'),
+            ).rejects.toThrow('GitHub API error 401');
         });
 
         it('extracts username from author login even when commit author differs', async () => {
@@ -350,8 +420,9 @@ describe('GitHubProvider', () => {
                 mergedAt: null,
                 closedAt: null,
                 reviewers: [{name: '', email: '', username: 'bob'}],
-                additions: 40,
-                deletions: 10,
+                // additions/deletions are not returned by the PR list endpoint
+                additions: 0,
+                deletions: 0,
             });
         });
 
@@ -384,22 +455,33 @@ describe('GitHubProvider', () => {
             expect(prs[0].state).toBe('closed');
         });
 
-        it('stops pagination when PRs older than since are found', async () => {
-            const oldPR = makePRFixture({
+        it('stops pagination when PR updated_at is before since (correct cutoff field)', async () => {
+            // The list is sorted by updated_at desc, so the cutoff must use updated_at,
+            // not created_at — a PR created before since but updated after since should
+            // NOT trigger early termination.
+            const recentlyUpdatedOldPR = makePRFixture({
                 number: 1,
-                created_at: '2023-06-01T00:00:00Z', // older than since
+                created_at: '2023-06-01T00:00:00Z', // old creation date
+                updated_at: '2024-02-01T00:00:00Z', // updated after since → keep
             });
-            const fetchMock = makeFetchMock([{body: [oldPR]}]);
+            const trulyOldPR = makePRFixture({
+                number: 2,
+                created_at: '2023-01-01T00:00:00Z',
+                updated_at: '2023-06-01T00:00:00Z', // updated before since → stop
+            });
+            const fetchMock = makeFetchMock([{body: [recentlyUpdatedOldPR, trulyOldPR]}]);
             vi.stubGlobal('fetch', fetchMock);
 
             const prs = await provider.getPullRequests('my-repo', 'all', '2024-01-01T00:00:00Z');
 
-            expect(prs).toEqual([]);
+            // Only the PR with updated_at >= since should be returned
+            expect(prs).toHaveLength(1);
+            expect(prs[0].id).toBe('1');
         });
 
         it('follows Link header pagination', async () => {
-            const pr1 = makePRFixture({number: 1, created_at: '2024-01-20T00:00:00Z'});
-            const pr2 = makePRFixture({number: 2, created_at: '2024-01-18T00:00:00Z'});
+            const pr1 = makePRFixture({number: 1, created_at: '2024-01-20T00:00:00Z', updated_at: '2024-01-20T00:00:00Z'});
+            const pr2 = makePRFixture({number: 2, created_at: '2024-01-18T00:00:00Z', updated_at: '2024-01-18T00:00:00Z'});
             const fetchMock = makeFetchMock([
                 {
                     body: [pr1],

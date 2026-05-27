@@ -63,8 +63,18 @@ async function fetchGitHub(url: string, headers: Record<string, string>): Promis
         if (res.status === 403) {
             const remaining = res.headers.get('x-ratelimit-remaining');
             const reset = res.headers.get('x-ratelimit-reset');
+            const retryAfter403 = res.headers.get('retry-after');
+            // Primary rate limit: x-ratelimit-remaining=0 with reset time
             if (remaining === '0' && reset) {
                 const delayMs = Math.max(parseInt(reset, 10) * 1_000 - Date.now(), 0) + 1_000;
+                if (attempt < MAX_RETRIES) {
+                    await sleep(delayMs);
+                    attempt++;
+                    continue;
+                }
+            // Secondary rate limit (abuse detection): Retry-After present, no ratelimit headers
+            } else if (retryAfter403) {
+                const delayMs = parseFloat(retryAfter403) * 1_000;
                 if (attempt < MAX_RETRIES) {
                     await sleep(delayMs);
                     attempt++;
@@ -137,11 +147,11 @@ interface RawPR {
     user: {login: string} | null;
     state: string;
     created_at: string;
+    updated_at: string;
     merged_at: string | null;
     closed_at: string | null;
     requested_reviewers: Array<{login: string}>;
-    additions: number;
-    deletions: number;
+    // additions/deletions are NOT in the PR list response; only on the individual PR endpoint
 }
 
 interface RawReviewComment {
@@ -222,6 +232,7 @@ export class GitHubProvider implements GitProvider {
         }
 
         const commits: GitCommit[] = [];
+        let lastDetailError: Error | null = null;
         for (const summary of summaries) {
             try {
                 const detailRes = await fetchGitHub(
@@ -244,9 +255,15 @@ export class GitHubProvider implements GitProvider {
                     deletions: detail.stats?.deletions ?? 0,
                     filesChanged: (detail.files ?? []).map((f) => f.filename),
                 });
-            } catch {
-                // Skip commits where detail fetch fails
+            } catch (err) {
+                lastDetailError = err instanceof Error ? err : new Error(String(err));
             }
+        }
+
+        // If every single detail fetch failed on a non-empty commit list, the error
+        // is systemic (auth failure, network outage) — surface it rather than returning [].
+        if (commits.length === 0 && summaries.length > 0 && lastDetailError) {
+            throw lastDetailError;
         }
 
         return commits;
@@ -271,7 +288,10 @@ export class GitHubProvider implements GitProvider {
 
             let reachedSince = false;
             for (const pr of page) {
-                if (sinceDate && new Date(pr.created_at) < sinceDate) {
+                // The list is sorted by updated_at desc, so use updated_at as the cutoff.
+                // Using created_at would cause early termination when an old PR appears
+                // near the top of the list due to a recent comment or update.
+                if (sinceDate && new Date(pr.updated_at) < sinceDate) {
                     reachedSince = true;
                     break;
                 }
@@ -302,8 +322,10 @@ export class GitHubProvider implements GitProvider {
                     mergedAt: pr.merged_at,
                     closedAt: pr.closed_at,
                     reviewers,
-                    additions: pr.additions ?? 0,
-                    deletions: pr.deletions ?? 0,
+                    // additions/deletions are absent from the PR list endpoint;
+                    // only the individual PR endpoint (/pulls/{number}) returns them.
+                    additions: 0,
+                    deletions: 0,
                 });
             }
 
