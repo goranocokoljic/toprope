@@ -4,7 +4,7 @@ import {aggregateDailyMetrics} from './analyzer.js';
 import {toAnalysisCommit, toAnalysisPR, toAnalysisReviewComment} from './analysis-types.js';
 import type {AnalysisCommit, AnalysisPR, AnalysisReviewComment} from './analysis-types.js';
 import {createGitProvider} from './providers/factory.js';
-import type {GitProviderConfig, GitProviderType, GitFileDiff, GitPR} from './providers/types.js';
+import type {GitProviderConfig, GitProviderType, GitCommit, GitFileDiff, GitPR} from './providers/types.js';
 import type {ConnectorInterface, SyncResult} from '../types.js';
 import type {GitConnectorConfig} from '../../config/types.js';
 
@@ -118,6 +118,7 @@ function mergeSnapshots(a: GitSnapshotRow, b: GitSnapshotRow): GitSnapshotRow {
         ? (a.ai_signature_score * a.commits + b.ai_signature_score * b.commits) / totalCommits
         : 0;
 
+    // Cross-provider churn cannot be recomputed without the full commit set; simple average is an approximation.
     const avgChurn = (a.code_churn_rate + b.code_churn_rate) / 2;
 
     return {
@@ -227,7 +228,6 @@ interface ProviderFetchResult {
     prs: AnalysisPR[];
     reviewComments: AnalysisReviewComment[];
     errors: string[];
-    unmatchedAuthors: Set<string>;
     stateKey: string;
 }
 
@@ -237,7 +237,6 @@ async function fetchProviderData(
     db: Database.Database,
 ): Promise<ProviderFetchResult> {
     const errors: string[] = [];
-    const unmatchedAuthors = new Set<string>();
     const allCommits: AnalysisCommit[] = [];
     const allPRs: AnalysisPR[] = [];
     const allReviewComments: AnalysisReviewComment[] = [];
@@ -249,9 +248,10 @@ async function fetchProviderData(
     const since = getProviderLastSyncTime(db, stateKey) ?? '';
 
     const rawRepos = 'repos' in providerConfig ? providerConfig.repos : undefined;
-    const excludeRepos = 'exclude_repos' in providerConfig
-        ? (providerConfig as {exclude_repos?: string[]}).exclude_repos
-        : undefined;
+    const excludeRepos =
+        providerConfig.type === 'github' || providerConfig.type === 'bitbucket'
+            ? providerConfig.exclude_repos
+            : undefined;
     const {include: includeRepos, exclude: excludeFromList} = parseRepoFilters(rawRepos);
     const allExclude = [...excludeFromList, ...(excludeRepos ?? [])];
 
@@ -263,7 +263,7 @@ async function fetchProviderData(
         errors.push(
             `[${providerType}] Failed to list repos: ${err instanceof Error ? err.message : String(err)}`,
         );
-        return {commits: allCommits, prs: allPRs, reviewComments: allReviewComments, errors, unmatchedAuthors, stateKey};
+        return {commits: allCommits, prs: allPRs, reviewComments: allReviewComments, errors, stateKey};
     }
 
     const reposToSync = applyRepoFilter(
@@ -273,7 +273,7 @@ async function fetchProviderData(
     );
 
     for (const repoName of reposToSync) {
-        let rawCommits = [];
+        let rawCommits: GitCommit[] = [];
         try {
             rawCommits = await provider.getCommits(repoName, since, now);
         } catch (err) {
@@ -317,14 +317,7 @@ async function fetchProviderData(
         }
     }
 
-    return {
-        commits: allCommits,
-        prs: allPRs,
-        reviewComments: allReviewComments,
-        errors,
-        unmatchedAuthors,
-        stateKey,
-    };
+    return {commits: allCommits, prs: allPRs, reviewComments: allReviewComments, errors, stateKey};
 }
 
 export class GitSync implements ConnectorInterface {
@@ -386,7 +379,6 @@ export class GitSync implements ConnectorInterface {
         for (const pc of providerConfigs) {
             const result = await fetchProviderData(pc, now, db);
             errors.push(...result.errors);
-            for (const a of result.unmatchedAuthors) allUnmatched.add(a);
             fetchResults.push({result, providerType: pc.type});
         }
 
@@ -474,7 +466,12 @@ export class GitSync implements ConnectorInterface {
 
     private getProviderConfigs(): GitProviderConfig[] {
         if (Array.isArray(this.config.providers) && this.config.providers.length > 0) {
-            return this.config.providers as GitProviderConfig[];
+            // config.providers is unknown[] to avoid circular imports; validate minimally at runtime.
+            const valid = (this.config.providers as unknown[]).filter(
+                (p): p is GitProviderConfig =>
+                    typeof p === 'object' && p !== null && typeof (p as Record<string, unknown>).type === 'string',
+            );
+            return valid;
         }
 
         const token = this.config.api_token ?? process.env.GITHUB_TOKEN ?? '';

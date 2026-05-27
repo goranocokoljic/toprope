@@ -438,7 +438,7 @@ syncCommand
     .command('git')
     .description('Pull commit and PR data from configured git providers')
     .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
-    .option('--provider <type>', 'Only sync a specific provider (github, bitbucket, gitlab)')
+    .option('--provider <type>', 'Only sync a specific provider (github, bitbucket, gitlab). Note: partial re-runs overwrite any existing multi-provider snapshot for the same developer+day.')
     .action(async (options: {config: string; provider?: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const config = loadConfig(configPath);
