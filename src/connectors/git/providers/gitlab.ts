@@ -194,7 +194,7 @@ export class GitLabProvider implements GitProvider {
     }
 
     async listRepos(): Promise<GitRepo[]> {
-        // name is path_with_namespace (e.g. "group/repo") rather than the short slug so that
+        // the name is path_with_namespace (e.g. "group/repo") rather than the short slug so that
         // getCommits/getPullRequests etc. can URL-encode the full path and reach subgroup projects.
         // name === fullName is intentional: GitLab has no separate "slug" vs "full name" distinction.
         let baseUrl = `${this.baseUrl}/groups/${encodeURIComponent(this.group)}/projects?include_archived=false&per_page=${PER_PAGE}`;
@@ -205,7 +205,8 @@ export class GitLabProvider implements GitProvider {
         const repos: GitRepo[] = [];
         let page = 1;
 
-        while (true) {
+        let hasNextPage = true;
+        while (hasNextPage) {
             const res = await fetchGitLab(`${baseUrl}&page=${page}`, this.authHeaders);
             const projects = (await res.json()) as RawProject[];
 
@@ -222,22 +223,23 @@ export class GitLabProvider implements GitProvider {
             }
 
             const nextPage = res.headers.get('x-next-page');
-            if (!nextPage || nextPage === '') break;
-            page = parseInt(nextPage, 10);
+            hasNextPage = !!nextPage && nextPage !== '';
+            if (hasNextPage) page = parseInt(nextPage!, 10);
         }
 
         return repos;
     }
 
     async getCommits(repo: string, since: string, until: string): Promise<GitCommit[]> {
-        const params = new URLSearchParams({per_page: String(PER_PAGE)});
+        const params = new URLSearchParams({ per_page: String(PER_PAGE) });
         if (since) params.set('since', since);
         if (until) params.set('until', until);
 
         const raw: RawCommit[] = [];
         let page = 1;
 
-        while (true) {
+        let hasNextPage = true;
+        while (hasNextPage) {
             params.set('page', String(page));
             const url = `${this.baseUrl}/projects/${this.projectPath(repo)}/repository/commits?${params.toString()}`;
             const res = await fetchGitLab(url, this.authHeaders);
@@ -245,8 +247,8 @@ export class GitLabProvider implements GitProvider {
             raw.push(...data);
 
             const nextPage = res.headers.get('x-next-page');
-            if (!nextPage || nextPage === '') break;
-            page = parseInt(nextPage, 10);
+            hasNextPage = !!nextPage && nextPage !== '';
+            if (hasNextPage) page = parseInt(nextPage!, 10);
         }
 
         const commits: GitCommit[] = [];
