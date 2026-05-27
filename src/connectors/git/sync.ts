@@ -1,13 +1,18 @@
 import type Database from 'better-sqlite3';
 import {randomUUID} from 'crypto';
-import {GitClient} from './client';
-import type {GitCommit, GitPullRequest, GitReviewComment} from './client';
-import {aggregateDailyMetrics} from './analyzer';
-import type {ConnectorInterface, SyncResult} from '../types';
-import type {GitConnectorConfig} from '../../config/types';
+import {aggregateDailyMetrics} from './analyzer.js';
+import {toAnalysisCommit, toAnalysisPR, toAnalysisReviewComment} from './analysis-types.js';
+import type {AnalysisCommit, AnalysisPR, AnalysisReviewComment} from './analysis-types.js';
+import {createGitProvider} from './providers/factory.js';
+import type {GitProviderConfig, GitProviderType, GitCommit, GitFileDiff, GitPR} from './providers/types.js';
+import type {ConnectorInterface, SyncResult} from '../types.js';
+import type {GitConnectorConfig} from '../../config/types.js';
 
 const CONNECTOR_NAME = 'git';
-const SYNC_STATE_KEY = 'git_last_sync';
+
+function syncStateKey(providerType: GitProviderType, identifier: string): string {
+    return `git_last_sync:${providerType}:${identifier}`;
+}
 
 interface SyncStateRow {
     value: string;
@@ -15,6 +20,7 @@ interface SyncStateRow {
 
 interface DeveloperRow {
     id: string;
+    email: string | null;
     external_ids: string | null;
 }
 
@@ -33,34 +39,105 @@ interface GitSnapshotRow {
     ai_signature_score: number;
     avg_commit_size: number;
     commit_burst_count: number;
+    data_source: string;
 }
 
-function getLastSyncTime(db: Database.Database): string | null {
+function getProviderLastSyncTime(db: Database.Database, key: string): string | null {
     const row = db
         .prepare('SELECT value FROM sync_state WHERE key = ?')
-        .get(SYNC_STATE_KEY) as SyncStateRow | undefined;
+        .get(key) as SyncStateRow | undefined;
     return row?.value ?? null;
 }
 
-function setLastSyncTime(db: Database.Database, time: string): void {
+function setProviderLastSyncTime(db: Database.Database, key: string, time: string): void {
     db.prepare(
         'INSERT INTO sync_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
-    ).run(SYNC_STATE_KEY, time);
+    ).run(key, time);
 }
 
-function buildLoginToDevIdMap(db: Database.Database): Map<string, string> {
-    const rows = db.prepare('SELECT id, external_ids FROM developers').all() as DeveloperRow[];
+// Build a map from identifier → developer_id, covering:
+//   - email (from developers.email)
+//   - github:<login>, bitbucket:<login>, gitlab:<login> (from external_ids JSON)
+function buildDevLookupMap(db: Database.Database): Map<string, string> {
+    const rows = db.prepare('SELECT id, email, external_ids FROM developers').all() as DeveloperRow[];
     const map = new Map<string, string>();
+
     for (const row of rows) {
+        if (row.email) {
+            map.set(`email:${row.email.toLowerCase()}`, row.id);
+        }
         if (!row.external_ids) continue;
         try {
             const ext = JSON.parse(row.external_ids) as Record<string, string | undefined>;
-            if (ext.github) map.set(ext.github, row.id);
+            for (const [provider, username] of Object.entries(ext)) {
+                if (username) map.set(`${provider}:${username}`, row.id);
+            }
         } catch {
             // malformed external_ids — skip
         }
     }
+
     return map;
+}
+
+function resolveDeveloperId(
+    lookup: Map<string, string>,
+    providerType: GitProviderType,
+    login: string | null,
+    email: string | null,
+): string | null {
+    if (login) {
+        const byLogin = lookup.get(`${providerType}:${login}`);
+        if (byLogin) return byLogin;
+    }
+    if (email) {
+        const byEmail = lookup.get(`email:${email.toLowerCase()}`);
+        if (byEmail) return byEmail;
+    }
+    return null;
+}
+
+// Merge two snapshots for the same (developer_id, date) from different providers.
+// Additive for counts; weighted average for rates and scores.
+function mergeSnapshots(a: GitSnapshotRow, b: GitSnapshotRow): GitSnapshotRow {
+    const totalCommits = a.commits + b.commits;
+    const totalPrs = a.prs_merged + b.prs_merged;
+
+    let avgTTM: number | null = null;
+    if (a.avg_time_to_merge_hours !== null && b.avg_time_to_merge_hours !== null && totalPrs > 0) {
+        avgTTM = (a.avg_time_to_merge_hours * a.prs_merged + b.avg_time_to_merge_hours * b.prs_merged) / totalPrs;
+    } else {
+        avgTTM = a.avg_time_to_merge_hours ?? b.avg_time_to_merge_hours;
+    }
+
+    const avgCommitSize = totalCommits > 0
+        ? (a.avg_commit_size * a.commits + b.avg_commit_size * b.commits) / totalCommits
+        : 0;
+
+    const avgAiScore = totalCommits > 0
+        ? (a.ai_signature_score * a.commits + b.ai_signature_score * b.commits) / totalCommits
+        : 0;
+
+    // Cross-provider churn cannot be recomputed without the full commit set; simple average is an approximation.
+    const avgChurn = (a.code_churn_rate + b.code_churn_rate) / 2;
+
+    return {
+        developer_id: a.developer_id,
+        date: a.date,
+        commits: totalCommits,
+        lines_added: a.lines_added + b.lines_added,
+        lines_removed: a.lines_removed + b.lines_removed,
+        files_changed: a.files_changed + b.files_changed,
+        prs_opened: a.prs_opened + b.prs_opened,
+        prs_merged: totalPrs,
+        review_comments_given: a.review_comments_given + b.review_comments_given,
+        avg_time_to_merge_hours: avgTTM,
+        code_churn_rate: avgChurn,
+        ai_signature_score: avgAiScore,
+        avg_commit_size: avgCommitSize,
+        commit_burst_count: a.commit_burst_count + b.commit_burst_count,
+        data_source: a.data_source === b.data_source ? a.data_source : 'multi',
+    };
 }
 
 function upsertSnapshot(db: Database.Database, snap: GitSnapshotRow): 'written' | 'skipped' {
@@ -69,8 +146,8 @@ function upsertSnapshot(db: Database.Database, snap: GitSnapshotRow): 'written' 
             `INSERT INTO git_snapshots
              (id, developer_id, date, commits, lines_added, lines_removed, files_changed,
               prs_opened, prs_merged, review_comments_given, avg_time_to_merge_hours,
-              code_churn_rate, ai_signature_score, avg_commit_size, commit_burst_count)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              code_churn_rate, ai_signature_score, avg_commit_size, commit_burst_count, data_source)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(developer_id, date) DO UPDATE SET
                commits = excluded.commits,
                lines_added = excluded.lines_added,
@@ -83,7 +160,8 @@ function upsertSnapshot(db: Database.Database, snap: GitSnapshotRow): 'written' 
                code_churn_rate = excluded.code_churn_rate,
                ai_signature_score = excluded.ai_signature_score,
                avg_commit_size = excluded.avg_commit_size,
-               commit_burst_count = excluded.commit_burst_count`,
+               commit_burst_count = excluded.commit_burst_count,
+               data_source = excluded.data_source`,
         )
         .run(
             randomUUID(),
@@ -101,24 +179,145 @@ function upsertSnapshot(db: Database.Database, snap: GitSnapshotRow): 'written' 
             snap.ai_signature_score,
             snap.avg_commit_size,
             snap.commit_burst_count,
+            snap.data_source,
         );
 
     return result.changes > 0 ? 'written' : 'skipped';
 }
 
-function filterRepos(
-    allRepos: string[],
+function providerIdentifier(config: GitProviderConfig): string {
+    switch (config.type) {
+        case 'github': return config.org;
+        case 'bitbucket': return config.workspace;
+        case 'gitlab': return config.group;
+    }
+}
+
+function applyRepoFilter(
+    repos: string[],
     include: string[] | undefined,
     exclude: string[] | undefined,
 ): string[] {
-    let repos = allRepos;
+    let filtered = repos;
     if (include && include.length > 0) {
-        repos = repos.filter((r) => include.includes(r));
+        filtered = filtered.filter((r) => include.includes(r));
     }
     if (exclude && exclude.length > 0) {
-        repos = repos.filter((r) => !exclude.includes(r));
+        filtered = filtered.filter((r) => !exclude.includes(r));
     }
-    return repos;
+    return filtered;
+}
+
+function parseRepoFilters(rawRepos: string[] | undefined): {include: string[]; exclude: string[]} {
+    const include: string[] = [];
+    const exclude: string[] = [];
+    for (const entry of rawRepos ?? []) {
+        if (entry.startsWith('exclude:')) {
+            exclude.push(entry.slice('exclude:'.length));
+        } else if (entry.startsWith('include:')) {
+            include.push(entry.slice('include:'.length));
+        } else {
+            include.push(entry);
+        }
+    }
+    return {include, exclude};
+}
+
+interface ProviderFetchResult {
+    commits: AnalysisCommit[];
+    prs: AnalysisPR[];
+    reviewComments: AnalysisReviewComment[];
+    errors: string[];
+    stateKey: string;
+}
+
+async function fetchProviderData(
+    providerConfig: GitProviderConfig,
+    now: string,
+    db: Database.Database,
+): Promise<ProviderFetchResult> {
+    const errors: string[] = [];
+    const allCommits: AnalysisCommit[] = [];
+    const allPRs: AnalysisPR[] = [];
+    const allReviewComments: AnalysisReviewComment[] = [];
+
+    const provider = createGitProvider(providerConfig);
+    const providerType = provider.name;
+    const identifier = providerIdentifier(providerConfig);
+    const stateKey = syncStateKey(providerType, identifier);
+    const since = getProviderLastSyncTime(db, stateKey) ?? '';
+
+    const rawRepos = 'repos' in providerConfig ? providerConfig.repos : undefined;
+    const excludeRepos =
+        providerConfig.type === 'github' || providerConfig.type === 'bitbucket'
+            ? providerConfig.exclude_repos
+            : undefined;
+    const {include: includeRepos, exclude: excludeFromList} = parseRepoFilters(rawRepos);
+    const allExclude = [...excludeFromList, ...(excludeRepos ?? [])];
+
+    let repoNames: string[] = [];
+    try {
+        const repos = await provider.listRepos();
+        repoNames = repos.filter((r) => !r.isArchived).map((r) => r.name);
+    } catch (err) {
+        errors.push(
+            `[${providerType}] Failed to list repos: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return {commits: allCommits, prs: allPRs, reviewComments: allReviewComments, errors, stateKey};
+    }
+
+    const reposToSync = applyRepoFilter(
+        repoNames,
+        includeRepos.length > 0 ? includeRepos : undefined,
+        allExclude.length > 0 ? allExclude : undefined,
+    );
+
+    for (const repoName of reposToSync) {
+        let rawCommits: GitCommit[] = [];
+        try {
+            rawCommits = await provider.getCommits(repoName, since, now);
+        } catch (err) {
+            errors.push(
+                `[${providerType}/${repoName}] Failed to fetch commits: ${err instanceof Error ? err.message : String(err)}`,
+            );
+            continue;
+        }
+
+        for (const rawCommit of rawCommits) {
+            let diffs: GitFileDiff[] = [];
+            try {
+                diffs = await provider.getCommitDiff(repoName, rawCommit.sha);
+            } catch {
+                // Diff fetch failed — use empty diffs; commit still counts
+            }
+            // Namespace file paths by repo to prevent false churn collisions
+            const namespacedDiffs = diffs.map((d) => ({...d, path: `${repoName}/${d.path}`}));
+            allCommits.push(toAnalysisCommit(rawCommit, namespacedDiffs));
+        }
+
+        let rawPRs: GitPR[] = [];
+        try {
+            rawPRs = await provider.getPullRequests(repoName, 'all', since);
+        } catch (err) {
+            errors.push(
+                `[${providerType}/${repoName}] Failed to fetch PRs: ${err instanceof Error ? err.message : String(err)}`,
+            );
+        }
+
+        for (const pr of rawPRs) {
+            allPRs.push(toAnalysisPR(pr));
+            try {
+                const comments = await provider.getReviewComments(repoName, pr.id);
+                for (const c of comments) {
+                    allReviewComments.push(toAnalysisReviewComment(c));
+                }
+            } catch {
+                // Review comment fetch failed — skip for this PR
+            }
+        }
+    }
+
+    return {commits: allCommits, prs: allPRs, reviewComments: allReviewComments, errors, stateKey};
 }
 
 export class GitSync implements ConnectorInterface {
@@ -133,180 +332,158 @@ export class GitSync implements ConnectorInterface {
     }
 
     getLastSyncTime(db: Database.Database): string | null {
-        return getLastSyncTime(db);
+        const providers = this.getProviderConfigs();
+        let latest: string | null = null;
+        for (const pc of providers) {
+            const key = syncStateKey(pc.type, providerIdentifier(pc));
+            const row = db
+                .prepare('SELECT value FROM sync_state WHERE key = ?')
+                .get(key) as SyncStateRow | undefined;
+            const t = row?.value ?? null;
+            if (t && (!latest || t > latest)) latest = t;
+        }
+        return latest;
     }
 
-    async sync(db: Database.Database): Promise<SyncResult> {
+    async sync(db: Database.Database, providerFilter?: string): Promise<SyncResult> {
         const errors: string[] = [];
         let snapshotsWritten = 0;
         let snapshotsSkipped = 0;
         const now = new Date().toISOString();
+        const allUnmatched = new Set<string>();
 
-        const token = this.config.api_token ?? process.env.GITHUB_TOKEN ?? '';
-        const org = this.config.org ?? '';
+        const providerConfigs = this.getProviderConfigs().filter(
+            (pc) => !providerFilter || pc.type === providerFilter,
+        );
 
-        if (!token || !org) {
+        if (providerConfigs.length === 0) {
             return {
                 connector: CONNECTOR_NAME,
                 snapshotsWritten: 0,
                 snapshotsSkipped: 0,
-                errors: ['Missing required config: org and api_token (or GITHUB_TOKEN env)'],
+                errors: providerFilter
+                    ? [`No provider of type '${providerFilter}' configured`]
+                    : ['No git providers configured'],
                 lastSyncTime: now,
             };
         }
 
-        const client = new GitClient({org, token});
-        const loginToDevId = buildLoginToDevIdMap(db);
-        const since = getLastSyncTime(db) ?? undefined;
+        const devLookup = buildDevLookupMap(db);
         const churnWindowHours = this.config.analysis?.churn_window_hours ?? 48;
 
-        // Discover repos
-        let allRepoNames: string[] = [];
-        try {
-            const repos = await client.listRepos();
-            allRepoNames = repos.map((r) => r.name);
-        } catch (err) {
-            errors.push(
-                `Failed to list repos: ${err instanceof Error ? err.message : String(err)}`,
-            );
-            return {connector: CONNECTOR_NAME, snapshotsWritten, snapshotsSkipped, errors, lastSyncTime: now};
+        // Fetch data from all providers separately (for per-provider sync state),
+        // then merge before analysis so multi-provider contributions to the same
+        // (developer_id, date) are accumulated rather than overwritten.
+        const fetchResults: Array<{result: ProviderFetchResult; providerType: GitProviderType}> = [];
+
+        for (const pc of providerConfigs) {
+            const result = await fetchProviderData(pc, now, db);
+            errors.push(...result.errors);
+            fetchResults.push({result, providerType: pc.type});
         }
 
-        // Config may specify include/exclude as a flat list of repo names or "include:X/exclude:X" prefixes.
-        // Accept both plain names and "include:name" / "exclude:name" prefixes for forward compat.
-        const includeRepos: string[] = [];
-        const excludeRepos: string[] = [];
-        for (const entry of this.config.repos ?? []) {
-            if (entry.startsWith('exclude:')) {
-                excludeRepos.push(entry.slice('exclude:'.length));
-            } else if (entry.startsWith('include:')) {
-                includeRepos.push(entry.slice('include:'.length));
-            } else {
-                includeRepos.push(entry);
-            }
-        }
+        // Accumulate snapshots from all providers into a single map keyed by
+        // "developer_id:date" so same-day multi-provider data is merged.
+        const globalSnapshots = new Map<string, GitSnapshotRow>();
 
-        const reposToSync = filterRepos(
-            allRepoNames,
-            includeRepos.length > 0 ? includeRepos : undefined,
-            excludeRepos.length > 0 ? excludeRepos : undefined,
-        );
+        for (const {result, providerType} of fetchResults) {
+            const {commits, prs, reviewComments, stateKey} = result;
 
-        let writeError = false;
-
-        // Accumulate across all repos, then aggregate once. Aggregating and
-        // upserting per repo would have each repo's write overwrite the same
-        // developer+day row, dropping earlier repos' contributions.
-        const allCommits: GitCommit[] = [];
-        const allPrs: GitPullRequest[] = [];
-        const allReviewComments: GitReviewComment[] = [];
-
-        for (const repoName of reposToSync) {
-            let commits: GitCommit[] = [];
-            try {
-                commits = await client.getCommits(repoName, since);
-            } catch (err) {
-                errors.push(
-                    `[${repoName}] Failed to fetch commits: ${err instanceof Error ? err.message : String(err)}`,
-                );
+            if (commits.length === 0 && prs.length === 0 && reviewComments.length === 0) {
+                setProviderLastSyncTime(db, stateKey, now);
                 continue;
             }
 
-            let prs: GitPullRequest[] = [];
-            try {
-                prs = await client.getPullRequests(repoName, since);
-            } catch (err) {
-                errors.push(
-                    `[${repoName}] Failed to fetch PRs: ${err instanceof Error ? err.message : String(err)}`,
-                );
-                // Continue with commits-only data
-            }
+            const metricsMap = aggregateDailyMetrics(commits, prs, churnWindowHours, reviewComments);
 
-            // Namespace file paths by repo so churn detection never collides two
-            // different repos' identically-named files into false re-churn.
+            // Check for unmatched authors
             for (const commit of commits) {
-                allCommits.push({
-                    ...commit,
-                    files: commit.files.map((f) => ({
-                        ...f,
-                        filename: `${repoName}/${f.filename}`,
-                    })),
-                });
-            }
-            allPrs.push(...prs);
-
-            // Fetch review comments only for PRs that have any, to limit API calls.
-            for (const pr of prs) {
-                if (pr.review_comments <= 0) continue;
-                try {
-                    const comments = await client.getReviewComments(repoName, pr.number, since);
-                    allReviewComments.push(...comments);
-                } catch (err) {
-                    errors.push(
-                        `[${repoName}] Failed to fetch review comments for PR #${pr.number}: ${err instanceof Error ? err.message : String(err)}`,
-                    );
+                const devId = resolveDeveloperId(devLookup, providerType, commit.authorLogin, commit.authorEmail);
+                if (!devId) {
+                    const label = commit.authorLogin ?? commit.authorEmail ?? 'unknown';
+                    allUnmatched.add(`${providerType}:${label}`);
                 }
             }
+
+            for (const [login, byDate] of metricsMap) {
+                const emailForLogin = commits.find((c) => c.authorLogin === login)?.authorEmail ?? null;
+                const developerId = resolveDeveloperId(devLookup, providerType, login, emailForLogin);
+                if (!developerId) continue;
+
+                for (const [, metrics] of byDate) {
+                    const snap: GitSnapshotRow = {
+                        developer_id: developerId,
+                        date: metrics.date,
+                        commits: metrics.commits,
+                        lines_added: metrics.lines_added,
+                        lines_removed: metrics.lines_removed,
+                        files_changed: metrics.files_changed,
+                        prs_opened: metrics.prs_opened,
+                        prs_merged: metrics.prs_merged,
+                        review_comments_given: metrics.review_comments_given,
+                        avg_time_to_merge_hours: metrics.avg_time_to_merge_hours,
+                        code_churn_rate: metrics.code_churn_rate,
+                        ai_signature_score: metrics.ai_signature_score,
+                        avg_commit_size: metrics.avg_commit_size,
+                        commit_burst_count: metrics.commit_burst_count,
+                        data_source: providerType,
+                    };
+
+                    const key = `${developerId}:${metrics.date}`;
+                    const existing = globalSnapshots.get(key);
+                    globalSnapshots.set(key, existing ? mergeSnapshots(existing, snap) : snap);
+                }
+            }
+
+            setProviderLastSyncTime(db, stateKey, now);
         }
 
-        if (allCommits.length > 0 || allPrs.length > 0 || allReviewComments.length > 0) {
-            const metricsMap = aggregateDailyMetrics(
-                allCommits,
-                allPrs,
-                churnWindowHours,
-                allReviewComments,
+        // Upsert all merged snapshots in a single transaction
+        const insertMany = db.transaction(() => {
+            for (const snap of globalSnapshots.values()) {
+                const outcome = upsertSnapshot(db, snap);
+                if (outcome === 'written') snapshotsWritten++;
+                else snapshotsSkipped++;
+            }
+        });
+
+        try {
+            insertMany();
+        } catch (err) {
+            errors.push(
+                `Failed to write snapshots: ${err instanceof Error ? err.message : String(err)}`,
             );
-
-            const insertMany = db.transaction(() => {
-                for (const [login, byDate] of metricsMap) {
-                    const developerId = loginToDevId.get(login);
-                    if (!developerId) continue;
-
-                    for (const [, metrics] of byDate) {
-                        const snap: GitSnapshotRow = {
-                            developer_id: developerId,
-                            date: metrics.date,
-                            commits: metrics.commits,
-                            lines_added: metrics.lines_added,
-                            lines_removed: metrics.lines_removed,
-                            files_changed: metrics.files_changed,
-                            prs_opened: metrics.prs_opened,
-                            prs_merged: metrics.prs_merged,
-                            review_comments_given: metrics.review_comments_given,
-                            avg_time_to_merge_hours: metrics.avg_time_to_merge_hours,
-                            code_churn_rate: metrics.code_churn_rate,
-                            ai_signature_score: metrics.ai_signature_score,
-                            avg_commit_size: metrics.avg_commit_size,
-                            commit_burst_count: metrics.commit_burst_count,
-                        };
-
-                        const outcome = upsertSnapshot(db, snap);
-                        if (outcome === 'written') snapshotsWritten++;
-                        else snapshotsSkipped++;
-                    }
-                }
-            });
-
-            try {
-                insertMany();
-            } catch (err) {
-                writeError = true;
-                errors.push(
-                    `Failed to write snapshots: ${err instanceof Error ? err.message : String(err)}`,
-                );
-            }
         }
 
-        if (!writeError) {
-            try {
-                setLastSyncTime(db, now);
-            } catch (err) {
-                errors.push(
-                    `Failed to update sync state: ${err instanceof Error ? err.message : String(err)}`,
-                );
-            }
+        if (allUnmatched.size > 0) {
+            errors.push(
+                `Unmatched authors (no developer record found): ${[...allUnmatched].join(', ')}`,
+            );
         }
 
         return {connector: CONNECTOR_NAME, snapshotsWritten, snapshotsSkipped, errors, lastSyncTime: now};
+    }
+
+    private getProviderConfigs(): GitProviderConfig[] {
+        if (Array.isArray(this.config.providers) && this.config.providers.length > 0) {
+            // config.providers is unknown[] to avoid circular imports; validate minimally at runtime.
+            const valid = (this.config.providers as unknown[]).filter(
+                (p): p is GitProviderConfig =>
+                    typeof p === 'object' && p !== null && typeof (p as Record<string, unknown>).type === 'string',
+            );
+            return valid;
+        }
+
+        const token = this.config.api_token ?? process.env.GITHUB_TOKEN ?? '';
+        const org = this.config.org ?? '';
+        if (!token || !org) return [];
+
+        const legacy: GitProviderConfig = {
+            type: 'github',
+            org,
+            auth: {type: 'token', api_token: token},
+            repos: this.config.repos,
+        };
+        return [legacy];
     }
 }
