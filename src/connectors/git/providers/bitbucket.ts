@@ -264,8 +264,11 @@ export class BitbucketProvider implements GitProvider {
             let diffs: GitFileDiff[] = [];
             try {
                 diffs = await this.getCommitDiff(repo, raw.hash);
-            } catch {
-                // diffstat unavailable for this commit (e.g. merge commits); record with zero stats
+            } catch (err) {
+                // 404 means diffstat absent for this commit (e.g. merge commits) — record with zero stats
+                // Re-throw anything else (auth failure, server error) so systemic problems surface
+                const msg = err instanceof Error ? err.message : String(err);
+                if (!msg.includes(' 404:')) throw err;
             }
             commits.push({
                 sha: raw.hash,

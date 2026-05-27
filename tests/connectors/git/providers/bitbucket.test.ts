@@ -426,7 +426,7 @@ describe('BitbucketProvider', () => {
             expect(commits).toEqual([]);
         });
 
-        it('still returns commits when diffstat endpoint returns 404 (merge commits)', async () => {
+        it('still returns commit when diffstat returns 404 (merge commit); records zero stats', async () => {
             const hash = 'abc123';
             let callCount = 0;
             vi.stubGlobal('fetch', vi.fn().mockImplementation(() => {
@@ -440,7 +440,6 @@ describe('BitbucketProvider', () => {
                         text: () => Promise.resolve(''),
                     } as unknown as Response);
                 }
-                // diffstat returns 404 (e.g. merge commit)
                 return Promise.resolve({
                     ok: false,
                     status: 404,
@@ -457,6 +456,85 @@ describe('BitbucketProvider', () => {
             expect(commits[0].additions).toBe(0);
             expect(commits[0].deletions).toBe(0);
             expect(commits[0].filesChanged).toEqual([]);
+        });
+
+        it('returns both commits when one diffstat succeeds and another returns 404', async () => {
+            const hashA = 'aaa111';
+            const hashB = 'bbb222'; // merge commit — no diffstat
+            let callCount = 0;
+            vi.stubGlobal('fetch', vi.fn().mockImplementation(() => {
+                callCount++;
+                if (callCount === 1) {
+                    // commit list: two commits in range
+                    return Promise.resolve({
+                        ok: true,
+                        status: 200,
+                        headers: new Headers(),
+                        json: () => Promise.resolve(pagedResponse([
+                            makeCommitFixture(hashA, {date: '2024-01-20T00:00:00+00:00'}),
+                            makeCommitFixture(hashB, {date: '2024-01-18T00:00:00+00:00'}),
+                        ])),
+                        text: () => Promise.resolve(''),
+                    } as unknown as Response);
+                }
+                if (callCount === 2) {
+                    // diffstat for hashA — succeeds
+                    return Promise.resolve({
+                        ok: true,
+                        status: 200,
+                        headers: new Headers(),
+                        json: () => Promise.resolve(pagedResponse(makeDiffstatFixture())),
+                        text: () => Promise.resolve(''),
+                    } as unknown as Response);
+                }
+                // diffstat for hashB — 404 (merge commit)
+                return Promise.resolve({
+                    ok: false,
+                    status: 404,
+                    headers: new Headers(),
+                    json: () => Promise.resolve({}),
+                    text: () => Promise.resolve('not found'),
+                } as unknown as Response);
+            }));
+
+            const commits = await provider.getCommits('my-repo', '2024-01-01T00:00:00Z', '2024-01-31T23:59:59Z');
+
+            expect(commits).toHaveLength(2);
+            expect(commits[0].sha).toBe(hashA);
+            expect(commits[0].additions).toBe(40);
+            expect(commits[0].filesChanged).toEqual(['src/foo.ts', 'src/bar.ts']);
+            expect(commits[1].sha).toBe(hashB);
+            expect(commits[1].additions).toBe(0);
+            expect(commits[1].filesChanged).toEqual([]);
+        });
+
+        it('propagates non-404 diffstat errors (e.g. 401 auth failure)', async () => {
+            const hash = 'abc123';
+            let callCount = 0;
+            vi.stubGlobal('fetch', vi.fn().mockImplementation(() => {
+                callCount++;
+                if (callCount === 1) {
+                    return Promise.resolve({
+                        ok: true,
+                        status: 200,
+                        headers: new Headers(),
+                        json: () => Promise.resolve(pagedResponse([makeCommitFixture(hash)])),
+                        text: () => Promise.resolve(''),
+                    } as unknown as Response);
+                }
+                // diffstat returns 401 — auth failure, should propagate
+                return Promise.resolve({
+                    ok: false,
+                    status: 401,
+                    headers: new Headers(),
+                    json: () => Promise.resolve({}),
+                    text: () => Promise.resolve('unauthorized'),
+                } as unknown as Response);
+            }));
+
+            await expect(
+                provider.getCommits('my-repo', '2024-01-01T00:00:00Z', '2024-01-31T23:59:59Z'),
+            ).rejects.toThrow('Bitbucket API error 401');
         });
     });
 
