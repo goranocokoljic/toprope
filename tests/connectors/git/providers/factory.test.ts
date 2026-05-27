@@ -137,9 +137,13 @@ describe('createGitProvider', () => {
             expect(typeof provider.getCommitDiff).toBe('function');
         });
 
-        it('bitbucket provider listRepos returns a rejected Promise', async () => {
+        it('bitbucket provider exposes all required GitProvider methods', () => {
             const provider = createGitProvider(validBitbucket);
-            await expect(provider.listRepos()).rejects.toThrow('bitbucket provider not yet implemented');
+            expect(typeof provider.listRepos).toBe('function');
+            expect(typeof provider.getCommits).toBe('function');
+            expect(typeof provider.getPullRequests).toBe('function');
+            expect(typeof provider.getReviewComments).toBe('function');
+            expect(typeof provider.getCommitDiff).toBe('function');
         });
 
         it('gitlab provider listRepos returns a rejected Promise', async () => {
