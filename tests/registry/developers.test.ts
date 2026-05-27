@@ -9,6 +9,8 @@ import {
     getDeveloperById,
     linkDeveloper,
     findByGithubUsername,
+    findByExternalId,
+    findByEmail,
 } from '../../src/registry/developers';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../src/storage/migrations');
@@ -51,6 +53,28 @@ describe('addDeveloper', () => {
         expect(dev.name).toBe('Bob');
         expect(dev.email).toBeNull();
         expect(dev.external_ids).toEqual({});
+    });
+
+    it('stores bitbucket and gitlab identities', () => {
+        const dev = addDeveloper(db, 'Dana', 'frontend', 'dana@x.com', undefined, {
+            bitbucket: 'dana-bb',
+            gitlab: 'dana-gl',
+        });
+        expect(dev.external_ids.bitbucket).toBe('dana-bb');
+        expect(dev.external_ids.gitlab).toBe('dana-gl');
+        expect(dev.external_ids.github).toBeUndefined();
+    });
+
+    it('normalizes git emails (lowercase, dedupe) into a comma-separated list', () => {
+        const dev = addDeveloper(db, 'Dana', 'frontend', undefined, undefined, {
+            gitEmails: ['Dana@Work.com', 'dana@work.com', 'dana@home.com'],
+        });
+        expect(dev.external_ids.git_emails).toBe('dana@work.com,dana@home.com');
+    });
+
+    it('omits git_emails when no git emails provided', () => {
+        const dev = addDeveloper(db, 'Dana', 'frontend', undefined, undefined, {bitbucket: 'd'});
+        expect(dev.external_ids.git_emails).toBeUndefined();
     });
 
     it('generates a unique id for each developer', () => {
@@ -201,6 +225,85 @@ describe('linkDeveloper', () => {
 
     it('returns null for an unknown developer id', () => {
         expect(linkDeveloper(db, 'nonexistent', {copilot: 'x'})).toBeNull();
+    });
+
+    it('updates github, bitbucket, and gitlab identities', () => {
+        const dev = addDeveloper(db, 'Alice', 'frontend');
+        const updated = linkDeveloper(db, dev.id, {
+            github: 'alice-gh',
+            bitbucket: 'alice-bb',
+            gitlab: 'alice-gl',
+        });
+        expect(updated!.external_ids.github).toBe('alice-gh');
+        expect(updated!.external_ids.bitbucket).toBe('alice-bb');
+        expect(updated!.external_ids.gitlab).toBe('alice-gl');
+    });
+
+    it('appends and dedupes git emails across multiple link calls', () => {
+        const dev = addDeveloper(db, 'Alice', 'frontend', undefined, undefined, {
+            gitEmails: ['alice@work.com'],
+        });
+        linkDeveloper(db, dev.id, {gitEmails: ['Alice@Personal.com', 'alice@work.com']});
+        const updated = getDeveloperById(db, dev.id);
+        expect(updated!.external_ids.git_emails).toBe('alice@work.com,alice@personal.com');
+    });
+});
+
+describe('findByExternalId', () => {
+    let db: Database.Database;
+
+    beforeEach(() => {
+        db = makeDb();
+        seedTeam(db);
+    });
+
+    afterEach(() => {
+        db.close();
+    });
+
+    it('finds a developer by bitbucket and gitlab identity', () => {
+        addDeveloper(db, 'Alice', 'frontend', undefined, undefined, {
+            bitbucket: 'alice-bb',
+            gitlab: 'alice-gl',
+        });
+        expect(findByExternalId(db, 'bitbucket', 'alice-bb')!.name).toBe('Alice');
+        expect(findByExternalId(db, 'gitlab', 'alice-gl')!.name).toBe('Alice');
+    });
+
+    it('returns null when no developer has that identity', () => {
+        addDeveloper(db, 'Alice', 'frontend', undefined, undefined, {bitbucket: 'alice-bb'});
+        expect(findByExternalId(db, 'bitbucket', 'someone-else')).toBeNull();
+        expect(findByExternalId(db, 'gitlab', 'alice-bb')).toBeNull();
+    });
+});
+
+describe('findByEmail', () => {
+    let db: Database.Database;
+
+    beforeEach(() => {
+        db = makeDb();
+        seedTeam(db);
+    });
+
+    afterEach(() => {
+        db.close();
+    });
+
+    it('matches the primary email case-insensitively', () => {
+        addDeveloper(db, 'Alice', 'frontend', 'Alice@Example.com');
+        expect(findByEmail(db, 'alice@example.com')!.name).toBe('Alice');
+    });
+
+    it('matches a secondary git email', () => {
+        addDeveloper(db, 'Alice', 'frontend', 'alice@example.com', undefined, {
+            gitEmails: ['alice@work.com'],
+        });
+        expect(findByEmail(db, 'alice@work.com')!.name).toBe('Alice');
+    });
+
+    it('returns null when no developer owns the email', () => {
+        addDeveloper(db, 'Alice', 'frontend', 'alice@example.com');
+        expect(findByEmail(db, 'bob@example.com')).toBeNull();
     });
 });
 

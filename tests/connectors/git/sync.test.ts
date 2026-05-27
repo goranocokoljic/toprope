@@ -96,6 +96,7 @@ function makeMockProvider(overrides: Partial<GitProvider> = {}): GitProvider {
         getPullRequests: vi.fn().mockResolvedValue([]),
         getReviewComments: vi.fn().mockResolvedValue([]),
         getCommitDiff: vi.fn().mockResolvedValue([]),
+        checkAccess: vi.fn().mockResolvedValue(undefined),
         ...overrides,
     };
 }
@@ -457,6 +458,48 @@ describe('GitSync', () => {
         const row = db
             .prepare(`SELECT commits FROM git_snapshots WHERE developer_id = ? AND date = '2024-01-15'`)
             .get(devId) as {commits: number} | undefined;
+
+        expect(row).toBeDefined();
+        expect(row!.commits).toBe(1);
+    });
+
+    it('matches a commit by a secondary git email from external_ids', async () => {
+        try {
+            addTeam(db, 'eng');
+        } catch {
+            // team may already exist
+        }
+        // Primary email is dana@primary.com; the commit is authored under a
+        // secondary email registered via gitEmails.
+        const dev = addDeveloper(db, 'Dana', 'eng', 'dana@primary.com', undefined, {
+            gitEmails: ['dana@work.com'],
+        });
+
+        const createGitProvider = await getCreateGitProvider();
+        const commit: GitCommit = {
+            sha: 'sha-dana',
+            author: {name: 'Dana', email: 'dana@work.com', username: ''},
+            date: '2024-01-15T10:00:00Z',
+            message: 'feat: secondary email',
+            additions: 10,
+            deletions: 2,
+            filesChanged: ['src/a.ts'],
+        };
+        const provider = makeMockProvider({
+            listRepos: vi.fn().mockResolvedValue([makeRepo('myrepo')]),
+            getCommits: vi.fn().mockResolvedValue([commit]),
+            getCommitDiff: vi
+                .fn()
+                .mockResolvedValue([{path: 'src/a.ts', additions: 10, deletions: 2, status: 'modified'}]),
+        });
+        createGitProvider.mockReturnValue(provider);
+
+        const syncer = new GitSync(makeGithubConfig());
+        await syncer.sync(db);
+
+        const row = db
+            .prepare(`SELECT commits FROM git_snapshots WHERE developer_id = ? AND date = '2024-01-15'`)
+            .get(dev.id) as {commits: number} | undefined;
 
         expect(row).toBeDefined();
         expect(row!.commits).toBe(1);

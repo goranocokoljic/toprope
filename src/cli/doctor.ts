@@ -2,6 +2,9 @@ import fs from 'fs';
 import type Database from 'better-sqlite3';
 import type {GovProxyConfig} from '../config/types';
 import {getMigrationStatus} from '../storage/migrator';
+import {resolveGitProviderConfigs} from '../connectors/git/providers/config';
+import {createGitProvider} from '../connectors/git/providers/factory';
+import type {GitProvider, GitProviderConfig} from '../connectors/git/providers/types';
 
 interface CheckResult {
     label: string;
@@ -292,59 +295,160 @@ async function checkWindsurfKey(config: GovProxyConfig): Promise<CheckResult> {
     }
 }
 
-async function checkGitRepos(config: GovProxyConfig): Promise<CheckResult> {
+function gitProviderIdentifier(pc: GitProviderConfig): string {
+    switch (pc.type) {
+        case 'github':
+            return `org "${pc.org}"`;
+        case 'bitbucket':
+            return `workspace "${pc.workspace}"`;
+        case 'gitlab':
+            return `group "${pc.group}"`;
+    }
+}
+
+function gitProviderFixHint(type: GitProviderConfig['type'], message?: string): string {
+    const m = message ?? '';
+    if (m.includes(' 401') || m.includes('(401)')) {
+        return `${type}: credentials invalid or expired — generate a new token/app password with read access.`;
+    }
+    if (m.includes(' 403') || m.includes('(403)') || m.includes('forbidden')) {
+        return `${type}: token lacks required read scopes (repositories + pull requests).`;
+    }
+    if (m.includes(' 404') || m.includes('(404)')) {
+        return `${type}: workspace/org/group not found — check the identifier in connectors.git.providers[].`;
+    }
+    switch (type) {
+        case 'bitbucket':
+            return 'Set providers[].workspace and a valid auth block (app_password needs username + app_password; access_token/oauth need token).';
+        case 'gitlab':
+            return 'Set providers[].group and a token with read_api + read_repository scopes.';
+        default:
+            return 'Set providers[].org (or git.org) and a token with repo read access.';
+    }
+}
+
+// Exact (non-glob) repo slugs configured as includes for a provider. Glob
+// patterns and `exclude:` entries are skipped — only literal slugs can be
+// verified to exist.
+export function exactConfiguredRepos(pc: GitProviderConfig): string[] {
+    const exact: string[] = [];
+    for (const entry of pc.repos ?? []) {
+        if (entry.startsWith('exclude:')) continue;
+        const pattern = entry.startsWith('include:') ? entry.slice('include:'.length) : entry;
+        if (pattern && !pattern.includes('*') && !pattern.includes('?')) exact.push(pattern);
+    }
+    return exact;
+}
+
+// Configured slugs that don't appear in the provider's repo list. Matches a
+// slug against the full name and the last path segment so GitLab short names
+// (e.g. "repo" vs "group/repo") are handled.
+export function findMissingRepos(configured: string[], repoNames: string[]): string[] {
+    if (configured.length === 0) return [];
+    const names = new Set(repoNames);
+    const shortNames = new Set(repoNames.map((n) => n.split('/').pop() ?? n));
+    return configured.filter((slug) => !names.has(slug) && !shortNames.has(slug));
+}
+
+async function checkOneGitProvider(pc: GitProviderConfig): Promise<CheckResult> {
+    const label = `Git: ${pc.type}`;
+    let provider: GitProvider;
+    try {
+        provider = createGitProvider(pc);
+    } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return fail(label, msg, gitProviderFixHint(pc.type));
+    }
+    try {
+        await provider.checkAccess();
+    } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return fail(label, msg, gitProviderFixHint(pc.type, msg));
+    }
+
+    // Only enumerate repos when an explicit slug list is configured — then we
+    // can confirm the slugs exist (a typo'd slug otherwise syncs nothing).
+    // With no list (monitor-all), the cheap checkAccess() probe is enough.
+    const configured = exactConfiguredRepos(pc);
+    if (configured.length === 0) {
+        return pass(label, `${gitProviderIdentifier(pc)} reachable`);
+    }
+
+    let repoNames: string[];
+    try {
+        repoNames = (await provider.listRepos()).map((r) => r.name);
+    } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return fail(label, msg, gitProviderFixHint(pc.type, msg));
+    }
+
+    const missing = findMissingRepos(configured, repoNames);
+    if (missing.length > 0) {
+        return fail(
+            label,
+            `${gitProviderIdentifier(pc)} reachable, but configured repo(s) not found: ${missing.join(', ')}`,
+            `Check the configured repo slug(s) — they must match repositories in ${gitProviderIdentifier(pc)}.`,
+        );
+    }
+    return pass(label, `${gitProviderIdentifier(pc)} reachable (${configured.length} configured repo(s) verified)`);
+}
+
+async function checkGitProviders(config: GovProxyConfig): Promise<CheckResult[]> {
     const {git} = config.connectors;
     if (!git.enabled) {
-        return pass('Git repos', 'Git connector disabled — skipped');
+        return [pass('Git providers', 'Git connector disabled — skipped')];
     }
 
-    const repos = git.repos ?? [];
-    if (repos.length === 0) {
-        return fail(
-            'Git repos',
-            'No repos configured',
-            'Add repos under connectors.git.repos in config (e.g. ["owner/repo"]).',
-        );
-    }
-
-    const token = git.api_token ?? process.env.GITHUB_TOKEN ?? '';
-    if (!token) {
-        return fail(
-            'Git repos',
-            'No API token configured for git connector',
-            'Set connectors.git.api_token in config or export GITHUB_TOKEN=<token>',
-        );
-    }
-
-    const checked = repos.slice(0, 5);
-    const unreachable: string[] = [];
-    for (const repo of checked) {
-        try {
-            const res = await fetch(`https://api.github.com/repos/${repo}`, {
-                headers: {
-                    Authorization: `Bearer ${token}`,
-                    Accept: 'application/vnd.github+json',
-                    'X-GitHub-Api-Version': '2022-11-28',
-                },
-                signal: AbortSignal.timeout(8_000),
-            });
-            if (!res.ok) {
-                unreachable.push(`${repo} (${res.status})`);
-            }
-        } catch {
-            unreachable.push(`${repo} (network error)`);
+    const usingProvidersArray = Array.isArray(git.providers) && git.providers.length > 0;
+    if (!usingProvidersArray) {
+        // Legacy GitHub shorthand (git.org + git.api_token). Give targeted hints.
+        const token = git.api_token ?? process.env.GITHUB_TOKEN ?? '';
+        const org = git.org ?? '';
+        if (!org && !token) {
+            return [
+                fail(
+                    'Git providers',
+                    'No git providers configured',
+                    'Add connectors.git.providers[] (bitbucket/gitlab/github), or set git.org + git.api_token for the GitHub shorthand.',
+                ),
+            ];
+        }
+        if (!token) {
+            return [
+                fail(
+                    'Git providers',
+                    'GitHub shorthand configured but no API token',
+                    'Set connectors.git.api_token in config or export GITHUB_TOKEN=<token>.',
+                ),
+            ];
+        }
+        if (!org) {
+            return [
+                fail(
+                    'Git providers',
+                    'GitHub shorthand configured but no org',
+                    'Set connectors.git.org to your GitHub org login.',
+                ),
+            ];
         }
     }
 
-    if (unreachable.length > 0) {
-        return fail(
-            'Git repos',
-            `${unreachable.length} repo(s) unreachable: ${unreachable.join(', ')}`,
-            'Verify repo names and that the token has repo read access.',
-        );
+    const providerConfigs = resolveGitProviderConfigs(git);
+    if (providerConfigs.length === 0) {
+        return [
+            fail(
+                'Git providers',
+                'No valid git providers configured',
+                'Each connectors.git.providers[] entry needs a "type" of github, bitbucket, or gitlab.',
+            ),
+        ];
     }
-    const suffix = repos.length > checked.length ? ` (first ${checked.length} checked)` : '';
-    return pass('Git repos', `${repos.length} repo(s) configured and reachable${suffix}`);
+
+    const results: CheckResult[] = [];
+    for (const pc of providerConfigs) {
+        results.push(await checkOneGitProvider(pc));
+    }
+    return results;
 }
 
 async function checkSummaryModel(config: GovProxyConfig): Promise<CheckResult> {
@@ -440,7 +544,7 @@ export async function runDoctor(
     checks.push(await checkCopilotAccess(config));
     checks.push(await checkAnthropicKey(config));
     checks.push(await checkWindsurfKey(config));
-    checks.push(await checkGitRepos(config));
+    checks.push(...(await checkGitProviders(config)));
     checks.push(await checkSummaryModel(config));
 
     let allPassed = true;

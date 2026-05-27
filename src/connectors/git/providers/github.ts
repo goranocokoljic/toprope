@@ -188,6 +188,10 @@ export class GitHubProvider implements GitProvider {
         return !this.excludeRepos.some((p) => p === repoName || globMatch(p, repoName));
     }
 
+    async checkAccess(): Promise<void> {
+        await fetchGitHub(`${BASE_URL}/orgs/${this.org}/repos?per_page=1`, this.authHeaders);
+    }
+
     async listRepos(): Promise<GitRepo[]> {
         const repos: GitRepo[] = [];
         let nextUrl: string | null =
