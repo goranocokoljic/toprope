@@ -39,6 +39,11 @@ export interface GitConnectorConfig extends ConnectorBaseConfig {
     api_token?: string;
     repos?: string[];
     analysis?: GitAnalysisConfig;
+    // Multi-provider configuration — each entry is a full provider config
+    // (GitProviderConfig from providers/types). Using unknown[] here avoids
+    // importing provider types into the config layer at load time; the sync
+    // orchestrator casts and validates via the provider factory.
+    providers?: unknown[];
 }
 
 export interface ConnectorsConfig {

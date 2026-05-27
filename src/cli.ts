@@ -436,9 +436,10 @@ syncCommand
 
 syncCommand
     .command('git')
-    .description('Pull commit and PR data from GitHub repos')
+    .description('Pull commit and PR data from configured git providers')
     .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
-    .action(async (options: {config: string}) => {
+    .option('--provider <type>', 'Only sync a specific provider (github, bitbucket, gitlab). Note: partial re-runs overwrite any existing multi-provider snapshot for the same developer+day.')
+    .action(async (options: {config: string; provider?: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const config = loadConfig(configPath);
         const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
@@ -447,7 +448,7 @@ syncCommand
         try {
             runMigrations(db, MIGRATIONS_DIR);
             const syncer = new GitSync(config.connectors.git);
-            const result = await syncer.sync(db);
+            const result = await syncer.sync(db, options.provider);
             console.log(
                 `[git] sync complete — ${result.snapshotsWritten} written, ${result.snapshotsSkipped} skipped`,
             );

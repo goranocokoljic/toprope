@@ -1,51 +1,47 @@
 import {describe, it, expect} from 'vitest';
 import {scoreAiSignature} from '../../../src/connectors/git/ai-signature';
-import type {GitCommit} from '../../../src/connectors/git/client';
+import type {AnalysisCommit} from '../../../src/connectors/git/analysis-types';
 
-function makeCommit(overrides: Partial<GitCommit> = {}): GitCommit {
+function makeCommit(overrides: Partial<AnalysisCommit> = {}): AnalysisCommit {
     return {
         sha: 'abc123',
-        author_login: 'alice',
-        author_email: 'alice@example.com',
-        author_date: '2024-01-15T10:00:00Z',
+        authorLogin: 'alice',
+        authorEmail: 'alice@example.com',
+        date: '2024-01-15T10:00:00Z',
         message: 'feat: add feature',
         additions: 20,
         deletions: 5,
-        files_changed: 2,
-        files: [
-            {filename: 'src/foo.ts', additions: 10, deletions: 5, changes: 15, status: 'modified'},
-            {filename: 'src/bar.ts', additions: 10, deletions: 0, changes: 10, status: 'modified'},
+        fileDiffs: [
+            {path: 'src/foo.ts', additions: 10, deletions: 5, status: 'modified'},
+            {path: 'src/bar.ts', additions: 10, deletions: 0, status: 'modified'},
         ],
         ...overrides,
     };
 }
 
-function makeAiPatternedCommit(): GitCommit {
+function makeAiPatternedCommit(): AnalysisCommit {
     // Simulate a large AI-generated commit: many new files, high additions, zero deletions
-    const files = Array.from({length: 8}, (_, i) => ({
-        filename: `src/module${i}.ts`,
+    const fileDiffs = Array.from({length: 8}, (_, i) => ({
+        path: `src/module${i}.ts`,
         additions: 80,
         deletions: 0,
-        changes: 80,
         status: 'added',
     }));
     return makeCommit({
         additions: 640,
         deletions: 0,
-        files_changed: 8,
-        files,
+        fileDiffs,
         message: 'feat: generate comprehensive service layer with full error handling',
     });
 }
 
-function makeNormalCommit(): GitCommit {
+function makeNormalCommit(): AnalysisCommit {
     return makeCommit({
         additions: 15,
         deletions: 8,
-        files_changed: 2,
-        files: [
-            {filename: 'src/foo.ts', additions: 10, deletions: 5, changes: 15, status: 'modified'},
-            {filename: 'src/bar.ts', additions: 5, deletions: 3, changes: 8, status: 'modified'},
+        fileDiffs: [
+            {path: 'src/foo.ts', additions: 10, deletions: 5, status: 'modified'},
+            {path: 'src/bar.ts', additions: 5, deletions: 3, status: 'modified'},
         ],
         message: 'fix: correct null check in auth middleware',
     });
@@ -82,12 +78,10 @@ describe('scoreAiSignature', () => {
         const commit = makeCommit({
             additions: 400,
             deletions: 10,
-            files_changed: 5,
-            files: Array.from({length: 5}, (_, i) => ({
-                filename: `src/x${i}.ts`,
+            fileDiffs: Array.from({length: 5}, (_, i) => ({
+                path: `src/x${i}.ts`,
                 additions: 80,
                 deletions: 2,
-                changes: 82,
                 status: 'modified',
             })),
         });
@@ -96,14 +90,13 @@ describe('scoreAiSignature', () => {
     });
 
     it('detects bulk new files signal', () => {
-        const files = Array.from({length: 6}, (_, i) => ({
-            filename: `src/new${i}.ts`,
+        const fileDiffs = Array.from({length: 6}, (_, i) => ({
+            path: `src/new${i}.ts`,
             additions: 50,
             deletions: 0,
-            changes: 50,
             status: 'added',
         }));
-        const commit = makeCommit({files, additions: 300, deletions: 0, files_changed: 6});
+        const commit = makeCommit({fileDiffs, additions: 300, deletions: 0});
         const result = scoreAiSignature(commit);
         expect(result.signals.some((s) => s.startsWith('bulk_new_files'))).toBe(true);
     });
@@ -112,8 +105,7 @@ describe('scoreAiSignature', () => {
         const commit = makeCommit({
             additions: 5,
             deletions: 2,
-            files_changed: 1,
-            files: [{filename: 'src/foo.ts', additions: 5, deletions: 2, changes: 7, status: 'modified'}],
+            fileDiffs: [{path: 'src/foo.ts', additions: 5, deletions: 2, status: 'modified'}],
         });
         const result = scoreAiSignature(commit);
         expect(result.estimated_score).toBe(0);

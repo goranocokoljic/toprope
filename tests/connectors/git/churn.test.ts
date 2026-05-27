@@ -1,20 +1,19 @@
 import {describe, it, expect} from 'vitest';
 import {calculateChurnRate, calculateDailyChurnRates} from '../../../src/connectors/git/churn';
-import type {GitCommit} from '../../../src/connectors/git/client';
+import type {AnalysisCommit} from '../../../src/connectors/git/analysis-types';
 
-function makeCommit(overrides: Partial<GitCommit> & {files?: GitCommit['files']} = {}): GitCommit {
+function makeCommit(overrides: Partial<AnalysisCommit> = {}): AnalysisCommit {
     return {
         sha: 'abc123',
-        author_login: 'alice',
-        author_email: 'alice@example.com',
-        author_date: '2024-01-15T10:00:00Z',
+        authorLogin: 'alice',
+        authorEmail: 'alice@example.com',
+        date: '2024-01-15T10:00:00Z',
         message: 'feat: add feature',
         additions: 50,
         deletions: 10,
-        files_changed: 2,
-        files: [
-            {filename: 'src/foo.ts', additions: 30, deletions: 5, changes: 35, status: 'modified'},
-            {filename: 'src/bar.ts', additions: 20, deletions: 5, changes: 25, status: 'modified'},
+        fileDiffs: [
+            {path: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'},
+            {path: 'src/bar.ts', additions: 20, deletions: 5, status: 'modified'},
         ],
         ...overrides,
     };
@@ -25,13 +24,13 @@ describe('calculateChurnRate', () => {
         const commits = [
             makeCommit({
                 sha: 'c1',
-                author_date: '2024-01-15T10:00:00Z',
-                files: [{filename: 'src/foo.ts', additions: 10, deletions: 5, changes: 15, status: 'modified'}],
+                date: '2024-01-15T10:00:00Z',
+                fileDiffs: [{path: 'src/foo.ts', additions: 10, deletions: 5, status: 'modified'}],
             }),
             makeCommit({
                 sha: 'c2',
-                author_date: '2024-01-16T10:00:00Z',
-                files: [{filename: 'src/bar.ts', additions: 20, deletions: 5, changes: 25, status: 'modified'}],
+                date: '2024-01-16T10:00:00Z',
+                fileDiffs: [{path: 'src/bar.ts', additions: 20, deletions: 5, status: 'modified'}],
             }),
         ];
 
@@ -43,13 +42,13 @@ describe('calculateChurnRate', () => {
         const commits = [
             makeCommit({
                 sha: 'c1',
-                author_date: '2024-01-15T10:00:00Z',
-                files: [{filename: 'src/foo.ts', additions: 10, deletions: 0, changes: 10, status: 'modified'}],
+                date: '2024-01-15T10:00:00Z',
+                fileDiffs: [{path: 'src/foo.ts', additions: 10, deletions: 0, status: 'modified'}],
             }),
             makeCommit({
                 sha: 'c2',
-                author_date: '2024-01-15T20:00:00Z', // 10 hours later — within 48h window
-                files: [{filename: 'src/foo.ts', additions: 5, deletions: 5, changes: 10, status: 'modified'}],
+                date: '2024-01-15T20:00:00Z', // 10 hours later — within 48h window
+                fileDiffs: [{path: 'src/foo.ts', additions: 5, deletions: 5, status: 'modified'}],
             }),
         ];
 
@@ -62,13 +61,13 @@ describe('calculateChurnRate', () => {
         const commits = [
             makeCommit({
                 sha: 'c1',
-                author_date: '2024-01-01T00:00:00Z',
-                files: [{filename: 'src/foo.ts', additions: 10, deletions: 0, changes: 10, status: 'modified'}],
+                date: '2024-01-01T00:00:00Z',
+                fileDiffs: [{path: 'src/foo.ts', additions: 10, deletions: 0, status: 'modified'}],
             }),
             makeCommit({
                 sha: 'c2',
-                author_date: '2024-01-05T00:00:00Z', // 4 days later — outside 48h window
-                files: [{filename: 'src/foo.ts', additions: 10, deletions: 0, changes: 10, status: 'modified'}],
+                date: '2024-01-05T00:00:00Z', // 4 days later — outside 48h window
+                fileDiffs: [{path: 'src/foo.ts', additions: 10, deletions: 0, status: 'modified'}],
             }),
         ];
 
@@ -81,13 +80,13 @@ describe('calculateChurnRate', () => {
         const commits = [
             makeCommit({
                 sha: 'c1',
-                author_date: '2024-01-15T00:00:00Z',
-                files: [{filename: 'src/foo.ts', additions: 10, deletions: 0, changes: 10, status: 'modified'}],
+                date: '2024-01-15T00:00:00Z',
+                fileDiffs: [{path: 'src/foo.ts', additions: 10, deletions: 0, status: 'modified'}],
             }),
             makeCommit({
                 sha: 'c2',
-                author_date: '2024-01-15T12:00:00Z', // 12 hours later
-                files: [{filename: 'src/foo.ts', additions: 5, deletions: 5, changes: 10, status: 'modified'}],
+                date: '2024-01-15T12:00:00Z', // 12 hours later
+                fileDiffs: [{path: 'src/foo.ts', additions: 5, deletions: 5, status: 'modified'}],
             }),
         ];
 
@@ -116,13 +115,13 @@ describe('calculateChurnRate', () => {
         const commits = [
             makeCommit({
                 sha: 'c1',
-                author_date: '2024-01-15T10:00:00Z',
-                files: [{filename: 'src/foo.ts', additions: 100, deletions: 0, changes: 100, status: 'modified'}],
+                date: '2024-01-15T10:00:00Z',
+                fileDiffs: [{path: 'src/foo.ts', additions: 100, deletions: 0, status: 'modified'}],
             }),
             makeCommit({
                 sha: 'c2',
-                author_date: '2024-01-15T12:00:00Z',
-                files: [{filename: 'src/foo.ts', additions: 50, deletions: 50, changes: 100, status: 'modified'}],
+                date: '2024-01-15T12:00:00Z',
+                fileDiffs: [{path: 'src/foo.ts', additions: 50, deletions: 50, status: 'modified'}],
             }),
         ];
 
@@ -139,13 +138,13 @@ describe('calculateDailyChurnRates', () => {
         const commits = [
             makeCommit({
                 sha: 'c1',
-                author_date: '2024-01-15T10:00:00Z',
-                files: [{filename: 'src/foo.ts', additions: 100, deletions: 0, changes: 100, status: 'modified'}],
+                date: '2024-01-15T10:00:00Z',
+                fileDiffs: [{path: 'src/foo.ts', additions: 100, deletions: 0, status: 'modified'}],
             }),
             makeCommit({
                 sha: 'c2',
-                author_date: '2024-01-16T06:00:00Z', // 20h later — within 48h, next day
-                files: [{filename: 'src/foo.ts', additions: 50, deletions: 0, changes: 50, status: 'modified'}],
+                date: '2024-01-16T06:00:00Z', // 20h later — within 48h, next day
+                fileDiffs: [{path: 'src/foo.ts', additions: 50, deletions: 0, status: 'modified'}],
             }),
         ];
 
@@ -158,13 +157,13 @@ describe('calculateDailyChurnRates', () => {
         const commits = [
             makeCommit({
                 sha: 'c1',
-                author_date: '2024-01-15T10:00:00Z',
-                files: [{filename: 'src/foo.ts', additions: 100, deletions: 0, changes: 100, status: 'modified'}],
+                date: '2024-01-15T10:00:00Z',
+                fileDiffs: [{path: 'src/foo.ts', additions: 100, deletions: 0, status: 'modified'}],
             }),
             makeCommit({
                 sha: 'c2',
-                author_date: '2024-01-18T10:00:00Z', // 72h later — outside 48h
-                files: [{filename: 'src/foo.ts', additions: 50, deletions: 0, changes: 50, status: 'modified'}],
+                date: '2024-01-18T10:00:00Z', // 72h later — outside 48h
+                fileDiffs: [{path: 'src/foo.ts', additions: 50, deletions: 0, status: 'modified'}],
             }),
         ];
 

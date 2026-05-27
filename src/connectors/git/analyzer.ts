@@ -1,6 +1,6 @@
-import type {GitCommit, GitPullRequest, GitReviewComment} from './client';
-import {calculateDailyChurnRates} from './churn';
-import {scoreAiSignature} from './ai-signature';
+import type {AnalysisCommit, AnalysisPR, AnalysisReviewComment} from './analysis-types.js';
+import {calculateDailyChurnRates} from './churn.js';
+import {scoreAiSignature} from './ai-signature.js';
 
 export interface DailyGitMetrics {
     developer_login: string;
@@ -29,19 +29,19 @@ function toDateString(isoDate: string): string {
 // Detect bursts across a developer's full commit stream (so bursts spanning
 // midnight are not split), attributing each burst to the day of its first
 // commit. Returns burst counts keyed by date.
-function detectBurstsByDate(commits: GitCommit[]): Map<string, number> {
+function detectBurstsByDate(commits: AnalysisCommit[]): Map<string, number> {
     const burstsByDate = new Map<string, number>();
     if (commits.length < COMMIT_BURST_MIN_COUNT) return burstsByDate;
 
     const sorted = [...commits].sort(
-        (a, b) => new Date(a.author_date).getTime() - new Date(b.author_date).getTime(),
+        (a, b) => new Date(a.date).getTime() - new Date(b.date).getTime(),
     );
-    const times = sorted.map((c) => new Date(c.author_date).getTime());
+    const times = sorted.map((c) => new Date(c.date).getTime());
     const windowMs = COMMIT_BURST_WINDOW_MINUTES * 60 * 1_000;
 
     for (let i = 0; i <= times.length - COMMIT_BURST_MIN_COUNT; i++) {
         if (times[i + COMMIT_BURST_MIN_COUNT - 1] - times[i] <= windowMs) {
-            const day = toDateString(sorted[i].author_date);
+            const day = toDateString(sorted[i].date);
             burstsByDate.set(day, (burstsByDate.get(day) ?? 0) + 1);
             // Skip past all commits in this burst to avoid double-counting overlapping windows
             const burstEnd = times[i] + windowMs;
@@ -73,20 +73,20 @@ function emptyMetrics(login: string, date: string): DailyGitMetrics {
 }
 
 export function aggregateDailyMetrics(
-    commits: GitCommit[],
-    pullRequests: GitPullRequest[],
+    commits: AnalysisCommit[],
+    pullRequests: AnalysisPR[],
     churnWindowHours = 48,
-    reviewComments: GitReviewComment[] = [],
+    reviewComments: AnalysisReviewComment[] = [],
 ): Map<string, Map<string, DailyGitMetrics>> {
     // Map: login -> date -> metrics
     const result = new Map<string, Map<string, DailyGitMetrics>>();
 
     // Group commits by login and date
-    const commitsByLoginDate = new Map<string, Map<string, GitCommit[]>>();
+    const commitsByLoginDate = new Map<string, Map<string, AnalysisCommit[]>>();
     for (const commit of commits) {
-        const login = commit.author_login;
+        const login = commit.authorLogin;
         if (!login) continue;
-        const date = toDateString(commit.author_date);
+        const date = toDateString(commit.date);
 
         if (!commitsByLoginDate.has(login)) commitsByLoginDate.set(login, new Map());
         const byDate = commitsByLoginDate.get(login)!;
@@ -96,9 +96,9 @@ export function aggregateDailyMetrics(
 
     // Group all commits per login for burst detection and windowed churn
     // (both need the full cross-day commit stream, not just one day's commits)
-    const allCommitsByLogin = new Map<string, GitCommit[]>();
+    const allCommitsByLogin = new Map<string, AnalysisCommit[]>();
     for (const commit of commits) {
-        const login = commit.author_login;
+        const login = commit.authorLogin;
         if (!login) continue;
         if (!allCommitsByLogin.has(login)) allCommitsByLogin.set(login, []);
         allCommitsByLogin.get(login)!.push(commit);
@@ -120,7 +120,7 @@ export function aggregateDailyMetrics(
         for (const [date, dayCommits] of byDate) {
             const totalAdded = dayCommits.reduce((s, c) => s + c.additions, 0);
             const totalRemoved = dayCommits.reduce((s, c) => s + c.deletions, 0);
-            const totalFiles = dayCommits.reduce((s, c) => s + c.files_changed, 0);
+            const totalFiles = dayCommits.reduce((s, c) => s + c.fileDiffs.length, 0);
             const avgCommitSize = dayCommits.length > 0 ? (totalAdded + totalRemoved) / dayCommits.length : 0;
 
             const churnRate = churnByDate?.get(date) ?? 0;
@@ -163,10 +163,10 @@ export function aggregateDailyMetrics(
 
     // Process PR metrics
     for (const pr of pullRequests) {
-        const login = pr.author_login;
+        const login = pr.authorLogin;
         if (!login) continue;
 
-        const openedDate = toDateString(pr.created_at);
+        const openedDate = toDateString(pr.createdAt);
         if (!result.has(login)) result.set(login, new Map());
         const devMetrics = result.get(login)!;
 
@@ -181,10 +181,10 @@ export function aggregateDailyMetrics(
         }
 
         // prs_merged and time-to-merge on merged date
-        if (pr.merged_at) {
-            const mergedDate = toDateString(pr.merged_at);
+        if (pr.mergedAt) {
+            const mergedDate = toDateString(pr.mergedAt);
             const timeToMergeHours =
-                (new Date(pr.merged_at).getTime() - new Date(pr.created_at).getTime()) /
+                (new Date(pr.mergedAt).getTime() - new Date(pr.createdAt).getTime()) /
                 (1000 * 3600);
 
             if (!devMetrics.has(mergedDate)) {
@@ -209,10 +209,10 @@ export function aggregateDailyMetrics(
     // Attribute review comments to the developer who wrote them, on the day
     // the comment was made (a reviewer's activity, not the PR author's).
     for (const comment of reviewComments) {
-        const login = comment.author_login;
+        const login = comment.authorLogin;
         if (!login) continue;
 
-        const date = toDateString(comment.created_at);
+        const date = toDateString(comment.createdAt);
         if (!result.has(login)) result.set(login, new Map());
         const devMetrics = result.get(login)!;
 
