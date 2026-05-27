@@ -1,4 +1,4 @@
-import type {GitCommit} from './client';
+import type {AnalysisCommit} from './analysis-types.js';
 
 export interface AiSignatureResult {
     estimated_score: number;
@@ -13,8 +13,8 @@ const BULK_ERROR_HANDLING_THRESHOLD = 10;
 const ERROR_HANDLING_PATTERN = /\b(try|catch|throw|Error|exception|handleError|onError)\b/gi;
 const BOILERPLATE_EXTENSIONS = ['.ts', '.js', '.py', '.java', '.go', '.cs'];
 
-function isBoilerplateExtension(filename: string): boolean {
-    return BOILERPLATE_EXTENSIONS.some((ext) => filename.endsWith(ext));
+function isBoilerplateExtension(path: string): boolean {
+    return BOILERPLATE_EXTENSIONS.some((ext) => path.endsWith(ext));
 }
 
 function countErrorHandlingLines(message: string): number {
@@ -22,18 +22,19 @@ function countErrorHandlingLines(message: string): number {
     return matches?.length ?? 0;
 }
 
-export function scoreAiSignature(commit: GitCommit): AiSignatureResult {
+export function scoreAiSignature(commit: AnalysisCommit): AiSignatureResult {
     const signals: string[] = [];
     let score = 0;
 
+    const filesChanged = commit.fileDiffs.length;
     const totalLines = commit.additions + commit.deletions;
-    const newFiles = commit.files.filter((f) => f.status === 'added');
-    const boilerplateNewFiles = newFiles.filter((f) => isBoilerplateExtension(f.filename));
+    const newFiles = commit.fileDiffs.filter((f) => f.status === 'added');
+    const boilerplateNewFiles = newFiles.filter((f) => isBoilerplateExtension(f.path));
 
     // Signal 1: Very large commit with many additions
-    if (commit.additions >= LARGE_COMMIT_ADDITIONS_THRESHOLD && commit.files_changed >= 3) {
+    if (commit.additions >= LARGE_COMMIT_ADDITIONS_THRESHOLD && filesChanged >= 3) {
         score += 25;
-        signals.push(`large_commit:${commit.additions}_additions_${commit.files_changed}_files`);
+        signals.push(`large_commit:${commit.additions}_additions_${filesChanged}_files`);
     }
 
     // Signal 2: Multiple new boilerplate files in single commit
@@ -44,24 +45,24 @@ export function scoreAiSignature(commit: GitCommit): AiSignatureResult {
 
     // Signal 3: Bulk error handling additions in commit message or large ratio of error handling
     const errorHandlingCount = countErrorHandlingLines(commit.message);
-    const avgAdditionsPerFile = commit.files_changed > 0 ? commit.additions / commit.files_changed : 0;
+    const avgAdditionsPerFile = filesChanged > 0 ? commit.additions / filesChanged : 0;
     if (
         errorHandlingCount >= BULK_ERROR_HANDLING_THRESHOLD ||
-        (avgAdditionsPerFile > 50 && commit.additions > 200 && commit.files_changed > 3)
+        (avgAdditionsPerFile > 50 && commit.additions > 200 && filesChanged > 3)
     ) {
         score += 20;
         signals.push(`bulk_error_handling:${errorHandlingCount}_mentions`);
     }
 
     // Signal 4: High additions with very few deletions (new code only — typical of AI generation)
-    if (totalLines > 500 && commit.deletions === 0 && commit.files_changed >= 3) {
+    if (totalLines > 500 && commit.deletions === 0 && filesChanged >= 3) {
         score += 15;
         signals.push(`zero_deletions_large:${totalLines}_lines`);
     }
 
     // Signal 5: Uniformly large files (consistent generation pattern)
-    if (commit.files.length >= 3) {
-        const perFileAdditions = commit.files.map((f) => f.additions);
+    if (commit.fileDiffs.length >= 3) {
+        const perFileAdditions = commit.fileDiffs.map((f) => f.additions);
         const min = Math.min(...perFileAdditions);
         const max = Math.max(...perFileAdditions);
         // All files within 20% of each other and all large
