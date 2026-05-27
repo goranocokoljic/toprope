@@ -135,6 +135,32 @@ describe('createGitProvider', () => {
             });
             expect(provider.name).toBe('gitlab');
         });
+
+        it('accepts valid https url', () => {
+            const provider = createGitProvider({
+                ...validGitLab,
+                url: 'https://gitlab.example.com',
+            });
+            expect(provider.name).toBe('gitlab');
+        });
+
+        it('throws when url is not a valid URL', () => {
+            expect(() =>
+                createGitProvider({
+                    ...validGitLab,
+                    url: 'not-a-url',
+                }),
+            ).toThrow('GitLab provider url must be a valid URL');
+        });
+
+        it('throws when url uses a non-http scheme', () => {
+            expect(() =>
+                createGitProvider({
+                    ...validGitLab,
+                    url: 'ftp://gitlab.example.com',
+                }),
+            ).toThrow('GitLab provider url must use http or https scheme');
+        });
     });
 
     describe('invalid provider type', () => {

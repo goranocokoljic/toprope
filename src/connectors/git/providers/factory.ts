@@ -43,6 +43,17 @@ function validateGitLab(config: GitLabProviderConfig): void {
     if (!config.auth?.token) {
         throw new Error('GitLab provider requires auth.token');
     }
+    if (config.url !== undefined) {
+        let parsed: URL;
+        try {
+            parsed = new URL(config.url);
+        } catch {
+            throw new Error('GitLab provider url must be a valid URL');
+        }
+        if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+            throw new Error('GitLab provider url must use http or https scheme');
+        }
+    }
 }
 
 export function createGitProvider(config: GitProviderConfig): GitProvider {

@@ -170,8 +170,8 @@ export class GitLabProvider implements GitProvider {
 
     constructor(config: GitLabProviderConfig) {
         this.group = config.group;
-        const rawUrl = (config.url ?? DEFAULT_BASE_URL).replace(/\/$/, '');
-        this.baseUrl = rawUrl.includes('/api/') ? rawUrl : `${rawUrl}/api/v4`;
+        // config.url is the base host (e.g. "https://gitlab.example.com"); always append /api/v4
+        this.baseUrl = (config.url ?? DEFAULT_BASE_URL).replace(/\/$/, '').replace(/\/api\/v4$/, '') + '/api/v4';
         this.authHeaders = buildAuthHeaders(config.auth);
         this.includeRepos = config.repos ?? [];
         this.includeSubgroups = config.include_subgroups ?? false;
@@ -189,16 +189,15 @@ export class GitLabProvider implements GitProvider {
         );
     }
 
-    private encodedGroup(): string {
-        return encodeURIComponent(this.group);
-    }
-
     private projectPath(repo: string): string {
         return encodeURIComponent(repo);
     }
 
     async listRepos(): Promise<GitRepo[]> {
-        let baseUrl = `${this.baseUrl}/groups/${this.encodedGroup()}/projects?include_archived=false&per_page=${PER_PAGE}`;
+        // name is path_with_namespace (e.g. "group/repo") rather than the short slug so that
+        // getCommits/getPullRequests etc. can URL-encode the full path and reach subgroup projects.
+        // name === fullName is intentional: GitLab has no separate "slug" vs "full name" distinction.
+        let baseUrl = `${this.baseUrl}/groups/${encodeURIComponent(this.group)}/projects?include_archived=false&per_page=${PER_PAGE}`;
         if (this.includeSubgroups) {
             baseUrl += '&include_subgroups=true';
         }
@@ -251,17 +250,15 @@ export class GitLabProvider implements GitProvider {
         }
 
         const commits: GitCommit[] = [];
-        let lastDiffError: Error | null = null;
         for (const c of raw) {
             let diffs: GitFileDiff[] = [];
             try {
                 diffs = await this.getCommitDiff(repo, c.id);
             } catch (err) {
                 const msg = err instanceof Error ? err.message : String(err);
-                if (!msg.includes(' 404:')) {
-                    lastDiffError = err instanceof Error ? err : new Error(msg);
-                    throw lastDiffError;
-                }
+                // Re-throw systemic errors (auth failure, server error); silently swallow 404
+                // (GitLab may return 404 for diffs on certain commits, e.g. initial commits)
+                if (!msg.includes(' 404:')) throw err;
             }
 
             commits.push({
@@ -269,6 +266,7 @@ export class GitLabProvider implements GitProvider {
                 author: {
                     name: c.author_name,
                     email: c.author_email,
+                    // GitLab commit API does not expose usernames; only MR authors have usernames
                     username: '',
                 },
                 date: c.authored_date,

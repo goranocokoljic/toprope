@@ -204,6 +204,7 @@ describe('GitLabProvider', () => {
         });
 
         it('does not double-append /api/v4 when URL already contains it', async () => {
+            // The constructor strips any trailing /api/v4 before appending, so both forms work
             const p = new GitLabProvider({
                 ...CONFIG_PAT,
                 url: 'https://gitlab.example.com/api/v4',
@@ -214,6 +215,7 @@ describe('GitLabProvider', () => {
             await p.listRepos();
 
             const [url] = fetchMock.mock.calls[0] as [string];
+            expect(url).toContain('https://gitlab.example.com/api/v4');
             expect(url).not.toContain('/api/v4/api/v4');
         });
     });
