@@ -178,32 +178,9 @@ describe('runDoctor', () => {
         }
     });
 
-    it('fails git repos check when git enabled but no repos configured', async () => {
+    it('fails git providers check when nothing is configured', async () => {
         const config = disabledConfig();
-        (config.connectors.git as {enabled: boolean; api_token: string; repos: string[]}).enabled =
-            true;
-        (config.connectors.git as {enabled: boolean; api_token: string; repos: string[]}).api_token =
-            'ghp_fake';
-        (config.connectors.git as {enabled: boolean; api_token: string; repos: string[]}).repos = [];
-
-        const result = await runDoctor(db, config, tmpConfigPath, MIGRATIONS_DIR);
-        expect(result).toBe(false);
-        const allOutput = [...output, ...errors].join('\n');
-        expect(allOutput).toContain('Git repos');
-        expect(allOutput).toContain('No repos configured');
-    });
-
-    it('fails git repos check when git enabled but no token', async () => {
-        const config = disabledConfig();
-        (
-            config.connectors.git as {enabled: boolean; api_token?: string; repos: string[]}
-        ).enabled = true;
-        (
-            config.connectors.git as {enabled: boolean; api_token?: string; repos: string[]}
-        ).repos = ['owner/repo'];
-        (
-            config.connectors.git as {enabled: boolean; api_token?: string; repos: string[]}
-        ).api_token = undefined;
+        (config.connectors.git as {enabled: boolean}).enabled = true;
 
         const savedToken = process.env.GITHUB_TOKEN;
         delete process.env.GITHUB_TOKEN;
@@ -212,11 +189,48 @@ describe('runDoctor', () => {
             const result = await runDoctor(db, config, tmpConfigPath, MIGRATIONS_DIR);
             expect(result).toBe(false);
             const allOutput = [...output, ...errors].join('\n');
-            expect(allOutput).toContain('Git repos');
-            expect(allOutput).toContain('No API token');
+            expect(allOutput).toContain('Git providers');
+            expect(allOutput).toContain('No git providers configured');
         } finally {
             if (savedToken !== undefined) process.env.GITHUB_TOKEN = savedToken;
         }
+    });
+
+    it('fails git providers check when github shorthand has org but no token', async () => {
+        const config = disabledConfig();
+        (config.connectors.git as {enabled: boolean; org: string; api_token?: string}).enabled = true;
+        (config.connectors.git as {enabled: boolean; org: string; api_token?: string}).org = 'myorg';
+        (config.connectors.git as {enabled: boolean; org: string; api_token?: string}).api_token =
+            undefined;
+
+        const savedToken = process.env.GITHUB_TOKEN;
+        delete process.env.GITHUB_TOKEN;
+
+        try {
+            const result = await runDoctor(db, config, tmpConfigPath, MIGRATIONS_DIR);
+            expect(result).toBe(false);
+            const allOutput = [...output, ...errors].join('\n');
+            expect(allOutput).toContain('Git providers');
+            expect(allOutput).toContain('no API token');
+        } finally {
+            if (savedToken !== undefined) process.env.GITHUB_TOKEN = savedToken;
+        }
+    });
+
+    it('fails per-provider git check when a providers[] entry is missing required fields', async () => {
+        const config = disabledConfig();
+        // Bitbucket entry without a workspace — factory validation rejects it
+        // synchronously, so this exercises the provider-aware path with no network.
+        (config.connectors.git as {enabled: boolean; providers: unknown[]}).enabled = true;
+        (config.connectors.git as {enabled: boolean; providers: unknown[]}).providers = [
+            {type: 'bitbucket', auth: {type: 'app_password', username: 'u', app_password: 'p'}},
+        ];
+
+        const result = await runDoctor(db, config, tmpConfigPath, MIGRATIONS_DIR);
+        expect(result).toBe(false);
+        const allOutput = [...output, ...errors].join('\n');
+        expect(allOutput).toContain('Git: bitbucket');
+        expect(allOutput).toContain('workspace');
     });
 
     it('skips summary model check when summaries disabled', async () => {

@@ -31,17 +31,42 @@ function rowToDeveloper(row: DeveloperRow): Developer {
     };
 }
 
+// Optional git identities that can be attached to a developer for commit/PR
+// attribution across providers.
+export interface DeveloperIdentities {
+    bitbucket?: string;
+    gitlab?: string;
+    gitEmails?: string[];
+}
+
+// Normalize a set of git emails into a deduped, lowercased comma-separated string.
+function joinGitEmails(emails: string[]): string {
+    const seen = new Set<string>();
+    for (const e of emails) {
+        const trimmed = e.trim().toLowerCase();
+        if (trimmed) seen.add(trimmed);
+    }
+    return [...seen].join(',');
+}
+
 export function addDeveloper(
     db: Database.Database,
     name: string,
     team: string,
     email?: string,
     github?: string,
+    identities?: DeveloperIdentities,
 ): Developer {
     const id = randomUUID();
     const now = new Date().toISOString();
     const externalIds: ExternalIds = {};
     if (github) externalIds.github = github;
+    if (identities?.bitbucket) externalIds.bitbucket = identities.bitbucket;
+    if (identities?.gitlab) externalIds.gitlab = identities.gitlab;
+    if (identities?.gitEmails && identities.gitEmails.length > 0) {
+        const joined = joinGitEmails(identities.gitEmails);
+        if (joined) externalIds.git_emails = joined;
+    }
 
     db.prepare(
         'INSERT INTO developers (id, name, email, team, external_ids, created_at) VALUES (?, ?, ?, ?, ?, ?)',
@@ -71,18 +96,36 @@ export function findByGithubUsername(db: Database.Database, github: string): Dev
     return null;
 }
 
+export interface LinkUpdates {
+    github?: string;
+    copilot?: string;
+    claude?: string;
+    windsurf?: string;
+    bitbucket?: string;
+    gitlab?: string;
+    // Additional git commit emails; appended to any existing ones.
+    gitEmails?: string[];
+}
+
 export function linkDeveloper(
     db: Database.Database,
     id: string,
-    updates: Partial<Pick<ExternalIds, 'copilot' | 'claude' | 'windsurf'>>,
+    updates: LinkUpdates,
 ): Developer | null {
     const row = db.prepare('SELECT * FROM developers WHERE id = ?').get(id) as DeveloperRow | undefined;
     if (!row) return null;
 
     const existing = parseExternalIds(row.external_ids);
+    if (updates.github !== undefined) existing.github = updates.github;
     if (updates.copilot !== undefined) existing.copilot = updates.copilot;
     if (updates.claude !== undefined) existing.claude = updates.claude;
     if (updates.windsurf !== undefined) existing.windsurf = updates.windsurf;
+    if (updates.bitbucket !== undefined) existing.bitbucket = updates.bitbucket;
+    if (updates.gitlab !== undefined) existing.gitlab = updates.gitlab;
+    if (updates.gitEmails && updates.gitEmails.length > 0) {
+        const current = existing.git_emails ? existing.git_emails.split(',') : [];
+        existing.git_emails = joinGitEmails([...current, ...updates.gitEmails]);
+    }
 
     db.prepare('UPDATE developers SET external_ids = ? WHERE id = ?').run(
         JSON.stringify(existing),

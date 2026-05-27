@@ -53,6 +53,28 @@ describe('addDeveloper', () => {
         expect(dev.external_ids).toEqual({});
     });
 
+    it('stores bitbucket and gitlab identities', () => {
+        const dev = addDeveloper(db, 'Dana', 'frontend', 'dana@x.com', undefined, {
+            bitbucket: 'dana-bb',
+            gitlab: 'dana-gl',
+        });
+        expect(dev.external_ids.bitbucket).toBe('dana-bb');
+        expect(dev.external_ids.gitlab).toBe('dana-gl');
+        expect(dev.external_ids.github).toBeUndefined();
+    });
+
+    it('normalizes git emails (lowercase, dedupe) into a comma-separated list', () => {
+        const dev = addDeveloper(db, 'Dana', 'frontend', undefined, undefined, {
+            gitEmails: ['Dana@Work.com', 'dana@work.com', 'dana@home.com'],
+        });
+        expect(dev.external_ids.git_emails).toBe('dana@work.com,dana@home.com');
+    });
+
+    it('omits git_emails when no git emails provided', () => {
+        const dev = addDeveloper(db, 'Dana', 'frontend', undefined, undefined, {bitbucket: 'd'});
+        expect(dev.external_ids.git_emails).toBeUndefined();
+    });
+
     it('generates a unique id for each developer', () => {
         const d1 = addDeveloper(db, 'Alice', 'frontend');
         const d2 = addDeveloper(db, 'Bob', 'frontend');
@@ -201,6 +223,27 @@ describe('linkDeveloper', () => {
 
     it('returns null for an unknown developer id', () => {
         expect(linkDeveloper(db, 'nonexistent', {copilot: 'x'})).toBeNull();
+    });
+
+    it('updates github, bitbucket, and gitlab identities', () => {
+        const dev = addDeveloper(db, 'Alice', 'frontend');
+        const updated = linkDeveloper(db, dev.id, {
+            github: 'alice-gh',
+            bitbucket: 'alice-bb',
+            gitlab: 'alice-gl',
+        });
+        expect(updated!.external_ids.github).toBe('alice-gh');
+        expect(updated!.external_ids.bitbucket).toBe('alice-bb');
+        expect(updated!.external_ids.gitlab).toBe('alice-gl');
+    });
+
+    it('appends and dedupes git emails across multiple link calls', () => {
+        const dev = addDeveloper(db, 'Alice', 'frontend', undefined, undefined, {
+            gitEmails: ['alice@work.com'],
+        });
+        linkDeveloper(db, dev.id, {gitEmails: ['Alice@Personal.com', 'alice@work.com']});
+        const updated = getDeveloperById(db, dev.id);
+        expect(updated!.external_ids.git_emails).toBe('alice@work.com,alice@personal.com');
     });
 });
 

@@ -4,6 +4,7 @@ import {aggregateDailyMetrics} from './analyzer.js';
 import {toAnalysisCommit, toAnalysisPR, toAnalysisReviewComment} from './analysis-types.js';
 import type {AnalysisCommit, AnalysisPR, AnalysisReviewComment} from './analysis-types.js';
 import {createGitProvider} from './providers/factory.js';
+import {resolveGitProviderConfigs} from './providers/config.js';
 import type {GitProviderConfig, GitProviderType, GitCommit, GitFileDiff, GitPR} from './providers/types.js';
 import type {ConnectorInterface, SyncResult} from '../types.js';
 import type {GitConnectorConfig} from '../../config/types.js';
@@ -69,8 +70,18 @@ function buildDevLookupMap(db: Database.Database): Map<string, string> {
         if (!row.external_ids) continue;
         try {
             const ext = JSON.parse(row.external_ids) as Record<string, string | undefined>;
-            for (const [provider, username] of Object.entries(ext)) {
-                if (username) map.set(`${provider}:${username}`, row.id);
+            for (const [key, value] of Object.entries(ext)) {
+                if (!value) continue;
+                // git_emails holds a comma-separated list of additional commit
+                // emails; register each as an email-lookup rather than a username.
+                if (key === 'git_emails') {
+                    for (const raw of value.split(',')) {
+                        const email = raw.trim().toLowerCase();
+                        if (email) map.set(`email:${email}`, row.id);
+                    }
+                    continue;
+                }
+                map.set(`${key}:${value}`, row.id);
             }
         } catch {
             // malformed external_ids — skip
@@ -465,25 +476,6 @@ export class GitSync implements ConnectorInterface {
     }
 
     private getProviderConfigs(): GitProviderConfig[] {
-        if (Array.isArray(this.config.providers) && this.config.providers.length > 0) {
-            // config.providers is unknown[] to avoid circular imports; validate minimally at runtime.
-            const valid = (this.config.providers as unknown[]).filter(
-                (p): p is GitProviderConfig =>
-                    typeof p === 'object' && p !== null && typeof (p as Record<string, unknown>).type === 'string',
-            );
-            return valid;
-        }
-
-        const token = this.config.api_token ?? process.env.GITHUB_TOKEN ?? '';
-        const org = this.config.org ?? '';
-        if (!token || !org) return [];
-
-        const legacy: GitProviderConfig = {
-            type: 'github',
-            org,
-            auth: {type: 'token', api_token: token},
-            repos: this.config.repos,
-        };
-        return [legacy];
+        return resolveGitProviderConfigs(this.config);
     }
 }
