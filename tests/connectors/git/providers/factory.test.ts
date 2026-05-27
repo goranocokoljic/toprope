@@ -127,17 +127,24 @@ describe('createGitProvider', () => {
         });
     });
 
-    describe('unimplemented provider methods', () => {
-        it('listRepos returns a rejected Promise, not a synchronous throw', async () => {
+    describe('provider method availability', () => {
+        it('github provider exposes all required GitProvider methods', () => {
             const provider = createGitProvider(validGitHub);
-            await expect(provider.listRepos()).rejects.toThrow('github provider not yet implemented');
+            expect(typeof provider.listRepos).toBe('function');
+            expect(typeof provider.getCommits).toBe('function');
+            expect(typeof provider.getPullRequests).toBe('function');
+            expect(typeof provider.getReviewComments).toBe('function');
+            expect(typeof provider.getCommitDiff).toBe('function');
         });
 
-        it('getCommits returns a rejected Promise', async () => {
-            const provider = createGitProvider(validGitHub);
-            await expect(provider.getCommits('repo', '2024-01-01', '2024-01-31')).rejects.toThrow(
-                'github provider not yet implemented',
-            );
+        it('bitbucket provider listRepos returns a rejected Promise', async () => {
+            const provider = createGitProvider(validBitbucket);
+            await expect(provider.listRepos()).rejects.toThrow('bitbucket provider not yet implemented');
+        });
+
+        it('gitlab provider listRepos returns a rejected Promise', async () => {
+            const provider = createGitProvider(validGitLab);
+            await expect(provider.listRepos()).rejects.toThrow('gitlab provider not yet implemented');
         });
     });
 });
