@@ -7,7 +7,7 @@ description: >-
   concatenates their sections into a single file in /reviews. With
   --post, it also publishes a summary + inline findings to the branch's
   GitHub PR. Diff scope is merge-base against a configurable base branch.
-argument-hint: "[anchor: what this change does and why — the bug/issue/feature being addressed] [--base <branch> (default: main)] [--post (publish to the GitHub PR)]"
+argument-hint: "[anchor: what this change does and why — the bug/issue/feature being addressed] [--base <branch> (default: develop)] [--post (publish to the GitHub PR)]"
 ---
 
 # Multi-Lens PR Review
@@ -101,7 +101,7 @@ Batch the independent commands into a single message.
 
 **Parse flags from `$ARGUMENTS`.**
 - If `$ARGUMENTS` contains `--base <branch>`, set `$BASE_BRANCH` to that
-  value and strip the token. Otherwise `$BASE_BRANCH=main`.
+  value and strip the token. Otherwise `$BASE_BRANCH=develop`.
 - If `$ARGUMENTS` contains `--post`, set `$POST=1` and strip the token.
   Otherwise `$POST=0`.
 - The remaining text is the anchor.
