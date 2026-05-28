@@ -13,6 +13,7 @@ dist/
 
 # Review artifacts
 reviews/
+.review-diff.patch
 
 # Logs
 *.log
