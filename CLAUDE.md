@@ -98,7 +98,7 @@ Server starts on port 8080. `GET /health` must always return `{"status":"ok"}`.
 Types: `feat` `fix` `chore` `test` `docs` `refactor`
 
 ## Merge strategy
-Squash merge into main. Always delete the branch after merge.
+Feature branches are cut from `develop` and squash-merged back into `develop` (always delete the branch after merge). `main` stays frozen — the user merges `develop` into `main` manually at the end of a phase.
 
 ## TypeScript rules
 - No `any` unless genuinely unavoidable — use `unknown` + narrowing instead
