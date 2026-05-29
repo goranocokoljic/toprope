@@ -1,5 +1,18 @@
 import crypto from 'crypto';
 import type {FastifyRequest, FastifyReply, FastifyInstance} from 'fastify';
+import {matchesPathPrefix} from '../paths';
+
+/**
+ * Paths reachable without the admin password.
+ * - /health: liveness probe.
+ * - /dashboard: the static SPA shell (HTML/JS/CSS/fonts). It carries no data;
+ *   the dashboard's data still comes from the auth-gated /api/* endpoints. The
+ *   shell must load unauthenticated so a future login page (Task 2.2) can be
+ *   served from it. Per-user session auth replaces this in Task 2.2 (#37).
+ */
+function isPublicPath(url: string): boolean {
+    return matchesPathPrefix(url, '/health') || matchesPathPrefix(url, '/dashboard');
+}
 
 export function registerAuthMiddleware(app: FastifyInstance, adminPassword: string | undefined): void {
     if (!adminPassword) {
@@ -10,7 +23,7 @@ export function registerAuthMiddleware(app: FastifyInstance, adminPassword: stri
     const expectedBuf = Buffer.from(adminPassword);
 
     app.addHook('onRequest', async (request: FastifyRequest, reply: FastifyReply) => {
-        if (request.url === '/health' || request.url.startsWith('/health?') || request.url.startsWith('/health/')) {
+        if (isPublicPath(request.url)) {
             return;
         }
 
