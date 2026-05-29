@@ -12,6 +12,10 @@ function makeDist(): string {
     return dir;
 }
 
+// Browsers send this on document navigations (deep links) but not on
+// script/style/fetch requests.
+const HTML_ACCEPT = {accept: 'text/html,application/xhtml+xml'};
+
 describe('Dashboard static serving', () => {
     let app: FastifyInstance;
     let distDir: string;
@@ -46,10 +50,17 @@ describe('Dashboard static serving', () => {
         expect(res.body).toContain('console.log');
     });
 
-    it('falls back to index.html for client-side deep links', async () => {
-        const res = await app.inject({method: 'GET', url: '/dashboard/manager'});
+    it('falls back to index.html for client-side deep links (HTML navigation)', async () => {
+        const res = await app.inject({method: 'GET', url: '/dashboard/manager', headers: HTML_ACCEPT});
         expect(res.statusCode).toBe(200);
         expect(res.body).toContain('id="root"');
+    });
+
+    it('returns a real 404 for missing assets instead of HTML', async () => {
+        const res = await app.inject({method: 'GET', url: '/dashboard/assets/missing.js'});
+        expect(res.statusCode).toBe(404);
+        expect(res.headers['content-type']).toContain('application/json');
+        expect(res.json()).toMatchObject({statusCode: 404, error: 'Not Found'});
     });
 
     it('still returns JSON 404 for unknown non-dashboard routes', async () => {
@@ -85,7 +96,7 @@ describe('Dashboard static serving', () => {
             expect(res.statusCode).toBe(404);
             expect(res.json()).toMatchObject({statusCode: 404, error: 'Not Found'});
             // No build → /dashboard paths get the same JSON 404, not HTML.
-            const dash = await noBuildApp.inject({method: 'GET', url: '/dashboard/manager'});
+            const dash = await noBuildApp.inject({method: 'GET', url: '/dashboard/manager', headers: HTML_ACCEPT});
             expect(dash.statusCode).toBe(404);
             expect(dash.headers['content-type']).toContain('application/json');
         } finally {
@@ -120,7 +131,7 @@ describe('Dashboard static serving under auth', () => {
     });
 
     it('serves SPA deep links without credentials', async () => {
-        const res = await app.inject({method: 'GET', url: '/dashboard/manager'});
+        const res = await app.inject({method: 'GET', url: '/dashboard/manager', headers: HTML_ACCEPT});
         expect(res.statusCode).toBe(200);
         expect(res.body).toContain('id="root"');
     });

@@ -14,6 +14,7 @@
         "build:web": "tsc --noEmit -p src/dashboard/frontend/tsconfig.json && vite build --config src/dashboard/frontend/vite.config.ts",
         "test": "vitest run",
         "lint": "eslint src tests --ext .ts",
+        "lint:web": "eslint src/dashboard/frontend --ext .ts,.tsx",
         "typecheck": "tsc --noEmit",
         "typecheck:web": "tsc --noEmit -p src/dashboard/frontend/tsconfig.json"
     },
@@ -48,6 +49,8 @@
         "autoprefixer": "^10.5.0",
         "concurrently": "^9.2.1",
         "eslint": "^8.57.0",
+        "eslint-plugin-react-hooks": "^4.6.2",
+        "eslint-plugin-react-refresh": "^0.4.26",
         "jsdom": "^25.0.1",
         "postcss": "^8.5.15",
         "prettier": "^3.4.2",

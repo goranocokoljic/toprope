@@ -1,16 +1,5 @@
-import {createContext, useCallback, useEffect, useMemo, useState, type ReactNode} from 'react';
-
-export type Theme = 'light' | 'dark';
-
-const STORAGE_KEY = 'govproxy-theme';
-
-export interface ThemeContextValue {
-    theme: Theme;
-    setTheme: (theme: Theme) => void;
-    toggleTheme: () => void;
-}
-
-export const ThemeContext = createContext<ThemeContextValue | undefined>(undefined);
+import {useCallback, useEffect, useMemo, useState, type ReactNode} from 'react';
+import {ThemeContext, THEME_STORAGE_KEY as STORAGE_KEY, type Theme, type ThemeContextValue} from './themeContext';
 
 function resolveInitialTheme(): Theme {
     if (typeof window === 'undefined') {

@@ -1,9 +1,6 @@
 import crypto from 'crypto';
 import type {FastifyRequest, FastifyReply, FastifyInstance} from 'fastify';
-
-function matchesPrefix(url: string, prefix: string): boolean {
-    return url === prefix || url.startsWith(`${prefix}/`) || url.startsWith(`${prefix}?`);
-}
+import {matchesPathPrefix} from '../paths';
 
 /**
  * Paths reachable without the admin password.
@@ -14,7 +11,7 @@ function matchesPrefix(url: string, prefix: string): boolean {
  *   served from it. Per-user session auth replaces this in Task 2.2 (#37).
  */
 function isPublicPath(url: string): boolean {
-    return matchesPrefix(url, '/health') || matchesPrefix(url, '/dashboard');
+    return matchesPathPrefix(url, '/health') || matchesPathPrefix(url, '/dashboard');
 }
 
 export function registerAuthMiddleware(app: FastifyInstance, adminPassword: string | undefined): void {

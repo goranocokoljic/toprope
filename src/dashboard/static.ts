@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import fastifyStatic from '@fastify/static';
 import type {FastifyInstance, FastifyReply, FastifyRequest} from 'fastify';
+import {matchesPathPrefix} from './paths';
 
 const DASHBOARD_PREFIX = '/dashboard';
 
@@ -28,8 +29,19 @@ function resolveFrontendDist(override?: string): string | undefined {
     return undefined;
 }
 
-function isDashboardPath(url: string): boolean {
-    return url === DASHBOARD_PREFIX || url.startsWith(`${DASHBOARD_PREFIX}/`) || url.startsWith(`${DASHBOARD_PREFIX}?`);
+// A document navigation (deep link) the SPA should handle vs. a missing asset.
+// Browsers send `Accept: text/html` for navigations but not for script/style/
+// fetch requests, so only HTML-accepting GET/HEAD requests fall back to the
+// SPA; a missing /dashboard/assets/*.js returns a real 404 instead of HTML
+// (which would otherwise surface as a confusing MIME-type error in the browser).
+function isSpaNavigation(request: FastifyRequest): boolean {
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+        return false;
+    }
+    if (!matchesPathPrefix(request.url, DASHBOARD_PREFIX)) {
+        return false;
+    }
+    return (request.headers.accept ?? '').includes('text/html');
 }
 
 /**
@@ -62,7 +74,7 @@ export function registerDashboardStatic(app: FastifyInstance, distDirOverride?: 
     // to the SPA's index.html (when built) so client-side routing handles deep
     // links; everything else gets Fastify's standard JSON 404 shape.
     app.setNotFoundHandler((request: FastifyRequest, reply: FastifyReply) => {
-        if (distDir && request.method === 'GET' && isDashboardPath(request.url)) {
+        if (distDir && isSpaNavigation(request)) {
             return reply.type('text/html').sendFile('index.html');
         }
         return reply.status(404).send({

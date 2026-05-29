@@ -90,6 +90,24 @@ describe('dashboard smoke', () => {
         expect(overviewCallCount()).toBe(1);
     });
 
+    it('navigates between routes client-side without a full reload', async () => {
+        render(
+            <QueryClientProvider client={makeClient()}>
+                <ThemeProvider>
+                    <MemoryRouter initialEntries={['/manager']}>
+                        <App />
+                    </MemoryRouter>
+                </ThemeProvider>
+            </QueryClientProvider>,
+        );
+
+        expect(await screen.findByText('Organization Overview')).toBeInTheDocument();
+        // Click the developer nav link; React Router swaps content in place.
+        fireEvent.click(screen.getByRole('link', {name: 'My Dashboard'}));
+        expect(await screen.findByText('Your personal AI adoption journey.')).toBeInTheDocument();
+        expect(screen.queryByText('Organization Overview')).not.toBeInTheDocument();
+    });
+
     it('toggles dark mode programmatically via the theme control', () => {
         render(
             <ThemeProvider>
