@@ -3,7 +3,9 @@ import type {OverviewData} from '../api/types';
 
 interface ChartDatum {
     quality: string;
-    developers: number;
+    // Count of data points (tool_snapshots rows) at this quality level — the
+    // backend groups by data_quality over snapshots, not distinct developers.
+    points: number;
     fill: string;
 }
 
@@ -22,7 +24,7 @@ const QUALITY_META: {key: keyof OverviewData['data_quality_distribution']; label
 export function DataQualityChart({overview}: {overview: OverviewData}): JSX.Element {
     const data: ChartDatum[] = QUALITY_META.map((meta) => ({
         quality: meta.label,
-        developers: overview.data_quality_distribution[meta.key],
+        points: overview.data_quality_distribution[meta.key],
         fill: meta.fill,
     }));
 
@@ -34,7 +36,7 @@ export function DataQualityChart({overview}: {overview: OverviewData}): JSX.Elem
                     <XAxis dataKey="quality" tickLine={false} axisLine={false} fontSize={12} />
                     <YAxis allowDecimals={false} tickLine={false} axisLine={false} fontSize={12} width={32} />
                     <Tooltip cursor={{fill: 'rgb(148 163 184 / 0.12)'}} />
-                    <Bar dataKey="developers" radius={[4, 4, 0, 0]}>
+                    <Bar dataKey="points" name="data points" radius={[4, 4, 0, 0]}>
                         {data.map((datum) => (
                             <Cell key={datum.quality} fill={datum.fill} />
                         ))}

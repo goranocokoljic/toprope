@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import '../test/setup';
 import '@testing-library/jest-dom/vitest';
 import {afterEach, beforeEach, describe, expect, it, vi, type Mock} from 'vitest';
 import {cleanup, fireEvent, render, screen, waitFor} from '@testing-library/react';
@@ -67,6 +68,26 @@ describe('dashboard smoke', () => {
         // Sample chart renders with the fetched data.
         expect(screen.getByTestId('data-quality-chart')).toBeInTheDocument();
         expect(overviewCallCount()).toBe(1);
+    });
+
+    it('renders an error state when the API call fails', async () => {
+        fetchMock.mockImplementation(
+            async () => new Response('nope', {status: 500, headers: {'Content-Type': 'text/plain'}}),
+        );
+
+        render(
+            <QueryClientProvider client={makeClient()}>
+                <ThemeProvider>
+                    <MemoryRouter initialEntries={['/manager']}>
+                        <App />
+                    </MemoryRouter>
+                </ThemeProvider>
+            </QueryClientProvider>,
+        );
+
+        // The ApiError message surfaces in the error branch of ManagerOverview.
+        expect(await screen.findByText(/Failed to load overview/i)).toBeInTheDocument();
+        expect(screen.queryByTestId('data-quality-chart')).not.toBeInTheDocument();
     });
 
     it('caches the overview query across consumers (no duplicate requests)', async () => {

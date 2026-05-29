@@ -6,12 +6,6 @@ export const THEME_STORAGE_KEY = 'govproxy-theme';
 
 export interface ThemeContextValue {
     theme: Theme;
-    /**
-     * Set an explicit theme. Used by `toggleTheme` today, and the API a future
-     * settings screen (Task 2.16) calls to apply a persisted per-user dark-mode
-     * preference on load.
-     */
-    setTheme: (theme: Theme) => void;
     toggleTheme: () => void;
 }
 

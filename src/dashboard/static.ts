@@ -7,15 +7,19 @@ import {matchesPathPrefix} from './paths';
 const DASHBOARD_PREFIX = '/dashboard';
 
 /**
- * Candidate locations for the built frontend, in priority order. This module
- * lives at src/dashboard/static.ts in dev (tsx, __dirname = src/dashboard) and
- * at dist/dashboard/static.js in prod (__dirname = dist/dashboard); the Vite
- * output always lands in src/dashboard/frontend/dist, which both resolve to.
+ * Candidate locations for the built frontend, in priority order. This module is
+ * src/dashboard/static.ts in dev (tsx, __dirname = src/dashboard) and
+ * dist/dashboard/static.js in prod (__dirname = dist/dashboard). `frontend/dist`
+ * relative to __dirname resolves the Vite output in both: in dev it is
+ * src/dashboard/frontend/dist; in prod the build copies that output to
+ * dist/dashboard/frontend/dist so the dist/ tree is self-contained (the Docker
+ * runtime ships only dist/). The second candidate is a fallback for running the
+ * compiled backend against an un-copied source tree.
  */
 function frontendDistCandidates(): string[] {
     return [
-        path.resolve(__dirname, 'frontend/dist'), // dev (tsx)
-        path.resolve(__dirname, '../../src/dashboard/frontend/dist'), // prod (dist/dashboard)
+        path.resolve(__dirname, 'frontend/dist'), // dev + self-contained prod
+        path.resolve(__dirname, '../../src/dashboard/frontend/dist'), // fallback: source tree
     ];
 }
 

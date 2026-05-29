@@ -35,18 +35,17 @@ export function ThemeProvider({children}: {children: ReactNode}): JSX.Element {
         applyThemeClass(theme);
     }, [theme]);
 
-    const setTheme = useCallback((next: Theme) => {
-        setThemeState(next);
-        if (typeof window !== 'undefined') {
-            window.localStorage.setItem(STORAGE_KEY, next);
-        }
+    const toggleTheme = useCallback(() => {
+        setThemeState((current) => {
+            const next = current === 'dark' ? 'light' : 'dark';
+            if (typeof window !== 'undefined') {
+                window.localStorage.setItem(STORAGE_KEY, next);
+            }
+            return next;
+        });
     }, []);
 
-    const toggleTheme = useCallback(() => {
-        setTheme(theme === 'dark' ? 'light' : 'dark');
-    }, [theme, setTheme]);
-
-    const value = useMemo<ThemeContextValue>(() => ({theme, setTheme, toggleTheme}), [theme, setTheme, toggleTheme]);
+    const value = useMemo<ThemeContextValue>(() => ({theme, toggleTheme}), [theme, toggleTheme]);
 
     return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;
 }

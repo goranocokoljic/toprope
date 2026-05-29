@@ -14,7 +14,9 @@ export default defineConfig({
     build: {
         outDir: path.resolve(root, 'dist'),
         emptyOutDir: true,
-        sourcemap: true,
+        // The /dashboard shell is served publicly (auth-exempt), so don't ship
+        // source maps that would expose the unminified frontend source.
+        sourcemap: false,
     },
     server: {
         port: 5173,

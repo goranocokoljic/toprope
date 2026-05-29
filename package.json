@@ -10,7 +10,7 @@
         "dev": "concurrently -n server,web -c blue,magenta \"npm:dev:server\" \"npm:dev:web\"",
         "dev:server": "tsx src/server.ts",
         "dev:web": "vite --config src/dashboard/frontend/vite.config.ts",
-        "build": "npm run build:web && tsc && node -e \"require('fs').cpSync('src/storage/migrations','dist/storage/migrations',{recursive:true})\"",
+        "build": "npm run build:web && tsc && node -e \"const fs=require('fs');fs.cpSync('src/storage/migrations','dist/storage/migrations',{recursive:true});fs.cpSync('src/dashboard/frontend/dist','dist/dashboard/frontend/dist',{recursive:true})\"",
         "build:web": "tsc --noEmit -p src/dashboard/frontend/tsconfig.json && vite build --config src/dashboard/frontend/vite.config.ts",
         "test": "vitest run",
         "lint": "eslint src tests --ext .ts",
