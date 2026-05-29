@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import fastifyStatic from '@fastify/static';
-import type {FastifyInstance} from 'fastify';
+import type {FastifyInstance, FastifyReply, FastifyRequest} from 'fastify';
 
 const DASHBOARD_PREFIX = '/dashboard';
 
@@ -9,13 +9,12 @@ const DASHBOARD_PREFIX = '/dashboard';
  * Candidate locations for the built frontend, in priority order. This module
  * lives at src/dashboard/static.ts in dev (tsx, __dirname = src/dashboard) and
  * at dist/dashboard/static.js in prod (__dirname = dist/dashboard); the Vite
- * output always lands in src/dashboard/frontend/dist, so we resolve both.
+ * output always lands in src/dashboard/frontend/dist, which both resolve to.
  */
 function frontendDistCandidates(): string[] {
     return [
-        path.resolve(__dirname, 'frontend/dist'),
-        path.resolve(__dirname, '../../src/dashboard/frontend/dist'),
-        path.resolve(process.cwd(), 'src/dashboard/frontend/dist'),
+        path.resolve(__dirname, 'frontend/dist'), // dev (tsx)
+        path.resolve(__dirname, '../../src/dashboard/frontend/dist'), // prod (dist/dashboard)
     ];
 }
 
@@ -29,36 +28,49 @@ function resolveFrontendDist(override?: string): string | undefined {
     return undefined;
 }
 
+function isDashboardPath(url: string): boolean {
+    return url === DASHBOARD_PREFIX || url.startsWith(`${DASHBOARD_PREFIX}/`) || url.startsWith(`${DASHBOARD_PREFIX}?`);
+}
+
 /**
  * Serves the built React dashboard as static files under /dashboard, with an
  * SPA fallback so client-side routes (e.g. /dashboard/manager) resolve to
  * index.html. If the frontend has not been built (e.g. backend-only dev or
- * tests), registration is skipped so the server still boots.
+ * tests), static serving is skipped and the function returns false — but the
+ * not-found handler is always installed so the API's JSON 404 contract is
+ * identical whether or not the frontend has been built. Returns whether the
+ * static frontend was registered.
  */
 export function registerDashboardStatic(app: FastifyInstance, distDirOverride?: string): boolean {
     const distDir = resolveFrontendDist(distDirOverride);
-    if (!distDir) {
+
+    if (distDir) {
+        void app.register(fastifyStatic, {
+            root: distDir,
+            prefix: `${DASHBOARD_PREFIX}/`,
+            redirect: true,
+            wildcard: false,
+        });
+    } else {
         app.log.warn(
             'Dashboard frontend build not found (run `npm run build:web`) — /dashboard will not be served',
         );
-        return false;
     }
 
-    void app.register(fastifyStatic, {
-        root: distDir,
-        prefix: `${DASHBOARD_PREFIX}/`,
-        redirect: true,
-        wildcard: false,
-    });
-
-    // SPA deep-link fallback: any unmatched /dashboard/* path returns index.html
-    // so the client router can handle it. API and other 404s stay JSON.
-    app.setNotFoundHandler((request, reply) => {
-        if (request.method === 'GET' && request.url.startsWith(DASHBOARD_PREFIX)) {
+    // Registered unconditionally so the 404 contract does not depend on whether
+    // the frontend was built. For unmatched GET /dashboard/* requests, fall back
+    // to the SPA's index.html (when built) so client-side routing handles deep
+    // links; everything else gets Fastify's standard JSON 404 shape.
+    app.setNotFoundHandler((request: FastifyRequest, reply: FastifyReply) => {
+        if (distDir && request.method === 'GET' && isDashboardPath(request.url)) {
             return reply.type('text/html').sendFile('index.html');
         }
-        return reply.status(404).send({error: 'Not Found', message: `Route ${request.url} not found`});
+        return reply.status(404).send({
+            statusCode: 404,
+            error: 'Not Found',
+            message: `Route ${request.method}:${request.url} not found`,
+        });
     });
 
-    return true;
+    return distDir !== undefined;
 }

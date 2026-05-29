@@ -10,7 +10,6 @@ export interface ThemeContextValue {
     toggleTheme: () => void;
 }
 
-// eslint-disable-next-line react-refresh/only-export-components
 export const ThemeContext = createContext<ThemeContextValue | undefined>(undefined);
 
 function resolveInitialTheme(): Theme {
@@ -55,14 +54,8 @@ export function ThemeProvider({children}: {children: ReactNode}): JSX.Element {
     }, []);
 
     const toggleTheme = useCallback(() => {
-        setThemeState((current) => {
-            const next = current === 'dark' ? 'light' : 'dark';
-            if (typeof window !== 'undefined') {
-                window.localStorage.setItem(STORAGE_KEY, next);
-            }
-            return next;
-        });
-    }, []);
+        setTheme(theme === 'dark' ? 'light' : 'dark');
+    }, [theme, setTheme]);
 
     const value = useMemo<ThemeContextValue>(() => ({theme, setTheme, toggleTheme}), [theme, setTheme, toggleTheme]);
 

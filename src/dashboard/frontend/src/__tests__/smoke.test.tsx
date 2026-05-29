@@ -8,6 +8,7 @@ import {App} from '../App';
 import {Header} from '../components/Header';
 import {useOverview} from '../hooks/useOverview';
 import {ThemeProvider} from '../theme/ThemeProvider';
+import {createQueryClient} from '../api/queryClient';
 import type {OverviewData} from '../api/types';
 
 const OVERVIEW: OverviewData = {
@@ -69,7 +70,9 @@ describe('dashboard smoke', () => {
     });
 
     it('caches the overview query across consumers (no duplicate requests)', async () => {
-        const client = makeClient();
+        // Uses the production query-client config so the shipped caching
+        // behavior (staleTime/dedup) is what's actually exercised.
+        const client = createQueryClient();
         function Probe(): JSX.Element {
             const {data} = useOverview();
             return <span>{data ? String(data.total_developers) : 'loading'}</span>;
