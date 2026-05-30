@@ -332,6 +332,30 @@ describe('plan-roi detection', () => {
         expect(at61.evaluated).toBe(1);
     });
 
+    it('compares per-day rates, not totals, when baseline and settling windows differ', () => {
+        // Baseline window is 30 days; settling override makes the post window 15 days.
+        // baseline 150/30 = 5/day; post 150/15 = 10/day → usage ratio 2 (per-day),
+        // so cost ratio 4 < 3×2 = 6 → NOT flagged. If the code compared raw totals
+        // (150 vs 150 → ratio 1) it would wrongly flag. This pins the normalization.
+        setGlobalSetting(db, 'roi_managers_can_override', true);
+        setTeamSetting(db, 'engineering', 'roi_settling_days', 15);
+
+        const changedDate = dateDaysBefore(40);
+        insertPlanChange(db, {
+            developer_id: alice,
+            tool: 'claude_code',
+            old_monthly_cost: 20,
+            new_monthly_cost: 80, // 4× cost
+            changed_at: `${changedDate}T00:00:00.000Z`,
+        });
+        insertUsage(db, alice, dateDaysBefore(15, new Date(changedDate)), 'claude_code', 150);
+        insertUsage(db, alice, dateDaysBefore(-7, new Date(changedDate)), 'claude_code', 150);
+
+        const result = evaluatePlanRoi(db);
+        expect(result.evaluated).toBe(1);
+        expect(result.flagged).toBe(0);
+    });
+
     // ── Non-upgrades are never flagged ─────────────────────────────────────────
 
     it('does not evaluate or flag a downgrade', () => {

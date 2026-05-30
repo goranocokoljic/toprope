@@ -44,7 +44,14 @@ const MS_PER_DAY = 86_400_000;
 export interface PlanRoiOptions {
     /** Evaluation "now"; injectable so tests can simulate elapsed settling. */
     now?: Date;
-    /** Days before the change over which baseline usage is averaged (default 30). */
+    /**
+     * Days before the change over which baseline usage is averaged (default 30).
+     * This is the deliverable's "configurable baseline window" hook. Unlike the
+     * threshold and settling period — which are per-team settings (Task 2.16) — the
+     * baseline window is intentionally a single global knob: it defines how the
+     * historical baseline is measured, not a per-team policy. If a per-team window is
+     * ever needed it should move into getRoiConfigForTeam alongside the others.
+     */
     baselineWindowDays?: number;
 }
 
@@ -217,6 +224,11 @@ export function evaluatePlanRoi(db: Database.Database, options: PlanRoiOptions =
 
     const baselinesCaptured = captureBaselines(db, baselineWindowDays);
 
+    // Re-evaluation is gated solely on the event's own `evaluated_at`, NOT on whether
+    // an active waste_alert already exists (the dedup runWasteDetection uses). A plan
+    // upgrade is a point-in-time transition, evaluated exactly once: if a manager later
+    // resolves the alert it is intentionally not re-raised, and a fresh upgrade on the
+    // same developer+tool is a new event row that evaluates on its own merits.
     const events = db
         .prepare(
             `SELECT pce.id, pce.developer_id, d.team, d.name AS developer_name,
