@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3';
+import {getDeveloperPlanChanges, type PlanChangeEvent} from '../../expenses/subscription-tracker';
 
 export interface ToolSnapshotRow {
     id: string;
@@ -48,6 +49,11 @@ export interface DeveloperDetail {
     tool_snapshots: ToolSnapshotRow[];
     git_snapshots: GitSnapshotRow[];
     subscriptions: SubscriptionRow[];
+    // Subscription transitions (plan upgrades/downgrades, tool switches) in
+    // chronological order — the data behind the "adoption journey" narrative.
+    // `subscriptions` above already includes revoked rows, so the two together
+    // tell the full history: which seats existed when, and how they changed.
+    plan_changes: PlanChangeEvent[];
     activity_summary: {
         active_tools: string[];
         active_days_30d: number;
@@ -121,6 +127,8 @@ export function getDeveloperDetail(db: Database.Database, id: string): Developer
         )
         .all(id) as SubscriptionRow[];
 
+    const planChanges = getDeveloperPlanChanges(db, id);
+
     const cutoff = new Date();
     cutoff.setDate(cutoff.getDate() - 30);
     const cutoffDate = cutoff.toISOString().slice(0, 10);
@@ -159,6 +167,7 @@ export function getDeveloperDetail(db: Database.Database, id: string): Developer
         tool_snapshots: toolSnapshots,
         git_snapshots: gitSnapshots,
         subscriptions,
+        plan_changes: planChanges,
         activity_summary: {
             active_tools: activeTools.map((t) => t.tool),
             active_days_30d: activityRow.active_days,

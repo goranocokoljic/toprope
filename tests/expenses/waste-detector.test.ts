@@ -4,7 +4,10 @@ import path from 'path';
 import {runMigrations} from '../../src/storage/migrator';
 import {addTeam} from '../../src/registry/teams';
 import {addDeveloper} from '../../src/registry/developers';
-import {upsertSubscription} from '../../src/expenses/subscription-tracker';
+import {
+    upsertSubscription as upsertSubscriptionRaw,
+    type UpsertData,
+} from '../../src/expenses/subscription-tracker';
 import {
     runWasteDetection,
     listActiveAlerts,
@@ -25,6 +28,24 @@ function daysAgo(n: number): string {
     const d = new Date();
     d.setDate(d.getDate() - n);
     return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Seed an "established" subscription: by default the seat was assigned 60 days
+ * ago. The waste detector's fresh-seat exemption (Task 2.14) skips seats
+ * younger than the inactivity window, so seats created "today" (as
+ * upsertSubscription does) would never be flagged as unused. These tests are
+ * about seats that have genuinely existed long enough to be unused, so we
+ * backdate the assignment. The dedicated exemption test seeds a fresh seat
+ * explicitly instead.
+ */
+function upsertSubscription(db: Database.Database, data: UpsertData): {id: string} {
+    const sub = upsertSubscriptionRaw(db, data);
+    db.prepare('UPDATE subscriptions SET seat_assigned_at = ? WHERE id = ?').run(
+        `${daysAgo(60)}T00:00:00.000Z`,
+        sub.id,
+    );
+    return sub;
 }
 
 interface DevIds {
@@ -230,6 +251,45 @@ describe('unused seat detection', () => {
 
         const result = runWasteDetection(db, {inactivity_threshold_days: 14});
         expect(result.created).toBe(1); // should still flag — not *active*
+    });
+
+    it('does not flag a freshly-transitioned seat assigned within the inactivity window', () => {
+        // A seat assigned just now (e.g. a plan upgrade or tool switch today)
+        // with no activity yet must NOT be flagged as "unused for 14 days" — it
+        // hasn't existed for 14 days. upsertSubscriptionRaw leaves seat_assigned_at
+        // at now, unlike the backdating test helper.
+        upsertSubscriptionRaw(db, {
+            developer_id: devIds.alice,
+            tool: 'copilot',
+            plan: 'business',
+            billing_model: 'company_managed',
+            monthly_cost: 19,
+            data_source: 'expense_import',
+        });
+        // No activity at all.
+
+        const result = runWasteDetection(db, {inactivity_threshold_days: 14});
+        expect(result.created).toBe(0);
+        expect(listActiveAlerts(db)).toHaveLength(0);
+    });
+
+    it('flags the same unused seat once it ages past the inactivity window', () => {
+        const sub = upsertSubscriptionRaw(db, {
+            developer_id: devIds.alice,
+            tool: 'copilot',
+            plan: 'business',
+            billing_model: 'company_managed',
+            monthly_cost: 19,
+            data_source: 'expense_import',
+        });
+        // Backdate the seat to 20 days ago — now older than the 14-day window.
+        db.prepare('UPDATE subscriptions SET seat_assigned_at = ? WHERE id = ?').run(
+            `${daysAgo(20)}T00:00:00.000Z`,
+            sub.id,
+        );
+
+        const result = runWasteDetection(db, {inactivity_threshold_days: 14});
+        expect(result.created).toBe(1);
     });
 });
 
