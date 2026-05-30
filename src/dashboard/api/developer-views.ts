@@ -1,5 +1,5 @@
 import type Database from 'better-sqlite3';
-import type {TimelinePoint} from './developer-detail';
+import {getDeveloperTimelineWindow, type TimelinePoint} from './developer-detail';
 
 /**
  * Data layer for the self-service developer view (Task 2.4 / #39).
@@ -78,12 +78,18 @@ export function earliestDeveloperDate(db: Database.Database, developerId: string
     return row.earliest;
 }
 
-/** Inclusive count of days from `from` to the midpoint, used to split a range in half. */
+/** Midpoint date (YYYY-MM-DD) of the inclusive [from, to] window. */
 function midpoint(from: string, to: string): string {
     const fromMs = Date.parse(`${from}T00:00:00.000Z`);
     const toMs = Date.parse(`${to}T00:00:00.000Z`);
     const midMs = fromMs + Math.floor((toMs - fromMs) / 2);
     return new Date(midMs).toISOString().slice(0, 10);
+}
+
+/** Add `days` to a YYYY-MM-DD date, returning YYYY-MM-DD. */
+function addDays(date: string, days: number): string {
+    const ms = Date.parse(`${date}T00:00:00.000Z`) + days * 86_400_000;
+    return new Date(ms).toISOString().slice(0, 10);
 }
 
 function aggregateAcceptanceRate(
@@ -139,15 +145,22 @@ export function getMeOverview(
                  FROM tool_snapshots
                  WHERE developer_id = ? AND is_active = 1 AND date >= ? AND date <= ?
                  GROUP BY tool
-                 HAVING interactions > 0 OR COUNT(*) > 0
+                 HAVING interactions > 0
                  ORDER BY interactions DESC, tool`,
             )
             .all(developerId, from, to) as {tool: string; interactions: number}[]
     ).map((r) => r.tool);
 
+    // Split the window into two DISJOINT halves so the midpoint day is never
+    // counted in both: the first half is [from, mid], the second is the day
+    // after mid through to. When the window is too short to have a distinct
+    // second half (a single day), there is no trend to compute, so both halves
+    // resolve to the same value and the direction reads 'flat'.
     const mid = midpoint(from, to);
+    const secondHalfStart = addDays(mid, 1);
     const previous = aggregateAcceptanceRate(db, developerId, from, mid);
-    const current = aggregateAcceptanceRate(db, developerId, mid, to);
+    const current =
+        secondHalfStart > to ? previous : aggregateAcceptanceRate(db, developerId, secondHalfStart, to);
 
     let trend: TrendDirection = 'flat';
     if (current !== null && previous !== null) {
@@ -179,21 +192,22 @@ export function getMeOverview(
     };
 }
 
-/** Stored features_used is a JSON array string; parse defensively. */
+/**
+ * Stored features_used is a JSON array string (written by the connectors as
+ * JSON.stringify(string[])). Parse it back to a string array; any row that is
+ * absent, unparseable, or not an array of strings contributes no features
+ * rather than throwing.
+ */
 function parseFeatures(raw: string | null): string[] {
     if (!raw) {
         return [];
     }
     try {
         const parsed = JSON.parse(raw) as unknown;
-        if (Array.isArray(parsed)) {
-            return parsed.filter((v): v is string => typeof v === 'string');
-        }
+        return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === 'string') : [];
     } catch {
-        // Not JSON — fall back to a comma-separated list.
-        return raw.split(',').map((s) => s.trim()).filter(Boolean);
+        return [];
     }
-    return [];
 }
 
 /**
@@ -265,11 +279,17 @@ export function getMeTools(
 }
 
 /**
- * Personal git activity over the window. Totals are summed across every git
- * provider (the snapshots are already merged per day at sync time, so a day
- * with both Bitbucket and GitHub commits is one row tagged data_source='multi');
- * the per-provider breakdown reports the contribution recorded under each
- * data_source so the unification is visible.
+ * Personal git activity over the window. `totals` are summed across every git
+ * provider and are the authoritative unified numbers the developer view shows.
+ *
+ * The `providers` breakdown groups by the snapshot's `data_source`. Because git
+ * snapshots are merged per developer per day at sync time (one row per dev/day,
+ * UNIQUE(developer_id, date)), a day on which the developer was active on more
+ * than one provider is stored as a single row tagged `data_source = 'multi'` —
+ * so that day appears under a `'multi'` bucket here rather than split back into
+ * its constituent providers (the per-provider split is not recoverable from the
+ * merged row). The breakdown therefore reflects how the data is stored, while
+ * `totals` always reflect the true cross-provider sum.
  */
 export function getMeActivity(
     db: Database.Database,
@@ -331,8 +351,10 @@ export function getMeActivity(
 
 /**
  * Personal activity timeline over the window: per-day tool interactions and git
- * activity. Same point shape as the admin developer timeline, but bounded by the
- * shared range parser rather than a fixed 90-day window.
+ * activity. Delegates to the shared windowed core so the developer self-service
+ * timeline and the admin developer timeline can never drift apart — the only
+ * difference is that this one is bounded by the shared range parser instead of a
+ * fixed 90-day window, and the id is already resolved from the session.
  */
 export function getMeTimeline(
     db: Database.Database,
@@ -340,61 +362,5 @@ export function getMeTimeline(
     from: string,
     to: string,
 ): TimelinePoint[] {
-    const toolRows = db
-        .prepare(
-            `SELECT date,
-                    MAX(is_active) as is_active,
-                    COALESCE(SUM(interaction_count), 0) as interaction_count,
-                    GROUP_CONCAT(DISTINCT CASE WHEN is_active = 1 THEN tool END) as tools
-             FROM tool_snapshots
-             WHERE developer_id = ? AND date >= ? AND date <= ?
-             GROUP BY date
-             ORDER BY date`,
-        )
-        .all(developerId, from, to) as {
-        date: string;
-        is_active: number;
-        interaction_count: number;
-        tools: string | null;
-    }[];
-
-    const gitRows = db
-        .prepare(
-            `SELECT date, commits, lines_added, lines_removed, ai_signature_score
-             FROM git_snapshots
-             WHERE developer_id = ? AND date >= ? AND date <= ?
-             ORDER BY date`,
-        )
-        .all(developerId, from, to) as {
-        date: string;
-        commits: number;
-        lines_added: number;
-        lines_removed: number;
-        ai_signature_score: number | null;
-    }[];
-
-    const gitByDate = new Map(gitRows.map((r) => [r.date, r]));
-    const toolByDate = new Map(toolRows.map((r) => [r.date, r]));
-
-    const allDates = new Set([...toolByDate.keys(), ...gitByDate.keys()]);
-    const sortedDates = Array.from(allDates).sort();
-
-    return sortedDates.map((date) => {
-        const t = toolByDate.get(date);
-        const g = gitByDate.get(date);
-        return {
-            date,
-            tool_activity: {
-                is_active: (t?.is_active ?? 0) === 1,
-                interaction_count: t?.interaction_count ?? 0,
-                tools: t?.tools ? t.tools.split(',').filter(Boolean) : [],
-            },
-            git_activity: {
-                commits: g?.commits ?? 0,
-                lines_added: g?.lines_added ?? 0,
-                lines_removed: g?.lines_removed ?? 0,
-                ai_signature_score: g?.ai_signature_score ?? null,
-            },
-        };
-    });
+    return getDeveloperTimelineWindow(db, developerId, from, to);
 }

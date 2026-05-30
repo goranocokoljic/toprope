@@ -245,6 +245,39 @@ describe('Developer API (Task 2.4)', () => {
             expect(data.acceptance_rate.trend).toBe('up');
         });
 
+        it('reports a flat trend for a single-day window (no distinct halves to compare)', async () => {
+            // The midpoint split must not double-count the only day into both
+            // halves and read a false direction — a one-day window is 'flat'.
+            seedToolSnapshot(db, {developer: 'alice', date: '2026-05-15', interactions: 100, acceptances: 90});
+            const res = await app.inject({
+                method: 'GET',
+                url: '/api/me/overview?range=custom&from=2026-05-15&to=2026-05-15',
+                headers: authHeaders(aliceToken),
+            });
+            expect(res.statusCode).toBe(200);
+            const {data} = res.json() as {data: {acceptance_rate: {trend: string; current: number | null; previous: number | null}}};
+            expect(data.acceptance_rate.trend).toBe('flat');
+            expect(data.acceptance_rate.current).toBeCloseTo(0.9);
+            expect(data.acceptance_rate.previous).toBeCloseTo(0.9);
+        });
+
+        it('does not double-count the midpoint day across the trend halves', async () => {
+            // Two-day window: each day is its own half. A drop from day 1 to day 2
+            // must read 'down', which only holds if the halves are disjoint.
+            seedToolSnapshot(db, {developer: 'alice', date: '2026-05-10', interactions: 100, acceptances: 90});
+            seedToolSnapshot(db, {developer: 'alice', date: '2026-05-11', interactions: 100, acceptances: 10});
+            const res = await app.inject({
+                method: 'GET',
+                url: '/api/me/overview?range=custom&from=2026-05-10&to=2026-05-11',
+                headers: authHeaders(aliceToken),
+            });
+            expect(res.statusCode).toBe(200);
+            const {data} = res.json() as {data: {acceptance_rate: {trend: string; current: number | null; previous: number | null}}};
+            expect(data.acceptance_rate.previous).toBeCloseTo(0.9);
+            expect(data.acceptance_rate.current).toBeCloseTo(0.1);
+            expect(data.acceptance_rate.trend).toBe('down');
+        });
+
         it('reports zeros and a flat trend for a developer with no activity', async () => {
             const res = await app.inject({method: 'GET', url: '/api/me/overview', headers: authHeaders(aliceToken)});
             expect(res.statusCode).toBe(200);
@@ -383,6 +416,27 @@ describe('Developer API (Task 2.4)', () => {
             const bitbucket = data.providers.find((p) => p.provider === 'bitbucket')!;
             expect(github.commits).toBe(4);
             expect(bitbucket.commits).toBe(3);
+        });
+
+        it("surfaces a merged same-day cross-provider row under the 'multi' bucket", async () => {
+            // At sync time a day with activity on >1 provider is merged into one
+            // row (UNIQUE(developer_id, date)) tagged data_source='multi'. The
+            // breakdown reflects how the data is stored; totals stay correct.
+            seedGitSnapshot(db, {developer: 'alice', date: '2026-05-10', dataSource: 'multi', commits: 7, linesAdded: 290, prsMerged: 3});
+
+            const res = await app.inject({
+                method: 'GET',
+                url: '/api/me/activity?range=custom&from=2026-05-01&to=2026-05-31',
+                headers: authHeaders(aliceToken),
+            });
+            expect(res.statusCode).toBe(200);
+            const {data} = res.json() as {
+                data: {totals: {commits: number}; providers: Array<{provider: string; commits: number}>};
+            };
+            expect(data.totals.commits).toBe(7);
+            expect(data.providers).toHaveLength(1);
+            expect(data.providers[0].provider).toBe('multi');
+            expect(data.providers[0].commits).toBe(7);
         });
 
         it('returns zero totals and no providers for a developer with no git activity', async () => {
