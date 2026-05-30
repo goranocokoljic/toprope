@@ -5,4 +5,7 @@
  */
 export const queryKeys = {
     overview: ['overview'] as const,
+    globalSettings: ['settings', 'global'] as const,
+    teamSettings: (team: string) => ['settings', 'team', team] as const,
+    preferences: ['preferences'] as const,
 };

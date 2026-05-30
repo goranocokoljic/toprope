@@ -7,6 +7,8 @@ export const THEME_STORAGE_KEY = 'govproxy-theme';
 export interface ThemeContextValue {
     theme: Theme;
     toggleTheme: () => void;
+    // Set the theme explicitly (used to apply a persisted user preference).
+    setTheme: (theme: Theme) => void;
 }
 
 // Kept in its own module (separate from ThemeProvider) so the provider file
