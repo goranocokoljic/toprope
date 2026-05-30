@@ -1,5 +1,6 @@
 import type Database from 'better-sqlite3';
 import {randomUUID} from 'crypto';
+import {deleteSessionsForUser} from './sessions';
 import type {User, UserRole} from './types';
 
 interface UserRow {
@@ -101,6 +102,11 @@ export function deactivateUser(db: Database.Database, userId: string): boolean {
     const res = db
         .prepare('UPDATE users SET deactivated_at = ? WHERE id = ? AND deactivated_at IS NULL')
         .run(new Date().toISOString(), userId);
+    if (res.changes > 0) {
+        // Immediately revoke any live sessions so a deactivated user is locked
+        // out at once, rather than relying solely on the per-request check.
+        deleteSessionsForUser(db, userId);
+    }
     return res.changes > 0;
 }
 

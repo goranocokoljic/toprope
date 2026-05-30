@@ -7,7 +7,9 @@ CREATE TABLE users (
     email TEXT NOT NULL UNIQUE,
     password_hash TEXT NOT NULL,
     role TEXT NOT NULL CHECK (role IN ('admin', 'developer')),
-    developer_id TEXT REFERENCES developers(id),
+    -- SET NULL so removing a developer leaves their login intact as an
+    -- unlinked account rather than failing the delete or orphaning the FK.
+    developer_id TEXT REFERENCES developers(id) ON DELETE SET NULL,
     must_change_password INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     deactivated_at TEXT

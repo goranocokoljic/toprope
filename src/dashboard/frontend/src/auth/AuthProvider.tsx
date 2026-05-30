@@ -21,9 +21,8 @@ export function AuthProvider({children}: {children: ReactNode}): JSX.Element {
         let active = true;
         void (async () => {
             try {
-                const me = await api.getMe();
                 if (active) {
-                    setUser(me);
+                    await refresh();
                 }
             } finally {
                 if (active) {
@@ -34,7 +33,7 @@ export function AuthProvider({children}: {children: ReactNode}): JSX.Element {
         return () => {
             active = false;
         };
-    }, []);
+    }, [refresh]);
 
     const login = useCallback(
         async (email: string, password: string): Promise<void> => {

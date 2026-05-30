@@ -14,33 +14,40 @@ declare module 'fastify' {
     }
 }
 
+// All path predicates below operate on the query-stripped pathname, so a
+// trailing `?...` can neither sneak past a public-path check nor break a
+// fail-closed allowlist match.
+function pathname(url: string): string {
+    const q = url.indexOf('?');
+    return q < 0 ? url : url.slice(0, q);
+}
+
 /**
  * Paths reachable without a session:
  * - /health: liveness probe.
  * - /dashboard: the static SPA shell (login page is served from it).
  * - /api/auth/login: the entry point to obtain a session.
  */
-function isPublicPath(url: string): boolean {
+function isPublicPath(path: string): boolean {
     return (
-        matchesPathPrefix(url, '/health') ||
-        matchesPathPrefix(url, '/dashboard') ||
-        url === '/api/auth/login' ||
-        url.startsWith('/api/auth/login?')
+        matchesPathPrefix(path, '/health') ||
+        matchesPathPrefix(path, '/dashboard') ||
+        path === '/api/auth/login'
     );
 }
 
 // Developer-role sessions may only reach their own self-service area and the
 // shared auth endpoints. Everything else under /api is admin-only.
-function isDeveloperAllowedPath(url: string): boolean {
-    return matchesPathPrefix(url, '/api/me') || matchesPathPrefix(url, '/api/auth');
+function isDeveloperAllowedPath(path: string): boolean {
+    return matchesPathPrefix(path, '/api/me') || matchesPathPrefix(path, '/api/auth');
 }
 
 // Until a user changes a forced-reset password, only these endpoints work.
-function isPasswordChangeAllowedPath(url: string): boolean {
+function isPasswordChangeAllowedPath(path: string): boolean {
     return (
-        url === '/api/auth/change-password' ||
-        url === '/api/auth/logout' ||
-        url === '/api/auth/me'
+        path === '/api/auth/change-password' ||
+        path === '/api/auth/logout' ||
+        path === '/api/auth/me'
     );
 }
 
@@ -50,17 +57,20 @@ function unauthorized(reply: FastifyReply, message: string): void {
 
 export function registerSessionAuth(app: FastifyInstance, db: Database.Database): void {
     app.addHook('onRequest', async (request: FastifyRequest, reply: FastifyReply) => {
-        const url = request.url;
-        if (isPublicPath(url)) {
+        const path = pathname(request.url);
+        if (isPublicPath(path)) {
             return;
         }
 
         // Only API routes are guarded; anything else (unknown paths) falls
         // through to the normal 404 handling.
-        if (!matchesPathPrefix(url, '/api')) {
+        if (!matchesPathPrefix(path, '/api')) {
             return;
         }
 
+        // The browser SPA authenticates via the HttpOnly session cookie. We also
+        // accept the same opaque token as an `Authorization: Bearer` header so
+        // it can serve as an API token for programmatic/CLI clients.
         const cookies = parseCookies(request.headers.cookie);
         let token = cookies[SESSION_COOKIE];
         if (!token) {
@@ -97,7 +107,7 @@ export function registerSessionAuth(app: FastifyInstance, db: Database.Database)
         };
 
         // First-login: a forced password change blocks every action until done.
-        if (user.must_change_password && !isPasswordChangeAllowedPath(url)) {
+        if (user.must_change_password && !isPasswordChangeAllowedPath(path)) {
             return reply.status(403).send({
                 error: 'Forbidden',
                 code: 'password_change_required',
@@ -106,7 +116,7 @@ export function registerSessionAuth(app: FastifyInstance, db: Database.Database)
         }
 
         // Role enforcement: developers are confined to their own area.
-        if (user.role === 'developer' && !isDeveloperAllowedPath(url)) {
+        if (user.role === 'developer' && !isDeveloperAllowedPath(path)) {
             return reply.status(403).send({
                 error: 'Forbidden',
                 message: 'Admin privileges required',

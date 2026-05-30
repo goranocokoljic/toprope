@@ -4,10 +4,18 @@ import {SESSION_COOKIE, clearCookie, serializeCookie} from '../../auth/cookies';
 import {hashPassword, validatePasswordStrength, verifyPassword} from '../../auth/password';
 import {createSession, deleteSession, deleteSessionsForUser} from '../../auth/sessions';
 import {getActiveUserByEmail, getUserById, updatePassword} from '../../auth/users';
+import {LoginRateLimiter, type RateLimitOptions} from '../../auth/rate-limit';
+
+// Upper bounds on credential inputs, rejected at the HTTP boundary so an
+// oversized body can't be fed into argon2 (a CPU-DoS lever).
+const MAX_EMAIL_LENGTH = 320;
+const MAX_PASSWORD_LENGTH = 1024;
 
 export interface AuthRoutesOptions {
     sessionTtlHours: number;
     cookieSecure: boolean;
+    // Optional override for the login brute-force limiter (mainly for tests).
+    loginRateLimit?: RateLimitOptions;
 }
 
 // A real argon2 hash used to equalize verify timing when the email is unknown,
@@ -42,14 +50,30 @@ export function registerAuthRoutes(
     db: Database.Database,
     opts: AuthRoutesOptions,
 ): void {
+    // One limiter per server instance; resets with the process.
+    const loginLimiter = new LoginRateLimiter(opts.loginRateLimit);
+
     app.post<{Body: {email?: string; password?: string}}>(
         '/api/auth/login',
         async (request, reply) => {
+            const rateKey = request.ip;
+            if (loginLimiter.isLimited(rateKey)) {
+                return reply.status(429).send({
+                    error: 'Too Many Requests',
+                    message: 'Too many login attempts. Please try again later.',
+                });
+            }
+
             const {email, password} = request.body ?? {};
             if (typeof email !== 'string' || typeof password !== 'string' || !email || !password) {
                 return reply
                     .status(400)
                     .send({error: 'Bad Request', message: 'Email and password are required'});
+            }
+            if (email.length > MAX_EMAIL_LENGTH || password.length > MAX_PASSWORD_LENGTH) {
+                return reply
+                    .status(400)
+                    .send({error: 'Bad Request', message: 'Email or password is too long'});
             }
 
             const user = getActiveUserByEmail(db, email);
@@ -63,11 +87,13 @@ export function registerAuthRoutes(
             }
 
             if (!user || !passwordOk) {
+                loginLimiter.recordFailure(rateKey);
                 return reply
                     .status(401)
                     .send({error: 'Unauthorized', message: 'Invalid email or password'});
             }
 
+            loginLimiter.reset(rateKey);
             const session = createSession(db, user.id, opts.sessionTtlHours);
             setSessionCookie(reply, session.id, opts);
 
@@ -121,6 +147,11 @@ export function registerAuthRoutes(
                     error: 'Bad Request',
                     message: 'current_password and new_password are required',
                 });
+            }
+            if (newPassword.length > MAX_PASSWORD_LENGTH) {
+                return reply
+                    .status(400)
+                    .send({error: 'Bad Request', message: 'New password is too long'});
             }
 
             const strength = validatePasswordStrength(newPassword);

@@ -5,7 +5,7 @@ import type {GovProxyConfig} from './config/types';
 import {openDb} from './storage/db';
 import {runMigrations} from './storage/migrator';
 import {registerSessionAuth} from './auth/middleware';
-import {DEFAULT_SESSION_TTL_HOURS} from './auth/sessions';
+import {DEFAULT_SESSION_TTL_HOURS, pruneExpiredSessions} from './auth/sessions';
 import {registerAuthRoutes} from './dashboard/api/auth-routes';
 import {registerMeRoutes} from './dashboard/api/me';
 import {registerOverviewRoutes} from './dashboard/api/overview';
@@ -40,6 +40,10 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
     const db = openDb(dbPath);
     runMigrations(db, MIGRATIONS_DIR);
 
+    // Sweep dead session rows on startup so the table doesn't accumulate
+    // never-looked-up expired sessions over the life of the deployment.
+    pruneExpiredSessions(db);
+
     // Per-user session auth (Task 2.2): the onRequest hook guards every /api/*
     // route except login; developers are confined to /api/me/* and /api/auth/*.
     registerSessionAuth(app, db);
@@ -50,9 +54,19 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
 
     app.addHook('onClose', () => db.close());
 
+    const cookieSecure = config.dashboard?.auth?.cookie_secure ?? false;
+    const host = config.server?.host;
+    const isLoopback = host === undefined || host === 'localhost' || host === '127.0.0.1' || host === '::1';
+    if (!cookieSecure && !isLoopback) {
+        app.log.warn(
+            `Server is binding non-loopback host '${host}' with dashboard.auth.cookie_secure=false — ` +
+                'session cookies will be sent over plaintext HTTP. Enable cookie_secure behind HTTPS.',
+        );
+    }
+
     const authOptions = {
         sessionTtlHours: config.dashboard?.auth?.session_ttl_hours ?? DEFAULT_SESSION_TTL_HOURS,
-        cookieSecure: config.dashboard?.auth?.cookie_secure ?? false,
+        cookieSecure,
     };
     registerAuthRoutes(app, db, authOptions);
     registerMeRoutes(app, db);
