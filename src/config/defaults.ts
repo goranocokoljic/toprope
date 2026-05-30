@@ -50,7 +50,7 @@ export const defaultConfig: GovProxyConfig = {
     },
     dashboard: {
         enabled: true,
-        auth: { type: 'basic' },
+        auth: { type: 'session', session_ttl_hours: 168, cookie_secure: false },
     },
     teams: [],
 };

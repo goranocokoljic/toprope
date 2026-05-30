@@ -3,7 +3,6 @@ import type {FastifyInstance} from 'fastify';
 import Fastify from 'fastify';
 import Database from 'better-sqlite3';
 import {makeTestDb, seedFixtures} from './fixtures';
-import {registerAuthMiddleware} from '../../src/dashboard/api/auth';
 import {registerOverviewRoutes} from '../../src/dashboard/api/overview';
 import {registerTeamRoutes} from '../../src/dashboard/api/teams';
 import {registerDeveloperRoutes} from '../../src/dashboard/api/developers';
@@ -11,9 +10,10 @@ import {registerWasteRoutes} from '../../src/dashboard/api/waste';
 import {registerSnapshotRoutes} from '../../src/dashboard/api/snapshots';
 import {registerExportRoutes} from '../../src/dashboard/api/export';
 
-function buildTestApp(db: Database.Database, password?: string): FastifyInstance {
+// These tests exercise the data-route handlers in isolation, without the
+// session-auth gate (which has its own dedicated suite under tests/auth).
+function buildTestApp(db: Database.Database): FastifyInstance {
     const app = Fastify({logger: false});
-    registerAuthMiddleware(app, password);
     app.get('/health', async () => ({status: 'ok'}));
     registerOverviewRoutes(app, db);
     registerTeamRoutes(app, db);
@@ -322,53 +322,5 @@ describe('API Endpoints', () => {
                 expect(row.team).toBe('backend');
             }
         });
-    });
-});
-
-describe('Auth Middleware', () => {
-    let db: Database.Database;
-    let app: FastifyInstance;
-
-    beforeEach(async () => {
-        db = makeTestDb();
-        app = buildTestApp(db, 'secret123');
-        await app.ready();
-    });
-
-    afterEach(async () => {
-        await app.close();
-        db.close();
-    });
-
-    it('GET /health passes without auth', async () => {
-        const res = await app.inject({method: 'GET', url: '/health'});
-        expect(res.statusCode).toBe(200);
-    });
-
-    it('returns 401 without Authorization header', async () => {
-        const res = await app.inject({method: 'GET', url: '/api/overview'});
-        expect(res.statusCode).toBe(401);
-        const body = res.json<{error: string}>();
-        expect(body.error).toBe('Unauthorized');
-    });
-
-    it('returns 401 with wrong password', async () => {
-        const creds = Buffer.from(':wrongpassword').toString('base64');
-        const res = await app.inject({
-            method: 'GET',
-            url: '/api/overview',
-            headers: {Authorization: `Basic ${creds}`},
-        });
-        expect(res.statusCode).toBe(401);
-    });
-
-    it('allows access with correct password', async () => {
-        const creds = Buffer.from(':secret123').toString('base64');
-        const res = await app.inject({
-            method: 'GET',
-            url: '/api/overview',
-            headers: {Authorization: `Basic ${creds}`},
-        });
-        expect(res.statusCode).toBe(200);
     });
 });
