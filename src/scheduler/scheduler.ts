@@ -78,8 +78,9 @@ export function startScheduler(
                     runMigrations(db, MIGRATIONS_DIR);
                     await runPipeline(db, [entry.makeConnector()]);
                     // New snapshots may push a pending plan upgrade past its settling
-                    // period; evaluate ROI here so flagged upgrades surface daily. Failure
-                    // is isolated below so a connector sync is never lost to an ROI error.
+                    // period; evaluate ROI here so flagged upgrades surface daily. The
+                    // sync result is already persisted before this runs, so even if ROI
+                    // throws (caught by the shared catch below) no connector data is lost.
                     evaluatePlanRoi(db);
                 } catch (err) {
                     console.error(`[scheduler] ${entry.name} unhandled error:`, err);

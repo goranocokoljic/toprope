@@ -170,7 +170,9 @@ describe('plan-roi detection', () => {
         const alert = alerts[0];
         expect(alert.alert_type).toBe('plan_roi');
         expect(alert.tool).toBe('claude_code');
-        expect(alert.monthly_waste).toBe(60); // cost delta 80 - 20
+        // A review prompt is not confirmed waste — monthly_waste stays null so it does
+        // not inflate hard-dollar waste totals; the cost increase lives in details.
+        expect(alert.monthly_waste).toBeNull();
         expect(alert.details.old_plan).toBe('pro');
         expect(alert.details.new_plan).toBe('max');
         expect(alert.details.cost_delta).toBe(60);
@@ -387,6 +389,25 @@ describe('plan-roi detection', () => {
         const result = evaluatePlanRoi(db);
         expect(result.evaluated).toBe(1);
         expect(result.flagged).toBe(0);
+    });
+
+    it('ignores inactive-day interactions when averaging usage (matches the waste detector)', () => {
+        const changedDate = dateDaysBefore(40);
+        const id = insertPlanChange(db, {
+            developer_id: alice,
+            tool: 'claude_code',
+            old_monthly_cost: 20,
+            new_monthly_cost: 80,
+            changed_at: `${changedDate}T00:00:00.000Z`,
+        });
+        // A snapshot with interaction_count but is_active = 0 must NOT count as usage.
+        db.prepare(
+            `INSERT INTO tool_snapshots (id, developer_id, date, tool, data_source, data_quality, is_active, interaction_count)
+             VALUES (?, ?, ?, 'claude_code', 'test', 'high', 0, 300)`,
+        ).run('inactive-row', alice, dateDaysBefore(15, new Date(changedDate)));
+
+        captureBaselines(db);
+        expect(getEvent(db, id).baseline_usage).toBe(0);
     });
 
     // ── Tool switch baseline uses the OLD tool's prior usage ────────────────────

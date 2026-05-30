@@ -1,6 +1,7 @@
 import type Database from 'better-sqlite3';
 import {randomUUID} from 'crypto';
 import {getRoiConfigForTeam} from '../settings/store';
+import {addDays} from './subscription-tracker';
 
 /**
  * Plan-Change ROI Detection (Task 2.15 / #50).
@@ -86,18 +87,25 @@ const UPGRADE_CANDIDATE_WHERE = `
     AND old_monthly_cost > 0
 `;
 
-/** Add `days` (may be negative) to a YYYY-MM-DD date, returning YYYY-MM-DD (UTC). */
-function addDays(date: string, days: number): string {
-    const ms = Date.parse(`${date}T00:00:00.000Z`) + days * MS_PER_DAY;
-    return new Date(ms).toISOString().slice(0, 10);
-}
-
 /**
  * Average daily usage (interaction_count) for a developer+tool over the half-open
  * date window [start, end). The total interactions are divided by the full window
  * length in days, so days with no snapshot count as zero usage — this is the honest
  * "average daily usage" rather than an average over only the active days, and keeps
  * the baseline and post-change figures directly comparable as per-day rates.
+ *
+ * Only `is_active = 1` snapshots contribute, matching every other usage query in the
+ * waste detector (findUnusedSeats / findUnderutilized): "usage" means active days, so
+ * an inactive day with a residual interaction_count is not counted here either — the
+ * two detectors must agree on what "using a tool" means.
+ *
+ * NOTE on post-change windows: the window may end at "now", so the most recent day(s)
+ * can lack snapshots if a connector sync has lagged, marginally depressing the figure.
+ * A coverage guard ("defer until N post-window days have snapshots") is deliberately
+ * NOT applied: a developer who genuinely stopped using the tool has zero active days,
+ * which is the exact case this feature must flag — a coverage guard would suppress it.
+ * Against the 30-day default window a one-day lag is negligible, and the review framing
+ * makes a benign false positive cheap (the manager reviews and resolves it).
  */
 function avgDailyUsage(
     db: Database.Database,
@@ -114,7 +122,7 @@ function avgDailyUsage(
         .prepare(
             `SELECT COALESCE(SUM(interaction_count), 0) AS total
              FROM tool_snapshots
-             WHERE developer_id = ? AND tool = ? AND date >= ? AND date < ?`,
+             WHERE developer_id = ? AND tool = ? AND is_active = 1 AND date >= ? AND date < ?`,
         )
         .get(developerId, tool, startDate, endDate) as {total: number};
     return row.total / windowDays;
@@ -288,13 +296,18 @@ export function evaluatePlanRoi(db: Database.Database, options: PlanRoiOptions =
                         `over the ${settlingDays}-day settling period. Worth confirming the upgrade is ` +
                         `delivering value for this developer.`,
                 };
+                // monthly_waste is left NULL — a flagged upgrade is a *review prompt*,
+                // not confirmed waste, so it must not inflate the hard-dollar "waste"
+                // totals that getWasteSummaryByTeam and the CLI sum. The cost increase
+                // under review lives in details.cost_delta. This matches cost_outlier,
+                // which is likewise advisory and stores null.
                 insertAlert.run(
                     randomUUID(),
                     event.developer_id,
                     event.team,
                     event.tool,
                     JSON.stringify(details),
-                    round(costDelta),
+                    null,
                     nowIso,
                 );
             }
