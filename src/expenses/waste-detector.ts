@@ -442,6 +442,46 @@ export function listActiveAlerts(db: Database.Database): WasteAlert[] {
     }));
 }
 
+export function listResolvedAlerts(db: Database.Database): WasteAlert[] {
+    const rows = db
+        .prepare(
+            `SELECT wa.id, wa.developer_id, d.name as developer_name, wa.team,
+                    wa.alert_type, wa.tool, wa.details, wa.monthly_waste,
+                    wa.detected_at, wa.resolved_at, wa.resolution
+             FROM waste_alerts wa
+             LEFT JOIN developers d ON d.id = wa.developer_id
+             WHERE wa.resolved_at IS NOT NULL
+             ORDER BY wa.resolved_at DESC`,
+        )
+        .all() as {
+        id: string;
+        developer_id: string | null;
+        developer_name: string | null;
+        team: string;
+        alert_type: string;
+        tool: string | null;
+        details: string;
+        monthly_waste: number | null;
+        detected_at: string;
+        resolved_at: string | null;
+        resolution: string | null;
+    }[];
+
+    return rows.map((row) => ({
+        id: row.id,
+        developer_id: row.developer_id,
+        developer_name: row.developer_name,
+        team: row.team,
+        alert_type: row.alert_type,
+        tool: row.tool,
+        details: parseJsonSafe(row.details),
+        monthly_waste: row.monthly_waste,
+        detected_at: row.detected_at,
+        resolved_at: row.resolved_at,
+        resolution: row.resolution,
+    }));
+}
+
 export function getWasteSummaryByTeam(db: Database.Database): WasteTeamSummary[] {
     const rows = db
         .prepare(
@@ -474,6 +514,22 @@ export function getWasteSummaryByTeam(db: Database.Database): WasteTeamSummary[]
             alerts_by_type: alertsByType,
         };
     });
+}
+
+// Allowed reasons a manager may attach when resolving a waste alert (Task 2.3).
+export const WASTE_RESOLUTION_REASONS = [
+    'reallocated',
+    'upgraded',
+    'justified',
+    'downgrade_recommended',
+    'monitor_longer',
+    'dismissed',
+] as const;
+
+export type WasteResolutionReason = (typeof WASTE_RESOLUTION_REASONS)[number];
+
+export function isWasteResolutionReason(value: unknown): value is WasteResolutionReason {
+    return typeof value === 'string' && (WASTE_RESOLUTION_REASONS as readonly string[]).includes(value);
 }
 
 export function resolveAlert(
