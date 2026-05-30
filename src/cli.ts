@@ -418,7 +418,7 @@ userCommand
     .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
     .action(async (options: {email: string; password?: string; config: string}) => {
         const email = options.email.trim();
-        if (!email.includes('@')) {
+        if (!email.includes('@') || email.length > 320) {
             console.error(`Error: '${email}' is not a valid email address.`);
             process.exit(1);
         }

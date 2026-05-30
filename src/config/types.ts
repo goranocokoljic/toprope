@@ -127,7 +127,9 @@ export interface DashboardAuthConfig {
     admin_password?: string;
     // Session lifetime in hours for issued login sessions.
     session_ttl_hours?: number;
-    // Set the Secure flag on the session cookie (enable behind HTTPS).
+    // Set the Secure flag on the session cookie. Enable this whenever the
+    // dashboard is reached over HTTPS — including behind a TLS-terminating
+    // proxy where the app itself binds loopback/HTTP.
     cookie_secure?: boolean;
 }
 

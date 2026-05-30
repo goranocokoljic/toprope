@@ -14,9 +14,9 @@ declare module 'fastify' {
     }
 }
 
-// All path predicates below operate on the query-stripped pathname, so a
-// trailing `?...` can neither sneak past a public-path check nor break a
-// fail-closed allowlist match.
+// Strip the query string so the exact-match predicates below (`=== '/api/auth/login'`,
+// the change-password allowlist) compare against the pathname cleanly. The
+// `matchesPathPrefix` checks already tolerate a trailing `?...`.
 function pathname(url: string): string {
     const q = url.indexOf('?');
     return q < 0 ? url : url.slice(0, q);
@@ -123,18 +123,4 @@ export function registerSessionAuth(app: FastifyInstance, db: Database.Database)
             });
         }
     });
-}
-
-/**
- * preHandler guard for endpoints that must reject developer-role sessions even
- * if they were somehow reachable. Defence-in-depth alongside the central rule.
- */
-export function requireAdmin(request: FastifyRequest, reply: FastifyReply): void {
-    if (!request.authUser) {
-        reply.status(401).send({error: 'Unauthorized', message: 'Authentication required'});
-        return;
-    }
-    if (request.authUser.role !== 'admin') {
-        reply.status(403).send({error: 'Forbidden', message: 'Admin privileges required'});
-    }
 }

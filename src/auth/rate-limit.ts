@@ -13,6 +13,11 @@ export const DEFAULT_LOGIN_RATE_LIMIT: RateLimitOptions = {
  * client (IP). It throttles online password brute force without a new
  * dependency. A successful login clears the key. One instance lives per server,
  * so it resets with the process — adequate for a single-node deployment.
+ *
+ * Deployment note: callers key this on `request.ip`. Fastify resolves that from
+ * the socket peer unless `trustProxy` is enabled, so behind a reverse proxy the
+ * server must enable `trustProxy` (and the proxy must forward the real client
+ * IP) or every client collapses to the proxy's address.
  */
 export class LoginRateLimiter {
     private readonly failures = new Map<string, number[]>();
