@@ -29,6 +29,7 @@ import {
     getWasteSummaryByTeam,
     resolveAlert,
 } from './expenses/waste-detector';
+import {evaluatePlanRoi} from './expenses/plan-roi';
 import {hashPassword, validatePasswordStrength, generateTempPassword} from './auth/password';
 import {createUser, getActiveUserByEmail, countAdmins} from './auth/users';
 
@@ -485,6 +486,12 @@ syncCommand
                 new GitSync(config.connectors.git),
             ];
             const results = await runPipeline(db, connectors);
+            // Fresh snapshots may settle a pending plan upgrade — evaluate ROI after
+            // the pull so plan_roi alerts stay current without a separate command.
+            const roi = evaluatePlanRoi(db);
+            if (roi.flagged > 0) {
+                console.log(`[plan-roi] ${roi.flagged} plan upgrade(s) flagged for cost/usage review`);
+            }
             for (const {connector, result, retried} of results) {
                 const retry = retried ? ' (retried)' : '';
                 console.log(
@@ -744,6 +751,7 @@ wasteCommand
 
             const wasteThreshold = config.alerts?.waste_threshold ?? 14;
             const result = runWasteDetection(db, {inactivity_threshold_days: wasteThreshold});
+            evaluatePlanRoi(db);
             if (result.created > 0) {
                 console.log(`Detected ${result.created} new waste alert(s).`);
             }
@@ -770,6 +778,7 @@ wasteCommand
                 underutilized: 'Underutilized Seats',
                 duplicate_tool: 'Duplicate Tools',
                 cost_outlier: 'Cost Outliers',
+                plan_roi: 'Plan-Change ROI (review)',
             };
 
             let totalWaste = 0;
