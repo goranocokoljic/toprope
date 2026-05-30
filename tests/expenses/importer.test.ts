@@ -279,6 +279,82 @@ describe('importCsv — malformed rows', () => {
     });
 });
 
+describe('importCsv — subscription lifecycle (change detection)', () => {
+    let db: Database.Database;
+    let tmpFile: string;
+
+    beforeEach(() => {
+        db = makeDb();
+        seedDevelopers(db);
+        tmpFile = path.join(os.tmpdir(), `govproxy-test-lifecycle-${Date.now()}.csv`);
+    });
+
+    afterEach(() => {
+        db.close();
+        if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
+    });
+
+    function writeCsv(plan: string, cost: number): void {
+        fs.writeFileSync(
+            tmpFile,
+            [
+                'developer_email,tool,plan,monthly_cost,billing_model',
+                `alice@example.com,claude_code,${plan},${cost},reimbursed`,
+            ].join('\n'),
+        );
+    }
+
+    it('detects a plan change and applies revoke-old + create-new (no duplicate active sub)', () => {
+        const config: ExpensesConfig = {subscription_defaults: {}};
+
+        writeCsv('pro', 20);
+        importCsv(db, tmpFile, config);
+
+        writeCsv('max', 200);
+        importCsv(db, tmpFile, config);
+
+        const aliceRow = db.prepare('SELECT id FROM developers WHERE email = ?').get('alice@example.com') as {id: string};
+
+        // Exactly one ACTIVE subscription, carrying the new plan/cost.
+        const active = db
+            .prepare('SELECT plan, monthly_cost FROM subscriptions WHERE developer_id = ? AND tool = ? AND seat_revoked_at IS NULL')
+            .all(aliceRow.id, 'claude_code') as {plan: string; monthly_cost: number}[];
+        expect(active).toHaveLength(1);
+        expect(active[0].plan).toBe('max');
+        expect(active[0].monthly_cost).toBe(200);
+
+        // The old seat is preserved with a revoke date (history intact).
+        const total = (
+            db
+                .prepare('SELECT COUNT(*) as n FROM subscriptions WHERE developer_id = ? AND tool = ?')
+                .get(aliceRow.id, 'claude_code') as {n: number}
+        ).n;
+        expect(total).toBe(2);
+
+        // A plan-change event was recorded.
+        const events = db
+            .prepare('SELECT old_plan, new_plan, old_monthly_cost, new_monthly_cost FROM plan_change_events WHERE developer_id = ?')
+            .all(aliceRow.id) as {old_plan: string; new_plan: string; old_monthly_cost: number; new_monthly_cost: number}[];
+        expect(events).toHaveLength(1);
+        expect(events[0]).toMatchObject({old_plan: 'pro', new_plan: 'max', old_monthly_cost: 20, new_monthly_cost: 200});
+    });
+
+    it('re-importing unchanged data creates no new rows and no events', () => {
+        const config: ExpensesConfig = {subscription_defaults: {}};
+        writeCsv('pro', 20);
+        importCsv(db, tmpFile, config);
+        importCsv(db, tmpFile, config);
+
+        const aliceRow = db.prepare('SELECT id FROM developers WHERE email = ?').get('alice@example.com') as {id: string};
+        const total = (
+            db.prepare('SELECT COUNT(*) as n FROM subscriptions WHERE developer_id = ? AND tool = ?').get(aliceRow.id, 'claude_code') as {n: number}
+        ).n;
+        expect(total).toBe(1);
+        const events = db.prepare('SELECT COUNT(*) as n FROM plan_change_events WHERE developer_id = ?').get(aliceRow.id) as {n: number};
+        expect(events.n).toBe(0);
+    });
+});
+
 describe('importCsv — billing model normalization', () => {
     let db: Database.Database;
     let tmpFile: string;

@@ -103,12 +103,16 @@ function seedSubscription(
     db: Database.Database,
     opts: {id: string; developer: string; tool: string; cost: number; revoked?: boolean},
 ): void {
+    // Seat assigned well in the past so these "established" seats are eligible
+    // for unused-seat detection (the waste detector exempts seats assigned
+    // within the inactivity window — Task 2.14).
+    const assignedAt = '2026-01-01T00:00:00.000Z';
     db.prepare(
         `INSERT INTO subscriptions
            (id, developer_id, tool, plan, billing_model, monthly_cost, seat_assigned_at,
             seat_revoked_at, data_source)
          VALUES (?, ?, ?, 'pro', 'company_managed', ?, ?, ?, 'expense_import')`,
-    ).run(opts.id, opts.developer, opts.tool, opts.cost, NOW, opts.revoked ? NOW : null);
+    ).run(opts.id, opts.developer, opts.tool, opts.cost, assignedAt, opts.revoked ? NOW : null);
 }
 
 function seedSyncLog(
