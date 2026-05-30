@@ -1,6 +1,13 @@
 import type {FastifyInstance} from 'fastify';
 import type Database from 'better-sqlite3';
 import {parsePagination, buildPaginatedResponse} from './types';
+import {isAdmin, forbidden} from './guards';
+import {
+    listResolvedAlerts,
+    resolveAlert,
+    isWasteResolutionReason,
+    WASTE_RESOLUTION_REASONS,
+} from '../../expenses/waste-detector';
 
 interface WasteAlert {
     id: string;
@@ -102,6 +109,52 @@ export function registerWasteRoutes(app: FastifyInstance, db: Database.Database)
 
         return {data: summaries};
     });
+
+    // Resolved waste alerts — the audit trail of manager actions (Task 2.3).
+    // Resolved alerts never appear in the active /api/waste list above.
+    app.get('/api/waste/resolved', async (request, reply) => {
+        if (!isAdmin(request)) {
+            return forbidden(reply);
+        }
+        return {data: listResolvedAlerts(db)};
+    });
+
+    // Mark an active alert resolved with a structured reason.
+    app.post<{Params: {id: string}; Body: {reason?: unknown}}>(
+        '/api/waste/:id/resolve',
+        async (request, reply) => {
+            if (!isAdmin(request)) {
+                return forbidden(reply);
+            }
+
+            const reason = request.body?.reason;
+            if (!isWasteResolutionReason(reason)) {
+                return reply.status(400).send({
+                    error: 'Bad Request',
+                    message: `reason must be one of: ${WASTE_RESOLUTION_REASONS.join(', ')}`,
+                });
+            }
+
+            const {id} = request.params;
+            const ok = resolveAlert(db, id, reason);
+            if (!ok) {
+                const existing = db
+                    .prepare('SELECT resolved_at FROM waste_alerts WHERE id = ?')
+                    .get(id) as {resolved_at: string | null} | undefined;
+                if (!existing) {
+                    return reply
+                        .status(404)
+                        .send({error: 'Not Found', message: `Waste alert '${id}' not found`});
+                }
+                return reply
+                    .status(409)
+                    .send({error: 'Conflict', message: 'Waste alert is already resolved'});
+            }
+
+            const resolved = listResolvedAlerts(db).find((a) => a.id === id);
+            return {data: resolved};
+        },
+    );
 }
 
 function parseJsonSafe(value: string): Record<string, unknown> {
