@@ -30,3 +30,32 @@ export interface AuthUser {
     developer_id: string | null;
     must_change_password: boolean;
 }
+
+// --- Settings & preferences (Task 2.16) ---------------------------------
+
+/** Global settings as returned by GET /api/settings/global. */
+export interface GlobalSettings {
+    leaderboard_enabled: boolean;
+    leaderboard_managers_can_enable: boolean;
+    roi_threshold: number;
+    roi_settling_days: number;
+    roi_managers_can_override: boolean;
+}
+
+/** Per-team settings view: resolved values, raw overrides, and override gates. */
+export interface TeamSettings {
+    team: string;
+    effective: GlobalSettings;
+    overrides: Partial<GlobalSettings>;
+    // Only team-overridable keys appear; each value is whether its governing
+    // managers_can_* flag is currently on.
+    overridable: Partial<Record<keyof GlobalSettings, boolean>>;
+}
+
+export type TimeRange = '7d' | '30d' | '90d';
+
+/** Per-user preferences as returned by GET /api/me/preferences. */
+export interface UserPreferences {
+    default_time_range: TimeRange;
+    dark_mode: boolean;
+}

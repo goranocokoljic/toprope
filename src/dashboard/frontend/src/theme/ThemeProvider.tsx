@@ -35,6 +35,13 @@ export function ThemeProvider({children}: {children: ReactNode}): JSX.Element {
         applyThemeClass(theme);
     }, [theme]);
 
+    const setTheme = useCallback((next: Theme) => {
+        if (typeof window !== 'undefined') {
+            window.localStorage.setItem(STORAGE_KEY, next);
+        }
+        setThemeState(next);
+    }, []);
+
     const toggleTheme = useCallback(() => {
         setThemeState((current) => {
             const next = current === 'dark' ? 'light' : 'dark';
@@ -45,7 +52,10 @@ export function ThemeProvider({children}: {children: ReactNode}): JSX.Element {
         });
     }, []);
 
-    const value = useMemo<ThemeContextValue>(() => ({theme, toggleTheme}), [theme, toggleTheme]);
+    const value = useMemo<ThemeContextValue>(
+        () => ({theme, toggleTheme, setTheme}),
+        [theme, toggleTheme, setTheme],
+    );
 
     return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;
 }
