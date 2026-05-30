@@ -252,6 +252,11 @@ export function upsertSubscription(db: Database.Database, data: UpsertData): Sub
  *
  * If there is no active seat on from_tool, this still opens the new seat and
  * records the switch with null old_* fields — the destination is what matters.
+ *
+ * Any pre-existing active seat on to_tool is revoked first, so the invariant of
+ * at most one active seat per (developer, tool) holds even when switching onto a
+ * tool the developer already has (or when from_tool === to_tool) — the
+ * destination ends with exactly the one new seat.
  */
 export function switchTool(db: Database.Database, data: SwitchToolData): Subscription {
     const now = new Date().toISOString();
@@ -266,6 +271,13 @@ export function switchTool(db: Database.Database, data: SwitchToolData): Subscri
         if (old) {
             db.prepare('UPDATE subscriptions SET seat_revoked_at = ? WHERE id = ?').run(now, old.id);
         }
+
+        // Guard the one-active-seat-per-tool invariant: revoke any active seat
+        // already on the destination tool (covers switching onto a tool the
+        // developer holds, and from_tool === to_tool re-assignment).
+        db.prepare(
+            'UPDATE subscriptions SET seat_revoked_at = ? WHERE developer_id = ? AND tool = ? AND seat_revoked_at IS NULL',
+        ).run(now, data.developer_id, data.to_tool);
 
         const created = insertSubscription(
             db,
@@ -424,33 +436,34 @@ export function detectDuplicates(db: Database.Database): DuplicateAlert[] {
     return alerts;
 }
 
+interface CostedSubscription {
+    monthly_cost: number;
+    seat_assigned_at: string | null;
+    seat_revoked_at: string | null;
+}
+
 /**
- * A subscription is active on a given date (YYYY-MM-DD) when its seat was
- * assigned on or before that date and not yet revoked as of the *end* of that
- * date. Comparing on the date portion means the day a seat is revoked and its
- * replacement assigned does not double-count: the revoked seat's last active day
- * is the day before its revoke date, and the new seat is active from its assign
- * date onward.
- *
- * `date(...)` is applied to the stored full-ISO timestamps so a same-day
- * revoke+create (the lifecycle transition pattern) lands cleanly on the date
- * boundary regardless of the time-of-day component.
+ * The single home for the "active on date" rule. A subscription is active on a
+ * given date (YYYY-MM-DD) when its seat was assigned on or before that date and
+ * not yet revoked as of the *end* of that date. The comparison is on the date
+ * portion only, so the day a seat is revoked and its replacement assigned does
+ * not double-count: the revoked seat's last active day is the day before its
+ * revoke date, and the new seat is active from its assign date onward.
  *
  * INVARIANT: the revoke and create of a transition share an identical `now`
  * timestamp, so old.seat_revoked_at == new.seat_assigned_at to the millisecond.
- * Any seat-active-on-date test MUST therefore compare on `date(...)`, never the
- * raw timestamps — a raw `<`/`>` comparison would see a zero-width overlap on
- * the transition instant and either double-count or drop the seat. Reuse this
- * clause (or `isActiveOnDate` below) rather than hand-rolling the comparison.
+ * The comparison is therefore on the date prefix (`slice(0,10)`), never the raw
+ * timestamps — a raw `<`/`>` comparison would see a zero-width overlap on the
+ * transition instant and either double-count or drop the seat. All cost-over-time
+ * accounting routes through this one predicate so the SQL and JS paths cannot
+ * drift.
+ *
+ * Precondition: seat timestamps are zero-padded UTC ISO-8601 (`...Z`), as written
+ * by insertSubscription. The prefix slice assumes that canonical form; it does
+ * not normalise non-padded or timezone-offset timestamps the way SQLite's
+ * date() would.
  */
-const ACTIVE_ON_DATE_CLAUSE =
-    "date(seat_assigned_at) <= ? AND (seat_revoked_at IS NULL OR date(seat_revoked_at) > ?)";
-
-/** Date-granularity active test mirroring ACTIVE_ON_DATE_CLAUSE for in-memory rows. */
-function isActiveOnDate(
-    sub: {seat_assigned_at: string | null; seat_revoked_at: string | null},
-    date: string,
-): boolean {
+function isActiveOnDate(sub: CostedSubscription, date: string): boolean {
     const assigned = sub.seat_assigned_at?.slice(0, 10);
     if (assigned === undefined || assigned > date) {
         return false;
@@ -459,6 +472,28 @@ function isActiveOnDate(
         return true;
     }
     return sub.seat_revoked_at.slice(0, 10) > date;
+}
+
+/** A developer's cost-bearing subscriptions, fetched once for in-memory folding. */
+function getCostedSubscriptions(db: Database.Database, developerId: string): CostedSubscription[] {
+    return db
+        .prepare(
+            `SELECT monthly_cost, seat_assigned_at, seat_revoked_at
+             FROM subscriptions
+             WHERE developer_id = ? AND monthly_cost IS NOT NULL`,
+        )
+        .all(developerId) as CostedSubscription[];
+}
+
+/** Sum the cost of the subscriptions active on a single date. */
+function sumActiveOnDate(subs: CostedSubscription[], date: string): number {
+    let cost = 0;
+    for (const sub of subs) {
+        if (isActiveOnDate(sub, date)) {
+            cost += sub.monthly_cost;
+        }
+    }
+    return cost;
 }
 
 /**
@@ -472,14 +507,7 @@ export function getDeveloperCostOnDate(
     developerId: string,
     date: string,
 ): number {
-    const row = db
-        .prepare(
-            `SELECT COALESCE(SUM(monthly_cost), 0) AS cost
-             FROM subscriptions
-             WHERE developer_id = ? AND ${ACTIVE_ON_DATE_CLAUSE}`,
-        )
-        .get(developerId, date, date) as {cost: number};
-    return row.cost;
+    return sumActiveOnDate(getCostedSubscriptions(db, developerId), date);
 }
 
 /** Add `days` to a YYYY-MM-DD date, returning YYYY-MM-DD (UTC). */
@@ -504,27 +532,11 @@ export function getDeveloperCostOverTime(
     from: string,
     to: string,
 ): CostPoint[] {
-    const subs = db
-        .prepare(
-            `SELECT monthly_cost, seat_assigned_at, seat_revoked_at
-             FROM subscriptions
-             WHERE developer_id = ? AND monthly_cost IS NOT NULL`,
-        )
-        .all(developerId) as {
-        monthly_cost: number;
-        seat_assigned_at: string | null;
-        seat_revoked_at: string | null;
-    }[];
+    const subs = getCostedSubscriptions(db, developerId);
 
     const points: CostPoint[] = [];
     for (let date = from; date <= to; date = addDays(date, 1)) {
-        let cost = 0;
-        for (const sub of subs) {
-            if (isActiveOnDate(sub, date)) {
-                cost += sub.monthly_cost;
-            }
-        }
-        points.push({date, monthly_cost: cost});
+        points.push({date, monthly_cost: sumActiveOnDate(subs, date)});
     }
     return points;
 }

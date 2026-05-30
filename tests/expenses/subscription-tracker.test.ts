@@ -622,6 +622,48 @@ describe('subscription lifecycle — tool switches', () => {
             new_monthly_cost: 20,
         });
     });
+
+    it('switching onto a tool the developer already holds leaves exactly one active seat', () => {
+        // Alice already has an active cursor seat AND a copilot seat.
+        upsertSubscription(db, {
+            developer_id: devIds.alice,
+            tool: 'copilot',
+            plan: 'business',
+            billing_model: 'company_managed',
+            monthly_cost: 19,
+            data_source: 'expense_import',
+        });
+        upsertSubscription(db, {
+            developer_id: devIds.alice,
+            tool: 'cursor',
+            plan: 'free',
+            billing_model: 'personal',
+            monthly_cost: 0,
+            data_source: 'expense_import',
+        });
+
+        switchTool(db, {
+            developer_id: devIds.alice,
+            from_tool: 'copilot',
+            to_tool: 'cursor',
+            plan: 'pro',
+            billing_model: 'company_managed',
+            monthly_cost: 20,
+            data_source: 'admin',
+        });
+
+        // The pre-existing cursor seat is revoked; exactly one active cursor seat
+        // remains (the new one), preserving the one-active-seat-per-tool invariant.
+        const cursor = activeSubs(db, devIds.alice, 'cursor');
+        expect(cursor).toHaveLength(1);
+        expect(cursor[0].plan).toBe('pro');
+        expect(cursor[0].monthly_cost).toBe(20);
+        // The old cursor seat is preserved as history, not deleted.
+        const allCursor = db
+            .prepare('SELECT COUNT(*) as n FROM subscriptions WHERE developer_id = ? AND tool = ?')
+            .get(devIds.alice, 'cursor') as {n: number};
+        expect(allCursor.n).toBe(2);
+    });
 });
 
 describe('subscription lifecycle — cost over time', () => {
