@@ -1,4 +1,5 @@
 import {NavLink} from 'react-router-dom';
+import {UserMenu} from './UserMenu';
 
 interface NavItem {
     to: string;
@@ -36,6 +37,9 @@ export function Sidebar(): JSX.Element {
                     </NavLink>
                 </div>
             ))}
+            <div className="mt-auto">
+                <UserMenu />
+            </div>
         </nav>
     );
 }

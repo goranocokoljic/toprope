@@ -22,9 +22,9 @@ describe('runMigrations', () => {
         db.close();
     });
 
-    it('applies all 8 migrations on a fresh database', () => {
+    it('applies all migrations on a fresh database', () => {
         const count = runMigrations(db, MIGRATIONS_DIR);
-        expect(count).toBe(9);
+        expect(count).toBe(10);
     });
 
     it('is idempotent — running twice applies nothing the second time', () => {
@@ -53,13 +53,13 @@ describe('getMigrationStatus', () => {
         db.close();
     });
 
-    it('returns 8 entries after all migrations are applied', () => {
+    it('returns one entry per migration after all are applied', () => {
         runMigrations(db, MIGRATIONS_DIR);
         const statuses = getMigrationStatus(db, MIGRATIONS_DIR);
-        expect(statuses).toHaveLength(9);
+        expect(statuses).toHaveLength(10);
     });
 
-    it('marks all 8 migrations as applied', () => {
+    it('marks all migrations as applied', () => {
         runMigrations(db, MIGRATIONS_DIR);
         const statuses = getMigrationStatus(db, MIGRATIONS_DIR);
         expect(statuses.every((s) => s.applied)).toBe(true);
@@ -128,6 +128,14 @@ describe('table creation', () => {
 
     it('creates the waste_alerts table', () => {
         expect(tableExists('waste_alerts')).toBe(true);
+    });
+
+    it('creates the users table', () => {
+        expect(tableExists('users')).toBe(true);
+    });
+
+    it('creates the sessions table', () => {
+        expect(tableExists('sessions')).toBe(true);
     });
 });
 

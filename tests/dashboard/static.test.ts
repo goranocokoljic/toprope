@@ -3,8 +3,13 @@ import Fastify, {type FastifyInstance} from 'fastify';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import Database from 'better-sqlite3';
 import {registerDashboardStatic} from '../../src/dashboard/static';
-import {registerAuthMiddleware} from '../../src/dashboard/api/auth';
+import {registerSessionAuth} from '../../src/auth/middleware';
+import {makeTestDb} from './fixtures';
+import {createUser} from '../../src/auth/users';
+import {createSession} from '../../src/auth/sessions';
+import {hashPassword} from '../../src/auth/password';
 
 function makeDist(): string {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'govproxy-dash-'));
@@ -106,14 +111,24 @@ describe('Dashboard static serving', () => {
     });
 });
 
-describe('Dashboard static serving under auth', () => {
+describe('Dashboard static serving under session auth', () => {
     let app: FastifyInstance;
     let distDir: string;
+    let db: Database.Database;
+    let token: string;
 
     beforeAll(async () => {
         distDir = makeDist();
+        db = makeTestDb();
+        const user = createUser(db, {
+            email: 'admin@test.com',
+            passwordHash: await hashPassword('correct-horse'),
+            role: 'admin',
+        });
+        token = createSession(db, user.id).id;
+
         app = Fastify({logger: false});
-        registerAuthMiddleware(app, 'secret-password');
+        registerSessionAuth(app, db);
         app.get('/api/overview', async () => ({data: {ok: true}}));
         registerDashboardStatic(app, distDir);
         await app.ready();
@@ -121,6 +136,7 @@ describe('Dashboard static serving under auth', () => {
 
     afterAll(async () => {
         await app.close();
+        db.close();
         fs.rmSync(distDir, {recursive: true, force: true});
     });
 
@@ -136,17 +152,16 @@ describe('Dashboard static serving under auth', () => {
         expect(res.body).toContain('id="root"');
     });
 
-    it('still gates the data API behind the admin password', async () => {
+    it('still gates the data API behind a session', async () => {
         const res = await app.inject({method: 'GET', url: '/api/overview'});
         expect(res.statusCode).toBe(401);
     });
 
-    it('allows the data API with valid credentials', async () => {
-        const credentials = Buffer.from('admin:secret-password').toString('base64');
+    it('allows the data API with a valid session', async () => {
         const res = await app.inject({
             method: 'GET',
             url: '/api/overview',
-            headers: {authorization: `Basic ${credentials}`},
+            headers: {authorization: `Bearer ${token}`},
         });
         expect(res.statusCode).toBe(200);
         expect(res.json()).toEqual({data: {ok: true}});
