@@ -169,19 +169,18 @@ export function getDeveloperDetail(db: Database.Database, id: string): Developer
 }
 
 /**
- * Build the 90-day activity timeline for a developer, or null if the id is
- * unknown. Shared by /api/developers/:id/timeline and /api/me/timeline.
+ * Build an activity timeline for a developer over an inclusive [from, to] date
+ * window. Does NOT check that the developer exists — callers that need a 404 on
+ * an unknown id (the admin route) verify it first; the session-scoped /api/me
+ * route already holds a real developer id. Shared by the manager timeline and
+ * the developer self-service timeline so the two can never drift apart.
  */
-export function getDeveloperTimeline(db: Database.Database, id: string): TimelinePoint[] | null {
-    const dev = db.prepare('SELECT id FROM developers WHERE id = ?').get(id) as {id: string} | undefined;
-    if (!dev) {
-        return null;
-    }
-
-    const cutoff = new Date();
-    cutoff.setDate(cutoff.getDate() - 90);
-    const cutoffDate = cutoff.toISOString().slice(0, 10);
-
+export function getDeveloperTimelineWindow(
+    db: Database.Database,
+    id: string,
+    from: string,
+    to: string,
+): TimelinePoint[] {
     const toolRows = db
         .prepare(
             `SELECT date,
@@ -189,11 +188,11 @@ export function getDeveloperTimeline(db: Database.Database, id: string): Timelin
                     COALESCE(SUM(interaction_count), 0) as interaction_count,
                     GROUP_CONCAT(DISTINCT CASE WHEN is_active = 1 THEN tool END) as tools
              FROM tool_snapshots
-             WHERE developer_id = ? AND date >= ?
+             WHERE developer_id = ? AND date >= ? AND date <= ?
              GROUP BY date
              ORDER BY date`,
         )
-        .all(id, cutoffDate) as {
+        .all(id, from, to) as {
         date: string;
         is_active: number;
         interaction_count: number;
@@ -204,10 +203,10 @@ export function getDeveloperTimeline(db: Database.Database, id: string): Timelin
         .prepare(
             `SELECT date, commits, lines_added, lines_removed, ai_signature_score
              FROM git_snapshots
-             WHERE developer_id = ? AND date >= ?
+             WHERE developer_id = ? AND date >= ? AND date <= ?
              ORDER BY date`,
         )
-        .all(id, cutoffDate) as {
+        .all(id, from, to) as {
         date: string;
         commits: number;
         lines_added: number;
@@ -240,4 +239,21 @@ export function getDeveloperTimeline(db: Database.Database, id: string): Timelin
             },
         };
     });
+}
+
+/**
+ * Build the 90-day activity timeline for a developer, or null if the id is
+ * unknown. Used by the admin route /api/developers/:id/timeline; the 404 on an
+ * unknown id is why this wrapper exists over the windowed core.
+ */
+export function getDeveloperTimeline(db: Database.Database, id: string): TimelinePoint[] | null {
+    const dev = db.prepare('SELECT id FROM developers WHERE id = ?').get(id) as {id: string} | undefined;
+    if (!dev) {
+        return null;
+    }
+
+    const to = new Date();
+    const from = new Date(to.getTime());
+    from.setDate(from.getDate() - 90);
+    return getDeveloperTimelineWindow(db, id, from.toISOString().slice(0, 10), to.toISOString().slice(0, 10));
 }
