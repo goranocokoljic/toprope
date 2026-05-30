@@ -107,6 +107,24 @@ function GlobalPanel(): JSX.Element {
         );
     }
 
+    function onSave(): void {
+        if (!draft) {
+            return;
+        }
+        // Drop any number field left non-finite by an empty input, so clearing a
+        // box and saving falls back to the stored value rather than triggering a
+        // raw 400 from the server's finite-number check (mirrors TeamPanel).
+        const patch: Partial<GlobalSettings> = {};
+        for (const field of FIELDS) {
+            const next = draft[field.key];
+            if (field.type === 'number' && !Number.isFinite(next as number)) {
+                continue;
+            }
+            (patch as Record<string, boolean | number>)[field.key] = next;
+        }
+        update.mutate(patch);
+    }
+
     return (
         <Card title="Global settings">
             <div className="space-y-4">
@@ -131,7 +149,7 @@ function GlobalPanel(): JSX.Element {
                 <div className="flex items-center gap-3 pt-2">
                     <button
                         type="button"
-                        onClick={() => update.mutate(draft)}
+                        onClick={onSave}
                         disabled={update.isPending}
                         className="rounded-md bg-accent px-4 py-2 text-sm font-medium text-white disabled:opacity-60"
                     >

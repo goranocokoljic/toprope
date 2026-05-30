@@ -97,10 +97,25 @@ export const api = {
         });
     },
 
-    /** Team names, for the per-team settings selector. */
+    /**
+     * Team names, for the per-team settings selector. `/api/teams` caps `limit`
+     * at 100, so we page through until every team is collected rather than
+     * silently truncating the selector for orgs with >100 teams.
+     */
     async getTeamNames(): Promise<string[]> {
-        const body = await request<{data: {name: string}[]}>('/api/teams?limit=100');
-        return body.data.map((t) => t.name);
+        const names: string[] = [];
+        for (let page = 1; ; page += 1) {
+            const body = await request<{
+                data: {name: string}[];
+                pagination: {page: number; limit: number; total: number};
+            }>(`/api/teams?page=${page}&limit=100`);
+            names.push(...body.data.map((t) => t.name));
+            const {limit, total} = body.pagination;
+            if (body.data.length === 0 || page * limit >= total) {
+                break;
+            }
+        }
+        return names;
     },
 
     // --- Settings (admin) ---

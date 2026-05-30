@@ -1,7 +1,7 @@
-import {useEffect, useRef} from 'react';
 import {Card} from '../components/Card';
 import {usePreferences, useUpdatePreferences} from '../hooks/usePreferences';
 import {useTheme} from '../theme/useTheme';
+import {useApplyThemePreference} from '../theme/useApplyThemePreference';
 import type {TimeRange} from '../api/types';
 
 const TIME_RANGES: {value: TimeRange; label: string}[] = [
@@ -21,16 +21,9 @@ export function Preferences(): JSX.Element {
     const update = useUpdatePreferences();
     const {theme, setTheme} = useTheme();
 
-    // Apply the persisted dark-mode preference to the live theme once, on first
-    // load. A ref guards against re-applying on every render/refetch so the user
-    // can still flip the theme afterward without it snapping back.
-    const synced = useRef(false);
-    useEffect(() => {
-        if (data && !synced.current) {
-            synced.current = true;
-            setTheme(data.dark_mode ? 'dark' : 'light');
-        }
-    }, [data, setTheme]);
+    // The app shell already applies this preference on load; calling the shared
+    // hook here keeps the page correct when rendered on its own (and in tests).
+    useApplyThemePreference();
 
     function onToggleDarkMode(): void {
         const previous = theme;

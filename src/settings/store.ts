@@ -36,10 +36,19 @@ function decodeStored(def: SettingDef, raw: string): SettingValue {
     try {
         parsed = JSON.parse(raw);
     } catch {
+        console.warn(`[settings] unparseable stored value for ${def.key}; using default`);
         return def.default;
     }
     const result = coerceSettingValue(def, parsed);
-    return result.ok ? result.value : def.default;
+    if (!result.ok) {
+        // A stored row that no longer satisfies the registry (e.g. bounds were
+        // tightened by a later migration, or the DB was hand-edited) is logged
+        // rather than swallowed silently, so config drift is discoverable
+        // instead of surfacing later as an unexplained reset to default.
+        console.warn(`[settings] stored value for ${def.key} failed re-coercion (${result.error}); using default`);
+        return def.default;
+    }
+    return result.value;
 }
 
 /** Effective global value for a key: stored row if present, else registry default. */
@@ -120,6 +129,17 @@ export function isTeamOverrideAllowed(db: Database.Database, key: string): boole
     return getGlobalSetting(db, def.overrideGovernedBy) === true;
 }
 
+/**
+ * Write a raw per-team override. This is an UNGUARDED persistence primitive: it
+ * does not verify the team exists, nor that the key is currently overridable
+ * (`isTeamOverrideAllowed`). Authorization is the caller's responsibility — the
+ * only caller today, the admin-gated PATCH route, checks both the admin role and
+ * the governing managers_can_* flag before calling. Any future caller wiring a
+ * team value from request input MUST re-apply those gates, or it will persist
+ * orphan/forbidden overrides. `resolveSetting` still refuses to honor an override
+ * whose flag is off, so a stray row cannot change resolved values, but it is dead
+ * weight until cleaned up.
+ */
 export function setTeamSetting(db: Database.Database, team: string, key: string, value: SettingValue): void {
     const def = getSettingDef(key);
     if (!def) {
@@ -214,10 +234,15 @@ function decodePreference(def: PreferenceDef, raw: string): boolean | string {
     try {
         parsed = JSON.parse(raw);
     } catch {
+        console.warn(`[settings] unparseable stored preference for ${def.key}; using default`);
         return def.default;
     }
     const result = coercePreferenceValue(def, parsed);
-    return result.ok ? result.value : def.default;
+    if (!result.ok) {
+        console.warn(`[settings] stored preference for ${def.key} failed re-coercion (${result.error}); using default`);
+        return def.default;
+    }
+    return result.value;
 }
 
 /** All preferences for a user, merged over the registry defaults. */

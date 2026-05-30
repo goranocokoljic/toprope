@@ -71,7 +71,8 @@ beforeEach(() => {
             return json({data: teamSettings()});
         }
         if (u.includes('/api/teams')) {
-            return json({data: [{name: 'frontend'}, {name: 'backend'}]});
+            const data = [{name: 'frontend'}, {name: 'backend'}];
+            return json({data, pagination: {page: 1, limit: 100, total: data.length}});
         }
         return json({error: 'not found'}, 404);
     });
@@ -151,6 +152,32 @@ describe('Settings page', () => {
         // Wait for the loaded form (the loading card shares the panel title).
         expect(await screen.findByText('ROI threshold')).toBeInTheDocument();
         expect(screen.getByText('Global settings')).toBeInTheDocument();
+    });
+
+    it('clearing a global number field saves cleanly (no error, finite value sent)', async () => {
+        renderSettings();
+        // The global ROI threshold spinbutton is the first instance (no team yet).
+        const input = (await screen.findByRole('spinbutton', {name: /roi threshold/i})) as HTMLInputElement;
+        // Emptying a number input coerces to 0 (finite) via Number(''), so the
+        // panel must send a valid value rather than a NaN the server would 400.
+        fireEvent.change(input, {target: {value: ''}});
+        fireEvent.click(screen.getByRole('button', {name: /save global settings/i}));
+
+        await waitFor(() => {
+            const patch = fetchMock.mock.calls.find(
+                (c) =>
+                    String(c[0]).includes('/api/settings/global') &&
+                    (c[1]?.method ?? 'GET').toUpperCase() === 'PATCH',
+            );
+            expect(patch).toBeTruthy();
+            const sent = JSON.parse(String(patch?.[1]?.body)) as Record<string, unknown>;
+            // Whatever is sent for roi_threshold is a finite number, never NaN/null.
+            if ('roi_threshold' in sent) {
+                expect(Number.isFinite(sent.roi_threshold as number)).toBe(true);
+            }
+        });
+        // The save succeeds — no server-error text surfaces.
+        expect(screen.queryByText(/must be a finite number/i)).not.toBeInTheDocument();
     });
 
     it('disables a team override row when the governing flag is off', async () => {
