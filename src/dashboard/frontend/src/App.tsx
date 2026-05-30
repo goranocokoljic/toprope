@@ -2,6 +2,9 @@ import {Navigate, Route, Routes} from 'react-router-dom';
 import {AppShell} from './components/AppShell';
 import {ManagerOverview} from './pages/ManagerOverview';
 import {DeveloperDashboard} from './pages/DeveloperDashboard';
+import {Preferences} from './pages/Preferences';
+import {Settings} from './pages/Settings';
+import {RequireAdmin} from './components/RequireAdmin';
 import {NotFound} from './pages/NotFound';
 
 /**
@@ -16,6 +19,15 @@ export function App(): JSX.Element {
                 <Route index element={<Navigate to="/manager" replace />} />
                 <Route path="manager" element={<ManagerOverview />} />
                 <Route path="developer" element={<DeveloperDashboard />} />
+                <Route path="preferences" element={<Preferences />} />
+                <Route
+                    path="settings"
+                    element={
+                        <RequireAdmin>
+                            <Settings />
+                        </RequireAdmin>
+                    }
+                />
                 <Route path="*" element={<NotFound />} />
             </Route>
         </Routes>

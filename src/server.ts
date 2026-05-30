@@ -14,6 +14,7 @@ import {registerDeveloperRoutes} from './dashboard/api/developers';
 import {registerWasteRoutes} from './dashboard/api/waste';
 import {registerSnapshotRoutes} from './dashboard/api/snapshots';
 import {registerExportRoutes} from './dashboard/api/export';
+import {registerSettingsRoutes} from './dashboard/api/settings';
 import {registerDashboardStatic} from './dashboard/static';
 import {startScheduler} from './scheduler/scheduler';
 
@@ -76,6 +77,7 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
     registerWasteRoutes(app, db);
     registerSnapshotRoutes(app, db);
     registerExportRoutes(app, db);
+    registerSettingsRoutes(app, db);
 
     // Serve the built React dashboard (Phase 2) at /dashboard, if present.
     registerDashboardStatic(app);

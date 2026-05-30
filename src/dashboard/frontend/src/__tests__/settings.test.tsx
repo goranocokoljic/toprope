@@ -1,0 +1,168 @@
+// @vitest-environment jsdom
+import '../test/setup';
+import '@testing-library/jest-dom/vitest';
+import {afterEach, beforeEach, describe, expect, it, vi, type Mock} from 'vitest';
+import {cleanup, fireEvent, render, screen, waitFor} from '@testing-library/react';
+import {QueryClient, QueryClientProvider} from '@tanstack/react-query';
+import {MemoryRouter} from 'react-router-dom';
+import {Preferences} from '../pages/Preferences';
+import {Settings} from '../pages/Settings';
+import {ThemeProvider} from '../theme/ThemeProvider';
+import type {GlobalSettings, TeamSettings, UserPreferences} from '../api/types';
+
+const DEFAULT_PREFS: UserPreferences = {default_time_range: '30d', dark_mode: false};
+
+const DEFAULT_GLOBAL: GlobalSettings = {
+    leaderboard_enabled: false,
+    leaderboard_managers_can_enable: false,
+    roi_threshold: 3.0,
+    roi_settling_days: 30,
+    roi_managers_can_override: false,
+};
+
+let prefs: UserPreferences;
+let global: GlobalSettings;
+let fetchMock: Mock;
+
+function json(body: unknown, status = 200): Response {
+    return new Response(JSON.stringify(body), {status, headers: {'Content-Type': 'application/json'}});
+}
+
+function makeClient(): QueryClient {
+    return new QueryClient({defaultOptions: {queries: {retry: false}}});
+}
+
+function teamSettings(): TeamSettings {
+    return {
+        team: 'frontend',
+        effective: global,
+        overrides: {},
+        overridable: {
+            leaderboard_enabled: global.leaderboard_managers_can_enable,
+            leaderboard_managers_can_enable: false,
+            roi_threshold: global.roi_managers_can_override,
+            roi_settling_days: global.roi_managers_can_override,
+            roi_managers_can_override: false,
+        },
+    };
+}
+
+beforeEach(() => {
+    prefs = {...DEFAULT_PREFS};
+    global = {...DEFAULT_GLOBAL};
+    fetchMock = vi.fn(async (url: unknown, init?: RequestInit) => {
+        const u = String(url);
+        const method = (init?.method ?? 'GET').toUpperCase();
+        const bodyObj = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
+
+        if (u.includes('/api/me/preferences')) {
+            if (method === 'PATCH') {
+                prefs = {...prefs, ...(bodyObj as Partial<UserPreferences>)};
+            }
+            return json({data: prefs});
+        }
+        if (u.includes('/api/settings/global')) {
+            if (method === 'PATCH') {
+                global = {...global, ...(bodyObj as Partial<GlobalSettings>)};
+            }
+            return json({data: global});
+        }
+        if (u.includes('/api/settings/team/')) {
+            return json({data: teamSettings()});
+        }
+        if (u.includes('/api/teams')) {
+            return json({data: [{name: 'frontend'}, {name: 'backend'}]});
+        }
+        return json({error: 'not found'}, 404);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+});
+
+afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    window.localStorage.clear();
+    document.documentElement.classList.remove('dark');
+});
+
+function renderPrefs(): void {
+    render(
+        <QueryClientProvider client={makeClient()}>
+            <ThemeProvider>
+                <MemoryRouter>
+                    <Preferences />
+                </MemoryRouter>
+            </ThemeProvider>
+        </QueryClientProvider>,
+    );
+}
+
+function renderSettings(): void {
+    render(
+        <QueryClientProvider client={makeClient()}>
+            <ThemeProvider>
+                <MemoryRouter>
+                    <Settings />
+                </MemoryRouter>
+            </ThemeProvider>
+        </QueryClientProvider>,
+    );
+}
+
+describe('Preferences page', () => {
+    it('toggling dark mode persists the preference and drives the theme', async () => {
+        renderPrefs();
+        const toggle = await screen.findByRole('switch', {name: /dark mode/i});
+        expect(document.documentElement.classList.contains('dark')).toBe(false);
+
+        fireEvent.click(toggle);
+
+        expect(document.documentElement.classList.contains('dark')).toBe(true);
+        await waitFor(() => {
+            const patched = fetchMock.mock.calls.some(
+                (c) =>
+                    String(c[0]).includes('/api/me/preferences') &&
+                    (c[1]?.method ?? 'GET').toUpperCase() === 'PATCH',
+            );
+            expect(patched).toBe(true);
+        });
+        expect(prefs.dark_mode).toBe(true);
+    });
+
+    it('applies a persisted dark_mode preference on load', async () => {
+        prefs = {...DEFAULT_PREFS, dark_mode: true};
+        renderPrefs();
+        await waitFor(() =>
+            expect(document.documentElement.classList.contains('dark')).toBe(true),
+        );
+    });
+
+    it('changing the default time range persists it', async () => {
+        renderPrefs();
+        const select = (await screen.findByLabelText(/default time range/i)) as HTMLSelectElement;
+        fireEvent.change(select, {target: {value: '7d'}});
+        await waitFor(() => expect(prefs.default_time_range).toBe('7d'));
+    });
+});
+
+describe('Settings page', () => {
+    it('renders global settings loaded from the API', async () => {
+        renderSettings();
+        // Wait for the loaded form (the loading card shares the panel title).
+        expect(await screen.findByText('ROI threshold')).toBeInTheDocument();
+        expect(screen.getByText('Global settings')).toBeInTheDocument();
+    });
+
+    it('disables a team override row when the governing flag is off', async () => {
+        renderSettings();
+        const select = await screen.findByRole('combobox');
+        // The team options arrive asynchronously; wait before selecting so the
+        // value actually takes (a select rejects values with no matching option).
+        await screen.findByRole('option', {name: 'frontend'});
+        fireEvent.change(select, {target: {value: 'frontend'}});
+
+        // roi_threshold override row should be present but disabled, with the
+        // policy note, because roi_managers_can_override is false.
+        await waitFor(() => expect(screen.getAllByText(/Override disabled by global policy/i).length).toBeGreaterThan(0));
+    });
+});

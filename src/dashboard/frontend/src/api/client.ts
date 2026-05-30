@@ -1,4 +1,11 @@
-import type {ApiEnvelope, AuthUser, OverviewData} from './types';
+import type {
+    ApiEnvelope,
+    AuthUser,
+    GlobalSettings,
+    OverviewData,
+    TeamSettings,
+    UserPreferences,
+} from './types';
 
 /**
  * Typed, fetch-based client for the Phase 1 API. In production the SPA is
@@ -44,6 +51,14 @@ async function postJson<T>(path: string, body: unknown): Promise<T> {
     });
 }
 
+async function patchJson<T>(path: string, body: unknown): Promise<T> {
+    return request<T>(path, {
+        method: 'PATCH',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body),
+    });
+}
+
 export const api = {
     async getOverview(): Promise<OverviewData> {
         const body = await request<ApiEnvelope<OverviewData>>('/api/overview');
@@ -80,5 +95,48 @@ export const api = {
             current_password: currentPassword,
             new_password: newPassword,
         });
+    },
+
+    /** Team names, for the per-team settings selector. */
+    async getTeamNames(): Promise<string[]> {
+        const body = await request<{data: {name: string}[]}>('/api/teams?limit=100');
+        return body.data.map((t) => t.name);
+    },
+
+    // --- Settings (admin) ---
+    async getGlobalSettings(): Promise<GlobalSettings> {
+        const body = await request<ApiEnvelope<GlobalSettings>>('/api/settings/global');
+        return body.data;
+    },
+
+    async patchGlobalSettings(patch: Partial<GlobalSettings>): Promise<GlobalSettings> {
+        const body = await patchJson<ApiEnvelope<GlobalSettings>>('/api/settings/global', patch);
+        return body.data;
+    },
+
+    async getTeamSettings(team: string): Promise<TeamSettings> {
+        const body = await request<ApiEnvelope<TeamSettings>>(
+            `/api/settings/team/${encodeURIComponent(team)}`,
+        );
+        return body.data;
+    },
+
+    async patchTeamSettings(team: string, patch: Partial<GlobalSettings>): Promise<TeamSettings> {
+        const body = await patchJson<ApiEnvelope<TeamSettings>>(
+            `/api/settings/team/${encodeURIComponent(team)}`,
+            patch,
+        );
+        return body.data;
+    },
+
+    // --- Preferences (own) ---
+    async getPreferences(): Promise<UserPreferences> {
+        const body = await request<ApiEnvelope<UserPreferences>>('/api/me/preferences');
+        return body.data;
+    },
+
+    async patchPreferences(patch: Partial<UserPreferences>): Promise<UserPreferences> {
+        const body = await patchJson<ApiEnvelope<UserPreferences>>('/api/me/preferences', patch);
+        return body.data;
     },
 };
