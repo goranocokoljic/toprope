@@ -122,7 +122,13 @@ export interface AlertsConfig {
 
 export interface DashboardAuthConfig {
     type?: string;
+    // Legacy Phase 1 single admin password. Superseded by per-user accounts
+    // (Task 2.2) and no longer enforced; retained so old configs still load.
     admin_password?: string;
+    // Session lifetime in hours for issued login sessions.
+    session_ttl_hours?: number;
+    // Set the Secure flag on the session cookie (enable behind HTTPS).
+    cookie_secure?: boolean;
 }
 
 export interface DashboardConfig {

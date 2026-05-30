@@ -20,3 +20,13 @@ export interface OverviewData {
     active_waste_alert_count: number;
     total_monthly_waste: number;
 }
+
+export type UserRole = 'admin' | 'developer';
+
+/** The current session identity, as returned by GET /api/auth/me. */
+export interface AuthUser {
+    email: string;
+    role: UserRole;
+    developer_id: string | null;
+    must_change_password: boolean;
+}

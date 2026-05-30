@@ -29,6 +29,8 @@ import {
     getWasteSummaryByTeam,
     resolveAlert,
 } from './expenses/waste-detector';
+import {hashPassword, validatePasswordStrength, generateTempPassword} from './auth/password';
+import {createUser, getActiveUserByEmail, countAdmins} from './auth/users';
 
 // Commander option collector for repeatable flags (e.g. --git-email).
 function collectValue(value: string, previous: string[]): string[] {
@@ -405,6 +407,62 @@ devCommand
             }
         },
     );
+
+const userCommand = program.command('user').description('Manage user accounts and authentication');
+
+userCommand
+    .command('create-admin')
+    .description('Bootstrap an admin account for dashboard login')
+    .requiredOption('--email <email>', 'Admin email address')
+    .option('--password <password>', 'Password (a temporary one is generated and printed if omitted)')
+    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .action(async (options: {email: string; password?: string; config: string}) => {
+        const email = options.email.trim();
+        if (!email.includes('@')) {
+            console.error(`Error: '${email}' is not a valid email address.`);
+            process.exit(1);
+        }
+
+        const configPath = path.resolve(process.cwd(), options.config);
+        const db = openRegistryDb(configPath);
+        try {
+            if (getActiveUserByEmail(db, email)) {
+                console.error(`Error: a user with email '${email}' already exists.`);
+                process.exit(1);
+            }
+
+            // When no password is supplied, generate a temporary one and force a
+            // change on first login.
+            const generated = !options.password;
+            const password = options.password ?? generateTempPassword();
+
+            const strength = validatePasswordStrength(password);
+            if (!strength.valid) {
+                console.error(`Error: ${strength.error}.`);
+                process.exit(1);
+            }
+
+            const passwordHash = await hashPassword(password);
+            const user = createUser(db, {
+                email,
+                passwordHash,
+                role: 'admin',
+                mustChangePassword: generated,
+            });
+
+            console.log(`Admin account created for ${user.email} (id: ${user.id}).`);
+            if (generated) {
+                console.log('');
+                console.log(`  Temporary password: ${password}`);
+                console.log('  You will be required to change it on first login.');
+            }
+            if (countAdmins(db) > 1) {
+                console.warn('Note: more than one admin account now exists.');
+            }
+        } finally {
+            db.close();
+        }
+    });
 
 const syncCommand = program.command('sync').description('Sync data from connectors');
 
