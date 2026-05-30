@@ -510,8 +510,8 @@ export function getDeveloperCostOnDate(
     return sumActiveOnDate(getCostedSubscriptions(db, developerId), date);
 }
 
-/** Add `days` to a YYYY-MM-DD date, returning YYYY-MM-DD (UTC). */
-function addDays(date: string, days: number): string {
+/** Add `days` (may be negative) to a YYYY-MM-DD date, returning YYYY-MM-DD (UTC). */
+export function addDays(date: string, days: number): string {
     const ms = Date.parse(`${date}T00:00:00.000Z`) + days * 86_400_000;
     return new Date(ms).toISOString().slice(0, 10);
 }

@@ -8,6 +8,7 @@ import {ClaudeCodeSync} from '../connectors/claude-code/sync';
 import {WindsurfSync} from '../connectors/windsurf/sync';
 import {GitSync} from '../connectors/git/sync';
 import {runPipeline} from './sync-pipeline';
+import {evaluatePlanRoi} from '../expenses/plan-roi';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../storage/migrations');
 
@@ -76,6 +77,11 @@ export function startScheduler(
                 try {
                     runMigrations(db, MIGRATIONS_DIR);
                     await runPipeline(db, [entry.makeConnector()]);
+                    // New snapshots may push a pending plan upgrade past its settling
+                    // period; evaluate ROI here so flagged upgrades surface daily. The
+                    // sync result is already persisted before this runs, so even if ROI
+                    // throws (caught by the shared catch below) no connector data is lost.
+                    evaluatePlanRoi(db);
                 } catch (err) {
                     console.error(`[scheduler] ${entry.name} unhandled error:`, err);
                 } finally {
