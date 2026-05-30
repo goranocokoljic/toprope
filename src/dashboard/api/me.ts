@@ -1,11 +1,10 @@
 import type {FastifyInstance, FastifyReply, FastifyRequest} from 'fastify';
 import type Database from 'better-sqlite3';
-import {getDeveloperDetail} from './developer-detail';
+import {getDeveloperDetail, getDeveloperTimelineWindow} from './developer-detail';
 import {
     earliestDeveloperDate,
     getMeActivity,
     getMeOverview,
-    getMeTimeline,
     getMeTools,
 } from './developer-views';
 import {parseTimeRange, TimeRangeError, type TimeRangeInput} from './range';
@@ -112,7 +111,7 @@ export function registerMeRoutes(app: FastifyInstance, db: Database.Database): v
                 range: range.range,
                 from: range.from,
                 to: range.to,
-                points: getMeTimeline(db, developerId, range.from, range.to),
+                points: getDeveloperTimelineWindow(db, developerId, range.from, range.to),
             },
         };
     });

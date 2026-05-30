@@ -1,5 +1,4 @@
 import type Database from 'better-sqlite3';
-import {getDeveloperTimelineWindow, type TimelinePoint} from './developer-detail';
 
 /**
  * Data layer for the self-service developer view (Task 2.4 / #39).
@@ -290,6 +289,12 @@ export function getMeTools(
  * its constituent providers (the per-provider split is not recoverable from the
  * merged row). The breakdown therefore reflects how the data is stored, while
  * `totals` always reflect the true cross-provider sum.
+ *
+ * Note `totals.avg_churn_rate` is a rough indicator only: it is an unweighted
+ * mean of the per-day churn ratios (a 2-line day counts the same as a 2000-line
+ * day), days with no churn value are excluded, and a cross-provider day's churn
+ * is itself an approximation from the sync-time merge. Use it as a trend hint,
+ * not an exact figure — the count fields above are the authoritative numbers.
  */
 export function getMeActivity(
     db: Database.Database,
@@ -349,18 +354,6 @@ export function getMeActivity(
     };
 }
 
-/**
- * Personal activity timeline over the window: per-day tool interactions and git
- * activity. Delegates to the shared windowed core so the developer self-service
- * timeline and the admin developer timeline can never drift apart — the only
- * difference is that this one is bounded by the shared range parser instead of a
- * fixed 90-day window, and the id is already resolved from the session.
- */
-export function getMeTimeline(
-    db: Database.Database,
-    developerId: string,
-    from: string,
-    to: string,
-): TimelinePoint[] {
-    return getDeveloperTimelineWindow(db, developerId, from, to);
-}
+// The personal activity timeline is the manager timeline scoped to a session-
+// resolved id and bounded by the shared range parser, so /api/me/timeline calls
+// getDeveloperTimelineWindow directly rather than wrapping it here.
