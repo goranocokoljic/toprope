@@ -47,7 +47,9 @@ export interface TeamSettings {
     team: string;
     effective: GlobalSettings;
     overrides: Partial<GlobalSettings>;
-    overridable: Record<keyof GlobalSettings, boolean>;
+    // Only team-overridable keys appear; each value is whether its governing
+    // managers_can_* flag is currently on.
+    overridable: Partial<Record<keyof GlobalSettings, boolean>>;
 }
 
 export type TimeRange = '7d' | '30d' | '90d';

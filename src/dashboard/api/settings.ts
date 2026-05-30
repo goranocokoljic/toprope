@@ -2,6 +2,7 @@ import type {FastifyInstance, FastifyReply, FastifyRequest} from 'fastify';
 import type Database from 'better-sqlite3';
 import {GLOBAL_SETTINGS, coercePreferenceValue, coerceSettingValue, getPreferenceDef, getSettingDef} from '../../settings/registry';
 import {
+    clearOverridesGovernedBy,
     getAllGlobalSettings,
     getTeamOverrides,
     getUserPreferences,
@@ -15,16 +16,21 @@ import {
 /**
  * Settings & preferences endpoints (Task 2.16 / #51).
  *
- * Permission model:
+ * Permission model. The PRIMARY gate is the session middleware
+ * (src/auth/middleware.ts), which confines the only non-admin role
+ * (`developer`) to /api/me and /api/auth — so every request that reaches a
+ * /api/settings/* route is already an admin. The per-route `isAdmin` checks
+ * below are deliberate defense-in-depth: a backstop if the middleware's path
+ * allowlist ever changes, and the seam where a future manager role would be
+ * authorized. They are redundant with the middleware today, not the live
+ * enforcement.
  *  - /api/settings/global   admin only (the site admin owns global config and
  *                           the managers_can_* flags that gate team overrides).
- *  - /api/settings/team/:t  admin only at the role level today; a per-key team
- *                           override is additionally gated by its governing
- *                           managers_can_* flag, so when overrides are
- *                           disallowed the PATCH is rejected with a clear
- *                           message regardless of caller. (Manager-role callers
- *                           drop in here once a manager role + team linkage
- *                           exist; the flag gate is already in place.)
+ *  - /api/settings/team/:t  admin only; a per-key team override is additionally
+ *                           gated by its governing managers_can_* flag, so when
+ *                           overrides are disallowed the PATCH is rejected with
+ *                           a clear message. Disabling a flag also discards the
+ *                           overrides it gated (see clearOverridesGovernedBy).
  *  - /api/me/preferences    any authenticated user, scoped to their own row.
  */
 
@@ -83,6 +89,11 @@ export function registerSettingsRoutes(app: FastifyInstance, db: Database.Databa
         db.transaction(() => {
             for (const u of updates) {
                 setGlobalSetting(db, u.key, u.value);
+                // Turning a managers_can_* flag off discards the team overrides
+                // it gated, so a later re-enable can't silently resurrect them.
+                if (u.value === false) {
+                    clearOverridesGovernedBy(db, u.key);
+                }
             }
         })();
 
@@ -102,10 +113,13 @@ export function registerSettingsRoutes(app: FastifyInstance, db: Database.Databa
 
         // Report effective (resolved) values, the raw stored overrides, and
         // which keys may currently be overridden — so the UI can disable the
-        // controls whose governing flag is off.
+        // controls whose governing flag is off. Only team-overridable keys get
+        // an entry; the managers_can_* flags themselves are global-only.
         const overridable: Record<string, boolean> = {};
-        for (const key of Object.keys(GLOBAL_SETTINGS)) {
-            overridable[key] = isTeamOverrideAllowed(db, key);
+        for (const [key, def] of Object.entries(GLOBAL_SETTINGS)) {
+            if (def.teamOverridable) {
+                overridable[key] = isTeamOverrideAllowed(db, key);
+            }
         }
 
         return {

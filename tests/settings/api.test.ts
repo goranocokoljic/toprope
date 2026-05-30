@@ -120,6 +120,20 @@ describe('settings API', () => {
             expect(res.statusCode).toBe(400);
         });
 
+        it('rejects a fractional value for an integer-only setting', async () => {
+            const res = await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/global',
+                headers: authHeaders(adminToken),
+                payload: {roi_settling_days: 14.7},
+            });
+            expect(res.statusCode).toBe(400);
+
+            // Nothing was written — the default still stands.
+            const reread = await app.inject({method: 'GET', url: '/api/settings/global', headers: authHeaders(adminToken)});
+            expect(reread.json().data.roi_settling_days).toBe(30);
+        });
+
         it('non-admin cannot read or change global settings', async () => {
             const get = await app.inject({method: 'GET', url: '/api/settings/global', headers: authHeaders(devToken)});
             const patch = await app.inject({
@@ -170,6 +184,45 @@ describe('settings API', () => {
             });
             expect(get.json().data.effective.roi_threshold).toBe(7);
             expect(get.json().data.overridable.roi_threshold).toBe(true);
+        });
+
+        it('disabling the governing flag discards the team override it gated', async () => {
+            // Enable the flag, write a team override, confirm it resolves.
+            await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/global',
+                headers: authHeaders(adminToken),
+                payload: {roi_managers_can_override: true},
+            });
+            await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/team/frontend',
+                headers: authHeaders(adminToken),
+                payload: {roi_threshold: 7},
+            });
+
+            // Turn the flag back off — the override row should be cleared, not dormant.
+            await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/global',
+                headers: authHeaders(adminToken),
+                payload: {roi_managers_can_override: false},
+            });
+
+            // Re-enable: resolution falls back to the global default, not the old override.
+            await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/global',
+                headers: authHeaders(adminToken),
+                payload: {roi_managers_can_override: true},
+            });
+            const get = await app.inject({
+                method: 'GET',
+                url: '/api/settings/team/frontend',
+                headers: authHeaders(adminToken),
+            });
+            expect(get.json().data.overrides.roi_threshold).toBeUndefined();
+            expect(get.json().data.effective.roi_threshold).toBe(3.0);
         });
 
         it('rejects overriding a non-overridable key', async () => {

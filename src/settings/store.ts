@@ -133,6 +133,26 @@ export function setTeamSetting(db: Database.Database, team: string, key: string,
 }
 
 /**
+ * Delete every team override for keys governed by `flagKey`, across all teams.
+ * Called when an admin turns a managers_can_* flag off: disabling the flag
+ * discards the overrides it gated rather than leaving stale rows that would
+ * silently resurrect if the flag were ever re-enabled. A no-op for keys that
+ * govern nothing.
+ */
+export function clearOverridesGovernedBy(db: Database.Database, flagKey: string): void {
+    const governedKeys = Object.values(GLOBAL_SETTINGS)
+        .filter((d) => d.overrideGovernedBy === flagKey)
+        .map((d) => d.key);
+    if (governedKeys.length === 0) {
+        return;
+    }
+    const placeholders = governedKeys.map(() => '?').join(',');
+    db.prepare(
+        `DELETE FROM settings WHERE scope = 'team' AND key IN (${placeholders})`,
+    ).run(...governedKeys);
+}
+
+/**
  * The effective value of a setting for a given team. This is THE resolution
  * helper other features (ROI logic, leaderboard gating) call. A team override
  * wins only when (a) the key is team-overridable, (b) its governing flag is on,

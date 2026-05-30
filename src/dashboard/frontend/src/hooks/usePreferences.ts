@@ -1,4 +1,10 @@
-import {useMutation, useQuery, useQueryClient, type UseQueryResult} from '@tanstack/react-query';
+import {
+    useMutation,
+    useQuery,
+    useQueryClient,
+    type UseMutationResult,
+    type UseQueryResult,
+} from '@tanstack/react-query';
 import {api} from '../api/client';
 import {queryKeys} from '../api/queryKeys';
 import type {UserPreferences} from '../api/types';
@@ -16,7 +22,11 @@ export function usePreferences(): UseQueryResult<UserPreferences, Error> {
  * into the cache, so the UI (dark mode, default time range) reflects the change
  * immediately without a refetch.
  */
-export function useUpdatePreferences() {
+export function useUpdatePreferences(): UseMutationResult<
+    UserPreferences,
+    Error,
+    Partial<UserPreferences>
+> {
     const queryClient = useQueryClient();
     return useMutation({
         mutationFn: (patch: Partial<UserPreferences>) => api.patchPreferences(patch),

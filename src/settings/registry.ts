@@ -30,6 +30,8 @@ export interface SettingDef {
     min?: number;
     /** Inclusive upper bound for numeric settings. */
     max?: number;
+    /** Require a whole number (e.g. a day count) for numeric settings. */
+    integer?: boolean;
 }
 
 export const GLOBAL_SETTINGS: Record<string, SettingDef> = {
@@ -63,6 +65,7 @@ export const GLOBAL_SETTINGS: Record<string, SettingDef> = {
         overrideGovernedBy: 'roi_managers_can_override',
         min: 0,
         max: 365,
+        integer: true,
     },
     roi_managers_can_override: {
         key: 'roi_managers_can_override',
@@ -105,10 +108,12 @@ export function getPreferenceDef(key: string): PreferenceDef | undefined {
 }
 
 // Discriminated union: when `ok` is true `value` is always present, so callers
-// narrow with a single `if (!result.ok)` rather than re-checking `value`.
-export type CoercionResult =
-    | {ok: true; value: SettingValue}
-    | {ok: false; error: string};
+// narrow with a single `if (!result.ok)` rather than re-checking `value`. One
+// generic shape serves both the settings and preferences coercers below.
+export type Coerced<T> = {ok: true; value: T} | {ok: false; error: string};
+
+export type CoercionResult = Coerced<SettingValue>;
+export type PreferenceCoercionResult = Coerced<boolean | string>;
 
 /**
  * Validate and coerce a raw (untrusted) value against a setting's declared
@@ -125,6 +130,9 @@ export function coerceSettingValue(def: SettingDef, raw: unknown): CoercionResul
     if (typeof raw !== 'number' || !Number.isFinite(raw)) {
         return {ok: false, error: `${def.key} must be a finite number`};
     }
+    if (def.integer && !Number.isInteger(raw)) {
+        return {ok: false, error: `${def.key} must be a whole number`};
+    }
     if (def.min !== undefined && raw < def.min) {
         return {ok: false, error: `${def.key} must be >= ${def.min}`};
     }
@@ -133,10 +141,6 @@ export function coerceSettingValue(def: SettingDef, raw: unknown): CoercionResul
     }
     return {ok: true, value: raw};
 }
-
-export type PreferenceCoercionResult =
-    | {ok: true; value: boolean | string}
-    | {ok: false; error: string};
 
 export function coercePreferenceValue(def: PreferenceDef, raw: unknown): PreferenceCoercionResult {
     if (def.type === 'boolean') {

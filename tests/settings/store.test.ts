@@ -9,6 +9,7 @@ import {
     getUserPreferences,
     isLeaderboardEnabledForTeam,
     isTeamOverrideAllowed,
+    clearOverridesGovernedBy,
     resolveSetting,
     setGlobalSetting,
     setTeamSetting,
@@ -128,6 +129,40 @@ describe('settings store', () => {
             expect(getTeamOverrides(db, 'frontend')).toEqual({});
             // The other team's overrides are untouched.
             expect(getTeamOverrides(db, 'backend').roi_threshold).toBe(5);
+        });
+
+        it('clearOverridesGovernedBy discards overrides for the keys a flag gates', () => {
+            setTeamSetting(db, 'frontend', 'roi_threshold', 8);
+            setTeamSetting(db, 'frontend', 'roi_settling_days', 14);
+            // An override governed by a *different* flag must survive.
+            setTeamSetting(db, 'frontend', 'leaderboard_enabled', true);
+
+            clearOverridesGovernedBy(db, 'roi_managers_can_override');
+
+            const overrides = getTeamOverrides(db, 'frontend');
+            expect(overrides.roi_threshold).toBeUndefined();
+            expect(overrides.roi_settling_days).toBeUndefined();
+            expect(overrides.leaderboard_enabled).toBe(true);
+        });
+
+        it('disabling a flag clears its overrides so a re-enable cannot resurrect them', () => {
+            setGlobalSetting(db, 'roi_managers_can_override', true);
+            setTeamSetting(db, 'frontend', 'roi_threshold', 7);
+            expect(resolveSetting(db, 'roi_threshold', 'frontend')).toBe(7);
+
+            // Admin turns the flag off: the override is discarded, not merely suppressed.
+            clearOverridesGovernedBy(db, 'roi_managers_can_override');
+            setGlobalSetting(db, 'roi_managers_can_override', false);
+
+            // Re-enabling the flag falls back to the global value, not the old override.
+            setGlobalSetting(db, 'roi_managers_can_override', true);
+            expect(resolveSetting(db, 'roi_threshold', 'frontend')).toBe(3.0);
+        });
+
+        it('clearOverridesGovernedBy is a no-op for a flag that governs nothing', () => {
+            setTeamSetting(db, 'frontend', 'roi_threshold', 8);
+            clearOverridesGovernedBy(db, 'leaderboard_enabled');
+            expect(getTeamOverrides(db, 'frontend').roi_threshold).toBe(8);
         });
 
         it('getRoiConfigForTeam composes both ROI keys', () => {

@@ -1,4 +1,10 @@
-import {useMutation, useQuery, useQueryClient, type UseQueryResult} from '@tanstack/react-query';
+import {
+    useMutation,
+    useQuery,
+    useQueryClient,
+    type UseMutationResult,
+    type UseQueryResult,
+} from '@tanstack/react-query';
 import {api} from '../api/client';
 import {queryKeys} from '../api/queryKeys';
 import type {GlobalSettings, TeamSettings} from '../api/types';
@@ -10,7 +16,11 @@ export function useGlobalSettings(): UseQueryResult<GlobalSettings, Error> {
     });
 }
 
-export function useUpdateGlobalSettings() {
+export function useUpdateGlobalSettings(): UseMutationResult<
+    GlobalSettings,
+    Error,
+    Partial<GlobalSettings>
+> {
     const queryClient = useQueryClient();
     return useMutation({
         mutationFn: (patch: Partial<GlobalSettings>) => api.patchGlobalSettings(patch),
@@ -38,7 +48,9 @@ export function useTeamSettings(team: string | null): UseQueryResult<TeamSetting
     });
 }
 
-export function useUpdateTeamSettings(team: string) {
+export function useUpdateTeamSettings(
+    team: string,
+): UseMutationResult<TeamSettings, Error, Partial<GlobalSettings>> {
     const queryClient = useQueryClient();
     return useMutation({
         mutationFn: (patch: Partial<GlobalSettings>) => api.patchTeamSettings(team, patch),
