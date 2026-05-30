@@ -121,6 +121,14 @@ function findUnusedSeats(db: Database.Database, thresholdDays: number): WasteCon
              JOIN developers d ON d.id = s.developer_id
              WHERE s.seat_revoked_at IS NULL
                AND s.monthly_cost IS NOT NULL
+               -- A freshly-transitioned (or brand-new) seat can't be "unused for
+               -- N days" if it's only existed for fewer than N days. Exempt seats
+               -- assigned within the inactivity window so a plan upgrade or tool
+               -- switch isn't instantly flagged as waste (Task 2.14).
+               AND (
+                   s.seat_assigned_at IS NULL
+                   OR date(s.seat_assigned_at) <= date('now', '-' || ? || ' days')
+               )
                AND NOT EXISTS (
                    SELECT 1 FROM tool_snapshots ts
                    WHERE ts.developer_id = s.developer_id
@@ -129,7 +137,7 @@ function findUnusedSeats(db: Database.Database, thresholdDays: number): WasteCon
                      AND ts.date > date('now', '-' || ? || ' days')
                )`,
         )
-        .all(thresholdDays) as {
+        .all(thresholdDays, thresholdDays) as {
         developer_id: string;
         developer_name: string;
         team: string;

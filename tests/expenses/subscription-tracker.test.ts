@@ -6,11 +6,15 @@ import {addTeam} from '../../src/registry/teams';
 import {addDeveloper} from '../../src/registry/developers';
 import {
     upsertSubscription,
+    switchTool,
     listSubscriptions,
     getDeveloperCostSummaries,
     getTeamCostSummaries,
     getOrgCostSummary,
     detectDuplicates,
+    getDeveloperCostOnDate,
+    getDeveloperCostOverTime,
+    getDeveloperPlanChanges,
 } from '../../src/expenses/subscription-tracker';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../src/storage/migrations');
@@ -376,5 +380,288 @@ describe('detectDuplicates', () => {
 
         const alerts = detectDuplicates(db);
         expect(alerts).toHaveLength(0);
+    });
+});
+
+// ─── Subscription lifecycle handling (Task 2.14 / #49) ───────────────────────
+
+function activeSubs(db: Database.Database, developerId: string, tool?: string): {
+    id: string;
+    plan: string | null;
+    monthly_cost: number | null;
+    seat_assigned_at: string | null;
+    seat_revoked_at: string | null;
+}[] {
+    const sql = tool
+        ? 'SELECT * FROM subscriptions WHERE developer_id = ? AND tool = ? AND seat_revoked_at IS NULL'
+        : 'SELECT * FROM subscriptions WHERE developer_id = ? AND seat_revoked_at IS NULL';
+    return (tool ? db.prepare(sql).all(developerId, tool) : db.prepare(sql).all(developerId)) as never;
+}
+
+describe('subscription lifecycle — plan changes', () => {
+    let db: Database.Database;
+    let devIds: DevIds;
+
+    beforeEach(() => {
+        db = makeDb();
+        devIds = seedDevelopers(db);
+    });
+
+    afterEach(() => {
+        db.close();
+    });
+
+    it('upgrade revokes the old seat, creates a new active one, and records an event', () => {
+        const before = upsertSubscription(db, {
+            developer_id: devIds.alice,
+            tool: 'claude_code',
+            plan: 'pro',
+            billing_model: 'reimbursed',
+            monthly_cost: 20,
+            data_source: 'expense_import',
+        });
+        const after = upsertSubscription(db, {
+            developer_id: devIds.alice,
+            tool: 'claude_code',
+            plan: 'max',
+            billing_model: 'reimbursed',
+            monthly_cost: 200,
+            data_source: 'expense_import',
+        });
+
+        // New active row is a distinct row with the new plan/cost.
+        expect(after.id).not.toBe(before.id);
+        const active = activeSubs(db, devIds.alice, 'claude_code');
+        expect(active).toHaveLength(1);
+        expect(active[0].plan).toBe('max');
+        expect(active[0].monthly_cost).toBe(200);
+
+        // Old row preserved with a revoke date — full history retained.
+        const all = db
+            .prepare('SELECT * FROM subscriptions WHERE developer_id = ? AND tool = ? ORDER BY seat_assigned_at')
+            .all(devIds.alice, 'claude_code') as {id: string; plan: string; seat_revoked_at: string | null}[];
+        expect(all).toHaveLength(2);
+        const old = all.find((r) => r.id === before.id)!;
+        expect(old.plan).toBe('pro');
+        expect(old.seat_revoked_at).not.toBeNull();
+
+        // Event captures before/after.
+        const events = getDeveloperPlanChanges(db, devIds.alice);
+        expect(events).toHaveLength(1);
+        expect(events[0]).toMatchObject({
+            tool: 'claude_code',
+            old_tool: null,
+            old_plan: 'pro',
+            new_plan: 'max',
+            old_monthly_cost: 20,
+            new_monthly_cost: 200,
+        });
+    });
+
+    it('downgrade is handled identically (revoke + create + event)', () => {
+        upsertSubscription(db, {
+            developer_id: devIds.alice,
+            tool: 'claude_code',
+            plan: 'max',
+            billing_model: 'reimbursed',
+            monthly_cost: 200,
+            data_source: 'expense_import',
+        });
+        upsertSubscription(db, {
+            developer_id: devIds.alice,
+            tool: 'claude_code',
+            plan: 'pro',
+            billing_model: 'reimbursed',
+            monthly_cost: 20,
+            data_source: 'expense_import',
+        });
+
+        const active = activeSubs(db, devIds.alice, 'claude_code');
+        expect(active).toHaveLength(1);
+        expect(active[0].plan).toBe('pro');
+        expect(active[0].monthly_cost).toBe(20);
+
+        const events = getDeveloperPlanChanges(db, devIds.alice);
+        expect(events).toHaveLength(1);
+        expect(events[0].old_monthly_cost).toBe(200);
+        expect(events[0].new_monthly_cost).toBe(20);
+    });
+
+    it('re-recording identical plan + cost does not churn history or emit an event', () => {
+        const first = upsertSubscription(db, {
+            developer_id: devIds.alice,
+            tool: 'copilot',
+            plan: 'business',
+            billing_model: 'company_managed',
+            monthly_cost: 19,
+            data_source: 'expense_import',
+        });
+        const second = upsertSubscription(db, {
+            developer_id: devIds.alice,
+            tool: 'copilot',
+            plan: 'business',
+            billing_model: 'company_managed',
+            monthly_cost: 19,
+            data_source: 'expense_import',
+        });
+
+        expect(second.id).toBe(first.id);
+        const all = db
+            .prepare('SELECT * FROM subscriptions WHERE developer_id = ? AND tool = ?')
+            .all(devIds.alice, 'copilot');
+        expect(all).toHaveLength(1);
+        expect(getDeveloperPlanChanges(db, devIds.alice)).toHaveLength(0);
+    });
+
+    it('a billing-model-only change is patched in place without a transition', () => {
+        const first = upsertSubscription(db, {
+            developer_id: devIds.alice,
+            tool: 'copilot',
+            plan: 'business',
+            billing_model: 'personal',
+            monthly_cost: 19,
+            data_source: 'expense_import',
+        });
+        const second = upsertSubscription(db, {
+            developer_id: devIds.alice,
+            tool: 'copilot',
+            plan: 'business',
+            billing_model: 'company_managed',
+            monthly_cost: 19,
+            data_source: 'expense_import',
+        });
+
+        expect(second.id).toBe(first.id);
+        expect(second.billing_model).toBe('company_managed');
+        expect(activeSubs(db, devIds.alice, 'copilot')).toHaveLength(1);
+        expect(getDeveloperPlanChanges(db, devIds.alice)).toHaveLength(0);
+    });
+
+    it('preserves historical tool_snapshots across a transition', () => {
+        db.prepare(
+            `INSERT INTO tool_snapshots (id, developer_id, date, tool, data_source, data_quality, is_active, interaction_count)
+             VALUES ('snap-keep', ?, '2026-01-05', 'claude_code', 'api', 'high', 1, 42)`,
+        ).run(devIds.alice);
+
+        upsertSubscription(db, {
+            developer_id: devIds.alice,
+            tool: 'claude_code',
+            plan: 'pro',
+            billing_model: 'reimbursed',
+            monthly_cost: 20,
+            data_source: 'expense_import',
+        });
+        upsertSubscription(db, {
+            developer_id: devIds.alice,
+            tool: 'claude_code',
+            plan: 'max',
+            billing_model: 'reimbursed',
+            monthly_cost: 200,
+            data_source: 'expense_import',
+        });
+
+        const snap = db
+            .prepare('SELECT interaction_count, tool FROM tool_snapshots WHERE id = ?')
+            .get('snap-keep') as {interaction_count: number; tool: string};
+        expect(snap.interaction_count).toBe(42);
+        expect(snap.tool).toBe('claude_code');
+    });
+});
+
+describe('subscription lifecycle — tool switches', () => {
+    let db: Database.Database;
+    let devIds: DevIds;
+
+    beforeEach(() => {
+        db = makeDb();
+        devIds = seedDevelopers(db);
+    });
+
+    afterEach(() => {
+        db.close();
+    });
+
+    it('switchTool revokes the old tool, opens the new one, and records the switch', () => {
+        upsertSubscription(db, {
+            developer_id: devIds.alice,
+            tool: 'copilot',
+            plan: 'business',
+            billing_model: 'company_managed',
+            monthly_cost: 19,
+            data_source: 'expense_import',
+        });
+
+        const created = switchTool(db, {
+            developer_id: devIds.alice,
+            from_tool: 'copilot',
+            to_tool: 'cursor',
+            plan: 'pro',
+            billing_model: 'company_managed',
+            monthly_cost: 20,
+            data_source: 'admin',
+        });
+
+        // copilot revoked, cursor active.
+        expect(activeSubs(db, devIds.alice, 'copilot')).toHaveLength(0);
+        const cursor = activeSubs(db, devIds.alice, 'cursor');
+        expect(cursor).toHaveLength(1);
+        expect(cursor[0].id).toBe(created.id);
+        expect(cursor[0].monthly_cost).toBe(20);
+
+        const events = getDeveloperPlanChanges(db, devIds.alice);
+        expect(events).toHaveLength(1);
+        expect(events[0]).toMatchObject({
+            tool: 'cursor',
+            old_tool: 'copilot',
+            old_plan: 'business',
+            new_plan: 'pro',
+            old_monthly_cost: 19,
+            new_monthly_cost: 20,
+        });
+    });
+});
+
+describe('subscription lifecycle — cost over time', () => {
+    let db: Database.Database;
+    let devIds: DevIds;
+
+    beforeEach(() => {
+        db = makeDb();
+        devIds = seedDevelopers(db);
+        // Simulate a mid-month upgrade with controlled seat dates: Pro $20 from
+        // Jan 1, revoked Jan 15; Max $200 assigned Jan 15.
+        db.prepare(
+            `INSERT INTO subscriptions (id, developer_id, tool, plan, billing_model, monthly_cost, seat_assigned_at, seat_revoked_at, data_source)
+             VALUES ('cot-pro', ?, 'claude_code', 'pro', 'reimbursed', 20, '2026-01-01T00:00:00.000Z', '2026-01-15T00:00:00.000Z', 'expense_import')`,
+        ).run(devIds.alice);
+        db.prepare(
+            `INSERT INTO subscriptions (id, developer_id, tool, plan, billing_model, monthly_cost, seat_assigned_at, seat_revoked_at, data_source)
+             VALUES ('cot-max', ?, 'claude_code', 'max', 'reimbursed', 200, '2026-01-15T00:00:00.000Z', NULL, 'expense_import')`,
+        ).run(devIds.alice);
+    });
+
+    afterEach(() => {
+        db.close();
+    });
+
+    it('charges the old rate before the change and the new rate after', () => {
+        expect(getDeveloperCostOnDate(db, devIds.alice, '2026-01-10')).toBe(20);
+        expect(getDeveloperCostOnDate(db, devIds.alice, '2026-01-20')).toBe(200);
+    });
+
+    it('does not double-count on the transition day', () => {
+        // On Jan 15 the Pro seat is already revoked (revoked date not > date) and
+        // the Max seat is active — exactly one seat's cost, not both.
+        expect(getDeveloperCostOnDate(db, devIds.alice, '2026-01-15')).toBe(200);
+    });
+
+    it('produces a per-day series that reflects the change date', () => {
+        const series = getDeveloperCostOverTime(db, devIds.alice, '2026-01-13', '2026-01-16');
+        expect(series).toEqual([
+            {date: '2026-01-13', monthly_cost: 20},
+            {date: '2026-01-14', monthly_cost: 20},
+            {date: '2026-01-15', monthly_cost: 200},
+            {date: '2026-01-16', monthly_cost: 200},
+        ]);
     });
 });
