@@ -165,4 +165,40 @@ describe('Settings page', () => {
         // policy note, because roi_managers_can_override is false.
         await waitFor(() => expect(screen.getAllByText(/Override disabled by global policy/i).length).toBeGreaterThan(0));
     });
+
+    it('edits a team override via draft + Save (one PATCH on Save, not per keystroke)', async () => {
+        // Enable the governing flag so the roi_threshold row is editable.
+        global = {...DEFAULT_GLOBAL, roi_managers_can_override: true};
+        renderSettings();
+        const select = await screen.findByRole('combobox');
+        await screen.findByRole('option', {name: 'frontend'});
+        fireEvent.change(select, {target: {value: 'frontend'}});
+
+        // The ROI threshold spinbutton is enabled; editing it must not PATCH yet.
+        // The label appears in both panels (global first, team second) — wait for
+        // the team row to mount, then take the team panel's (last) instance.
+        await waitFor(() =>
+            expect(screen.getAllByRole('spinbutton', {name: /roi threshold/i}).length).toBe(2),
+        );
+        const inputs = screen.getAllByRole('spinbutton', {name: /roi threshold/i});
+        const input = inputs[inputs.length - 1] as HTMLInputElement;
+        fireEvent.change(input, {target: {value: '6'}});
+        const patchesBeforeSave = fetchMock.mock.calls.filter(
+            (c) =>
+                String(c[0]).includes('/api/settings/team/') &&
+                (c[1]?.method ?? 'GET').toUpperCase() === 'PATCH',
+        ).length;
+        expect(patchesBeforeSave).toBe(0);
+
+        fireEvent.click(screen.getByRole('button', {name: /save team overrides/i}));
+        await waitFor(() => {
+            const patch = fetchMock.mock.calls.find(
+                (c) =>
+                    String(c[0]).includes('/api/settings/team/frontend') &&
+                    (c[1]?.method ?? 'GET').toUpperCase() === 'PATCH',
+            );
+            expect(patch).toBeTruthy();
+            expect(JSON.parse(String(patch?.[1]?.body))).toEqual({roi_threshold: 6});
+        });
+    });
 });

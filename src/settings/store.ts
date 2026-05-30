@@ -39,21 +39,7 @@ function decodeStored(def: SettingDef, raw: string): SettingValue {
         return def.default;
     }
     const result = coerceSettingValue(def, parsed);
-    return result.ok && result.value !== undefined ? result.value : def.default;
-}
-
-function readGlobalRow(db: Database.Database, key: string): SettingValue | undefined {
-    const def = getSettingDef(key);
-    if (!def) {
-        return undefined;
-    }
-    const row = db
-        .prepare("SELECT value FROM settings WHERE scope = 'global' AND scope_name = '' AND key = ?")
-        .get(key) as SettingRow | undefined;
-    if (!row) {
-        return undefined;
-    }
-    return decodeStored(def, row.value);
+    return result.ok ? result.value : def.default;
 }
 
 /** Effective global value for a key: stored row if present, else registry default. */
@@ -62,8 +48,10 @@ export function getGlobalSetting(db: Database.Database, key: string): SettingVal
     if (!def) {
         throw new Error(`Unknown setting key: ${key}`);
     }
-    const stored = readGlobalRow(db, key);
-    return stored !== undefined ? stored : def.default;
+    const row = db
+        .prepare("SELECT value FROM settings WHERE scope = 'global' AND scope_name = '' AND key = ?")
+        .get(key) as SettingRow | undefined;
+    return row ? decodeStored(def, row.value) : def.default;
 }
 
 /** Every global setting resolved to its effective value (stored or default). */
@@ -144,10 +132,6 @@ export function setTeamSetting(db: Database.Database, team: string, key: string,
     ).run(team, key, JSON.stringify(value), nowIso());
 }
 
-export function deleteTeamSetting(db: Database.Database, team: string, key: string): void {
-    db.prepare("DELETE FROM settings WHERE scope = 'team' AND scope_name = ? AND key = ?").run(team, key);
-}
-
 /**
  * The effective value of a setting for a given team. This is THE resolution
  * helper other features (ROI logic, leaderboard gating) call. A team override
@@ -213,7 +197,7 @@ function decodePreference(def: PreferenceDef, raw: string): boolean | string {
         return def.default;
     }
     const result = coercePreferenceValue(def, parsed);
-    return result.ok && result.value !== undefined ? result.value : def.default;
+    return result.ok ? result.value : def.default;
 }
 
 /** All preferences for a user, merged over the registry defaults. */

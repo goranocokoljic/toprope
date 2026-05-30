@@ -1,6 +1,6 @@
 import type {FastifyInstance, FastifyReply, FastifyRequest} from 'fastify';
 import type Database from 'better-sqlite3';
-import {GLOBAL_SETTINGS, USER_PREFERENCES, coercePreferenceValue, coerceSettingValue, getSettingDef} from '../../settings/registry';
+import {GLOBAL_SETTINGS, coercePreferenceValue, coerceSettingValue, getPreferenceDef, getSettingDef} from '../../settings/registry';
 import {
     getAllGlobalSettings,
     getTeamOverrides,
@@ -74,8 +74,8 @@ export function registerSettingsRoutes(app: FastifyInstance, db: Database.Databa
                 return badRequest(reply, `Unknown setting: ${key}`);
             }
             const result = coerceSettingValue(def, raw);
-            if (!result.ok || result.value === undefined) {
-                return badRequest(reply, result.error ?? `Invalid value for ${key}`);
+            if (!result.ok) {
+                return badRequest(reply, result.error);
             }
             updates.push({key, value: result.value});
         }
@@ -135,6 +135,10 @@ export function registerSettingsRoutes(app: FastifyInstance, db: Database.Databa
                 return badRequest(reply, 'Request body must be an object of settings to update');
             }
 
+            // All-or-nothing: every key is validated and authorized before any
+            // write. If any key is unknown, non-overridable, governed by an
+            // off flag, or invalid, the whole PATCH is rejected and nothing is
+            // persisted — a partial multi-key update never happens.
             const updates: {key: string; value: boolean | number}[] = [];
             for (const [key, raw] of Object.entries(body)) {
                 const def = getSettingDef(key);
@@ -154,8 +158,8 @@ export function registerSettingsRoutes(app: FastifyInstance, db: Database.Databa
                     );
                 }
                 const result = coerceSettingValue(def, raw);
-                if (!result.ok || result.value === undefined) {
-                    return badRequest(reply, result.error ?? `Invalid value for ${key}`);
+                if (!result.ok) {
+                    return badRequest(reply, result.error);
                 }
                 updates.push({key, value: result.value});
             }
@@ -197,13 +201,13 @@ export function registerSettingsRoutes(app: FastifyInstance, db: Database.Databa
 
         const updates: {key: string; value: boolean | string}[] = [];
         for (const [key, raw] of Object.entries(body)) {
-            const def = USER_PREFERENCES[key];
+            const def = getPreferenceDef(key);
             if (!def) {
                 return badRequest(reply, `Unknown preference: ${key}`);
             }
             const result = coercePreferenceValue(def, raw);
-            if (!result.ok || result.value === undefined) {
-                return badRequest(reply, result.error ?? `Invalid value for ${key}`);
+            if (!result.ok) {
+                return badRequest(reply, result.error);
             }
             updates.push({key, value: result.value});
         }

@@ -104,11 +104,11 @@ export function getPreferenceDef(key: string): PreferenceDef | undefined {
     return USER_PREFERENCES[key];
 }
 
-export interface CoercionResult {
-    ok: boolean;
-    value?: SettingValue;
-    error?: string;
-}
+// Discriminated union: when `ok` is true `value` is always present, so callers
+// narrow with a single `if (!result.ok)` rather than re-checking `value`.
+export type CoercionResult =
+    | {ok: true; value: SettingValue}
+    | {ok: false; error: string};
 
 /**
  * Validate and coerce a raw (untrusted) value against a setting's declared
@@ -134,11 +134,9 @@ export function coerceSettingValue(def: SettingDef, raw: unknown): CoercionResul
     return {ok: true, value: raw};
 }
 
-export interface PreferenceCoercionResult {
-    ok: boolean;
-    value?: boolean | string;
-    error?: string;
-}
+export type PreferenceCoercionResult =
+    | {ok: true; value: boolean | string}
+    | {ok: false; error: string};
 
 export function coercePreferenceValue(def: PreferenceDef, raw: unknown): PreferenceCoercionResult {
     if (def.type === 'boolean') {

@@ -15,6 +15,17 @@ CREATE TABLE settings (
     PRIMARY KEY (scope, scope_name, key)
 );
 
+-- Team overrides are keyed by team name (scope_name) rather than a column FK,
+-- because the same table also holds global rows (scope_name = ''), which no
+-- team row could satisfy. This trigger gives team rows the equivalent of
+-- ON DELETE CASCADE: removing a team drops its override rows, so a later team
+-- that reuses the name can't silently inherit ghost overrides.
+CREATE TRIGGER settings_team_cascade_delete
+AFTER DELETE ON teams
+BEGIN
+    DELETE FROM settings WHERE scope = 'team' AND scope_name = OLD.name;
+END;
+
 -- Per-user UI preferences (e.g. default_time_range, dark_mode). Cascade so a
 -- removed user's preferences are cleaned up with their account.
 CREATE TABLE user_preferences (

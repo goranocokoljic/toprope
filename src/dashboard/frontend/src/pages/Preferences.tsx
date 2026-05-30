@@ -33,9 +33,12 @@ export function Preferences(): JSX.Element {
     }, [data, setTheme]);
 
     function onToggleDarkMode(): void {
+        const previous = theme;
         const next = theme !== 'dark';
+        // Optimistically flip the live theme, but roll back if the write fails
+        // so the visible theme never silently diverges from the persisted value.
         setTheme(next ? 'dark' : 'light');
-        update.mutate({dark_mode: next});
+        update.mutate({dark_mode: next}, {onError: () => setTheme(previous)});
     }
 
     function onChangeTimeRange(value: TimeRange): void {

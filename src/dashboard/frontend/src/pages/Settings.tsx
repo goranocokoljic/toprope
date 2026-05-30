@@ -155,6 +155,39 @@ function TeamPanel(): JSX.Element {
 
     const overridableFields = FIELDS.filter((f) => f.teamOverridable);
 
+    // Stage edits locally and commit on Save, mirroring GlobalPanel. Binding
+    // inputs straight to the server-resolved value and mutating per keystroke
+    // makes the field fight the user (and fires a PATCH per character); a draft
+    // avoids both. Re-seeded whenever the selected team's settings load/refresh.
+    const [draft, setDraft] = useState<GlobalSettings | null>(null);
+    useEffect(() => {
+        setDraft(settings ? settings.effective : null);
+    }, [settings]);
+
+    function onSave(): void {
+        if (!settings || !draft) {
+            return;
+        }
+        // Send only overridable keys whose value actually changed, skipping any
+        // non-finite number left by an empty input.
+        const patch: Partial<GlobalSettings> = {};
+        for (const field of overridableFields) {
+            if (!settings.overridable[field.key]) {
+                continue;
+            }
+            const next = draft[field.key];
+            if (field.type === 'number' && !Number.isFinite(next as number)) {
+                continue;
+            }
+            if (next !== settings.effective[field.key]) {
+                (patch as Record<string, boolean | number>)[field.key] = next;
+            }
+        }
+        if (Object.keys(patch).length > 0) {
+            update.mutate(patch);
+        }
+    }
+
     return (
         <Card title="Per-team settings">
             <div className="space-y-4">
@@ -174,7 +207,7 @@ function TeamPanel(): JSX.Element {
                     </select>
                 </label>
 
-                {team && settings ? (
+                {team && settings && draft ? (
                     <div className="space-y-4">
                         <p className="text-xs text-muted">
                             Overrides apply only to settings whose global “managers may…” flag is on.
@@ -182,15 +215,14 @@ function TeamPanel(): JSX.Element {
                         </p>
                         {overridableFields.map((field) => {
                             const allowed = settings.overridable[field.key];
-                            const effective = settings.effective[field.key];
                             if (field.type === 'boolean') {
                                 return (
                                     <div key={field.key}>
                                         <BooleanRow
                                             label={field.label}
-                                            checked={effective as boolean}
+                                            checked={draft[field.key] as boolean}
                                             disabled={!allowed}
-                                            onChange={(next) => update.mutate({[field.key]: next})}
+                                            onChange={(next) => setDraft({...draft, [field.key]: next})}
                                         />
                                         {!allowed ? (
                                             <p className="text-xs text-muted">Override disabled by global policy.</p>
@@ -202,10 +234,10 @@ function TeamPanel(): JSX.Element {
                                 <div key={field.key}>
                                     <NumberRow
                                         label={field.label}
-                                        value={effective as number}
+                                        value={draft[field.key] as number}
                                         step={field.step}
                                         disabled={!allowed}
-                                        onChange={(next) => update.mutate({[field.key]: next})}
+                                        onChange={(next) => setDraft({...draft, [field.key]: next})}
                                     />
                                     {!allowed ? (
                                         <p className="text-xs text-muted">Override disabled by global policy.</p>
@@ -213,9 +245,20 @@ function TeamPanel(): JSX.Element {
                                 </div>
                             );
                         })}
-                        {update.isError ? (
-                            <p className="text-sm text-danger">{update.error.message}</p>
-                        ) : null}
+                        <div className="flex items-center gap-3 pt-2">
+                            <button
+                                type="button"
+                                onClick={onSave}
+                                disabled={update.isPending}
+                                className="rounded-md bg-accent px-4 py-2 text-sm font-medium text-white disabled:opacity-60"
+                            >
+                                {update.isPending ? 'Saving…' : 'Save team overrides'}
+                            </button>
+                            {update.isError ? (
+                                <span className="text-sm text-danger">{update.error.message}</span>
+                            ) : null}
+                            {update.isSuccess ? <span className="text-sm text-muted">Saved.</span> : null}
+                        </div>
                     </div>
                 ) : null}
             </div>

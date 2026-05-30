@@ -121,6 +121,15 @@ describe('settings store', () => {
             expect(overrides.roi_threshold).toBe(8);
         });
 
+        it('deleting a team cascades away its overrides (no ghost rows)', () => {
+            setTeamSetting(db, 'frontend', 'roi_threshold', 8);
+            setTeamSetting(db, 'backend', 'roi_threshold', 5);
+            db.prepare('DELETE FROM teams WHERE name = ?').run('frontend');
+            expect(getTeamOverrides(db, 'frontend')).toEqual({});
+            // The other team's overrides are untouched.
+            expect(getTeamOverrides(db, 'backend').roi_threshold).toBe(5);
+        });
+
         it('getRoiConfigForTeam composes both ROI keys', () => {
             setGlobalSetting(db, 'roi_managers_can_override', true);
             setGlobalSetting(db, 'roi_threshold', 2);
