@@ -385,17 +385,20 @@ describe('detectDuplicates', () => {
 
 // ─── Subscription lifecycle handling (Task 2.14 / #49) ───────────────────────
 
-function activeSubs(db: Database.Database, developerId: string, tool?: string): {
+interface ActiveSubRow {
     id: string;
     plan: string | null;
     monthly_cost: number | null;
     seat_assigned_at: string | null;
     seat_revoked_at: string | null;
-}[] {
+}
+
+function activeSubs(db: Database.Database, developerId: string, tool?: string): ActiveSubRow[] {
     const sql = tool
         ? 'SELECT * FROM subscriptions WHERE developer_id = ? AND tool = ? AND seat_revoked_at IS NULL'
         : 'SELECT * FROM subscriptions WHERE developer_id = ? AND seat_revoked_at IS NULL';
-    return (tool ? db.prepare(sql).all(developerId, tool) : db.prepare(sql).all(developerId)) as never;
+    const rows = tool ? db.prepare(sql).all(developerId, tool) : db.prepare(sql).all(developerId);
+    return rows as ActiveSubRow[];
 }
 
 describe('subscription lifecycle — plan changes', () => {

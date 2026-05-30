@@ -167,6 +167,14 @@ function recordPlanChangeEvent(
  * or data-source-only difference is bookkeeping metadata, not a lifecycle
  * transition, so it is applied in place rather than spawning a revoke+create
  * (and is never recorded as a plan-change event, to keep the ROI signal clean).
+ *
+ * The monthly_cost comparison is exact (`!==`). This is safe for the only
+ * caller that flows real data — the expense importer parses costs with
+ * parseFloat over identical CSV strings on re-import, so an unchanged row
+ * yields a bit-identical float and does not trip a spurious transition. If a
+ * future caller feeds a *computed* rate (e.g. proration), switch to an epsilon
+ * compare here so floating-point noise (19.99 vs 19.990000001) isn't read as a
+ * downgrade-then-upgrade.
  */
 function isMaterialChange(existing: Subscription, data: UpsertData): boolean {
     return existing.plan !== data.plan || existing.monthly_cost !== data.monthly_cost;
@@ -427,9 +435,31 @@ export function detectDuplicates(db: Database.Database): DuplicateAlert[] {
  * `date(...)` is applied to the stored full-ISO timestamps so a same-day
  * revoke+create (the lifecycle transition pattern) lands cleanly on the date
  * boundary regardless of the time-of-day component.
+ *
+ * INVARIANT: the revoke and create of a transition share an identical `now`
+ * timestamp, so old.seat_revoked_at == new.seat_assigned_at to the millisecond.
+ * Any seat-active-on-date test MUST therefore compare on `date(...)`, never the
+ * raw timestamps — a raw `<`/`>` comparison would see a zero-width overlap on
+ * the transition instant and either double-count or drop the seat. Reuse this
+ * clause (or `isActiveOnDate` below) rather than hand-rolling the comparison.
  */
 const ACTIVE_ON_DATE_CLAUSE =
     "date(seat_assigned_at) <= ? AND (seat_revoked_at IS NULL OR date(seat_revoked_at) > ?)";
+
+/** Date-granularity active test mirroring ACTIVE_ON_DATE_CLAUSE for in-memory rows. */
+function isActiveOnDate(
+    sub: {seat_assigned_at: string | null; seat_revoked_at: string | null},
+    date: string,
+): boolean {
+    const assigned = sub.seat_assigned_at?.slice(0, 10);
+    if (assigned === undefined || assigned > date) {
+        return false;
+    }
+    if (sub.seat_revoked_at === null) {
+        return true;
+    }
+    return sub.seat_revoked_at.slice(0, 10) > date;
+}
 
 /**
  * Total monthly cost of a developer's subscriptions that were active on a single
@@ -463,6 +493,10 @@ function addDays(date: string, days: number): string {
  * window. Each point is the rate in effect on that date, so summing or charting
  * the series reflects plan changes at the exact date they took effect rather
  * than retroactively applying the current plan to past dates.
+ *
+ * The developer's subscriptions are fetched once and the per-day cost is folded
+ * in memory — O(days × subs) arithmetic with a single DB round-trip — rather
+ * than one query per day, so a wide range stays cheap.
  */
 export function getDeveloperCostOverTime(
     db: Database.Database,
@@ -470,9 +504,27 @@ export function getDeveloperCostOverTime(
     from: string,
     to: string,
 ): CostPoint[] {
+    const subs = db
+        .prepare(
+            `SELECT monthly_cost, seat_assigned_at, seat_revoked_at
+             FROM subscriptions
+             WHERE developer_id = ? AND monthly_cost IS NOT NULL`,
+        )
+        .all(developerId) as {
+        monthly_cost: number;
+        seat_assigned_at: string | null;
+        seat_revoked_at: string | null;
+    }[];
+
     const points: CostPoint[] = [];
     for (let date = from; date <= to; date = addDays(date, 1)) {
-        points.push({date, monthly_cost: getDeveloperCostOnDate(db, developerId, date)});
+        let cost = 0;
+        for (const sub of subs) {
+            if (isActiveOnDate(sub, date)) {
+                cost += sub.monthly_cost;
+            }
+        }
+        points.push({date, monthly_cost: cost});
     }
     return points;
 }
