@@ -10,6 +10,13 @@ export const queryKeys = {
     overviewTrend: (window: string) => ['overview', 'trend', window] as const,
     coverage: ['coverage'] as const,
     wasteSummary: ['waste', 'summary'] as const,
+    // Teams list + per-team detail surfaces (Task 2.6).
+    teams: ['teams'] as const,
+    teamDetail: (team: string) => ['teams', 'detail', team] as const,
+    // Keyed by team + resolved window so changing either refetches.
+    teamTrend: (team: string, window: string) => ['teams', 'trend', team, window] as const,
+    teamProviders: (team: string) => ['teams', 'providers', team] as const,
+    teamWaste: (team: string) => ['teams', 'waste', team] as const,
     globalSettings: ['settings', 'global'] as const,
     teamSettings: (team: string) => ['settings', 'team', team] as const,
     preferences: ['preferences'] as const,

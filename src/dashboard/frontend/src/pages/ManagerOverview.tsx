@@ -15,26 +15,9 @@ import {EmptyState} from '../components/EmptyState';
 import {ColdStartPanel, type ConnectorStatus} from '../components/ColdStartPanel';
 import {classifyDataState} from '../components/dataState';
 import {toolLabel} from '../components/toolLabels';
+import {formatCurrency, formatPercent, formatDateTick} from '../components/format';
 import {inclusiveDayCount} from '../timeRange/range';
 import type {OverviewData, ToolDistributionEntry, WasteTeamSummary} from '../api/types';
-
-function formatCurrency(value: number): string {
-    return new Intl.NumberFormat('en-US', {style: 'currency', currency: 'USD', maximumFractionDigits: 0}).format(value);
-}
-
-/** Whole-number percent for utilization-style ratios. */
-function formatPercent(ratio: number): string {
-    return `${Math.round(ratio * 100)}%`;
-}
-
-/** 'YYYY-MM-DD' → a short, locale-aware axis tick (e.g. "May 5"). */
-function formatDateTick(value: string | number): string {
-    const date = new Date(`${value}T00:00:00.000Z`);
-    if (Number.isNaN(date.getTime())) {
-        return String(value);
-    }
-    return new Intl.DateTimeFormat(undefined, {month: 'short', day: 'numeric', timeZone: 'UTC'}).format(date);
-}
 
 // The connectors GovProxy can pull from. We always list all three so the
 // cold-start panel shows what's still unconnected, not just what's wired up.

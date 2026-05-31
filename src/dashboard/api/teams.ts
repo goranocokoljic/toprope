@@ -1,6 +1,7 @@
 import type {FastifyInstance} from 'fastify';
 import type Database from 'better-sqlite3';
 import {parsePagination, buildPaginatedResponse} from './types';
+import {isAdmin, forbidden} from './guards';
 
 interface TeamSummary {
     name: string;
@@ -26,18 +27,35 @@ interface DeveloperInTeam {
     has_waste: boolean;
 }
 
+interface TeamToolBreakdown {
+    tool: string;
+    /** Distinct developers in the team active on this tool in the last 30 days. */
+    developers: number;
+    /** Team's monthly spend on this tool (sum of per-developer seat cost). */
+    monthly_cost: number;
+}
+
 interface TeamDetail {
     name: string;
     department: string | null;
     manager: string | null;
     developer_count: number;
+    /** Distinct developers active (any is_active snapshot) in the last 30 days. */
+    active_count: number;
     total_monthly_cost: number;
     total_monthly_waste: number;
     developers: DeveloperInTeam[];
+    tool_breakdown: TeamToolBreakdown[];
 }
 
 export function registerTeamRoutes(app: FastifyInstance, db: Database.Database): void {
-    app.get<{Querystring: {page?: string; limit?: string}}>('/api/teams', async (request) => {
+    app.get<{Querystring: {page?: string; limit?: string}}>('/api/teams', async (request, reply) => {
+        // Team summaries are manager-scoped; guard inline as defense-in-depth
+        // alongside the session middleware, matching every sibling manager route.
+        if (!isAdmin(request)) {
+            return forbidden(reply);
+        }
+
         const pagination = parsePagination(request.query as Record<string, unknown>);
 
         const cutoff = new Date();
@@ -117,6 +135,12 @@ export function registerTeamRoutes(app: FastifyInstance, db: Database.Database):
     });
 
     app.get<{Params: {team: string}}>('/api/teams/:team', async (request, reply) => {
+        // Returns per-developer identities + metrics, so manager-only — guard
+        // inline as defense-in-depth alongside the session middleware.
+        if (!isAdmin(request)) {
+            return forbidden(reply);
+        }
+
         const {team: teamName} = request.params;
 
         const team = db
@@ -204,14 +228,67 @@ export function registerTeamRoutes(app: FastifyInstance, db: Database.Database):
             )
             .get(teamName) as {total_waste: number};
 
+        // Per-tool breakdown for the team: adoption (distinct active developers
+        // on the tool in the last 30 days) and cost (sum of each developer's
+        // latest seat cost per tool, matching the team-total cost computation).
+        // Tools are the UNION of the two — a tool can have paid seats but no
+        // active use, or active use logged without a tracked subscription.
+        const adoptionRows = db
+            .prepare(
+                `SELECT ts.tool AS tool, COUNT(DISTINCT ts.developer_id) AS developers
+                 FROM tool_snapshots ts
+                 JOIN developers d ON d.id = ts.developer_id
+                 WHERE d.team = ? AND ts.is_active = 1 AND ts.date >= ?
+                 GROUP BY ts.tool`,
+            )
+            .all(teamName, cutoffDate) as {tool: string; developers: number}[];
+
+        const toolCostRows = db
+            .prepare(
+                `SELECT tool, COALESCE(SUM(monthly_cost), 0) AS monthly_cost
+                 FROM (SELECT s.tool AS tool, MAX(s.monthly_cost) AS monthly_cost
+                       FROM subscriptions s
+                       JOIN developers d ON d.id = s.developer_id
+                       WHERE d.team = ? AND s.seat_revoked_at IS NULL
+                       GROUP BY s.developer_id, s.tool)
+                 GROUP BY tool`,
+            )
+            .all(teamName) as {tool: string; monthly_cost: number}[];
+
+        // Active developer count, defined identically to the list endpoint
+        // (distinct developers with an is_active snapshot in the window) so the
+        // detail header and the list row never drift apart.
+        const activeCount = (
+            db
+                .prepare(
+                    `SELECT COUNT(DISTINCT ts.developer_id) AS cnt
+                     FROM tool_snapshots ts
+                     JOIN developers d ON d.id = ts.developer_id
+                     WHERE d.team = ? AND ts.is_active = 1 AND ts.date >= ?`,
+                )
+                .get(teamName, cutoffDate) as {cnt: number}
+        ).cnt;
+
+        const adoptionMap = new Map(adoptionRows.map((r) => [r.tool, r.developers]));
+        const toolCostMap = new Map(toolCostRows.map((r) => [r.tool, r.monthly_cost]));
+        const toolBreakdown: TeamToolBreakdown[] = [...new Set([...adoptionMap.keys(), ...toolCostMap.keys()])]
+            .sort()
+            .map((tool) => ({
+                tool,
+                developers: adoptionMap.get(tool) ?? 0,
+                monthly_cost: toolCostMap.get(tool) ?? 0,
+            }));
+
         const detail: TeamDetail = {
             name: team.name,
             department: team.department,
             manager: team.manager,
             developer_count: developers.length,
+            active_count: activeCount,
             total_monthly_cost: costRow.total_cost,
             total_monthly_waste: wasteRow.total_waste,
             developers: devDetails,
+            tool_breakdown: toolBreakdown,
         };
 
         return {data: detail};

@@ -5,6 +5,7 @@ import {makeTestDb} from './fixtures';
 import {registerSessionAuth} from '../../src/auth/middleware';
 import {registerAuthRoutes} from '../../src/dashboard/api/auth-routes';
 import {registerMeRoutes} from '../../src/dashboard/api/me';
+import {registerTeamRoutes} from '../../src/dashboard/api/teams';
 import {registerTrendRoutes} from '../../src/dashboard/api/trends';
 import {registerToolsRoutes} from '../../src/dashboard/api/tools';
 import {registerCoverageRoutes} from '../../src/dashboard/api/coverage';
@@ -23,6 +24,7 @@ async function buildApp(db: Database.Database): Promise<FastifyInstance> {
     registerSessionAuth(app, db);
     registerAuthRoutes(app, db, {sessionTtlHours: 24, cookieSecure: false});
     registerMeRoutes(app, db);
+    registerTeamRoutes(app, db);
     registerTrendRoutes(app, db);
     registerToolsRoutes(app, db);
     registerCoverageRoutes(app, db);
@@ -231,6 +233,30 @@ describe('Manager API (Task 2.3)', () => {
             const team = await app.inject({method: 'GET', url: '/api/teams/eng/trend?range=30d', headers: authHeaders(devToken)});
             expect(org.statusCode).toBe(403);
             expect(team.statusCode).toBe(403);
+        });
+    });
+
+    // ── teams list + detail ──────────────────────────────────────────────────
+    describe('team endpoints', () => {
+        beforeEach(() => {
+            seedTeam(db, 'eng');
+            seedDeveloper(db, 'dev1', 'eng');
+            seedToolSnapshot(db, {developer: 'dev1', date: '2026-05-10'});
+        });
+
+        it('serves the teams list and team detail to admins', async () => {
+            const list = await app.inject({method: 'GET', url: '/api/teams', headers: authHeaders(adminToken)});
+            const detail = await app.inject({method: 'GET', url: '/api/teams/eng', headers: authHeaders(adminToken)});
+            expect(list.statusCode).toBe(200);
+            expect(detail.statusCode).toBe(200);
+            expect((detail.json() as {data: {active_count: number}}).data.active_count).toBe(1);
+        });
+
+        it('returns 403 for developer-role sessions', async () => {
+            const list = await app.inject({method: 'GET', url: '/api/teams', headers: authHeaders(devToken)});
+            const detail = await app.inject({method: 'GET', url: '/api/teams/eng', headers: authHeaders(devToken)});
+            expect(list.statusCode).toBe(403);
+            expect(detail.statusCode).toBe(403);
         });
     });
 

@@ -5,9 +5,15 @@ import type {
     GlobalSettings,
     OverviewData,
     OverviewTrend,
+    PaginatedResponse,
+    TeamDetail,
+    TeamListItem,
+    TeamProviders,
     TeamSettings,
+    TeamTrend,
     ToolDistribution,
     UserPreferences,
+    WasteAlert,
     WasteTeamSummary,
 } from './types';
 
@@ -86,6 +92,25 @@ async function patchJson<T>(path: string, body: unknown): Promise<T> {
     });
 }
 
+/**
+ * Collect every row of a paginated endpoint. The API caps `limit` at 100, so
+ * callers that need the full set (sorted/merged client-side) page through here
+ * rather than each re-implementing the same termination logic. `pathFor`
+ * builds the request path for a given 1-based page.
+ */
+async function fetchAllPages<T>(pathFor: (page: number) => string): Promise<T[]> {
+    const rows: T[] = [];
+    for (let page = 1; ; page += 1) {
+        const body = await request<PaginatedResponse<T>>(pathFor(page));
+        rows.push(...body.data);
+        const {limit, total} = body.pagination;
+        if (body.data.length === 0 || page * limit >= total) {
+            break;
+        }
+    }
+    return rows;
+}
+
 export const api = {
     async getOverview(): Promise<OverviewData> {
         const body = await request<ApiEnvelope<OverviewData>>('/api/overview');
@@ -116,6 +141,44 @@ export const api = {
     async getWasteSummary(): Promise<WasteTeamSummary[]> {
         const body = await request<ApiEnvelope<WasteTeamSummary[]>>('/api/waste/summary');
         return body.data;
+    },
+
+    /**
+     * Every team's list-row summary. The teams list sorts client-side, so we
+     * collect all pages rather than truncating an org with >100 teams.
+     */
+    async getTeams(): Promise<TeamListItem[]> {
+        return fetchAllPages<TeamListItem>((page) => `/api/teams?page=${page}&limit=100`);
+    },
+
+    /** Full detail (summary + per-developer aggregates) for one team. */
+    async getTeamDetail(team: string): Promise<TeamDetail> {
+        const body = await request<ApiEnvelope<TeamDetail>>(
+            `/api/teams/${encodeURIComponent(team)}`,
+        );
+        return body.data;
+    },
+
+    /** Adoption trend scoped to one team over a time window (admin). */
+    async getTeamTrend(team: string, params: TimeRangeQuery): Promise<TeamTrend> {
+        const body = await request<ApiEnvelope<TeamTrend>>(
+            `/api/teams/${encodeURIComponent(team)}/trend${timeRangeQueryString(params)}`,
+        );
+        return body.data;
+    },
+
+    /** Git provider(s) hosting a team's repos, by developer git activity. */
+    async getTeamProviders(team: string): Promise<TeamProviders> {
+        const body = await request<ApiEnvelope<TeamProviders>>(
+            `/api/teams/${encodeURIComponent(team)}/providers`,
+        );
+        return body.data;
+    },
+
+    /** Open waste alerts scoped to one team (all pages). */
+    async getTeamWaste(team: string): Promise<WasteAlert[]> {
+        const q = encodeURIComponent(team);
+        return fetchAllPages<WasteAlert>((page) => `/api/waste?team=${q}&page=${page}&limit=100`);
     },
 
     /**
@@ -151,24 +214,12 @@ export const api = {
     },
 
     /**
-     * Team names, for the per-team settings selector. `/api/teams` caps `limit`
-     * at 100, so we page through until every team is collected rather than
-     * silently truncating the selector for orgs with >100 teams.
+     * Team names, for the per-team settings selector. Pages through every team
+     * rather than silently truncating the selector for orgs with >100 teams.
      */
     async getTeamNames(): Promise<string[]> {
-        const names: string[] = [];
-        for (let page = 1; ; page += 1) {
-            const body = await request<{
-                data: {name: string}[];
-                pagination: {page: number; limit: number; total: number};
-            }>(`/api/teams?page=${page}&limit=100`);
-            names.push(...body.data.map((t) => t.name));
-            const {limit, total} = body.pagination;
-            if (body.data.length === 0 || page * limit >= total) {
-                break;
-            }
-        }
-        return names;
+        const teams = await fetchAllPages<{name: string}>((page) => `/api/teams?page=${page}&limit=100`);
+        return teams.map((t) => t.name);
     },
 
     // --- Settings (admin) ---
