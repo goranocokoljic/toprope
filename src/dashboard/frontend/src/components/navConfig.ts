@@ -20,15 +20,14 @@ const ADMIN_SECTION: NavSection = {title: 'Admin', items: [{to: '/settings', lab
 /**
  * Build the nav for a role. Managers are modelled as admins in this codebase, so
  * an admin gets the manager + admin areas; a developer gets the developer area.
- * When the role is unknown (component rendered outside an AuthProvider, e.g. in
- * isolated tests) we show both non-admin areas so the shell is still navigable.
+ * An unknown role (missing/garbled session, or the component rendered outside an
+ * AuthProvider) fails CLOSED to the least-privileged developer view rather than
+ * exposing the manager area — the server still enforces the real boundary, but
+ * the nav shouldn't advertise screens an unknown principal may not reach.
  */
 export function navSectionsForRole(role: UserRole | undefined): NavSection[] {
     if (role === 'admin') {
         return [MANAGER_SECTION, ADMIN_SECTION, ACCOUNT_SECTION];
     }
-    if (role === 'developer') {
-        return [DEVELOPER_SECTION, ACCOUNT_SECTION];
-    }
-    return [MANAGER_SECTION, DEVELOPER_SECTION, ACCOUNT_SECTION];
+    return [DEVELOPER_SECTION, ACCOUNT_SECTION];
 }

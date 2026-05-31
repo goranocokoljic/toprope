@@ -60,7 +60,8 @@ export function ComparisonChart({
             tick={axisTick}
             tickLine={false}
             axisLine={false}
-            allowDecimals={!horizontal ? undefined : false}
+            // When horizontal, the X axis is the value axis → no decimal ticks.
+            allowDecimals={horizontal ? false : undefined}
         />
     );
     const valueAxis = (
@@ -80,6 +81,10 @@ export function ComparisonChart({
             <ResponsiveContainer width="100%" height="100%">
                 <BarChart
                     data={data}
+                    // Recharts' `layout` names the axis the BARS run along, which
+                    // is the opposite of how we describe the chart: our
+                    // "horizontal" bars (long category labels down the side) are
+                    // Recharts' `layout="vertical"`.
                     layout={horizontal ? 'vertical' : 'horizontal'}
                     margin={{top: 8, right: 8, bottom: 0, left: 0}}
                 >

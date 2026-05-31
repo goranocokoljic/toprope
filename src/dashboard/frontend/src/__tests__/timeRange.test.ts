@@ -72,4 +72,15 @@ describe('smartDefaultPreset', () => {
         expect(smartDefaultPreset({now: NOW, earliest: daysBefore(200)})).toBe('year');
         expect(smartDefaultPreset({now: NOW, earliest: daysBefore(400)})).toBe('lifetime');
     });
+
+    it('never selects a preset whose window omits the earliest day (boundary)', () => {
+        // The chosen preset's resolved window must start on or before earliest.
+        const year = resolvePreset('year', {now: NOW}); // from = 2025-06-01
+        expect(smartDefaultPreset({now: NOW, earliest: year.from})).toBe('year');
+        // One day older than the year window can hold → must escalate to lifetime,
+        // not silently pick `year` and drop that day (the off-by-one guard).
+        const dayBeforeYear = '2025-05-31';
+        expect(dayBeforeYear < year.from).toBe(true);
+        expect(smartDefaultPreset({now: NOW, earliest: dayBeforeYear})).toBe('lifetime');
+    });
 });

@@ -14,6 +14,7 @@ import {StatCard} from '../components/StatCard';
 import {DataTable, type Column} from '../components/DataTable';
 import {TimeRangeSelector} from '../components/TimeRangeSelector';
 import {Skeleton, SkeletonStatCard} from '../components/Skeleton';
+import {DarkModeToggle} from '../components/DarkModeToggle';
 import {TrendChart} from '../charts/TrendChart';
 import {ComparisonChart} from '../charts/ComparisonChart';
 import {DistributionChart} from '../charts/DistributionChart';
@@ -47,10 +48,11 @@ describe('navSectionsForRole', () => {
         expect(titles).not.toContain('Manager');
     });
 
-    it('falls back to both non-admin areas when the role is unknown', () => {
+    it('fails closed to the developer view when the role is unknown', () => {
         const titles = navSectionsForRole(undefined).map((s) => s.title);
-        expect(titles).toEqual(['Manager', 'Developer', 'Account']);
+        expect(titles).toEqual(['Developer', 'Account']);
         expect(titles).not.toContain('Admin');
+        expect(titles).not.toContain('Manager');
     });
 });
 
@@ -306,6 +308,77 @@ describe('useChartTheme', () => {
         );
         const dark = screen.getByTestId('accent').textContent;
         expect(light).not.toBe(dark);
+    });
+});
+
+// --- DarkModeToggle (persistence + rollback) -------------------------------
+
+describe('DarkModeToggle', () => {
+    let prefs: UserPreferences;
+    let fetchMock: Mock;
+
+    function renderToggle(): void {
+        const client = new QueryClient({defaultOptions: {queries: {retry: false}}});
+        render(
+            <QueryClientProvider client={client}>
+                <ThemeProvider>
+                    <DarkModeToggle />
+                </ThemeProvider>
+            </QueryClientProvider>,
+        );
+    }
+
+    beforeEach(() => {
+        prefs = {default_time_range: '30d', dark_mode: false};
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+    });
+
+    it('flips the theme and persists dark_mode=true', async () => {
+        fetchMock = vi.fn(async (url: unknown, init?: RequestInit) => {
+            if (String(url).includes('/api/me/preferences') && (init?.method ?? 'GET').toUpperCase() === 'PATCH') {
+                prefs = {...prefs, ...(JSON.parse(String(init?.body)) as Partial<UserPreferences>)};
+            }
+            return new Response(JSON.stringify({data: prefs}), {
+                status: 200,
+                headers: {'Content-Type': 'application/json'},
+            });
+        });
+        vi.stubGlobal('fetch', fetchMock);
+
+        renderToggle();
+        expect(document.documentElement.classList.contains('dark')).toBe(false);
+        fireEvent.click(screen.getByRole('button', {name: /mode/i}));
+
+        expect(document.documentElement.classList.contains('dark')).toBe(true);
+        await waitFor(() => {
+            const patch = fetchMock.mock.calls.find(
+                (c) =>
+                    String(c[0]).includes('/api/me/preferences') &&
+                    (c[1]?.method ?? 'GET').toUpperCase() === 'PATCH',
+            );
+            expect(patch).toBeTruthy();
+            expect(JSON.parse(String(patch?.[1]?.body))).toEqual({dark_mode: true});
+        });
+    });
+
+    it('rolls the theme back when the PATCH fails', async () => {
+        fetchMock = vi.fn(async (url: unknown) => {
+            if (String(url).includes('/api/me/preferences')) {
+                return new Response('nope', {status: 500});
+            }
+            return new Response(JSON.stringify({data: prefs}), {status: 200});
+        });
+        vi.stubGlobal('fetch', fetchMock);
+
+        renderToggle();
+        fireEvent.click(screen.getByRole('button', {name: /mode/i}));
+        // Optimistic flip to dark…
+        expect(document.documentElement.classList.contains('dark')).toBe(true);
+        // …then reverts to light once the write is rejected.
+        await waitFor(() => expect(document.documentElement.classList.contains('dark')).toBe(false));
     });
 });
 

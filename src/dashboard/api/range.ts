@@ -8,6 +8,12 @@
  * callers feed straight into `date >= ? AND date <= ?` SQL. "lifetime" resolves
  * `from` to the earliest available record for the scope being queried, via the
  * caller-supplied `earliest` callback.
+ *
+ * The dashboard mirrors this arithmetic client-side in
+ * `src/dashboard/frontend/src/timeRange/range.ts` so the selector can preview a
+ * window before the API call (the browser bundle can't import this Node module).
+ * The two are kept in lock-step by `tests/dashboard/range-parity.test.ts` — keep
+ * any change to the preset windows here in sync there.
  */
 
 export type TimeRangeKind = '30d' | '90d' | 'year' | 'lifetime' | 'custom';

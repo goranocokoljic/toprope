@@ -38,7 +38,7 @@ export const DEFAULT_PRESET: TimeRangePreset = '30d';
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
-export function formatDate(date: Date): string {
+function formatDate(date: Date): string {
     return date.toISOString().slice(0, 10);
 }
 
@@ -109,26 +109,25 @@ export function presetValue(preset: TimeRangePreset, options: ResolveOptions = {
     return {kind: preset, ...resolvePreset(preset, options)};
 }
 
-const PRESET_SPAN_DAYS: {preset: TimeRangePreset; days: number}[] = [
-    {preset: '30d', days: 30},
-    {preset: '90d', days: 90},
-    {preset: 'year', days: 366},
-];
+// Bounded presets, smallest window first. `lifetime` is the catch-all.
+const BOUNDED_PRESETS: TimeRangePreset[] = ['30d', '90d', 'year'];
 
 /**
- * The smallest preset whose window comfortably contains all available history.
- * With no data, defaults to 30d. When history is older than a year, `lifetime`
- * is the only preset that fully contains it.
+ * The smallest preset whose window actually contains all available history.
+ * The decision is tied to each preset's *resolved* window (its `from` must fall
+ * on or before the scope's earliest data day), so it can never drift from
+ * `resolvePreset` — e.g. there's no separate "365 vs 366 days" constant to keep
+ * in sync. With no data, defaults to 30d; history older than the year window
+ * falls through to `lifetime`.
  */
 export function smartDefaultPreset(options: ResolveOptions = {}): TimeRangePreset {
     const {earliest} = options;
     if (!earliest || !isValidDateString(earliest)) {
         return '30d';
     }
-    const today = formatDate(options.now ?? new Date());
-    const span = inclusiveDayCount(earliest, today);
-    for (const {preset, days} of PRESET_SPAN_DAYS) {
-        if (span <= days) {
+    for (const preset of BOUNDED_PRESETS) {
+        // YYYY-MM-DD compares lexically the same as chronologically.
+        if (resolvePreset(preset, options).from <= earliest) {
             return preset;
         }
     }
