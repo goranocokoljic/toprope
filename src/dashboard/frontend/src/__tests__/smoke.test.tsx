@@ -26,7 +26,11 @@ const OVERVIEW: OverviewData = {
 let fetchMock: Mock;
 
 function overviewCallCount(): number {
-    return fetchMock.mock.calls.filter((call) => String(call[0]).includes('/api/overview')).length;
+    // Match the overview endpoint exactly — `/api/overview/trend` shares the
+    // prefix but is a distinct query and must not inflate the count.
+    return fetchMock.mock.calls.filter(
+        (call) => new URL(String(call[0]), 'http://localhost').pathname === '/api/overview',
+    ).length;
 }
 
 function makeClient(): QueryClient {
@@ -65,8 +69,9 @@ describe('dashboard smoke', () => {
 
         // Value derived from the fetched payload (active / total developers).
         expect(await screen.findByText('12 / 20')).toBeInTheDocument();
-        // Sample chart renders with the fetched data.
-        expect(screen.getByTestId('data-quality-chart')).toBeInTheDocument();
+        // The metric grid renders alongside it once data is ready.
+        expect(screen.getByText('Monthly spend')).toBeInTheDocument();
+        // Overview is fetched exactly once despite the page's many queries.
         expect(overviewCallCount()).toBe(1);
     });
 
@@ -87,7 +92,8 @@ describe('dashboard smoke', () => {
 
         // The ApiError message surfaces in the error branch of ManagerOverview.
         expect(await screen.findByText(/Failed to load overview/i)).toBeInTheDocument();
-        expect(screen.queryByTestId('data-quality-chart')).not.toBeInTheDocument();
+        // The ready-state content (metric grid) is not rendered on error.
+        expect(screen.queryByText('Monthly spend')).not.toBeInTheDocument();
     });
 
     it('caches the overview query across consumers (no duplicate requests)', async () => {

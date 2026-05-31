@@ -464,5 +464,21 @@ describe('Manager API (Task 2.3)', () => {
             expect(resolved.statusCode).toBe(403);
             expect(resolve.statusCode).toBe(403);
         });
+
+        it('serves the active list and summary to admins', async () => {
+            seedAlert();
+            const list = await app.inject({method: 'GET', url: '/api/waste', headers: authHeaders(adminToken)});
+            const summary = await app.inject({method: 'GET', url: '/api/waste/summary', headers: authHeaders(adminToken)});
+            expect(list.statusCode).toBe(200);
+            expect(summary.statusCode).toBe(200);
+        });
+
+        it('refuses the active list and summary for developer-role sessions', async () => {
+            seedAlert();
+            const list = await app.inject({method: 'GET', url: '/api/waste', headers: authHeaders(devToken)});
+            const summary = await app.inject({method: 'GET', url: '/api/waste/summary', headers: authHeaders(devToken)});
+            expect(list.statusCode).toBe(403);
+            expect(summary.statusCode).toBe(403);
+        });
     });
 });

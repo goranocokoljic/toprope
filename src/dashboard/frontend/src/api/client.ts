@@ -1,11 +1,38 @@
 import type {
     ApiEnvelope,
     AuthUser,
+    CoverageData,
     GlobalSettings,
     OverviewData,
+    OverviewTrend,
     TeamSettings,
+    ToolDistribution,
     UserPreferences,
+    WasteTeamSummary,
 } from './types';
+
+/**
+ * Query params for a time-windowed request. Either a named preset (`range`) or
+ * an explicit custom window (`from`+`to`); the backend recomputes preset windows
+ * server-side, so for presets we send only `range`.
+ */
+export interface TimeRangeQuery {
+    range?: string;
+    from?: string;
+    to?: string;
+}
+
+function timeRangeQueryString(params: TimeRangeQuery): string {
+    const search = new URLSearchParams();
+    if (params.range) {
+        search.set('range', params.range);
+    } else {
+        if (params.from) search.set('from', params.from);
+        if (params.to) search.set('to', params.to);
+    }
+    const qs = search.toString();
+    return qs ? `?${qs}` : '';
+}
 
 /**
  * Typed, fetch-based client for the Phase 1 API. In production the SPA is
@@ -62,6 +89,32 @@ async function patchJson<T>(path: string, body: unknown): Promise<T> {
 export const api = {
     async getOverview(): Promise<OverviewData> {
         const body = await request<ApiEnvelope<OverviewData>>('/api/overview');
+        return body.data;
+    },
+
+    /** Per-tool seat/developer/cost distribution across the org (admin). */
+    async getToolDistribution(): Promise<ToolDistribution> {
+        const body = await request<ApiEnvelope<ToolDistribution>>('/api/tools/distribution');
+        return body.data;
+    },
+
+    /** Active-developer adoption trend over a time window (admin). */
+    async getOverviewTrend(params: TimeRangeQuery): Promise<OverviewTrend> {
+        const body = await request<ApiEnvelope<OverviewTrend>>(
+            `/api/overview/trend${timeRangeQueryString(params)}`,
+        );
+        return body.data;
+    },
+
+    /** Data-coverage snapshot: per-developer quality, connectors, git providers (admin). */
+    async getCoverage(): Promise<CoverageData> {
+        const body = await request<ApiEnvelope<CoverageData>>('/api/coverage');
+        return body.data;
+    },
+
+    /** Per-team open-waste rollup, ordered by waste descending. */
+    async getWasteSummary(): Promise<WasteTeamSummary[]> {
+        const body = await request<ApiEnvelope<WasteTeamSummary[]>>('/api/waste/summary');
         return body.data;
     },
 
