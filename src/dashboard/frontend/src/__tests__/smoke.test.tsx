@@ -129,11 +129,13 @@ describe('dashboard smoke', () => {
         expect(screen.queryByText('Organization Overview')).not.toBeInTheDocument();
     });
 
-    it('toggles dark mode programmatically via the theme control', () => {
+    it('toggles dark mode via the header control (and persists the preference)', () => {
         render(
-            <ThemeProvider>
-                <Header />
-            </ThemeProvider>,
+            <QueryClientProvider client={makeClient()}>
+                <ThemeProvider>
+                    <Header />
+                </ThemeProvider>
+            </QueryClientProvider>,
         );
 
         expect(document.documentElement.classList.contains('dark')).toBe(false);

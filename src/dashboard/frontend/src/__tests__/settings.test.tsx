@@ -141,8 +141,8 @@ describe('Preferences page', () => {
     it('changing the default time range persists it', async () => {
         renderPrefs();
         const select = (await screen.findByLabelText(/default time range/i)) as HTMLSelectElement;
-        fireEvent.change(select, {target: {value: '7d'}});
-        await waitFor(() => expect(prefs.default_time_range).toBe('7d'));
+        fireEvent.change(select, {target: {value: 'year'}});
+        await waitFor(() => expect(prefs.default_time_range).toBe('year'));
     });
 });
 
