@@ -40,7 +40,7 @@ function timingMessage(collectedDays: number | undefined, significanceDays: numb
         return 'Once a connector is syncing, meaningful trends appear after about ' +
             `${significanceDays} days of data.`;
     }
-    const collected = Math.max(0, Math.floor(collectedDays));
+    const collected = Number.isFinite(collectedDays) ? Math.max(0, Math.floor(collectedDays)) : 0;
     const remaining = Math.max(0, significanceDays - collected);
     // This panel is the cold-start treatment, so we never claim the data is
     // "ready" here — once the window is satisfied the scope routes away from
