@@ -13,7 +13,7 @@ import {Sparkline} from '../components/Sparkline';
 import {StatCard} from '../components/StatCard';
 import {DataTable, type Column} from '../components/DataTable';
 import {TimeRangeSelector} from '../components/TimeRangeSelector';
-import {Skeleton, SkeletonStatCard} from '../components/Skeleton';
+import {Skeleton, SkeletonStatCard, SkeletonText, SkeletonChart, SkeletonTable} from '../components/Skeleton';
 import {DarkModeToggle} from '../components/DarkModeToggle';
 import {TrendChart} from '../charts/TrendChart';
 import {ComparisonChart} from '../charts/ComparisonChart';
@@ -152,6 +152,21 @@ describe('Skeletons', () => {
         render(<SkeletonStatCard />);
         expect(screen.getByRole('status', {name: 'Loading'})).toBeInTheDocument();
     });
+
+    it('SkeletonText renders the requested number of lines', () => {
+        const {container} = render(<SkeletonText lines={4} />);
+        expect(screen.getByRole('status', {name: 'Loading'})).toBeInTheDocument();
+        expect(container.querySelectorAll('[data-testid="skeleton"]').length).toBe(4);
+    });
+
+    it('SkeletonChart and SkeletonTable render labelled placeholders', () => {
+        const {rerender} = render(<SkeletonChart height={120} />);
+        expect(screen.getByRole('status', {name: 'Loading chart'})).toBeInTheDocument();
+        rerender(<SkeletonTable rows={3} columns={2} />);
+        expect(screen.getByRole('status', {name: 'Loading table'})).toBeInTheDocument();
+        // 2 header cells + 3 rows × 2 cells = 8 shimmer blocks.
+        expect(screen.getAllByTestId('skeleton').length).toBe(8);
+    });
 });
 
 // --- DataTable -------------------------------------------------------------
@@ -285,6 +300,19 @@ describe('chart wrappers', () => {
     it('shows an empty state when there is no data', () => {
         renderInTheme(<TrendChart data={[]} xKey="date" series={[{key: 'a'}]} emptyMessage="Nothing" />, 'light');
         expect(screen.getByTestId('chart-empty')).toHaveTextContent('Nothing');
+    });
+
+    it('ComparisonChart accepts per-category colors for a single series', () => {
+        renderInTheme(
+            <ComparisonChart
+                data={[{tier: 'High', n: 8}, {tier: 'Low', n: 2}]}
+                categoryKey="tier"
+                series={[{key: 'n'}]}
+                categoryColors={['rgb(22 163 74)', 'rgb(220 38 38)']}
+            />,
+            'light',
+        );
+        expect(screen.getByTestId('comparison-chart')).toBeInTheDocument();
     });
 });
 

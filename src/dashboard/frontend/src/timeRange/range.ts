@@ -99,9 +99,15 @@ export function resolvePreset(preset: TimeRangePreset, options: ResolveOptions =
         from.setUTCDate(from.getUTCDate() + 1);
         return {from: formatDate(from), to};
     }
-    // lifetime
-    const earliest = options.earliest ?? null;
-    return {from: earliest && isValidDateString(earliest) ? earliest : to, to};
+    if (preset === 'lifetime') {
+        const earliest = options.earliest ?? null;
+        return {from: earliest && isValidDateString(earliest) ? earliest : to, to};
+    }
+    // Unknown kind — the param is typed `TimeRangePreset`, so this is only
+    // reachable on contract drift (e.g. a server preset the bundle predates).
+    // Fall back to the safe default window rather than silently resolving to
+    // "all time", which would over-fetch.
+    return {from: formatDate(subtractDays(now, 29)), to};
 }
 
 /** Build a resolved value for a preset kind. */

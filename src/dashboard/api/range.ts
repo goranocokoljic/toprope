@@ -127,7 +127,10 @@ export function parseTimeRange(
         return {range: kind, from: formatDate(from), to: today};
     }
 
-    // lifetime
+    // lifetime — resolve `from` to the scope's earliest record, but validate it
+    // (the callback reads from the DB; a malformed/empty value must not produce
+    // an out-of-shape range). Mirrors the frontend's lifetime resolution so the
+    // two stay in lock-step (see range-parity.test.ts).
     const earliest = options.earliest?.() ?? null;
-    return {range: kind, from: earliest ?? today, to: today};
+    return {range: kind, from: earliest && isValidDate(earliest) ? earliest : today, to: today};
 }

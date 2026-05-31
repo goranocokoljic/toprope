@@ -37,12 +37,14 @@ export function Sparkline({
     const points = data.map((value, i) => {
         const x = pad + i * stepX;
         const y = pad + (1 - (value - min) / span) * (height - pad * 2);
-        return [x, y] as const;
+        return {x: x.toFixed(2), y: y.toFixed(2)};
     });
-    const line = points.map(([x, y]) => `${x.toFixed(2)},${y.toFixed(2)}`).join(' ');
-    const areaPath = `M ${points[0][0].toFixed(2)},${(height - pad).toFixed(2)} L ${points
-        .map(([x, y]) => `${x.toFixed(2)},${y.toFixed(2)}`)
-        .join(' L ')} L ${points[points.length - 1][0].toFixed(2)},${(height - pad).toFixed(2)} Z`;
+    const line = points.map((p) => `${p.x},${p.y}`).join(' ');
+    // Close the line down to the baseline at both ends so the area fills under it.
+    const baseline = (height - pad).toFixed(2);
+    const first = points[0];
+    const last = points[points.length - 1];
+    const areaPath = `M ${first.x},${baseline} L ${points.map((p) => `${p.x},${p.y}`).join(' L ')} L ${last.x},${baseline} Z`;
 
     return (
         <svg

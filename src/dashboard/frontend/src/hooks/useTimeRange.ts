@@ -48,6 +48,10 @@ export function useTimeRange(options: UseTimeRangeOptions = {}): UseTimeRange {
     const [range, setRangeState] = useState<TimeRangeValue>(() =>
         presetValue(smartDefaultPreset(resolveOpts), resolveOpts),
     );
+    // Mirror of `range` for `setRange` to read without a stale closure (and
+    // without taking `range` as a callback dep, which would churn the identity).
+    const rangeRef = useRef(range);
+    rangeRef.current = range;
 
     // Adopt the remembered preference (or smart default) once it loads, and keep
     // the window correct if `earliest` arrives after the preference. Stops as
@@ -64,11 +68,13 @@ export function useTimeRange(options: UseTimeRangeOptions = {}): UseTimeRange {
     const setRange = useCallback(
         (value: TimeRangeValue) => {
             userTouched.current = true;
+            const previousKind = rangeRef.current.kind;
             setRangeState(value);
-            // Persist preset choices so they're remembered next session. Custom
-            // ranges carry dates a single-string preference can't hold, so they
-            // stay session-local by design.
-            if (value.kind !== 'custom') {
+            // Persist preset choices so they're remembered next session, but only
+            // when the preset actually changed — re-picking the current one would
+            // be a redundant PATCH. Custom ranges carry dates a single-string
+            // preference can't hold, so they stay session-local by design.
+            if (value.kind !== 'custom' && value.kind !== previousKind) {
                 update.mutate({default_time_range: value.kind});
             }
         },

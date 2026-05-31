@@ -27,4 +27,11 @@ describe('frontend/backend time-range parity', () => {
         const frontend = presetValue('lifetime', {now: NOW, earliest: null});
         expect({from: frontend.from, to: frontend.to}).toEqual({from: backend.from, to: backend.to});
     });
+
+    it('agrees on lifetime when earliest is malformed (both fall back to today)', () => {
+        const backend = parseTimeRange({range: 'lifetime'}, {now: NOW, earliest: () => '2026-02-31'});
+        const frontend = presetValue('lifetime', {now: NOW, earliest: '2026-02-31'});
+        expect({from: frontend.from, to: frontend.to}).toEqual({from: backend.from, to: backend.to});
+        expect(frontend.from).toBe('2026-05-31'); // today, not the bad date
+    });
 });
