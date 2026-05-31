@@ -184,6 +184,26 @@ describe('ManagerOverview — top-line metrics', () => {
         expect(await screen.findByText('—')).toBeInTheDocument();
         expect(screen.getByText('no paid seats yet')).toBeInTheDocument();
     });
+
+    it('clamps utilization at 100% but the hint explains over-subscription', async () => {
+        fetchMock.mockImplementation(async (url: unknown) => {
+            const path = new URL(String(url), 'http://localhost').pathname;
+            if (path === '/api/overview') {
+                // More active developers than paid seats: headline clamps, hint owns the reason.
+                return jsonResponse({...OVERVIEW, active_developers: 20, total_subscriptions: 18});
+            }
+            if (path === '/api/me/preferences') return jsonResponse(PREFERENCES);
+            if (path === '/api/tools/distribution') return jsonResponse(DISTRIBUTION);
+            if (path === '/api/overview/trend') return jsonResponse(TREND);
+            if (path === '/api/coverage') return jsonResponse(COVERAGE);
+            if (path === '/api/waste/summary') return jsonResponse(WASTE_SUMMARY);
+            return new Response('{}', {status: 404});
+        });
+        renderPage();
+
+        expect(await screen.findByText('100%')).toBeInTheDocument();
+        expect(screen.getByText('20 active developers exceed 18 paid seats')).toBeInTheDocument();
+    });
 });
 
 describe('ManagerOverview — tool distribution', () => {
@@ -251,6 +271,26 @@ describe('ManagerOverview — quick links & needs attention', () => {
         expect(teamsLink).toHaveAttribute('href', '/manager/teams');
         const wasteLink = screen.getByRole('link', {name: /Waste detection/});
         expect(wasteLink).toHaveAttribute('href', '/manager/waste');
+    });
+
+    it('shows an error state (not a false "all clear") when the waste summary fails', async () => {
+        fetchMock.mockImplementation(async (url: unknown) => {
+            const path = new URL(String(url), 'http://localhost').pathname;
+            if (path === '/api/waste/summary') {
+                return new Response('nope', {status: 500});
+            }
+            if (path === '/api/overview') return jsonResponse(OVERVIEW);
+            if (path === '/api/me/preferences') return jsonResponse(PREFERENCES);
+            if (path === '/api/tools/distribution') return jsonResponse(DISTRIBUTION);
+            if (path === '/api/overview/trend') return jsonResponse(TREND);
+            if (path === '/api/coverage') return jsonResponse(COVERAGE);
+            return new Response('{}', {status: 404});
+        });
+        renderPage();
+
+        expect(await screen.findByText('Failed to load waste summary')).toBeInTheDocument();
+        // The empty-state copy must NOT appear — a failed load is not "all clear".
+        expect(screen.queryByText('No teams need attention right now.')).not.toBeInTheDocument();
     });
 
     it('quick links resolve to real routes (no dead links)', async () => {

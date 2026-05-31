@@ -29,7 +29,14 @@ interface WasteTeamSummary {
 }
 
 export function registerWasteRoutes(app: FastifyInstance, db: Database.Database): void {
-    app.get<{Querystring: {page?: string; limit?: string; team?: string}}>('/api/waste', async (request) => {
+    app.get<{Querystring: {page?: string; limit?: string; team?: string}}>('/api/waste', async (request, reply) => {
+        // /api/waste returns individual developer identities (developer_id/name),
+        // so it is manager-only — guard inline as defense-in-depth alongside the
+        // session middleware, matching the rest of the manager API.
+        if (!isAdmin(request)) {
+            return forbidden(reply);
+        }
+
         const pagination = parsePagination(request.query as Record<string, unknown>);
         const {team} = request.query;
 
@@ -81,7 +88,12 @@ export function registerWasteRoutes(app: FastifyInstance, db: Database.Database)
         return buildPaginatedResponse(alerts, total, pagination);
     });
 
-    app.get('/api/waste/summary', async () => {
+    app.get('/api/waste/summary', async (request, reply) => {
+        // Team-aggregate waste rollup — manager-scoped per the privacy model.
+        if (!isAdmin(request)) {
+            return forbidden(reply);
+        }
+
         const rows = db
             .prepare(
                 `SELECT team,

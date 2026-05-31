@@ -89,7 +89,19 @@ function MetricCards({data}: {data: OverviewData}): JSX.Element {
     // not seats, so a developer active without a tracked subscription can push
     // the ratio over 100% — clamp the headline so it never reads above full.
     const paidSeats = data.total_subscriptions;
-    const utilization = paidSeats > 0 ? Math.min(1, data.active_developers / paidSeats) : null;
+    const activeDevs = data.active_developers;
+    const utilization = paidSeats > 0 ? Math.min(1, activeDevs / paidSeats) : null;
+    // Keep the headline clamped at 100%, but make the hint own the reason: when
+    // more developers are active than there are paid seats, say so rather than
+    // pairing a "100%" headline with operands that read as over-full.
+    let utilizationHint: string;
+    if (paidSeats === 0) {
+        utilizationHint = 'no paid seats yet';
+    } else if (activeDevs > paidSeats) {
+        utilizationHint = `${activeDevs} active developers exceed ${paidSeats} paid seats`;
+    } else {
+        utilizationHint = `${activeDevs} active / ${paidSeats} paid seats`;
+    }
 
     return (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
@@ -102,11 +114,7 @@ function MetricCards({data}: {data: OverviewData}): JSX.Element {
             <StatCard
                 label="Utilization"
                 value={utilization === null ? '—' : formatPercent(utilization)}
-                hint={
-                    paidSeats > 0
-                        ? `${data.active_developers} active / ${paidSeats} paid seats`
-                        : 'no paid seats yet'
-                }
+                hint={utilizationHint}
             />
             <StatCard
                 label="Potential savings"
@@ -122,6 +130,10 @@ function MetricCards({data}: {data: OverviewData}): JSX.Element {
 // --- Hero adoption-trend chart ---------------------------------------------
 
 function AdoptionTrend(): JSX.Element {
+    // No `earliest` is passed: the org overview has no cheap earliest-data date
+    // to hand the hook, so the smart default stays 30d. Correctness is
+    // unaffected — the backend widens `lifetime` server-side, and the coverage
+    // badge below reads the window the server actually resolved.
     const {range, setRange} = useTimeRange();
     const {data, isPending, isError, error, refetch} = useOverviewTrend(range);
 
@@ -184,6 +196,9 @@ function ToolDistributionCard(): JSX.Element {
     const {data, isPending, isError, error, refetch} = useToolDistribution();
     const tools = data?.tools ?? [];
     const slices: DistributionSlice[] = tools.map((t) => ({label: toolLabel(t.tool), value: t.monthly_cost}));
+    // Sum the same per-tool costs the ring draws so the center total can never
+    // diverge from the visible slices (rather than trusting a separate field).
+    const totalCost = tools.reduce((sum, t) => sum + t.monthly_cost, 0);
 
     return (
         <Card title="Tool distribution">
@@ -199,7 +214,7 @@ function ToolDistributionCard(): JSX.Element {
                     <DistributionChart
                         data={slices}
                         valueFormatter={(v) => formatCurrency(Number(v))}
-                        centerLabel={{value: formatCurrency(data?.total_monthly_cost ?? 0), caption: 'monthly'}}
+                        centerLabel={{value: formatCurrency(totalCost), caption: 'monthly'}}
                         emptyMessage="No spend recorded."
                     />
                     <DataTable
@@ -235,18 +250,27 @@ function QuickLink({to, label, sublabel}: {to: string; label: string; sublabel: 
 }
 
 function NeedsAttention(): JSX.Element {
-    const {data, isPending, isError} = useWasteSummary();
+    const {data, isPending, isError, error, refetch} = useWasteSummary();
     // The summary is ordered by waste descending, so the first few teams are the
     // ones bleeding the most. Surface up to three; a calm note when all is clear.
     const topTeams: WasteTeamSummary[] = (data ?? []).filter((t) => t.total_monthly_waste > 0).slice(0, 3);
 
     return (
         <Card title="Needs attention">
-            {isPending ? (
-                <SkeletonText lines={3} />
-            ) : isError || topTeams.length === 0 ? (
+            {isPending ? <SkeletonText lines={3} /> : null}
+            {/* A load failure must NOT read as "all clear" — on the savings
+                surface that would hide real waste behind a false calm. */}
+            {isError ? (
+                <ErrorState
+                    title="Failed to load waste summary"
+                    detail={error?.message}
+                    onRetry={() => void refetch()}
+                />
+            ) : null}
+            {!isPending && !isError && topTeams.length === 0 ? (
                 <p className="text-sm text-muted">No teams need attention right now.</p>
-            ) : (
+            ) : null}
+            {!isPending && !isError && topTeams.length > 0 ? (
                 <ul className="space-y-2">
                     {topTeams.map((team) => (
                         <li key={team.team}>
@@ -267,7 +291,7 @@ function NeedsAttention(): JSX.Element {
                         </li>
                     ))}
                 </ul>
-            )}
+            ) : null}
         </Card>
     );
 }
