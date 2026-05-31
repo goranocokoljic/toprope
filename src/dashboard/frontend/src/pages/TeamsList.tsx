@@ -187,7 +187,7 @@ export function TeamsList(): JSX.Element {
                         rows={mergeRows(teams, waste.data, wasteKnown)}
                         getRowKey={(r) => r.name}
                         initialSort={{key: 'name', direction: 'asc'}}
-                        caption="Teams by adoption, cost, and waste — sortable by every column except the tool list"
+                        caption="Teams by adoption, cost, and waste — sortable by every column"
                     />
                 </>
             ) : null}

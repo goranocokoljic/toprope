@@ -1,8 +1,9 @@
 import {useQuery, type UseQueryResult} from '@tanstack/react-query';
-import {api, type TimeRangeQuery} from '../api/client';
+import {api} from '../api/client';
 import {queryKeys} from '../api/queryKeys';
 import type {TeamDetail, TeamListItem, TeamProviders, TeamTrend, WasteAlert} from '../api/types';
 import type {TimeRangeValue} from '../timeRange/range';
+import {trendQuery, trendWindowKey} from '../timeRange/trendQuery';
 
 /**
  * Data hooks backing the manager Teams list + Team Detail screens (Task 2.6).
@@ -24,20 +25,6 @@ export function useTeamDetail(team: string): UseQueryResult<TeamDetail, Error> {
         queryKey: queryKeys.teamDetail(team),
         queryFn: () => api.getTeamDetail(team),
     });
-}
-
-/**
- * Turn a resolved range into the trend query the backend expects. Presets carry
- * a window the server recomputes, so we send only `range`; custom carries
- * explicit dates the server can't derive, so we send `from`+`to`.
- */
-function trendQuery(range: TimeRangeValue): TimeRangeQuery {
-    return range.kind === 'custom' ? {from: range.from, to: range.to} : {range: range.kind};
-}
-
-/** Stable cache key for a window — preset name, or the custom date span. */
-function trendWindowKey(range: TimeRangeValue): string {
-    return range.kind === 'custom' ? `custom:${range.from}:${range.to}` : range.kind;
 }
 
 /** Adoption trend for one team over the selected window. */
