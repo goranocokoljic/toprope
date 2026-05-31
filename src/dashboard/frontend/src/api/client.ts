@@ -5,9 +5,15 @@ import type {
     GlobalSettings,
     OverviewData,
     OverviewTrend,
+    PaginatedResponse,
+    TeamDetail,
+    TeamListItem,
+    TeamProviders,
     TeamSettings,
+    TeamTrend,
     ToolDistribution,
     UserPreferences,
+    WasteAlert,
     WasteTeamSummary,
 } from './types';
 
@@ -116,6 +122,70 @@ export const api = {
     async getWasteSummary(): Promise<WasteTeamSummary[]> {
         const body = await request<ApiEnvelope<WasteTeamSummary[]>>('/api/waste/summary');
         return body.data;
+    },
+
+    /**
+     * Every team's list-row summary. `/api/teams` caps `limit` at 100 and the
+     * teams list sorts client-side, so we page through until all teams are
+     * collected rather than silently truncating an org with >100 teams.
+     */
+    async getTeams(): Promise<TeamListItem[]> {
+        const teams: TeamListItem[] = [];
+        for (let page = 1; ; page += 1) {
+            const body = await request<PaginatedResponse<TeamListItem>>(
+                `/api/teams?page=${page}&limit=100`,
+            );
+            teams.push(...body.data);
+            const {limit, total} = body.pagination;
+            if (body.data.length === 0 || page * limit >= total) {
+                break;
+            }
+        }
+        return teams;
+    },
+
+    /** Full detail (summary + per-developer aggregates) for one team. */
+    async getTeamDetail(team: string): Promise<TeamDetail> {
+        const body = await request<ApiEnvelope<TeamDetail>>(
+            `/api/teams/${encodeURIComponent(team)}`,
+        );
+        return body.data;
+    },
+
+    /** Adoption trend scoped to one team over a time window (admin). */
+    async getTeamTrend(team: string, params: TimeRangeQuery): Promise<TeamTrend> {
+        const body = await request<ApiEnvelope<TeamTrend>>(
+            `/api/teams/${encodeURIComponent(team)}/trend${timeRangeQueryString(params)}`,
+        );
+        return body.data;
+    },
+
+    /** Git provider(s) hosting a team's repos, by developer git activity. */
+    async getTeamProviders(team: string): Promise<TeamProviders> {
+        const body = await request<ApiEnvelope<TeamProviders>>(
+            `/api/teams/${encodeURIComponent(team)}/providers`,
+        );
+        return body.data;
+    },
+
+    /**
+     * Open waste alerts scoped to one team. `/api/waste` is paginated (limit
+     * capped at 100); a single team's open alerts comfortably fit, but we page
+     * through for correctness rather than trusting the first page.
+     */
+    async getTeamWaste(team: string): Promise<WasteAlert[]> {
+        const alerts: WasteAlert[] = [];
+        for (let page = 1; ; page += 1) {
+            const body = await request<PaginatedResponse<WasteAlert>>(
+                `/api/waste?team=${encodeURIComponent(team)}&page=${page}&limit=100`,
+            );
+            alerts.push(...body.data);
+            const {limit, total} = body.pagination;
+            if (body.data.length === 0 || page * limit >= total) {
+                break;
+            }
+        }
+        return alerts;
     },
 
     /**

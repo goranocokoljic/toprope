@@ -12,7 +12,13 @@ export interface NavSection {
 
 // Section catalog. Routes are limited to screens that exist today so the nav
 // never renders a dead link; later Phase 2 tasks extend these lists.
-const MANAGER_SECTION: NavSection = {title: 'Manager', items: [{to: '/manager', label: 'Overview'}]};
+const MANAGER_SECTION: NavSection = {
+    title: 'Manager',
+    items: [
+        {to: '/manager', label: 'Overview'},
+        {to: '/manager/teams', label: 'Teams'},
+    ],
+};
 const DEVELOPER_SECTION: NavSection = {title: 'Developer', items: [{to: '/developer', label: 'My Dashboard'}]};
 const ACCOUNT_SECTION: NavSection = {title: 'Account', items: [{to: '/preferences', label: 'Preferences'}]};
 const ADMIN_SECTION: NavSection = {title: 'Admin', items: [{to: '/settings', label: 'Settings'}]};

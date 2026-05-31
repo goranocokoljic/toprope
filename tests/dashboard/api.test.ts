@@ -152,6 +152,18 @@ describe('API Endpoints', () => {
             expect(dev.activity_summary).toHaveProperty('active_days_30d');
             expect(dev.activity_summary).toHaveProperty('total_interactions_30d');
         });
+
+        it('includes a per-tool breakdown with adoption and cost', async () => {
+            const res = await app.inject({method: 'GET', url: '/api/teams/frontend'});
+            const body = res.json<{
+                data: {tool_breakdown: Array<{tool: string; developers: number; monthly_cost: number}>};
+            }>();
+            // frontend: dev-1 holds the copilot seat ($19) and is active on it; dev-3 has neither.
+            const copilot = body.data.tool_breakdown.find((t) => t.tool === 'copilot');
+            expect(copilot).toBeDefined();
+            expect(copilot?.developers).toBe(1);
+            expect(copilot?.monthly_cost).toBe(19);
+        });
     });
 
     describe('GET /api/developers/:id', () => {

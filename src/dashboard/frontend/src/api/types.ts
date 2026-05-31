@@ -90,6 +90,106 @@ export interface WasteTeamSummary {
     alert_types: string[];
 }
 
+// --- Manager teams list + detail (Task 2.6) -----------------------------
+
+/** Pagination envelope returned alongside list responses (e.g. /api/teams). */
+export interface Pagination {
+    page: number;
+    limit: number;
+    total: number;
+}
+
+export interface PaginatedResponse<T> {
+    data: T[];
+    pagination: Pagination;
+}
+
+/** One row of the teams list. From /api/teams. */
+export interface TeamListItem {
+    name: string;
+    department: string | null;
+    manager: string | null;
+    developer_count: number;
+    active_count: number;
+    tool_mix: string[];
+    total_monthly_cost: number;
+    /** active_count / developer_count, 0..1 (0 when the team has no developers). */
+    utilization_rate: number;
+}
+
+/** One developer's aggregate metrics within a team. From /api/teams/:team. */
+export interface DeveloperInTeam {
+    id: string;
+    name: string;
+    email: string | null;
+    tools: string[];
+    activity_summary: {
+        active_days_30d: number;
+        total_interactions_30d: number;
+    };
+    subscription_cost: number;
+    has_waste: boolean;
+}
+
+/** One tool's adoption + cost within a team. Part of TeamDetail. */
+export interface TeamToolBreakdown {
+    tool: string;
+    /** Distinct developers in the team active on this tool in the last 30 days. */
+    developers: number;
+    /** Team's monthly spend on this tool. */
+    monthly_cost: number;
+}
+
+/** Full per-team detail. From /api/teams/:team. */
+export interface TeamDetail {
+    name: string;
+    department: string | null;
+    manager: string | null;
+    developer_count: number;
+    total_monthly_cost: number;
+    total_monthly_waste: number;
+    developers: DeveloperInTeam[];
+    tool_breakdown: TeamToolBreakdown[];
+}
+
+/** Adoption trend scoped to one team. From /api/teams/:team/trend. */
+export interface TeamTrend {
+    team: string;
+    range: TimeRangeKind;
+    from: string;
+    to: string;
+    points: TrendPoint[];
+}
+
+/**
+ * Git provider usage for a team. The Phase-1 schema tracks no repositories, so
+ * `developer_count` (developers with git activity per provider) is the honest
+ * unit, not a repo count. From /api/teams/:team/providers.
+ */
+export interface TeamProviderUsage {
+    provider: string;
+    developer_count: number;
+    snapshot_count: number;
+}
+
+export interface TeamProviders {
+    team: string;
+    providers: TeamProviderUsage[];
+}
+
+/** One open waste alert. From /api/waste (optionally team-scoped via ?team=). */
+export interface WasteAlert {
+    id: string;
+    developer_id: string | null;
+    developer_name: string | null;
+    team: string;
+    alert_type: string;
+    tool: string | null;
+    details: Record<string, unknown>;
+    monthly_waste: number | null;
+    detected_at: string;
+}
+
 export type UserRole = 'admin' | 'developer';
 
 /** The current session identity, as returned by GET /api/auth/me. */
