@@ -83,7 +83,12 @@ export interface PreferenceDef {
     allowed?: readonly string[];
 }
 
-export const TIME_RANGE_OPTIONS = ['7d', '30d', '90d'] as const;
+// The persisted "default time range" presets. These mirror the preset kinds the
+// manager/developer range parser accepts (src/dashboard/api/range.ts) MINUS
+// `custom`, which needs explicit from/to dates and so cannot be a single-string
+// default. `7d` was intentionally dropped: the range parser never supported it,
+// so storing it produced a default the API could not resolve.
+export const TIME_RANGE_OPTIONS = ['30d', '90d', 'year', 'lifetime'] as const;
 
 export const USER_PREFERENCES: Record<string, PreferenceDef> = {
     default_time_range: {
