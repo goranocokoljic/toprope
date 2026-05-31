@@ -16,7 +16,6 @@ export interface ErrorStateProps {
     /** Suggested next step. Defaults to a generic "usually temporary" note. */
     suggestion?: ReactNode;
     onRetry?: () => void;
-    retryLabel?: string;
     testId?: string;
 }
 
@@ -39,7 +38,6 @@ export function ErrorState({
     detail,
     suggestion = 'This is usually temporary. Try again in a moment.',
     onRetry,
-    retryLabel = 'Try again',
     testId = 'error-state',
 }: ErrorStateProps): JSX.Element {
     return (
@@ -54,7 +52,7 @@ export function ErrorState({
                     {detail ? <span className="mt-2 block text-xs text-muted/80">{detail}</span> : null}
                 </>
             }
-            action={onRetry ? {label: retryLabel, onClick: onRetry} : undefined}
+            action={onRetry ? {label: 'Try again', onClick: onRetry} : undefined}
             testId={testId}
         />
     );

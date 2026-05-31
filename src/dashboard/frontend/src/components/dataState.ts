@@ -21,11 +21,16 @@ export type DataStateKind = 'loading' | 'error' | 'cold-start' | 'empty' | 'read
 export interface DataStateInput {
     /** The query is still loading. */
     isLoading?: boolean;
-    /** The query failed (any truthy error). */
+    /** The query failed (React Query's `Error | null`, or any error value). */
     error?: unknown;
     /** At least one connector is configured for this scope. */
     connected?: boolean;
-    /** Real days of data collected for this scope. */
+    /**
+     * Real days of data collected for this scope. Optional: some surfaces (e.g.
+     * the org-aggregate overview) have no per-scope collection window. When
+     * omitted, the significance check is skipped and we cannot honestly emit
+     * 'empty' — a connected-but-silent scope reads as still collecting.
+     */
     dataDays?: number;
     /** Whether the scope has any non-zero activity signal. */
     hasSignal?: boolean;
@@ -39,20 +44,27 @@ export interface DataStateInput {
  * over a failed refetch.
  */
 export function classifyDataState(input: DataStateInput): DataStateKind {
-    const {isLoading, error, connected = false, dataDays = 0, hasSignal = false} = input;
+    const {isLoading, error, connected = false, dataDays, hasSignal = false} = input;
     const significanceDays = input.significanceDays ?? SIGNIFICANCE_DAYS;
 
-    if (error) return 'error';
+    if (error != null) return 'error';
     if (isLoading) return 'loading';
 
-    // Nothing connected, or connected but not enough collected yet → cold-start.
-    // We cannot honestly call a scope "empty" until we've collected enough days
-    // to be confident the absence of activity is real and not just early days.
+    // Nothing connected at all → cold-start (setup not done).
     if (!connected) return 'cold-start';
+
+    if (dataDays === undefined) {
+        // No collection window to measure against. We can't prove the
+        // significance window has elapsed, so we must not call a silent scope
+        // "empty" — it's either producing signal (ready) or still collecting.
+        return hasSignal ? 'ready' : 'cold-start';
+    }
+
+    // Connected but not enough collected yet → cold-start. We cannot honestly
+    // call a scope "empty" until we've collected enough days to be confident the
+    // absence of activity is real and not just early days.
     if (dataDays < significanceDays) return 'cold-start';
 
     // Enough history, but genuinely no activity → real empty (e.g. unused seat).
-    if (!hasSignal) return 'empty';
-
-    return 'ready';
+    return hasSignal ? 'ready' : 'empty';
 }

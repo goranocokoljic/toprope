@@ -55,6 +55,13 @@ describe('classifyDataState', () => {
     it('honors a custom significance window', () => {
         expect(classifyDataState({connected: true, dataDays: 5, hasSignal: false, significanceDays: 3})).toBe('empty');
     });
+
+    it('without a collection window, never claims "empty" — a silent scope is still collecting', () => {
+        // No dataDays: we can't prove the significance window elapsed, so a
+        // connected-but-silent scope must read as cold-start, not genuine-empty.
+        expect(classifyDataState({connected: true, hasSignal: false})).toBe('cold-start');
+        expect(classifyDataState({connected: true, hasSignal: true})).toBe('ready');
+    });
 });
 
 // --- confidenceTier thresholds ---------------------------------------------
@@ -106,6 +113,18 @@ describe('ColdStartPanel vs EmptyState', () => {
         const checklist = screen.getByTestId('cold-start-checklist');
         expect(checklist).toHaveTextContent('Connect a tool');
         expect(checklist).toHaveTextContent('First sync collected');
+    });
+
+    it('does not claim to be "collecting" when nothing is connected yet', () => {
+        const {rerender} = render(
+            <ColdStartPanel connectors={[{name: 'copilot', connected: false}]} />,
+        );
+        expect(screen.getByTestId('cold-start')).toHaveTextContent(/Connect a tool to get started/i);
+        expect(screen.getByTestId('cold-start')).not.toHaveTextContent(/Collecting/i);
+
+        // Once a connector is wired, it switches to the collecting framing.
+        rerender(<ColdStartPanel connectors={[{name: 'copilot', connected: true}]} />);
+        expect(screen.getByTestId('cold-start')).toHaveTextContent(/Collecting your data/i);
     });
 });
 

@@ -104,7 +104,15 @@ export function ColdStartPanel({
     collectedDays,
     significanceDays = SIGNIFICANCE_DAYS,
 }: ColdStartPanelProps): JSX.Element {
-    const title = scopeLabel ? `Collecting data for ${scopeLabel}` : 'Collecting your data';
+    // Nothing actually collecting yet → don't claim we're "collecting"; the
+    // honest message is "get set up". Collection is underway once a connector is
+    // wired or we've already banked some days.
+    const collecting = (connectors ?? []).some((c) => c.connected) || (collectedDays ?? 0) > 0;
+    const title = collecting
+        ? scopeLabel
+            ? `Collecting data for ${scopeLabel}`
+            : 'Collecting your data'
+        : 'Connect a tool to get started';
     return (
         <StatePanel
             tone="accent"

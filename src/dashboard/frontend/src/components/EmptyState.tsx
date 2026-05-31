@@ -8,6 +8,12 @@ import {StatePanel, type StatePanelAction} from './StatePanel';
  * activity over a full significance window. The calm, neutral framing (no
  * "in progress" language) is what keeps it semantically distinct from
  * cold-start.
+ *
+ * Part of the shared data-state library. Its first consumers are the
+ * list-bearing screens not yet built (Waste, Teams, My Tools — tasks 2.5–2.9);
+ * it ships here with the rest of the family so those screens reuse it rather
+ * than re-inventing an empty treatment, the same way 2.10 shipped shared
+ * components ahead of their screens.
  */
 
 export interface EmptyStateProps {

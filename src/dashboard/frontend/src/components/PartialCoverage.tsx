@@ -7,6 +7,15 @@ import {confidenceTier} from './coverage';
  * thin data into a confident-looking average; instead we display per-member
  * confidence honestly and lead with the caveat ("4 of 12 still thin") so the
  * gap is impossible to miss. Thin members are listed first for the same reason.
+ *
+ * Privacy: this lists named scopes. Per the platform's privacy model (managers
+ * see team aggregates, not individuals), callers must only pass non-PII labels
+ * (teams) in a manager context; per-developer names belong to a developer's own
+ * self-view, never a manager-facing screen.
+ *
+ * Part of the shared data-state library. Its first consumer is the Team Detail
+ * screen (task 2.6), which has the per-scope day-counts this needs; it ships
+ * here with the rest of the family so that screen reuses it.
  */
 
 export interface CoverageScope {
