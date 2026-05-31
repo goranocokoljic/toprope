@@ -146,6 +146,8 @@ export interface TeamDetail {
     department: string | null;
     manager: string | null;
     developer_count: number;
+    /** Distinct developers active in the last 30 days (defined server-side). */
+    active_count: number;
     total_monthly_cost: number;
     total_monthly_waste: number;
     developers: DeveloperInTeam[];

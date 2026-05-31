@@ -19,13 +19,10 @@ import type {DeveloperInTeam, TeamDetail as TeamDetailData, WasteAlert} from '..
 
 // --- Scoped summary cards --------------------------------------------------
 
-/** A developer counts as "active" for the team when they have any active day in the window. */
-function activeDeveloperCount(team: TeamDetailData): number {
-    return team.developers.filter((d) => d.activity_summary.active_days_30d > 0).length;
-}
-
 function SummaryCards({team}: {team: TeamDetailData}): JSX.Element {
-    const activeCount = activeDeveloperCount(team);
+    // `active_count` is defined server-side (same query as the teams list), so
+    // the detail header can never drift from the list's "active" definition.
+    const activeCount = team.active_count;
     const utilization = team.developer_count > 0 ? activeCount / team.developer_count : null;
     const tier = utilization === null ? null : utilizationTier(utilization);
 
@@ -130,6 +127,10 @@ const DEVELOPER_COLUMNS: Column<DeveloperInTeam>[] = [
         key: 'activity',
         header: 'Activity',
         accessor: (r) => r.activity_summary.active_days_30d,
+        // Deliberately not sortable: this is a utilization-health view, not a
+        // leaderboard — sorting developers by activity is the ranking the
+        // product principle (and issue #41) forbids.
+        sortable: false,
         render: (r) => <ActivityCell dev={r} />,
     },
     {
@@ -154,6 +155,8 @@ const DEVELOPER_COLUMNS: Column<DeveloperInTeam>[] = [
         header: 'Interactions (30d)',
         accessor: (r) => r.activity_summary.total_interactions_30d,
         align: 'right',
+        // Not sortable, for the same anti-leaderboard reason as Activity above.
+        sortable: false,
         render: (r) => <span className="tabular-nums">{r.activity_summary.total_interactions_30d.toLocaleString()}</span>,
     },
     {

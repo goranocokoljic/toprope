@@ -135,9 +135,11 @@ describe('API Endpoints', () => {
         it('returns team detail with developers', async () => {
             const res = await app.inject({method: 'GET', url: '/api/teams/frontend'});
             expect(res.statusCode).toBe(200);
-            const body = res.json<{data: {name: string; developers: unknown[]}}>();
+            const body = res.json<{data: {name: string; active_count: number; developers: unknown[]}}>();
             expect(body.data.name).toBe('frontend');
             expect(body.data.developers).toHaveLength(2);
+            // dev-1 has active snapshots; dev-3 has none → 1 of 2 active.
+            expect(body.data.active_count).toBe(1);
         });
 
         it('returns 404 for unknown team', async () => {

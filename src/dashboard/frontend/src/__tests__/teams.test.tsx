@@ -54,6 +54,7 @@ const TEAM_DETAIL: TeamDetailData = {
     department: 'Engineering',
     manager: 'Mae',
     developer_count: 2,
+    active_count: 1,
     total_monthly_cost: 200,
     total_monthly_waste: 80,
     developers: [
