@@ -1,4 +1,5 @@
-import {Badge, type BadgeTone} from './Badge';
+import {Badge} from './Badge';
+import {confidenceTier} from './coverage';
 
 export interface CoverageBadgeProps {
     /** Number of real data-days backing the current view/scope. */
@@ -8,23 +9,6 @@ export interface CoverageBadgeProps {
     className?: string;
 }
 
-interface Tier {
-    tone: BadgeTone;
-    label: string;
-}
-
-/**
- * Map a data-day count to a confidence tier. 14 days is the platform's
- * significance threshold (see the waste model: 14 days of inactivity = unused),
- * so a fortnight of real data is treated as high confidence.
- */
-function tierFor(dataDays: number): Tier {
-    if (dataDays <= 0) return {tone: 'neutral', label: 'No data'};
-    if (dataDays < 7) return {tone: 'danger', label: 'Low confidence'};
-    if (dataDays < 14) return {tone: 'warning', label: 'Medium confidence'};
-    return {tone: 'success', label: 'High confidence'};
-}
-
 /**
  * Shows how many real days of data back a view, with a confidence tier. This is
  * the honesty signal on every time-series surface: a polished chart over 2 days
@@ -32,7 +16,7 @@ function tierFor(dataDays: number): Tier {
  */
 export function CoverageBadge({dataDays, spanDays, className}: CoverageBadgeProps): JSX.Element {
     const days = Math.max(0, Math.floor(dataDays));
-    const tier = tierFor(days);
+    const tier = confidenceTier(days);
     const count =
         spanDays !== undefined && spanDays > 0
             ? `${days} of ${Math.floor(spanDays)} days`

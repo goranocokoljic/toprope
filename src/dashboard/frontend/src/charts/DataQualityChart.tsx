@@ -22,9 +22,12 @@ const QUALITY_META: {key: keyof OverviewData['data_quality_distribution']; label
  * /api/overview. Shows the per-data-point quality distribution as a bar chart.
  */
 export function DataQualityChart({overview}: {overview: OverviewData}): JSX.Element {
+    const dist = overview.data_quality_distribution;
     const data: ChartDatum[] = QUALITY_META.map((meta) => ({
         quality: meta.label,
-        points: overview.data_quality_distribution[meta.key],
+        // `?? 0`: a partial/malformed distribution must render an honest zero
+        // bar, not a Recharts gap that reads as "no such category".
+        points: dist?.[meta.key] ?? 0,
         fill: meta.fill,
     }));
 
