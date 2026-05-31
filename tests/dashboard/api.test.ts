@@ -14,6 +14,20 @@ import {registerExportRoutes} from '../../src/dashboard/api/export';
 // session-auth gate (which has its own dedicated suite under tests/auth).
 function buildTestApp(db: Database.Database): FastifyInstance {
     const app = Fastify({logger: false});
+    // This suite exercises handler logic past the session-auth gate, so stand in
+    // for an authenticated admin — handlers with an inline isAdmin guard (e.g.
+    // /api/waste*) then run their real logic instead of short-circuiting to 403.
+    // The auth gate itself has dedicated coverage under tests/auth + manager-api.
+    app.addHook('onRequest', async (request) => {
+        request.authUser = {
+            userId: 'test-admin',
+            email: 'admin@example.com',
+            role: 'admin',
+            developerId: null,
+            mustChangePassword: false,
+            sessionId: 'test-session',
+        };
+    });
     app.get('/health', async () => ({status: 'ok'}));
     registerOverviewRoutes(app, db);
     registerTeamRoutes(app, db);

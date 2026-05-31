@@ -4,6 +4,7 @@ import '@testing-library/jest-dom/vitest';
 import {afterEach, describe, expect, it, vi, type Mock} from 'vitest';
 import {cleanup, fireEvent, render, screen, within} from '@testing-library/react';
 import {QueryClient, QueryClientProvider} from '@tanstack/react-query';
+import {MemoryRouter} from 'react-router-dom';
 import type {ReactNode} from 'react';
 
 import {classifyDataState, SIGNIFICANCE_DAYS} from '../components/dataState';
@@ -216,9 +217,15 @@ describe('ManagerOverview data states', () => {
 
     function renderPage(): void {
         const client = new QueryClient({defaultOptions: {queries: {retry: false}}});
+        // The ready state renders charts (need ThemeProvider) and quick-link
+        // <Link>s (need a Router), so wrap with both.
         render(
             <QueryClientProvider client={client}>
-                <ManagerOverview />
+                <ThemeProvider>
+                    <MemoryRouter>
+                        <ManagerOverview />
+                    </MemoryRouter>
+                </ThemeProvider>
             </QueryClientProvider>,
         );
     }

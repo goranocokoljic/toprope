@@ -21,6 +21,75 @@ export interface OverviewData {
     total_monthly_waste: number;
 }
 
+// --- Manager organization overview (Task 2.5) ---------------------------
+
+/** Seats, distinct developers, and cost for one tool. From /api/tools/distribution. */
+export interface ToolDistributionEntry {
+    tool: string;
+    seats: number;
+    developers: number;
+    monthly_cost: number;
+}
+
+/** Org-wide tool distribution: per-tool seat/cost mix plus totals. */
+export interface ToolDistribution {
+    tools: ToolDistributionEntry[];
+    total_seats: number;
+    total_monthly_cost: number;
+}
+
+/** One day on the adoption-trend axis. From /api/overview/trend. */
+export interface TrendPoint {
+    date: string;
+    active_developers: number;
+    interactions: number;
+    acceptances: number;
+}
+
+/** Adoption trend over a resolved window. */
+export interface OverviewTrend {
+    range: TimeRangeKind;
+    from: string;
+    to: string;
+    points: TrendPoint[];
+}
+
+/** Latest connector sync status. From /api/coverage. */
+export interface CoverageConnector {
+    connector: string;
+    connected: boolean;
+    status: string | null;
+    last_sync: string | null;
+}
+
+/**
+ * Git provider coverage. The Phase-1 schema does not track repositories, so the
+ * backend reports the number of developers with git activity per provider, not a
+ * repo count — `developer_count` is the honest unit here.
+ */
+export interface CoverageGitProvider {
+    provider: string;
+    connected: boolean;
+    developer_count: number;
+    last_sync: string | null;
+}
+
+/** Honest data-coverage snapshot: per-developer quality, connectors, git providers. */
+export interface CoverageData {
+    // Per-developer best-signal tier counts (high=API, medium=git, low=expense, none).
+    data_quality: Record<DataQuality, number>;
+    connectors: CoverageConnector[];
+    git_providers: CoverageGitProvider[];
+}
+
+/** One team's open-waste rollup. From /api/waste/summary. */
+export interface WasteTeamSummary {
+    team: string;
+    alert_count: number;
+    total_monthly_waste: number;
+    alert_types: string[];
+}
+
 export type UserRole = 'admin' | 'developer';
 
 /** The current session identity, as returned by GET /api/auth/me. */
