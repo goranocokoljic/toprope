@@ -1,14 +1,39 @@
+import {Link} from 'react-router-dom';
 import {useOverview} from '../hooks/useOverview';
+import {useCoverage, useOverviewTrend, useToolDistribution, useWasteSummary} from '../hooks/useManagerData';
+import {useTimeRange} from '../hooks/useTimeRange';
 import {Card, StatCard} from '../components/Card';
-import {DataQualityChart} from '../charts/DataQualityChart';
-import {SkeletonStatCard, SkeletonChart} from '../components/Skeleton';
+import {CoveragePanel} from '../components/CoveragePanel';
+import {CoverageBadge} from '../components/CoverageBadge';
+import {DataTable, type Column} from '../components/DataTable';
+import {TimeRangeSelector} from '../components/TimeRangeSelector';
+import {TrendChart, type ChartDatum} from '../charts/TrendChart';
+import {DistributionChart, type DistributionSlice} from '../charts/DistributionChart';
+import {SkeletonChart, SkeletonStatCard, SkeletonText} from '../components/Skeleton';
 import {ErrorState} from '../components/ErrorState';
+import {EmptyState} from '../components/EmptyState';
 import {ColdStartPanel, type ConnectorStatus} from '../components/ColdStartPanel';
 import {classifyDataState} from '../components/dataState';
-import type {OverviewData} from '../api/types';
+import {toolLabel} from '../components/toolLabels';
+import {inclusiveDayCount} from '../timeRange/range';
+import type {OverviewData, ToolDistributionEntry, WasteTeamSummary} from '../api/types';
 
 function formatCurrency(value: number): string {
     return new Intl.NumberFormat('en-US', {style: 'currency', currency: 'USD', maximumFractionDigits: 0}).format(value);
+}
+
+/** Whole-number percent for utilization-style ratios. */
+function formatPercent(ratio: number): string {
+    return `${Math.round(ratio * 100)}%`;
+}
+
+/** 'YYYY-MM-DD' → a short, locale-aware axis tick (e.g. "May 5"). */
+function formatDateTick(value: string | number): string {
+    const date = new Date(`${value}T00:00:00.000Z`);
+    if (Number.isNaN(date.getTime())) {
+        return String(value);
+    }
+    return new Intl.DateTimeFormat(undefined, {month: 'short', day: 'numeric', timeZone: 'UTC'}).format(date);
 }
 
 // The connectors GovProxy can pull from. We always list all three so the
@@ -49,10 +74,217 @@ function LoadingOverview(): JSX.Element {
                 <SkeletonStatCard />
                 <SkeletonStatCard />
             </div>
-            <Card title="Data quality coverage">
+            <Card title="Adoption trend">
                 <SkeletonChart />
             </Card>
         </>
+    );
+}
+
+// --- Top-line metric cards -------------------------------------------------
+
+function MetricCards({data}: {data: OverviewData}): JSX.Element {
+    // Utilization is an org-level proxy: distinct developers active in the last
+    // 30 days over paid (non-revoked) seats. active_developers counts developers,
+    // not seats, so a developer active without a tracked subscription can push
+    // the ratio over 100% — clamp the headline so it never reads above full.
+    const paidSeats = data.total_subscriptions;
+    const utilization = paidSeats > 0 ? Math.min(1, data.active_developers / paidSeats) : null;
+
+    return (
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            <StatCard
+                label="Active developers"
+                value={`${data.active_developers} / ${data.total_developers}`}
+                hint="active in last 30 days"
+            />
+            <StatCard label="Monthly spend" value={formatCurrency(data.total_monthly_cost)} hint="across all tools" />
+            <StatCard
+                label="Utilization"
+                value={utilization === null ? '—' : formatPercent(utilization)}
+                hint={
+                    paidSeats > 0
+                        ? `${data.active_developers} active / ${paidSeats} paid seats`
+                        : 'no paid seats yet'
+                }
+            />
+            <StatCard
+                label="Potential savings"
+                value={formatCurrency(data.total_monthly_waste)}
+                hint={`${data.active_waste_alert_count} active ${
+                    data.active_waste_alert_count === 1 ? 'alert' : 'alerts'
+                }`}
+            />
+        </div>
+    );
+}
+
+// --- Hero adoption-trend chart ---------------------------------------------
+
+function AdoptionTrend(): JSX.Element {
+    const {range, setRange} = useTimeRange();
+    const {data, isPending, isError, error, refetch} = useOverviewTrend(range);
+
+    // Honest coverage: measure days with data and the span from the window the
+    // backend actually resolved (correct even for lifetime, which it widens to
+    // the earliest record), not the client-side preview window.
+    const points = data?.points ?? [];
+    const dataDays = points.length;
+    const spanDays = data ? inclusiveDayCount(data.from, data.to) : undefined;
+    // Plot only the active-developer measure; annotate as ChartDatum[] so the
+    // mapped literals satisfy the chart's index-signature row type.
+    const chartData: ChartDatum[] = points.map((p) => ({date: p.date, active_developers: p.active_developers}));
+
+    return (
+        <Card>
+            <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+                <div>
+                    <h2 className="text-sm font-semibold text-foreground">Adoption trend</h2>
+                    <p className="mt-0.5 text-xs text-muted">Active developers over time.</p>
+                </div>
+                <div className="flex flex-col items-end gap-2">
+                    <TimeRangeSelector value={range} onChange={setRange} />
+                    {!isPending && !isError ? <CoverageBadge dataDays={dataDays} spanDays={spanDays} /> : null}
+                </div>
+            </div>
+            {isPending ? <SkeletonChart /> : null}
+            {isError ? (
+                <ErrorState title="Failed to load trend" detail={error?.message} onRetry={() => void refetch()} />
+            ) : null}
+            {!isPending && !isError ? (
+                <TrendChart
+                    data={chartData}
+                    xKey="date"
+                    series={[{key: 'active_developers', label: 'Active developers'}]}
+                    variant="area"
+                    xTickFormatter={formatDateTick}
+                    emptyMessage="No activity in this range yet."
+                />
+            ) : null}
+        </Card>
+    );
+}
+
+// --- Tool distribution -----------------------------------------------------
+
+const TOOL_COLUMNS: Column<ToolDistributionEntry>[] = [
+    {key: 'tool', header: 'Tool', accessor: (r) => toolLabel(r.tool)},
+    {key: 'developers', header: 'Developers', accessor: (r) => r.developers, align: 'right'},
+    {key: 'seats', header: 'Seats', accessor: (r) => r.seats, align: 'right'},
+    {
+        key: 'monthly_cost',
+        header: 'Cost',
+        accessor: (r) => r.monthly_cost,
+        align: 'right',
+        render: (r) => formatCurrency(r.monthly_cost),
+    },
+];
+
+function ToolDistributionCard(): JSX.Element {
+    const {data, isPending, isError, error, refetch} = useToolDistribution();
+    const tools = data?.tools ?? [];
+    const slices: DistributionSlice[] = tools.map((t) => ({label: toolLabel(t.tool), value: t.monthly_cost}));
+
+    return (
+        <Card title="Tool distribution">
+            {isPending ? <SkeletonChart /> : null}
+            {isError ? (
+                <ErrorState title="Failed to load tools" detail={error?.message} onRetry={() => void refetch()} />
+            ) : null}
+            {!isPending && !isError && tools.length === 0 ? (
+                <EmptyState title="No tool subscriptions" message="Import expense data to see the tool mix." />
+            ) : null}
+            {!isPending && !isError && tools.length > 0 ? (
+                <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+                    <DistributionChart
+                        data={slices}
+                        valueFormatter={(v) => formatCurrency(Number(v))}
+                        centerLabel={{value: formatCurrency(data?.total_monthly_cost ?? 0), caption: 'monthly'}}
+                        emptyMessage="No spend recorded."
+                    />
+                    <DataTable
+                        columns={TOOL_COLUMNS}
+                        rows={tools}
+                        getRowKey={(r) => r.tool}
+                        initialSort={{key: 'monthly_cost', direction: 'desc'}}
+                        caption="Developers, seats, and monthly cost per tool"
+                    />
+                </div>
+            ) : null}
+        </Card>
+    );
+}
+
+// --- Quick links + needs attention -----------------------------------------
+
+function QuickLink({to, label, sublabel}: {to: string; label: string; sublabel: string}): JSX.Element {
+    return (
+        <Link
+            to={to}
+            className="flex items-center justify-between rounded-md border border-border bg-surface px-3 py-2.5 transition-colors hover:bg-surface-raised"
+        >
+            <span>
+                <span className="block text-sm font-medium text-foreground">{label}</span>
+                <span className="block text-xs text-muted">{sublabel}</span>
+            </span>
+            <span aria-hidden className="text-muted">
+                →
+            </span>
+        </Link>
+    );
+}
+
+function NeedsAttention(): JSX.Element {
+    const {data, isPending, isError} = useWasteSummary();
+    // The summary is ordered by waste descending, so the first few teams are the
+    // ones bleeding the most. Surface up to three; a calm note when all is clear.
+    const topTeams: WasteTeamSummary[] = (data ?? []).filter((t) => t.total_monthly_waste > 0).slice(0, 3);
+
+    return (
+        <Card title="Needs attention">
+            {isPending ? (
+                <SkeletonText lines={3} />
+            ) : isError || topTeams.length === 0 ? (
+                <p className="text-sm text-muted">No teams need attention right now.</p>
+            ) : (
+                <ul className="space-y-2">
+                    {topTeams.map((team) => (
+                        <li key={team.team}>
+                            <Link
+                                to="/manager/waste"
+                                className="flex items-center justify-between rounded-md px-2 py-1.5 transition-colors hover:bg-surface-raised"
+                            >
+                                <span className="text-sm font-medium text-foreground">{team.team}</span>
+                                <span className="text-right">
+                                    <span className="block text-sm font-medium text-danger">
+                                        {formatCurrency(team.total_monthly_waste)}/mo
+                                    </span>
+                                    <span className="block text-xs text-muted">
+                                        {team.alert_count} {team.alert_count === 1 ? 'alert' : 'alerts'}
+                                    </span>
+                                </span>
+                            </Link>
+                        </li>
+                    ))}
+                </ul>
+            )}
+        </Card>
+    );
+}
+
+// --- Data coverage indicator -----------------------------------------------
+
+function DataCoverage(): JSX.Element {
+    const {data, isPending, isError, error, refetch} = useCoverage();
+
+    return (
+        <Card title="Data coverage">
+            {isPending ? <SkeletonText lines={5} /> : null}
+            {isError ? (
+                <ErrorState title="Failed to load coverage" detail={error?.message} onRetry={() => void refetch()} />
+            ) : null}
+            {!isPending && !isError && data ? <CoveragePanel coverage={data} /> : null}
+        </Card>
     );
 }
 
@@ -99,24 +331,27 @@ export function ManagerOverview(): JSX.Element {
 
             {state === 'ready' && data ? (
                 <>
-                    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-                        <StatCard
-                            label="Active developers"
-                            value={`${data.active_developers} / ${data.total_developers}`}
-                            hint="active in last 30 days"
-                        />
-                        <StatCard label="Monthly spend" value={formatCurrency(data.total_monthly_cost)} />
-                        <StatCard
-                            label="Monthly waste"
-                            value={formatCurrency(data.total_monthly_waste)}
-                            hint={`${data.active_waste_alert_count} active alerts`}
-                        />
-                        <StatCard label="Subscriptions" value={String(data.total_subscriptions)} />
+                    <MetricCards data={data} />
+                    <AdoptionTrend />
+                    <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
+                        <div className="lg:col-span-2">
+                            <ToolDistributionCard />
+                        </div>
+                        <div className="space-y-6">
+                            <Card title="Quick links">
+                                <div className="space-y-2">
+                                    <QuickLink to="/manager/teams" label="Teams" sublabel="Adoption & cost by team" />
+                                    <QuickLink
+                                        to="/manager/waste"
+                                        label="Waste detection"
+                                        sublabel="Unused & duplicate seats"
+                                    />
+                                </div>
+                            </Card>
+                            <NeedsAttention />
+                        </div>
                     </div>
-
-                    <Card title="Data quality coverage">
-                        <DataQualityChart overview={data} />
-                    </Card>
+                    <DataCoverage />
                 </>
             ) : null}
         </div>
