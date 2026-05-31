@@ -135,9 +135,11 @@ describe('API Endpoints', () => {
         it('returns team detail with developers', async () => {
             const res = await app.inject({method: 'GET', url: '/api/teams/frontend'});
             expect(res.statusCode).toBe(200);
-            const body = res.json<{data: {name: string; developers: unknown[]}}>();
+            const body = res.json<{data: {name: string; active_count: number; developers: unknown[]}}>();
             expect(body.data.name).toBe('frontend');
             expect(body.data.developers).toHaveLength(2);
+            // dev-1 has active snapshots; dev-3 has none → 1 of 2 active.
+            expect(body.data.active_count).toBe(1);
         });
 
         it('returns 404 for unknown team', async () => {
@@ -151,6 +153,18 @@ describe('API Endpoints', () => {
             const dev = body.data.developers[0];
             expect(dev.activity_summary).toHaveProperty('active_days_30d');
             expect(dev.activity_summary).toHaveProperty('total_interactions_30d');
+        });
+
+        it('includes a per-tool breakdown with adoption and cost', async () => {
+            const res = await app.inject({method: 'GET', url: '/api/teams/frontend'});
+            const body = res.json<{
+                data: {tool_breakdown: Array<{tool: string; developers: number; monthly_cost: number}>};
+            }>();
+            // frontend: dev-1 holds the copilot seat ($19) and is active on it; dev-3 has neither.
+            const copilot = body.data.tool_breakdown.find((t) => t.tool === 'copilot');
+            expect(copilot).toBeDefined();
+            expect(copilot?.developers).toBe(1);
+            expect(copilot?.monthly_cost).toBe(19);
         });
     });
 
