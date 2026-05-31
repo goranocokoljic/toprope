@@ -52,10 +52,18 @@ export interface TeamSettings {
     overridable: Partial<Record<keyof GlobalSettings, boolean>>;
 }
 
-export type TimeRange = '7d' | '30d' | '90d';
+/**
+ * Time-range presets. These mirror the backend range parser
+ * (src/dashboard/api/range.ts) and the persistable preference set
+ * (TIME_RANGE_OPTIONS in src/settings/registry.ts). `custom` is a selectable
+ * kind but NOT a preset — it carries explicit from/to dates and is never
+ * persisted as the single-string default preference.
+ */
+export type TimeRangePreset = '30d' | '90d' | 'year' | 'lifetime';
+export type TimeRangeKind = TimeRangePreset | 'custom';
 
 /** Per-user preferences as returned by GET /api/me/preferences. */
 export interface UserPreferences {
-    default_time_range: TimeRange;
+    default_time_range: TimeRangePreset;
     dark_mode: boolean;
 }

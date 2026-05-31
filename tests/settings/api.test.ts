@@ -264,10 +264,10 @@ describe('settings API', () => {
                 method: 'PATCH',
                 url: '/api/me/preferences',
                 headers: authHeaders(devToken),
-                payload: {dark_mode: true, default_time_range: '7d'},
+                payload: {dark_mode: true, default_time_range: '90d'},
             });
             expect(patch.statusCode).toBe(200);
-            expect(patch.json().data).toEqual({default_time_range: '7d', dark_mode: true});
+            expect(patch.json().data).toEqual({default_time_range: '90d', dark_mode: true});
         });
 
         it('rejects an invalid time range', async () => {

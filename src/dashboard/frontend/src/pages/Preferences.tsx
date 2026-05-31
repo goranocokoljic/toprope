@@ -2,13 +2,13 @@ import {Card} from '../components/Card';
 import {usePreferences, useUpdatePreferences} from '../hooks/usePreferences';
 import {useTheme} from '../theme/useTheme';
 import {useApplyThemePreference} from '../theme/useApplyThemePreference';
-import type {TimeRange} from '../api/types';
+import {PRESET_LABELS, PRESET_ORDER} from '../timeRange/range';
+import type {TimeRangePreset} from '../api/types';
 
-const TIME_RANGES: {value: TimeRange; label: string}[] = [
-    {value: '7d', label: 'Last 7 days'},
-    {value: '30d', label: 'Last 30 days'},
-    {value: '90d', label: 'Last 90 days'},
-];
+const TIME_RANGES: {value: TimeRangePreset; label: string}[] = PRESET_ORDER.map((value) => ({
+    value,
+    label: PRESET_LABELS[value],
+}));
 
 /**
  * Per-user UI preferences (Task 2.16): default time range and dark mode. The
@@ -34,7 +34,7 @@ export function Preferences(): JSX.Element {
         update.mutate({dark_mode: next}, {onError: () => setTheme(previous)});
     }
 
-    function onChangeTimeRange(value: TimeRange): void {
+    function onChangeTimeRange(value: TimeRangePreset): void {
         update.mutate({default_time_range: value});
     }
 
@@ -90,7 +90,7 @@ export function Preferences(): JSX.Element {
                             <select
                                 id="default-time-range"
                                 value={data.default_time_range}
-                                onChange={(e) => onChangeTimeRange(e.target.value as TimeRange)}
+                                onChange={(e) => onChangeTimeRange(e.target.value as TimeRangePreset)}
                                 className="rounded-md border border-border bg-surface px-3 py-1.5 text-sm text-foreground"
                             >
                                 {TIME_RANGES.map((r) => (

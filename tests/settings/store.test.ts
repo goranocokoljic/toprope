@@ -190,8 +190,8 @@ describe('settings store', () => {
 
         it('persists set preferences over the defaults', () => {
             setUserPreference(db, userId, 'dark_mode', true);
-            setUserPreference(db, userId, 'default_time_range', '7d');
-            expect(getUserPreferences(db, userId)).toEqual({default_time_range: '7d', dark_mode: true});
+            setUserPreference(db, userId, 'default_time_range', 'lifetime');
+            expect(getUserPreferences(db, userId)).toEqual({default_time_range: 'lifetime', dark_mode: true});
         });
 
         it('throws on unknown preference keys', () => {
