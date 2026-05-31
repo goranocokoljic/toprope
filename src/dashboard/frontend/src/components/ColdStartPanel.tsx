@@ -40,12 +40,16 @@ function timingMessage(collectedDays: number | undefined, significanceDays: numb
         return 'Once a connector is syncing, meaningful trends appear after about ' +
             `${significanceDays} days of data.`;
     }
-    const remaining = Math.max(0, significanceDays - Math.floor(collectedDays));
-    if (remaining <= 0) {
-        return `${Math.floor(collectedDays)} days collected — your data is ready to read.`;
+    const collected = Math.max(0, Math.floor(collectedDays));
+    const remaining = Math.max(0, significanceDays - collected);
+    // This panel is the cold-start treatment, so we never claim the data is
+    // "ready" here — once the window is satisfied the scope routes away from
+    // cold-start entirely. At/over the window we just say it's still firming up.
+    if (remaining === 0) {
+        return `${collected} days collected — still building confidence as more data lands.`;
     }
     return (
-        `${Math.floor(collectedDays)} of ${significanceDays} days collected — ` +
+        `${collected} of ${significanceDays} days collected — ` +
         `meaningful trends appear in about ${remaining} more ${remaining === 1 ? 'day' : 'days'}.`
     );
 }

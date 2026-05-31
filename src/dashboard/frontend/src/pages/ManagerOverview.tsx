@@ -13,7 +13,14 @@ function formatCurrency(value: number): string {
 
 // The connectors GovProxy can pull from. We always list all three so the
 // cold-start panel shows what's still unconnected, not just what's wired up.
-const KNOWN_CONNECTORS = ['copilot', 'claude-code', 'windsurf'] as const;
+// `id` must match the tool string the backend writes into tool_snapshots (see
+// each connector's transformer, e.g. claude-code → 'claude_code'); `label` is
+// the human-facing chip text.
+const KNOWN_CONNECTORS = [
+    {id: 'copilot', label: 'Copilot'},
+    {id: 'claude_code', label: 'Claude Code'},
+    {id: 'windsurf', label: 'Windsurf'},
+] as const;
 
 /**
  * Count of collected tool snapshots backing the overview. The API's
@@ -30,7 +37,7 @@ function collectedSnapshotCount(data: OverviewData): number {
 
 function connectorStatuses(data: OverviewData): ConnectorStatus[] {
     const tools = data.active_tools ?? [];
-    return KNOWN_CONNECTORS.map((name) => ({name, connected: tools.includes(name)}));
+    return KNOWN_CONNECTORS.map(({id, label}) => ({name: label, connected: tools.includes(id)}));
 }
 
 function LoadingOverview(): JSX.Element {
@@ -74,8 +81,8 @@ export function ManagerOverview(): JSX.Element {
 
             {state === 'loading' ? <LoadingOverview /> : null}
 
-            {state === 'error' && isError ? (
-                <ErrorState title="Failed to load overview" detail={error.message} onRetry={() => void refetch()} />
+            {state === 'error' ? (
+                <ErrorState title="Failed to load overview" detail={error?.message} onRetry={() => void refetch()} />
             ) : null}
 
             {state === 'cold-start' && data ? (

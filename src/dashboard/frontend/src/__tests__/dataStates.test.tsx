@@ -2,7 +2,7 @@
 import '../test/setup';
 import '@testing-library/jest-dom/vitest';
 import {afterEach, describe, expect, it, vi, type Mock} from 'vitest';
-import {cleanup, fireEvent, render, screen} from '@testing-library/react';
+import {cleanup, fireEvent, render, screen, within} from '@testing-library/react';
 import {QueryClient, QueryClientProvider} from '@tanstack/react-query';
 import type {ReactNode} from 'react';
 
@@ -256,6 +256,26 @@ describe('ManagerOverview data states', () => {
         expect(await screen.findByTestId('cold-start')).toBeInTheDocument();
         // The hollow stat grid must NOT be shown alongside cold-start.
         expect(screen.queryByText('Monthly spend')).not.toBeInTheDocument();
+    });
+
+    it('marks an actively-syncing connector as connected using the backend tool id', async () => {
+        // The backend writes the Claude Code tool string as 'claude_code'
+        // (underscore). The connector chip must reflect that as connected, not
+        // mislabel it as unconnected.
+        const overview: OverviewData = {...COLD_OVERVIEW, active_tools: ['claude_code']};
+        fetchMock = vi.fn(
+            async () =>
+                new Response(JSON.stringify({data: overview}), {
+                    status: 200,
+                    headers: {'Content-Type': 'application/json'},
+                }),
+        );
+        vi.stubGlobal('fetch', fetchMock);
+        renderPage();
+        const connectors = await screen.findByTestId('cold-start-connectors');
+        const claude = within(connectors).getByText('Claude Code').closest('span');
+        expect(claude).toHaveTextContent(/connected/i);
+        expect(claude).not.toHaveTextContent(/not connected/i);
     });
 
     it('shows the normal stat grid once data has been collected', async () => {
