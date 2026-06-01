@@ -424,10 +424,14 @@ function earliestDate(a: string | null, b: string | null): string | null {
  * lifecycle record the manager ROI feature reads.
  */
 export function getMeJourney(db: Database.Database, developerId: string): MeJourney {
+    // first_active/last_active are gated on is_active = 1 so "started using" means
+    // the first day of real engagement, not the first snapshot row — connectors
+    // also write is_active = 0 rows for seat-but-no-usage days, and counting those
+    // would contradict the is_active semantics getMeOverview uses for active_days.
     const activityRows = db
         .prepare(
             `SELECT tool,
-                    MIN(date) AS first_active,
+                    MIN(CASE WHEN is_active = 1 THEN date END) AS first_active,
                     MAX(CASE WHEN is_active = 1 THEN date END) AS last_active
              FROM tool_snapshots
              WHERE developer_id = ?

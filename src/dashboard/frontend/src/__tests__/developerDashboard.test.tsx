@@ -22,14 +22,6 @@ const MONTH_OVERVIEW: MeOverview = {
     estimated_monthly_cost: 34,
 };
 
-const WEEK_OVERVIEW: MeOverview = {
-    ...MONTH_OVERVIEW,
-    range: 'custom',
-    from: '2026-05-27',
-    to: '2026-06-02',
-    active_days: 4,
-};
-
 const JOURNEY: MeJourney = {
     tools: [
         {
@@ -114,7 +106,6 @@ function jsonResponse(body: unknown): Response {
 
 interface Overrides {
     monthOverview?: MeOverview;
-    weekOverview?: MeOverview;
     journey?: MeJourney;
     timeline?: MeTimeline;
     failOverview?: boolean;
@@ -131,9 +122,7 @@ function installFetch(overrides: Overrides = {}): void {
                 if (overrides.failOverview) {
                     return new Response('nope', {status: 500});
                 }
-                // The month card uses range=30d; the week card uses a custom window.
-                const isMonth = parsed.searchParams.get('range') === '30d';
-                return jsonResponse(isMonth ? overrides.monthOverview ?? MONTH_OVERVIEW : overrides.weekOverview ?? WEEK_OVERVIEW);
+                return jsonResponse(overrides.monthOverview ?? MONTH_OVERVIEW);
             }
             case '/api/me/journey':
                 return jsonResponse(overrides.journey ?? JOURNEY);
@@ -188,9 +177,11 @@ describe('DeveloperDashboard — personal stat cards', () => {
     it('shows active days (week + month), primary tool, acceptance rate, and cost', async () => {
         renderPage();
 
-        // Active days headline is the 30-day count; the hint carries the week count.
+        // Active days headline is the 30-day count; the hint carries the week
+        // count, derived from the trailing 7 days of the 30-day timeline (both
+        // fixture points are active and fall in that window → 2).
         expect(await screen.findByText('18')).toBeInTheDocument();
-        expect(screen.getByText('4 this week · last 30 days')).toBeInTheDocument();
+        expect(screen.getByText('2 this week · last 30 days')).toBeInTheDocument();
 
         // Primary tool is the most-used; the hint notes the others in play.
         // ('Copilot' also appears in the journey, so match at least one.)
@@ -203,6 +194,15 @@ describe('DeveloperDashboard — personal stat cards', () => {
 
         // Estimated personal AI cost.
         expect(screen.getByText('$34')).toBeInTheDocument();
+    });
+
+    it('fetches the overview once (week count derives from the timeline, not a 2nd call)', async () => {
+        renderPage();
+        await screen.findByText('2 this week · last 30 days');
+        const overviewCalls = fetchMock.mock.calls
+            .map((c) => String(c[0]))
+            .filter((u) => new URL(u, 'http://localhost').pathname === '/api/me/overview');
+        expect(overviewCalls).toHaveLength(1);
     });
 
     it('never renders a competitive ranking or peer comparison', async () => {

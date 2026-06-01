@@ -1,6 +1,5 @@
 import {useMeJourney, useMeOverview, useMeTimeline} from '../hooks/useMe';
 import {useTimeRange} from '../hooks/useTimeRange';
-import type {TimeRangeQuery} from '../api/client';
 import {Card, StatCard} from '../components/Card';
 import {TimeRangeSelector} from '../components/TimeRangeSelector';
 import {CoverageBadge} from '../components/CoverageBadge';
@@ -11,8 +10,8 @@ import {StatePanel} from '../components/StatePanel';
 import {SIGNIFICANCE_DAYS} from '../components/dataState';
 import {toolLabel} from '../components/toolLabels';
 import {formatCurrency, formatPercent, formatDateTick} from '../components/format';
-import {inclusiveDayCount} from '../timeRange/range';
-import type {MeJourney, MeJourneyEvent, MeJourneyTool, MeOverview} from '../api/types';
+import {inclusiveDayCount, presetValue} from '../timeRange/range';
+import type {MeJourney, MeJourneyEvent, MeJourneyTool, MeOverview, MeTimeline} from '../api/types';
 
 /**
  * Developer "My Dashboard" (Task 2.8). The developer's private landing screen:
@@ -27,12 +26,32 @@ function isoDate(date: Date): string {
     return date.toISOString().slice(0, 10);
 }
 
-/** A `[today-(days-1), today]` inclusive window as a raw range query. */
-function trailingWindow(days: number): TimeRangeQuery {
-    const to = new Date();
-    const from = new Date(to.getTime());
-    from.setUTCDate(from.getUTCDate() - (days - 1));
-    return {from: isoDate(from), to: isoDate(to)};
+/**
+ * Distinct active days in the trailing 7 days of a timeline, using the same
+ * "tool active OR a commit landed" definition as the server's active_days, and
+ * anchored to the timeline's server-resolved `to` date so the count never drifts
+ * with the browser clock. Returns null until the timeline has loaded.
+ */
+function weekActiveDays(timeline: MeTimeline | undefined): number | null {
+    if (!timeline) {
+        return null;
+    }
+    const toMs = Date.parse(`${timeline.to}T00:00:00.000Z`);
+    if (Number.isNaN(toMs)) {
+        return null;
+    }
+    const cutoffMs = toMs - 6 * 86_400_000; // inclusive 7-day window ending at `to`
+    let count = 0;
+    for (const point of timeline.points) {
+        const dayMs = Date.parse(`${point.date}T00:00:00.000Z`);
+        if (Number.isNaN(dayMs) || dayMs < cutoffMs) {
+            continue;
+        }
+        if (point.tool_activity.is_active || point.git_activity.commits > 0) {
+            count += 1;
+        }
+    }
+    return count;
 }
 
 /** Earliest started_on across all journey tools, or null if none recorded. */
@@ -60,18 +79,25 @@ function formatMonthYear(value: string): string {
 
 // --- Personal stat cards ---------------------------------------------------
 
-function StatCards({month, week}: {month: MeOverview; week: MeOverview | undefined}): JSX.Element {
+function StatCards({month, weekDays}: {month: MeOverview; weekDays: number | null}): JSX.Element {
     const primary = month.primary_tools[0];
     const extraTools = month.primary_tools.length - 1;
-    const {current, previous, trend} = month.acceptance_rate;
+    const {current, previous} = month.acceptance_rate;
 
     // Acceptance card: show the rate plus a points-delta chip when we can compare
-    // two halves. When there's nothing to compare, name the direction softly
-    // rather than implying a precise move.
+    // two halves. The chip and the hint are both driven off the same client-side
+    // delta so they can never disagree (e.g. an "up" hint beside a 0pp chip).
     const acceptanceValue = current === null ? '—' : formatPercent(current);
     const showDelta = current !== null && previous !== null;
-    const deltaPoints = showDelta ? Math.round((current! - previous!) * 100) : 0;
-    const trendHint = trend === 'flat' ? 'holding steady' : trend === 'up' ? 'trending up' : 'trending down';
+    const deltaPoints = showDelta ? Math.round((current - previous) * 100) : 0;
+    let acceptanceHint: string;
+    if (current === null) {
+        acceptanceHint = 'no suggestions yet';
+    } else if (!showDelta || deltaPoints === 0) {
+        acceptanceHint = 'holding steady';
+    } else {
+        acceptanceHint = deltaPoints > 0 ? 'trending up' : 'trending down';
+    }
 
     return (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
@@ -79,8 +105,8 @@ function StatCards({month, week}: {month: MeOverview; week: MeOverview | undefin
                 label="Active days"
                 value={String(month.active_days)}
                 hint={
-                    week
-                        ? `${week.active_days} this week · last 30 days`
+                    weekDays !== null
+                        ? `${weekDays} this week · last 30 days`
                         : 'in the last 30 days'
                 }
             />
@@ -98,8 +124,8 @@ function StatCards({month, week}: {month: MeOverview; week: MeOverview | undefin
             <StatCard
                 label="Acceptance rate"
                 value={acceptanceValue}
-                hint={current === null ? 'no suggestions yet' : trendHint}
-                trend={showDelta ? {value: deltaPoints, goodWhen: 'up', suffix: 'pp'} : undefined}
+                hint={acceptanceHint}
+                trend={showDelta && deltaPoints !== 0 ? {value: deltaPoints, goodWhen: 'up', suffix: 'pp'} : undefined}
             />
             <StatCard
                 label="Your AI cost"
@@ -282,11 +308,16 @@ function LoadingDashboard(): JSX.Element {
 }
 
 export function DeveloperDashboard(): JSX.Element {
-    // Stat cards read fixed trailing windows (week + month) so the headline
-    // numbers stay stable regardless of the trend chart's own range selector.
+    // Stat cards read a fixed 30-day window so the headline numbers stay stable
+    // regardless of the trend chart's own range selector. The "this week" figure
+    // is derived from the same fixed 30-day timeline rather than a second
+    // overview round-trip — one cheap per-day series covers both windows, and
+    // both anchor to the server-resolved dates (no browser-clock drift). When the
+    // chart's range is also 30d, React Query dedupes the two timeline reads.
     const month = useMeOverview({range: '30d'});
-    const week = useMeOverview(trailingWindow(7));
+    const monthTimeline = useMeTimeline(presetValue('30d'));
     const journey = useMeJourney();
+    const weekDays = weekActiveDays(monthTimeline.data);
 
     // Structural load/error gate keys off the month summary + journey; the trend
     // chart owns its own loading/error inline.
@@ -350,7 +381,7 @@ export function DeveloperDashboard(): JSX.Element {
                             </span>
                         </div>
                     ) : null}
-                    <StatCards month={month.data} week={week.data} />
+                    <StatCards month={month.data} weekDays={weekDays} />
                     {journey.data ? <AdoptionJourney journey={journey.data} /> : null}
                     <ActivityTrend earliest={earliest} />
                 </>

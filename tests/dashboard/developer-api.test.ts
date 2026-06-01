@@ -598,6 +598,20 @@ describe('Developer API (Task 2.4)', () => {
             expect(move).toMatchObject({from_tool: 'copilot', tool: 'windsurf', date: '2026-05-10'});
         });
 
+        it('starts the journey at the first ACTIVE day, not the first tracked snapshot', async () => {
+            // A seat-but-no-usage day (is_active = 0) precedes real engagement.
+            // "Started using" must reflect first engagement, matching the
+            // is_active semantics the overview uses for active_days.
+            seedToolSnapshot(db, {developer: 'alice', date: '2026-02-01', tool: 'copilot', isActive: false, interactions: 0});
+            seedToolSnapshot(db, {developer: 'alice', date: '2026-03-10', tool: 'copilot', interactions: 8});
+
+            const res = await app.inject({method: 'GET', url: '/api/me/journey', headers: authHeaders(aliceToken)});
+            expect(res.statusCode).toBe(200);
+            const copilot = (res.json() as JourneyBody).data.tools.find((t) => t.tool === 'copilot')!;
+            expect(copilot.started_on).toBe('2026-03-10');
+            expect(copilot.last_active_on).toBe('2026-03-10');
+        });
+
         it('returns empty tools and events for a developer with no history', async () => {
             const res = await app.inject({method: 'GET', url: '/api/me/journey', headers: authHeaders(aliceToken)});
             expect(res.statusCode).toBe(200);
