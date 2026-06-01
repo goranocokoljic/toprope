@@ -10,6 +10,9 @@ export const queryKeys = {
     overviewTrend: (window: string) => ['overview', 'trend', window] as const,
     coverage: ['coverage'] as const,
     wasteSummary: ['waste', 'summary'] as const,
+    // Waste Detection screen (Task 2.7): active alert list + resolved audit trail.
+    wasteAlerts: ['waste', 'alerts'] as const,
+    wasteResolved: ['waste', 'resolved'] as const,
     // Teams list + per-team detail surfaces (Task 2.6).
     teams: ['teams'] as const,
     teamDetail: (team: string) => ['teams', 'detail', team] as const,

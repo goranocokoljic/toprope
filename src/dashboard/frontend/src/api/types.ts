@@ -179,7 +179,11 @@ export interface TeamProviders {
     providers: TeamProviderUsage[];
 }
 
-/** One open waste alert. From /api/waste (optionally team-scoped via ?team=). */
+/**
+ * One waste alert. From /api/waste (active, optionally team-scoped via ?team=)
+ * or /api/waste/resolved (audit trail). `resolved_at` / `resolution` are only
+ * populated on the resolved endpoint; the active list omits them.
+ */
 export interface WasteAlert {
     id: string;
     developer_id: string | null;
@@ -190,7 +194,22 @@ export interface WasteAlert {
     details: Record<string, unknown>;
     monthly_waste: number | null;
     detected_at: string;
+    resolved_at?: string | null;
+    resolution?: string | null;
 }
+
+/**
+ * Structured reasons a manager may attach when resolving a waste alert. Mirrors
+ * WASTE_RESOLUTION_REASONS on the backend (src/expenses/waste-detector.ts) — the
+ * server validates the value, so this list must stay in lockstep with it.
+ */
+export type WasteResolutionReason =
+    | 'reallocated'
+    | 'upgraded'
+    | 'justified'
+    | 'downgrade_recommended'
+    | 'monitor_longer'
+    | 'dismissed';
 
 export type UserRole = 'admin' | 'developer';
 
