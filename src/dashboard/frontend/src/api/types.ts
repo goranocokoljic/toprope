@@ -238,3 +238,82 @@ export interface UserPreferences {
     default_time_range: TimeRangePreset;
     dark_mode: boolean;
 }
+
+// --- Admin Management (Task 2.13) ---------------------------------------
+
+/** A user account as returned by the admin users API (never includes a hash). */
+export interface AdminUser {
+    id: string;
+    email: string;
+    role: UserRole;
+    developer_id: string | null;
+    developer_name: string | null;
+    must_change_password: boolean;
+    created_at: string;
+    deactivated_at: string | null;
+    active: boolean;
+}
+
+/** Result of creating a user / resetting a password — temp password shown once. */
+export interface AdminUserWithTempPassword extends AdminUser {
+    temp_password: string;
+}
+
+export interface AdminPasswordReset {
+    id: string;
+    temp_password: string;
+}
+
+/** A team as returned by the admin teams API. */
+export interface AdminTeam {
+    name: string;
+    department: string | null;
+    manager: string | null;
+    created_at: string;
+    archived_at: string | null;
+    developer_count: number;
+}
+
+/** A developer's external-identity map, editable in the admin UI. */
+export interface DeveloperExternalIds {
+    github?: string;
+    copilot?: string;
+    claude?: string;
+    windsurf?: string;
+    bitbucket?: string;
+    gitlab?: string;
+    git_emails?: string;
+    [key: string]: string | undefined;
+}
+
+/** A developer as returned by the admin developers API. */
+export interface AdminDeveloper {
+    id: string;
+    name: string;
+    email: string | null;
+    team: string;
+    external_ids: DeveloperExternalIds;
+    created_at: string;
+}
+
+/** A subscription as returned by the admin subscriptions API. */
+export interface AdminSubscription {
+    id: string;
+    developer_id: string;
+    developer_name: string;
+    developer_email: string | null;
+    team: string;
+    tool: string;
+    plan: string | null;
+    billing_model: string;
+    monthly_cost: number | null;
+    seat_assigned_at: string | null;
+    seat_revoked_at: string | null;
+    data_source: string;
+}
+
+/** Read-only data-sources status from GET /api/admin/data-sources. */
+export interface AdminDataSources {
+    connectors: CoverageConnector[];
+    git_providers: CoverageGitProvider[];
+}

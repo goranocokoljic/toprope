@@ -7,6 +7,11 @@ import {ComingSoon} from './pages/ComingSoon';
 import {DeveloperDashboard} from './pages/DeveloperDashboard';
 import {Preferences} from './pages/Preferences';
 import {Settings} from './pages/Settings';
+import {AdminUsers} from './pages/admin/AdminUsers';
+import {AdminTeams} from './pages/admin/AdminTeams';
+import {AdminIdentities} from './pages/admin/AdminIdentities';
+import {AdminSubscriptions} from './pages/admin/AdminSubscriptions';
+import {AdminDataSources} from './pages/admin/AdminDataSources';
 import {RequireAdmin} from './components/RequireAdmin';
 import {NotFound} from './pages/NotFound';
 
@@ -50,6 +55,46 @@ export function App(): JSX.Element {
                     element={
                         <RequireAdmin>
                             <Settings />
+                        </RequireAdmin>
+                    }
+                />
+                <Route
+                    path="admin/users"
+                    element={
+                        <RequireAdmin>
+                            <AdminUsers />
+                        </RequireAdmin>
+                    }
+                />
+                <Route
+                    path="admin/teams"
+                    element={
+                        <RequireAdmin>
+                            <AdminTeams />
+                        </RequireAdmin>
+                    }
+                />
+                <Route
+                    path="admin/identities"
+                    element={
+                        <RequireAdmin>
+                            <AdminIdentities />
+                        </RequireAdmin>
+                    }
+                />
+                <Route
+                    path="admin/subscriptions"
+                    element={
+                        <RequireAdmin>
+                            <AdminSubscriptions />
+                        </RequireAdmin>
+                    }
+                />
+                <Route
+                    path="admin/data-sources"
+                    element={
+                        <RequireAdmin>
+                            <AdminDataSources />
                         </RequireAdmin>
                     }
                 />

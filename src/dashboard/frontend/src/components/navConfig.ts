@@ -21,7 +21,17 @@ const MANAGER_SECTION: NavSection = {
 };
 const DEVELOPER_SECTION: NavSection = {title: 'Developer', items: [{to: '/developer', label: 'My Dashboard'}]};
 const ACCOUNT_SECTION: NavSection = {title: 'Account', items: [{to: '/preferences', label: 'Preferences'}]};
-const ADMIN_SECTION: NavSection = {title: 'Admin', items: [{to: '/settings', label: 'Settings'}]};
+const ADMIN_SECTION: NavSection = {
+    title: 'Admin',
+    items: [
+        {to: '/admin/users', label: 'Users'},
+        {to: '/admin/teams', label: 'Teams'},
+        {to: '/admin/identities', label: 'Identities'},
+        {to: '/admin/subscriptions', label: 'Subscriptions'},
+        {to: '/admin/data-sources', label: 'Data Sources'},
+        {to: '/settings', label: 'Settings'},
+    ],
+};
 
 /**
  * Build the nav for a role. Managers are modelled as admins in this codebase, so

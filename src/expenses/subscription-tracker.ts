@@ -307,6 +307,45 @@ export function switchTool(db: Database.Database, data: SwitchToolData): Subscri
     })();
 }
 
+/**
+ * End an active subscription by stamping seat_revoked_at (Task 2.13). The row is
+ * never deleted, so cost-over-time accounting and history stay intact —
+ * isActiveOnDate stops counting it from the revoke date onward. Idempotent:
+ * an already-revoked seat is left untouched. Returns true when an active seat
+ * was revoked by this call.
+ */
+export function revokeSubscription(db: Database.Database, id: string): boolean {
+    const res = db
+        .prepare('UPDATE subscriptions SET seat_revoked_at = ? WHERE id = ? AND seat_revoked_at IS NULL')
+        .run(new Date().toISOString(), id);
+    return res.changes > 0;
+}
+
+export function getSubscriptionById(db: Database.Database, id: string): Subscription | null {
+    const row = db.prepare('SELECT * FROM subscriptions WHERE id = ?').get(id) as Subscription | undefined;
+    return row ?? null;
+}
+
+/**
+ * A single subscription joined with its developer's name/email/team — the same
+ * shape listSubscriptions yields, for endpoints that return one row (assign /
+ * end) so the response matches the list type rather than the bare Subscription.
+ */
+export function getSubscriptionWithDeveloperById(
+    db: Database.Database,
+    id: string,
+): SubscriptionWithDeveloper | null {
+    const row = db
+        .prepare(
+            `SELECT s.*, d.name as developer_name, d.email as developer_email, d.team
+             FROM subscriptions s
+             JOIN developers d ON s.developer_id = d.id
+             WHERE s.id = ?`,
+        )
+        .get(id) as SubscriptionWithDeveloper | undefined;
+    return row ?? null;
+}
+
 export function listSubscriptions(
     db: Database.Database,
     teamFilter?: string,

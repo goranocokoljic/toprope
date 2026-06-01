@@ -98,7 +98,7 @@ function latestSync(
         | undefined;
 }
 
-function computeConnectors(db: Database.Database): ConnectorStatus[] {
+export function computeConnectors(db: Database.Database): ConnectorStatus[] {
     return CONNECTORS.map((connector) => {
         const row = latestSync(db, connector);
         return {
@@ -123,7 +123,7 @@ interface GitProviderCoverage {
  * coverage is reported as the number of developers with git activity per
  * provider. Last sync comes from the shared 'git' connector's sync log.
  */
-function computeGitProviders(db: Database.Database): GitProviderCoverage[] {
+export function computeGitProviders(db: Database.Database): GitProviderCoverage[] {
     const rows = db
         .prepare(
             `SELECT data_source AS provider, COUNT(DISTINCT developer_id) AS developer_count
