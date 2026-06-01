@@ -1,6 +1,5 @@
 import type {FastifyInstance, FastifyReply, FastifyRequest} from 'fastify';
 import type Database from 'better-sqlite3';
-import {parseTimeRange, TimeRangeError, type TimeRange} from './range';
 import {getGlobalSetting, resolveSetting} from '../../settings/store';
 import {canAccessLeaderboard, type LeaderboardRole} from './leaderboard-gate';
 
@@ -14,6 +13,8 @@ import {canAccessLeaderboard, type LeaderboardRole} from './leaderboard-gate';
  *    that when disabled there is no trace of it (not merely a blocked link).
  *  - GET /api/leaderboard/:team — the ranked view itself; returns 403 whenever
  *    the gate denies access, including the default (leaderboard disabled) state.
+ *    The gate is evaluated BEFORE the team-existence check so a denied caller
+ *    cannot use the 404-vs-403 distinction as a team-existence oracle.
  *
  * Both sit behind the session middleware, which already confines the only
  * non-admin role (`developer`) to /api/me and /api/auth — so a request reaching
@@ -23,11 +24,24 @@ import {canAccessLeaderboard, type LeaderboardRole} from './leaderboard-gate';
  * Ranking metrics: `activity` (total tool interactions), `acceptance` (accepted
  * suggestions / interactions), or `output` (git commits). All three are computed
  * for every developer so the UI can switch metric without a different shape; the
- * chosen metric drives the sort and the `value` field.
+ * chosen metric drives the sort and the `value` field. The window is the last 30
+ * days, matching the other team views (e.g. /api/teams).
  */
 
 const METRICS = ['activity', 'acceptance', 'output'] as const;
 type LeaderboardMetric = (typeof METRICS)[number];
+
+/** Rolling window length (days) for the ranked aggregates — matches /api/teams. */
+const WINDOW_DAYS = 30;
+
+/**
+ * Minimum interactions for a developer's acceptance RATE to be ranked on its own
+ * merit. Below this, the rate is statistically meaningless (1/1 = 100% would
+ * otherwise top a 900/1000 developer), so such developers sort to the bottom of
+ * the acceptance board. Their true rate is still reported in the row; only the
+ * sort value is floored. Activity/output metrics are counts and need no floor.
+ */
+const MIN_ACCEPTANCE_SAMPLE = 10;
 
 function parseMetric(raw: unknown): LeaderboardMetric | null {
     if (raw === undefined) {
@@ -55,7 +69,8 @@ function metricValue(entry: LeaderboardEntry, metric: LeaderboardMetric): number
         case 'activity':
             return entry.interactions;
         case 'acceptance':
-            return entry.acceptance_rate;
+            // Floor low-sample developers so a fluke rate can't top the board.
+            return entry.interactions >= MIN_ACCEPTANCE_SAMPLE ? entry.acceptance_rate : 0;
         case 'output':
             return entry.commits;
     }
@@ -65,7 +80,16 @@ function metricValue(entry: LeaderboardEntry, metric: LeaderboardMetric): number
  * The role the gate should evaluate for this request. Today the middleware only
  * ever lets `admin` reach these routes; `developer` is mapped through so the
  * defense-in-depth gate denies it explicitly rather than relying on the route
- * never being hit. A future dedicated manager role would map to `'manager'`.
+ * never being hit.
+ *
+ * SEAM — wiring a future dedicated `manager` role: this is the one place that
+ * decides the gate role, but it is NOT sufficient on its own. To make managers
+ * able to reach leaderboards you must ALSO (1) return `'manager'` here for that
+ * role, (2) relax the developer-confinement in src/auth/middleware.ts so the
+ * manager role is admitted to /api/leaderboard/:team, and (3) ensure
+ * /availability resolves a manager's team-independent answer (already routed
+ * through canAccessLeaderboard, so no change needed there). Miss any of the
+ * three and the manager path is half-connected.
  */
 function gateRole(request: FastifyRequest): LeaderboardRole {
     return request.authUser?.role === 'admin' ? 'admin' : 'developer';
@@ -79,38 +103,40 @@ function forbidden(reply: FastifyReply): void {
     });
 }
 
+/** The window [from, to] (inclusive, YYYY-MM-DD) used for the ranked aggregates. */
+function rankingWindow(now = new Date()): {from: string; to: string} {
+    const to = now.toISOString().slice(0, 10);
+    const fromDate = new Date(now.getTime());
+    fromDate.setUTCDate(fromDate.getUTCDate() - (WINDOW_DAYS - 1));
+    return {from: fromDate.toISOString().slice(0, 10), to};
+}
+
 export function registerLeaderboardRoutes(app: FastifyInstance, db: Database.Database): void {
     // Capability probe for the dashboard nav. Returns whether the current
     // principal may view any leaderboard, so the nav can hide the entry point
-    // entirely when disabled. Cheap: reads only the two global flags.
+    // entirely when disabled. Routed through the same gate as the data endpoint
+    // (with a team-independent `teamEnabled: true`) so the availability answer
+    // can never drift from the real access rule.
     app.get('/api/leaderboard/availability', async (request) => {
         const globalEnabled = getGlobalSetting(db, 'leaderboard_enabled') === true;
         const managersCanEnable = getGlobalSetting(db, 'leaderboard_managers_can_enable') === true;
-        // Availability is the team-independent question "could this principal see
-        // a leaderboard for some team?". For an admin that is exactly the global
-        // master switch; for a manager it additionally needs the managers flag on
-        // (a specific team is still gated per request at the :team route).
-        const role = gateRole(request);
-        const available =
-            role === 'admin'
-                ? globalEnabled
-                : canAccessLeaderboard({role, globalEnabled, managersCanEnable, teamEnabled: true});
-        return {data: {available, leaderboard_enabled: globalEnabled, managers_can_enable: managersCanEnable}};
+        const available = canAccessLeaderboard({
+            role: gateRole(request),
+            globalEnabled,
+            managersCanEnable,
+            teamEnabled: true,
+        });
+        return {data: {available}};
     });
 
-    app.get<{Params: {team: string}; Querystring: {metric?: string; range?: string; from?: string; to?: string}}>(
+    app.get<{Params: {team: string}; Querystring: {metric?: string}}>(
         '/api/leaderboard/:team',
         async (request, reply) => {
             const {team} = request.params;
 
-            const teamRow = db.prepare('SELECT name FROM teams WHERE name = ?').get(team) as
-                | {name: string}
-                | undefined;
-            if (!teamRow) {
-                return reply.status(404).send({error: 'Not Found', message: `Team '${team}' not found`});
-            }
-
-            // --- Gate: global master switch + role + resolved per-team value ---
+            // Gate FIRST — before any team-existence check — so a denied caller
+            // gets a uniform 403 whether or not the team exists (no existence
+            // oracle). resolveSetting tolerates an unknown team (returns global).
             const globalEnabled = getGlobalSetting(db, 'leaderboard_enabled') === true;
             const managersCanEnable = getGlobalSetting(db, 'leaderboard_managers_can_enable') === true;
             const teamEnabled = resolveSetting(db, 'leaderboard_enabled', team) === true;
@@ -122,6 +148,13 @@ export function registerLeaderboardRoutes(app: FastifyInstance, db: Database.Dat
             });
             if (!allowed) {
                 return forbidden(reply);
+            }
+
+            const teamRow = db.prepare('SELECT name FROM teams WHERE name = ?').get(team) as
+                | {name: string}
+                | undefined;
+            if (!teamRow) {
+                return reply.status(404).send({error: 'Not Found', message: `Team '${team}' not found`});
             }
 
             const metric = parseMetric(request.query.metric);
@@ -136,47 +169,19 @@ export function registerLeaderboardRoutes(app: FastifyInstance, db: Database.Dat
                 .prepare('SELECT id, name FROM developers WHERE team = ? ORDER BY name')
                 .all(team) as {id: string; name: string}[];
 
-            let range: TimeRange;
-            try {
-                range = parseTimeRange(request.query, {
-                    earliest: () => earliestTeamDate(db, team),
-                });
-            } catch (err) {
-                if (err instanceof TimeRangeError) {
-                    return reply.status(400).send({error: 'Bad Request', message: err.message});
-                }
-                throw err;
-            }
-
-            const entries = rankDevelopers(db, developers, range, metric);
+            const window = rankingWindow();
+            const entries = rankDevelopers(db, developers, window, metric);
             return {
                 data: {
                     team,
                     metric,
-                    range: range.range,
-                    from: range.from,
-                    to: range.to,
+                    from: window.from,
+                    to: window.to,
                     entries,
                 },
             };
         },
     );
-}
-
-/** Earliest snapshot date (tool or git) across a team's developers, for lifetime. */
-function earliestTeamDate(db: Database.Database, team: string): string | null {
-    const row = db
-        .prepare(
-            `SELECT MIN(d) AS earliest FROM (
-                SELECT MIN(ts.date) AS d FROM tool_snapshots ts
-                  JOIN developers dv ON dv.id = ts.developer_id WHERE dv.team = ?
-                UNION ALL
-                SELECT MIN(gs.date) AS d FROM git_snapshots gs
-                  JOIN developers dv ON dv.id = gs.developer_id WHERE dv.team = ?
-             )`,
-        )
-        .get(team, team) as {earliest: string | null};
-    return row.earliest;
 }
 
 /**
@@ -189,7 +194,7 @@ function earliestTeamDate(db: Database.Database, team: string): string | null {
 function rankDevelopers(
     db: Database.Database,
     developers: {id: string; name: string}[],
-    range: TimeRange,
+    window: {from: string; to: string},
     metric: LeaderboardMetric,
 ): LeaderboardEntry[] {
     if (developers.length === 0) {
@@ -198,16 +203,20 @@ function rankDevelopers(
     const ids = developers.map((d) => d.id);
     const placeholders = ids.map(() => '?').join(',');
 
+    // `is_active = 1` mirrors every other tool-snapshot aggregation
+    // (overview.ts, developer-views.ts, developer-detail.ts), so the
+    // leaderboard's interaction totals can't diverge from the rest of the
+    // product when a connector writes an inactive-but-nonzero row.
     const toolRows = db
         .prepare(
             `SELECT developer_id,
                     COALESCE(SUM(interaction_count), 0) AS interactions,
                     COALESCE(SUM(acceptance_count), 0) AS acceptances
              FROM tool_snapshots
-             WHERE developer_id IN (${placeholders}) AND date >= ? AND date <= ?
+             WHERE developer_id IN (${placeholders}) AND is_active = 1 AND date >= ? AND date <= ?
              GROUP BY developer_id`,
         )
-        .all(...ids, range.from, range.to) as {developer_id: string; interactions: number; acceptances: number}[];
+        .all(...ids, window.from, window.to) as {developer_id: string; interactions: number; acceptances: number}[];
 
     const gitRows = db
         .prepare(
@@ -218,7 +227,7 @@ function rankDevelopers(
              WHERE developer_id IN (${placeholders}) AND date >= ? AND date <= ?
              GROUP BY developer_id`,
         )
-        .all(...ids, range.from, range.to) as {developer_id: string; commits: number; lines_added: number}[];
+        .all(...ids, window.from, window.to) as {developer_id: string; commits: number; lines_added: number}[];
 
     const toolMap = new Map(toolRows.map((r) => [r.developer_id, r]));
     const gitMap = new Map(gitRows.map((r) => [r.developer_id, r]));
@@ -228,6 +237,9 @@ function rankDevelopers(
         const git = gitMap.get(dev.id);
         const interactions = tool?.interactions ?? 0;
         const acceptances = tool?.acceptances ?? 0;
+        // Clamp to [0,1]: a malformed upstream row with acceptances > interactions
+        // must not produce a >100% rate that outranks honest entries.
+        const rate = interactions > 0 ? Math.min(1, acceptances / interactions) : 0;
         return {
             rank: 0,
             developer_id: dev.id,
@@ -235,7 +247,7 @@ function rankDevelopers(
             value: 0,
             interactions,
             acceptances,
-            acceptance_rate: interactions > 0 ? acceptances / interactions : 0,
+            acceptance_rate: rate,
             commits: git?.commits ?? 0,
             lines_added: git?.lines_added ?? 0,
         };
@@ -248,14 +260,14 @@ function rankDevelopers(
     entries.sort((a, b) => (b.value !== a.value ? b.value - a.value : a.name.localeCompare(b.name)));
 
     let lastValue: number | null = null;
-    let lastRank = 0;
     entries.forEach((entry, index) => {
+        // Competition ranking: a new value takes its 1-based position; a tie
+        // reuses the rank of the first element in the value-group (its index+1).
         if (lastValue === null || entry.value !== lastValue) {
             entry.rank = index + 1;
-            lastRank = entry.rank;
             lastValue = entry.value;
         } else {
-            entry.rank = lastRank;
+            entry.rank = entries[index - 1].rank;
         }
     });
 

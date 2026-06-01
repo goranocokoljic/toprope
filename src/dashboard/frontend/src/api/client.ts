@@ -300,7 +300,7 @@ export const api = {
             return body.data;
         } catch (err) {
             if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
-                return {available: false, leaderboard_enabled: false, managers_can_enable: false};
+                return {available: false};
             }
             throw err;
         }

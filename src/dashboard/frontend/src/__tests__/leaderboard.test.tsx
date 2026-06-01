@@ -10,22 +10,13 @@ import {RequireLeaderboard} from '../components/RequireLeaderboard';
 import {navSectionsForRole} from '../components/navConfig';
 import type {Leaderboard as LeaderboardData, LeaderboardAvailability} from '../api/types';
 
-const AVAILABLE: LeaderboardAvailability = {
-    available: true,
-    leaderboard_enabled: true,
-    managers_can_enable: false,
-};
-const UNAVAILABLE: LeaderboardAvailability = {
-    available: false,
-    leaderboard_enabled: false,
-    managers_can_enable: false,
-};
+const AVAILABLE: LeaderboardAvailability = {available: true};
+const UNAVAILABLE: LeaderboardAvailability = {available: false};
 
 function board(metric: LeaderboardData['metric']): LeaderboardData {
     return {
         team: 'eng',
         metric,
-        range: '30d',
         from: '2026-05-01',
         to: '2026-05-30',
         entries: [

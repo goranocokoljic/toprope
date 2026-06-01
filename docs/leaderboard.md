@@ -54,13 +54,19 @@ into, and is fully covered by the gating unit tests.
 ## API
 
 - `GET /api/leaderboard/availability` — cheap capability probe used by the
-  dashboard nav. Returns `{ available, leaderboard_enabled, managers_can_enable }`.
+  dashboard nav. Returns `{ available }` — routed through the same gate as the
+  data endpoint so the answer can never drift from the real access rule.
 - `GET /api/leaderboard/:team?metric=activity|acceptance|output` — the ranked
-  view. Returns `403` (`code: leaderboard_disabled`) whenever the gate denies
-  access, including the default disabled state. `404` if the team does not exist.
+  view. The gate is evaluated **before** the team-existence check, so a denied
+  caller always gets `403` (`code: leaderboard_disabled`) — whether or not the
+  team exists — and cannot use the `404`-vs-`403` distinction as a team-existence
+  oracle. When access is permitted, an unknown team returns `404`.
 
 Ranking metrics: `activity` (total tool interactions), `acceptance` (accepted
 suggestions ÷ interactions), or `output` (git commits). All three values are
-returned for every developer; the chosen metric drives the sort. Ties share a
-rank (standard competition ranking: 1, 2, 2, 4). A supported time window
-(`range` / `from` + `to`) may be supplied; it defaults to the last 30 days.
+returned for every developer; the chosen metric drives the sort. The window is
+the trailing 30 days, matching the other team views. Ties share a rank (standard
+competition ranking: 1, 2, 2, 4). Only `is_active` tool snapshots are counted, so
+interaction totals stay consistent with the rest of the product. For the
+`acceptance` metric, developers below a minimum interaction sample (10) are sorted
+to the bottom so a fluke 100% rate from one interaction cannot top the board.

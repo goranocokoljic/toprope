@@ -270,8 +270,6 @@ export type LeaderboardMetric = 'activity' | 'acceptance' | 'output';
  */
 export interface LeaderboardAvailability {
     available: boolean;
-    leaderboard_enabled: boolean;
-    managers_can_enable: boolean;
 }
 
 /** One ranked developer on a team leaderboard. */
@@ -288,11 +286,10 @@ export interface LeaderboardEntry {
     lines_added: number;
 }
 
-/** A ranked team leaderboard over a resolved window. From /api/leaderboard/:team. */
+/** A ranked team leaderboard over the trailing window. From /api/leaderboard/:team. */
 export interface Leaderboard {
     team: string;
     metric: LeaderboardMetric;
-    range: TimeRangeKind;
     from: string;
     to: string;
     entries: LeaderboardEntry[];

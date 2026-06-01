@@ -234,6 +234,45 @@ describe('Leaderboard API (Task 2.17)', () => {
             expect(entries[0].value).toBe(10);
         });
 
+        it('excludes inactive (is_active=0) snapshots from the activity ranking', async () => {
+            // Carol gets a big interaction count on an INACTIVE row; it must not
+            // count, keeping the leaderboard consistent with every other view.
+            db.prepare(
+                `INSERT INTO tool_snapshots
+                   (id, developer_id, date, tool, data_source, data_quality, is_active, interaction_count, acceptance_count)
+                 VALUES ('carol-inactive', 'd3', '2026-05-29', 'copilot', 'api', 'high', 0, 999, 999)`,
+            ).run();
+            const res = await app.inject({
+                method: 'GET',
+                url: '/api/leaderboard/eng?metric=activity',
+                headers: authHeaders(adminToken),
+            });
+            const entries = res.json().data.entries as {name: string; interactions: number}[];
+            const carol = entries.find((e) => e.name === 'Carol');
+            expect(carol?.interactions).toBe(0);
+            // Carol stays last despite the 999 on the inactive row.
+            expect(entries[entries.length - 1].name).toBe('Carol');
+        });
+
+        it('floors low-sample developers on the acceptance metric (no fluke 100%)', async () => {
+            // Dave: 1 interaction, 1 acceptance → raw rate 1.0, but below the
+            // sample floor, so he must NOT outrank Alice (50/100 = 0.5).
+            seedDeveloper(db, 'd4', 'Dave', 'eng');
+            seedToolSnapshot(db, {developer: 'd4', date: '2026-05-29', interactions: 1, acceptances: 1});
+            const res = await app.inject({
+                method: 'GET',
+                url: '/api/leaderboard/eng?metric=acceptance',
+                headers: authHeaders(adminToken),
+            });
+            const entries = res.json().data.entries as {name: string; value: number}[];
+            const dave = entries.find((e) => e.name === 'Dave');
+            const alice = entries.find((e) => e.name === 'Alice');
+            expect(dave?.value).toBe(0); // floored
+            expect((alice?.value ?? 0) > (dave?.value ?? 0)).toBe(true);
+            // The top spot is the high-sample leader, never the 1/1 developer.
+            expect(entries[0].name).not.toBe('Dave');
+        });
+
         it('rejects an unknown metric with 400', async () => {
             const res = await app.inject({
                 method: 'GET',
