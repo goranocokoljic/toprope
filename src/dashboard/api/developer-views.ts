@@ -471,14 +471,12 @@ export function getMeJourney(db: Database.Database, developerId: string): MeJour
         return entry;
     };
 
+    // One row per tool (GROUP BY tool), so a direct assign is exact; first_active
+    // and last_active are null for a tool seen only on inactive days.
     for (const row of activityRows) {
         const entry = ensureTool(row.tool);
         entry.started_on = earliestDate(entry.started_on, row.first_active);
-        // last_active is the latest active day; one row per tool here, but guard
-        // anyway so the latest wins if this ever sees more than one.
-        if (row.last_active && (entry.last_active_on === null || row.last_active > entry.last_active_on)) {
-            entry.last_active_on = row.last_active;
-        }
+        entry.last_active_on = row.last_active;
     }
 
     // Subscriptions are ordered by seat_assigned_at, so the last non-revoked row

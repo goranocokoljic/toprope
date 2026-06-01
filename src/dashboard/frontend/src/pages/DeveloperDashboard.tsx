@@ -329,7 +329,11 @@ export function DeveloperDashboard(): JSX.Element {
     const isColdStart =
         !isPending && !isError && (journey.data?.tools.length ?? 0) === 0 && (month.data?.active_days ?? 0) === 0;
     // Low-data: real but young history — a gentle, encouraging note, not a block.
-    const historyDays = earliest ? inclusiveDayCount(earliest, isoDate(new Date())) : 0;
+    // Measure tenure to the server-resolved overview date (falling back to the
+    // browser clock only before it loads) so the threshold never drifts a day on
+    // a clock-skewed client, consistent with the week-active-days derivation.
+    const today = month.data?.to ?? isoDate(new Date());
+    const historyDays = earliest ? inclusiveDayCount(earliest, today) : 0;
     const isLowData = !isColdStart && earliest !== null && historyDays < SIGNIFICANCE_DAYS;
 
     return (

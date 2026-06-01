@@ -19,8 +19,11 @@ import {trendQuery, trendWindowKey} from '../timeRange/trendQuery';
  * this takes a raw `TimeRangeQuery` and is cache-keyed by its window descriptor.
  */
 export function useMeOverview(params: TimeRangeQuery): UseQueryResult<MeOverview, Error> {
+    // Key on the preset name, or the custom span when no preset is given —
+    // the same window descriptor trendWindowKey produces for the timeline hooks.
+    const windowKey = params.range ?? `custom:${params.from ?? ''}:${params.to ?? ''}`;
     return useQuery({
-        queryKey: queryKeys.meOverview(windowKeyFor(params)),
+        queryKey: queryKeys.meOverview(windowKey),
         queryFn: () => api.getMeOverview(params),
     });
 }
@@ -39,12 +42,4 @@ export function useMeJourney(): UseQueryResult<MeJourney, Error> {
         queryKey: queryKeys.meJourney,
         queryFn: api.getMeJourney,
     });
-}
-
-/** Stable cache-key fragment for a raw range query (preset name or custom span). */
-function windowKeyFor(params: TimeRangeQuery): string {
-    if (params.range) {
-        return params.range;
-    }
-    return `custom:${params.from ?? ''}:${params.to ?? ''}`;
 }
