@@ -258,6 +258,46 @@ export interface UserPreferences {
     dark_mode: boolean;
 }
 
+// --- Optional leaderboard (Task 2.17) -----------------------------------
+
+/** Ranking metrics the leaderboard can sort by. From /api/leaderboard/:team. */
+export type LeaderboardMetric = 'activity' | 'acceptance' | 'output';
+
+/**
+ * Whether the current principal may see a leaderboard at all. Drives whether the
+ * nav entry point and route exist — when `available` is false the leaderboard
+ * leaves no trace in the UI. From GET /api/leaderboard/availability.
+ */
+export interface LeaderboardAvailability {
+    available: boolean;
+    leaderboard_enabled: boolean;
+    managers_can_enable: boolean;
+}
+
+/** One ranked developer on a team leaderboard. */
+export interface LeaderboardEntry {
+    rank: number;
+    developer_id: string;
+    name: string;
+    /** Value of the selected metric: interactions, a 0..1 rate, or commits. */
+    value: number;
+    interactions: number;
+    acceptances: number;
+    acceptance_rate: number;
+    commits: number;
+    lines_added: number;
+}
+
+/** A ranked team leaderboard over a resolved window. From /api/leaderboard/:team. */
+export interface Leaderboard {
+    team: string;
+    metric: LeaderboardMetric;
+    range: TimeRangeKind;
+    from: string;
+    to: string;
+    entries: LeaderboardEntry[];
+}
+
 // --- Admin Management (Task 2.13) ---------------------------------------
 
 /** A user account as returned by the admin users API (never includes a hash). */
