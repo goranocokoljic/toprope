@@ -20,4 +20,10 @@ export const queryKeys = {
     globalSettings: ['settings', 'global'] as const,
     teamSettings: (team: string) => ['settings', 'team', team] as const,
     preferences: ['preferences'] as const,
+    // Admin Management (Task 2.13).
+    adminUsers: ['admin', 'users'] as const,
+    adminTeams: ['admin', 'teams'] as const,
+    adminDevelopers: ['admin', 'developers'] as const,
+    adminSubscriptions: ['admin', 'subscriptions'] as const,
+    adminDataSources: ['admin', 'data-sources'] as const,
 };

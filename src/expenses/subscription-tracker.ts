@@ -307,6 +307,25 @@ export function switchTool(db: Database.Database, data: SwitchToolData): Subscri
     })();
 }
 
+/**
+ * End an active subscription by stamping seat_revoked_at (Task 2.13). The row is
+ * never deleted, so cost-over-time accounting and history stay intact —
+ * isActiveOnDate stops counting it from the revoke date onward. Idempotent:
+ * an already-revoked seat is left untouched. Returns true when an active seat
+ * was revoked by this call.
+ */
+export function revokeSubscription(db: Database.Database, id: string): boolean {
+    const res = db
+        .prepare('UPDATE subscriptions SET seat_revoked_at = ? WHERE id = ? AND seat_revoked_at IS NULL')
+        .run(new Date().toISOString(), id);
+    return res.changes > 0;
+}
+
+export function getSubscriptionById(db: Database.Database, id: string): Subscription | null {
+    const row = db.prepare('SELECT * FROM subscriptions WHERE id = ?').get(id) as Subscription | undefined;
+    return row ?? null;
+}
+
 export function listSubscriptions(
     db: Database.Database,
     teamFilter?: string,

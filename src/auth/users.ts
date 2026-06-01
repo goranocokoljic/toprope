@@ -98,6 +98,60 @@ export function updatePassword(db: Database.Database, userId: string, passwordHa
     ).run(passwordHash, userId);
 }
 
+export interface UpdateUserParams {
+    email?: string;
+    role?: UserRole;
+    developerId?: string | null;
+}
+
+/**
+ * Patch a user's email, role, and/or developer link. Only provided keys are
+ * written. Emails are normalized; the caller is responsible for handling the
+ * UNIQUE-email constraint (a duplicate throws). Returns the updated user, or
+ * null if it does not exist.
+ */
+export function updateUser(db: Database.Database, userId: string, params: UpdateUserParams): User | null {
+    const existing = getUserById(db, userId);
+    if (!existing) return null;
+
+    const email = params.email !== undefined ? normalizeEmail(params.email) : existing.email;
+    const role = params.role ?? existing.role;
+    const developerId =
+        params.developerId !== undefined ? params.developerId : existing.developer_id;
+
+    db.prepare('UPDATE users SET email = ?, role = ?, developer_id = ? WHERE id = ?').run(
+        email,
+        role,
+        developerId,
+        userId,
+    );
+    return {...existing, email, role, developer_id: developerId};
+}
+
+/**
+ * Admin-triggered password reset: store a new hash and force a change on next
+ * login. Existing sessions are revoked so the old password's sessions can't be
+ * used after a reset. Distinct from updatePassword, which CLEARS the
+ * must_change_password flag for a user changing their own password.
+ */
+export function adminResetPassword(db: Database.Database, userId: string, passwordHash: string): boolean {
+    const res = db
+        .prepare('UPDATE users SET password_hash = ?, must_change_password = 1 WHERE id = ?')
+        .run(passwordHash, userId);
+    if (res.changes > 0) {
+        deleteSessionsForUser(db, userId);
+    }
+    return res.changes > 0;
+}
+
+/** Reactivate a deactivated user. Returns true when a deactivated user was restored. */
+export function reactivateUser(db: Database.Database, userId: string): boolean {
+    const res = db
+        .prepare('UPDATE users SET deactivated_at = NULL WHERE id = ? AND deactivated_at IS NOT NULL')
+        .run(userId);
+    return res.changes > 0;
+}
+
 export function deactivateUser(db: Database.Database, userId: string): boolean {
     const res = db
         .prepare('UPDATE users SET deactivated_at = ? WHERE id = ? AND deactivated_at IS NULL')
