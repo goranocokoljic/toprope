@@ -60,7 +60,6 @@ interface LeaderboardEntry {
     acceptances: number;
     acceptance_rate: number;
     commits: number;
-    lines_added: number;
 }
 
 /** The metric value used for sorting/ranking a single entry. */
@@ -227,13 +226,12 @@ function rankDevelopers(
     const gitRows = db
         .prepare(
             `SELECT developer_id,
-                    COALESCE(SUM(commits), 0) AS commits,
-                    COALESCE(SUM(lines_added), 0) AS lines_added
+                    COALESCE(SUM(commits), 0) AS commits
              FROM git_snapshots
              WHERE developer_id IN (${placeholders}) AND date >= ? AND date <= ?
              GROUP BY developer_id`,
         )
-        .all(...ids, window.from, window.to) as {developer_id: string; commits: number; lines_added: number}[];
+        .all(...ids, window.from, window.to) as {developer_id: string; commits: number}[];
 
     const toolMap = new Map(toolRows.map((r) => [r.developer_id, r]));
     const gitMap = new Map(gitRows.map((r) => [r.developer_id, r]));
@@ -255,7 +253,6 @@ function rankDevelopers(
             acceptances,
             acceptance_rate: rate,
             commits: git?.commits ?? 0,
-            lines_added: git?.lines_added ?? 0,
         };
     });
 
@@ -263,7 +260,20 @@ function rankDevelopers(
         entry.value = metricValue(entry, metric);
     }
 
-    entries.sort((a, b) => (b.value !== a.value ? b.value - a.value : a.name.localeCompare(b.name)));
+    // Sort: metric desc, then interactions desc, then name asc. The interactions
+    // tiebreak keeps more-active developers above idle ones when the metric value
+    // ties — notably on the acceptance board, where low-sample developers and
+    // zero-activity developers both floor to value 0 but shouldn't interleave by
+    // name alone (a 1/1 developer reads more sensibly above a never-used-it one).
+    entries.sort((a, b) => {
+        if (b.value !== a.value) {
+            return b.value - a.value;
+        }
+        if (b.interactions !== a.interactions) {
+            return b.interactions - a.interactions;
+        }
+        return a.name.localeCompare(b.name);
+    });
 
     let lastValue: number | null = null;
     entries.forEach((entry, index) => {

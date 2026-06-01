@@ -24,7 +24,6 @@ function board(metric: LeaderboardData['metric']): LeaderboardData {
             acceptances: 50,
             acceptance_rate: 0.5,
             commits: 2,
-            lines_added: 20,
         },
         {
             rank: 2,
@@ -35,7 +34,6 @@ function board(metric: LeaderboardData['metric']): LeaderboardData {
             acceptances: 18,
             acceptance_rate: 0.9,
             commits: 10,
-            lines_added: 100,
         },
     ];
     if (metric === 'acceptance') {
@@ -50,7 +48,6 @@ function board(metric: LeaderboardData['metric']): LeaderboardData {
             acceptances: 1,
             acceptance_rate: 1,
             commits: 0,
-            lines_added: 0,
         });
     }
     return {team: 'eng', metric, from: '2026-05-01', to: '2026-05-30', entries};

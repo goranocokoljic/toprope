@@ -283,7 +283,6 @@ export interface LeaderboardEntry {
     acceptances: number;
     acceptance_rate: number;
     commits: number;
-    lines_added: number;
 }
 
 /** A ranked team leaderboard over the trailing window. From /api/leaderboard/:team. */
