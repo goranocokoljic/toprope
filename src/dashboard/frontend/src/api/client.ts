@@ -13,6 +13,9 @@ import type {
     Leaderboard,
     LeaderboardAvailability,
     LeaderboardMetric,
+    MeJourney,
+    MeOverview,
+    MeTimeline,
     OverviewData,
     OverviewTrend,
     PaginatedResponse,
@@ -435,6 +438,25 @@ export const api = {
     // --- Admin: data sources (read-only) ---
     async getAdminDataSources(): Promise<AdminDataSources> {
         const body = await request<ApiEnvelope<AdminDataSources>>('/api/admin/data-sources');
+        return body.data;
+    },
+
+    // --- Developer "My Dashboard" (Task 2.8): session-scoped to the caller ---
+    /** Personal stat summary over a time window. */
+    async getMeOverview(params: TimeRangeQuery): Promise<MeOverview> {
+        const body = await request<ApiEnvelope<MeOverview>>(`/api/me/overview${timeRangeQueryString(params)}`);
+        return body.data;
+    },
+
+    /** Personal activity timeline (AI interactions + git) over a time window. */
+    async getMeTimeline(params: TimeRangeQuery): Promise<MeTimeline> {
+        const body = await request<ApiEnvelope<MeTimeline>>(`/api/me/timeline${timeRangeQueryString(params)}`);
+        return body.data;
+    },
+
+    /** Personal adoption journey: per-tool status + lifecycle milestones. */
+    async getMeJourney(): Promise<MeJourney> {
+        const body = await request<ApiEnvelope<MeJourney>>('/api/me/journey');
         return body.data;
     },
 

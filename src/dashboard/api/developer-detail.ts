@@ -73,6 +73,8 @@ export interface TimelinePoint {
         commits: number;
         lines_added: number;
         lines_removed: number;
+        prs_opened: number;
+        prs_merged: number;
         ai_signature_score: number | null;
     };
 }
@@ -210,7 +212,7 @@ export function getDeveloperTimelineWindow(
 
     const gitRows = db
         .prepare(
-            `SELECT date, commits, lines_added, lines_removed, ai_signature_score
+            `SELECT date, commits, lines_added, lines_removed, prs_opened, prs_merged, ai_signature_score
              FROM git_snapshots
              WHERE developer_id = ? AND date >= ? AND date <= ?
              ORDER BY date`,
@@ -220,6 +222,8 @@ export function getDeveloperTimelineWindow(
         commits: number;
         lines_added: number;
         lines_removed: number;
+        prs_opened: number;
+        prs_merged: number;
         ai_signature_score: number | null;
     }[];
 
@@ -244,6 +248,8 @@ export function getDeveloperTimelineWindow(
                 commits: g?.commits ?? 0,
                 lines_added: g?.lines_added ?? 0,
                 lines_removed: g?.lines_removed ?? 0,
+                prs_opened: g?.prs_opened ?? 0,
+                prs_merged: g?.prs_merged ?? 0,
                 ai_signature_score: g?.ai_signature_score ?? null,
             },
         };
