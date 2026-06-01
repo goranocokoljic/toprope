@@ -198,7 +198,11 @@ export const api = {
         return fetchAllPages<WasteAlert>((page) => `/api/waste?page=${page}&limit=100`);
     },
 
-    /** Resolved waste alerts — the audit trail (not paginated server-side). */
+    /**
+     * Resolved waste alerts — the audit trail. The endpoint returns the full set
+     * unpaginated today; if it ever gains pagination (as /api/waste already has),
+     * switch this to fetchAllPages so the audit view can't silently truncate.
+     */
     async getResolvedWaste(): Promise<WasteAlert[]> {
         const body = await request<ApiEnvelope<WasteAlert[]>>('/api/waste/resolved');
         return body.data;

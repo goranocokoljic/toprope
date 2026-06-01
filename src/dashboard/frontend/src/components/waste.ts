@@ -20,14 +20,24 @@ export interface ResolutionOption {
     label: string;
 }
 
-export const RESOLUTION_OPTIONS: ResolutionOption[] = [
-    {value: 'reallocated', label: 'Seat reallocated'},
-    {value: 'upgraded', label: 'Plan upgraded'},
-    {value: 'justified', label: 'Justified — keep as is'},
-    {value: 'downgrade_recommended', label: 'Downgrade recommended'},
-    {value: 'monitor_longer', label: 'Monitor longer'},
-    {value: 'dismissed', label: 'Dismissed'},
-];
+/**
+ * Label per reason, typed as a *total* Record over the WasteResolutionReason
+ * union (which mirrors WASTE_RESOLUTION_REASONS on the backend). Adding a reason
+ * to the union without a label here is a compile error, so the select options
+ * and the union can't silently drift apart.
+ */
+const RESOLUTION_REASON_LABELS: Record<WasteResolutionReason, string> = {
+    reallocated: 'Seat reallocated',
+    upgraded: 'Plan upgraded',
+    justified: 'Justified — keep as is',
+    downgrade_recommended: 'Downgrade recommended',
+    monitor_longer: 'Monitor longer',
+    dismissed: 'Dismissed',
+};
+
+export const RESOLUTION_OPTIONS: ResolutionOption[] = (
+    Object.keys(RESOLUTION_REASON_LABELS) as WasteResolutionReason[]
+).map((value) => ({value, label: RESOLUTION_REASON_LABELS[value]}));
 
 /** Human label for a stored resolution reason (audit trail display). */
 export function resolutionLabel(reason: string | null | undefined): string {

@@ -39,7 +39,11 @@ function computeTotals(alerts: WasteAlert[]): WasteTotals {
     let planRoiCount = 0;
 
     for (const a of alerts) {
-        const dollars = a.monthly_waste ?? 0;
+        // Guard the sum the way the detail readers guard their inputs: a null
+        // (advisory plan_roi/cost_outlier) or any non-finite value contributes 0,
+        // so the headline total and 12x projection can never read $NaN.
+        const dollars =
+            typeof a.monthly_waste === 'number' && Number.isFinite(a.monthly_waste) ? a.monthly_waste : 0;
         monthlyWaste += dollars;
         if (a.alert_type === 'plan_roi') planRoiCount += 1;
         const entry = byTypeMap.get(a.alert_type) ?? {count: 0, monthlyWaste: 0};
