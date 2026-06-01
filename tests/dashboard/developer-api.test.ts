@@ -115,14 +115,56 @@ function seedGitSnapshot(
 
 function seedSubscription(
     db: Database.Database,
-    opts: {id: string; developer: string; tool: string; cost: number; revoked?: boolean},
+    opts: {
+        id: string;
+        developer: string;
+        tool: string;
+        cost: number;
+        revoked?: boolean;
+        plan?: string;
+        assignedAt?: string;
+        revokedAt?: string;
+    },
 ): void {
+    const revokedAt = opts.revokedAt ?? (opts.revoked ? NOW : null);
     db.prepare(
         `INSERT INTO subscriptions
            (id, developer_id, tool, plan, billing_model, monthly_cost, seat_assigned_at,
             seat_revoked_at, data_source)
-         VALUES (?, ?, ?, 'pro', 'company_managed', ?, ?, ?, 'expense_import')`,
-    ).run(opts.id, opts.developer, opts.tool, opts.cost, NOW, opts.revoked ? NOW : null);
+         VALUES (?, ?, ?, ?, 'company_managed', ?, ?, ?, 'expense_import')`,
+    ).run(opts.id, opts.developer, opts.tool, opts.plan ?? 'pro', opts.cost, opts.assignedAt ?? NOW, revokedAt);
+}
+
+function seedPlanChange(
+    db: Database.Database,
+    opts: {
+        id: string;
+        developer: string;
+        tool: string;
+        oldTool?: string | null;
+        oldPlan?: string | null;
+        newPlan?: string | null;
+        oldCost?: number | null;
+        newCost?: number | null;
+        changedAt: string;
+    },
+): void {
+    db.prepare(
+        `INSERT INTO plan_change_events
+           (id, developer_id, tool, old_tool, old_plan, new_plan, old_monthly_cost,
+            new_monthly_cost, changed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+        opts.id,
+        opts.developer,
+        opts.tool,
+        opts.oldTool ?? null,
+        opts.oldPlan ?? null,
+        opts.newPlan ?? null,
+        opts.oldCost ?? null,
+        opts.newCost ?? null,
+        opts.changedAt,
+    );
 }
 
 interface MeRangeBody {
@@ -159,7 +201,13 @@ describe('Developer API (Task 2.4)', () => {
 
     // ── authentication / scoping ─────────────────────────────────────────────
     describe('authentication and scoping', () => {
-        const endpoints = ['/api/me/overview', '/api/me/tools', '/api/me/timeline', '/api/me/activity'];
+        const endpoints = [
+            '/api/me/overview',
+            '/api/me/tools',
+            '/api/me/timeline',
+            '/api/me/activity',
+            '/api/me/journey',
+        ];
 
         it('returns 401 for unauthenticated requests on every endpoint', async () => {
             for (const url of endpoints) {
@@ -339,9 +387,9 @@ describe('Developer API (Task 2.4)', () => {
 
     // ── timeline ─────────────────────────────────────────────────────────────
     describe('GET /api/me/timeline', () => {
-        it('returns a per-day series and respects the range window', async () => {
+        it('returns a per-day series with PR overlay and respects the range window', async () => {
             seedToolSnapshot(db, {developer: 'alice', date: '2026-05-10', interactions: 5});
-            seedGitSnapshot(db, {developer: 'alice', date: '2026-05-10', commits: 2, linesAdded: 100});
+            seedGitSnapshot(db, {developer: 'alice', date: '2026-05-10', commits: 2, linesAdded: 100, prsOpened: 3, prsMerged: 1});
             seedToolSnapshot(db, {developer: 'alice', date: '2026-01-01', interactions: 9}); // outside window
 
             const res = await app.inject({
@@ -354,13 +402,20 @@ describe('Developer API (Task 2.4)', () => {
                 data: {
                     from: string;
                     to: string;
-                    points: Array<{date: string; tool_activity: {interaction_count: number}; git_activity: {commits: number}}>;
+                    points: Array<{
+                        date: string;
+                        tool_activity: {interaction_count: number};
+                        git_activity: {commits: number; prs_opened: number; prs_merged: number};
+                    }>;
                 };
             };
             expect(data.points).toHaveLength(1);
             expect(data.points[0].date).toBe('2026-05-10');
             expect(data.points[0].tool_activity.interaction_count).toBe(5);
             expect(data.points[0].git_activity.commits).toBe(2);
+            // Git activity overlay carries PRs for the developer trend chart.
+            expect(data.points[0].git_activity.prs_opened).toBe(3);
+            expect(data.points[0].git_activity.prs_merged).toBe(1);
         });
 
         it('rejects an invalid custom range with 400 (same as manager endpoints)', async () => {
@@ -446,6 +501,116 @@ describe('Developer API (Task 2.4)', () => {
             expect(data.totals.commits).toBe(0);
             expect(data.totals.avg_churn_rate).toBeNull();
             expect(data.providers).toEqual([]);
+        });
+    });
+
+    // ── adoption journey ─────────────────────────────────────────────────────
+    interface JourneyBody {
+        data: {
+            tools: Array<{
+                tool: string;
+                started_on: string | null;
+                last_active_on: string | null;
+                current_plan: string | null;
+                current_monthly_cost: number | null;
+                active: boolean;
+            }>;
+            events: Array<{
+                date: string;
+                type: 'started' | 'plan_change' | 'tool_switch';
+                tool: string;
+                from_tool: string | null;
+                from_plan: string | null;
+                to_plan: string | null;
+                old_monthly_cost: number | null;
+                new_monthly_cost: number | null;
+            }>;
+        };
+    }
+
+    describe('GET /api/me/journey', () => {
+        it('reports per-tool start dates, current plan/cost, and active status', async () => {
+            // First activity predates the subscription assignment for copilot.
+            seedToolSnapshot(db, {developer: 'alice', date: '2026-03-01', tool: 'copilot', interactions: 5});
+            seedToolSnapshot(db, {developer: 'alice', date: '2026-05-20', tool: 'copilot', interactions: 5});
+            seedToolSnapshot(db, {developer: 'alice', date: '2026-04-10', tool: 'windsurf', interactions: 2});
+            seedSubscription(db, {
+                id: 's-cop', developer: 'alice', tool: 'copilot', cost: 19, plan: 'business',
+                assignedAt: '2026-03-15T00:00:00.000Z',
+            });
+            // Windsurf seat was revoked — tool no longer active, but still in the journey.
+            seedSubscription(db, {
+                id: 's-wind', developer: 'alice', tool: 'windsurf', cost: 15, plan: 'pro',
+                assignedAt: '2026-04-01T00:00:00.000Z', revokedAt: '2026-05-01T00:00:00.000Z',
+            });
+
+            const res = await app.inject({method: 'GET', url: '/api/me/journey', headers: authHeaders(aliceToken)});
+            expect(res.statusCode).toBe(200);
+            const {data} = res.json() as JourneyBody;
+
+            const copilot = data.tools.find((t) => t.tool === 'copilot')!;
+            // started_on is the earliest of first activity (03-01) and seat assignment (03-15).
+            expect(copilot.started_on).toBe('2026-03-01');
+            expect(copilot.last_active_on).toBe('2026-05-20');
+            expect(copilot.current_plan).toBe('business');
+            expect(copilot.current_monthly_cost).toBe(19);
+            expect(copilot.active).toBe(true);
+
+            const windsurf = data.tools.find((t) => t.tool === 'windsurf')!;
+            // Earliest of activity (04-10) and seat assignment (04-01) → 04-01.
+            expect(windsurf.started_on).toBe('2026-04-01');
+            expect(windsurf.active).toBe(false);
+            expect(windsurf.current_plan).toBeNull();
+
+            // Tools are ordered by start date — copilot (March) before windsurf (April).
+            expect(data.tools.map((t) => t.tool)).toEqual(['copilot', 'windsurf']);
+        });
+
+        it('emits chronological milestones: started, plan changes, and tool switches', async () => {
+            seedToolSnapshot(db, {developer: 'alice', date: '2026-03-01', tool: 'claude_code', interactions: 5});
+            seedSubscription(db, {
+                id: 's1', developer: 'alice', tool: 'claude_code', cost: 200, plan: 'max',
+                assignedAt: '2026-04-01T00:00:00.000Z',
+            });
+            // Pro → Max upgrade on the same tool.
+            seedPlanChange(db, {
+                id: 'pc1', developer: 'alice', tool: 'claude_code', oldPlan: 'pro', newPlan: 'max',
+                oldCost: 20, newCost: 200, changedAt: '2026-04-01T12:00:00.000Z',
+            });
+            // A genuine tool switch: copilot → windsurf.
+            seedPlanChange(db, {
+                id: 'pc2', developer: 'alice', tool: 'windsurf', oldTool: 'copilot', oldPlan: 'business',
+                newPlan: 'pro', oldCost: 19, newCost: 15, changedAt: '2026-05-10T09:00:00.000Z',
+            });
+
+            const res = await app.inject({method: 'GET', url: '/api/me/journey', headers: authHeaders(aliceToken)});
+            expect(res.statusCode).toBe(200);
+            const {events} = (res.json() as JourneyBody).data;
+
+            // Chronological: started (03-01) → plan_change (04-01) → tool_switch (05-10).
+            expect(events.map((e) => e.type)).toEqual(['started', 'plan_change', 'tool_switch']);
+            expect(events[0]).toMatchObject({date: '2026-03-01', tool: 'claude_code'});
+
+            const upgrade = events.find((e) => e.type === 'plan_change')!;
+            expect(upgrade).toMatchObject({from_plan: 'pro', to_plan: 'max', new_monthly_cost: 200});
+
+            const move = events.find((e) => e.type === 'tool_switch')!;
+            expect(move).toMatchObject({from_tool: 'copilot', tool: 'windsurf', date: '2026-05-10'});
+        });
+
+        it('returns empty tools and events for a developer with no history', async () => {
+            const res = await app.inject({method: 'GET', url: '/api/me/journey', headers: authHeaders(aliceToken)});
+            expect(res.statusCode).toBe(200);
+            const {data} = res.json() as JourneyBody;
+            expect(data.tools).toEqual([]);
+            expect(data.events).toEqual([]);
+        });
+
+        it("never includes another developer's journey", async () => {
+            seedToolSnapshot(db, {developer: 'alice', date: '2026-03-01', tool: 'copilot', interactions: 5});
+            const res = await app.inject({method: 'GET', url: '/api/me/journey', headers: authHeaders(bobToken)});
+            expect(res.statusCode).toBe(200);
+            expect((res.json() as JourneyBody).data.tools).toEqual([]);
         });
     });
 

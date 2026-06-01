@@ -18,6 +18,12 @@ export interface ChartSeries {
     key: string;
     label?: string;
     color?: string;
+    /**
+     * Which Y axis this series plots against. Defaults to 'left'. Set 'right' to
+     * overlay a series on its own scale (e.g. small git counts beside large AI
+     * interaction counts) so neither measure is crushed by the other's range.
+     */
+    axis?: 'left' | 'right';
 }
 
 export type ChartDatum = Record<string, number | string | null>;
@@ -69,6 +75,14 @@ export function TrendChart({
     const axisTick = {fill: theme.muted, fontSize: 12};
     const ChartImpl = variant === 'area' ? AreaChart : LineChart;
 
+    // Only switch to keyed (dual) axes when a series actually opts into the right
+    // axis; otherwise keep the single default axis so existing single-scale
+    // charts render byte-identically. Recharts requires each series' yAxisId to
+    // match a rendered YAxis, so we resolve one consistently for both.
+    const hasRightAxis = series.some((s) => s.axis === 'right');
+    const axisIdFor = (s: ChartSeries): 'left' | 'right' | undefined =>
+        hasRightAxis ? (s.axis === 'right' ? 'right' : 'left') : undefined;
+
     return (
         <ChartFrame height={height} testId={testId}>
             <ResponsiveContainer width="100%" height="100%">
@@ -82,13 +96,36 @@ export function TrendChart({
                         tickFormatter={xTickFormatter}
                         minTickGap={24}
                     />
-                    <YAxis tick={axisTick} tickLine={false} axisLine={false} width={40} allowDecimals={false} />
+                    {hasRightAxis ? (
+                        <>
+                            <YAxis
+                                yAxisId="left"
+                                tick={axisTick}
+                                tickLine={false}
+                                axisLine={false}
+                                width={40}
+                                allowDecimals={false}
+                            />
+                            <YAxis
+                                yAxisId="right"
+                                orientation="right"
+                                tick={axisTick}
+                                tickLine={false}
+                                axisLine={false}
+                                width={40}
+                                allowDecimals={false}
+                            />
+                        </>
+                    ) : (
+                        <YAxis tick={axisTick} tickLine={false} axisLine={false} width={40} allowDecimals={false} />
+                    )}
                     <Tooltip content={tooltip} cursor={{stroke: theme.grid}} />
                     {legendVisible ? <Legend wrapperStyle={{fontSize: 12, color: theme.muted}} /> : null}
                     {series.map((s, i) =>
                         variant === 'area' ? (
                             <Area
                                 key={s.key}
+                                yAxisId={axisIdFor(s)}
                                 type="monotone"
                                 dataKey={s.key}
                                 name={s.label ?? s.key}
@@ -102,6 +139,7 @@ export function TrendChart({
                         ) : (
                             <Line
                                 key={s.key}
+                                yAxisId={axisIdFor(s)}
                                 type="monotone"
                                 dataKey={s.key}
                                 name={s.label ?? s.key}

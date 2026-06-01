@@ -4,6 +4,7 @@ import {getDeveloperDetail, getDeveloperTimelineWindow} from './developer-detail
 import {
     earliestDeveloperDate,
     getMeActivity,
+    getMeJourney,
     getMeOverview,
     getMeTools,
 } from './developer-views';
@@ -114,6 +115,14 @@ export function registerMeRoutes(app: FastifyInstance, db: Database.Database): v
                 points: getDeveloperTimelineWindow(db, developerId, range.from, range.to),
             },
         };
+    });
+
+    app.get('/api/me/journey', async (request, reply) => {
+        const developerId = requireDeveloperId(request, reply);
+        if (!developerId) {
+            return reply;
+        }
+        return {data: getMeJourney(db, developerId)};
     });
 
     app.get<{Querystring: TimeRangeInput}>('/api/me/activity', async (request, reply) => {

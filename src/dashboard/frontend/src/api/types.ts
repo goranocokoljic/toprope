@@ -211,6 +211,81 @@ export type WasteResolutionReason =
     | 'monitor_longer'
     | 'dismissed';
 
+// --- Developer "My Dashboard" (Task 2.8) --------------------------------
+
+export type TrendDirection = 'up' | 'down' | 'flat';
+
+/** Personal stat summary. From /api/me/overview. */
+export interface MeOverview {
+    range: TimeRangeKind;
+    from: string;
+    to: string;
+    active_days: number;
+    primary_tools: string[];
+    acceptance_rate: {
+        current: number | null;
+        previous: number | null;
+        trend: TrendDirection;
+    };
+    estimated_monthly_cost: number;
+}
+
+/** One day on the personal activity timeline. From /api/me/timeline. */
+export interface DeveloperTimelinePoint {
+    date: string;
+    tool_activity: {
+        is_active: boolean;
+        interaction_count: number;
+        tools: string[];
+    };
+    git_activity: {
+        commits: number;
+        lines_added: number;
+        lines_removed: number;
+        prs_opened: number;
+        prs_merged: number;
+        ai_signature_score: number | null;
+    };
+}
+
+/** Personal activity timeline over a resolved window. From /api/me/timeline. */
+export interface MeTimeline {
+    range: TimeRangeKind;
+    from: string;
+    to: string;
+    points: DeveloperTimelinePoint[];
+}
+
+export type MeJourneyEventType = 'started' | 'plan_change' | 'tool_switch';
+
+/** Current per-tool status on the adoption journey. */
+export interface MeJourneyTool {
+    tool: string;
+    started_on: string | null;
+    last_active_on: string | null;
+    current_plan: string | null;
+    current_monthly_cost: number | null;
+    active: boolean;
+}
+
+/** A milestone on the adoption journey (first use, plan change, tool switch). */
+export interface MeJourneyEvent {
+    date: string;
+    type: MeJourneyEventType;
+    tool: string;
+    from_tool: string | null;
+    from_plan: string | null;
+    to_plan: string | null;
+    old_monthly_cost: number | null;
+    new_monthly_cost: number | null;
+}
+
+/** The developer's adoption journey. From /api/me/journey. */
+export interface MeJourney {
+    tools: MeJourneyTool[];
+    events: MeJourneyEvent[];
+}
+
 export type UserRole = 'admin' | 'developer';
 
 /** The current session identity, as returned by GET /api/auth/me. */

@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3';
+import {getDeveloperPlanChanges} from '../../expenses/subscription-tracker';
 
 /**
  * Data layer for the self-service developer view (Task 2.4 / #39).
@@ -357,3 +358,183 @@ export function getMeActivity(
 // The personal activity timeline is the manager timeline scoped to a session-
 // resolved id and bounded by the shared range parser, so /api/me/timeline calls
 // getDeveloperTimelineWindow directly rather than wrapping it here.
+
+/** A milestone on the developer's adoption journey. */
+export type MeJourneyEventType = 'started' | 'plan_change' | 'tool_switch';
+
+export interface MeJourneyTool {
+    tool: string;
+    /** When the developer first used this tool (earliest activity or seat) — YYYY-MM-DD. */
+    started_on: string | null;
+    /** Most recent day the developer was active on this tool — YYYY-MM-DD. */
+    last_active_on: string | null;
+    /** Plan of the current (non-revoked) subscription, if any. */
+    current_plan: string | null;
+    /** Monthly cost of the current (non-revoked) subscription, if any. */
+    current_monthly_cost: number | null;
+    /** Whether the developer holds a live (non-revoked) seat for this tool. */
+    active: boolean;
+}
+
+export interface MeJourneyEvent {
+    /** Day the milestone happened — YYYY-MM-DD. */
+    date: string;
+    type: MeJourneyEventType;
+    /** The tool the event concerns (the new tool, for a switch). */
+    tool: string;
+    /** The tool moved away from, on a tool switch; null otherwise. */
+    from_tool: string | null;
+    from_plan: string | null;
+    to_plan: string | null;
+    old_monthly_cost: number | null;
+    new_monthly_cost: number | null;
+}
+
+/**
+ * Per-tool current status plus the chronological list of "started"/plan-change/
+ * tool-switch milestones. From `developer.id`.
+ */
+export interface MeJourney {
+    tools: MeJourneyTool[];
+    events: MeJourneyEvent[];
+}
+
+/** Date portion (YYYY-MM-DD) of a stored timestamp, or null. */
+function dateOf(value: string | null): string | null {
+    return value ? value.slice(0, 10) : null;
+}
+
+/** The earlier of two YYYY-MM-DD dates, ignoring nulls (lexical = chronological). */
+function earliestDate(a: string | null, b: string | null): string | null {
+    if (a === null) return b;
+    if (b === null) return a;
+    return a <= b ? a : b;
+}
+
+/**
+ * The developer's adoption journey: when they started each tool, the current
+ * plan/cost per tool, and a chronological list of lifecycle milestones (first
+ * use, plan upgrades/downgrades, tool switches). This is the growth-story data
+ * behind the "My adoption journey" view — never a comparison to anyone else.
+ *
+ * Start dates are taken from the full activity history (no recency cutoff) and
+ * the earliest seat assignment, so "when I started" reflects the true first
+ * touch even for a tool whose snapshots predate the detail view's one-year
+ * window. Plan/tool transitions come from `plan_change_events`, the same
+ * lifecycle record the manager ROI feature reads.
+ */
+export function getMeJourney(db: Database.Database, developerId: string): MeJourney {
+    const activityRows = db
+        .prepare(
+            `SELECT tool,
+                    MIN(date) AS first_active,
+                    MAX(CASE WHEN is_active = 1 THEN date END) AS last_active
+             FROM tool_snapshots
+             WHERE developer_id = ?
+             GROUP BY tool`,
+        )
+        .all(developerId) as {tool: string; first_active: string | null; last_active: string | null}[];
+
+    const subscriptionRows = db
+        .prepare(
+            `SELECT tool, plan, monthly_cost, seat_assigned_at, seat_revoked_at
+             FROM subscriptions
+             WHERE developer_id = ?
+             ORDER BY seat_assigned_at`,
+        )
+        .all(developerId) as {
+        tool: string;
+        plan: string | null;
+        monthly_cost: number | null;
+        seat_assigned_at: string | null;
+        seat_revoked_at: string | null;
+    }[];
+
+    const tools = new Map<string, MeJourneyTool>();
+    const ensureTool = (tool: string): MeJourneyTool => {
+        let entry = tools.get(tool);
+        if (!entry) {
+            entry = {
+                tool,
+                started_on: null,
+                last_active_on: null,
+                current_plan: null,
+                current_monthly_cost: null,
+                active: false,
+            };
+            tools.set(tool, entry);
+        }
+        return entry;
+    };
+
+    for (const row of activityRows) {
+        const entry = ensureTool(row.tool);
+        entry.started_on = earliestDate(entry.started_on, row.first_active);
+        // last_active is the latest active day; one row per tool here, but guard
+        // anyway so the latest wins if this ever sees more than one.
+        if (row.last_active && (entry.last_active_on === null || row.last_active > entry.last_active_on)) {
+            entry.last_active_on = row.last_active;
+        }
+    }
+
+    // Subscriptions are ordered by seat_assigned_at, so the last non-revoked row
+    // we see for a tool is its current seat (latest assignment wins).
+    for (const sub of subscriptionRows) {
+        const entry = ensureTool(sub.tool);
+        entry.started_on = earliestDate(entry.started_on, dateOf(sub.seat_assigned_at));
+        if (sub.seat_revoked_at === null) {
+            entry.active = true;
+            entry.current_plan = sub.plan;
+            entry.current_monthly_cost = sub.monthly_cost;
+        }
+    }
+
+    const planChanges = getDeveloperPlanChanges(db, developerId);
+
+    const events: MeJourneyEvent[] = [];
+    for (const entry of tools.values()) {
+        if (entry.started_on) {
+            events.push({
+                date: entry.started_on,
+                type: 'started',
+                tool: entry.tool,
+                from_tool: null,
+                from_plan: null,
+                to_plan: null,
+                old_monthly_cost: null,
+                new_monthly_cost: null,
+            });
+        }
+    }
+    for (const change of planChanges) {
+        const isSwitch = change.old_tool !== null && change.old_tool !== change.tool;
+        events.push({
+            date: dateOf(change.changed_at) ?? change.changed_at,
+            type: isSwitch ? 'tool_switch' : 'plan_change',
+            tool: change.tool,
+            from_tool: change.old_tool,
+            from_plan: change.old_plan,
+            to_plan: change.new_plan,
+            old_monthly_cost: change.old_monthly_cost,
+            new_monthly_cost: change.new_monthly_cost,
+        });
+    }
+
+    // Chronological, with a stable tie-break so equal-dated milestones don't
+    // reorder between requests (started before transitions on the same day).
+    const typeRank: Record<MeJourneyEventType, number> = {started: 0, plan_change: 1, tool_switch: 1};
+    events.sort(
+        (a, b) =>
+            a.date.localeCompare(b.date) || typeRank[a.type] - typeRank[b.type] || a.tool.localeCompare(b.tool),
+    );
+
+    const toolList = Array.from(tools.values()).sort((a, b) => {
+        // Earliest-started first; tools without a start date sort last by name.
+        if (a.started_on && b.started_on) return a.started_on.localeCompare(b.started_on) || a.tool.localeCompare(b.tool);
+        if (a.started_on) return -1;
+        if (b.started_on) return 1;
+        return a.tool.localeCompare(b.tool);
+    });
+
+    return {tools: toolList, events};
+}
