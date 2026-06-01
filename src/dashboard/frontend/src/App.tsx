@@ -8,6 +8,8 @@ import {ComingSoon} from './pages/ComingSoon';
 import {DeveloperDashboard} from './pages/DeveloperDashboard';
 import {Preferences} from './pages/Preferences';
 import {Settings} from './pages/Settings';
+import {Leaderboard} from './pages/Leaderboard';
+import {RequireLeaderboard} from './components/RequireLeaderboard';
 import {AdminUsers} from './pages/admin/AdminUsers';
 import {AdminTeams} from './pages/admin/AdminTeams';
 import {AdminIdentities} from './pages/admin/AdminIdentities';
@@ -40,6 +42,14 @@ export function App(): JSX.Element {
                     }
                 />
                 <Route path="manager/waste" element={<WasteDetection />} />
+                <Route
+                    path="manager/leaderboard"
+                    element={
+                        <RequireLeaderboard>
+                            <Leaderboard />
+                        </RequireLeaderboard>
+                    }
+                />
                 <Route path="developer" element={<DeveloperDashboard />} />
                 <Route path="preferences" element={<Preferences />} />
                 <Route
