@@ -2,13 +2,17 @@ import {useContext} from 'react';
 import {NavLink} from 'react-router-dom';
 import {AuthContext} from '../auth/authContext';
 import {navSectionsForRole} from './navConfig';
+import {useLeaderboardAvailability} from '../hooks/useLeaderboard';
 import {UserMenu} from './UserMenu';
 
 export function Sidebar(): JSX.Element {
     // Read context directly (not useAuth) so the sidebar renders without an
     // AuthProvider in isolated tests.
     const auth = useContext(AuthContext);
-    const sections = navSectionsForRole(auth?.user?.role);
+    // The optional leaderboard (Task 2.17) is off by default; only when the
+    // server reports it available does its nav entry appear at all.
+    const {data: leaderboard} = useLeaderboardAvailability();
+    const sections = navSectionsForRole(auth?.user?.role, leaderboard?.available ?? false);
 
     return (
         <nav className="flex w-56 flex-col gap-6 border-r border-border bg-surface px-4 py-6">

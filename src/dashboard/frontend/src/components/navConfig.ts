@@ -12,14 +12,15 @@ export interface NavSection {
 
 // Section catalog. Routes are limited to screens that exist today so the nav
 // never renders a dead link; later Phase 2 tasks extend these lists.
-const MANAGER_SECTION: NavSection = {
-    title: 'Manager',
-    items: [
-        {to: '/manager', label: 'Overview'},
-        {to: '/manager/teams', label: 'Teams'},
-        {to: '/manager/waste', label: 'Waste'},
-    ],
-};
+const MANAGER_ITEMS: NavItem[] = [
+    {to: '/manager', label: 'Overview'},
+    {to: '/manager/teams', label: 'Teams'},
+    {to: '/manager/waste', label: 'Waste'},
+];
+// Appended to the manager section ONLY when the leaderboard is available
+// (Task 2.17). The leaderboard ships off by default; when off it must leave no
+// trace, so the nav entry is omitted entirely rather than rendered-and-blocked.
+const LEADERBOARD_ITEM: NavItem = {to: '/manager/leaderboard', label: 'Leaderboard'};
 const DEVELOPER_SECTION: NavSection = {title: 'Developer', items: [{to: '/developer', label: 'My Dashboard'}]};
 const ACCOUNT_SECTION: NavSection = {title: 'Account', items: [{to: '/preferences', label: 'Preferences'}]};
 const ADMIN_SECTION: NavSection = {
@@ -41,10 +42,20 @@ const ADMIN_SECTION: NavSection = {
  * AuthProvider) fails CLOSED to the least-privileged developer view rather than
  * exposing the manager area — the server still enforces the real boundary, but
  * the nav shouldn't advertise screens an unknown principal may not reach.
+ *
+ * `leaderboardAvailable` (Task 2.17) gates the optional leaderboard entry: it is
+ * appended to the manager section only when true. Defaults to false so the
+ * feature stays invisible until availability has been confirmed.
  */
-export function navSectionsForRole(role: UserRole | undefined): NavSection[] {
+export function navSectionsForRole(
+    role: UserRole | undefined,
+    leaderboardAvailable = false,
+): NavSection[] {
     if (role === 'admin') {
-        return [MANAGER_SECTION, ADMIN_SECTION, ACCOUNT_SECTION];
+        const managerItems = leaderboardAvailable
+            ? [...MANAGER_ITEMS, LEADERBOARD_ITEM]
+            : MANAGER_ITEMS;
+        return [{title: 'Manager', items: managerItems}, ADMIN_SECTION, ACCOUNT_SECTION];
     }
     return [DEVELOPER_SECTION, ACCOUNT_SECTION];
 }

@@ -22,6 +22,9 @@ export const queryKeys = {
     teamWaste: (team: string) => ['teams', 'waste', team] as const,
     globalSettings: ['settings', 'global'] as const,
     teamSettings: (team: string) => ['settings', 'team', team] as const,
+    // Optional leaderboard (Task 2.17): availability probe + per-team ranked view.
+    leaderboardAvailability: ['leaderboard', 'availability'] as const,
+    leaderboard: (team: string, metric: string) => ['leaderboard', team, metric] as const,
     preferences: ['preferences'] as const,
     // Admin Management (Task 2.13).
     adminUsers: ['admin', 'users'] as const,

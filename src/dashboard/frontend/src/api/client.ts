@@ -10,6 +10,9 @@ import type {
     AuthUser,
     CoverageData,
     GlobalSettings,
+    Leaderboard,
+    LeaderboardAvailability,
+    LeaderboardMetric,
     OverviewData,
     OverviewTrend,
     PaginatedResponse,
@@ -280,6 +283,33 @@ export const api = {
         const body = await patchJson<ApiEnvelope<TeamSettings>>(
             `/api/settings/team/${encodeURIComponent(team)}`,
             patch,
+        );
+        return body.data;
+    },
+
+    // --- Optional leaderboard (Task 2.17) ---
+    /**
+     * Whether a leaderboard is available to the current principal. Returns a
+     * not-available result instead of throwing on 401/403, so the nav can treat
+     * "leaderboard off / not permitted" as a normal state and simply hide the
+     * entry point rather than surfacing an error.
+     */
+    async getLeaderboardAvailability(): Promise<LeaderboardAvailability> {
+        try {
+            const body = await request<ApiEnvelope<LeaderboardAvailability>>('/api/leaderboard/availability');
+            return body.data;
+        } catch (err) {
+            if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
+                return {available: false};
+            }
+            throw err;
+        }
+    },
+
+    /** Ranked leaderboard for a team by the chosen metric (admin/manager). */
+    async getLeaderboard(team: string, metric: LeaderboardMetric): Promise<Leaderboard> {
+        const body = await request<ApiEnvelope<Leaderboard>>(
+            `/api/leaderboard/${encodeURIComponent(team)}?metric=${encodeURIComponent(metric)}`,
         );
         return body.data;
     },
