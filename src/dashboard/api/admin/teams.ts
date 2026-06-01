@@ -1,4 +1,4 @@
-import type {FastifyInstance, FastifyReply} from 'fastify';
+import type {FastifyInstance} from 'fastify';
 import type Database from 'better-sqlite3';
 import {
     addTeam,
@@ -10,7 +10,16 @@ import {
     updateTeam,
 } from '../../../registry/teams';
 import type {Team} from '../../../registry/types';
-import {asObject, badRequest, conflict, forbidden, isAdmin, notFound} from './helpers';
+import {
+    FIELD_INVALID,
+    asObject,
+    badRequest,
+    conflict,
+    forbidden,
+    isAdmin,
+    notFound,
+    optionalStringField,
+} from './helpers';
 
 const MAX_NAME_LENGTH = 100;
 
@@ -19,23 +28,6 @@ function withDeveloperCount(db: Database.Database, team: Team): Record<string, u
         .prepare('SELECT COUNT(*) AS cnt FROM developers WHERE team = ?')
         .get(team.name) as {cnt: number};
     return {...team, developer_count: row.cnt};
-}
-
-// Distinguishes "a 400 was already sent for a bad type" from a real value.
-const INVALID = Symbol('invalid-field');
-
-// An optional string field: undefined → omit, null/'' → clear, else trimmed. A
-// non-string (e.g. a number) is a client error and is rejected with 400 rather
-// than silently dropped.
-function optionalString(value: unknown, field: string, reply: FastifyReply): string | null | undefined | typeof INVALID {
-    if (value === undefined) return undefined;
-    if (value === null) return null;
-    if (typeof value !== 'string') {
-        badRequest(reply, `${field} must be a string`);
-        return INVALID;
-    }
-    const trimmed = value.trim();
-    return trimmed ? trimmed : null;
 }
 
 export function registerAdminTeamRoutes(app: FastifyInstance, db: Database.Database): void {
@@ -59,10 +51,10 @@ export function registerAdminTeamRoutes(app: FastifyInstance, db: Database.Datab
             return conflict(reply, `Team '${name}' already exists`);
         }
 
-        const department = optionalString(body.department, 'department', reply);
-        if (department === INVALID) return;
-        const manager = optionalString(body.manager, 'manager', reply);
-        if (manager === INVALID) return;
+        const department = optionalStringField(body.department, 'department', reply);
+        if (department === FIELD_INVALID) return;
+        const manager = optionalStringField(body.manager, 'manager', reply);
+        if (manager === FIELD_INVALID) return;
         const team = addTeam(db, name, department ?? undefined, manager ?? undefined);
         return reply.status(201).send({data: withDeveloperCount(db, team)});
     });
@@ -88,10 +80,10 @@ export function registerAdminTeamRoutes(app: FastifyInstance, db: Database.Datab
                 }
             }
 
-            const department = optionalString(body.department, 'department', reply);
-            if (department === INVALID) return;
-            const manager = optionalString(body.manager, 'manager', reply);
-            if (manager === INVALID) return;
+            const department = optionalStringField(body.department, 'department', reply);
+            if (department === FIELD_INVALID) return;
+            const manager = optionalStringField(body.manager, 'manager', reply);
+            if (manager === FIELD_INVALID) return;
             if (department !== undefined || manager !== undefined) {
                 updateTeam(db, name, {department, manager});
             }

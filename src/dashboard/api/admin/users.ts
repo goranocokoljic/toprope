@@ -14,7 +14,7 @@ import {
 import {generateTempPassword, hashPassword} from '../../../auth/password';
 import {getDeveloperById} from '../../../registry/developers';
 import type {User, UserRole} from '../../../auth/types';
-import {asObject, badRequest, conflict, forbidden, isAdmin, notFound} from './helpers';
+import {FIELD_INVALID, asObject, badRequest, conflict, forbidden, isAdmin, notFound} from './helpers';
 
 const MAX_EMAIL_LENGTH = 320;
 
@@ -32,6 +32,20 @@ function publicUser(db: Database.Database, user: User): Record<string, unknown> 
         deactivated_at: user.deactivated_at,
         active: user.deactivated_at === null,
     };
+}
+
+/**
+ * Map a SQLite UNIQUE-constraint violation to a user-facing conflict message, or
+ * null if the error isn't a UNIQUE violation. The developer_id partial unique
+ * index is the backstop for the async gap between the app-level link check and
+ * the insert; the email index backs the email uniqueness check.
+ */
+function mapUniqueError(err: unknown): string | null {
+    if (!(err instanceof Error) || !/UNIQUE/i.test(err.message)) return null;
+    if (/developer_id/i.test(err.message)) {
+        return 'Developer is already linked to another user';
+    }
+    return 'A user with that email already exists';
 }
 
 function isValidEmail(email: string): boolean {
@@ -68,7 +82,7 @@ export function registerAdminUserRoutes(app: FastifyInstance, db: Database.Datab
             return badRequest(reply, "role must be 'admin' or 'developer'");
         }
         const developerId = validateDeveloperLink(db, body.developer_id, reply, null);
-        if (developerId === INVALID) return;
+        if (developerId === FIELD_INVALID) return;
 
         // Provision with a one-time temporary password; force a change on first
         // login. The plaintext is returned ONCE here and never stored.
@@ -85,9 +99,8 @@ export function registerAdminUserRoutes(app: FastifyInstance, db: Database.Datab
                 mustChangePassword: true,
             });
         } catch (err) {
-            if (err instanceof Error && /UNIQUE/i.test(err.message)) {
-                return conflict(reply, 'A user with that email already exists');
-            }
+            const mapped = mapUniqueError(err);
+            if (mapped) return conflict(reply, mapped);
             throw err;
         }
 
@@ -124,7 +137,7 @@ export function registerAdminUserRoutes(app: FastifyInstance, db: Database.Datab
             let developerId: string | null | undefined;
             if (body.developer_id !== undefined) {
                 const resolved = validateDeveloperLink(db, body.developer_id, reply, target.id);
-                if (resolved === INVALID) return;
+                if (resolved === FIELD_INVALID) return;
                 developerId = resolved;
             }
 
@@ -161,9 +174,8 @@ export function registerAdminUserRoutes(app: FastifyInstance, db: Database.Datab
                     }
                 })();
             } catch (err) {
-                if (err instanceof Error && /UNIQUE/i.test(err.message)) {
-                    return conflict(reply, 'A user with that email already exists');
-                }
+                const mapped = mapUniqueError(err);
+                if (mapped) return conflict(reply, mapped);
                 throw err;
             }
             if (lastAdminBlocked) {
@@ -191,26 +203,22 @@ export function registerAdminUserRoutes(app: FastifyInstance, db: Database.Datab
     );
 }
 
-// Sentinel distinguishing "validation already sent an error response" from a
-// legitimately null developer link.
-const INVALID = Symbol('invalid-developer-link');
-
 function validateDeveloperLink(
     db: Database.Database,
     raw: unknown,
     reply: FastifyReply,
     selfUserId: string | null,
-): string | null | typeof INVALID {
+): string | null | typeof FIELD_INVALID {
     if (raw === undefined || raw === null || raw === '') {
         return null;
     }
     if (typeof raw !== 'string') {
         badRequest(reply, 'developer_id must be a string');
-        return INVALID;
+        return FIELD_INVALID;
     }
     if (!getDeveloperById(db, raw)) {
         badRequest(reply, `Developer '${raw}' not found`);
-        return INVALID;
+        return FIELD_INVALID;
     }
     // A developer maps to at most one account: reject a link already held by a
     // different user, so deactivating one account fully severs access to that
@@ -218,7 +226,7 @@ function validateDeveloperLink(
     const owner = getUserByDeveloperId(db, raw);
     if (owner && owner.id !== selfUserId) {
         conflict(reply, `Developer is already linked to another user (${owner.email})`);
-        return INVALID;
+        return FIELD_INVALID;
     }
     return raw;
 }

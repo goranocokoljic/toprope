@@ -1,4 +1,4 @@
-import type {FastifyInstance, FastifyReply} from 'fastify';
+import type {FastifyInstance} from 'fastify';
 import type Database from 'better-sqlite3';
 import {
     findByEmail,
@@ -9,8 +9,17 @@ import {
     setDeveloperTeam,
     type IdentityUpdates,
 } from '../../../registry/developers';
-import {teamExists} from '../../../registry/teams';
-import {asObject, badRequest, conflict, forbidden, isAdmin, notFound} from './helpers';
+import {getTeam} from '../../../registry/teams';
+import {
+    FIELD_INVALID,
+    asObject,
+    badRequest,
+    conflict,
+    forbidden,
+    isAdmin,
+    notFound,
+    optionalStringField,
+} from './helpers';
 
 // Git-attribution providers must be unique across developers, or commit
 // attribution becomes ambiguous (same rule the Phase 1 registry enforces).
@@ -18,16 +27,6 @@ const ATTRIBUTION_PROVIDERS = ['github', 'bitbucket', 'gitlab'] as const;
 // Tool identities (Copilot/Claude/Windsurf) are not attribution keys; they are
 // not subject to the uniqueness check.
 const ALL_PROVIDERS = [...ATTRIBUTION_PROVIDERS, 'copilot', 'claude', 'windsurf'] as const;
-
-function asOptionalString(value: unknown, reply: FastifyReply, field: string): string | undefined | null {
-    if (value === undefined) return undefined;
-    if (value === null) return '';
-    if (typeof value !== 'string') {
-        badRequest(reply, `${field} must be a string`);
-        return null;
-    }
-    return value;
-}
 
 export function registerAdminDeveloperRoutes(app: FastifyInstance, db: Database.Database): void {
     app.get('/api/admin/developers', async (request, reply) => {
@@ -47,9 +46,11 @@ export function registerAdminDeveloperRoutes(app: FastifyInstance, db: Database.
 
             const updates: IdentityUpdates = {};
             for (const provider of ALL_PROVIDERS) {
-                const value = asOptionalString(body[provider], reply, provider);
-                if (value === null) return; // type error already sent
-                if (value !== undefined) updates[provider] = value;
+                const value = optionalStringField(body[provider], provider, reply);
+                if (value === FIELD_INVALID) return; // type error already sent
+                // null (explicit null or blank) clears the field; setDeveloperIdentities
+                // treats an empty string as "remove this identity".
+                if (value !== undefined) updates[provider] = value ?? '';
             }
 
             // git_emails: an array of strings replacing the stored set.
@@ -114,8 +115,14 @@ export function registerAdminDeveloperRoutes(app: FastifyInstance, db: Database.
                 return badRequest(reply, 'team must be a non-empty string');
             }
             const team = body.team.trim();
-            if (!teamExists(db, team)) {
+            const target = getTeam(db, team);
+            if (!target) {
                 return badRequest(reply, `Team '${team}' does not exist`);
+            }
+            // The server is the trust boundary: reject a move onto an archived
+            // team even though the UI already filters them out of the dropdown.
+            if (target.archived_at) {
+                return badRequest(reply, `Team '${team}' is archived`);
             }
 
             const updated = setDeveloperTeam(db, developer.id, team);

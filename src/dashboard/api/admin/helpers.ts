@@ -37,3 +37,31 @@ export function asObject(body: unknown): Record<string, unknown> | null {
     }
     return body as Record<string, unknown>;
 }
+
+/**
+ * Shared sentinel returned by validation helpers that have ALREADY sent an
+ * error response (via badRequest/conflict). The caller checks for it and bails
+ * without sending a second reply. One sentinel across all admin routes so the
+ * "did a helper already reply?" check is uniform.
+ */
+export const FIELD_INVALID = Symbol('field-invalid');
+
+/**
+ * Coerce an optional string field from a request body:
+ *   undefined → undefined (omit), null or blank → null (clear),
+ *   non-string → 400 + FIELD_INVALID, else the trimmed value.
+ */
+export function optionalStringField(
+    value: unknown,
+    field: string,
+    reply: FastifyReply,
+): string | null | undefined | typeof FIELD_INVALID {
+    if (value === undefined) return undefined;
+    if (value === null) return null;
+    if (typeof value !== 'string') {
+        badRequest(reply, `${field} must be a string`);
+        return FIELD_INVALID;
+    }
+    const trimmed = value.trim();
+    return trimmed ? trimmed : null;
+}

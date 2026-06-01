@@ -400,6 +400,29 @@ describe('admin API', () => {
             });
             expect(res.statusCode).toBe(400);
         });
+
+        it('rejects a move onto an archived team (server is the trust boundary)', async () => {
+            await app.inject({
+                method: 'POST',
+                url: '/api/admin/teams',
+                headers: authHeaders(adminToken),
+                payload: {name: 'retired'},
+            });
+            await app.inject({
+                method: 'PATCH',
+                url: '/api/admin/teams/retired',
+                headers: authHeaders(adminToken),
+                payload: {archived: true},
+            });
+            const res = await app.inject({
+                method: 'PATCH',
+                url: '/api/admin/developers/dev-1',
+                headers: authHeaders(adminToken),
+                payload: {team: 'retired'},
+            });
+            expect(res.statusCode).toBe(400);
+            expect(res.json().message).toMatch(/archived/i);
+        });
     });
 
     describe('subscriptions', () => {
