@@ -26,6 +26,11 @@ export const queryKeys = {
     leaderboardAvailability: ['leaderboard', 'availability'] as const,
     leaderboard: (team: string, metric: string) => ['leaderboard', team, metric] as const,
     preferences: ['preferences'] as const,
+    // Developer "My Dashboard" (Task 2.8). Window-keyed surfaces refetch when the
+    // selected time range changes; the journey is window-independent.
+    meOverview: (window: string) => ['me', 'overview', window] as const,
+    meTimeline: (window: string) => ['me', 'timeline', window] as const,
+    meJourney: ['me', 'journey'] as const,
     // Admin Management (Task 2.13).
     adminUsers: ['admin', 'users'] as const,
     adminTeams: ['admin', 'teams'] as const,
