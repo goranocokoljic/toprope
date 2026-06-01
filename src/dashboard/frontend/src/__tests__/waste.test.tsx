@@ -52,6 +52,7 @@ function planRoi(): WasteAlert {
 
 let active: WasteAlert[];
 let resolved: WasteAlert[];
+let failResolve: boolean;
 let fetchMock: Mock;
 
 function json(body: unknown, status = 200): Response {
@@ -65,6 +66,7 @@ function makeClient(): QueryClient {
 beforeEach(() => {
     active = [unusedSeat(), planRoi()];
     resolved = [];
+    failResolve = false;
 
     fetchMock = vi.fn(async (url: unknown, init?: RequestInit) => {
         const u = String(url);
@@ -73,6 +75,7 @@ beforeEach(() => {
         // POST /api/waste/:id/resolve — move the alert from active to resolved.
         const resolveMatch = u.match(/\/api\/waste\/([^/]+)\/resolve/);
         if (resolveMatch && method === 'POST') {
+            if (failResolve) return json({error: 'boom'}, 500);
             const id = resolveMatch[1];
             const body = init?.body ? (JSON.parse(String(init.body)) as {reason: string}) : {reason: ''};
             const found = active.find((a) => a.id === id);
@@ -197,5 +200,30 @@ describe('WasteDetection page', () => {
         active = [];
         renderPage();
         expect(await screen.findByText('No active waste detected')).toBeInTheDocument();
+    });
+
+    it('keeps the alert in the active list and shows an error when resolve fails', async () => {
+        failResolve = true;
+        renderPage();
+        const alice = await screen.findByText('Alice Dev');
+        const card = alice.closest('li') as HTMLElement;
+        fireEvent.click(within(card).getByRole('button', {name: /review.*resolve/i}));
+        fireEvent.click(within(card).getByRole('button', {name: /^confirm$/i}));
+
+        // The failure surfaces inline and the alert is NOT removed from active.
+        expect(await within(card).findByText(/couldn't save/i)).toBeInTheDocument();
+        expect(screen.getByText('Alice Dev')).toBeInTheDocument();
+    });
+
+    it('rounds a fractional Plan ROI usage delta to one decimal', async () => {
+        active = [
+            {
+                ...planRoi(),
+                details: {...planRoi().details, usage_delta: 1.83},
+            },
+        ];
+        renderPage();
+        const roiCard = (await screen.findByText('Plan ROI review')).closest('li') as HTMLElement;
+        expect(within(roiCard).getByText('+1.8 interactions/day')).toBeInTheDocument();
     });
 });

@@ -29,14 +29,10 @@ export const RESOLUTION_OPTIONS: ResolutionOption[] = [
     {value: 'dismissed', label: 'Dismissed'},
 ];
 
-const RESOLUTION_LABELS: Record<string, string> = Object.fromEntries(
-    RESOLUTION_OPTIONS.map((o) => [o.value, o.label]),
-);
-
 /** Human label for a stored resolution reason (audit trail display). */
 export function resolutionLabel(reason: string | null | undefined): string {
     if (!reason) return '—';
-    return RESOLUTION_LABELS[reason] ?? reason;
+    return RESOLUTION_OPTIONS.find((o) => o.value === reason)?.label ?? reason;
 }
 
 // --- Safe detail readers ----------------------------------------------------
@@ -61,7 +57,7 @@ export function describeWasteAlert(alert: WasteAlert): string | null {
     switch (alert.alert_type) {
         case 'unused_seat': {
             const days = num(d, 'inactivity_days');
-            return days
+            return days != null
                 ? `No activity recorded in the last ${days}+ days — the seat may be reassignable, or the developer may prefer another tool.`
                 : 'No recent activity recorded on this seat.';
         }
@@ -75,8 +71,12 @@ export function describeWasteAlert(alert: WasteAlert): string | null {
         }
         case 'duplicate_tool': {
             const tools = Array.isArray(d.tools)
-                ? (d.tools as {tool?: unknown}[])
-                      .map((t) => (typeof t.tool === 'string' ? toolLabel(t.tool) : null))
+                ? (d.tools as unknown[])
+                      .map((t) =>
+                          t != null && typeof t === 'object' && typeof (t as {tool?: unknown}).tool === 'string'
+                              ? toolLabel((t as {tool: string}).tool)
+                              : null,
+                      )
                       .filter((t): t is string => t !== null)
                 : [];
             const category = str(d, 'category');
@@ -85,7 +85,7 @@ export function describeWasteAlert(alert: WasteAlert): string | null {
         }
         case 'cost_outlier': {
             const mult = num(d, 'multiplier_detected');
-            return mult
+            return mult != null
                 ? `Cost per merged PR is about ${mult}× the team average — worth a look at whether the tooling fits this developer's work.`
                 : 'Cost per output is well above the team average — worth reviewing.';
         }
@@ -98,18 +98,19 @@ export function describeWasteAlert(alert: WasteAlert): string | null {
 
 // --- Plan ROI detail shape --------------------------------------------------
 
-/** The change-driven fields a Plan-ROI alert carries (see plan-roi.ts). */
+/**
+ * The change-driven fields a Plan-ROI alert carries (see plan-roi.ts), limited
+ * to those the Plan-ROI card actually renders. The stored details blob has more
+ * (raw baseline/post usage, old/new monthly cost); they're omitted here until a
+ * consumer needs them.
+ */
 export interface PlanRoiDetails {
     developerName: string | null;
     tool: string | null;
     oldPlan: string | null;
     newPlan: string | null;
-    oldMonthlyCost: number | null;
-    newMonthlyCost: number | null;
     costDelta: number | null;
     usageDelta: number | null;
-    baselineUsage: number | null;
-    postChangeUsage: number | null;
     daysSinceChange: number | null;
     note: string | null;
 }
@@ -122,12 +123,8 @@ export function planRoiDetails(alert: WasteAlert): PlanRoiDetails {
         tool: str(d, 'tool') ?? alert.tool,
         oldPlan: str(d, 'old_plan'),
         newPlan: str(d, 'new_plan'),
-        oldMonthlyCost: num(d, 'old_monthly_cost'),
-        newMonthlyCost: num(d, 'new_monthly_cost'),
         costDelta: num(d, 'cost_delta'),
         usageDelta: num(d, 'usage_delta'),
-        baselineUsage: num(d, 'baseline_usage'),
-        postChangeUsage: num(d, 'post_change_usage'),
         daysSinceChange: num(d, 'days_since_change'),
         note: str(d, 'note'),
     };

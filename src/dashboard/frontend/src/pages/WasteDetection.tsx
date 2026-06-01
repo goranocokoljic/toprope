@@ -212,8 +212,13 @@ function PlanRoiCard({alert}: {alert: WasteAlert}): JSX.Element {
     const d = planRoiDetails(alert);
     const costDeltaLabel =
         d.costDelta != null ? `${d.costDelta >= 0 ? '+' : ''}${formatCurrency(d.costDelta)}/mo` : '—';
+    // usage_delta is a difference of average daily-usage rates the backend
+    // rounds to 2dp, so it's usually fractional (e.g. 1.83). Round to 1dp for a
+    // clean display rather than rendering the raw noisy decimal.
     const usageDeltaLabel =
-        d.usageDelta != null ? `${d.usageDelta >= 0 ? '+' : ''}${d.usageDelta} interactions/day` : '—';
+        d.usageDelta != null
+            ? `${d.usageDelta >= 0 ? '+' : ''}${Math.round(d.usageDelta * 10) / 10} interactions/day`
+            : '—';
 
     return (
         <li className="rounded-card border border-accent/40 bg-accent-soft p-4">
@@ -398,6 +403,16 @@ function LoadingWaste(): JSX.Element {
     );
 }
 
+/**
+ * Manager Waste Detection screen (Task 2.7). Active/resolved tabs, summary
+ * totals, categorized alerts, highlighted Plan-ROI reviews, and a
+ * resolve-with-reason workflow over the admin-guarded /api/waste family.
+ *
+ * Unlike ManagerOverview, this screen does NOT use the shared classifyDataState:
+ * an alert list has no per-scope collection window, so "no active alerts" is a
+ * genuine-empty (a positive "spend looks efficient" confirmation), never
+ * cold-start. The simple isPending/isError/length branching below is deliberate.
+ */
 export function WasteDetection(): JSX.Element {
     const {data, isPending, isError, error, refetch} = useWasteAlerts();
     const [tab, setTab] = useState<Tab>('active');
@@ -438,18 +453,19 @@ export function WasteDetection(): JSX.Element {
                     {!isPending && !isError ? (
                         <>
                             <SummaryCards totals={totals} />
-                            {totals.byType.length > 0 ? (
-                                <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-                                    <div className="lg:col-span-2">
-                                        <ActiveAlerts alerts={alerts} />
-                                    </div>
+                            {/* Single grid: ActiveAlerts owns its own empty state,
+                                so the breakdown is simply omitted when there are no
+                                alerts (byType is empty iff alerts is empty). */}
+                            <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
+                                <div className="lg:col-span-2">
+                                    <ActiveAlerts alerts={alerts} />
+                                </div>
+                                {totals.byType.length > 0 ? (
                                     <div>
                                         <TypeBreakdown totals={totals} />
                                     </div>
-                                </div>
-                            ) : (
-                                <ActiveAlerts alerts={alerts} />
-                            )}
+                                ) : null}
+                            </div>
                         </>
                     ) : null}
                 </>
