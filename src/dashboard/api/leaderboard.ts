@@ -1,6 +1,6 @@
 import type {FastifyInstance, FastifyReply, FastifyRequest} from 'fastify';
 import type Database from 'better-sqlite3';
-import {getGlobalSetting, resolveSetting} from '../../settings/store';
+import {getGlobalSetting, isLeaderboardEnabledForTeam} from '../../settings/store';
 import {canAccessLeaderboard, type LeaderboardRole} from './leaderboard-gate';
 
 /**
@@ -86,10 +86,13 @@ function metricValue(entry: LeaderboardEntry, metric: LeaderboardMetric): number
  * decides the gate role, but it is NOT sufficient on its own. To make managers
  * able to reach leaderboards you must ALSO (1) return `'manager'` here for that
  * role, (2) relax the developer-confinement in src/auth/middleware.ts so the
- * manager role is admitted to /api/leaderboard/:team, and (3) ensure
- * /availability resolves a manager's team-independent answer (already routed
- * through canAccessLeaderboard, so no change needed there). Miss any of the
- * three and the manager path is half-connected.
+ * manager role is admitted to /api/leaderboard/:team, and (3) make /availability
+ * resolve a manager's PER-TEAM answer — it currently hardcodes `teamEnabled:
+ * true` because it takes no team, which is correct for admins (who ignore the
+ * team value) but would over-report availability for a manager whose team has
+ * opted out. A manager-aware probe must take a team (or scan "any team enabled?")
+ * rather than assume true. Miss any of the three and the manager path is
+ * half-connected.
  */
 function gateRole(request: FastifyRequest): LeaderboardRole {
     return request.authUser?.role === 'admin' ? 'admin' : 'developer';
@@ -115,8 +118,11 @@ export function registerLeaderboardRoutes(app: FastifyInstance, db: Database.Dat
     // Capability probe for the dashboard nav. Returns whether the current
     // principal may view any leaderboard, so the nav can hide the entry point
     // entirely when disabled. Routed through the same gate as the data endpoint
-    // (with a team-independent `teamEnabled: true`) so the availability answer
-    // can never drift from the real access rule.
+    // with a team-independent `teamEnabled: true`. This is admin-accurate (admin
+    // access ignores the per-team value); for the future `manager` role it is
+    // intentionally optimistic — see the gateRole SEAM note. The data endpoint
+    // always re-resolves per-team, so an over-optimistic probe can only show a
+    // nav entry, never leak data.
     app.get('/api/leaderboard/availability', async (request) => {
         const globalEnabled = getGlobalSetting(db, 'leaderboard_enabled') === true;
         const managersCanEnable = getGlobalSetting(db, 'leaderboard_managers_can_enable') === true;
@@ -139,7 +145,7 @@ export function registerLeaderboardRoutes(app: FastifyInstance, db: Database.Dat
             // oracle). resolveSetting tolerates an unknown team (returns global).
             const globalEnabled = getGlobalSetting(db, 'leaderboard_enabled') === true;
             const managersCanEnable = getGlobalSetting(db, 'leaderboard_managers_can_enable') === true;
-            const teamEnabled = resolveSetting(db, 'leaderboard_enabled', team) === true;
+            const teamEnabled = isLeaderboardEnabledForTeam(db, team);
             const allowed = canAccessLeaderboard({
                 role: gateRole(request),
                 globalEnabled,

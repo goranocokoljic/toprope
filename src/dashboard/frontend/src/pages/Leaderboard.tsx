@@ -49,7 +49,22 @@ function LeaderboardTable({team, metric}: {team: string; metric: LeaderboardMetr
             key: 'value',
             header: METRIC_OPTIONS.find((m) => m.value === metric)?.label ?? 'Score',
             accessor: (r) => r.value,
-            render: (r) => <span className="font-medium text-foreground">{metricCell(r, metric)}</span>,
+            render: (r) => {
+                // On the acceptance board, a developer below the server's
+                // sample floor is ranked at value 0 but still shows a real
+                // (possibly high) rate — flag it so a "100% yet ranked last"
+                // row reads as deliberate, not a bug. The floor signal is
+                // value===0 while the underlying rate is positive.
+                const lowSample = metric === 'acceptance' && r.value === 0 && r.acceptance_rate > 0;
+                return (
+                    <span className="font-medium text-foreground">
+                        {metricCell(r, metric)}
+                        {lowSample ? (
+                            <span className="ml-1 text-xs font-normal text-muted">(low sample)</span>
+                        ) : null}
+                    </span>
+                );
+            },
             align: 'right',
         },
         {key: 'interactions', header: 'Interactions', accessor: (r) => r.interactions, align: 'right'},

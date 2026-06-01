@@ -14,36 +14,46 @@ const AVAILABLE: LeaderboardAvailability = {available: true};
 const UNAVAILABLE: LeaderboardAvailability = {available: false};
 
 function board(metric: LeaderboardData['metric']): LeaderboardData {
-    return {
-        team: 'eng',
-        metric,
-        from: '2026-05-01',
-        to: '2026-05-30',
-        entries: [
-            {
-                rank: 1,
-                developer_id: 'd1',
-                name: 'Alice',
-                value: 100,
-                interactions: 100,
-                acceptances: 50,
-                acceptance_rate: 0.5,
-                commits: 2,
-                lines_added: 20,
-            },
-            {
-                rank: 2,
-                developer_id: 'd2',
-                name: 'Bob',
-                value: 20,
-                interactions: 20,
-                acceptances: 18,
-                acceptance_rate: 0.9,
-                commits: 10,
-                lines_added: 100,
-            },
-        ],
-    };
+    const entries: LeaderboardData['entries'] = [
+        {
+            rank: 1,
+            developer_id: 'd1',
+            name: 'Alice',
+            value: metric === 'acceptance' ? 0.5 : 100,
+            interactions: 100,
+            acceptances: 50,
+            acceptance_rate: 0.5,
+            commits: 2,
+            lines_added: 20,
+        },
+        {
+            rank: 2,
+            developer_id: 'd2',
+            name: 'Bob',
+            value: metric === 'acceptance' ? 0.9 : 20,
+            interactions: 20,
+            acceptances: 18,
+            acceptance_rate: 0.9,
+            commits: 10,
+            lines_added: 100,
+        },
+    ];
+    if (metric === 'acceptance') {
+        // Dave: 1/1 = 100% raw, but floored to value 0 by the server's sample
+        // floor → the UI must mark him "(low sample)" despite the 100%.
+        entries.push({
+            rank: 3,
+            developer_id: 'd4',
+            name: 'Dave',
+            value: 0,
+            interactions: 1,
+            acceptances: 1,
+            acceptance_rate: 1,
+            commits: 0,
+            lines_added: 0,
+        });
+    }
+    return {team: 'eng', metric, from: '2026-05-01', to: '2026-05-30', entries};
 }
 
 let availability: LeaderboardAvailability;
@@ -157,5 +167,19 @@ describe('Leaderboard page', () => {
             const called = fetchMock.mock.calls.some((c) => String(c[0]).includes('metric=acceptance'));
             expect(called).toBe(true);
         });
+    });
+
+    it('marks a low-sample developer on the acceptance board (100% yet floored)', async () => {
+        renderWith(<Leaderboard />);
+        const teamSelect = await screen.findByRole('combobox', {name: /team/i});
+        await screen.findByRole('option', {name: 'eng'});
+        fireEvent.change(teamSelect, {target: {value: 'eng'}});
+        await screen.findByText('Alice');
+
+        fireEvent.change(screen.getByRole('combobox', {name: /rank by/i}), {target: {value: 'acceptance'}});
+
+        // Dave's floored row is annotated so a "100% ranked last" row reads as deliberate.
+        expect(await screen.findByText('Dave')).toBeInTheDocument();
+        expect(screen.getByText(/low sample/i)).toBeInTheDocument();
     });
 });

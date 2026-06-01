@@ -55,7 +55,10 @@ into, and is fully covered by the gating unit tests.
 
 - `GET /api/leaderboard/availability` — cheap capability probe used by the
   dashboard nav. Returns `{ available }` — routed through the same gate as the
-  data endpoint so the answer can never drift from the real access rule.
+  data endpoint. It is admin-accurate; because it takes no team it is
+  team-blind, so for a future `manager` role it is intentionally optimistic (it
+  can only reveal a nav entry, never leak data — the data endpoint always
+  re-resolves per-team). See the `gateRole` seam note in `leaderboard.ts`.
 - `GET /api/leaderboard/:team?metric=activity|acceptance|output` — the ranked
   view. The gate is evaluated **before** the team-existence check, so a denied
   caller always gets `403` (`code: leaderboard_disabled`) — whether or not the
