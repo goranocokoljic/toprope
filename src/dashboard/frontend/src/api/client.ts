@@ -21,6 +21,7 @@ import type {
     ToolDistribution,
     UserPreferences,
     WasteAlert,
+    WasteResolutionReason,
     WasteTeamSummary,
 } from './types';
 
@@ -186,6 +187,34 @@ export const api = {
     async getTeamWaste(team: string): Promise<WasteAlert[]> {
         const q = encodeURIComponent(team);
         return fetchAllPages<WasteAlert>((page) => `/api/waste?team=${q}&page=${page}&limit=100`);
+    },
+
+    /**
+     * Every active (unresolved) waste alert across the org. The waste screen
+     * computes its own totals and per-type breakdown client-side, so it needs
+     * the full set rather than one page.
+     */
+    async getWasteAlerts(): Promise<WasteAlert[]> {
+        return fetchAllPages<WasteAlert>((page) => `/api/waste?page=${page}&limit=100`);
+    },
+
+    /**
+     * Resolved waste alerts — the audit trail. The endpoint returns the full set
+     * unpaginated today; if it ever gains pagination (as /api/waste already has),
+     * switch this to fetchAllPages so the audit view can't silently truncate.
+     */
+    async getResolvedWaste(): Promise<WasteAlert[]> {
+        const body = await request<ApiEnvelope<WasteAlert[]>>('/api/waste/resolved');
+        return body.data;
+    },
+
+    /** Mark an active alert resolved with a structured reason. */
+    async resolveWaste(id: string, reason: WasteResolutionReason): Promise<WasteAlert> {
+        const body = await postJson<ApiEnvelope<WasteAlert>>(
+            `/api/waste/${encodeURIComponent(id)}/resolve`,
+            {reason},
+        );
+        return body.data;
     },
 
     /**

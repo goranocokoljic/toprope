@@ -17,6 +17,7 @@ const MANAGER_SECTION: NavSection = {
     items: [
         {to: '/manager', label: 'Overview'},
         {to: '/manager/teams', label: 'Teams'},
+        {to: '/manager/waste', label: 'Waste'},
     ],
 };
 const DEVELOPER_SECTION: NavSection = {title: 'Developer', items: [{to: '/developer', label: 'My Dashboard'}]};
