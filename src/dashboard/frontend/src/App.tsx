@@ -3,6 +3,7 @@ import {AppShell} from './components/AppShell';
 import {ManagerOverview} from './pages/ManagerOverview';
 import {TeamsList} from './pages/TeamsList';
 import {TeamDetail} from './pages/TeamDetail';
+import {WasteDetection} from './pages/WasteDetection';
 import {ComingSoon} from './pages/ComingSoon';
 import {DeveloperDashboard} from './pages/DeveloperDashboard';
 import {Preferences} from './pages/Preferences';
@@ -17,10 +18,9 @@ import {NotFound} from './pages/NotFound';
 
 /**
  * Route table. Several manager/developer areas are placeholders for now; the real
- * screens arrive in later Phase 2 tasks. The manager Waste route and the manager
- * developer-detail route are placeholders so the Teams screens' links resolve.
- * App expects to be rendered inside a router (BrowserRouter in main.tsx,
- * MemoryRouter in tests).
+ * screens arrive in later Phase 2 tasks. The manager developer-detail route is a
+ * placeholder so the Teams screens' links resolve. App expects to be rendered
+ * inside a router (BrowserRouter in main.tsx, MemoryRouter in tests).
  */
 export function App(): JSX.Element {
     return (
@@ -39,15 +39,7 @@ export function App(): JSX.Element {
                         />
                     }
                 />
-                <Route
-                    path="manager/waste"
-                    element={
-                        <ComingSoon
-                            title="Waste Detection"
-                            description="Unused seats, duplicates, and underutilized subscriptions."
-                        />
-                    }
-                />
+                <Route path="manager/waste" element={<WasteDetection />} />
                 <Route path="developer" element={<DeveloperDashboard />} />
                 <Route path="preferences" element={<Preferences />} />
                 <Route

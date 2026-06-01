@@ -73,6 +73,7 @@ const WASTE_TYPE_LABELS: Record<string, string> = {
     underutilized: 'Underutilized',
     duplicate_tool: 'Duplicate tool',
     cost_outlier: 'Cost outlier',
+    plan_roi: 'Plan ROI',
 };
 
 export function wasteTypeLabel(alertType: string): string {
