@@ -1,4 +1,4 @@
-import type {FastifyInstance} from 'fastify';
+import type {FastifyInstance, FastifyReply} from 'fastify';
 import type Database from 'better-sqlite3';
 import {
     addTeam,
@@ -21,11 +21,19 @@ function withDeveloperCount(db: Database.Database, team: Team): Record<string, u
     return {...team, developer_count: row.cnt};
 }
 
-// An optional string field: undefined → omit, null/'' → clear, else trimmed.
-function optionalString(value: unknown): string | null | undefined {
+// Distinguishes "a 400 was already sent for a bad type" from a real value.
+const INVALID = Symbol('invalid-field');
+
+// An optional string field: undefined → omit, null/'' → clear, else trimmed. A
+// non-string (e.g. a number) is a client error and is rejected with 400 rather
+// than silently dropped.
+function optionalString(value: unknown, field: string, reply: FastifyReply): string | null | undefined | typeof INVALID {
     if (value === undefined) return undefined;
     if (value === null) return null;
-    if (typeof value !== 'string') return undefined;
+    if (typeof value !== 'string') {
+        badRequest(reply, `${field} must be a string`);
+        return INVALID;
+    }
     const trimmed = value.trim();
     return trimmed ? trimmed : null;
 }
@@ -51,9 +59,11 @@ export function registerAdminTeamRoutes(app: FastifyInstance, db: Database.Datab
             return conflict(reply, `Team '${name}' already exists`);
         }
 
-        const department = optionalString(body.department) ?? undefined;
-        const manager = optionalString(body.manager) ?? undefined;
-        const team = addTeam(db, name, department, manager);
+        const department = optionalString(body.department, 'department', reply);
+        if (department === INVALID) return;
+        const manager = optionalString(body.manager, 'manager', reply);
+        if (manager === INVALID) return;
+        const team = addTeam(db, name, department ?? undefined, manager ?? undefined);
         return reply.status(201).send({data: withDeveloperCount(db, team)});
     });
 
@@ -78,8 +88,10 @@ export function registerAdminTeamRoutes(app: FastifyInstance, db: Database.Datab
                 }
             }
 
-            const department = optionalString(body.department);
-            const manager = optionalString(body.manager);
+            const department = optionalString(body.department, 'department', reply);
+            if (department === INVALID) return;
+            const manager = optionalString(body.manager, 'manager', reply);
+            if (manager === INVALID) return;
             if (department !== undefined || manager !== undefined) {
                 updateTeam(db, name, {department, manager});
             }

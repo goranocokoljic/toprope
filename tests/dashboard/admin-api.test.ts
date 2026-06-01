@@ -113,6 +113,39 @@ describe('admin API', () => {
             expect(res.statusCode).toBe(409);
         });
 
+        it('rejects linking a developer already linked to another user (409)', async () => {
+            // alice@test.com is already linked to dev-1 in beforeEach.
+            const res = await app.inject({
+                method: 'POST',
+                url: '/api/admin/users',
+                headers: authHeaders(adminToken),
+                payload: {email: 'second@test.com', role: 'developer', developer_id: 'dev-1'},
+            });
+            expect(res.statusCode).toBe(409);
+        });
+
+        it('rejects re-linking a taken developer on update, but allows the same user to keep its link', async () => {
+            const hash = await hashPassword(PASSWORD);
+            const u = createUser(db, {email: 'free@test.com', passwordHash: hash, role: 'developer'});
+            // dev-1 is taken by alice → 409.
+            const taken = await app.inject({
+                method: 'PATCH',
+                url: `/api/admin/users/${u.id}`,
+                headers: authHeaders(adminToken),
+                payload: {developer_id: 'dev-1'},
+            });
+            expect(taken.statusCode).toBe(409);
+            // dev-3 is free → ok.
+            const ok = await app.inject({
+                method: 'PATCH',
+                url: `/api/admin/users/${u.id}`,
+                headers: authHeaders(adminToken),
+                payload: {developer_id: 'dev-3'},
+            });
+            expect(ok.statusCode).toBe(200);
+            expect(ok.json().data.developer_id).toBe('dev-3');
+        });
+
         it('rejects an invalid role', async () => {
             const res = await app.inject({
                 method: 'POST',
@@ -268,6 +301,16 @@ describe('admin API', () => {
             expect(res.statusCode).toBe(409);
         });
 
+        it('rejects a non-string field with 400 instead of silently dropping it', async () => {
+            const res = await app.inject({
+                method: 'PATCH',
+                url: '/api/admin/teams/frontend',
+                headers: authHeaders(adminToken),
+                payload: {department: 42},
+            });
+            expect(res.statusCode).toBe(400);
+        });
+
         it('404 when patching an unknown team', async () => {
             const res = await app.inject({
                 method: 'PATCH',
@@ -395,6 +438,37 @@ describe('admin API', () => {
                 .prepare('SELECT 1 FROM plan_change_events WHERE developer_id = ? AND tool = ?')
                 .all('dev-1', 'copilot');
             expect(events.length).toBe(1);
+        });
+
+        it('normalizes the tool key so a case variant maps to the same active seat', async () => {
+            // dev-1 already has an active 'copilot' seat (sub-1). Posting 'COPILOT'
+            // with the same plan/cost must resolve to that one seat, not open a
+            // second — the response tool is lowercased and there is one active seat.
+            const res = await app.inject({
+                method: 'POST',
+                url: '/api/admin/subscriptions',
+                headers: authHeaders(adminToken),
+                payload: {developer_id: 'dev-1', tool: 'COPILOT', plan: 'business', monthly_cost: 19},
+            });
+            expect(res.statusCode).toBe(201);
+            expect(res.json().data.tool).toBe('copilot');
+            const active = db
+                .prepare(
+                    'SELECT COUNT(*) AS cnt FROM subscriptions WHERE developer_id = ? AND tool = ? AND seat_revoked_at IS NULL',
+                )
+                .get('dev-1', 'copilot') as {cnt: number};
+            expect(active.cnt).toBe(1);
+        });
+
+        it('returns the joined developer shape on assign', async () => {
+            const res = await app.inject({
+                method: 'POST',
+                url: '/api/admin/subscriptions',
+                headers: authHeaders(adminToken),
+                payload: {developer_id: 'dev-3', tool: 'windsurf', monthly_cost: 15},
+            });
+            expect(res.json().data.developer_name).toBe('Carol Dev');
+            expect(res.json().data.team).toBe('frontend');
         });
 
         it('ends an active subscription by revoking the seat (row preserved)', async () => {

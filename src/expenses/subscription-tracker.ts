@@ -326,6 +326,26 @@ export function getSubscriptionById(db: Database.Database, id: string): Subscrip
     return row ?? null;
 }
 
+/**
+ * A single subscription joined with its developer's name/email/team — the same
+ * shape listSubscriptions yields, for endpoints that return one row (assign /
+ * end) so the response matches the list type rather than the bare Subscription.
+ */
+export function getSubscriptionWithDeveloperById(
+    db: Database.Database,
+    id: string,
+): SubscriptionWithDeveloper | null {
+    const row = db
+        .prepare(
+            `SELECT s.*, d.name as developer_name, d.email as developer_email, d.team
+             FROM subscriptions s
+             JOIN developers d ON s.developer_id = d.id
+             WHERE s.id = ?`,
+        )
+        .get(id) as SubscriptionWithDeveloper | undefined;
+    return row ?? null;
+}
+
 export function listSubscriptions(
     db: Database.Database,
     teamFilter?: string,

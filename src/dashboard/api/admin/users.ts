@@ -6,6 +6,7 @@ import {
     createUser,
     deactivateUser,
     getUserById,
+    getUserByDeveloperId,
     listUsers,
     reactivateUser,
     updateUser,
@@ -66,7 +67,7 @@ export function registerAdminUserRoutes(app: FastifyInstance, db: Database.Datab
         if (role !== 'admin' && role !== 'developer') {
             return badRequest(reply, "role must be 'admin' or 'developer'");
         }
-        const developerId = validateDeveloperLink(db, body.developer_id, reply);
+        const developerId = validateDeveloperLink(db, body.developer_id, reply, null);
         if (developerId === INVALID) return;
 
         // Provision with a one-time temporary password; force a change on first
@@ -122,7 +123,7 @@ export function registerAdminUserRoutes(app: FastifyInstance, db: Database.Datab
             }
             let developerId: string | null | undefined;
             if (body.developer_id !== undefined) {
-                const resolved = validateDeveloperLink(db, body.developer_id, reply);
+                const resolved = validateDeveloperLink(db, body.developer_id, reply, target.id);
                 if (resolved === INVALID) return;
                 developerId = resolved;
             }
@@ -136,28 +137,37 @@ export function registerAdminUserRoutes(app: FastifyInstance, db: Database.Datab
                 setActive = body.active;
             }
 
-            // Last-admin guard: block demotion or deactivation of the final admin.
+            // Field updates, the activation change, AND the last-admin guard run in
+            // one transaction so the edit is all-or-nothing and the admin count
+            // can't be undercut between the check and the write. (The same
+            // invariant is intentionally NOT enforced in the model-layer
+            // deactivateUser/updateUser, which the founder-only CLI may bypass.)
             const demoting = role === 'developer' && target.role === 'admin';
             const deactivating = setActive === false;
-            if (wouldDropLastAdmin(db, target, demoting || deactivating)) {
-                return conflict(reply, 'Cannot remove the last active admin');
-            }
-
-            // Apply field updates, then the activation change.
+            let lastAdminBlocked = false;
             try {
-                if (email !== undefined || role !== undefined || developerId !== undefined) {
-                    updateUser(db, target.id, {email, role, developerId});
-                }
+                db.transaction(() => {
+                    if (wouldDropLastAdmin(db, target, demoting || deactivating)) {
+                        lastAdminBlocked = true;
+                        return;
+                    }
+                    if (email !== undefined || role !== undefined || developerId !== undefined) {
+                        updateUser(db, target.id, {email, role, developerId});
+                    }
+                    if (setActive === false) {
+                        deactivateUser(db, target.id);
+                    } else if (setActive === true) {
+                        reactivateUser(db, target.id);
+                    }
+                })();
             } catch (err) {
                 if (err instanceof Error && /UNIQUE/i.test(err.message)) {
                     return conflict(reply, 'A user with that email already exists');
                 }
                 throw err;
             }
-            if (setActive === false) {
-                deactivateUser(db, target.id);
-            } else if (setActive === true) {
-                reactivateUser(db, target.id);
+            if (lastAdminBlocked) {
+                return conflict(reply, 'Cannot remove the last active admin');
             }
 
             const updated = getUserById(db, target.id);
@@ -189,6 +199,7 @@ function validateDeveloperLink(
     db: Database.Database,
     raw: unknown,
     reply: FastifyReply,
+    selfUserId: string | null,
 ): string | null | typeof INVALID {
     if (raw === undefined || raw === null || raw === '') {
         return null;
@@ -199,6 +210,14 @@ function validateDeveloperLink(
     }
     if (!getDeveloperById(db, raw)) {
         badRequest(reply, `Developer '${raw}' not found`);
+        return INVALID;
+    }
+    // A developer maps to at most one account: reject a link already held by a
+    // different user, so deactivating one account fully severs access to that
+    // developer's private data.
+    const owner = getUserByDeveloperId(db, raw);
+    if (owner && owner.id !== selfUserId) {
+        conflict(reply, `Developer is already linked to another user (${owner.email})`);
         return INVALID;
     }
     return raw;

@@ -60,35 +60,39 @@ export function registerAdminDeveloperRoutes(app: FastifyInstance, db: Database.
                 updates.gitEmails = body.git_emails as string[];
             }
 
-            // Uniqueness: a git-attribution id (github/bitbucket/gitlab) or a git
-            // email already owned by ANOTHER developer is rejected, so one
-            // identity never maps to two developers.
-            for (const provider of ATTRIBUTION_PROVIDERS) {
-                const value = updates[provider];
-                if (!value || !value.trim()) continue;
-                const owner = findByExternalId(db, provider, value.trim());
-                if (owner && owner.id !== developer.id) {
-                    return conflict(
-                        reply,
-                        `${provider} identity '${value.trim()}' is already mapped to ${owner.name}`,
-                    );
-                }
-            }
-            if (updates.gitEmails) {
-                for (const email of updates.gitEmails) {
-                    const trimmed = email.trim();
-                    if (!trimmed) continue;
-                    const owner = findByEmail(db, trimmed);
+            // Uniqueness check + write run in ONE transaction so two concurrent
+            // edits can't both pass the check and both write — which would map a
+            // single git-attribution identity to two developers. The uniqueness
+            // model is best-effort (the ids live in a JSON blob with no DB unique
+            // index), but the transaction closes the read-then-write race within
+            // this process. A git-attribution id (github/bitbucket/gitlab) or a
+            // git email already owned by ANOTHER developer is rejected.
+            let conflictMessage: string | null = null;
+            const updated = db.transaction((): ReturnType<typeof setDeveloperIdentities> => {
+                for (const provider of ATTRIBUTION_PROVIDERS) {
+                    const value = updates[provider];
+                    if (!value || !value.trim()) continue;
+                    const owner = findByExternalId(db, provider, value.trim());
                     if (owner && owner.id !== developer.id) {
-                        return conflict(
-                            reply,
-                            `git email '${trimmed}' is already mapped to ${owner.name}`,
-                        );
+                        conflictMessage = `${provider} identity '${value.trim()}' is already mapped to ${owner.name}`;
+                        return null;
                     }
                 }
-            }
+                if (updates.gitEmails) {
+                    for (const email of updates.gitEmails) {
+                        const trimmed = email.trim();
+                        if (!trimmed) continue;
+                        const owner = findByEmail(db, trimmed);
+                        if (owner && owner.id !== developer.id) {
+                            conflictMessage = `git email '${trimmed}' is already mapped to ${owner.name}`;
+                            return null;
+                        }
+                    }
+                }
+                return setDeveloperIdentities(db, developer.id, updates);
+            })();
 
-            const updated = setDeveloperIdentities(db, developer.id, updates);
+            if (conflictMessage) return conflict(reply, conflictMessage);
             return {data: updated};
         },
     );

@@ -89,6 +89,19 @@ export function getUserById(db: Database.Database, id: string): User | null {
 }
 
 /**
+ * Find the user account linked to a developer record, if any. A developer must
+ * map to at most one account — otherwise deactivating one account would not
+ * fully sever access to that developer's private data — so admin create/update
+ * uses this to reject a second link to the same developer.
+ */
+export function getUserByDeveloperId(db: Database.Database, developerId: string): User | null {
+    const row = db
+        .prepare('SELECT * FROM users WHERE developer_id = ?')
+        .get(developerId) as UserRow | undefined;
+    return row ? rowToUser(row) : null;
+}
+
+/**
  * Replace a user's password hash and clear the must_change_password flag. Used
  * by the change-password flow once a new password has been validated.
  */

@@ -37,10 +37,3 @@ export function asObject(body: unknown): Record<string, unknown> | null {
     }
     return body as Record<string, unknown>;
 }
-
-/** A non-empty trimmed string, or null. */
-export function asNonEmptyString(value: unknown): string | null {
-    if (typeof value !== 'string') return null;
-    const trimmed = value.trim();
-    return trimmed ? trimmed : null;
-}

@@ -2,6 +2,7 @@ import type {FastifyInstance} from 'fastify';
 import type Database from 'better-sqlite3';
 import {
     getSubscriptionById,
+    getSubscriptionWithDeveloperById,
     listSubscriptions,
     revokeSubscription,
     upsertSubscription,
@@ -32,7 +33,12 @@ export function registerAdminSubscriptionRoutes(app: FastifyInstance, db: Databa
         if (!developerId || !getDeveloperById(db, developerId)) {
             return badRequest(reply, 'A valid developer_id is required');
         }
-        const tool = typeof body.tool === 'string' ? body.tool.trim() : '';
+        // Normalize the tool key to lowercase so "Copilot" and "copilot" resolve
+        // to the SAME active seat — otherwise upsertSubscription, which keys on
+        // exact (developer_id, tool), would open a second seat for the same real
+        // tool and double-count cost. (TOOL_CATEGORIES in subscription-tracker
+        // is likewise keyed lowercase.)
+        const tool = typeof body.tool === 'string' ? body.tool.trim().toLowerCase() : '';
         if (!tool) return badRequest(reply, 'tool is required');
 
         let plan: string | null = null;
@@ -62,7 +68,9 @@ export function registerAdminSubscriptionRoutes(app: FastifyInstance, db: Databa
             monthly_cost: monthlyCost,
             data_source: ADMIN_DATA_SOURCE,
         });
-        return reply.status(201).send({data: subscription});
+        // Return the joined shape (developer_name/email/team) so the response
+        // matches the list type the client consumes.
+        return reply.status(201).send({data: getSubscriptionWithDeveloperById(db, subscription.id)});
     });
 
     // End a subscription (revoke the seat). active:false ends it; the row is kept
@@ -81,7 +89,7 @@ export function registerAdminSubscriptionRoutes(app: FastifyInstance, db: Databa
                 return badRequest(reply, 'Only ending a subscription (active:false) is supported here');
             }
             revokeSubscription(db, existing.id);
-            return {data: getSubscriptionById(db, existing.id)};
+            return {data: getSubscriptionWithDeveloperById(db, existing.id)};
         },
     );
 }
