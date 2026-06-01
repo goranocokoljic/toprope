@@ -137,6 +137,75 @@ export interface LinkUpdates {
     gitEmails?: string[];
 }
 
+/**
+ * Move a developer to a different team. Returns the updated developer, or null
+ * if the developer does not exist. The team name is stored as-is; callers are
+ * responsible for verifying the target team exists.
+ */
+export function setDeveloperTeam(db: Database.Database, id: string, team: string): Developer | null {
+    const row = db.prepare('SELECT * FROM developers WHERE id = ?').get(id) as DeveloperRow | undefined;
+    if (!row) return null;
+    db.prepare('UPDATE developers SET team = ? WHERE id = ?').run(team, id);
+    return rowToDeveloper({...row, team});
+}
+
+// Editable identity map for the admin UI. Unlike LinkUpdates, an empty string
+// clears the field (the UI sends what the form shows), and `gitEmails` REPLACES
+// the stored set rather than appending — the admin edits the full list.
+export interface IdentityUpdates {
+    github?: string;
+    copilot?: string;
+    claude?: string;
+    windsurf?: string;
+    bitbucket?: string;
+    gitlab?: string;
+    gitEmails?: string[];
+}
+
+const PROVIDER_KEYS = ['github', 'copilot', 'claude', 'windsurf', 'bitbucket', 'gitlab'] as const;
+
+/**
+ * Replace a developer's identity mapping from the admin UI. Each provided
+ * provider key is set to its value, or removed when the value is empty/blank.
+ * `gitEmails`, when provided, replaces the whole git-email set (deduped,
+ * lowercased). Keys omitted from `updates` are left untouched. Returns the
+ * updated developer, or null if it does not exist.
+ */
+export function setDeveloperIdentities(
+    db: Database.Database,
+    id: string,
+    updates: IdentityUpdates,
+): Developer | null {
+    const row = db.prepare('SELECT * FROM developers WHERE id = ?').get(id) as DeveloperRow | undefined;
+    if (!row) return null;
+
+    const existing = parseExternalIds(row.external_ids);
+    for (const key of PROVIDER_KEYS) {
+        const value = updates[key];
+        if (value === undefined) continue;
+        const trimmed = value.trim();
+        if (trimmed) {
+            existing[key] = trimmed;
+        } else {
+            delete existing[key];
+        }
+    }
+    if (updates.gitEmails !== undefined) {
+        const joined = joinGitEmails(updates.gitEmails);
+        if (joined) {
+            existing.git_emails = joined;
+        } else {
+            delete existing.git_emails;
+        }
+    }
+
+    db.prepare('UPDATE developers SET external_ids = ? WHERE id = ?').run(
+        JSON.stringify(existing),
+        id,
+    );
+    return rowToDeveloper({...row, external_ids: JSON.stringify(existing)});
+}
+
 export function linkDeveloper(
     db: Database.Database,
     id: string,

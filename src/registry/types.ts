@@ -3,6 +3,9 @@ export interface Team {
     department: string | null;
     manager: string | null;
     created_at: string;
+    // Set when the team is archived (Task 2.13). An archived team is hidden from
+    // active management but retained so historical data referencing it survives.
+    archived_at: string | null;
 }
 
 export interface ExternalIds {
