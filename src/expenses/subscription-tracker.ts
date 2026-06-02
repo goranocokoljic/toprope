@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3';
 import {randomUUID} from 'crypto';
-import {addDays, daysInMonth} from '../aggregation/dates';
+import {addDays, daysInMonth, assertDateRange} from '../aggregation/dates';
 
 // Re-exported for back-compat: callers (plan-roi, tests) historically imported
 // addDays from here. The canonical implementation now lives in aggregation/dates.
@@ -600,6 +600,12 @@ export function getDeveloperProratedCost(
     from: string,
     to: string,
 ): number {
+    // Self-defend: the day-stepping loop below compares dates lexicographically,
+    // which is only chronologically correct for valid fixed-width YYYY-MM-DD
+    // bounds with from <= to. Validate here so a direct caller can't trigger a
+    // degenerate or runaway loop with a malformed window.
+    assertDateRange(from, to);
+
     const subs = getCostedSubscriptions(db, developerId);
     let total = 0;
     for (let date = from; date <= to; date = addDays(date, 1)) {

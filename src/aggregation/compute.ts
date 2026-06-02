@@ -68,9 +68,9 @@ interface ToolRow {
 }
 
 /** Round to `dp` decimals, preserving null. Strips float artifacts from sums/means. */
-export function round(value: number, dp: number): number;
-export function round(value: number | null, dp: number): number | null;
-export function round(value: number | null, dp: number): number | null {
+function round(value: number, dp: number): number;
+function round(value: number | null, dp: number): number | null;
+function round(value: number | null, dp: number): number | null {
     if (value === null) {
         return null;
     }
@@ -119,10 +119,20 @@ export function computePeriodMetrics(
     // widen the snapshot queries below.
     assertDateRange(start, end);
 
+    // The integer columns are DEFAULT 0 but nullable in the schema (migration
+    // 003); COALESCE them to 0 at the boundary so the non-null GitRow typing
+    // holds and a stray NULL can't turn a sum into NaN. The REAL columns
+    // (churn/signature) stay nullable — meanOrNull handles their absence.
     const gitRows = db
         .prepare(
-            `SELECT date, commits, lines_added, lines_removed, files_changed,
-                    prs_opened, prs_merged, review_comments_given,
+            `SELECT date,
+                    COALESCE(commits, 0) AS commits,
+                    COALESCE(lines_added, 0) AS lines_added,
+                    COALESCE(lines_removed, 0) AS lines_removed,
+                    COALESCE(files_changed, 0) AS files_changed,
+                    COALESCE(prs_opened, 0) AS prs_opened,
+                    COALESCE(prs_merged, 0) AS prs_merged,
+                    COALESCE(review_comments_given, 0) AS review_comments_given,
                     code_churn_rate, ai_signature_score
              FROM git_snapshots
              WHERE developer_id = ? AND date >= ? AND date <= ?`,

@@ -121,6 +121,20 @@ describe('computeWeeklyAggregate', () => {
         expect(row.active_days).toBe(1);
     });
 
+    it('reports estimated_total_cost 0 (not null) when tool rows exist but cost is 0', () => {
+        // "seen but sums to zero" must stay 0, distinct from "never seen" → null.
+        addToolSnapshot(db, 'dev-1', '2026-05-04', {
+            is_active: 1,
+            interaction_count: 5,
+            estimated_cost: 0,
+        });
+
+        const row = computeWeeklyAggregate(db, 'dev-1', WEEK, NOW);
+
+        expect(row.estimated_total_cost).toBe(0);
+        expect(row.data_quality).toBe('high');
+    });
+
     it('counts distinct active days, not total events (git + tool on the same day)', () => {
         addGitSnapshot(db, 'dev-1', '2026-05-04', {commits: 2});
         addToolSnapshot(db, 'dev-1', '2026-05-04', {is_active: 1, interaction_count: 5});

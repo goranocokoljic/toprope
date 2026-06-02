@@ -10,7 +10,7 @@
  */
 
 import type Database from 'better-sqlite3';
-import {computePeriodMetrics, type PeriodMetrics} from './compute';
+import {computePeriodMetrics, type PeriodMetrics, type DataQuality} from './compute';
 import {weekRange, isoWeekStart} from './dates';
 
 export interface WeeklyAggregateRow {
@@ -32,7 +32,7 @@ export interface WeeklyAggregateRow {
     subscription_cost: number;
     cost_per_pr: number | null;
     is_active: 0 | 1;
-    data_quality: string;
+    data_quality: DataQuality;
     computed_at: string;
 }
 
