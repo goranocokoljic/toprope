@@ -8,7 +8,7 @@ import {SkeletonChart, SkeletonStatCard} from '../components/Skeleton';
 import {ErrorState} from '../components/ErrorState';
 import {StatePanel} from '../components/StatePanel';
 import {toolLabel, featureLabel} from '../components/toolLabels';
-import {formatCurrency, formatPercent, formatDateTick} from '../components/format';
+import {formatCount, formatCurrency, formatPercent, formatDateTick} from '../components/format';
 import {earliestJourneyStart} from '../components/meHelpers';
 import type {MeJourney, MeJourneyTool, MeToolBreakdown} from '../api/types';
 
@@ -18,11 +18,14 @@ import type {MeJourney, MeJourneyTool, MeToolBreakdown} from '../api/types';
  * can reach another developer's data. The value is self-reflection: the feature
  * breakdown makes it visually obvious when a paid (premium) seat is only being
  * used for basic features, without ranking the developer against anyone.
+ *
+ * The breakdown surfaces utilization implicitly through the bar lengths rather
+ * than through an editorial nudge: for some tools the headline interaction
+ * metric is itself stored as a feature (e.g. Copilot's `completions` equals the
+ * tool's interaction count), so a "you only use one feature" message would fire
+ * for nearly everyone and read as noise. The proportional bars tell the true
+ * story without over-claiming.
  */
-
-// Share of total feature usage at or above which a single feature is treated as
-// dominant — used only to phrase a gentle, non-judgmental utilization note.
-const DOMINANT_FEATURE_SHARE = 0.85;
 
 /** The plan/active status for a tool, looked up from the adoption journey. */
 function planForTool(journeyTools: MeJourneyTool[] | undefined, tool: string): MeJourneyTool | undefined {
@@ -51,7 +54,7 @@ function FeatureBreakdown({tool}: {tool: MeToolBreakdown}): JSX.Element {
                     <li key={f.feature}>
                         <div className="mb-1 flex items-baseline justify-between gap-2 text-sm">
                             <span className="text-foreground">{featureLabel(f.feature)}</span>
-                            <span className="tabular-nums text-muted">{f.count.toLocaleString()}</span>
+                            <span className="tabular-nums text-muted">{formatCount(f.count)}</span>
                         </div>
                         <div className="h-2 overflow-hidden rounded-full bg-surface-raised">
                             <div className="h-full rounded-full bg-accent" style={{width: `${pct}%`}} />
@@ -63,36 +66,10 @@ function FeatureBreakdown({tool}: {tool: MeToolBreakdown}): JSX.Element {
     );
 }
 
-/**
- * A gentle, non-causal utilization note. Only shown when the developer pays for
- * the tool and their usage is concentrated in a single feature — the case the
- * task calls out ("paying for a premium plan but only using basic features").
- * Deliberately suggestive, never prescriptive, and never a comparison to peers.
- */
-function utilizationNote(tool: MeToolBreakdown): string | null {
-    if (tool.estimated_monthly_cost <= 0 || tool.feature_usage.length === 0) {
-        return null;
-    }
-    const total = tool.feature_usage.reduce((sum, f) => sum + f.count, 0);
-    if (total <= 0) {
-        return null;
-    }
-    const top = tool.feature_usage[0];
-    const share = top.count / total;
-    if (tool.feature_usage.length === 1) {
-        return `Your ${toolLabel(tool.tool)} usage is all ${featureLabel(top.feature)} — worth checking your plan fits how you actually use it.`;
-    }
-    if (share >= DOMINANT_FEATURE_SHARE) {
-        return `Most of your ${toolLabel(tool.tool)} usage is ${featureLabel(top.feature)} — worth checking your plan fits how you actually use it.`;
-    }
-    return null;
-}
-
 // --- Per-tool card ---------------------------------------------------------
 
 function ToolCard({tool, plan}: {tool: MeToolBreakdown; plan: MeJourneyTool | undefined}): JSX.Element {
     const chartData: ChartDatum[] = tool.activity.map((p) => ({date: p.date, interactions: p.interactions}));
-    const note = utilizationNote(tool);
 
     return (
         <Card>
@@ -117,7 +94,7 @@ function ToolCard({tool, plan}: {tool: MeToolBreakdown; plan: MeJourneyTool | un
                 <div>
                     <p className="text-xs uppercase tracking-wider text-muted">Interactions</p>
                     <p className="font-display text-xl font-semibold text-foreground">
-                        {tool.interactions.toLocaleString()}
+                        {formatCount(tool.interactions)}
                     </p>
                 </div>
                 <div>
@@ -148,11 +125,6 @@ function ToolCard({tool, plan}: {tool: MeToolBreakdown; plan: MeJourneyTool | un
             <div className="mt-5">
                 <h3 className="mb-2 text-sm font-medium text-foreground">Feature usage</h3>
                 <FeatureBreakdown tool={tool} />
-                {note ? (
-                    <p className="mt-3 rounded-card bg-accent-soft/40 px-3 py-2 text-xs text-foreground" data-testid="utilization-note">
-                        {note}
-                    </p>
-                ) : null}
             </div>
         </Card>
     );
@@ -195,6 +167,11 @@ function PageHeader({children}: {children?: JSX.Element}): JSX.Element {
  * its smart default from the developer's true first day on its very first render
  * (no 30d→year flip after the journey loads, so the content never flashes back
  * to a skeleton).
+ *
+ * This deliberately differs from DeveloperDashboard's inline `useTimeRange`: there
+ * the structural gate keys off fixed-window queries, so a late-arriving `earliest`
+ * only reconciles the trend sub-chart. Here the page's MAIN query is range-driven,
+ * so the key flip would blank the whole screen — hence resolving `earliest` first.
  */
 function MyToolsContent({earliest, journey}: {earliest: string | null; journey: MeJourney | undefined}): JSX.Element {
     const {range, setRange} = useTimeRange({earliest});

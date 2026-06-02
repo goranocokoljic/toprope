@@ -163,10 +163,17 @@ describe('MyTools — per-tool detail', () => {
         expect(within(copilot).getByText('1,200')).toBeInTheDocument();
     });
 
-    it('surfaces a gentle utilization note when a paid tool is used for one feature', async () => {
+    it('makes a skewed feature mix visually apparent via proportional bars', async () => {
+        // The headline criterion is surfaced implicitly: the dominant feature's
+        // bar is full-width while a minor one is clamped to the 4% floor, so a
+        // lopsided mix reads at a glance without an editorial nudge.
         renderPage();
-        const note = await screen.findByTestId('utilization-note');
-        expect(note).toHaveTextContent(/Most of your Copilot usage is Autocomplete/i);
+        const breakdowns = await screen.findAllByTestId('feature-breakdown');
+        const bars = breakdowns[0].querySelectorAll('div[style*="width"]');
+        const widths = Array.from(bars).map((b) => (b as HTMLElement).style.width);
+        // completions:1200 (dominant → 100%) vs chat:80 (→ round(6.7%) = 7%).
+        expect(widths[0]).toBe('100%');
+        expect(widths[1]).toBe('7%');
     });
 
     it('shows an empty-feature note for a tool with no feature data', async () => {

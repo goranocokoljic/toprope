@@ -13,6 +13,11 @@ export function formatCurrency(value: number): string {
     }).format(value);
 }
 
+/** Grouped integer, e.g. 12500 → "12,500". */
+export function formatCount(value: number): string {
+    return value.toLocaleString();
+}
+
 /** Whole-number percent for 0..1 ratios, e.g. 0.666 → "67%". */
 export function formatPercent(ratio: number): string {
     return `${Math.round(ratio * 100)}%`;

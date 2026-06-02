@@ -8,7 +8,7 @@ import {SkeletonChart, SkeletonStatCard} from '../components/Skeleton';
 import {ErrorState} from '../components/ErrorState';
 import {StatePanel} from '../components/StatePanel';
 import {providerLabel} from '../components/toolLabels';
-import {formatPercent, formatDateTick} from '../components/format';
+import {formatCount, formatPercent, formatDateTick} from '../components/format';
 import {earliestJourneyStart} from '../components/meHelpers';
 import {inclusiveDayCount} from '../timeRange/range';
 import type {MeActivity, MeProviderActivity, MeTimeline} from '../api/types';
@@ -21,11 +21,6 @@ import type {MeActivity, MeProviderActivity, MeTimeline} from '../api/types';
  * causes the other, and the churn metric ships with a plain-language explanation
  * so a high number isn't mistaken for a verdict.
  */
-
-/** Compact integer, e.g. 12500 → "12,500". */
-function formatCount(value: number): string {
-    return value.toLocaleString();
-}
 
 // --- Stat cards ------------------------------------------------------------
 
@@ -52,7 +47,7 @@ function ChurnExplainer({churn}: {churn: number | null}): JSX.Element {
         <Card title="What code churn means">
             <p className="text-sm text-muted">
                 Churn is the share of your recently-written code that gets rewritten or deleted again
-                soon after. {churn === null ? 'There isn’t enough data to estimate it for this range yet.' : `Across this range it averaged about ${formatPercent(churn)}.`}
+                soon after. {churn === null ? 'There isn’t enough data to estimate it for this range yet.' : `Averaged across your active days in this range, it was about ${formatPercent(churn)}.`}
             </p>
             <p className="mt-2 text-sm text-muted">
                 A higher number isn’t automatically bad — it often just reflects healthy iteration or
@@ -230,21 +225,29 @@ function MyActivityContent({earliest}: {earliest: string | null}): JSX.Element {
                                 <h2 className="text-sm font-semibold text-foreground">Git activity over time</h2>
                                 <p className="mt-0.5 text-xs text-muted">Your commits, PRs merged, and lines changed by day.</p>
                             </div>
-                            <CoverageBadge dataDays={dataDays} spanDays={spanDays} />
+                            {!timeline.isError ? <CoverageBadge dataDays={dataDays} spanDays={spanDays} /> : null}
                         </div>
-                        <TrendChart
-                            data={gitTimelineData(timeline.data)}
-                            xKey="date"
-                            series={[
-                                {key: 'lines', label: 'Lines changed', axis: 'left'},
-                                {key: 'commits', label: 'Commits', axis: 'right'},
-                                {key: 'prs', label: 'PRs merged', axis: 'right'},
-                            ]}
-                            variant="line"
-                            xTickFormatter={formatDateTick}
-                            emptyMessage="No git activity in this range yet."
-                            testId="git-trend"
-                        />
+                        {timeline.isError ? (
+                            <ErrorState
+                                title="Couldn’t load your activity trend"
+                                detail={timeline.error?.message}
+                                onRetry={() => void timeline.refetch()}
+                            />
+                        ) : (
+                            <TrendChart
+                                data={gitTimelineData(timeline.data)}
+                                xKey="date"
+                                series={[
+                                    {key: 'lines', label: 'Lines changed', axis: 'left'},
+                                    {key: 'commits', label: 'Commits', axis: 'right'},
+                                    {key: 'prs', label: 'PRs merged', axis: 'right'},
+                                ]}
+                                variant="line"
+                                xTickFormatter={formatDateTick}
+                                emptyMessage="No git activity in this range yet."
+                                testId="git-trend"
+                            />
+                        )}
                     </Card>
 
                     <Card>
@@ -259,18 +262,26 @@ function MyActivityContent({earliest}: {earliest: string | null}): JSX.Element {
                             together is a correlation, not proof that one causes the other — plenty of other
                             things shape how much you ship.
                         </p>
-                        <TrendChart
-                            data={correlationData(timeline.data)}
-                            xKey="date"
-                            series={[
-                                {key: 'interactions', label: 'AI interactions', axis: 'left'},
-                                {key: 'commits', label: 'Commits', axis: 'right'},
-                            ]}
-                            variant="line"
-                            xTickFormatter={formatDateTick}
-                            emptyMessage="No activity in this range yet."
-                            testId="correlation-trend"
-                        />
+                        {timeline.isError ? (
+                            <ErrorState
+                                title="Couldn’t load your activity trend"
+                                detail={timeline.error?.message}
+                                onRetry={() => void timeline.refetch()}
+                            />
+                        ) : (
+                            <TrendChart
+                                data={correlationData(timeline.data)}
+                                xKey="date"
+                                series={[
+                                    {key: 'interactions', label: 'AI interactions', axis: 'left'},
+                                    {key: 'commits', label: 'Commits', axis: 'right'},
+                                ]}
+                                variant="line"
+                                xTickFormatter={formatDateTick}
+                                emptyMessage="No activity in this range yet."
+                                testId="correlation-trend"
+                            />
+                        )}
                     </Card>
 
                     <ChurnExplainer churn={activity.data.totals.avg_churn_rate} />

@@ -78,6 +78,7 @@ interface Overrides {
     activity?: MeActivity;
     timeline?: MeTimeline;
     failActivity?: boolean;
+    failTimeline?: boolean;
 }
 
 let fetchMock: Mock;
@@ -92,6 +93,9 @@ function installFetch(overrides: Overrides = {}): void {
                 }
                 return jsonResponse(overrides.activity ?? ACTIVITY);
             case '/api/me/timeline':
+                if (overrides.failTimeline) {
+                    return new Response('nope', {status: 500});
+                }
                 return jsonResponse(overrides.timeline ?? TIMELINE);
             case '/api/me/journey':
                 return jsonResponse(JOURNEY);
@@ -195,6 +199,19 @@ describe('MyActivity — empty & error states', () => {
         renderPage();
         expect(await screen.findByText('Failed to load your activity')).toBeInTheDocument();
         expect(screen.getByRole('button', {name: 'Try again'})).toBeInTheDocument();
+    });
+
+    it('surfaces a timeline failure in the chart cards rather than rendering them empty', async () => {
+        // Activity (stats) succeed but the timeline fails — the charts must show
+        // an error, not an empty "no activity" message that contradicts the stats.
+        installFetch({failTimeline: true});
+        renderPage();
+        // Stats still render from the activity query.
+        expect(await screen.findByText('120')).toBeInTheDocument();
+        // Both chart cards show the trend error instead of an empty chart.
+        expect(screen.getAllByText('Couldn’t load your activity trend').length).toBe(2);
+        expect(screen.queryByTestId('git-trend')).not.toBeInTheDocument();
+        expect(screen.queryByTestId('correlation-trend')).not.toBeInTheDocument();
     });
 
     it('never renders a competitive ranking or peer comparison', async () => {

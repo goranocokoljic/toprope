@@ -265,8 +265,9 @@ function accumulateFeatures(raw: string | null, into: Map<string, number>): void
 }
 
 /**
- * Per-tool breakdown for the developer: activity, acceptance rate, the union of
- * features touched, and the monthly cost of the matching active subscription.
+ * Per-tool breakdown for the developer: activity, acceptance rate, per-feature
+ * usage counts, a daily interaction series, and the monthly cost of the matching
+ * active subscription.
  */
 export function getMeTools(
     db: Database.Database,
