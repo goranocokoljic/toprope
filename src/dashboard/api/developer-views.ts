@@ -274,21 +274,22 @@ export function getMeTools(
     from: string,
     to: string,
 ): MeToolBreakdown[] {
+    // active_days and acceptances per tool. Interactions are NOT summed here —
+    // the headline per-tool total is derived from the daily `activity` series
+    // below so the sparkline and its headline figure share one source and can
+    // never drift (e.g. if one query later gains an is_active filter).
     const rows = db
         .prepare(
             `SELECT tool,
                     COUNT(DISTINCT CASE WHEN is_active = 1 THEN date END) AS active_days,
-                    COALESCE(SUM(interaction_count), 0) AS interactions,
                     COALESCE(SUM(acceptance_count), 0) AS acceptances
              FROM tool_snapshots
              WHERE developer_id = ? AND date >= ? AND date <= ?
-             GROUP BY tool
-             ORDER BY interactions DESC, tool`,
+             GROUP BY tool`,
         )
         .all(developerId, from, to) as {
         tool: string;
         active_days: number;
-        interactions: number;
         acceptances: number;
     }[];
 
@@ -333,28 +334,35 @@ export function getMeTools(
         )
         .all(developerId, from, to) as {tool: string; date: string; interactions: number}[];
     const activityByTool = new Map<string, ToolActivityPoint[]>();
+    const interactionsByTool = new Map<string, number>();
     for (const r of activityRows) {
         const points = activityByTool.get(r.tool) ?? [];
         points.push({date: r.date, interactions: r.interactions});
         activityByTool.set(r.tool, points);
+        interactionsByTool.set(r.tool, (interactionsByTool.get(r.tool) ?? 0) + r.interactions);
     }
 
-    return rows.map((r) => {
-        // Most-used first, then alphabetically so equal counts order stably.
-        const featureUsage: FeatureUsage[] = Array.from(featureCountsByTool.get(r.tool) ?? [])
-            .map(([feature, count]) => ({feature, count}))
-            .sort((a, b) => b.count - a.count || a.feature.localeCompare(b.feature));
-        return {
-            tool: r.tool,
-            active_days: r.active_days,
-            interactions: r.interactions,
-            acceptances: r.acceptances,
-            acceptance_rate: r.interactions > 0 ? r.acceptances / r.interactions : null,
-            feature_usage: featureUsage,
-            activity: activityByTool.get(r.tool) ?? [],
-            estimated_monthly_cost: costByTool.get(r.tool) ?? 0,
-        };
-    });
+    return rows
+        .map((r) => {
+            // Most-used first, then alphabetically so equal counts order stably.
+            const featureUsage: FeatureUsage[] = Array.from(featureCountsByTool.get(r.tool) ?? [])
+                .map(([feature, count]) => ({feature, count}))
+                .sort((a, b) => b.count - a.count || a.feature.localeCompare(b.feature));
+            const interactions = interactionsByTool.get(r.tool) ?? 0;
+            return {
+                tool: r.tool,
+                active_days: r.active_days,
+                interactions,
+                acceptances: r.acceptances,
+                acceptance_rate: interactions > 0 ? r.acceptances / interactions : null,
+                feature_usage: featureUsage,
+                activity: activityByTool.get(r.tool) ?? [],
+                estimated_monthly_cost: costByTool.get(r.tool) ?? 0,
+            };
+        })
+        // Most-used tool first, name as a stable tie-break (the interactions
+        // ordering moved here from SQL when the headline total became derived).
+        .sort((a, b) => b.interactions - a.interactions || a.tool.localeCompare(b.tool));
 }
 
 /**
