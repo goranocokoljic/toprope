@@ -580,6 +580,42 @@ export function getDeveloperCostOverTime(
     return points;
 }
 
+/** Number of days in the calendar month containing `date` (YYYY-MM-DD, UTC). */
+function daysInCalendarMonth(date: string): number {
+    const [year, mon] = date.split('-').map(Number);
+    // Day 0 of the next month is the last day of this month.
+    return new Date(Date.UTC(year, mon, 0)).getUTCDate();
+}
+
+/**
+ * Prorated subscription spend for a developer across an inclusive [from, to]
+ * window — the actual money the org spent on that developer's seats during the
+ * period, as opposed to {@link getDeveloperCostOnDate} which returns the monthly
+ * *rate* in effect on a day.
+ *
+ * Each day contributes the monthly rate in effect that day divided by the number
+ * of days in that day's calendar month. So a seat held for a full calendar month
+ * contributes exactly one monthly charge, a seat held for one week of a 31-day
+ * month contributes 7/31 of a charge, and a mid-period plan change is billed at
+ * the old rate up to the change date and the new rate after — because the
+ * per-day rate comes from {@link isActiveOnDate}, the single home for the
+ * active-on-date rule. Dividing by the day's own month length keeps a week that
+ * straddles a month boundary correct (Feb days divide by 28/29, March by 31).
+ */
+export function getDeveloperProratedCost(
+    db: Database.Database,
+    developerId: string,
+    from: string,
+    to: string,
+): number {
+    const subs = getCostedSubscriptions(db, developerId);
+    let total = 0;
+    for (let date = from; date <= to; date = addDays(date, 1)) {
+        total += sumActiveOnDate(subs, date) / daysInCalendarMonth(date);
+    }
+    return total;
+}
+
 /**
  * All plan-change events for a developer in chronological order — the data
  * behind the developer "adoption journey" transition narrative and the feed for
