@@ -25,7 +25,7 @@ import {SESSION_COOKIE} from '../../src/auth/cookies';
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../src/storage/migrations');
 
 /** Shared login password for every seeded account in the integration suite. */
-export const PASSWORD = 'correct-horse-battery';
+const PASSWORD = 'correct-horse-battery';
 
 export function makeIntegrationDb(): Database.Database {
     const db = new Database(':memory:');
@@ -69,7 +69,7 @@ export async function buildFullApp(db: Database.Database): Promise<FastifyInstan
 
 // ── auth helpers ────────────────────────────────────────────────────────────
 
-export function cookieToken(res: {headers: Record<string, unknown>}): string {
+function cookieToken(res: {headers: Record<string, unknown>}): string {
     const raw = res.headers['set-cookie'];
     const header = Array.isArray(raw) ? raw[0] : (raw as string);
     const match = new RegExp(`${SESSION_COOKIE}=([^;]+)`).exec(header ?? '');
@@ -107,6 +107,11 @@ export async function createAccount(
 
 // ── data seeding ────────────────────────────────────────────────────────────
 
+// Registry timestamps (created_at) only — these rows are never asserted on by
+// date, so a fixed value keeps them stable. Time-series rows instead use the
+// wall-clock-relative daysAgo() below, because the range endpoints (and the
+// Plan ROI settling window) are evaluated against the real "now"; seeding those
+// relative to today is what keeps the range/ROI assertions meaningful.
 const SEED_NOW = '2026-05-30T00:00:00.000Z';
 
 /** A YYYY-MM-DD string `n` days before today (UTC). */
@@ -223,7 +228,7 @@ export function seedSubscription(
     );
 }
 
-export function seedPlanChange(
+function seedPlanChange(
     db: Database.Database,
     opts: {
         id: string;
@@ -255,7 +260,7 @@ export function seedPlanChange(
     );
 }
 
-export function seedSyncLog(
+function seedSyncLog(
     db: Database.Database,
     opts: {connector: string; status: string; started: string; finished?: string},
 ): void {
@@ -265,19 +270,9 @@ export function seedSyncLog(
     ).run(`log-${opts.connector}`, opts.connector, opts.started, opts.finished ?? null, opts.status);
 }
 
-export interface WmgDeveloper {
-    id: string;
-    team: string;
-    email: string;
-}
-
 export interface WmgDataset {
+    /** The team names seeded, in registration order. */
     teams: string[];
-    developers: WmgDeveloper[];
-    /** Developer ids by role for convenient assertions. */
-    frontend: string[];
-    backend: string[];
-    platform: string[];
 }
 
 /**
@@ -286,8 +281,9 @@ export interface WmgDataset {
  * Code, Windsurf) and all three git providers (Bitbucket, GitHub, GitLab),
  * across three teams, with ~90 days of daily history, live + revoked
  * subscriptions, an unused seat, and a plan upgrade. This mirrors the
- * "real multi-source WMG data" the dogfood acceptance criteria call for, while
- * staying deterministic so the integration assertions are stable.
+ * "real multi-source WMG data" the dogfood acceptance criteria call for. The
+ * shape and counts are fixed; the dates roll with the wall clock (daysAgo), so
+ * assertions check structure, totals, and relative ordering — not absolute dates.
  *
  * Returns the seeded identity map; callers create the matching auth accounts.
  */
@@ -299,7 +295,14 @@ export function seedWmgDataset(db: Database.Database): WmgDataset {
 
     // Each developer is tagged with the git provider their team hosts on, so the
     // multi-provider correlation (Bitbucket + GitHub + GitLab) is real.
-    const developers: Array<WmgDeveloper & {tools: string[]; provider: string; idle?: boolean}> = [
+    const developers: Array<{
+        id: string;
+        team: string;
+        email: string;
+        tools: string[];
+        provider: string;
+        idle?: boolean;
+    }> = [
         {id: 'amy', team: 'frontend', email: 'amy@wmg.test', tools: ['copilot', 'windsurf'], provider: 'bitbucket'},
         {id: 'ben', team: 'frontend', email: 'ben@wmg.test', tools: ['copilot'], provider: 'bitbucket'},
         {id: 'cara', team: 'backend', email: 'cara@wmg.test', tools: ['claude_code'], provider: 'github'},
@@ -382,11 +385,5 @@ export function seedWmgDataset(db: Database.Database): WmgDataset {
     seedSyncLog(db, {connector: 'claude_code', status: 'success', started: now, finished: now});
     seedSyncLog(db, {connector: 'windsurf', status: 'success', started: now, finished: now});
 
-    return {
-        teams,
-        developers: developers.map((d) => ({id: d.id, team: d.team, email: d.email})),
-        frontend: ['amy', 'ben'],
-        backend: ['cara', 'dan'],
-        platform: ['eve', 'frank'],
-    };
+    return {teams};
 }

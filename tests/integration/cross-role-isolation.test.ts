@@ -72,6 +72,12 @@ describe('Integration (2.12): cross-role isolation', () => {
         db.close();
     });
 
+    // NOTE: isolation is enforced by a single central guard — the onRequest hook
+    // in src/auth/middleware.ts confines developers to /api/me + /api/auth and
+    // 403s any other /api/* path BEFORE the route handler runs. So these lists do
+    // not need to be exhaustive for correctness (a new admin route is auto-covered
+    // by the same guard); they are a broad, representative regression net that
+    // would also catch a future move to per-route guards leaving a route exposed.
     it('rejects every manager/admin endpoint for a developer session with 403', async () => {
         for (const url of MANAGER_GET) {
             const res = await app.inject({method: 'GET', url, headers: authHeaders(amyToken)});
@@ -79,12 +85,19 @@ describe('Integration (2.12): cross-role isolation', () => {
         }
     });
 
-    it('rejects admin write endpoints for a developer session with 403', async () => {
+    it('rejects admin/manager write endpoints for a developer session with 403', async () => {
         const writes: Array<{method: 'POST' | 'PATCH'; url: string}> = [
             {method: 'POST', url: '/api/admin/users'},
+            {method: 'PATCH', url: '/api/admin/users/some-id'},
+            {method: 'POST', url: '/api/admin/users/some-id/reset-password'},
             {method: 'POST', url: '/api/admin/teams'},
+            {method: 'PATCH', url: '/api/admin/teams/frontend'},
             {method: 'POST', url: '/api/admin/subscriptions'},
+            {method: 'PATCH', url: '/api/admin/subscriptions/some-id'},
+            {method: 'PATCH', url: '/api/admin/developers/amy'},
+            {method: 'PATCH', url: '/api/admin/developers/amy/identities'},
             {method: 'PATCH', url: '/api/settings/global'},
+            {method: 'PATCH', url: '/api/settings/team/frontend'},
             {method: 'POST', url: '/api/waste/some-id/resolve'},
         ];
         for (const {method, url} of writes) {
@@ -103,24 +116,31 @@ describe('Integration (2.12): cross-role isolation', () => {
     });
 
     it('scopes /api/me/* to the session developer regardless of any id passed', async () => {
-        // Amy has rich activity; Ben has his own. Amy must never see Ben's data,
-        // even when she explicitly passes Ben's id by every channel.
-        const plain = await app.inject({method: 'GET', url: '/api/me/activity?range=lifetime', headers: authHeaders(amyToken)});
+        // Use /api/me/tools, where Amy (copilot + windsurf) and Ben (copilot
+        // only) genuinely differ — so the assertions can prove the spoofed
+        // response is *Amy's*, not merely "some 200".
+        const toolsOf = (body: unknown): string[] =>
+            ((body as {data: {tools: Array<{tool: string}>}}).data.tools.map((t) => t.tool)).sort();
+
+        const plain = await app.inject({method: 'GET', url: '/api/me/tools?range=lifetime', headers: authHeaders(amyToken)});
         const spoofed = await app.inject({
             method: 'GET',
-            url: '/api/me/activity?range=lifetime&developer_id=ben&developerId=ben&id=ben',
+            url: '/api/me/tools?range=lifetime&developer_id=ben&developerId=ben&id=ben',
             headers: authHeaders(amyToken),
         });
+        const benOwn = await app.inject({method: 'GET', url: '/api/me/tools?range=lifetime', headers: authHeaders(benToken)});
         expect(plain.statusCode).toBe(200);
         expect(spoofed.statusCode).toBe(200);
-        // Identical payloads → the spoof parameters had no effect.
-        expect(spoofed.json()).toEqual(plain.json());
 
-        // Amy is on Bitbucket; Ben is also frontend/Bitbucket. Distinguish by
-        // commit totals instead: the two developers' totals differ, and Amy's
-        // own result must match her own, not Ben's.
-        const amyOwn = (plain.json() as {data: {providers: Array<{provider: string}>}}).data;
-        expect(amyOwn.providers.every((p) => ['bitbucket', 'multi'].includes(p.provider))).toBe(true);
+        // 1. The spoof parameters had no effect — identical to Amy's plain call.
+        expect(spoofed.json()).toEqual(plain.json());
+        // 2. The two developers' tool sets actually differ, so this is a real
+        //    discriminator: Amy has windsurf, Ben does not.
+        expect(toolsOf(plain.json())).toEqual(['copilot', 'windsurf']);
+        expect(toolsOf(benOwn.json())).toEqual(['copilot']);
+        // 3. Amy's spoofed-with-Ben's-id result is still Amy's, never Ben's.
+        expect(toolsOf(spoofed.json())).toEqual(toolsOf(plain.json()));
+        expect(toolsOf(spoofed.json())).not.toEqual(toolsOf(benOwn.json()));
     });
 
     it("never leaks one developer's tooling cost to another", async () => {
@@ -139,10 +159,14 @@ describe('Integration (2.12): cross-role isolation', () => {
         }
     });
 
-    it('keeps the leaderboard invisible to developers even when disabled by default', async () => {
-        // /availability is under /api/leaderboard, which is admin-only, so a
-        // developer gets a flat 403 — there is no capability probe leaking the
-        // feature's existence to the developer role.
+    it('keeps the leaderboard capability probe unreachable for developers', async () => {
+        // /api/leaderboard/* sits outside the developer-allowed prefixes, so the
+        // central middleware guard 403s it before the availability handler runs.
+        // (The handler itself would return 200 {available:false} if reached — the
+        // developer simply never reaches it, so the feature's existence does not
+        // leak via this probe.) If a future per-team manager role relaxes that
+        // confinement, this is the line that must be revisited alongside the
+        // leaderboard's own gate.
         const res = await app.inject({method: 'GET', url: '/api/leaderboard/availability', headers: authHeaders(amyToken)});
         expect(res.statusCode).toBe(403);
     });

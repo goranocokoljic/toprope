@@ -31,8 +31,10 @@ npm install
 npm run build      # compiles server + dashboard into dist/
 ```
 
-> If `npm install` fails TLS verification behind a corporate proxy, install the
-> failing package once with `npm install <pkg> --strict-ssl=false`.
+> If `npm install` fails TLS verification behind a **trusted corporate proxy**,
+> install the failing package once with `npm install <pkg> --strict-ssl=false`.
+> Scope it to the single failing package — never disable TLS globally, and don't
+> use this on an untrusted network.
 
 ---
 
@@ -81,13 +83,18 @@ proceed until it is green.
 ## 4. Register developers (10 min)
 
 Snapshots are attributed to developers by their tool identities and git commit
-emails. Register each person once:
+emails. Register each person, then link their AI-tool identities. `dev add`
+takes the name/team/email and git identities; the AI-tool identities (Copilot,
+Claude Code, Windsurf) are attached with `dev link`:
 
 ```powershell
+# 1. create the developer record (prints the generated developer id)
 npx govproxy dev add --name "Jane Dev" --team engineering `
     --email jane@company.com `
-    --bitbucket jane-bb --git-email jane@personal.com `
-    --copilot jane-gh --claude-code jane@company.com
+    --bitbucket jane-bb --git-email jane@personal.com
+
+# 2. link AI-tool identities to that id (note: --claude, not --claude-code)
+npx govproxy dev link --id <dev-id> --copilot jane-gh --claude jane@company.com
 ```
 
 For GitHub orgs you can bootstrap the roster with `npx govproxy dev discover`.

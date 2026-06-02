@@ -23,6 +23,10 @@ import {
  * multi-provider history). The build is shared across the suite (beforeAll) so
  * we measure steady-state query cost, not setup.
  */
+// The issue's hard target is 2s. This is a deliberately loose ceiling: the real
+// signal is "no pathological N+1 / full-scan regression", not a precise SLA. In
+// memory queries here run in single-digit ms, so 2000ms leaves wide headroom for
+// a contended CI runner without becoming a wall-clock flake.
 const LOAD_TARGET_MS = 2000;
 const TEAMS = ['frontend', 'backend', 'platform', 'data', 'mobile', 'sre'];
 const DEVS_PER_TEAM = 10;
