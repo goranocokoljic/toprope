@@ -47,7 +47,7 @@ function ChurnExplainer({churn}: {churn: number | null}): JSX.Element {
         <Card title="What code churn means">
             <p className="text-sm text-muted">
                 Churn is the share of your recently-written code that gets rewritten or deleted again
-                soon after. {churn === null ? 'There isn’t enough data to estimate it for this range yet.' : `Averaged across your active days in this range, it was about ${formatPercent(churn)}.`}
+                soon after. {churn === null ? 'There isn’t enough data to estimate it for this range yet.' : `Averaged across the days we could measure it in this range, it was about ${formatPercent(churn)}.`}
             </p>
             <p className="mt-2 text-sm text-muted">
                 A higher number isn’t automatically bad — it often just reflects healthy iteration or
@@ -61,12 +61,10 @@ function ChurnExplainer({churn}: {churn: number | null}): JSX.Element {
 
 // --- Multi-provider breakdown ----------------------------------------------
 
-/** True when the breakdown contains a merged multi-provider bucket. */
-function hasMultiBucket(providers: MeProviderActivity[]): boolean {
-    return providers.some((p) => p.provider === 'multi');
-}
-
 function ProviderBreakdown({providers}: {providers: MeProviderActivity[]}): JSX.Element {
+    // A day active on more than one provider is stored merged under a 'multi'
+    // bucket; only then do we show the explanatory note.
+    const hasMultiBucket = providers.some((p) => p.provider === 'multi');
     return (
         <Card title="Across your git providers">
             <p className="-mt-2 mb-4 text-xs text-muted">
@@ -98,7 +96,7 @@ function ProviderBreakdown({providers}: {providers: MeProviderActivity[]}): JSX.
                     </tbody>
                 </table>
             </div>
-            {hasMultiBucket(providers) ? (
+            {hasMultiBucket ? (
                 <p className="mt-3 text-xs text-muted">
                     “Multiple providers” covers days you were active on more than one provider, which are
                     recorded together. Your totals above always reflect the full cross-provider sum.

@@ -59,9 +59,8 @@ function seedToolSnapshot(
         isActive?: boolean;
         interactions?: number;
         acceptances?: number;
-        // Production connectors store a {feature: count} object; a legacy array
-        // (names only) is also accepted. Both are exercised here.
-        features?: string[] | Record<string, number>;
+        // Production connectors store a {feature: count} object.
+        features?: Record<string, number>;
     },
 ): void {
     const tool = opts.tool ?? 'copilot';
@@ -397,17 +396,18 @@ describe('Developer API (Task 2.4)', () => {
             expect(windsurf.estimated_monthly_cost).toBe(0); // no subscription
         });
 
-        it('accepts the legacy array feature form and drops non-count metric keys', async () => {
-            // Legacy array form counts one occurrence per name; ai_code_percentage
-            // is a derived metric, not a usage count, so it is excluded.
+        it('drops non-count metric keys and ignores non-numeric feature values', async () => {
+            // ai_code_percentage is a derived metric, not a usage count, so it is
+            // excluded. A non-numeric value (a shape regression) is silently
+            // skipped rather than corrupting the tally — see accumulateFeatures.
             seedToolSnapshot(db, {
                 developer: 'alice', date: '2026-05-10', tool: 'windsurf',
-                interactions: 20, acceptances: 10, features: ['autocomplete', 'chat'],
+                interactions: 20, acceptances: 10, features: {autocomplete: 1, chat: 1},
             });
             seedToolSnapshot(db, {
                 developer: 'alice', date: '2026-05-11', tool: 'windsurf',
                 interactions: 20, acceptances: 10,
-                features: {autocomplete: 100, ai_code_percentage: 37},
+                features: {autocomplete: 100, ai_code_percentage: 37, cascade: 'oops' as unknown as number},
             });
 
             const res = await app.inject({
@@ -420,13 +420,14 @@ describe('Developer API (Task 2.4)', () => {
                 data: {tools: Array<{tool: string; feature_usage: Array<{feature: string; count: number}>}>};
             };
             const windsurf = data.tools.find((t) => t.tool === 'windsurf')!;
-            // autocomplete: 1 (array occurrence) + 100 (object count) = 101; chat: 1.
-            // ai_code_percentage never appears.
+            // autocomplete: 1 + 100 = 101; chat: 1. ai_code_percentage (non-count)
+            // and cascade (non-numeric value) never appear.
             expect(windsurf.feature_usage).toEqual([
                 {feature: 'autocomplete', count: 101},
                 {feature: 'chat', count: 1},
             ]);
             expect(windsurf.feature_usage.some((f) => f.feature === 'ai_code_percentage')).toBe(false);
+            expect(windsurf.feature_usage.some((f) => f.feature === 'cascade')).toBe(false);
         });
     });
 

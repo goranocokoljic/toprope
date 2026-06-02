@@ -224,16 +224,19 @@ export function getMeOverview(
 const NON_COUNT_FEATURE_KEYS = new Set<string>(['ai_code_percentage']);
 
 /**
- * Stored features_used as written by the connectors is a JSON object mapping a
- * feature key to its usage count for that day, e.g.
- * `{"completions": 120, "chat": 8}` (see the copilot/windsurf/claude-code
- * transformers). Accumulate those counts into `into` for a single snapshot row.
+ * Stored features_used as written by every connector is a JSON object mapping a
+ * feature key to its usage count for that day, e.g. `{"completions": 120,
+ * "chat": 8}` (see the copilot/windsurf/claude-code transformers — all three use
+ * `JSON.stringify(Record<string, number>)`). Accumulate those counts into `into`
+ * for a single snapshot row.
  *
- * A legacy array form (`["completions", "chat"]`, names only) is also accepted
- * and treated as one occurrence each, so older rows still contribute a count.
- * Any row that is absent, unparseable, or otherwise shaped contributes nothing
- * rather than throwing. Non-count keys (see NON_COUNT_FEATURE_KEYS) and
- * non-positive counts are skipped so the breakdown stays a clean usage tally.
+ * Only numeric values are counted — by design. A row that is absent,
+ * unparseable, not an object, or whose value isn't a number contributes nothing
+ * rather than throwing, so a connector that ever changed a value's shape would
+ * drop that feature from the breakdown instead of corrupting the tally (see the
+ * "ignores non-numeric feature values" test). Non-count keys (see
+ * NON_COUNT_FEATURE_KEYS) and non-positive counts are skipped so the breakdown
+ * stays a clean usage tally.
  */
 function accumulateFeatures(raw: string | null, into: Map<string, number>): void {
     if (!raw) {
@@ -245,21 +248,17 @@ function accumulateFeatures(raw: string | null, into: Map<string, number>): void
     } catch {
         return;
     }
-    const add = (key: string, count: number): void => {
-        if (NON_COUNT_FEATURE_KEYS.has(key) || !Number.isFinite(count) || count <= 0) {
-            return;
-        }
-        into.set(key, (into.get(key) ?? 0) + count);
-    };
-    if (Array.isArray(parsed)) {
-        for (const v of parsed) {
-            if (typeof v === 'string') add(v, 1);
-        }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
         return;
     }
-    if (parsed && typeof parsed === 'object') {
-        for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
-            if (typeof value === 'number') add(key, value);
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+        if (
+            typeof value === 'number' &&
+            Number.isFinite(value) &&
+            value > 0 &&
+            !NON_COUNT_FEATURE_KEYS.has(key)
+        ) {
+            into.set(key, (into.get(key) ?? 0) + value);
         }
     }
 }
