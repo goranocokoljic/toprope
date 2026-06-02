@@ -31,6 +31,10 @@ export const queryKeys = {
     meOverview: (window: string) => ['me', 'overview', window] as const,
     meTimeline: (window: string) => ['me', 'timeline', window] as const,
     meJourney: ['me', 'journey'] as const,
+    // Developer "My Tools" + "My Activity" (Task 2.9). Window-keyed so changing
+    // the time range refetches.
+    meTools: (window: string) => ['me', 'tools', window] as const,
+    meActivity: (window: string) => ['me', 'activity', window] as const,
     // Admin Management (Task 2.13).
     adminUsers: ['admin', 'users'] as const,
     adminTeams: ['admin', 'teams'] as const,

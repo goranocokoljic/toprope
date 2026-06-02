@@ -6,6 +6,8 @@ import {TeamDetail} from './pages/TeamDetail';
 import {WasteDetection} from './pages/WasteDetection';
 import {ComingSoon} from './pages/ComingSoon';
 import {DeveloperDashboard} from './pages/DeveloperDashboard';
+import {MyTools} from './pages/MyTools';
+import {MyActivity} from './pages/MyActivity';
 import {Preferences} from './pages/Preferences';
 import {Settings} from './pages/Settings';
 import {Leaderboard} from './pages/Leaderboard';
@@ -51,6 +53,8 @@ export function App(): JSX.Element {
                     }
                 />
                 <Route path="developer" element={<DeveloperDashboard />} />
+                <Route path="developer/tools" element={<MyTools />} />
+                <Route path="developer/activity" element={<MyActivity />} />
                 <Route path="preferences" element={<Preferences />} />
                 <Route
                     path="settings"

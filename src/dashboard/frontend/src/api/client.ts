@@ -13,9 +13,11 @@ import type {
     Leaderboard,
     LeaderboardAvailability,
     LeaderboardMetric,
+    MeActivity,
     MeJourney,
     MeOverview,
     MeTimeline,
+    MeTools,
     OverviewData,
     OverviewTrend,
     PaginatedResponse,
@@ -457,6 +459,18 @@ export const api = {
     /** Personal adoption journey: per-tool status + lifecycle milestones. */
     async getMeJourney(): Promise<MeJourney> {
         const body = await request<ApiEnvelope<MeJourney>>('/api/me/journey');
+        return body.data;
+    },
+
+    /** Per-tool usage detail (My Tools, Task 2.9) over a time window. */
+    async getMeTools(params: TimeRangeQuery): Promise<MeTools> {
+        const body = await request<ApiEnvelope<MeTools>>(`/api/me/tools${timeRangeQueryString(params)}`);
+        return body.data;
+    },
+
+    /** Personal git activity totals + per-provider breakdown (My Activity, Task 2.9). */
+    async getMeActivity(params: TimeRangeQuery): Promise<MeActivity> {
+        const body = await request<ApiEnvelope<MeActivity>>(`/api/me/activity${timeRangeQueryString(params)}`);
         return body.data;
     },
 
