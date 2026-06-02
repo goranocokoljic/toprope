@@ -286,7 +286,11 @@ Work through these axes against the diff:
   clobber a day.
 - **TypeScript strictness.** Per project rules: no `any` (use `unknown`
   + narrowing), explicit return types on exported functions, no unsafe
-  casts that paper over a real shape mismatch.
+  casts that paper over a real shape mismatch. Verify discriminated-union
+  `switch` statements are exhaustive (a `const _: never = x` guard in the
+  `default`) — unless the `default` is a deliberate, documented fail-closed
+  branch (e.g. an auth/role gate that must deny unrecognized values), in
+  which case a `never` guard would be wrong; don't flag it.
 
 Cite concrete `file:line`. A theoretical risk with no path to it in this
 diff is a Low, not a Critical — rank by exploitability/likelihood given
