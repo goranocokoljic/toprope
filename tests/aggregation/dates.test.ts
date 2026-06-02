@@ -5,7 +5,7 @@ import {
     weekRange,
     monthRange,
     daysInMonth,
-    eachDay,
+    assertDateRange,
 } from '../../src/aggregation/dates';
 
 describe('isoWeekStart', () => {
@@ -73,17 +73,25 @@ describe('daysInMonth', () => {
     });
 });
 
-describe('addDays / eachDay', () => {
+describe('addDays', () => {
     it('adds across a month boundary', () => {
         expect(addDays('2026-05-31', 1)).toBe('2026-06-01');
         expect(addDays('2026-06-01', -1)).toBe('2026-05-31');
     });
+});
 
-    it('enumerates every day in an inclusive range', () => {
-        expect(eachDay({start: '2026-05-04', end: '2026-05-06'})).toEqual([
-            '2026-05-04',
-            '2026-05-05',
-            '2026-05-06',
-        ]);
+describe('assertDateRange', () => {
+    it('accepts a well-formed inclusive range (including a single day)', () => {
+        expect(() => assertDateRange('2026-05-04', '2026-05-10')).not.toThrow();
+        expect(() => assertDateRange('2026-05-04', '2026-05-04')).not.toThrow();
+    });
+
+    it('throws when start is after end', () => {
+        expect(() => assertDateRange('2026-05-10', '2026-05-04')).toThrow(/after end/);
+    });
+
+    it('throws on a malformed or empty bound', () => {
+        expect(() => assertDateRange('', '2026-05-10')).toThrow();
+        expect(() => assertDateRange('2026-05-04', 'nope')).toThrow();
     });
 });

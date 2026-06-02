@@ -17,6 +17,7 @@
 
 import type Database from 'better-sqlite3';
 import {getDeveloperProratedCost} from '../expenses/subscription-tracker';
+import {assertDateRange} from './dates';
 
 export type DataQuality = 'high' | 'medium' | 'low';
 
@@ -67,6 +68,8 @@ interface ToolRow {
 }
 
 /** Round to `dp` decimals, preserving null. Strips float artifacts from sums/means. */
+export function round(value: number, dp: number): number;
+export function round(value: number | null, dp: number): number | null;
 export function round(value: number | null, dp: number): number | null {
     if (value === null) {
         return null;
@@ -111,6 +114,11 @@ export function computePeriodMetrics(
     start: string,
     end: string,
 ): PeriodMetrics {
+    // Guard this exported boundary: callers in-tree pass weekRange/monthRange
+    // output, but a malformed window must fail loudly rather than silently
+    // widen the snapshot queries below.
+    assertDateRange(start, end);
+
     const gitRows = db
         .prepare(
             `SELECT date, commits, lines_added, lines_removed, files_changed,
@@ -174,7 +182,10 @@ export function computePeriodMetrics(
             toolsUsed.add(row.tool);
         }
     }
-    const avgAcceptanceRate = meanOrNull(toolRows.map((r) => r.acceptance_rate));
+    // Interaction-weighted acceptance rate (total accepted / total offered), not a
+    // flat mean of per-row rates — a day with 1 interaction must not weigh the same
+    // as a day with 1000. Null when there are no interactions to divide by.
+    const avgAcceptanceRate = totalInteractions > 0 ? totalAcceptances / totalInteractions : null;
     const estimatedTotalCost = estimatedCostSeen ? estimatedCostSum : null;
 
     // Prorated subscription spend for the window (mid-period plan changes handled
@@ -182,9 +193,14 @@ export function computePeriodMetrics(
     const subscriptionCost = getDeveloperProratedCost(db, developerId, start, end);
     const costPerPr = totalPrsMerged > 0 ? subscriptionCost / totalPrsMerged : null;
 
-    // Data quality = highest tier available for this developer this period.
+    // Data quality = highest tier available for this developer this period. "high"
+    // requires an actual tool *usage* signal, not merely the presence of a tool
+    // snapshot row: a connector may write a daily "seat exists, unused today" row
+    // (is_active=0, zero interactions), and tagging that period high-confidence
+    // would dishonestly imply measured adoption where there is none. Such a period
+    // falls through to the git tier (or low) like any other no-usage period.
     let dataQuality: DataQuality;
-    if (toolRows.length > 0) {
+    if (toolRows.some(hasToolActivity)) {
         dataQuality = 'high';
     } else if (gitRows.length > 0) {
         dataQuality = 'medium';
@@ -206,7 +222,7 @@ export function computePeriodMetrics(
         total_prs_merged: totalPrsMerged,
         avg_code_churn: round(avgCodeChurn, 4),
         avg_ai_signature_score: round(avgAiSignature, 4),
-        subscription_cost: round(subscriptionCost, 2) as number,
+        subscription_cost: round(subscriptionCost, 2),
         cost_per_pr: round(costPerPr, 2),
         data_quality: dataQuality,
     };

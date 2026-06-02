@@ -95,9 +95,30 @@ describe('computeWeeklyAggregate', () => {
         expect(row.data_quality).toBe('high');
         expect(row.total_interactions).toBe(50);
         expect(row.total_acceptances).toBe(38);
-        expect(row.avg_acceptance_rate).toBeCloseTo(0.775, 5);
+        // Interaction-weighted: 38 accepted / 50 offered, not the flat mean (0.775).
+        expect(row.avg_acceptance_rate).toBe(0.76);
         expect(row.estimated_total_cost).toBe(2);
         expect(JSON.parse(row.tools_used)).toEqual(['claude_code', 'copilot']);
+    });
+
+    it('does not upgrade to "high" for a dormant (unused) seat snapshot', () => {
+        addGitSnapshot(db, 'dev-1', '2026-05-04', {commits: 2});
+        // A connector wrote a "seat exists, unused today" row: no usage signal.
+        addToolSnapshot(db, 'dev-1', '2026-05-04', {
+            tool: 'copilot',
+            is_active: 0,
+            interaction_count: 0,
+            acceptance_count: 0,
+        });
+
+        const row = computeWeeklyAggregate(db, 'dev-1', WEEK, NOW);
+
+        // The git signal is the real evidence here — quality stays medium.
+        expect(row.data_quality).toBe('medium');
+        expect(row.avg_acceptance_rate).toBeNull();
+        expect(row.tools_used).toBe('[]');
+        // active_days still counts the git day, not the dormant tool row.
+        expect(row.active_days).toBe(1);
     });
 
     it('counts distinct active days, not total events (git + tool on the same day)', () => {
