@@ -1,5 +1,10 @@
 import Database from 'better-sqlite3';
 import {randomUUID} from 'crypto';
+import {addDays, daysInMonth, assertDateRange} from '../aggregation/dates';
+
+// Re-exported for back-compat: callers (plan-roi, tests) historically imported
+// addDays from here. The canonical implementation now lives in aggregation/dates.
+export {addDays};
 
 export interface Subscription {
     id: string;
@@ -549,12 +554,6 @@ export function getDeveloperCostOnDate(
     return sumActiveOnDate(getCostedSubscriptions(db, developerId), date);
 }
 
-/** Add `days` (may be negative) to a YYYY-MM-DD date, returning YYYY-MM-DD (UTC). */
-export function addDays(date: string, days: number): string {
-    const ms = Date.parse(`${date}T00:00:00.000Z`) + days * 86_400_000;
-    return new Date(ms).toISOString().slice(0, 10);
-}
-
 /**
  * Per-day active monthly cost for a developer across an inclusive [from, to]
  * window. Each point is the rate in effect on that date, so summing or charting
@@ -578,6 +577,41 @@ export function getDeveloperCostOverTime(
         points.push({date, monthly_cost: sumActiveOnDate(subs, date)});
     }
     return points;
+}
+
+/**
+ * Prorated subscription spend for a developer across an inclusive [from, to]
+ * window — the actual money the org spent on that developer's seats during the
+ * period, as opposed to {@link getDeveloperCostOnDate} which returns the monthly
+ * *rate* in effect on a day.
+ *
+ * Each day contributes the monthly rate in effect that day divided by the number
+ * of days in that day's calendar month. So a seat held for a full calendar month
+ * contributes exactly one monthly charge, a seat held for one week of a 31-day
+ * month contributes 7/31 of a charge, and a mid-period plan change is billed at
+ * the old rate up to the change date and the new rate after — because the
+ * per-day rate comes from {@link isActiveOnDate}, the single home for the
+ * active-on-date rule. Dividing by the day's own month length keeps a week that
+ * straddles a month boundary correct (Feb days divide by 28/29, March by 31).
+ */
+export function getDeveloperProratedCost(
+    db: Database.Database,
+    developerId: string,
+    from: string,
+    to: string,
+): number {
+    // Self-defend: the day-stepping loop below compares dates lexicographically,
+    // which is only chronologically correct for valid fixed-width YYYY-MM-DD
+    // bounds with from <= to. Validate here so a direct caller can't trigger a
+    // degenerate or runaway loop with a malformed window.
+    assertDateRange(from, to);
+
+    const subs = getCostedSubscriptions(db, developerId);
+    let total = 0;
+    for (let date = from; date <= to; date = addDays(date, 1)) {
+        total += sumActiveOnDate(subs, date) / daysInMonth(date);
+    }
+    return total;
 }
 
 /**
