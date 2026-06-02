@@ -256,6 +256,75 @@ export interface MeTimeline {
     points: DeveloperTimelinePoint[];
 }
 
+// --- Developer "My Tools" + "My Activity" (Task 2.9) --------------------
+
+/** One feature's usage count for a tool over the window. From /api/me/tools. */
+export interface FeatureUsage {
+    feature: string;
+    count: number;
+}
+
+/** One day of a tool's own interaction count, for the per-tool activity trend. */
+export interface ToolActivityPoint {
+    date: string;
+    interactions: number;
+}
+
+/** Per-tool breakdown scoped to the developer. From /api/me/tools. */
+export interface MeToolBreakdown {
+    tool: string;
+    active_days: number;
+    interactions: number;
+    acceptances: number;
+    acceptance_rate: number | null;
+    /** Per-feature usage counts, most-used first. */
+    feature_usage: FeatureUsage[];
+    /** Daily interaction counts over the window, ascending. */
+    activity: ToolActivityPoint[];
+    estimated_monthly_cost: number;
+}
+
+/** Per-tool usage detail over a resolved window. From /api/me/tools. */
+export interface MeTools {
+    range: TimeRangeKind;
+    from: string;
+    to: string;
+    tools: MeToolBreakdown[];
+}
+
+/** One git provider's contribution to the developer's activity. */
+export interface MeProviderActivity {
+    provider: string;
+    commits: number;
+    lines_added: number;
+    lines_removed: number;
+    files_changed: number;
+    prs_opened: number;
+    prs_merged: number;
+}
+
+/**
+ * The developer's git activity over a window. `totals` are the authoritative
+ * cross-provider sums; `providers` is the per-source breakdown (a day active on
+ * more than one provider is stored merged under a 'multi' bucket). `avg_churn_rate`
+ * is a 0..1 ratio and a rough trend indicator only. From /api/me/activity.
+ */
+export interface MeActivity {
+    range: TimeRangeKind;
+    from: string;
+    to: string;
+    totals: {
+        commits: number;
+        lines_added: number;
+        lines_removed: number;
+        files_changed: number;
+        prs_opened: number;
+        prs_merged: number;
+        avg_churn_rate: number | null;
+    };
+    providers: MeProviderActivity[];
+}
+
 export type MeJourneyEventType = 'started' | 'plan_change' | 'tool_switch';
 
 /** Current per-tool status on the adoption journey. */
