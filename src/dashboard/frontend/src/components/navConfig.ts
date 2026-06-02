@@ -21,7 +21,14 @@ const MANAGER_ITEMS: NavItem[] = [
 // (Task 2.17). The leaderboard ships off by default; when off it must leave no
 // trace, so the nav entry is omitted entirely rather than rendered-and-blocked.
 const LEADERBOARD_ITEM: NavItem = {to: '/manager/leaderboard', label: 'Leaderboard'};
-const DEVELOPER_SECTION: NavSection = {title: 'Developer', items: [{to: '/developer', label: 'My Dashboard'}]};
+const DEVELOPER_SECTION: NavSection = {
+    title: 'Developer',
+    items: [
+        {to: '/developer', label: 'My Dashboard'},
+        {to: '/developer/tools', label: 'My Tools'},
+        {to: '/developer/activity', label: 'My Activity'},
+    ],
+};
 const ACCOUNT_SECTION: NavSection = {title: 'Account', items: [{to: '/preferences', label: 'Preferences'}]};
 const ADMIN_SECTION: NavSection = {
     title: 'Admin',

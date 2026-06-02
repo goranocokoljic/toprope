@@ -28,13 +28,35 @@ export interface MeOverview {
     estimated_monthly_cost: number;
 }
 
+/** One feature's usage for a tool over the window, summed across the days. */
+export interface FeatureUsage {
+    /** Raw feature key as the connector stored it (e.g. 'completions', 'cascade'). */
+    feature: string;
+    /** Total times the feature was used in the window (sum of per-day counts). */
+    count: number;
+}
+
+/** One day of a tool's own interaction count, for the per-tool activity trend. */
+export interface ToolActivityPoint {
+    date: string;
+    interactions: number;
+}
+
 export interface MeToolBreakdown {
     tool: string;
     active_days: number;
     interactions: number;
     acceptances: number;
     acceptance_rate: number | null;
-    features_used: string[];
+    /**
+     * Per-feature usage counts over the window, sorted most-used first. This is
+     * what makes premium under-utilization visually obvious on the My Tools
+     * screen — a Windsurf Max seat whose only non-zero feature is `autocomplete`
+     * reads at a glance. Empty when no feature data was recorded for the tool.
+     */
+    feature_usage: FeatureUsage[];
+    /** Daily interaction counts over the window (ascending), for a per-tool sparkline/trend. */
+    activity: ToolActivityPoint[];
     estimated_monthly_cost: number;
 }
 
@@ -193,26 +215,58 @@ export function getMeOverview(
 }
 
 /**
- * Stored features_used is a JSON array string (written by the connectors as
- * JSON.stringify(string[])). Parse it back to a string array; any row that is
- * absent, unparseable, or not an array of strings contributes no features
- * rather than throwing.
+ * Feature keys that carry a derived metric (e.g. a percentage) rather than a
+ * usage count. They live alongside the real per-feature counts in the connector
+ * payload, but summing them as if they were counts would be meaningless, so the
+ * breakdown drops them. Kept minimal and explicit — extend only for keys we know
+ * are not counts.
  */
-function parseFeatures(raw: string | null): string[] {
+const NON_COUNT_FEATURE_KEYS = new Set<string>(['ai_code_percentage']);
+
+/**
+ * Stored features_used as written by every connector is a JSON object mapping a
+ * feature key to its usage count for that day, e.g. `{"completions": 120,
+ * "chat": 8}` (see the copilot/windsurf/claude-code transformers — all three use
+ * `JSON.stringify(Record<string, number>)`). Accumulate those counts into `into`
+ * for a single snapshot row.
+ *
+ * Only numeric values are counted — by design. A row that is absent,
+ * unparseable, not an object, or whose value isn't a number contributes nothing
+ * rather than throwing, so a connector that ever changed a value's shape would
+ * drop that feature from the breakdown instead of corrupting the tally (see the
+ * "ignores non-numeric feature values" test). Non-count keys (see
+ * NON_COUNT_FEATURE_KEYS) and non-positive counts are skipped so the breakdown
+ * stays a clean usage tally.
+ */
+function accumulateFeatures(raw: string | null, into: Map<string, number>): void {
     if (!raw) {
-        return [];
+        return;
     }
+    let parsed: unknown;
     try {
-        const parsed = JSON.parse(raw) as unknown;
-        return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === 'string') : [];
+        parsed = JSON.parse(raw);
     } catch {
-        return [];
+        return;
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return;
+    }
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+        if (
+            typeof value === 'number' &&
+            Number.isFinite(value) &&
+            value > 0 &&
+            !NON_COUNT_FEATURE_KEYS.has(key)
+        ) {
+            into.set(key, (into.get(key) ?? 0) + value);
+        }
     }
 }
 
 /**
- * Per-tool breakdown for the developer: activity, acceptance rate, the union of
- * features touched, and the monthly cost of the matching active subscription.
+ * Per-tool breakdown for the developer: activity, acceptance rate, per-feature
+ * usage counts, a daily interaction series, and the monthly cost of the matching
+ * active subscription.
  */
 export function getMeTools(
     db: Database.Database,
@@ -220,21 +274,22 @@ export function getMeTools(
     from: string,
     to: string,
 ): MeToolBreakdown[] {
+    // active_days and acceptances per tool. Interactions are NOT summed here —
+    // the headline per-tool total is derived from the daily `activity` series
+    // below so the sparkline and its headline figure share one source and can
+    // never drift (e.g. if one query later gains an is_active filter).
     const rows = db
         .prepare(
             `SELECT tool,
                     COUNT(DISTINCT CASE WHEN is_active = 1 THEN date END) AS active_days,
-                    COALESCE(SUM(interaction_count), 0) AS interactions,
                     COALESCE(SUM(acceptance_count), 0) AS acceptances
              FROM tool_snapshots
              WHERE developer_id = ? AND date >= ? AND date <= ?
-             GROUP BY tool
-             ORDER BY interactions DESC, tool`,
+             GROUP BY tool`,
         )
         .all(developerId, from, to) as {
         tool: string;
         active_days: number;
-        interactions: number;
         acceptances: number;
     }[];
 
@@ -250,7 +305,7 @@ export function getMeTools(
         .all(developerId) as {tool: string; cost: number}[];
     const costByTool = new Map(costRows.map((r) => [r.tool, r.cost]));
 
-    // Feature union per tool over the window.
+    // Per-feature usage counts per tool over the window, summed across every day.
     const featureRows = db
         .prepare(
             `SELECT tool, features_used
@@ -258,24 +313,56 @@ export function getMeTools(
              WHERE developer_id = ? AND date >= ? AND date <= ? AND features_used IS NOT NULL`,
         )
         .all(developerId, from, to) as {tool: string; features_used: string | null}[];
-    const featuresByTool = new Map<string, Set<string>>();
+    const featureCountsByTool = new Map<string, Map<string, number>>();
     for (const r of featureRows) {
-        const set = featuresByTool.get(r.tool) ?? new Set<string>();
-        for (const f of parseFeatures(r.features_used)) {
-            set.add(f);
+        let counts = featureCountsByTool.get(r.tool);
+        if (!counts) {
+            counts = new Map<string, number>();
+            featureCountsByTool.set(r.tool, counts);
         }
-        featuresByTool.set(r.tool, set);
+        accumulateFeatures(r.features_used, counts);
     }
 
-    return rows.map((r) => ({
-        tool: r.tool,
-        active_days: r.active_days,
-        interactions: r.interactions,
-        acceptances: r.acceptances,
-        acceptance_rate: r.interactions > 0 ? r.acceptances / r.interactions : null,
-        features_used: Array.from(featuresByTool.get(r.tool) ?? []).sort(),
-        estimated_monthly_cost: costByTool.get(r.tool) ?? 0,
-    }));
+    // Per-tool daily interaction series for the activity-over-time trend.
+    const activityRows = db
+        .prepare(
+            `SELECT tool, date, COALESCE(SUM(interaction_count), 0) AS interactions
+             FROM tool_snapshots
+             WHERE developer_id = ? AND date >= ? AND date <= ?
+             GROUP BY tool, date
+             ORDER BY tool, date`,
+        )
+        .all(developerId, from, to) as {tool: string; date: string; interactions: number}[];
+    const activityByTool = new Map<string, ToolActivityPoint[]>();
+    const interactionsByTool = new Map<string, number>();
+    for (const r of activityRows) {
+        const points = activityByTool.get(r.tool) ?? [];
+        points.push({date: r.date, interactions: r.interactions});
+        activityByTool.set(r.tool, points);
+        interactionsByTool.set(r.tool, (interactionsByTool.get(r.tool) ?? 0) + r.interactions);
+    }
+
+    return rows
+        .map((r) => {
+            // Most-used first, then alphabetically so equal counts order stably.
+            const featureUsage: FeatureUsage[] = Array.from(featureCountsByTool.get(r.tool) ?? [])
+                .map(([feature, count]) => ({feature, count}))
+                .sort((a, b) => b.count - a.count || a.feature.localeCompare(b.feature));
+            const interactions = interactionsByTool.get(r.tool) ?? 0;
+            return {
+                tool: r.tool,
+                active_days: r.active_days,
+                interactions,
+                acceptances: r.acceptances,
+                acceptance_rate: interactions > 0 ? r.acceptances / interactions : null,
+                feature_usage: featureUsage,
+                activity: activityByTool.get(r.tool) ?? [],
+                estimated_monthly_cost: costByTool.get(r.tool) ?? 0,
+            };
+        })
+        // Most-used tool first, name as a stable tie-break (the interactions
+        // ordering moved here from SQL when the headline total became derived).
+        .sort((a, b) => b.interactions - a.interactions || a.tool.localeCompare(b.tool));
 }
 
 /**

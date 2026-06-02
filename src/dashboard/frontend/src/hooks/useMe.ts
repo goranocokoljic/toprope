@@ -1,7 +1,7 @@
 import {useQuery, type UseQueryResult} from '@tanstack/react-query';
 import {api, type TimeRangeQuery} from '../api/client';
 import {queryKeys} from '../api/queryKeys';
-import type {MeJourney, MeOverview, MeTimeline} from '../api/types';
+import type {MeActivity, MeJourney, MeOverview, MeTimeline, MeTools} from '../api/types';
 import type {TimeRangeValue} from '../timeRange/range';
 import {trendQuery, trendWindowKey} from '../timeRange/trendQuery';
 
@@ -41,5 +41,21 @@ export function useMeJourney(): UseQueryResult<MeJourney, Error> {
     return useQuery({
         queryKey: queryKeys.meJourney,
         queryFn: api.getMeJourney,
+    });
+}
+
+/** Per-tool usage detail (My Tools, Task 2.9) for the selected window. */
+export function useMeTools(range: TimeRangeValue): UseQueryResult<MeTools, Error> {
+    return useQuery({
+        queryKey: queryKeys.meTools(trendWindowKey(range)),
+        queryFn: () => api.getMeTools(trendQuery(range)),
+    });
+}
+
+/** Personal git activity totals + per-provider breakdown (My Activity, Task 2.9). */
+export function useMeActivity(range: TimeRangeValue): UseQueryResult<MeActivity, Error> {
+    return useQuery({
+        queryKey: queryKeys.meActivity(trendWindowKey(range)),
+        queryFn: () => api.getMeActivity(trendQuery(range)),
     });
 }

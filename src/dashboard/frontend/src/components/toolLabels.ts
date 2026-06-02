@@ -19,6 +19,27 @@ const PROVIDER_LABELS: Record<string, string> = {
     git: 'Git',
 };
 
+/**
+ * Human labels for the raw per-feature keys the connectors store in
+ * `features_used` (Copilot, Windsurf, Claude Code). Used by the My Tools screen
+ * (Task 2.9) so the feature-usage breakdown reads in plain language rather than
+ * machine keys. Unknown keys fall back to Title Case.
+ */
+const FEATURE_LABELS: Record<string, string> = {
+    // Copilot
+    completions: 'Autocomplete',
+    chat: 'Chat',
+    chat_insertions: 'Chat insertions',
+    chat_copies: 'Chat copies',
+    // Windsurf
+    autocomplete: 'Autocomplete',
+    cascade: 'Cascade (agent)',
+    flows: 'Flows',
+    // Claude Code
+    commits: 'Commits',
+    prs_created: 'PRs created',
+};
+
 function titleCase(id: string): string {
     return id
         .split(/[_\s-]+/)
@@ -33,4 +54,8 @@ export function toolLabel(id: string): string {
 
 export function providerLabel(id: string): string {
     return PROVIDER_LABELS[id] ?? titleCase(id);
+}
+
+export function featureLabel(id: string): string {
+    return FEATURE_LABELS[id] ?? titleCase(id);
 }

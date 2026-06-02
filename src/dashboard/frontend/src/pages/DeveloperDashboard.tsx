@@ -11,6 +11,7 @@ import {SIGNIFICANCE_DAYS} from '../components/dataState';
 import {toolLabel} from '../components/toolLabels';
 import {formatCurrency, formatPercent, formatDateTick} from '../components/format';
 import {inclusiveDayCount, presetValue} from '../timeRange/range';
+import {earliestJourneyStart} from '../components/meHelpers';
 import type {MeJourney, MeJourneyEvent, MeJourneyTool, MeOverview, MeTimeline} from '../api/types';
 
 /**
@@ -52,20 +53,6 @@ function weekActiveDays(timeline: MeTimeline | undefined): number | null {
         }
     }
     return count;
-}
-
-/** Earliest started_on across all journey tools, or null if none recorded. */
-function earliestStart(journey: MeJourney | undefined): string | null {
-    if (!journey) {
-        return null;
-    }
-    let earliest: string | null = null;
-    for (const tool of journey.tools) {
-        if (tool.started_on && (earliest === null || tool.started_on < earliest)) {
-            earliest = tool.started_on;
-        }
-    }
-    return earliest;
 }
 
 /** 'YYYY-MM-DD' → "March 2026" for milestone labels; passes through bad input. */
@@ -324,7 +311,7 @@ export function DeveloperDashboard(): JSX.Element {
     const isPending = month.isPending || journey.isPending;
     const isError = month.isError || journey.isError;
 
-    const earliest = earliestStart(journey.data);
+    const earliest = earliestJourneyStart(journey.data);
     // "Building your history": no tool ever tracked and nothing active recently.
     const isColdStart =
         !isPending && !isError && (journey.data?.tools.length ?? 0) === 0 && (month.data?.active_days ?? 0) === 0;

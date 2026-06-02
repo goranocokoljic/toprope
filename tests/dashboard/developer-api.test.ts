@@ -59,7 +59,8 @@ function seedToolSnapshot(
         isActive?: boolean;
         interactions?: number;
         acceptances?: number;
-        features?: string[];
+        // Production connectors store a {feature: count} object.
+        features?: Record<string, number>;
     },
 ): void {
     const tool = opts.tool ?? 'copilot';
@@ -340,14 +341,15 @@ describe('Developer API (Task 2.4)', () => {
 
     // ── tools ────────────────────────────────────────────────────────────────
     describe('GET /api/me/tools', () => {
-        it('breaks down activity, acceptance, features, and cost per tool', async () => {
+        it('breaks down activity, acceptance, feature counts, and cost per tool', async () => {
+            // Production object form: {feature: count}. Counts sum across days.
             seedToolSnapshot(db, {
                 developer: 'alice', date: '2026-05-10', tool: 'copilot',
-                interactions: 50, acceptances: 30, features: ['completion', 'chat'],
+                interactions: 50, acceptances: 30, features: {completions: 40, chat: 5},
             });
             seedToolSnapshot(db, {
                 developer: 'alice', date: '2026-05-11', tool: 'copilot',
-                interactions: 50, acceptances: 10, features: ['chat', 'cli'],
+                interactions: 50, acceptances: 10, features: {chat: 3, chat_copies: 2},
             });
             seedToolSnapshot(db, {developer: 'alice', date: '2026-05-12', tool: 'windsurf', interactions: 10, acceptances: 8});
             seedSubscription(db, {id: 's1', developer: 'alice', tool: 'copilot', cost: 19});
@@ -366,7 +368,8 @@ describe('Developer API (Task 2.4)', () => {
                         interactions: number;
                         acceptances: number;
                         acceptance_rate: number | null;
-                        features_used: string[];
+                        feature_usage: Array<{feature: string; count: number}>;
+                        activity: Array<{date: string; interactions: number}>;
                         estimated_monthly_cost: number;
                     }>;
                 };
@@ -376,12 +379,55 @@ describe('Developer API (Task 2.4)', () => {
             expect(copilot.interactions).toBe(100);
             expect(copilot.acceptances).toBe(40);
             expect(copilot.acceptance_rate).toBeCloseTo(0.4);
-            // Feature union across both days, sorted.
-            expect(copilot.features_used).toEqual(['chat', 'cli', 'completion']);
+            // Per-feature counts, summed across both days and ordered most-used first.
+            expect(copilot.feature_usage).toEqual([
+                {feature: 'completions', count: 40},
+                {feature: 'chat', count: 8},
+                {feature: 'chat_copies', count: 2},
+            ]);
+            // Daily interaction series, ascending by date.
+            expect(copilot.activity).toEqual([
+                {date: '2026-05-10', interactions: 50},
+                {date: '2026-05-11', interactions: 50},
+            ]);
             expect(copilot.estimated_monthly_cost).toBe(19);
 
             const windsurf = data.tools.find((t) => t.tool === 'windsurf')!;
             expect(windsurf.estimated_monthly_cost).toBe(0); // no subscription
+        });
+
+        it('drops non-count metric keys and ignores non-numeric feature values', async () => {
+            // ai_code_percentage is a derived metric, not a usage count, so it is
+            // excluded. A non-numeric value (a shape regression) is silently
+            // skipped rather than corrupting the tally — see accumulateFeatures.
+            seedToolSnapshot(db, {
+                developer: 'alice', date: '2026-05-10', tool: 'windsurf',
+                interactions: 20, acceptances: 10, features: {autocomplete: 1, chat: 1},
+            });
+            seedToolSnapshot(db, {
+                developer: 'alice', date: '2026-05-11', tool: 'windsurf',
+                interactions: 20, acceptances: 10,
+                features: {autocomplete: 100, ai_code_percentage: 37, cascade: 'oops' as unknown as number},
+            });
+
+            const res = await app.inject({
+                method: 'GET',
+                url: '/api/me/tools?range=custom&from=2026-05-01&to=2026-05-31',
+                headers: authHeaders(aliceToken),
+            });
+            expect(res.statusCode).toBe(200);
+            const {data} = res.json() as {
+                data: {tools: Array<{tool: string; feature_usage: Array<{feature: string; count: number}>}>};
+            };
+            const windsurf = data.tools.find((t) => t.tool === 'windsurf')!;
+            // autocomplete: 1 + 100 = 101; chat: 1. ai_code_percentage (non-count)
+            // and cascade (non-numeric value) never appear.
+            expect(windsurf.feature_usage).toEqual([
+                {feature: 'autocomplete', count: 101},
+                {feature: 'chat', count: 1},
+            ]);
+            expect(windsurf.feature_usage.some((f) => f.feature === 'ai_code_percentage')).toBe(false);
+            expect(windsurf.feature_usage.some((f) => f.feature === 'cascade')).toBe(false);
         });
     });
 
