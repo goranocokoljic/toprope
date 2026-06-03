@@ -23,6 +23,7 @@ import {registerLeaderboardRoutes} from './dashboard/api/leaderboard';
 import {registerAdminRoutes} from './dashboard/api/admin';
 import {registerDashboardStatic} from './dashboard/static';
 import {startScheduler} from './scheduler/scheduler';
+import {startAggregationScheduler} from './aggregation/scheduler';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, './storage/migrations');
 
@@ -96,8 +97,12 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
 
     if (config.connectors && dbPath !== ':memory:') {
         const tasks = startScheduler(config as GovProxyConfig, dbPath);
+        // Aggregation rollups run on their own period boundaries (04:00+ UTC),
+        // deliberately after the connector syncs above so each rollup folds a
+        // daily-snapshot table the day's sync has already populated.
+        const aggregationTasks = startAggregationScheduler(dbPath);
         app.addHook('onClose', () => {
-            for (const task of tasks) task.stop();
+            for (const task of [...tasks, ...aggregationTasks]) task.stop();
         });
     }
 

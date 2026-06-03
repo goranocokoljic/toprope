@@ -31,6 +31,13 @@ import {
 } from './expenses/waste-detector';
 import {evaluatePlanRoi} from './expenses/plan-roi';
 import {runBackfill, type BackfillProgress} from './aggregation/backfill';
+import {
+    AGGREGATION_PERIODS,
+    type AggregationPeriod,
+    justCompletedPeriod,
+    periodKeyContaining,
+    runAggregationForPeriod,
+} from './aggregation/scheduler';
 import {hashPassword, validatePasswordStrength, generateTempPassword} from './auth/password';
 import {createUser, getActiveUserByEmail, countAdmins} from './auth/users';
 
@@ -910,6 +917,60 @@ wasteCommand
     });
 
 const aggregateCommand = program.command('aggregate').description('Compute trend aggregates');
+
+// Manual trigger for a single level — the same code path the scheduler runs, so
+// it reproduces a scheduled run exactly. With no --date it targets the
+// just-completed period (what the scheduled job would compute now); with --date
+// it targets the period that day falls in (for backfilling/re-running one period).
+aggregateCommand
+    .description('Compute trend aggregates (manually trigger one level, or use a subcommand)')
+    .option(
+        '--period <level>',
+        'Aggregate one level now: weekly | monthly | quarterly | yearly',
+    )
+    .option(
+        '--date <date>',
+        'Target the period containing this day (YYYY-MM-DD). Defaults to the just-completed period.',
+    )
+    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .action((options: {period?: string; date?: string; config: string}) => {
+        // No --period and no subcommand → nothing to do; show help and exit non-zero.
+        if (!options.period) {
+            aggregateCommand.help({error: true});
+            return;
+        }
+        if (!(AGGREGATION_PERIODS as readonly string[]).includes(options.period)) {
+            console.error(
+                `Error: invalid --period '${options.period}'. Expected one of: ${AGGREGATION_PERIODS.join(', ')}.`,
+            );
+            process.exit(1);
+        }
+        const period = options.period as AggregationPeriod;
+
+        const configPath = path.resolve(process.cwd(), options.config);
+        const config = loadConfig(configPath);
+        const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
+        const db = openDb(dbPath);
+        try {
+            runMigrations(db, MIGRATIONS_DIR);
+            const now = new Date();
+            let periodKey: string;
+            try {
+                periodKey = options.date
+                    ? periodKeyContaining(period, options.date)
+                    : justCompletedPeriod(period, now);
+            } catch (err) {
+                console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+                process.exit(1);
+            }
+            const result = runAggregationForPeriod(db, period, periodKey, now);
+            console.log(
+                `Aggregate ${result.period} complete — period ${result.periodKey}, ${result.rowsWritten} row(s) written.`,
+            );
+        } finally {
+            db.close();
+        }
+    });
 
 aggregateCommand
     .command('backfill')
