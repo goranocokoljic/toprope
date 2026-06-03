@@ -11,19 +11,20 @@
  *   1. By construction — the input type (`AggregateMetrics`) carries only numeric
  *      metrics, so there is no field through which repo free text could enter the
  *      payload. This is the primary guarantee.
- *   2. A runtime allowlist gate (`assertNumbersOnly`) that verifies every string
- *      in the assembled payload belongs to the controlled set: the level / scope
- *      type / data-quality / maturity-basis enums, the period key + ISO dates (a
- *      restricted character class), one of the generated data_basis sentences,
- *      and the scope name (the one operator/registry-supplied label, which is
- *      length- and character-restricted — never repo free text). `buildSummaryInput`
- *      runs this gate on its own output, so the guarantee is enforced at
- *      construction, not left for a future caller to remember.
+ *   2. A runtime allowlist gate (`assertNumbersOnly`) that validates each
+ *      string-typed field against the format/enum it is *supposed* to hold: the
+ *      level / scope-type / data-quality / maturity-basis enums, the period label
+ *      and ISO dates against their exact patterns, one of the generated data_basis
+ *      sentences, and the scope name (the one operator/registry-supplied label)
+ *      against a restricted name pattern. A completeness pass then asserts no
+ *      string escaped per-field validation. `buildSummaryInput` runs the gate on
+ *      its own output, so the guarantee is enforced at construction, not left for
+ *      a future caller to remember.
  *
- * The gate is an allowlist, not a code-token blocklist: it asserts what each
- * string MUST be rather than guessing at what it must not contain, so a future
- * widening of the payload that introduced a free-text field would fail the gate
- * rather than slip through.
+ * The gate is a per-field allowlist, not a code-token blocklist: it asserts what
+ * each field MUST be rather than guessing at what it must not contain, so a value
+ * that lands in the wrong field — or a future free-text field added to the
+ * payload — fails the gate rather than slipping through.
  *
  * The `data_basis` field is the bridge to Task 3.8's tier-aware prompts: it
  * states, in words, what the numbers are derived from (e.g. "git analysis +
@@ -275,53 +276,40 @@ function fmtPoint(value: number | null): string {
     return ` (${sign}${value} pts vs prior)`;
 }
 
-/**
- * The exact controlled strings a payload may contain: the closed enums plus the
- * generated data_basis sentences (one per maturity basis). Anything matching one
- * of these is, by definition, not repo free text.
- */
-const ALLOWED_EXACT: ReadonlySet<string> = new Set<string>([
-    // SummaryLevel
-    'weekly',
-    'monthly',
-    'quarterly',
-    'yearly',
-    // SummaryScope.type
-    'team',
-    'org',
-    // MaturityBasis
-    'git_estimate',
-    'mixed',
-    'measured',
-    // DataQuality
-    'high',
-    'medium',
-    'low',
-    // The generated data_basis sentences — every value deriveDataBasis can emit.
+// Closed-enum allowlists, one per enum-typed payload field.
+const ALLOWED_LEVELS: ReadonlySet<string> = new Set(['weekly', 'monthly', 'quarterly', 'yearly']);
+const ALLOWED_SCOPE_TYPES: ReadonlySet<string> = new Set(['team', 'org']);
+const ALLOWED_BASES: ReadonlySet<string> = new Set(['git_estimate', 'mixed', 'measured']);
+const ALLOWED_QUALITIES: ReadonlySet<string> = new Set(['high', 'medium', 'low']);
+
+/** The only strings `data_basis` may hold — every sentence deriveDataBasis emits. */
+const ALLOWED_DATA_BASIS: ReadonlySet<string> = new Set([
     deriveDataBasis('git_estimate'),
     deriveDataBasis('mixed'),
     deriveDataBasis('measured'),
 ]);
 
+/** ISO calendar date, exactly — used for period start/end. */
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
 /**
- * Period keys and ISO dates: alphanumerics and dashes only (e.g. '2026-W21',
- * '2026-Q2', '2026-05', '2026', '2026-05-19'). No spaces, no punctuation that
- * could carry prose.
+ * A period key: a year, optionally suffixed with a month / ISO week / quarter —
+ * '2026', '2026-05', '2026-W21', '2026-Q2'. Pinned to the actual formats so a
+ * single-token identifier (a branch name, a ticket slug) can't pass as a label.
  */
-const PERIOD_TOKEN = /^[0-9A-Za-z-]+$/;
+const PERIOD_LABEL = /^\d{4}(-(W\d{2}|Q[1-4]|\d{2}))?$/;
 
 /**
  * The scope name is the single operator/registry-supplied label (a team or org
- * name), so it cannot be an exact-match enum. It is constrained to a tight set
- * of name characters and a short length — enough for real team names, but with
- * no newlines, braces, slashes, or other markers that prose, commit messages,
- * or code carry. Repo free text cannot satisfy this.
+ * name), so it cannot be an exact-match enum. It is constrained to a tight set of
+ * name characters and a short length — enough for real team names, but with no
+ * newlines, braces, slashes, or other markers prose/commit messages/code carry.
  */
 const SCOPE_NAME = /^[A-Za-z0-9 ._\-&,']{1,64}$/;
 
 /**
  * Collect every string value reachable in the payload (recursively). Used by the
- * allowlist gate and the privacy test to inspect the payload's text content.
+ * gate's completeness backstop and by the privacy test to inspect text content.
  */
 export function collectStringValues(value: unknown, acc: string[] = []): string[] {
     if (typeof value === 'string') {
@@ -334,23 +322,52 @@ export function collectStringValues(value: unknown, acc: string[] = []): string[
     return acc;
 }
 
+function reject(field: string, value: string): never {
+    throw new Error(
+        `Summary input payload field "${field}" is outside the numbers-only allowlist ` +
+            `(${JSON.stringify(value.slice(0, 80))}); refusing to send to model`,
+    );
+}
+
 /**
- * Privacy gate (allowlist). Throws unless every string in the payload is one of:
- * a controlled enum value, a generated data_basis sentence, a period-key/ISO-date
- * token, or a scope name within the restricted name pattern. Because it asserts
- * what each string MUST be (not what it must not contain), a future change that
- * introduced a free-text field would fail here rather than slip through a token
- * blocklist. `buildSummaryInput` runs this on its own output, so a thrown error
- * means a programming regression that must fail loudly rather than leak data.
+ * Privacy gate. Validates each string-typed field of the payload against the
+ * format/enum it is *supposed* to hold — not a blanket "looks code-like" scan —
+ * so a value that lands in the wrong field (e.g. a branch name in `period.start`)
+ * is rejected even though it would pass a permissive character class. A final
+ * completeness pass asserts that no string in the payload escaped per-field
+ * validation, so a future change that adds a new string field fails closed here
+ * rather than slipping an unvalidated value through. `buildSummaryInput` runs this
+ * on its own output, so a throw means a programming regression that must fail
+ * loudly rather than leak data.
  */
 export function assertNumbersOnly(payload: SummaryInputPayload): void {
+    if (!ALLOWED_LEVELS.has(payload.period.level)) reject('period.level', payload.period.level);
+    if (!PERIOD_LABEL.test(payload.period.label)) reject('period.label', payload.period.label);
+    if (!ISO_DATE.test(payload.period.start)) reject('period.start', payload.period.start);
+    if (!ISO_DATE.test(payload.period.end)) reject('period.end', payload.period.end);
+    if (!ALLOWED_SCOPE_TYPES.has(payload.scope.type)) reject('scope.type', payload.scope.type);
+    if (!SCOPE_NAME.test(payload.scope.name)) reject('scope.name', payload.scope.name);
+    if (!ALLOWED_BASES.has(payload.metrics.ai_maturity_basis)) {
+        reject('metrics.ai_maturity_basis', payload.metrics.ai_maturity_basis);
+    }
+    if (!ALLOWED_DATA_BASIS.has(payload.data_basis)) reject('data_basis', payload.data_basis);
+    if (!ALLOWED_QUALITIES.has(payload.data_quality)) reject('data_quality', payload.data_quality);
+
+    // Completeness backstop: every string actually present must be one we just
+    // validated. Catches a newly-added string-typed field the checks above don't
+    // yet cover — it fails closed instead of going to the model unvalidated.
+    const validated = new Set<string>([
+        payload.period.level,
+        payload.period.label,
+        payload.period.start,
+        payload.period.end,
+        payload.scope.type,
+        payload.scope.name,
+        payload.metrics.ai_maturity_basis,
+        payload.data_basis,
+        payload.data_quality,
+    ]);
     for (const str of collectStringValues(payload)) {
-        const allowed = ALLOWED_EXACT.has(str) || PERIOD_TOKEN.test(str) || SCOPE_NAME.test(str);
-        if (!allowed) {
-            throw new Error(
-                `Summary input payload contains a string outside the numbers-only allowlist ` +
-                    `(${JSON.stringify(str.slice(0, 80))}); refusing to send to model`,
-            );
-        }
+        if (!validated.has(str)) reject('(unrecognized field)', str);
     }
 }

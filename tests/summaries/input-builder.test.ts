@@ -172,6 +172,17 @@ describe('privacy — numbers-only payload', () => {
         const ok = {...payload, scope: {...payload.scope, name: 'platform-infra & data'}};
         expect(() => assertNumbersOnly(ok)).not.toThrow();
     });
+
+    it('rejects a single-token identifier smuggled into a date field (per-field validation)', () => {
+        // A branch/ticket slug would pass a permissive char class but is not an ISO date.
+        const tampered = {...payload, period: {...payload.period, start: 'refactor-auth'}};
+        expect(() => assertNumbersOnly(tampered)).toThrow(/period\.start/);
+    });
+
+    it('rejects a data_basis that is not one of the generated sentences', () => {
+        const tampered = {...payload, data_basis: 'git analysis and some extra prose'};
+        expect(() => assertNumbersOnly(tampered)).toThrow(/data_basis/);
+    });
 });
 
 describe('formatSummaryInput', () => {

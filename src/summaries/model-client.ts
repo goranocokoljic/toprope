@@ -130,7 +130,7 @@ function defaultEndpointFor(type: SummaryModelType): string {
 }
 
 /** Strip a single trailing slash so endpoint + path joins don't double up. */
-function trimTrailingSlash(url: string): string {
+export function trimTrailingSlash(url: string): string {
     return url.endsWith('/') ? url.slice(0, -1) : url;
 }
 

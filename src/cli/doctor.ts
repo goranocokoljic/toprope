@@ -5,6 +5,7 @@ import {getMigrationStatus} from '../storage/migrator';
 import {resolveGitProviderConfigs} from '../connectors/git/providers/config';
 import {createGitProvider} from '../connectors/git/providers/factory';
 import type {GitProvider, GitProviderConfig} from '../connectors/git/providers/types';
+import {trimTrailingSlash} from '../summaries/model-client';
 
 interface CheckResult {
     label: string;
@@ -468,8 +469,9 @@ async function checkSummaryModel(config: GovProxyConfig): Promise<CheckResult> {
                 'Set summaries.model.api_key in config.',
             );
         }
+        const baseUrl = trimTrailingSlash(summaries.model?.endpoint ?? 'https://api.anthropic.com');
         try {
-            const res = await fetch('https://api.anthropic.com/v1/models', {
+            const res = await fetch(`${baseUrl}/v1/models`, {
                 headers: {
                     'x-api-key': apiKey,
                     'anthropic-version': '2023-06-01',
@@ -555,11 +557,6 @@ async function checkSummaryModel(config: GovProxyConfig): Promise<CheckResult> {
     }
 
     return pass('Summary model', `Model type "${modelType}" — skipping reachability check`);
-}
-
-/** Strip a single trailing slash so endpoint + path joins don't double up. */
-function trimTrailingSlash(url: string): string {
-    return url.endsWith('/') ? url.slice(0, -1) : url;
 }
 
 export async function runDoctor(
