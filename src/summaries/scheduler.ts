@@ -40,13 +40,17 @@ import {openDb} from '../storage/db';
 import {runMigrations} from '../storage/migrator';
 import {isoWeekLabel} from '../aggregation/dates';
 import {listTeams} from '../aggregation/team-period';
-import {justCompletedPeriod} from '../aggregation/scheduler';
+import {justCompletedPeriod, type AggregationPeriod} from '../aggregation/scheduler';
 import {generateSummary} from './generator';
 import type {SummaryScope} from './input-builder';
 import type {SummaryTarget} from './target';
 
-/** The levels that auto-generate on schedule. Quarterly/yearly are excluded by design. */
-export type SummaryAutoLevel = 'weekly' | 'monthly';
+/**
+ * The levels that auto-generate on schedule. Quarterly/yearly are excluded by design,
+ * so this is the weekly/monthly subset of the aggregation engine's period set —
+ * derived from it (rather than re-spelled) so the two can't drift if a level is renamed.
+ */
+export type SummaryAutoLevel = Extract<AggregationPeriod, 'weekly' | 'monthly'>;
 
 /** The two auto-generated levels, in coarsening order — the iteration order for a full run. */
 export const SUMMARY_AUTO_LEVELS: readonly SummaryAutoLevel[] = ['weekly', 'monthly'] as const;
@@ -85,11 +89,6 @@ export function isAutoGenerationEnabled(
     return true;
 }
 
-/** The auto levels currently enabled by config, preserving coarsening order. */
-export function enabledAutoLevels(summaries: SummariesConfig | undefined): SummaryAutoLevel[] {
-    return SUMMARY_AUTO_LEVELS.filter((level) => isAutoGenerationEnabled(summaries, level));
-}
-
 /**
  * The scopes a full run covers: the whole org, then every team in the registry, in
  * the registry's name order. Mirrors the input-source fold (org = all teams' members
@@ -102,26 +101,17 @@ export function enumerateScopes(db: Database.Database): SummaryScope[] {
 }
 
 /**
- * The aggregate-table key for `level`'s just-completed period — the value the rollup
- * stores and the gate counts against. Weekly rows are keyed by their Monday
- * `week_start` (YYYY-MM-DD); monthly rows by `month` (YYYY-MM). This is exactly the
- * key justCompletedPeriod returns for each level, so the gate and the rollup agree.
- */
-function aggregateKey(level: SummaryAutoLevel, now: Date): string {
-    return justCompletedPeriod(level, now);
-}
-
-/**
  * The summary period label for `level`'s just-completed period — the canonical key
- * the summary target/store use. Monthly is already `YYYY-MM`; weekly converts its
- * `week_start` (YYYY-MM-DD) to the ISO week label (`YYYY-Wnn`) the summary layer
- * keys on. Kept distinct from {@link aggregateKey} on purpose: the aggregate table
- * and the summary table key weeks differently, and conflating them would either
- * miss the aggregate rows or mislabel the summary.
+ * the summary target/store use. Kept distinct from the aggregate-table key
+ * (`justCompletedPeriod`) on purpose: the aggregate table keys weeks by their Monday
+ * `week_start` (YYYY-MM-DD), but the summary layer keys weeks by the ISO week label
+ * (`YYYY-Wnn`), so weekly is converted here. Monthly is `YYYY-MM` in both, so it
+ * passes straight through. Conflating the two would either miss the aggregate rows or
+ * mislabel the summary.
  */
 function summaryPeriodLabel(level: SummaryAutoLevel, now: Date): string {
-    const key = aggregateKey(level, now);
-    return level === 'weekly' ? isoWeekLabel(key) : key;
+    const aggKey = justCompletedPeriod(level, now);
+    return level === 'weekly' ? isoWeekLabel(aggKey) : aggKey;
 }
 
 /**
@@ -188,17 +178,16 @@ export interface SummaryAutoJobResult {
 export interface SummaryAutoLogger {
     jobStart(level: SummaryAutoLevel, period: string, scopeCount: number): void;
     aggregateMissing(level: SummaryAutoLevel, period: string, aggKey: string): void;
-    scopeGenerated(level: SummaryAutoLevel, period: string, scope: SummaryScope): void;
-    scopeFailed(
-        level: SummaryAutoLevel,
-        period: string,
-        scope: SummaryScope,
-        error: string,
-    ): void;
+    /**
+     * One scope finished — generated or failed, carried in the {@link ScopeOutcome}.
+     * A single per-scope channel (rather than separate generated/failed methods) since
+     * the outcome already discriminates the two and is the shape the result returns.
+     */
+    scopeFinished(level: SummaryAutoLevel, period: string, outcome: ScopeOutcome): void;
     /**
      * A whole-job infrastructure failure — the run never reached any scope (DB
-     * couldn't be opened, migrations threw). Distinct from scopeFailed so a job that
-     * never started isn't misread as one scope's generation failing.
+     * couldn't be opened, migrations threw). Distinct from a scope outcome so a job
+     * that never started isn't misread as one scope's generation failing.
      */
     jobFailure(level: SummaryAutoLevel, period: string, error: string): void;
     jobComplete(
@@ -225,13 +214,14 @@ export const consoleSummaryAutoLogger: SummaryAutoLogger = {
             `[summary:${level}] skip — no aggregate rows for ${aggKey}; aggregation did not complete, not summarising ${period}`,
         );
     },
-    scopeGenerated(level, period, scope) {
-        console.log(`[summary:${level}] done — ${period} ${scopeLabel(scope)}`);
-    },
-    scopeFailed(level, period, scope, error) {
-        console.error(
-            `[summary:${level}] FAILED — ${period} ${scopeLabel(scope)}: ${error}`,
-        );
+    scopeFinished(level, period, outcome) {
+        if (outcome.status === 'generated') {
+            console.log(`[summary:${level}] done — ${period} ${scopeLabel(outcome.scope)}`);
+        } else {
+            console.error(
+                `[summary:${level}] FAILED — ${period} ${scopeLabel(outcome.scope)}: ${outcome.detail}`,
+            );
+        }
     },
     jobFailure(level, period, error) {
         console.error(`[summary:${level}] JOB FAILED — period ${period}: ${error}`);
@@ -273,7 +263,7 @@ export async function runSummaryAutoGenerationJob(
     const now = (options.now ?? ((): Date => new Date()))();
     const generate = options.generate ?? generateSummary;
 
-    const aggKey = aggregateKey(level, now);
+    const aggKey = justCompletedPeriod(level, now);
     const period = summaryPeriodLabel(level, now);
     const scopes = enumerateScopes(db);
 
@@ -292,28 +282,24 @@ export async function runSummaryAutoGenerationJob(
 
     for (const scope of scopes) {
         const target: SummaryTarget = {level, period, scope};
+        let outcome: ScopeOutcome;
         try {
             const result = await generate(db, summaries, target, {now: () => now});
-            if (result.ok) {
-                generated += 1;
-                outcomes.push({scope, status: 'generated'});
-                logger.scopeGenerated(level, period, scope);
-            } else {
-                // generateSummary signals a handled failure (model down, no
-                // developers, rejected output) without throwing — isolate it the
-                // same as a throw so the remaining scopes still run.
-                failed += 1;
-                outcomes.push({scope, status: 'failed', detail: result.error});
-                logger.scopeFailed(level, period, scope, result.error);
-            }
+            outcome = result.ok
+                ? {scope, status: 'generated'}
+                : // generateSummary signals a handled failure (model down, no
+                  // developers, rejected output) without throwing — isolate it the
+                  // same as a throw so the remaining scopes still run.
+                  {scope, status: 'failed', detail: result.error};
         } catch (err) {
             // Defensive: generateSummary is designed not to throw, but an unexpected
             // error (a DB fault mid-loop) must still not blow up the whole run.
-            const message = err instanceof Error ? err.message : String(err);
-            failed += 1;
-            outcomes.push({scope, status: 'failed', detail: message});
-            logger.scopeFailed(level, period, scope, message);
+            outcome = {scope, status: 'failed', detail: err instanceof Error ? err.message : String(err)};
         }
+        if (outcome.status === 'generated') generated += 1;
+        else failed += 1;
+        outcomes.push(outcome);
+        logger.scopeFinished(level, period, outcome);
     }
 
     logger.jobComplete(level, period, generated, failed);
@@ -390,11 +376,12 @@ export function startSummaryScheduler(
     summaries: SummariesConfig | undefined,
     options: SummarySchedulerOptions = {},
 ): Array<ReturnType<typeof cron.schedule>> {
-    return enabledAutoLevels(summaries).map((level) =>
-        cron.schedule(
-            SUMMARY_CRON[level],
-            () => void runScheduledSummaryJob(dbPath, summaries, level, options),
-            {timezone: 'UTC'},
-        ),
+    return SUMMARY_AUTO_LEVELS.filter((level) => isAutoGenerationEnabled(summaries, level)).map(
+        (level) =>
+            cron.schedule(
+                SUMMARY_CRON[level],
+                () => void runScheduledSummaryJob(dbPath, summaries, level, options),
+                {timezone: 'UTC'},
+            ),
     );
 }

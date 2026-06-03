@@ -10,12 +10,13 @@ import {
     type SummaryAutoLevel,
     type SummaryAutoLogger,
     type GenerateSummaryFn,
+    type ScopeOutcome,
     isAutoGenerationEnabled,
-    enabledAutoLevels,
     enumerateScopes,
     aggregateCompleted,
     runSummaryAutoGenerationJob,
     runScheduledSummaryJob,
+    startSummaryScheduler,
 } from '../../src/summaries/scheduler';
 import {generateSummary} from '../../src/summaries/generator';
 import {getSummaryByTarget} from '../../src/summaries/store';
@@ -71,28 +72,24 @@ function realGenerateWith(failFor?: (scope: SummaryScope) => boolean): GenerateS
 function recordingLogger(): SummaryAutoLogger & {
     starts: Array<{level: SummaryAutoLevel; period: string; scopeCount: number}>;
     missing: Array<{level: SummaryAutoLevel; period: string; aggKey: string}>;
-    generated: Array<{scope: SummaryScope; period: string}>;
-    failed: Array<{scope: SummaryScope; error: string}>;
+    finished: Array<{period: string; outcome: ScopeOutcome}>;
     jobFailures: Array<{level: SummaryAutoLevel; period: string; error: string}>;
     completes: Array<{level: SummaryAutoLevel; generated: number; failed: number}>;
 } {
     const starts: Array<{level: SummaryAutoLevel; period: string; scopeCount: number}> = [];
     const missing: Array<{level: SummaryAutoLevel; period: string; aggKey: string}> = [];
-    const generated: Array<{scope: SummaryScope; period: string}> = [];
-    const failed: Array<{scope: SummaryScope; error: string}> = [];
+    const finished: Array<{period: string; outcome: ScopeOutcome}> = [];
     const jobFailures: Array<{level: SummaryAutoLevel; period: string; error: string}> = [];
     const completes: Array<{level: SummaryAutoLevel; generated: number; failed: number}> = [];
     return {
         starts,
         missing,
-        generated,
-        failed,
+        finished,
         jobFailures,
         completes,
         jobStart: (level, period, scopeCount) => void starts.push({level, period, scopeCount}),
         aggregateMissing: (level, period, aggKey) => void missing.push({level, period, aggKey}),
-        scopeGenerated: (_level, period, scope) => void generated.push({scope, period}),
-        scopeFailed: (_level, _period, scope, error) => void failed.push({scope, error}),
+        scopeFinished: (_level, period, outcome) => void finished.push({period, outcome}),
         jobFailure: (level, period, error) => void jobFailures.push({level, period, error}),
         jobComplete: (level, _period, generated_, failed_) =>
             void completes.push({level, generated: generated_, failed: failed_}),
@@ -142,10 +139,20 @@ describe('config gating', () => {
         expect(isAutoGenerationEnabled({weekly: {auto_generate: false}}, 'monthly')).toBe(true);
     });
 
-    it('enabledAutoLevels filters to the enabled levels in order', () => {
-        expect(enabledAutoLevels(undefined)).toEqual(['weekly', 'monthly']);
-        expect(enabledAutoLevels({enabled: false})).toEqual([]);
-        expect(enabledAutoLevels({monthly: {auto_generate: false}})).toEqual(['weekly']);
+    it('startSummaryScheduler registers a cron task only for each enabled level', () => {
+        // Default: both levels register.
+        const all = startSummaryScheduler(':memory:', undefined);
+        expect(all).toHaveLength(2);
+        all.forEach((t) => t.stop());
+
+        // Master switch off: nothing registers.
+        const none = startSummaryScheduler(':memory:', {enabled: false});
+        expect(none).toHaveLength(0);
+
+        // Per-level off: only the other level registers.
+        const weeklyOnly = startSummaryScheduler(':memory:', {monthly: {auto_generate: false}});
+        expect(weeklyOnly).toHaveLength(1);
+        weeklyOnly.forEach((t) => t.stop());
     });
 });
 
@@ -315,7 +322,11 @@ describe('runSummaryAutoGenerationJob — failure isolation', () => {
         expect(getSummaryByTarget(db, {level: 'weekly', period: WEEKLY_LABEL, scope: {type: 'team', name: 'backend'}})).toBeNull();
 
         expect(logger.completes).toEqual([{level: 'weekly', generated: 2, failed: 1}]);
-        expect(logger.failed.map((f) => f.scope.name)).toEqual(['backend']);
+        // Exactly one scope was logged as failed, and it was backend.
+        const failedScopes = logger.finished
+            .filter((f) => f.outcome.status === 'failed')
+            .map((f) => f.outcome.scope.name);
+        expect(failedScopes).toEqual(['backend']);
     });
 
     it('an unexpected throw in one scope is caught and the run continues', async () => {
@@ -395,6 +406,7 @@ describe('runScheduledSummaryJob — the production cron-fire path', () => {
         // Reported as a job-level failure, not a fabricated per-scope failure.
         expect(logger.jobFailures).toHaveLength(1);
         expect(logger.jobFailures[0].level).toBe('monthly');
-        expect(logger.failed).toEqual([]);
+        // No per-scope outcome was logged — the run never reached a scope.
+        expect(logger.finished).toEqual([]);
     });
 });
