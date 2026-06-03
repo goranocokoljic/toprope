@@ -913,7 +913,11 @@ const aggregateCommand = program.command('aggregate').description('Compute trend
 
 aggregateCommand
     .command('backfill')
-    .description('Compute historical aggregates (weekly, monthly, quarterly, yearly) from existing daily snapshots')
+    .description(
+        'Compute historical aggregates (weekly, monthly, quarterly, yearly) from existing daily snapshots. ' +
+            'Backfill the oldest range first and without gaps: deltas are not cascaded, so running a later ' +
+            'range before an earlier adjacent one leaves the boundary delta uncompared.',
+    )
     .option('--from <date>', 'Inclusive range start (YYYY-MM-DD). Defaults to 12 months before --to')
     .option('--to <date>', 'Inclusive range end (YYYY-MM-DD). Defaults to today (UTC)')
     .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
@@ -940,7 +944,13 @@ aggregateCommand
                 if (isTty) {
                     process.stdout.write(`\r${line}`);
                     if (p.levelIndex === p.levelTotal) process.stdout.write('\n');
-                } else if (p.levelIndex === p.levelTotal) {
+                    return;
+                }
+                // Non-TTY (captured logs / CI): \r can't rewrite a line in a file, so
+                // print discrete milestones — first and last period of each level,
+                // plus every 20th — to show liveness during a long pass without a
+                // flood of one line per period.
+                if (p.levelIndex === 1 || p.levelIndex === p.levelTotal || p.levelIndex % 20 === 0) {
                     console.log(line);
                 }
             };

@@ -16,10 +16,22 @@
  *      delta always finds its prior period already stored.
  *
  * Idempotency falls out for free: every rollup UPSERTs its row, so re-running a
- * backfill (or an overlapping range) overwrites and never duplicates. Because
- * each period is computed independently from the append-only daily snapshots and
- * the writes are small per-period upserts (not one long-held transaction), a
- * backfill is safe to run while the daily sync continues to append snapshots.
+ * backfill (or an overlapping range) overwrites and never duplicates.
+ *
+ * Each period is wrapped in its own transaction so that period's per-developer
+ * (or per-team) upserts commit as a single unit — collapsing what would
+ * otherwise be one fsync per row into one per period over a multi-month run.
+ * The transaction is per-period, not whole-run, so the lock is released between
+ * periods: a backfill stays safe to run while the daily sync continues to append
+ * snapshots, and a failure part-way leaves every already-committed period intact.
+ *
+ * Delta correctness depends on processing CHRONOLOGICALLY and CONTIGUOUSLY:
+ * deltas are not cascaded (see deltas.ts), so a period's delta is computed once,
+ * against whatever the prior period holds at that moment. Within a single run
+ * this is always correct (each level walks oldest→newest). Across runs, backfill
+ * oldest range first and without gaps — backfilling a later range before an
+ * earlier one leaves the earlier-adjacent delta computed against an absent prior
+ * period (null) and never repaired. The CLI help repeats this guidance.
  */
 
 import type Database from 'better-sqlite3';
@@ -84,10 +96,10 @@ function todayUtc(now: Date): string {
 }
 
 /**
- * `date` shifted back `months` calendar months, returned as YYYY-MM-DD (UTC).
- * Day-of-month that overflows the target month (e.g. backing a 31st into a
- * shorter month) rolls forward via Date normalisation rather than throwing — the
- * default range only needs a sane, valid start, not exact calendar arithmetic.
+ * `date` shifted back `months` calendar months, returned as YYYY-MM-DD (UTC),
+ * via Date normalisation so the result is always a valid ISO date. (The sole
+ * caller subtracts a whole year, which never changes the day-of-month; the
+ * normalisation is just belt-and-braces.)
  */
 function subtractMonths(date: string, months: number): string {
     const [year, mon, day] = date.split('-').map(Number);
@@ -130,27 +142,14 @@ export function runBackfill(db: Database.Database, options: BackfillOptions = {}
     let rowsWritten = 0;
     let overallIndex = 0;
 
-    // One driver shape per level: enumerate-then-compute, chronological. Kept as a
-    // small table so adding/reordering levels can't drift the progress accounting.
-    const levels: Array<{
-        level: BackfillLevel;
-        periods: string[];
-        compute: (period: string) => {length: number};
-    }> = [
-        {level: 'weekly', periods: weeks, compute: (p) => computeAllWeeklyAggregates(db, p, now)},
-        {level: 'monthly', periods: months, compute: (p) => computeAllMonthlyAggregates(db, p, now)},
-        {
-            level: 'quarterly',
-            periods: quarters,
-            compute: (p) => computeAllQuarterlyAggregates(db, p, now),
-        },
-        {level: 'yearly', periods: years, compute: (p) => computeAllYearlyAggregates(db, p, now)},
-    ];
-
-    for (const {level, periods, compute} of levels) {
+    // Process one level's periods oldest→newest, counting rows and emitting
+    // progress. Each period runs inside its own transaction (see header) so its
+    // per-developer/per-team upserts commit together; `compute` returns the rows
+    // it wrote and we only need their count, hence `unknown[]`.
+    const tally = (level: BackfillLevel, periods: string[], compute: (period: string) => unknown[]): void => {
+        const computeInTxn = db.transaction(compute);
         periods.forEach((period, i) => {
-            const rows = compute(period);
-            rowsWritten += rows.length;
+            rowsWritten += computeInTxn(period).length;
             overallIndex += 1;
             options.onProgress?.({
                 level,
@@ -161,7 +160,12 @@ export function runBackfill(db: Database.Database, options: BackfillOptions = {}
                 overallTotal,
             });
         });
-    }
+    };
+
+    tally('weekly', weeks, (p) => computeAllWeeklyAggregates(db, p, now));
+    tally('monthly', months, (p) => computeAllMonthlyAggregates(db, p, now));
+    tally('quarterly', quarters, (p) => computeAllQuarterlyAggregates(db, p, now));
+    tally('yearly', years, (p) => computeAllYearlyAggregates(db, p, now));
 
     return {
         from,
