@@ -76,11 +76,13 @@ export async function generateSummary(
     // is summarised normally (its zeros are genuine). Not retryable — the scope
     // itself is the problem, so re-running won't help.
     if (payload.scope.developer_count === 0) {
+        const scopeLabel =
+            target.scope.type === 'org' ? 'org' : `team:${target.scope.name}`;
         return {
             ok: false,
             retryable: false,
             error:
-                `No developers in scope ${target.scope.type}:${target.scope.name} — ` +
+                `No developers in scope ${scopeLabel} — ` +
                 'nothing to summarise (check the team name exists in the registry)',
         };
     }
