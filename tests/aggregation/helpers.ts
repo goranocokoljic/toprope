@@ -12,14 +12,19 @@ export function makeDb(): Database.Database {
     return db;
 }
 
-export function addDeveloper(db: Database.Database, id: string, team: string): void {
+export function addDeveloper(
+    db: Database.Database,
+    id: string,
+    team: string,
+    createdAt = '2026-01-01T00:00:00.000Z',
+): void {
     db.prepare('INSERT OR IGNORE INTO teams (name, created_at) VALUES (?, ?)').run(
         team,
         '2026-01-01T00:00:00.000Z',
     );
     db.prepare(
         'INSERT INTO developers (id, name, email, team, created_at) VALUES (?, ?, ?, ?, ?)',
-    ).run(id, `Dev ${id}`, `${id}@test.com`, team, '2026-01-01T00:00:00.000Z');
+    ).run(id, `Dev ${id}`, `${id}@test.com`, team, createdAt);
 }
 
 export interface GitFields {
