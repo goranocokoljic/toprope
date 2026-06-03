@@ -34,7 +34,7 @@ export interface SummaryRecord {
     is_stale: 0 | 1;
 }
 
-type SummaryScopeType = 'team' | 'org';
+export type SummaryScopeType = 'team' | 'org';
 
 /**
  * The deterministic primary key for a target. Stable across regeneration so the
@@ -91,6 +91,20 @@ function toRecord(row: SummaryRow): SummaryRecord {
     };
 }
 
+/**
+ * Reconstruct the {@link SummaryTarget} a stored record was generated for. The
+ * inverse of {@link summaryId}'s addressing: regeneration and the read-time
+ * basis/tier recompute (Task 3.11 / #80) both need to get from a persisted row
+ * back to its (level, period, scope) coordinates without re-parsing the id string.
+ */
+export function targetFromRecord(record: SummaryRecord): SummaryTarget {
+    return {
+        level: record.period_type,
+        period: record.period_value,
+        scope: {type: record.scope, name: record.scope_name},
+    };
+}
+
 /** Look a summary up by its primary key, or null when none exists. */
 export function getSummaryById(db: Database.Database, id: string): SummaryRecord | null {
     const row = db
@@ -105,6 +119,47 @@ export function getSummaryByTarget(
     target: SummaryTarget,
 ): SummaryRecord | null {
     return getSummaryById(db, summaryId(target));
+}
+
+/** Optional filters for {@link listSummaries}; an absent field means "any". */
+export interface SummaryListFilter {
+    level?: SummaryLevel;
+    scope?: SummaryScopeType;
+    /** Only meaningful with scope='team' — the team name to match. */
+    scopeName?: string;
+}
+
+/**
+ * Every stored summary, most recent first, optionally narrowed by level and/or
+ * scope. Drives the dashboard's summary list (Task 3.11 / #80): the ordering is
+ * the read contract (newest generation first) and the filters are folded into the
+ * WHERE clause rather than in JS so the order/limit semantics stay in the DB.
+ */
+export function listSummaries(
+    db: Database.Database,
+    filter: SummaryListFilter = {},
+): SummaryRecord[] {
+    const clauses: string[] = [];
+    const params: Record<string, string> = {};
+    if (filter.level !== undefined) {
+        clauses.push('period_type = @level');
+        params.level = filter.level;
+    }
+    if (filter.scope !== undefined) {
+        clauses.push('scope = @scope');
+        params.scope = filter.scope;
+    }
+    if (filter.scopeName !== undefined) {
+        clauses.push('scope_name = @scopeName');
+        params.scopeName = filter.scopeName;
+    }
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+    const rows = db
+        .prepare(
+            `SELECT ${SUMMARY_COLUMNS} FROM summaries ${where} ORDER BY generated_at DESC`,
+        )
+        .all(params) as SummaryRow[];
+    return rows.map(toRecord);
 }
 
 /** Every summary stored for a (period_type, period_value), most recent first. */
