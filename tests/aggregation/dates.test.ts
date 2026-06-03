@@ -21,6 +21,9 @@ import {
     enumerateMonths,
     enumerateQuarters,
     enumerateYears,
+    isoWeekLabel,
+    isoWeekRange,
+    priorIsoWeek,
 } from '../../src/aggregation/dates';
 
 describe('isoWeekStart', () => {
@@ -315,5 +318,41 @@ describe('enumerateYears', () => {
 
     it('returns a single year when from and to share it', () => {
         expect(enumerateYears('2026-01-01', '2026-12-31')).toEqual(['2026']);
+    });
+});
+
+describe('isoWeekLabel / isoWeekRange / priorIsoWeek', () => {
+    it('labels a date by its ISO week-numbering year and week', () => {
+        // 2026-01-01 is a Thursday → ISO week 1 of 2026.
+        expect(isoWeekLabel('2026-01-01')).toBe('2026-W01');
+        // Monday 2026-05-18 is the start of 2026-W21 (the design's CLI example).
+        expect(isoWeekLabel('2026-05-18')).toBe('2026-W21');
+    });
+
+    it('attributes an early-January day to the prior year when ISO weeks span the boundary', () => {
+        // 2027-01-01 is a Friday → still part of 2026-W53.
+        expect(isoWeekLabel('2027-01-01')).toBe('2026-W53');
+    });
+
+    it('returns the Monday–Sunday range for a week label', () => {
+        expect(isoWeekRange('2026-W21')).toEqual({start: '2026-05-18', end: '2026-05-24'});
+        // Week 1 of 2026 starts in the prior calendar year.
+        expect(isoWeekRange('2026-W01')).toEqual({start: '2025-12-29', end: '2026-01-04'});
+    });
+
+    it('round-trips a label through its range start and back', () => {
+        for (const label of ['2024-W01', '2025-W52', '2026-W53', '2021-W01', '2026-W21']) {
+            expect(isoWeekLabel(isoWeekRange(label).start)).toBe(label);
+        }
+    });
+
+    it('rejects a malformed week label', () => {
+        expect(() => isoWeekRange('2026-W54')).toThrow(/Invalid ISO week/);
+        expect(() => isoWeekRange('2026-21')).toThrow(/Invalid ISO week/);
+    });
+
+    it('steps back one week across the year boundary', () => {
+        expect(priorIsoWeek('2026-W21')).toBe('2026-W20');
+        expect(priorIsoWeek('2026-W01')).toBe('2025-W52');
     });
 });

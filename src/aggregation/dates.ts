@@ -13,6 +13,11 @@
  */
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+// ISO week-numbering label: YYYY-Wnn with the week zero-padded to two digits
+// (W01..W53). The summary layer keys weekly periods by this label rather than by
+// the Monday date so the period label matches the YYYY-Wnn form the numbers-only
+// payload allowlist expects.
+const ISO_WEEK_RE = /^\d{4}-W(0[1-9]|[1-4]\d|5[0-3])$/;
 // Month 01–12 only: a bare \d{2} shape would admit 2026-13 / 2026-00, and the
 // Date arithmetic in monthRange/priorMonth would silently roll those into a
 // valid-looking key rather than failing. Bounding the regex makes a malformed
@@ -119,6 +124,61 @@ export function yearRange(year: string): DateRange {
 export function priorWeekStart(weekStart: string): string {
     assertValidDate(weekStart);
     return addDays(weekStart, -7);
+}
+
+/**
+ * The ISO-8601 week-numbering label (`YYYY-Wnn`) of the week containing `date`.
+ * ISO weeks start Monday and week 1 is the week containing the year's first
+ * Thursday, so the week-numbering YEAR can differ from the calendar year for days
+ * in early January or late December (e.g. 2027-01-01 falls in 2026-W53). Computed
+ * via the week's Thursday, whose calendar year IS the ISO week-numbering year.
+ */
+export function isoWeekLabel(date: string): string {
+    assertValidDate(date);
+    const d = new Date(`${date}T00:00:00.000Z`);
+    // Shift to the Thursday of this ISO week (Mon=0..Sun=6 → +3 lands on Thursday).
+    const dayNum = (d.getUTCDay() + 6) % 7;
+    d.setUTCDate(d.getUTCDate() - dayNum + 3);
+    const isoYear = d.getUTCFullYear();
+    // Thursday of ISO week 1 is the Thursday of the week containing Jan 4.
+    const firstThursday = new Date(Date.UTC(isoYear, 0, 4));
+    const firstThursdayDayNum = (firstThursday.getUTCDay() + 6) % 7;
+    firstThursday.setUTCDate(firstThursday.getUTCDate() - firstThursdayDayNum + 3);
+    const week = 1 + Math.round((d.getTime() - firstThursday.getTime()) / (7 * 86_400_000));
+    return `${isoYear}-W${String(week).padStart(2, '0')}`;
+}
+
+/**
+ * Inclusive [Monday, Sunday] day range for an ISO week label (`YYYY-Wnn`). The
+ * start is the canonical week_start (Monday) that {@link isoWeekLabel} round-trips
+ * back to. Throws on a malformed label so a bad period key fails loudly rather
+ * than sweeping an unintended window.
+ */
+export function isoWeekRange(label: string): DateRange {
+    if (!ISO_WEEK_RE.test(label)) {
+        throw new Error(`Invalid ISO week (expected YYYY-Wnn): ${label}`);
+    }
+    const [yearPart, weekPart] = label.split('-W');
+    const isoYear = Number(yearPart);
+    const week = Number(weekPart);
+    // Monday of ISO week 1 is the Monday of the week containing Jan 4.
+    const jan4 = new Date(Date.UTC(isoYear, 0, 4));
+    const jan4DayNum = (jan4.getUTCDay() + 6) % 7;
+    const week1Monday = new Date(jan4.getTime() - jan4DayNum * 86_400_000);
+    const start = new Date(week1Monday.getTime() + (week - 1) * 7 * 86_400_000)
+        .toISOString()
+        .slice(0, 10);
+    return {start, end: addDays(start, 6)};
+}
+
+/**
+ * The ISO week label immediately before `label` (`YYYY-Wnn`) — the previous
+ * comparable period for weekly summary deltas. Derived through the Monday date so
+ * the year-boundary cases (W01 → prior year's W52/W53) fall out of the calendar
+ * arithmetic rather than needing special-casing.
+ */
+export function priorIsoWeek(label: string): string {
+    return isoWeekLabel(priorWeekStart(isoWeekRange(label).start));
 }
 
 /** The calendar month before `month` (`YYYY-MM`), e.g. `2026-01` → `2025-12`. */
