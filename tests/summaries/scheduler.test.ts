@@ -73,23 +73,27 @@ function recordingLogger(): SummaryAutoLogger & {
     missing: Array<{level: SummaryAutoLevel; period: string; aggKey: string}>;
     generated: Array<{scope: SummaryScope; period: string}>;
     failed: Array<{scope: SummaryScope; error: string}>;
+    jobFailures: Array<{level: SummaryAutoLevel; period: string; error: string}>;
     completes: Array<{level: SummaryAutoLevel; generated: number; failed: number}>;
 } {
     const starts: Array<{level: SummaryAutoLevel; period: string; scopeCount: number}> = [];
     const missing: Array<{level: SummaryAutoLevel; period: string; aggKey: string}> = [];
     const generated: Array<{scope: SummaryScope; period: string}> = [];
     const failed: Array<{scope: SummaryScope; error: string}> = [];
+    const jobFailures: Array<{level: SummaryAutoLevel; period: string; error: string}> = [];
     const completes: Array<{level: SummaryAutoLevel; generated: number; failed: number}> = [];
     return {
         starts,
         missing,
         generated,
         failed,
+        jobFailures,
         completes,
         jobStart: (level, period, scopeCount) => void starts.push({level, period, scopeCount}),
         aggregateMissing: (level, period, aggKey) => void missing.push({level, period, aggKey}),
         scopeGenerated: (_level, period, scope) => void generated.push({scope, period}),
         scopeFailed: (_level, _period, scope, error) => void failed.push({scope, error}),
+        jobFailure: (level, period, error) => void jobFailures.push({level, period, error}),
         jobComplete: (level, _period, generated_, failed_) =>
             void completes.push({level, generated: generated_, failed: failed_}),
     };
@@ -378,7 +382,7 @@ describe('runScheduledSummaryJob — the production cron-fire path', () => {
         }
     });
 
-    it('returns null and logs when the DB cannot be opened, without throwing', async () => {
+    it('returns null and logs a whole-job failure when the DB cannot be opened, without throwing', async () => {
         const logger = recordingLogger();
         // A directory path cannot be opened as a SQLite file → openDb throws.
         const result = await runScheduledSummaryJob(os.tmpdir(), {}, 'monthly', {
@@ -388,6 +392,9 @@ describe('runScheduledSummaryJob — the production cron-fire path', () => {
         });
 
         expect(result).toBeNull();
-        expect(logger.failed).toHaveLength(1);
+        // Reported as a job-level failure, not a fabricated per-scope failure.
+        expect(logger.jobFailures).toHaveLength(1);
+        expect(logger.jobFailures[0].level).toBe('monthly');
+        expect(logger.failed).toEqual([]);
     });
 });

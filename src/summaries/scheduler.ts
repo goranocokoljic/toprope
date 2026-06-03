@@ -56,6 +56,14 @@ export const SUMMARY_AUTO_LEVELS: readonly SummaryAutoLevel[] = ['weekly', 'mont
  * aggregation job (weekly 04:00, monthly 04:30 — see aggregation/scheduler.ts) so
  * the aggregate rows the gate checks for are already written. Minute, hour,
  * day-of-month, month, day-of-week.
+ *
+ * The 15-minute margin is the only slack between aggregation finishing and this
+ * fire. It is deliberately a hard dependency, not a soft one: if the upstream
+ * aggregation runs long or fails, the gate (aggregateCompleted) finds no rows and
+ * the period is skipped+logged rather than narrated from missing data — and because
+ * the next fire targets the *next* just-completed period, a skipped period is not
+ * auto-retried. That is the intended "don't summarise from missing data" behaviour;
+ * recovering a skipped period is an on-demand `generate` (CLI/API), by design.
  */
 export const SUMMARY_CRON: Record<SummaryAutoLevel, string> = {
     weekly: '15 4 * * 1', // Monday 04:15
@@ -121,6 +129,16 @@ function summaryPeriodLabel(level: SummaryAutoLevel, now: Date): string {
  * from missing data" gate. Weekly checks weekly_aggregates for the week_start,
  * monthly checks monthly_aggregates for the month. Zero rows means the upstream
  * aggregation job didn't run or wrote nothing, so the summary job is skipped.
+ *
+ * Note this is a *proxy*: the summary input is folded directly from the immutable
+ * daily snapshots (see input-source.ts), not from these aggregate rows. Aggregate
+ * presence stands in for "the period's daily pipeline ran", which is sound for the
+ * scheduled case — the period closed days ago, well inside any daily retention
+ * window, and aggregation reads the same snapshots generation will. The one way the
+ * two could diverge is daily snapshots being pruned while aggregate rows persist; at
+ * the launch retention horizon a just-closed period is never that old, so the proxy
+ * holds. A deployment with aggressive retention should gate (or additionally check)
+ * on snapshot presence instead.
  */
 export function aggregateCompleted(
     db: Database.Database,
@@ -177,6 +195,12 @@ export interface SummaryAutoLogger {
         scope: SummaryScope,
         error: string,
     ): void;
+    /**
+     * A whole-job infrastructure failure — the run never reached any scope (DB
+     * couldn't be opened, migrations threw). Distinct from scopeFailed so a job that
+     * never started isn't misread as one scope's generation failing.
+     */
+    jobFailure(level: SummaryAutoLevel, period: string, error: string): void;
     jobComplete(
         level: SummaryAutoLevel,
         period: string,
@@ -208,6 +232,9 @@ export const consoleSummaryAutoLogger: SummaryAutoLogger = {
         console.error(
             `[summary:${level}] FAILED — ${period} ${scopeLabel(scope)}: ${error}`,
         );
+    },
+    jobFailure(level, period, error) {
+        console.error(`[summary:${level}] JOB FAILED — period ${period}: ${error}`);
     },
     jobComplete(level, period, generated, failed) {
         console.log(
@@ -325,10 +352,11 @@ export async function runScheduledSummaryJob(
     try {
         db = openDb(dbPath);
     } catch (err) {
-        // Couldn't even open the DB — log against the level and bail; the other
-        // level's task is untouched.
+        // Couldn't even open the DB — the run never reached any scope, so log it as a
+        // whole-job failure (not a per-scope one) and bail; the other level's task is
+        // untouched.
         const message = err instanceof Error ? err.message : String(err);
-        logger.scopeFailed(level, summaryPeriodLabel(level, now), {type: 'org', name: 'org'}, message);
+        logger.jobFailure(level, summaryPeriodLabel(level, now), message);
         return null;
     }
     try {
@@ -340,9 +368,10 @@ export async function runScheduledSummaryJob(
         });
     } catch (err) {
         // Guards the migration step (the one call here that can throw) so a migration
-        // error still logs rather than escaping into node-cron.
+        // error still logs rather than escaping into node-cron. Again a whole-job
+        // failure: no scope was attempted.
         const message = err instanceof Error ? err.message : String(err);
-        logger.scopeFailed(level, summaryPeriodLabel(level, now), {type: 'org', name: 'org'}, message);
+        logger.jobFailure(level, summaryPeriodLabel(level, now), message);
         return null;
     } finally {
         db.close();
