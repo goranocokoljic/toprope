@@ -21,9 +21,11 @@
  * Each period is wrapped in its own transaction so that period's per-developer
  * (or per-team) upserts commit as a single unit — collapsing what would
  * otherwise be one fsync per row into one per period over a multi-month run.
- * The transaction is per-period, not whole-run, so the lock is released between
- * periods: a backfill stays safe to run while the daily sync continues to append
- * snapshots, and a failure part-way leaves every already-committed period intact.
+ * The transaction is per-period, not whole-run, so the write lock is released
+ * between periods rather than held for the entire backfill — minimising
+ * contention with the daily sync (under WAL, readers never block, and a
+ * concurrent writer waits at most one period rather than the whole run). A
+ * failure part-way leaves every already-committed period intact.
  *
  * Delta correctness depends on processing CHRONOLOGICALLY and CONTIGUOUSLY:
  * deltas are not cascaded (see deltas.ts), so a period's delta is computed once,
@@ -98,8 +100,8 @@ function todayUtc(now: Date): string {
 /**
  * `date` shifted back `months` calendar months, returned as YYYY-MM-DD (UTC),
  * via Date normalisation so the result is always a valid ISO date. (The sole
- * caller subtracts a whole year, which never changes the day-of-month; the
- * normalisation is just belt-and-braces.)
+ * caller subtracts a whole year; the only day-of-month shift that produces is a
+ * Feb-29 `to` normalising forward to Mar-01, which is harmless for a range bound.)
  */
 function subtractMonths(date: string, months: number): string {
     const [year, mon, day] = date.split('-').map(Number);
