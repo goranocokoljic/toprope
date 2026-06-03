@@ -102,7 +102,17 @@ export function computeDeveloperDeltas(
         return {...NULL_DEVELOPER_DELTAS};
     }
     return {
-        interaction_delta_pct: pctChange(current.total_interactions, previous.total_interactions, 1),
+        // interaction_delta_pct is null when neither period had any tool
+        // interactions: total_interactions is a count that defaults to 0 (never
+        // null), so without this guard a git-only developer — the launch reality —
+        // would show a fabricated "0% change" forever. Null here mirrors how
+        // avg_acceptance_rate / cost_per_pr stay null when there is no tool/PR
+        // data, keeping the engine's "don't fabricate from absent data" posture.
+        // A real signal on either side (usage starting or stopping) still deltas.
+        interaction_delta_pct:
+            current.total_interactions === 0 && previous.total_interactions === 0
+                ? null
+                : pctChange(current.total_interactions, previous.total_interactions, 1),
         acceptance_rate_delta: pointDelta(current.avg_acceptance_rate, previous.avg_acceptance_rate),
         commit_velocity_delta_pct: pctChange(current.total_commits, previous.total_commits, 1),
         prs_merged_delta_pct: pctChange(current.total_prs_merged, previous.total_prs_merged, 1),
@@ -148,7 +158,15 @@ const DEVELOPER_VALUE_COLUMNS =
 
 /**
  * Look up the prior period's per-developer values and compute the deltas against
- * `current`. Returns all-null deltas when the prior period has no stored row.
+ * `current`. `previousPeriod` is the immediately-preceding period key (e.g. last
+ * week's Monday, last month) — deltas are always "vs the period right before this
+ * one," never vs the most recent period that happened to have activity. Returns
+ * all-null deltas when that prior period has no stored row: this covers both the
+ * genuine first period and a gap where the preceding period was never rolled up.
+ * In normal operation the rollups write a row for every developer every period
+ * (a zero-activity period still produces a row), so a gap only arises when the
+ * preceding period was never computed at all — and a null delta is the honest
+ * "no comparable prior period" answer there too.
  *
  * `table`/`periodColumn` are internal constants (never user input), so the
  * interpolation into the query is safe; the period key is bound as a parameter.

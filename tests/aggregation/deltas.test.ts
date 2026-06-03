@@ -144,6 +144,26 @@ describe('computeDeveloperDeltas', () => {
         expect(d.acceptance_rate_delta).toBeNull();
         expect(d.commit_velocity_delta_pct).toBe(20);
     });
+
+    it('nulls interaction_delta_pct when neither period had tool interactions (no fabricated 0%)', () => {
+        const noTool: DeveloperDeltaValues = {...CURRENT, total_interactions: 0};
+        const noToolPrev: DeveloperDeltaValues = {...PREVIOUS, total_interactions: 0};
+        const d = computeDeveloperDeltas(noTool, noToolPrev);
+        expect(d.interaction_delta_pct).toBeNull();
+        // Git metrics still delta normally — only the tool-derived count nulls out.
+        expect(d.commit_velocity_delta_pct).toBe(20);
+    });
+
+    it('still deltas interactions when usage starts or stops (one side non-zero)', () => {
+        const started: DeveloperDeltaValues = {...CURRENT, total_interactions: 5};
+        const wasZero: DeveloperDeltaValues = {...PREVIOUS, total_interactions: 0};
+        // Usage started: (5 - 0) / max(0, 1) * 100 = 500 — a real signal, not null.
+        expect(computeDeveloperDeltas(started, wasZero).interaction_delta_pct).toBe(500);
+        // Usage stopped: (0 - 5) / max(5, 1) * 100 = -100.
+        const stopped: DeveloperDeltaValues = {...CURRENT, total_interactions: 0};
+        const wasFive: DeveloperDeltaValues = {...PREVIOUS, total_interactions: 5};
+        expect(computeDeveloperDeltas(stopped, wasFive).interaction_delta_pct).toBe(-100);
+    });
 });
 
 describe('computeTeamDeltas', () => {

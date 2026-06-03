@@ -3,7 +3,7 @@ import Database from 'better-sqlite3';
 import {computeWeeklyAggregate} from '../../src/aggregation/weekly';
 import {computeMonthlyAggregate} from '../../src/aggregation/monthly';
 import {computeQuarterlyAggregate} from '../../src/aggregation/quarterly';
-import {makeDb, addDeveloper, addGitSnapshot} from './helpers';
+import {makeDb, addDeveloper, addGitSnapshot, addToolSnapshot, addSubscription} from './helpers';
 
 const NOW = new Date('2026-06-01T04:30:00.000Z');
 
@@ -83,6 +83,80 @@ describe('weekly delta wiring', () => {
 
         expect(current.commit_velocity_delta_pct).toBe(500); // (5-0)/max(0,1)*100
         expect(Number.isFinite(current.commit_velocity_delta_pct as number)).toBe(true);
+    });
+
+    it('compares against the immediately-preceding week only — a gap yields null deltas', () => {
+        // Data in week N-2 (2026-04-20) and week N (2026-05-04); week N-1 skipped.
+        addGitSnapshot(db, 'dev-1', '2026-04-20', {commits: 10});
+        addGitSnapshot(db, 'dev-1', '2026-05-04', {commits: 12});
+        computeWeeklyAggregate(db, 'dev-1', '2026-04-20', NOW); // N-2 rolled up
+        // N-1 (2026-04-27) is never computed → no stored row to compare against.
+        const current = computeWeeklyAggregate(db, 'dev-1', '2026-05-04', NOW);
+
+        // Delta is "vs last week," not "vs the most recent week with data," so the
+        // missing N-1 row makes it null rather than silently comparing to N-2.
+        expect(current.commit_velocity_delta_pct).toBeNull();
+    });
+
+    it('re-running the prior week does NOT cascade into the current week\'s stored delta', () => {
+        addGitSnapshot(db, 'dev-1', '2026-04-27', {commits: 10});
+        addGitSnapshot(db, 'dev-1', '2026-05-04', {commits: 12});
+        computeWeeklyAggregate(db, 'dev-1', '2026-04-27', NOW);
+        const current = computeWeeklyAggregate(db, 'dev-1', '2026-05-04', NOW);
+        expect(current.commit_velocity_delta_pct).toBe(20); // (12-10)/10*100
+
+        // Late data lands in the PRIOR week and it is recomputed. The current
+        // week's stored delta is intentionally left stale until it is itself
+        // re-run — the documented non-cascade contract.
+        addGitSnapshot(db, 'dev-1', '2026-04-28', {commits: 10}); // prior week now 20
+        computeWeeklyAggregate(db, 'dev-1', '2026-04-27', NOW);
+
+        const storedCurrentDelta = (
+            db
+                .prepare(
+                    'SELECT commit_velocity_delta_pct AS d FROM weekly_aggregates WHERE developer_id = ? AND week_start = ?',
+                )
+                .get('dev-1', '2026-05-04') as {d: number | null}
+        ).d;
+        expect(storedCurrentDelta).toBe(20); // unchanged — no cascade
+
+        // Re-running the current week refreshes it against the prior week's new value.
+        const refreshed = computeWeeklyAggregate(db, 'dev-1', '2026-05-04', NOW);
+        expect(refreshed.commit_velocity_delta_pct).toBe(-40); // (12-20)/20*100
+    });
+
+    it('computes tool & cost deltas through the DB round-trip (interaction/acceptance/cost columns)', () => {
+        // Two adjacent weeks both fully inside May (so the prorated per-day seat
+        // rate and 7-day window match exactly, isolating the delta to the metrics).
+        // Prior week (Mon 2026-05-04): 100 interactions, 70 accepted (rate 0.70), 4 PRs.
+        addToolSnapshot(db, 'dev-1', '2026-05-04', {
+            is_active: 1,
+            interaction_count: 100,
+            acceptance_count: 70,
+        });
+        addGitSnapshot(db, 'dev-1', '2026-05-04', {prs_merged: 4});
+        // Current week (Mon 2026-05-11): 200 interactions, 160 accepted (rate 0.80), 4 PRs.
+        addToolSnapshot(db, 'dev-1', '2026-05-11', {
+            is_active: 1,
+            interaction_count: 200,
+            acceptance_count: 160,
+        });
+        addGitSnapshot(db, 'dev-1', '2026-05-11', {prs_merged: 4});
+        addSubscription(db, 'dev-1', {
+            monthly_cost: 30,
+            seat_assigned_at: '2026-01-01T00:00:00.000Z',
+        });
+
+        computeWeeklyAggregate(db, 'dev-1', '2026-05-04', NOW);
+        const current = computeWeeklyAggregate(db, 'dev-1', '2026-05-11', NOW);
+
+        // These three columns are added by migration 016 and read back via the
+        // DEVELOPER_VALUE_COLUMNS SELECT — exercise that round-trip, not just the
+        // pure formula.
+        expect(current.interaction_delta_pct).toBe(100); // (200-100)/100*100
+        expect(current.acceptance_rate_delta).toBe(0.1); // 0.80 - 0.70 points
+        // Identical prorated weekly cost and same 4 PRs both weeks → 0% change.
+        expect(current.cost_per_pr_delta_pct).toBe(0);
     });
 });
 

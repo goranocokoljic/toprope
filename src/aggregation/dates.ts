@@ -13,7 +13,11 @@
  */
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-const MONTH_RE = /^\d{4}-\d{2}$/;
+// Month 01–12 only: a bare \d{2} shape would admit 2026-13 / 2026-00, and the
+// Date arithmetic in monthRange/priorMonth would silently roll those into a
+// valid-looking key rather than failing. Bounding the regex makes a malformed
+// month throw loudly, matching the 1–4 bound QUARTER_RE already enforces.
+const MONTH_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
 const QUARTER_RE = /^\d{4}-Q[1-4]$/;
 const YEAR_RE = /^\d{4}$/;
 

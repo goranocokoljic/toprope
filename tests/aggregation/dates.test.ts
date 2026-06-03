@@ -68,6 +68,11 @@ describe('monthRange', () => {
         expect(() => monthRange('2026-5')).toThrow();
         expect(() => monthRange('2026-05-01')).toThrow();
     });
+
+    it('throws on an out-of-range month rather than rolling it into a valid key', () => {
+        expect(() => monthRange('2026-13')).toThrow();
+        expect(() => monthRange('2026-00')).toThrow();
+    });
 });
 
 describe('quarterRange', () => {
@@ -157,6 +162,11 @@ describe('priorMonth', () => {
 
     it('throws on a malformed month', () => {
         expect(() => priorMonth('2026-13-01')).toThrow();
+    });
+
+    it('throws on an out-of-range month (shape-valid but month > 12 or 00)', () => {
+        expect(() => priorMonth('2026-13')).toThrow();
+        expect(() => priorMonth('2026-00')).toThrow();
     });
 });
 
