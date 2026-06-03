@@ -501,7 +501,7 @@ async function checkSummaryModel(config: GovProxyConfig): Promise<CheckResult> {
     }
 
     if (modelType === 'ollama') {
-        const baseUrl = summaries.model?.endpoint ?? 'http://localhost:11434';
+        const baseUrl = trimTrailingSlash(summaries.model?.endpoint ?? 'http://localhost:11434');
         try {
             const res = await fetch(`${baseUrl}/api/tags`, {
                 signal: AbortSignal.timeout(5_000),
@@ -523,7 +523,43 @@ async function checkSummaryModel(config: GovProxyConfig): Promise<CheckResult> {
         }
     }
 
+    if (modelType === 'openai') {
+        const baseUrl = trimTrailingSlash(summaries.model?.endpoint ?? 'https://api.openai.com');
+        try {
+            const res = await fetch(`${baseUrl}/v1/models`, {
+                headers: apiKey ? {authorization: `Bearer ${apiKey}`} : {},
+                signal: AbortSignal.timeout(8_000),
+            });
+            if (res.status === 401) {
+                return fail(
+                    'Summary model',
+                    'OpenAI key invalid (401)',
+                    'Set a valid key under summaries.model.api_key in config.',
+                );
+            }
+            if (!res.ok) {
+                return fail(
+                    'Summary model',
+                    `OpenAI endpoint returned ${res.status}`,
+                    `Verify summaries.model.endpoint (${baseUrl}) and api_key.`,
+                );
+            }
+            return pass('Summary model', `OpenAI endpoint reachable (${summaries.model?.model_name ?? 'default'})`);
+        } catch (err) {
+            return fail(
+                'Summary model',
+                `Cannot reach OpenAI endpoint at ${baseUrl}: ${err instanceof Error ? err.message : String(err)}`,
+                'Check the endpoint URL and your network connection.',
+            );
+        }
+    }
+
     return pass('Summary model', `Model type "${modelType}" — skipping reachability check`);
+}
+
+/** Strip a single trailing slash so endpoint + path joins don't double up. */
+function trimTrailingSlash(url: string): string {
+    return url.endsWith('/') ? url.slice(0, -1) : url;
 }
 
 export async function runDoctor(

@@ -79,3 +79,11 @@ summaries:
 
 Note this sends the aggregate (numbers-only) payload to that provider. For
 `openai` and openai-compatible servers, set `endpoint` to the base URL.
+
+> **OpenAI parameter note.** The `openai` branch sends the legacy `max_tokens`
+> field, which OpenAI-compatible servers (vLLM, LM Studio, Ollama's OpenAI shim)
+> and older OpenAI models accept. Newer first-party OpenAI reasoning models
+> require `max_completion_tokens` and will reject `max_tokens` with an HTTP 400 —
+> handled gracefully (the summary is skipped, not crashed), but it means those
+> specific models won't generate via this branch. The branch primarily targets
+> local/compatible servers.

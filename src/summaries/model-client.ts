@@ -99,9 +99,20 @@ export function resolveSummaryModel(
         );
     }
 
+    const endpoint = base.endpoint ?? defaultEndpointFor(type);
+    // The endpoint is operator-supplied (config only, not user input), but
+    // validate the scheme at the boundary so a malformed value fails loudly here
+    // rather than as an opaque fetch error — and never points fetch at a non-HTTP
+    // scheme.
+    if (!/^https?:\/\//i.test(endpoint)) {
+        throw new Error(
+            `Invalid summary model endpoint "${endpoint}" (must be an http:// or https:// URL)`,
+        );
+    }
+
     return {
         type,
-        endpoint: base.endpoint ?? defaultEndpointFor(type),
+        endpoint,
         model_name: modelName,
         api_key: base.api_key,
     };
@@ -153,6 +164,12 @@ export class SummaryModelClient {
      * Generate narrative text from a prompt. Returns a result rather than
      * throwing for operational failures (unreachable endpoint, timeout, HTTP
      * error, malformed body) so the scheduler can log + skip + retry later.
+     *
+     * Deliberately does NOT retry in-request (unlike the sibling Anthropic
+     * connector client, which retries 429/5xx with backoff): summaries are a
+     * once-per-period batch job, so the scheduler's next run IS the retry loop.
+     * A transient blip skips this period and is retried on the next tick rather
+     * than blocking the request with sleeps.
      */
     async generate(prompt: string): Promise<SummaryModelResult> {
         const {type, model_name} = this.config;
@@ -164,6 +181,19 @@ export class SummaryModelClient {
                     return await this.generateAnthropic(prompt);
                 case 'openai':
                     return await this.generateOpenAI(prompt);
+                default: {
+                    // Fail closed. The factory path validates `type` via
+                    // resolveSummaryModel, but a directly-constructed config
+                    // (e.g. in a test) could carry an out-of-union value — return
+                    // an explicit non-retryable failure rather than `undefined`.
+                    const _exhaustive: never = type;
+                    return {
+                        ok: false,
+                        error: `Unsupported summary model type "${String(_exhaustive)}"`,
+                        retryable: false,
+                        model: model_name,
+                    };
+                }
             }
         } catch (err) {
             // Any throw from a provider branch (network error, timeout/abort,
@@ -206,7 +236,11 @@ export class SummaryModelClient {
         const url = `${trimTrailingSlash(this.config.endpoint)}/api/generate`;
         const {res, failure} = await this.fetchJson(
             url,
-            {model: this.config.model_name, prompt, stream: false},
+            // num_predict is Ollama's output-length cap — the equivalent of
+            // max_tokens on the cloud branches. Without it a large local model
+            // (the 70b default for monthly+) is bounded only by the request
+            // timeout, so apply the same ceiling here for parity.
+            {model: this.config.model_name, prompt, stream: false, options: {num_predict: MAX_OUTPUT_TOKENS}},
             {},
         );
         if (failure) return failure;
@@ -223,7 +257,7 @@ export class SummaryModelClient {
             this.logger.warn(`Summary model (anthropic/${this.config.model_name}) ${error} — skipping`);
             return {ok: false, error, retryable: false, model: this.config.model_name};
         }
-        const url = `${trimTrailingSlash(this.config.endpoint || ANTHROPIC_ENDPOINT)}/v1/messages`;
+        const url = `${trimTrailingSlash(this.config.endpoint)}/v1/messages`;
         const {res, failure} = await this.fetchJson(
             url,
             {
@@ -252,6 +286,12 @@ export class SummaryModelClient {
             url,
             {
                 model: this.config.model_name,
+                // Uses the legacy `max_tokens` field, which the OpenAI-compatible
+                // servers this branch primarily targets (vLLM, LM Studio, Ollama's
+                // OpenAI shim) and older OpenAI models accept. Newer first-party
+                // OpenAI reasoning models require `max_completion_tokens` instead
+                // and would 400 here (a graceful, non-retryable failure); see
+                // docs/summaries-model.md.
                 max_tokens: MAX_OUTPUT_TOKENS,
                 messages: [{role: 'user', content: prompt}],
             },

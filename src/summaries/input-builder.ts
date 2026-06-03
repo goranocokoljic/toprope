@@ -5,15 +5,25 @@
  * org benchmark for context) into a compact, NUMBERS-ONLY payload for the model.
  *
  * Privacy is the whole point of this module. The model that writes the summaries
- * must never see code, commit messages, or any free text from repositories. This
- * builder enforces that by construction: its input type (`AggregateMetrics`)
- * carries only numeric metrics, and the payload it emits contains only numbers
- * plus a small, fixed set of controlled label strings (the period key, the team
- * name from the registry, the level, the data-quality tier, the maturity basis,
- * and the generated data_basis sentence). There is no field through which repo
- * free text could ever reach the model. `assertNumbersOnly` is provided as a
- * defensive runtime check (and a directly testable privacy gate) that the
- * payload's string content is confined to that controlled set.
+ * must never see code, commit messages, or any free text from repositories.
+ * There are two layers of defence:
+ *
+ *   1. By construction — the input type (`AggregateMetrics`) carries only numeric
+ *      metrics, so there is no field through which repo free text could enter the
+ *      payload. This is the primary guarantee.
+ *   2. A runtime allowlist gate (`assertNumbersOnly`) that verifies every string
+ *      in the assembled payload belongs to the controlled set: the level / scope
+ *      type / data-quality / maturity-basis enums, the period key + ISO dates (a
+ *      restricted character class), one of the generated data_basis sentences,
+ *      and the scope name (the one operator/registry-supplied label, which is
+ *      length- and character-restricted — never repo free text). `buildSummaryInput`
+ *      runs this gate on its own output, so the guarantee is enforced at
+ *      construction, not left for a future caller to remember.
+ *
+ * The gate is an allowlist, not a code-token blocklist: it asserts what each
+ * string MUST be rather than guessing at what it must not contain, so a future
+ * widening of the payload that introduced a free-text field would fail the gate
+ * rather than slip through.
  *
  * The `data_basis` field is the bridge to Task 3.8's tier-aware prompts: it
  * states, in words, what the numbers are derived from (e.g. "git analysis +
@@ -181,7 +191,7 @@ export function buildSummaryInput(params: {
         org_avg_maturity_score: null,
     };
 
-    return {
+    const payload: SummaryInputPayload = {
         period: {level, label: periodLabel, start, end},
         scope: {
             type: scope.type,
@@ -205,6 +215,11 @@ export function buildSummaryInput(params: {
         data_basis: deriveDataBasis(current.ai_maturity_basis),
         data_quality: current.data_quality,
     };
+    // Enforce the privacy allowlist on our own output, so the numbers-only
+    // guarantee holds at construction time rather than depending on a downstream
+    // caller remembering to check.
+    assertNumbersOnly(payload);
+    return payload;
 }
 
 /**
@@ -261,33 +276,52 @@ function fmtPoint(value: number | null): string {
 }
 
 /**
- * Forbidden substrings that would indicate code or repo free text leaked into a
- * payload. Used by `assertNumbersOnly` as a defensive privacy gate. This is a
- * belt-and-braces check: the typed input already makes leakage impossible, but a
- * future change that widens `AggregateMetrics` would be caught here and in the
- * privacy test rather than silently shipping repo content to the model.
+ * The exact controlled strings a payload may contain: the closed enums plus the
+ * generated data_basis sentences (one per maturity basis). Anything matching one
+ * of these is, by definition, not repo free text.
  */
-// Note: deliberately does NOT include a bare ';' — the legitimate data_basis
-// sentence ("git analysis + expense data; no direct tool usage") contains one.
-// The tokens below are strong code/markup signals that never appear in the
-// controlled label set (period keys, team names, enums, the data_basis text).
-const CODE_LIKE_TOKENS: readonly string[] = [
-    'function ',
-    'const ',
-    'import ',
-    'class ',
-    '=>',
-    '{',
-    '}',
-    '//',
-    '/*',
-    '```',
-];
+const ALLOWED_EXACT: ReadonlySet<string> = new Set<string>([
+    // SummaryLevel
+    'weekly',
+    'monthly',
+    'quarterly',
+    'yearly',
+    // SummaryScope.type
+    'team',
+    'org',
+    // MaturityBasis
+    'git_estimate',
+    'mixed',
+    'measured',
+    // DataQuality
+    'high',
+    'medium',
+    'low',
+    // The generated data_basis sentences — every value deriveDataBasis can emit.
+    deriveDataBasis('git_estimate'),
+    deriveDataBasis('mixed'),
+    deriveDataBasis('measured'),
+]);
 
 /**
- * Collect every string value reachable in the payload (recursively). The privacy
- * test uses this to assert the payload's text content is confined to the
- * controlled label set.
+ * Period keys and ISO dates: alphanumerics and dashes only (e.g. '2026-W21',
+ * '2026-Q2', '2026-05', '2026', '2026-05-19'). No spaces, no punctuation that
+ * could carry prose.
+ */
+const PERIOD_TOKEN = /^[0-9A-Za-z-]+$/;
+
+/**
+ * The scope name is the single operator/registry-supplied label (a team or org
+ * name), so it cannot be an exact-match enum. It is constrained to a tight set
+ * of name characters and a short length — enough for real team names, but with
+ * no newlines, braces, slashes, or other markers that prose, commit messages,
+ * or code carry. Repo free text cannot satisfy this.
+ */
+const SCOPE_NAME = /^[A-Za-z0-9 ._\-&,']{1,64}$/;
+
+/**
+ * Collect every string value reachable in the payload (recursively). Used by the
+ * allowlist gate and the privacy test to inspect the payload's text content.
  */
 export function collectStringValues(value: unknown, acc: string[] = []): string[] {
     if (typeof value === 'string') {
@@ -301,19 +335,22 @@ export function collectStringValues(value: unknown, acc: string[] = []): string[
 }
 
 /**
- * Defensive runtime gate: throw if any string in the payload looks like code or
- * repo free text. Cheap and called by the generator before sending to the model;
- * a thrown error here means a programming regression (a free-text field slipped
- * into the payload), which should fail loudly rather than leak data.
+ * Privacy gate (allowlist). Throws unless every string in the payload is one of:
+ * a controlled enum value, a generated data_basis sentence, a period-key/ISO-date
+ * token, or a scope name within the restricted name pattern. Because it asserts
+ * what each string MUST be (not what it must not contain), a future change that
+ * introduced a free-text field would fail here rather than slip through a token
+ * blocklist. `buildSummaryInput` runs this on its own output, so a thrown error
+ * means a programming regression that must fail loudly rather than leak data.
  */
 export function assertNumbersOnly(payload: SummaryInputPayload): void {
     for (const str of collectStringValues(payload)) {
-        for (const token of CODE_LIKE_TOKENS) {
-            if (str.includes(token)) {
-                throw new Error(
-                    `Summary input payload contains forbidden code-like content (token "${token.trim()}"); refusing to send to model`,
-                );
-            }
+        const allowed = ALLOWED_EXACT.has(str) || PERIOD_TOKEN.test(str) || SCOPE_NAME.test(str);
+        if (!allowed) {
+            throw new Error(
+                `Summary input payload contains a string outside the numbers-only allowlist ` +
+                    `(${JSON.stringify(str.slice(0, 80))}); refusing to send to model`,
+            );
         }
     }
 }

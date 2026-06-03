@@ -147,17 +147,30 @@ describe('privacy — numbers-only payload', () => {
         expect(() => assertNumbersOnly(payload)).not.toThrow();
     });
 
-    it('assertNumbersOnly throws if code-like content is injected (defensive gate)', () => {
+    it('assertNumbersOnly throws if code-like content is injected (allowlist gate)', () => {
         const tampered = {
             ...payload,
             scope: {...payload.scope, name: 'function leak() { return secret; }'},
         };
-        expect(() => assertNumbersOnly(tampered)).toThrow(/forbidden code-like content/);
+        expect(() => assertNumbersOnly(tampered)).toThrow(/outside the numbers-only allowlist/);
     });
 
-    it('detects a leaked commit message containing a comment marker', () => {
+    it('detects a leaked commit message (free text outside the allowlist)', () => {
         const tampered = {...payload, data_basis: 'oops // TODO leaked commit message'};
-        expect(() => assertNumbersOnly(tampered)).toThrow();
+        expect(() => assertNumbersOnly(tampered)).toThrow(/outside the numbers-only allowlist/);
+    });
+
+    it('rejects a scope name with prose/newlines (not a real team name)', () => {
+        const tampered = {
+            ...payload,
+            scope: {...payload.scope, name: 'see commit:\nrefactored auth module per PR feedback'},
+        };
+        expect(() => assertNumbersOnly(tampered)).toThrow(/outside the numbers-only allowlist/);
+    });
+
+    it('accepts a realistic hyphenated team name', () => {
+        const ok = {...payload, scope: {...payload.scope, name: 'platform-infra & data'}};
+        expect(() => assertNumbersOnly(ok)).not.toThrow();
     });
 });
 
@@ -179,8 +192,8 @@ describe('formatSummaryInput', () => {
         expect(text).toContain('Total commits: 142');
         expect(text).toContain('PRs merged: 23');
         expect(text).toContain('Data basis: git analysis + expense data; no direct tool usage');
-        // The rendered block must itself be free of code-like content.
-        expect(() => assertNumbersOnly({...payload, data_basis: text})).not.toThrow();
+        // The rendered block must itself be free of code/markup markers.
+        expect(text).not.toMatch(/[{}]|=>|\/\/|```|function\s|const\s/);
     });
 
     it('notes the absence of a prior comparison on the first period', () => {
