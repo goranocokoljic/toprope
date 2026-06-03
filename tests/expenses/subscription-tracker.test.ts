@@ -15,6 +15,7 @@ import {
     getDeveloperCostOnDate,
     getDeveloperCostOverTime,
     getDeveloperPlanChanges,
+    getSeatProratedCost,
 } from '../../src/expenses/subscription-tracker';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../src/storage/migrations');
@@ -708,5 +709,52 @@ describe('subscription lifecycle — cost over time', () => {
             {date: '2026-01-15', monthly_cost: 200},
             {date: '2026-01-16', monthly_cost: 200},
         ]);
+    });
+});
+
+describe('getSeatProratedCost', () => {
+    it('charges one full month for a seat held a whole calendar month', () => {
+        const seat = {
+            monthly_cost: 90,
+            seat_assigned_at: '2026-01-01T00:00:00.000Z',
+            seat_revoked_at: null,
+        };
+        // Raw helper does not round (callers round the aggregated total); 31×(90/31)
+        // carries a float artifact, so compare with tolerance.
+        expect(getSeatProratedCost(seat, '2026-05-01', '2026-05-31')).toBeCloseTo(90, 6);
+    });
+
+    it('prorates a partial month by days held over that month length', () => {
+        const seat = {
+            monthly_cost: 31,
+            seat_assigned_at: '2026-05-01T00:00:00.000Z',
+            seat_revoked_at: null,
+        };
+        // 7 of 31 days at $31/mo → exactly $7.
+        expect(getSeatProratedCost(seat, '2026-05-01', '2026-05-07')).toBeCloseTo(7, 6);
+    });
+
+    it('charges nothing for a seat never active in the window', () => {
+        const seat = {
+            monthly_cost: 90,
+            seat_assigned_at: '2026-06-01T00:00:00.000Z',
+            seat_revoked_at: null,
+        };
+        expect(getSeatProratedCost(seat, '2026-05-01', '2026-05-31')).toBe(0);
+    });
+
+    it('charges nothing for a seat with no assign date', () => {
+        const seat = {monthly_cost: 90, seat_assigned_at: null, seat_revoked_at: null};
+        expect(getSeatProratedCost(seat, '2026-05-01', '2026-05-31')).toBe(0);
+    });
+
+    it('stops charging on the revoke date (exclusive)', () => {
+        const seat = {
+            monthly_cost: 30,
+            seat_assigned_at: '2026-04-01T00:00:00.000Z',
+            seat_revoked_at: '2026-04-16T00:00:00.000Z',
+        };
+        // Active Apr 1..15 = 15 of 30 days at $30 → $15.
+        expect(getSeatProratedCost(seat, '2026-04-01', '2026-04-30')).toBeCloseTo(15, 6);
     });
 });
