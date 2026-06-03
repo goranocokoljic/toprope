@@ -53,6 +53,7 @@ import {computeAllWeeklyAggregates} from './weekly';
 import {computeAllMonthlyAggregates} from './monthly';
 import {computeAllQuarterlyAggregates} from './quarterly';
 import {computeAllYearlyAggregates} from './yearly';
+import {markStaleSummariesForRecompute} from '../summaries/staleness';
 
 export type AggregationPeriod = 'weekly' | 'monthly' | 'quarterly' | 'yearly';
 
@@ -169,6 +170,15 @@ export function runAggregationForPeriod(
         }
     };
     const rows = db.transaction(compute)();
+
+    // After the recompute, re-check any summaries written for this period: if the
+    // underlying snapshots moved (late data, re-sync), the freshly built input no
+    // longer matches what a summary was generated from, so it is flagged stale.
+    // Read-only against snapshots and best-effort — it never alters the aggregate
+    // result and swallows its own per-summary errors, so a summary issue can't
+    // break the aggregation run.
+    markStaleSummariesForRecompute(db, period, periodKey);
+
     return {period, periodKey, rowsWritten: rows.length};
 }
 

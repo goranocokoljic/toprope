@@ -40,6 +40,9 @@ import {
 } from './aggregation/scheduler';
 import {hashPassword, validatePasswordStrength, generateTempPassword} from './auth/password';
 import {createUser, getActiveUserByEmail, countAdmins} from './auth/users';
+import {generateSummary} from './summaries/generator';
+import {getSummaryByTarget} from './summaries/store';
+import {parseLevel, parseScope, validatePeriod, type SummaryTarget} from './summaries/target';
 
 // Commander option collector for repeatable flags (e.g. --git-email).
 function collectValue(value: string, previous: string[]): string[] {
@@ -1031,6 +1034,123 @@ aggregateCommand
         } finally {
             db.close();
         }
+    });
+
+const summaryCommand = program.command('summary').description('Generate and view AI-written period summaries');
+
+/**
+ * Resolve and validate the shared --level/--period/--scope options into a target.
+ * Throws (with a user-facing message) on any malformed coordinate, so both
+ * subcommands reject bad input before opening the DB.
+ */
+function resolveSummaryTarget(options: {level: string; period: string; scope: string}): SummaryTarget {
+    const level = parseLevel(options.level);
+    const period = validatePeriod(level, options.period);
+    const scope = parseScope(options.scope);
+    return {level, period, scope};
+}
+
+summaryCommand
+    .command('generate')
+    .description('Generate (or regenerate) a summary for one level, period, and scope')
+    .requiredOption('--level <level>', 'weekly | monthly | quarterly | yearly')
+    .requiredOption('--period <period>', 'Period key: YYYY-Wnn | YYYY-MM | YYYY-Qn | YYYY')
+    .requiredOption('--scope <scope>', 'Scope: org | team:<name>')
+    .option('--focus <text>', 'Optional regeneration focus passed into the prompt (e.g. "cost")')
+    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .action(
+        async (options: {
+            level: string;
+            period: string;
+            scope: string;
+            focus?: string;
+            config: string;
+        }) => {
+            let target: SummaryTarget;
+            try {
+                target = resolveSummaryTarget(options);
+            } catch (err) {
+                console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+                process.exit(1);
+            }
+            const configPath = path.resolve(process.cwd(), options.config);
+            const config = loadConfig(configPath);
+            const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
+            const db = openDb(dbPath);
+            let failed = false;
+            try {
+                runMigrations(db, MIGRATIONS_DIR);
+                const result = await generateSummary(db, config.summaries, target, {
+                    focus: options.focus,
+                });
+                if (result.ok) {
+                    const regen =
+                        result.summary.regenerated_count > 0
+                            ? ` (regeneration #${result.summary.regenerated_count})`
+                            : '';
+                    console.log(
+                        `Generated ${target.level} summary for ${options.scope} ${target.period} ` +
+                            `using ${result.summary.model_used}${regen}.`,
+                    );
+                } else {
+                    console.error(
+                        `Summary generation failed${result.retryable ? ' (retryable)' : ''}: ${result.error}`,
+                    );
+                    failed = true;
+                }
+            } finally {
+                db.close();
+            }
+            if (failed) process.exit(1);
+        },
+    );
+
+summaryCommand
+    .command('show')
+    .description('Show a stored summary and its metadata for one level, period, and scope')
+    .requiredOption('--level <level>', 'weekly | monthly | quarterly | yearly')
+    .requiredOption('--period <period>', 'Period key: YYYY-Wnn | YYYY-MM | YYYY-Qn | YYYY')
+    .requiredOption('--scope <scope>', 'Scope: org | team:<name>')
+    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .action((options: {level: string; period: string; scope: string; config: string}) => {
+        let target: SummaryTarget;
+        try {
+            target = resolveSummaryTarget(options);
+        } catch (err) {
+            console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+            process.exit(1);
+        }
+        const configPath = path.resolve(process.cwd(), options.config);
+        const config = loadConfig(configPath);
+        const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
+        const db = openDb(dbPath);
+        let found = true;
+        try {
+            runMigrations(db, MIGRATIONS_DIR);
+            const summary = getSummaryByTarget(db, target);
+            if (!summary) {
+                console.error(
+                    `No ${target.level} summary found for ${options.scope} ${target.period}. ` +
+                        'Run `govproxy summary generate` first.',
+                );
+                found = false;
+            } else {
+                const staleTag = summary.is_stale === 1 ? '  ⚠ STALE (underlying data changed)' : '';
+                console.log('─'.repeat(80));
+                console.log(
+                    `${target.level} summary — ${options.scope} — ${target.period}${staleTag}`,
+                );
+                console.log(
+                    `Model: ${summary.model_used}  |  Generated: ${summary.generated_at}  |  ` +
+                        `Regenerations: ${summary.regenerated_count}`,
+                );
+                console.log('─'.repeat(80));
+                console.log(summary.summary_text);
+            }
+        } finally {
+            db.close();
+        }
+        if (!found) process.exit(1);
     });
 
 program
