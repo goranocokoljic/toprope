@@ -21,6 +21,9 @@ import {registerExportRoutes} from './dashboard/api/export';
 import {registerSettingsRoutes} from './dashboard/api/settings';
 import {registerLeaderboardRoutes} from './dashboard/api/leaderboard';
 import {registerAdminRoutes} from './dashboard/api/admin';
+import {registerAggregateRoutes} from './dashboard/api/aggregates';
+import {registerMaturityRoutes} from './dashboard/api/maturity';
+import {registerSummaryRoutes} from './dashboard/api/summaries';
 import {registerDashboardStatic} from './dashboard/static';
 import {startScheduler} from './scheduler/scheduler';
 import {startAggregationScheduler} from './aggregation/scheduler';
@@ -92,6 +95,10 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
     registerSettingsRoutes(app, db);
     registerLeaderboardRoutes(app, db);
     registerAdminRoutes(app, db);
+    // Phase 3 reads: pre-computed aggregates, maturity trend, and AI summaries.
+    registerAggregateRoutes(app, db);
+    registerMaturityRoutes(app, db);
+    registerSummaryRoutes(app, db, config.summaries);
 
     // Serve the built React dashboard (Phase 2) at /dashboard, if present.
     registerDashboardStatic(app);

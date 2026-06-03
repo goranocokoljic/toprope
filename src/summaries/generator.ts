@@ -142,6 +142,10 @@ export async function generateSummary(
         // Fresh summary starts at 0; an existing one being regenerated increments.
         regenerated_count: existing ? existing.regenerated_count + 1 : 0,
         is_stale: 0,
+        // Record what the narrative was written under so the API can label it
+        // honestly without re-folding snapshots on read (Task 3.11 / #80).
+        ai_maturity_basis: payload.metrics.ai_maturity_basis,
+        data_quality: payload.data_quality,
     };
     upsertSummary(db, record);
     return {ok: true, summary: record};

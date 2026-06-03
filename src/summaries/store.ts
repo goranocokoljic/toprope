@@ -15,6 +15,8 @@
 
 import {createHash} from 'crypto';
 import type Database from 'better-sqlite3';
+import type {DataQuality} from '../aggregation/compute';
+import type {MaturityBasis} from '../aggregation/team-period';
 import type {SummaryInputPayload} from './input-builder';
 import type {SummaryLevel} from './model-client';
 import type {SummaryTarget} from './target';
@@ -32,9 +34,17 @@ export interface SummaryRecord {
     generated_at: string;
     regenerated_count: number;
     is_stale: 0 | 1;
+    /**
+     * The maturity basis the summary was generated under ('git_estimate' at
+     * launch). Null only for legacy rows written before this column existed (Task
+     * 3.11 / #80) — the API surfaces it so the UI can label a "git-based estimate".
+     */
+    ai_maturity_basis: MaturityBasis | null;
+    /** The data-quality tier the period was computed at; null on legacy rows. */
+    data_quality: DataQuality | null;
 }
 
-type SummaryScopeType = 'team' | 'org';
+export type SummaryScopeType = 'team' | 'org';
 
 /**
  * The deterministic primary key for a target. Stable across regeneration so the
@@ -67,13 +77,16 @@ interface SummaryRow {
     generated_at: string;
     regenerated_count: number | null;
     is_stale: number | null;
+    ai_maturity_basis: string | null;
+    data_quality: string | null;
 }
 
 // The columns the read surface selects — named explicitly (rather than SELECT *)
 // so it matches the named write surface and is insulated from future column adds.
 const SUMMARY_COLUMNS =
     'id, scope, scope_name, period_type, period_value, summary_text, ' +
-    'model_used, input_hash, generated_at, regenerated_count, is_stale';
+    'model_used, input_hash, generated_at, regenerated_count, is_stale, ' +
+    'ai_maturity_basis, data_quality';
 
 function toRecord(row: SummaryRow): SummaryRecord {
     return {
@@ -88,6 +101,22 @@ function toRecord(row: SummaryRow): SummaryRecord {
         generated_at: row.generated_at,
         regenerated_count: row.regenerated_count ?? 0,
         is_stale: row.is_stale === 1 ? 1 : 0,
+        ai_maturity_basis: (row.ai_maturity_basis as MaturityBasis | null) ?? null,
+        data_quality: (row.data_quality as DataQuality | null) ?? null,
+    };
+}
+
+/**
+ * Reconstruct the {@link SummaryTarget} a stored record was generated for. The
+ * inverse of {@link summaryId}'s addressing: regeneration and the read-time
+ * basis/tier recompute (Task 3.11 / #80) both need to get from a persisted row
+ * back to its (level, period, scope) coordinates without re-parsing the id string.
+ */
+export function targetFromRecord(record: SummaryRecord): SummaryTarget {
+    return {
+        level: record.period_type,
+        period: record.period_value,
+        scope: {type: record.scope, name: record.scope_name},
     };
 }
 
@@ -105,6 +134,52 @@ export function getSummaryByTarget(
     target: SummaryTarget,
 ): SummaryRecord | null {
     return getSummaryById(db, summaryId(target));
+}
+
+/** Optional filters for {@link listSummaries}; an absent field means "any". */
+export interface SummaryListFilter {
+    level?: SummaryLevel;
+    scope?: SummaryScopeType;
+    /** Only meaningful with scope='team' — the team name to match. */
+    scopeName?: string;
+}
+
+/**
+ * Every stored summary, most recent first, optionally narrowed by level and/or
+ * scope. Drives the dashboard's summary list (Task 3.11 / #80): the ordering is
+ * the read contract (newest generation first) and the filters are folded into the
+ * WHERE clause rather than in JS so the order/limit semantics stay in the DB.
+ *
+ * Intentionally unbounded: the row count is one summary per (scope, level,
+ * period), which grows slowly, and the API maps each row with an O(1) column read
+ * (basis/tier are stored, not recomputed) — the same cost profile as the sibling
+ * trend reads. Pagination would be added here if summary volume ever warranted it.
+ */
+export function listSummaries(
+    db: Database.Database,
+    filter: SummaryListFilter = {},
+): SummaryRecord[] {
+    const clauses: string[] = [];
+    const params: Record<string, string> = {};
+    if (filter.level !== undefined) {
+        clauses.push('period_type = @level');
+        params.level = filter.level;
+    }
+    if (filter.scope !== undefined) {
+        clauses.push('scope = @scope');
+        params.scope = filter.scope;
+    }
+    if (filter.scopeName !== undefined) {
+        clauses.push('scope_name = @scopeName');
+        params.scopeName = filter.scopeName;
+    }
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+    const rows = db
+        .prepare(
+            `SELECT ${SUMMARY_COLUMNS} FROM summaries ${where} ORDER BY generated_at DESC`,
+        )
+        .all(params) as SummaryRow[];
+    return rows.map(toRecord);
 }
 
 /** Every summary stored for a (period_type, period_value), most recent first. */
@@ -131,10 +206,12 @@ export function upsertSummary(db: Database.Database, record: SummaryRecord): voi
     db.prepare(
         `INSERT INTO summaries (
             id, scope, scope_name, period_type, period_value, summary_text,
-            model_used, data_hash, input_hash, generated_at, regenerated_count, is_stale
+            model_used, data_hash, input_hash, generated_at, regenerated_count, is_stale,
+            ai_maturity_basis, data_quality
         ) VALUES (
             @id, @scope, @scope_name, @period_type, @period_value, @summary_text,
-            @model_used, @input_hash, @input_hash, @generated_at, @regenerated_count, 0
+            @model_used, @input_hash, @input_hash, @generated_at, @regenerated_count, 0,
+            @ai_maturity_basis, @data_quality
         )
         ON CONFLICT(id) DO UPDATE SET
             scope = excluded.scope,
@@ -147,7 +224,9 @@ export function upsertSummary(db: Database.Database, record: SummaryRecord): voi
             input_hash = excluded.input_hash,
             generated_at = excluded.generated_at,
             regenerated_count = excluded.regenerated_count,
-            is_stale = 0`,
+            is_stale = 0,
+            ai_maturity_basis = excluded.ai_maturity_basis,
+            data_quality = excluded.data_quality`,
     ).run({
         id: record.id,
         scope: record.scope,
@@ -159,6 +238,8 @@ export function upsertSummary(db: Database.Database, record: SummaryRecord): voi
         input_hash: record.input_hash,
         generated_at: record.generated_at,
         regenerated_count: record.regenerated_count,
+        ai_maturity_basis: record.ai_maturity_basis,
+        data_quality: record.data_quality,
     });
 }
 
