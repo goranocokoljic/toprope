@@ -65,6 +65,9 @@ export const FABRICATED_USAGE_TERMS: readonly string[] = [
     'lines of code accepted',
     'tab acceptance',
     'prompts accepted',
+    // Near-synonyms of "acceptance rate" a model reaches for when told not to say it.
+    'adoption rate',
+    'usage rate',
     'interactions',
     'interaction count',
     'active usage',
@@ -161,32 +164,48 @@ export const LEVEL_BRIEFS: Readonly<Record<SummaryInputPayload['period']['level'
  * outright ban on the direct-usage vocabulary, while a measured/mixed period is
  * told it may reference those metrics because the fields then exist.
  */
-function buildPreamble(payload: SummaryInputPayload): string {
-    // The first sentence is tier-specific; the ban that follows is identical for
-    // every tier that doesn't fully substantiate direct usage (git_estimate AND
-    // mixed), because the payload carries no per-tool direct-usage fields either way.
-    let usageClause: string;
-    if (directUsageSubstantiated(payload)) {
-        usageClause = [
-            `The numbers are derived from ${payload.data_basis}.`,
-            'Where direct tool-usage metrics are present in the input, you may describe them as measured; where a',
-            'figure is git-derived, describe it as such ("commit activity," "merged PRs," "code churn," "estimated',
-            'AI-assistance signal"). Never imply a measurement the input does not contain.',
-        ].join('\n');
-    } else {
-        const lead = isGitOnly(payload)
-            ? `Direct tool-usage data is NOT connected for this period. The numbers are derived from ${payload.data_basis}.`
-            : `Direct tool-usage data is only PARTIALLY connected for this period, and this payload carries only ` +
-              `aggregate git-derived numbers (${payload.data_basis}) — no per-tool usage figure you could cite.`;
-        usageClause = [
-            lead,
-            'You MUST NOT use the words or concepts "acceptance rate," "interactions," "suggestions accepted," or any',
-            'other direct-tool-usage metric. Those describe measured interactions with an AI tool, which this data',
-            'does not contain. Refer instead to git-derived signals as exactly what they are: "commit activity,"',
-            '"merged PRs," "code churn," and the "estimated AI-assistance signal." Do not imply that any figure was',
-            'measured directly from an AI tool.',
-        ].join('\n');
+/**
+ * The tier-specific usage clause (rule 2 of the preamble). A single switch on the
+ * maturity basis: `measured` permits direct-usage description; `git_estimate` and
+ * `mixed` both get the outright ban (the payload carries no per-tool field to cite
+ * either way), differing only in their lead sentence. Exhaustive over `MaturityBasis`.
+ */
+function buildUsageClause(payload: SummaryInputPayload): string {
+    const BAN = [
+        'You MUST NOT use the words or concepts "acceptance rate," "interactions," "suggestions accepted," or any',
+        'other direct-tool-usage metric. Those describe measured interactions with an AI tool, which this data',
+        'does not contain. Refer instead to git-derived signals as exactly what they are: "commit activity,"',
+        '"merged PRs," "code churn," and the "estimated AI-assistance signal." Do not imply that any figure was',
+        'measured directly from an AI tool.',
+    ];
+    switch (payload.metrics.ai_maturity_basis) {
+        case 'measured':
+            return [
+                `The numbers are derived from ${payload.data_basis}.`,
+                'Where direct tool-usage metrics are present in the input, you may describe them as measured; where a',
+                'figure is git-derived, describe it as such ("commit activity," "merged PRs," "code churn," "estimated',
+                'AI-assistance signal"). Never imply a measurement the input does not contain.',
+            ].join('\n');
+        case 'git_estimate':
+            return [
+                `Direct tool-usage data is NOT connected for this period. The numbers are derived from ${payload.data_basis}.`,
+                ...BAN,
+            ].join('\n');
+        case 'mixed':
+            return [
+                `Direct tool-usage data is only PARTIALLY connected for this period, and this payload carries only ` +
+                    `aggregate git-derived numbers (${payload.data_basis}) — no per-tool usage figure you could cite.`,
+                ...BAN,
+            ].join('\n');
+        default: {
+            const _exhaustive: never = payload.metrics.ai_maturity_basis;
+            throw new Error(`Unhandled maturity basis "${String(_exhaustive)}"`);
+        }
     }
+}
+
+function buildPreamble(payload: SummaryInputPayload): string {
+    const usageClause = buildUsageClause(payload);
 
     return [
         'You are GovProxy, an AI-adoption analyst. You write a clear, factual narrative from the aggregate metrics',
