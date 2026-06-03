@@ -537,6 +537,25 @@ describe('Phase 3 API (Task 3.11)', () => {
             });
             expect(res.statusCode).toBe(404);
         });
+
+        it('surfaces null basis/tier for a legacy row written before migration 018', async () => {
+            // A row predating the basis columns: both are NULL.
+            const id = 'summary:org:org:monthly:2026-03';
+            db.prepare(
+                `INSERT INTO summaries (id, scope, scope_name, period_type, period_value, summary_text, model_used, data_hash, input_hash, generated_at, regenerated_count, is_stale)
+                 VALUES (?, 'org', 'org', 'monthly', '2026-03', 'Legacy narrative', 'm', 'h', 'h', '2026-04-01T00:00:00.000Z', 0, 0)`,
+            ).run(id);
+            const res = await app.inject({
+                method: 'GET',
+                url: `/api/summaries/${encodeURIComponent(id)}`,
+                headers: authHeaders(adminToken),
+            });
+            expect(res.statusCode).toBe(200);
+            const data = res.json().data;
+            expect(data.basis).toBeNull();
+            expect(data.tier).toBeNull();
+            expect(data.data_basis).toBeNull();
+        });
     });
 
     // ── summaries: regenerate + generate ────────────────────────────────────────
@@ -567,6 +586,25 @@ describe('Phase 3 API (Task 3.11)', () => {
             expect(data.summary_text).toBe(FAKE_TEXT);
             expect(data.regenerated_count).toBe(1);
             expect(data.basis).toBe('git_estimate');
+        });
+
+        it('regenerating a stale summary clears is_stale', async () => {
+            const id = seedSummary(db, {
+                scope: 'team',
+                scopeName: 'frontend',
+                periodType: 'quarterly',
+                periodValue: '2026-Q2',
+                generatedAt: '2026-06-01T00:00:00.000Z',
+                isStale: 1,
+            });
+            const res = await app.inject({
+                method: 'POST',
+                url: `/api/summaries/${encodeURIComponent(id)}/regenerate`,
+                headers: authHeaders(adminToken),
+                payload: {},
+            });
+            expect(res.statusCode).toBe(200);
+            expect(res.json().data.is_stale).toBe(0);
         });
 
         it('404s regenerating an unknown summary', async () => {

@@ -7,11 +7,12 @@
  *   POST /api/summaries/generate        — on-demand generate { level, period, scope }
  *
  * Every summary response carries `basis` and `tier`/`data_basis` so the UI can
- * label the narrative honestly (a "git-based estimate" at launch). The summaries
- * table predates Phase 3 and stores no basis column, so it is recomputed at read
- * time from the same engine the summary was generated from
- * ({@link computeScopeAggregate}) — cheap at launch scale and always consistent
- * with the current underlying data, rather than a value frozen at generation.
+ * label the narrative honestly (a "git-based estimate" at launch). These are read
+ * straight off the summary row — the generator records `ai_maturity_basis` and
+ * `data_quality` at generation time (migration 018), so the read is an O(1) column
+ * lookup, not a snapshot re-fold, and the value reflects what the narrative was
+ * actually written under. Legacy rows written before those columns existed carry a
+ * null basis; the response surfaces null and the UI falls back to no label.
  *
  * Admin-gated like the rest of the manager API.
  */
