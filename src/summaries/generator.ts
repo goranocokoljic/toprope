@@ -67,6 +67,24 @@ export async function generateSummary(
 
     // Build the numbers-only payload (privacy gate runs inside buildSummaryInput).
     const payload = buildSummaryInputForTarget(db, target);
+
+    // Refuse to summarise a scope with no developers at all — an org with no
+    // registry, or (the common case) a mistyped `team:<name>` that matches no team.
+    // Without this guard the payload is all-zeros yet still passes the privacy gate,
+    // so the model would invent a narrative for a team that doesn't exist. A real
+    // team that exists but was simply idle this period has developer_count > 0 and
+    // is summarised normally (its zeros are genuine). Not retryable — the scope
+    // itself is the problem, so re-running won't help.
+    if (payload.scope.developer_count === 0) {
+        return {
+            ok: false,
+            retryable: false,
+            error:
+                `No developers in scope ${target.scope.type}:${target.scope.name} — ` +
+                'nothing to summarise (check the team name exists in the registry)',
+        };
+    }
+
     const prompt = buildSummaryPrompt(payload, options.focus ? {focus: options.focus} : undefined);
 
     // Call the model BEFORE any write so a failure can't leave a partial row.

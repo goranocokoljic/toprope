@@ -79,7 +79,19 @@ function bestQuality(members: TeamMember[]): DataQuality {
     return best;
 }
 
-/** Fold a member list into one scope-level metric set (sums, member-weighted means). */
+/**
+ * Fold a member list into one scope-level metric set (sums, member-weighted means).
+ *
+ * This deliberately pools the *member* metrics rather than reusing
+ * computeTeamPeriodMetrics's team-level result. The reason is the org scope: an
+ * org metric must be the member-weighted mean across every developer (pooling all
+ * teams' members), not a mean-of-team-means — so org churn/signature averages stay
+ * weighted by developer, not by team size. Pooling members is the single arithmetic
+ * that is correct for both a one-team scope and the whole org, which is why both
+ * paths run through here. For a single team this fold is, by construction, identical
+ * to computeTeamPeriodMetrics (same members, same sums/means); the equivalence is
+ * locked by a test so the two folds cannot silently drift.
+ */
 function foldScope(members: TeamMember[]): ScopeFold {
     let active = 0;
     let totalCommits = 0;
@@ -139,6 +151,12 @@ export function computeScopeAggregate(
     const {start, end} = periodRange(level, period);
     const fold = foldScope(scopeMembers(db, scope, start, end));
 
+    // The prior period is folded only to derive the maturity score's PR-throughput
+    // trend. This mirrors computeTeamMaturity's wiring but cannot reuse it: that
+    // helper reads the prior PR count from the *stored* quarterly/yearly aggregate
+    // row, whereas the summary layer must build every level (incl. weekly/monthly,
+    // which have no team-level stored row) directly from snapshots. The prior source
+    // genuinely differs, so the small overlap with computeTeamMaturity is intentional.
     const priorRange = periodRange(level, priorPeriod(level, period));
     const priorFold = foldScope(scopeMembers(db, scope, priorRange.start, priorRange.end));
     const prsMergedDeltaPct = foldHasActivity(priorFold)

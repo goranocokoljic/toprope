@@ -100,7 +100,14 @@ function describePeriodForm(level: SummaryLevel): string {
             return 'YYYY-Qn, e.g. 2026-Q2';
         case 'yearly':
             return 'YYYY, e.g. 2026';
+        default:
+            return assertNever(level);
     }
+}
+
+/** Fail closed if a SummaryLevel is added without extending the switches above. */
+function assertNever(value: never): never {
+    throw new Error(`Unhandled summary level: ${String(value)}`);
 }
 
 /** The inclusive [start, end] day range for a (level, period). Validates the key. */
@@ -115,6 +122,8 @@ export function periodRange(level: SummaryLevel, period: string): DateRange {
             return quarterRange(period);
         case 'yearly':
             return yearRange(period);
+        default:
+            return assertNever(level);
     }
 }
 
@@ -130,5 +139,7 @@ export function priorPeriod(level: SummaryLevel, period: string): string {
             return priorQuarter(period);
         case 'yearly':
             return priorYear(period);
+        default:
+            return assertNever(level);
     }
 }

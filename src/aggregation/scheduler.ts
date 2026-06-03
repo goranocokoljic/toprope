@@ -177,6 +177,13 @@ export function runAggregationForPeriod(
     // Read-only against snapshots and best-effort — it never alters the aggregate
     // result and swallows its own per-summary errors, so a summary issue can't
     // break the aggregation run.
+    //
+    // Deliberately runs AFTER the aggregate transaction commits, not inside it, so a
+    // summary problem can never roll back aggregates. The consequence is that
+    // is_stale is eventually-consistent, not guaranteed-on-commit: if the process
+    // dies between the commit above and this call, affected summaries stay
+    // is_stale = 0 until the period is next recomputed (which re-runs this check).
+    // Acceptable because every recompute self-heals it and is_stale is advisory.
     markStaleSummariesForRecompute(db, period, periodKey);
 
     return {period, periodKey, rowsWritten: rows.length};

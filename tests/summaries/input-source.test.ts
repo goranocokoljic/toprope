@@ -5,6 +5,7 @@ import {
     computeScopeAggregate,
 } from '../../src/summaries/input-source';
 import type {SummaryTarget} from '../../src/summaries/target';
+import {computeTeamPeriodMetrics} from '../../src/aggregation/team-period';
 import {makeDb, addDeveloper, addGitSnapshot, addSubscription} from '../aggregation/helpers';
 
 describe('computeScopeAggregate', () => {
@@ -29,6 +30,37 @@ describe('computeScopeAggregate', () => {
         expect(metrics.ai_maturity_basis).toBe('git_estimate');
         expect(metrics.data_quality).toBe('medium'); // git-only at launch
         expect(metrics.ai_maturity_score).toBeTypeOf('number');
+    });
+
+    it('returns an all-zero, low-quality, null-maturity aggregate for an unknown/empty scope', () => {
+        // No developers added for this team — a mistyped or empty scope.
+        const metrics = computeScopeAggregate(db, {type: 'team', name: 'ghost'}, 'monthly', '2026-05');
+        expect(metrics.developer_count).toBe(0);
+        expect(metrics.active_developer_count).toBe(0);
+        expect(metrics.total_commits).toBe(0);
+        expect(metrics.total_prs_merged).toBe(0);
+        expect(metrics.data_quality).toBe('low');
+        expect(metrics.ai_maturity_score).toBeNull();
+    });
+
+    it('matches computeTeamPeriodMetrics for a single team (folds may not drift)', () => {
+        addDeveloper(db, 'dev-1', 'backend');
+        addDeveloper(db, 'dev-2', 'backend');
+        addSubscription(db, 'dev-1', {monthly_cost: 30, seat_assigned_at: '2026-05-01'});
+        addGitSnapshot(db, 'dev-1', '2026-05-10', {commits: 5, prs_merged: 2, code_churn_rate: 0.2});
+        addGitSnapshot(db, 'dev-2', '2026-05-12', {commits: 3, prs_merged: 1, code_churn_rate: 0.4});
+
+        const agg = computeScopeAggregate(db, {type: 'team', name: 'backend'}, 'monthly', '2026-05');
+        const tpm = computeTeamPeriodMetrics(db, 'backend', '2026-05-01', '2026-05-31');
+        // The scope fold must reproduce the engine's own team rollup exactly.
+        expect(agg.developer_count).toBe(tpm.developer_count);
+        expect(agg.active_developer_count).toBe(tpm.active_developer_count);
+        expect(agg.total_commits).toBe(tpm.total_commits);
+        expect(agg.total_prs_merged).toBe(tpm.total_prs_merged);
+        expect(agg.avg_code_churn).toBe(tpm.avg_code_churn);
+        expect(agg.avg_ai_signature_score).toBe(tpm.avg_ai_signature_score);
+        expect(agg.subscription_cost).toBe(tpm.total_subscription_cost);
+        expect(agg.cost_per_pr).toBe(tpm.cost_per_pr);
     });
 
     it('folds every team for the org scope', () => {

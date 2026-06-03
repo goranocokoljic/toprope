@@ -69,6 +69,12 @@ interface SummaryRow {
     is_stale: number | null;
 }
 
+// The columns the read surface selects — named explicitly (rather than SELECT *)
+// so it matches the named write surface and is insulated from future column adds.
+const SUMMARY_COLUMNS =
+    'id, scope, scope_name, period_type, period_value, summary_text, ' +
+    'model_used, input_hash, generated_at, regenerated_count, is_stale';
+
 function toRecord(row: SummaryRow): SummaryRecord {
     return {
         id: row.id,
@@ -87,7 +93,9 @@ function toRecord(row: SummaryRow): SummaryRecord {
 
 /** Look a summary up by its primary key, or null when none exists. */
 export function getSummaryById(db: Database.Database, id: string): SummaryRecord | null {
-    const row = db.prepare('SELECT * FROM summaries WHERE id = ?').get(id) as SummaryRow | undefined;
+    const row = db
+        .prepare(`SELECT ${SUMMARY_COLUMNS} FROM summaries WHERE id = ?`)
+        .get(id) as SummaryRow | undefined;
     return row ? toRecord(row) : null;
 }
 
@@ -107,7 +115,7 @@ export function listSummariesForPeriod(
 ): SummaryRecord[] {
     const rows = db
         .prepare(
-            `SELECT * FROM summaries WHERE period_type = ? AND period_value = ?
+            `SELECT ${SUMMARY_COLUMNS} FROM summaries WHERE period_type = ? AND period_value = ?
              ORDER BY generated_at DESC`,
         )
         .all(periodType, periodValue) as SummaryRow[];

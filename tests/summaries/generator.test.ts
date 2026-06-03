@@ -122,6 +122,27 @@ describe('generateSummary', () => {
         expect(getSummaryByTarget(db, TARGET)).toBeNull();
     });
 
+    it('refuses an unknown/empty scope without calling the model or storing a row', async () => {
+        let modelCalled = false;
+        const result = await generateSummary(
+            db,
+            {},
+            {level: 'monthly', period: '2026-05', scope: {type: 'team', name: 'ghost-team'}},
+            deps(async () => {
+                modelCalled = true;
+                return {ok: true, text: 'should never run', model: 'm'};
+            }),
+        );
+        expect(result.ok).toBe(false);
+        if (!result.ok) {
+            expect(result.retryable).toBe(false);
+            expect(result.error).toMatch(/No developers in scope/);
+        }
+        expect(modelCalled).toBe(false);
+        const rows = db.prepare('SELECT COUNT(*) AS n FROM summaries').get() as {n: number};
+        expect(rows.n).toBe(0);
+    });
+
     it('regenerates an existing row in place (same id, updated text)', async () => {
         await generateSummary(
             db,
