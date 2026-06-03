@@ -29,41 +29,18 @@ import {
 } from '../../summaries/store';
 import {generateSummary, type GenerateOptions} from '../../summaries/generator';
 import {parseLevel, parseScope, validatePeriod, type SummaryTarget} from '../../summaries/target';
-import {computeScopeAggregate} from '../../summaries/input-source';
 import {deriveDataBasis} from '../../summaries/input-builder';
 
-/** The basis/tier a summary response carries for honest UI labelling. */
-interface SummaryTier {
-    /** Maturity basis: git_estimate | mixed | measured. */
-    basis: string;
-    /** Data-quality tier the period was computed at: high | medium | low. */
-    tier: string;
-    /** Human-readable statement of what the numbers derive from. */
-    data_basis: string;
-}
-
 /**
- * Recompute the basis/tier for a stored summary from its target's current
- * aggregate. Passing a null benchmark skips the org-average cost fold — basis and
- * data-quality don't depend on it. Returns null if the target can't be folded
- * (e.g. its scope no longer resolves), so a list never fails on one bad row.
+ * A list item: metadata + staleness + the basis/tier the summary was generated
+ * under. Basis/tier are read straight off the stored row (recorded at generation
+ * time, Task 3.11 / #80) — an O(1) lookup, no snapshot re-fold — so a long list
+ * stays a plain SELECT. They are null only for legacy rows written before the
+ * columns existed; the UI falls back to an unlabelled summary in that case. The
+ * heavy narrative text is omitted from the list view (see toDetail).
  */
-function summaryTier(db: Database.Database, record: SummaryRecord): SummaryTier | null {
-    try {
-        const target = targetFromRecord(record);
-        const agg = computeScopeAggregate(db, target.scope, target.level, target.period, null);
-        return {
-            basis: agg.ai_maturity_basis,
-            tier: agg.data_quality,
-            data_basis: deriveDataBasis(agg.ai_maturity_basis),
-        };
-    } catch {
-        return null;
-    }
-}
-
-/** A list item: metadata + staleness + basis/tier, without the full narrative text. */
-function toListItem(db: Database.Database, record: SummaryRecord): Record<string, unknown> {
+function toListItem(record: SummaryRecord): Record<string, unknown> {
+    const basis = record.ai_maturity_basis;
     return {
         id: record.id,
         scope: record.scope,
@@ -74,14 +51,16 @@ function toListItem(db: Database.Database, record: SummaryRecord): Record<string
         generated_at: record.generated_at,
         regenerated_count: record.regenerated_count,
         is_stale: record.is_stale,
-        ...(summaryTier(db, record) ?? {basis: null, tier: null, data_basis: null}),
+        basis,
+        tier: record.data_quality,
+        data_basis: basis ? deriveDataBasis(basis) : null,
     };
 }
 
 /** A full summary response: the list item plus the narrative text + input hash. */
-function toDetail(db: Database.Database, record: SummaryRecord): Record<string, unknown> {
+function toDetail(record: SummaryRecord): Record<string, unknown> {
     return {
-        ...toListItem(db, record),
+        ...toListItem(record),
         summary_text: record.summary_text,
         input_hash: record.input_hash,
     };
@@ -127,7 +106,7 @@ async function runGeneration(
             .status(status)
             .send({error: result.retryable ? 'Service Unavailable' : 'Bad Request', message: result.error});
     }
-    return {data: toDetail(db, result.summary)};
+    return {data: toDetail(result.summary)};
 }
 
 export function registerSummaryRoutes(
@@ -167,7 +146,7 @@ export function registerSummaryRoutes(
                 }
             }
 
-            const items = listSummaries(db, filter).map((r) => toListItem(db, r));
+            const items = listSummaries(db, filter).map(toListItem);
             return {data: items};
         },
     );
@@ -183,7 +162,7 @@ export function registerSummaryRoutes(
                 .status(404)
                 .send({error: 'Not Found', message: `Summary '${request.params.id}' not found`});
         }
-        return {data: toDetail(db, record)};
+        return {data: toDetail(record)};
     });
 
     // ── regenerate ────────────────────────────────────────────────────────────
@@ -244,6 +223,18 @@ export function registerSummaryRoutes(
                     error: 'Bad Request',
                     message: err instanceof Error ? err.message : String(err),
                 });
+            }
+
+            // 404 a typo'd team here (like the aggregates/maturity reads do) rather
+            // than letting it fall through to the generator's "no developers in
+            // scope" 400 — same operator error, same status across the API.
+            if (target.scope.type === 'team') {
+                const exists = db.prepare('SELECT 1 FROM teams WHERE name = ?').get(target.scope.name);
+                if (!exists) {
+                    return reply
+                        .status(404)
+                        .send({error: 'Not Found', message: `Team '${target.scope.name}' not found`});
+                }
             }
 
             return runGeneration(db, summaries, target, undefined, createClient, reply);

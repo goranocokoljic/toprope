@@ -128,8 +128,8 @@ function seedSummary(
 ): string {
     const id = `summary:${opts.scope}:${opts.scopeName}:${opts.periodType}:${opts.periodValue}`;
     db.prepare(
-        `INSERT INTO summaries (id, scope, scope_name, period_type, period_value, summary_text, model_used, data_hash, input_hash, generated_at, regenerated_count, is_stale)
-         VALUES (?, ?, ?, ?, ?, ?, 'm', 'h', 'h', ?, ?, ?)`,
+        `INSERT INTO summaries (id, scope, scope_name, period_type, period_value, summary_text, model_used, data_hash, input_hash, generated_at, regenerated_count, is_stale, ai_maturity_basis, data_quality)
+         VALUES (?, ?, ?, ?, ?, ?, 'm', 'h', 'h', ?, ?, ?, 'git_estimate', 'medium')`,
     ).run(
         id,
         opts.scope,
@@ -267,6 +267,15 @@ describe('Phase 3 API (Task 3.11)', () => {
             const res = await app.inject({
                 method: 'GET',
                 url: '/api/aggregates/org/monthly?period=2026-13',
+                headers: authHeaders(adminToken),
+            });
+            expect(res.statusCode).toBe(400);
+        });
+
+        it('400s on a rolled-over weekly date (2026-02-31), not silently the wrong week', async () => {
+            const res = await app.inject({
+                method: 'GET',
+                url: '/api/aggregates/team:frontend/weekly?period=2026-02-31',
                 headers: authHeaders(adminToken),
             });
             expect(res.statusCode).toBe(400);
@@ -457,7 +466,7 @@ describe('Phase 3 API (Task 3.11)', () => {
             ]);
             expect(items[0].is_stale).toBe(1);
             expect(items[0].basis).toBe('git_estimate');
-            expect(items[0].tier).toBeDefined();
+            expect(items[0].tier).toBe('medium');
             // The list view omits the heavy narrative text.
             expect(items[0].summary_text).toBeUndefined();
         });
@@ -618,6 +627,16 @@ describe('Phase 3 API (Task 3.11)', () => {
             });
             expect(res.statusCode).toBe(200);
             expect(res.json().data.period_type).toBe('yearly');
+        });
+
+        it('404s generating for an unknown team (consistent with the read endpoints)', async () => {
+            const res = await app.inject({
+                method: 'POST',
+                url: '/api/summaries/generate',
+                headers: authHeaders(adminToken),
+                payload: {level: 'quarterly', period: '2026-Q2', scope: 'team:ghost'},
+            });
+            expect(res.statusCode).toBe(404);
         });
 
         it('400s on a malformed generate body', async () => {

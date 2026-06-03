@@ -13,17 +13,24 @@
  *     carrying the maturity score + basis), so a team scope returns that team's
  *     single row and the org scope returns every team's row.
  *
- * Admin-gated like the rest of the manager API (developers reach their own data
- * through /api/me/*).
+ * Admin-gated like the rest of the manager API. The weekly/monthly responses
+ * therefore expose per-developer rows to an admin BY DESIGN — the privacy model
+ * confines the non-admin `developer` role to its own data (/api/me/*); an admin
+ * has full visibility (the same posture as /api/leaderboard). The row count is
+ * bounded by headcount (per-developer) or team count (team-level), like the
+ * sibling trend/leaderboard reads, so no pagination is layered on.
  */
 
 import type {FastifyInstance} from 'fastify';
 import type Database from 'better-sqlite3';
 import {isAdmin, forbidden} from './guards';
 import {isoWeekStart} from '../../aggregation/dates';
+import {parseScope as parseSummaryScope, validatePeriod} from '../../summaries/target';
+import type {SummaryLevel} from '../../summaries/model-client';
+import type {SummaryScope} from '../../summaries/input-builder';
 
 /** The four aggregate levels, each mapped to its table and period column. */
-type AggregateLevel = 'weekly' | 'monthly' | 'quarterly' | 'yearly';
+type AggregateLevel = SummaryLevel;
 
 interface LevelSpec {
     table: string;
@@ -35,64 +42,74 @@ interface LevelSpec {
 }
 
 const WEEK_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-const MONTH_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
-const QUARTER_RE = /^\d{4}-Q[1-4]$/;
-const YEAR_RE = /^\d{4}$/;
+
+/**
+ * Validate the period for monthly/quarterly/yearly by delegating to the shared
+ * `validatePeriod` (the same YYYY-MM / YYYY-Qn / YYYY grammar the summary layer
+ * already owns), translating its throw-on-invalid contract into the null this
+ * spec uses. Avoids re-declaring the three period regexes that live in
+ * aggregation/dates and summaries/target.
+ */
+function validateOrNull(level: SummaryLevel, raw: string): string | null {
+    try {
+        return validatePeriod(level, raw);
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Weekly is the one level that doesn't take a canonical period key: it accepts
+ * any day in the target week and normalizes to that week's Monday (the week_start
+ * the table is keyed on). The date must be a real calendar date — round-trip the
+ * parse so a rolled-over value like 2026-02-31 is rejected rather than silently
+ * resolving to the wrong week (it would otherwise pass isoWeekStart's laxer check).
+ */
+function normalizeWeekPeriod(raw: string): string | null {
+    if (!WEEK_DATE_RE.test(raw)) {
+        return null;
+    }
+    const parsed = new Date(`${raw}T00:00:00.000Z`);
+    if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== raw) {
+        return null;
+    }
+    return isoWeekStart(raw);
+}
 
 const LEVEL_SPECS: Record<AggregateLevel, LevelSpec> = {
     weekly: {
         table: 'weekly_aggregates',
         periodColumn: 'week_start',
         perDeveloper: true,
-        // Accept any date in the target week and normalize to that week's Monday —
-        // the canonical week_start the table is keyed on — so a caller need not know
-        // which day is the ISO week start.
-        normalizePeriod: (raw) => {
-            if (!WEEK_DATE_RE.test(raw)) {
-                return null;
-            }
-            try {
-                return isoWeekStart(raw);
-            } catch {
-                return null;
-            }
-        },
+        normalizePeriod: normalizeWeekPeriod,
     },
     monthly: {
         table: 'monthly_aggregates',
         periodColumn: 'month',
         perDeveloper: true,
-        normalizePeriod: (raw) => (MONTH_RE.test(raw) ? raw : null),
+        normalizePeriod: (raw) => validateOrNull('monthly', raw),
     },
     quarterly: {
         table: 'quarterly_aggregates',
         periodColumn: 'quarter',
         perDeveloper: false,
-        normalizePeriod: (raw) => (QUARTER_RE.test(raw) ? raw : null),
+        normalizePeriod: (raw) => validateOrNull('quarterly', raw),
     },
     yearly: {
         table: 'yearly_aggregates',
         periodColumn: 'year',
         perDeveloper: false,
-        normalizePeriod: (raw) => (YEAR_RE.test(raw) ? raw : null),
+        normalizePeriod: (raw) => validateOrNull('yearly', raw),
     },
 };
 
-interface ScopeFilter {
-    type: 'team' | 'org';
-    name: string;
-}
-
-/** Parse the :scope path param into a team/org filter, or null when malformed. */
-function parseScope(raw: string): ScopeFilter | null {
-    if (raw === 'org') {
-        return {type: 'org', name: 'org'};
+/** Parse the :scope path param into a team/org scope, or null when malformed. */
+function parseScope(raw: string): SummaryScope | null {
+    try {
+        return parseSummaryScope(raw);
+    } catch {
+        return null;
     }
-    if (raw.startsWith('team:')) {
-        const name = raw.slice('team:'.length).trim();
-        return name.length > 0 ? {type: 'team', name} : null;
-    }
-    return null;
 }
 
 function isAggregateLevel(value: string): value is AggregateLevel {
@@ -125,7 +142,7 @@ function shapeRow(row: AggregateRow): AggregateRow {
 function queryRows(
     db: Database.Database,
     spec: LevelSpec,
-    scope: ScopeFilter,
+    scope: SummaryScope,
     period: string,
 ): AggregateRow[] {
     const {table, periodColumn, perDeveloper} = spec;
