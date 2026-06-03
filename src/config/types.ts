@@ -91,7 +91,12 @@ export interface AggregationConfig {
 }
 
 export interface SummaryModelConfig {
+    // 'ollama' (default, local) | 'anthropic' | 'openai'.
     type?: string;
+    // Base URL of the model endpoint. For ollama this is the local server
+    // (default http://localhost:11434); for openai a compatible base URL.
+    // Ignored for anthropic, which always uses the official API host.
+    endpoint?: string;
     model_name?: string;
     api_key?: string;
 }
@@ -99,6 +104,8 @@ export interface SummaryModelConfig {
 export interface SummaryPeriodConfig {
     enabled?: boolean;
     auto_generate?: boolean;
+    // Per-level model override. Lets weekly stay on a small/local model while
+    // monthly+ point at a larger or cloud model (or vice versa).
     model_name?: string;
 }
 
@@ -108,6 +115,7 @@ export interface SummariesConfig {
     weekly?: SummaryPeriodConfig;
     monthly?: SummaryPeriodConfig;
     quarterly?: SummaryPeriodConfig;
+    yearly?: SummaryPeriodConfig;
 }
 
 export interface SlackAlertsConfig {

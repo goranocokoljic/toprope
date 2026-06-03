@@ -457,7 +457,7 @@ async function checkSummaryModel(config: GovProxyConfig): Promise<CheckResult> {
         return pass('Summary model', 'Summaries disabled — skipped');
     }
 
-    const modelType = summaries.model?.type ?? 'anthropic';
+    const modelType = summaries.model?.type ?? 'ollama';
     const apiKey = summaries.model?.api_key;
 
     if (modelType === 'anthropic') {
@@ -501,7 +501,7 @@ async function checkSummaryModel(config: GovProxyConfig): Promise<CheckResult> {
     }
 
     if (modelType === 'ollama') {
-        const baseUrl = 'http://localhost:11434';
+        const baseUrl = summaries.model?.endpoint ?? 'http://localhost:11434';
         try {
             const res = await fetch(`${baseUrl}/api/tags`, {
                 signal: AbortSignal.timeout(5_000),
