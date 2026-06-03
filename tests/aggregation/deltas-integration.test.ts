@@ -199,16 +199,19 @@ describe('quarterly delta wiring', () => {
 
     afterEach(() => db.close());
 
-    it('computes utilization_rate_delta against the prior quarter, maturity stays null', () => {
+    it('computes utilization_rate_delta and maturity_score_delta against the prior quarter', () => {
         // Q1: developer inactive (0 active / 1 dev → utilization 0).
         // Q2: developer active (1/1 → utilization 1). Delta = +1.0 points.
         addGitSnapshot(db, 'dev-1', '2026-04-10', {commits: 5});
-        computeQuarterlyAggregate(db, 'backend', '2026-Q1', NOW);
+        const q1 = computeQuarterlyAggregate(db, 'backend', '2026-Q1', NOW);
         const q2 = computeQuarterlyAggregate(db, 'backend', '2026-Q2', NOW);
 
         expect(q2.utilization_rate).toBe(1);
         expect(q2.utilization_rate_delta).toBe(1); // 1 - 0 points
-        expect(q2.maturity_score_delta).toBeNull(); // no maturity score until Task 3.4
+        // Both quarters now carry a maturity score (Task 3.4), so the delta is the
+        // points difference between them — Q2 (active) should be the higher score.
+        expect(q2.maturity_score_delta).toBe(q2.ai_maturity_score! - q1.ai_maturity_score!);
+        expect(q2.maturity_score_delta!).toBeGreaterThan(0);
     });
 
     it('first quarter has null utilization delta', () => {
