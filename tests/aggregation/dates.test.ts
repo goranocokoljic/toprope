@@ -4,6 +4,8 @@ import {
     isoWeekStart,
     weekRange,
     monthRange,
+    quarterRange,
+    yearRange,
     daysInMonth,
     assertDateRange,
 } from '../../src/aggregation/dates';
@@ -61,6 +63,36 @@ describe('monthRange', () => {
     it('throws on a malformed month', () => {
         expect(() => monthRange('2026-5')).toThrow();
         expect(() => monthRange('2026-05-01')).toThrow();
+    });
+});
+
+describe('quarterRange', () => {
+    it('maps each quarter to its calendar months', () => {
+        expect(quarterRange('2026-Q1')).toEqual({start: '2026-01-01', end: '2026-03-31'});
+        expect(quarterRange('2026-Q2')).toEqual({start: '2026-04-01', end: '2026-06-30'});
+        expect(quarterRange('2026-Q3')).toEqual({start: '2026-07-01', end: '2026-09-30'});
+        expect(quarterRange('2026-Q4')).toEqual({start: '2026-10-01', end: '2026-12-31'});
+    });
+
+    it('reflects a leap-year Q1 end (Feb has 29 days but Q1 still ends Mar 31)', () => {
+        expect(quarterRange('2024-Q1')).toEqual({start: '2024-01-01', end: '2024-03-31'});
+    });
+
+    it('throws on a malformed quarter', () => {
+        expect(() => quarterRange('2026-Q5')).toThrow();
+        expect(() => quarterRange('2026-1')).toThrow();
+        expect(() => quarterRange('2026-QQ')).toThrow();
+    });
+});
+
+describe('yearRange', () => {
+    it('returns Jan 1..Dec 31', () => {
+        expect(yearRange('2026')).toEqual({start: '2026-01-01', end: '2026-12-31'});
+    });
+
+    it('throws on a malformed year', () => {
+        expect(() => yearRange('26')).toThrow();
+        expect(() => yearRange('2026-01')).toThrow();
     });
 });
 

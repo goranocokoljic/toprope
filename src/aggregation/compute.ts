@@ -68,9 +68,9 @@ interface ToolRow {
 }
 
 /** Round to `dp` decimals, preserving null. Strips float artifacts from sums/means. */
-function round(value: number, dp: number): number;
-function round(value: number | null, dp: number): number | null;
-function round(value: number | null, dp: number): number | null {
+export function round(value: number, dp: number): number;
+export function round(value: number | null, dp: number): number | null;
+export function round(value: number | null, dp: number): number | null {
     if (value === null) {
         return null;
     }
@@ -79,7 +79,7 @@ function round(value: number | null, dp: number): number | null {
 }
 
 /** Mean of the non-null values, or null when there are none. */
-function meanOrNull(values: Array<number | null>): number | null {
+export function meanOrNull(values: Array<number | null>): number | null {
     const present = values.filter((v): v is number => v !== null);
     if (present.length === 0) {
         return null;

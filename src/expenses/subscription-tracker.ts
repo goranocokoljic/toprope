@@ -480,7 +480,7 @@ export function detectDuplicates(db: Database.Database): DuplicateAlert[] {
     return alerts;
 }
 
-interface CostedSubscription {
+export interface CostedSubscription {
     monthly_cost: number;
     seat_assigned_at: string | null;
     seat_revoked_at: string | null;
@@ -610,6 +610,30 @@ export function getDeveloperProratedCost(
     let total = 0;
     for (let date = from; date <= to; date = addDays(date, 1)) {
         total += sumActiveOnDate(subs, date) / daysInMonth(date);
+    }
+    return total;
+}
+
+/**
+ * Prorated spend for a single seat across an inclusive [from, to] window —
+ * the same per-day rule {@link getDeveloperProratedCost} applies, exposed for a
+ * single subscription so the aggregation engine's period waste-detection can
+ * value an individual unused seat without re-implementing (and risking drift
+ * from) the active-on-date proration. Each day the seat is active contributes
+ * monthly_cost / daysInMonth(day), so a seat held part of the period is billed
+ * only for the days it was held, straddling month boundaries correctly.
+ */
+export function getSeatProratedCost(
+    sub: CostedSubscription,
+    from: string,
+    to: string,
+): number {
+    assertDateRange(from, to);
+    let total = 0;
+    for (let date = from; date <= to; date = addDays(date, 1)) {
+        if (isActiveOnDate(sub, date)) {
+            total += sub.monthly_cost / daysInMonth(date);
+        }
     }
     return total;
 }

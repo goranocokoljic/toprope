@@ -14,6 +14,8 @@
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const MONTH_RE = /^\d{4}-\d{2}$/;
+const QUARTER_RE = /^\d{4}-Q[1-4]$/;
+const YEAR_RE = /^\d{4}$/;
 
 /** Add `days` (may be negative) to a YYYY-MM-DD date, returning YYYY-MM-DD (UTC). */
 export function addDays(date: string, days: number): string {
@@ -78,6 +80,31 @@ export function monthRange(month: string): DateRange {
     // Day 0 of the *next* month is the last day of this month.
     const lastDay = new Date(Date.UTC(year, mon, 0)).getUTCDate();
     return {start: `${month}-01`, end: `${month}-${String(lastDay).padStart(2, '0')}`};
+}
+
+/**
+ * Inclusive [first, last] day range for a calendar quarter (`YYYY-Q1`..`YYYY-Q4`).
+ * Quarters follow calendar months: Q1 Jan–Mar, Q2 Apr–Jun, Q3 Jul–Sep, Q4 Oct–Dec.
+ */
+export function quarterRange(quarter: string): DateRange {
+    if (!QUARTER_RE.test(quarter)) {
+        throw new Error(`Invalid quarter (expected YYYY-Q[1-4]): ${quarter}`);
+    }
+    const [year, q] = quarter.split('-Q').map(Number);
+    const firstMonth = (q - 1) * 3 + 1; // Q1→1, Q2→4, Q3→7, Q4→10
+    const start = `${year}-${String(firstMonth).padStart(2, '0')}-01`;
+    // Day 0 of the month after the quarter's last month is that last day.
+    const lastDay = new Date(Date.UTC(year, firstMonth + 2, 0)).getUTCDate();
+    const end = `${year}-${String(firstMonth + 2).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`;
+    return {start, end};
+}
+
+/** Inclusive [Jan 1, Dec 31] day range for a calendar year (`YYYY`). */
+export function yearRange(year: string): DateRange {
+    if (!YEAR_RE.test(year)) {
+        throw new Error(`Invalid year (expected YYYY): ${year}`);
+    }
+    return {start: `${year}-01-01`, end: `${year}-12-31`};
 }
 
 /** Number of days in the calendar month containing `date` (YYYY-MM-DD). */
