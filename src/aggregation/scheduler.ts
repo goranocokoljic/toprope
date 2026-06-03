@@ -205,14 +205,6 @@ export const consoleAggregationLogger: AggregationLogger = {
     },
 };
 
-/** A computation function with runAggregationForPeriod's shape, injectable for tests. */
-export type PeriodRunner = (
-    db: Database.Database,
-    period: AggregationPeriod,
-    periodKey: string,
-    now: Date,
-) => AggregationJobResult;
-
 export interface ScheduledJobResult {
     period: AggregationPeriod;
     periodKey: string;
@@ -224,23 +216,22 @@ export interface ScheduledJobResult {
 }
 
 /**
- * Run one scheduled job: resolve the just-completed period, compute it, and log
- * the lifecycle. Catches every failure and returns it as `ok: false` rather than
- * throwing — the contract that gives the scheduler its error isolation, so a
- * failing job logs and alerts but never blocks the others.
+ * Run one scheduled job against an open DB: resolve the just-completed period,
+ * compute it, and log the lifecycle. Catches every failure and returns it as
+ * `ok: false` rather than throwing — the contract that gives the scheduler its
+ * error isolation, so a failing job logs and alerts but never blocks the others.
  */
 export function runScheduledJob(
     db: Database.Database,
     period: AggregationPeriod,
     now: Date = new Date(),
     logger: AggregationLogger = consoleAggregationLogger,
-    runner: PeriodRunner = runAggregationForPeriod,
 ): ScheduledJobResult {
     const periodKey = justCompletedPeriod(period, now);
     logger.jobStart(period, periodKey);
     const startedAt = Date.now();
     try {
-        const {rowsWritten} = runner(db, period, periodKey, now);
+        const {rowsWritten} = runAggregationForPeriod(db, period, periodKey, now);
         logger.jobSuccess(period, periodKey, rowsWritten, Date.now() - startedAt);
         return {period, periodKey, rowsWritten, ok: true};
     } catch (err) {
@@ -255,21 +246,6 @@ export function runScheduledJob(
     }
 }
 
-/**
- * Run several scheduled jobs in sequence with per-job isolation — each goes
- * through runScheduledJob, so one failing leaves the rest unaffected. Returns
- * every result (successes and failures). Defaults to all four levels.
- */
-export function runScheduledJobs(
-    db: Database.Database,
-    periods: readonly AggregationPeriod[] = AGGREGATION_PERIODS,
-    now: Date = new Date(),
-    logger: AggregationLogger = consoleAggregationLogger,
-    runner: PeriodRunner = runAggregationForPeriod,
-): ScheduledJobResult[] {
-    return periods.map((period) => runScheduledJob(db, period, now, logger, runner));
-}
-
 const DEFAULT_MIGRATIONS_DIR = path.resolve(__dirname, '../storage/migrations');
 
 export interface AggregationSchedulerOptions {
@@ -282,45 +258,70 @@ export interface AggregationSchedulerOptions {
 }
 
 /**
+ * Run one scheduled level end-to-end against `dbPath`: open a short-lived DB
+ * handle, apply migrations, run the isolated job, and close. This is the exact
+ * body each cron fire executes, factored out so the production lifecycle —
+ * including the two failure branches and the guaranteed close — is directly
+ * testable without waiting on the wall clock.
+ *
+ * Never throws. Returns the job's ScheduledJobResult, or `null` if the DB could
+ * not even be opened (the failure is logged either way). Both failure paths are
+ * isolated so one level's bad fire never escapes into node-cron or touches the
+ * other three independent tasks.
+ */
+export function runScheduledAggregationJob(
+    dbPath: string,
+    period: AggregationPeriod,
+    options: AggregationSchedulerOptions = {},
+): ScheduledJobResult | null {
+    const logger = options.logger ?? consoleAggregationLogger;
+    const migrationsDir = options.migrationsDir ?? DEFAULT_MIGRATIONS_DIR;
+    const now = (options.now ?? ((): Date => new Date()))();
+
+    let db: Database.Database;
+    try {
+        db = openDb(dbPath);
+    } catch (err) {
+        // Couldn't even open the DB — log against the level and bail; the other
+        // levels' tasks are untouched.
+        logger.jobFailure(period, justCompletedPeriod(period, now), err);
+        return null;
+    }
+    try {
+        runMigrations(db, migrationsDir);
+        // runScheduledJob is self-isolating and never throws.
+        return runScheduledJob(db, period, now, logger);
+    } catch (err) {
+        // Guards only the migration step (the one call above that can throw) so a
+        // migration error still logs rather than escaping into node-cron.
+        const periodKey = justCompletedPeriod(period, now);
+        logger.jobFailure(period, periodKey, err);
+        return {
+            period,
+            periodKey,
+            rowsWritten: 0,
+            ok: false,
+            error: err instanceof Error ? err.message : String(err),
+        };
+    } finally {
+        db.close();
+    }
+}
+
+/**
  * Register the four cron jobs (weekly/monthly/quarterly/yearly) against `dbPath`
  * and return the node-cron tasks so the caller can stop them on shutdown. Each
- * fire opens its own short-lived DB handle, applies migrations, and runs the
- * isolated job. Open/migration errors are caught and logged so a transient
- * failure can never tear the scheduler down; the jobs themselves are already
- * isolated by runScheduledJob.
+ * fire delegates to the self-isolating runScheduledAggregationJob, so a transient
+ * failure on one level can never tear the scheduler down or affect the others.
  */
 export function startAggregationScheduler(
     dbPath: string,
     options: AggregationSchedulerOptions = {},
 ): Array<ReturnType<typeof cron.schedule>> {
-    const logger = options.logger ?? consoleAggregationLogger;
-    const migrationsDir = options.migrationsDir ?? DEFAULT_MIGRATIONS_DIR;
-    const clock = options.now ?? ((): Date => new Date());
-
     return AGGREGATION_PERIODS.map((period) =>
         cron.schedule(
             AGGREGATION_CRON[period],
-            () => {
-                let db: Database.Database;
-                try {
-                    db = openDb(dbPath);
-                } catch (err) {
-                    // Couldn't even open the DB — log against the level and bail; the
-                    // other levels' tasks are untouched.
-                    logger.jobFailure(period, justCompletedPeriod(period, clock()), err);
-                    return;
-                }
-                try {
-                    runMigrations(db, migrationsDir);
-                    runScheduledJob(db, period, clock(), logger);
-                } catch (err) {
-                    // runScheduledJob is self-isolating; this guards only the migration
-                    // step so a migration error still logs rather than escaping.
-                    logger.jobFailure(period, justCompletedPeriod(period, clock()), err);
-                } finally {
-                    db.close();
-                }
-            },
+            () => void runScheduledAggregationJob(dbPath, period, options),
             {timezone: 'UTC'},
         ),
     );

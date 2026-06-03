@@ -947,22 +947,26 @@ aggregateCommand
         }
         const period = options.period as AggregationPeriod;
 
+        // Resolve (and validate) the target period BEFORE touching the DB, so a
+        // malformed --date is rejected without opening the file or running
+        // migrations as a side effect.
+        const now = new Date();
+        let periodKey: string;
+        try {
+            periodKey = options.date
+                ? periodKeyContaining(period, options.date)
+                : justCompletedPeriod(period, now);
+        } catch (err) {
+            console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+            process.exit(1);
+        }
+
         const configPath = path.resolve(process.cwd(), options.config);
         const config = loadConfig(configPath);
         const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
         const db = openDb(dbPath);
         try {
             runMigrations(db, MIGRATIONS_DIR);
-            const now = new Date();
-            let periodKey: string;
-            try {
-                periodKey = options.date
-                    ? periodKeyContaining(period, options.date)
-                    : justCompletedPeriod(period, now);
-            } catch (err) {
-                console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
-                process.exit(1);
-            }
             const result = runAggregationForPeriod(db, period, periodKey, now);
             console.log(
                 `Aggregate ${result.period} complete — period ${result.periodKey}, ${result.rowsWritten} row(s) written.`,

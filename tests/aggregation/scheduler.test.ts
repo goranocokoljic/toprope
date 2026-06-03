@@ -1,5 +1,9 @@
-import {describe, it, expect, beforeEach, afterEach, vi} from 'vitest';
+import {describe, it, expect, beforeEach, afterEach} from 'vitest';
 import Database from 'better-sqlite3';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import {randomUUID} from 'crypto';
 import {
     AGGREGATION_CRON,
     AGGREGATION_PERIODS,
@@ -8,10 +12,14 @@ import {
     justCompletedPeriod,
     periodKeyContaining,
     runAggregationForPeriod,
+    runScheduledAggregationJob,
     runScheduledJob,
-    runScheduledJobs,
 } from '../../src/aggregation/scheduler';
+import {openDb} from '../../src/storage/db';
+import {runMigrations} from '../../src/storage/migrator';
 import {makeDb, addDeveloper, addGitSnapshot, addSubscription} from './helpers';
+
+const MIGRATIONS_DIR = path.resolve(__dirname, '../../src/storage/migrations');
 
 // Monday 2026-06-08 04:00 UTC — a representative weekly-job fire. The week that
 // just closed is 2026-06-01 … 2026-06-07 (key = its Monday, 2026-06-01).
@@ -201,51 +209,51 @@ describe('error isolation', () => {
         db = makeDb();
     });
 
-    afterEach(() => db.close());
+    afterEach(() => {
+        if (db.open) db.close();
+    });
 
-    it('a failing job is caught, logged, and does not stop the others', () => {
+    it('a job whose compute throws is caught, logged, and never re-thrown', () => {
         const logger = recordingLogger();
 
-        // A runner that blows up only for the monthly level.
-        const flakyRunner = vi.fn((_db, period: AggregationPeriod, periodKey: string) => {
-            if (period === 'monthly') {
-                throw new Error('boom');
-            }
-            return {period, periodKey, rowsWritten: 1};
-        });
+        // Force a real failure through the actual compute path: a closed DB makes
+        // runAggregationForPeriod's transaction throw. No injected runner — this is
+        // the genuine production path failing. The call returning at all (rather
+        // than throwing) is the isolation contract.
+        db.close();
 
-        const results = runScheduledJobs(db, AGGREGATION_PERIODS, WEEKLY_NOW, logger, flakyRunner);
+        const result = runScheduledJob(db, 'monthly', WEEKLY_NOW, logger);
 
-        // All four ran; only monthly failed.
-        const byPeriod = Object.fromEntries(results.map((r) => [r.period, r]));
-        expect(byPeriod.weekly.ok).toBe(true);
-        expect(byPeriod.monthly.ok).toBe(false);
-        expect(byPeriod.monthly.error).toBe('boom');
-        expect(byPeriod.monthly.rowsWritten).toBe(0);
-        expect(byPeriod.quarterly.ok).toBe(true);
-        expect(byPeriod.yearly.ok).toBe(true);
-
-        // The runner was still invoked for every level despite monthly throwing.
-        expect(flakyRunner).toHaveBeenCalledTimes(4);
-
-        // Logging reflects the isolation: every job started, three succeeded, one failed.
-        expect(logger.starts).toEqual(['weekly', 'monthly', 'quarterly', 'yearly']);
-        expect(logger.successes).toEqual(['weekly', 'quarterly', 'yearly']);
+        expect(result).toMatchObject({period: 'monthly', ok: false, rowsWritten: 0});
+        expect(result.error).toBeTruthy();
+        // The lifecycle was logged: started, then failed (no success).
+        expect(logger.starts).toEqual(['monthly']);
+        expect(logger.successes).toEqual([]);
         expect(logger.failures.map((f) => f.period)).toEqual(['monthly']);
     });
 
-    it('runScheduledJob never throws even when the runner throws', () => {
-        const throwingRunner = (): never => {
-            throw new Error('db gone');
-        };
-        expect(() =>
-            runScheduledJob(db, 'yearly', WEEKLY_NOW, recordingLogger(), throwingRunner),
-        ).not.toThrow();
+    it('a healthy job and a failing job are independent (one failing leaves the other green)', () => {
+        // Healthy level succeeds.
+        const healthy = runScheduledJob(db, 'weekly', WEEKLY_NOW, recordingLogger());
+        expect(healthy.ok).toBe(true);
+
+        // A second, broken level (closed DB) fails in isolation — the first
+        // remains committed and unaffected.
+        db.close();
+        const broken = runScheduledJob(db, 'yearly', WEEKLY_NOW, recordingLogger());
+        expect(broken.ok).toBe(false);
     });
 });
 
 describe('idempotency across a full scheduled run', () => {
     let db: Database.Database;
+
+    /** Run all four levels in sequence with per-job isolation, as the four cron tasks do. */
+    function runAllLevels(): void {
+        for (const period of AGGREGATION_PERIODS) {
+            runScheduledJob(db, period, WEEKLY_NOW, recordingLogger());
+        }
+    }
 
     beforeEach(() => {
         db = makeDb();
@@ -257,11 +265,11 @@ describe('idempotency across a full scheduled run', () => {
     afterEach(() => db.close());
 
     it('re-running every level twice leaves one row per period with identical values', () => {
-        runScheduledJobs(db, AGGREGATION_PERIODS, WEEKLY_NOW, recordingLogger());
+        runAllLevels();
         const firstWeekly = db.prepare('SELECT * FROM weekly_aggregates').all();
         const firstMonthly = db.prepare('SELECT * FROM monthly_aggregates').all();
 
-        runScheduledJobs(db, AGGREGATION_PERIODS, WEEKLY_NOW, recordingLogger());
+        runAllLevels();
 
         // No duplication: one developer → one weekly/monthly row, one team → one
         // quarterly/yearly row.
@@ -273,5 +281,80 @@ describe('idempotency across a full scheduled run', () => {
         // And the values are unchanged by the second run.
         expect(db.prepare('SELECT * FROM weekly_aggregates').all()).toEqual(firstWeekly);
         expect(db.prepare('SELECT * FROM monthly_aggregates').all()).toEqual(firstMonthly);
+    });
+});
+
+describe('runScheduledAggregationJob — the production cron-fire path', () => {
+    let dbPath: string;
+
+    beforeEach(() => {
+        // A real on-disk DB so the function can open its own short-lived handle,
+        // exactly as a cron fire does.
+        dbPath = path.join(os.tmpdir(), `govproxy-sched-${randomUUID()}.db`);
+        const seed = openDb(dbPath);
+        try {
+            runMigrations(seed, MIGRATIONS_DIR);
+            addDeveloper(seed, 'dev-1', 'backend');
+            addSubscription(seed, 'dev-1', {monthly_cost: 30, seat_assigned_at: '2026-01-01'});
+            addGitSnapshot(seed, 'dev-1', '2026-06-02', {
+                commits: 5,
+                prs_merged: 2,
+                code_churn_rate: 0.3,
+            });
+        } finally {
+            seed.close();
+        }
+    });
+
+    afterEach(() => {
+        for (const suffix of ['', '-wal', '-shm']) {
+            fs.rmSync(`${dbPath}${suffix}`, {force: true});
+        }
+    });
+
+    it('opens, migrates, computes the just-completed period, and closes', () => {
+        const logger = recordingLogger();
+        const result = runScheduledAggregationJob(dbPath, 'weekly', {
+            now: () => WEEKLY_NOW,
+            migrationsDir: MIGRATIONS_DIR,
+            logger,
+        });
+
+        expect(result).toMatchObject({
+            period: 'weekly',
+            periodKey: '2026-06-01',
+            rowsWritten: 1,
+            ok: true,
+        });
+        expect(logger.successes).toEqual(['weekly']);
+
+        // The row really landed, and the handle was released (we can reopen it).
+        const check = openDb(dbPath);
+        try {
+            const row = check
+                .prepare('SELECT total_commits FROM weekly_aggregates WHERE week_start = ?')
+                .get('2026-06-01') as {total_commits: number};
+            expect(row.total_commits).toBe(5);
+        } finally {
+            check.close();
+        }
+    });
+
+    it('returns null and logs when the DB cannot be opened, without throwing', () => {
+        const logger = recordingLogger();
+        // A directory path cannot be opened as a SQLite file → openDb throws.
+        // Returning null (rather than throwing) is the isolation contract.
+        const badPath = os.tmpdir();
+
+        const result = runScheduledAggregationJob(badPath, 'monthly', {
+            now: () => WEEKLY_NOW,
+            migrationsDir: MIGRATIONS_DIR,
+            logger,
+        });
+
+        expect(result).toBeNull();
+        expect(logger.failures.map((f) => f.period)).toEqual(['monthly']);
+        // It never reached a successful compute.
+        expect(logger.successes).toEqual([]);
     });
 });
