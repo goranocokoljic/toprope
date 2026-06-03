@@ -138,6 +138,67 @@ describe('computeQuarterlyAggregate', () => {
         expect(row.wasted_spend).toBe(0);
     });
 
+    it('does not let tool use on a later re-assignment mark an already-revoked seat as used (held-window scoping)', () => {
+        addDeveloper(db, 'dev-1', 'backend');
+        // Seat held all of Q2 but with no tool activity *while held* → unused.
+        addSubscription(db, 'dev-1', {
+            monthly_cost: 30,
+            seat_assigned_at: '2026-04-01T00:00:00.000Z',
+            seat_revoked_at: '2026-05-01T00:00:00.000Z',
+        });
+        // Activity in June — after this seat was revoked. Must NOT clear the seat.
+        addToolSnapshot(db, 'dev-1', '2026-06-15', {is_active: 1, interaction_count: 9});
+
+        const row = computeQuarterlyAggregate(db, 'backend', QUARTER, NOW);
+
+        // Held Apr 1..30 (30 days ≥ threshold), no activity in that window → unused.
+        expect(row.unused_seat_count).toBe(1);
+        // 30 of 30 April days at $30/mo → $30.
+        expect(row.wasted_spend).toBe(30);
+    });
+
+    it('counts a revoke+reassign transition of the same tool as one logical seat', () => {
+        addDeveloper(db, 'dev-1', 'backend');
+        // Plan change mid-quarter: $20 seat revoked 2026-05-15, $50 seat assigned
+        // the same instant. One logical (dev, tool) seat, not two.
+        addSubscription(db, 'dev-1', {
+            tool: 'copilot',
+            monthly_cost: 20,
+            seat_assigned_at: '2026-04-01T00:00:00.000Z',
+            seat_revoked_at: '2026-05-15T00:00:00.000Z',
+        });
+        addSubscription(db, 'dev-1', {
+            tool: 'copilot',
+            monthly_cost: 50,
+            seat_assigned_at: '2026-05-15T00:00:00.000Z',
+        });
+        addGitSnapshot(db, 'dev-1', '2026-04-10', {commits: 2}); // git only, no tool use
+
+        const row = computeQuarterlyAggregate(db, 'backend', QUARTER, NOW);
+
+        expect(row.unused_seat_count).toBe(1); // one logical seat, not two
+        // Apr 1..May 14 at $20/mo + May 15..Jun 30 at $50/mo, prorated per month.
+        // Apr: 30/30*20=20; May 1..14: 14/31*20=9.03; May 15..31: 17/31*50=27.42;
+        // Jun: 30/30*50=50 → 20+9.03+27.42+50 = 106.45.
+        expect(row.wasted_spend).toBeCloseTo(106.45, 2);
+    });
+
+    it('excludes seats of developers who joined the team after the period end', () => {
+        // dev-future joined in Q3 but holds a seat assigned before the Q2 end.
+        // They are not in Q2's head-count, so their seat must not appear in waste.
+        addDeveloper(db, 'dev-future', 'backend', '2026-08-01T00:00:00.000Z');
+        addSubscription(db, 'dev-future', {
+            monthly_cost: 90,
+            seat_assigned_at: '2026-01-01T00:00:00.000Z',
+        });
+
+        const row = computeQuarterlyAggregate(db, 'backend', QUARTER, NOW);
+
+        expect(row.developer_count).toBe(0);
+        expect(row.unused_seat_count).toBe(0);
+        expect(row.wasted_spend).toBe(0);
+    });
+
     it('exempts a seat assigned within the inactivity threshold of the quarter end', () => {
         addDeveloper(db, 'dev-1', 'backend');
         // Assigned 2026-06-25 — fewer than 14 days before the 2026-06-30 quarter end.

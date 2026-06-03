@@ -17,11 +17,8 @@
 
 import type Database from 'better-sqlite3';
 import {quarterRange} from './dates';
-import {computeTeamPeriodMetrics, listTeams} from './team-period';
+import {computeTeamPeriodMetrics, listTeams, type MaturityBasis} from './team-period';
 import {computePeriodWaste} from './waste-period';
-
-/** Basis label for the AI maturity score; git-only at launch. */
-export type MaturityBasis = 'git_estimate' | 'mixed' | 'measured';
 
 export interface QuarterlyAggregateRow {
     id: string;

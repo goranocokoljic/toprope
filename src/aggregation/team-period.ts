@@ -11,10 +11,26 @@
  * from daily snapshots — here by reusing the already-tested computePeriodMetrics
  * per developer and summing across the team, rather than re-querying snapshots.
  * That keeps the per-developer and team numbers consistent by construction.
+ *
+ * The fold runs computePeriodMetrics once per member, each of which issues a
+ * git query, a tool query, and a per-day prorated-cost loop. This trades
+ * throughput for that consistency-by-construction: a yearly all-teams backfill
+ * is O(teams × developers × period-days) and won't be cheap at large scale.
+ * At launch-scale data it's trivial; a future large-org backfill may want a
+ * batched query path instead.
  */
 
 import type Database from 'better-sqlite3';
-import {computePeriodMetrics, type PeriodMetrics} from './compute';
+import {computePeriodMetrics, round, meanOrNull, type PeriodMetrics} from './compute';
+
+/**
+ * Basis label for the AI maturity score (quarterly + yearly). git-only at
+ * launch; the other values are the column's defined vocabulary (per the issue
+ * spec and migration 015) that Task 3.4 will begin emitting. Lives here, the
+ * shared home of the team rollup, so the two job modules don't depend on each
+ * other for it.
+ */
+export type MaturityBasis = 'git_estimate' | 'mixed' | 'measured';
 
 export interface TeamMember {
     id: string;
@@ -40,26 +56,6 @@ export interface TeamPeriodMetrics {
     cost_per_pr: number | null;
     /** Per-member metrics, retained so the quarterly job can run waste detection. */
     members: TeamMember[];
-}
-
-/** Round to `dp` decimals, preserving null. */
-function round(value: number, dp: number): number;
-function round(value: number | null, dp: number): number | null;
-function round(value: number | null, dp: number): number | null {
-    if (value === null) {
-        return null;
-    }
-    const factor = 10 ** dp;
-    return Math.round(value * factor) / factor;
-}
-
-/** Mean of the non-null values, or null when there are none. */
-function meanOrNull(values: Array<number | null>): number | null {
-    const present = values.filter((v): v is number => v !== null);
-    if (present.length === 0) {
-        return null;
-    }
-    return present.reduce((a, b) => a + b, 0) / present.length;
 }
 
 interface DeveloperRow {

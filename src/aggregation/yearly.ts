@@ -15,8 +15,7 @@
 
 import type Database from 'better-sqlite3';
 import {yearRange} from './dates';
-import {computeTeamPeriodMetrics, listTeams} from './team-period';
-import type {MaturityBasis} from './quarterly';
+import {computeTeamPeriodMetrics, listTeams, type MaturityBasis} from './team-period';
 
 export interface YearlyAggregateRow {
     id: string;
