@@ -1,6 +1,7 @@
 import {describe, it, expect} from 'vitest';
 import {
     pctChange,
+    countPctChange,
     pointDelta,
     computeDeveloperDeltas,
     computeTeamDeltas,
@@ -46,6 +47,18 @@ describe('pctChange (percentage CHANGE)', () => {
     it('rounds to two decimal places', () => {
         // (1 - 3) / max(3, 1) * 100 = -66.666... → -66.67
         expect(pctChange(1, 3, 1)).toBe(-66.67);
+    });
+});
+
+describe('countPctChange (count metric: both-zero → null)', () => {
+    it('returns null only when both periods are 0 (absent on both sides)', () => {
+        expect(countPctChange(0, 0, 1)).toBeNull();
+    });
+
+    it('deltas normally when either side is non-zero', () => {
+        expect(countPctChange(5, 0, 1)).toBe(500); // started
+        expect(countPctChange(0, 5, 1)).toBe(-100); // stopped
+        expect(countPctChange(12, 10, 1)).toBe(20); // normal
     });
 });
 
@@ -152,6 +165,23 @@ describe('computeDeveloperDeltas', () => {
         expect(d.interaction_delta_pct).toBeNull();
         // Git metrics still delta normally — only the tool-derived count nulls out.
         expect(d.commit_velocity_delta_pct).toBe(20);
+    });
+
+    it('applies the both-zero null guard uniformly to all count deltas (commits, PRs, interactions)', () => {
+        // Tool-only developer: zero commits/PRs both periods → no fabricated 0%.
+        const toolOnly: DeveloperDeltaValues = {...CURRENT, total_commits: 0, total_prs_merged: 0};
+        const toolOnlyPrev: DeveloperDeltaValues = {...PREVIOUS, total_commits: 0, total_prs_merged: 0};
+        const d = computeDeveloperDeltas(toolOnly, toolOnlyPrev);
+        expect(d.commit_velocity_delta_pct).toBeNull();
+        expect(d.prs_merged_delta_pct).toBeNull();
+        // Interactions present both sides → still a real delta.
+        expect(d.interaction_delta_pct).toBe(10); // (110-100)/100*100
+    });
+
+    it('still deltas a count when only one period is zero (activity starting/stopping)', () => {
+        const started: DeveloperDeltaValues = {...PREVIOUS, total_commits: 0};
+        // current commits 120 vs prior 0 → (120-0)/max(0,1)*100 = 12000, not null.
+        expect(computeDeveloperDeltas(CURRENT, started).commit_velocity_delta_pct).toBe(12000);
     });
 
     it('still deltas interactions when usage starts or stops (one side non-zero)', () => {

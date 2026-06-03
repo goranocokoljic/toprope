@@ -21,8 +21,16 @@
  * deltas are folded into the row the job upserts. Because the job overwrites the
  * whole row, re-running a period (late data) recomputes its deltas against the
  * prior period's current stored values — always correct for the re-run period.
- * (Downstream periods that compared against the changed one are not cascaded;
- * they refresh when they themselves are next recomputed.)
+ *
+ * Known limitation (non-cascade): re-running period N updates N's deltas but does
+ * NOT refresh the deltas of N+1, which compared against N's old values. This is
+ * deliberate — deltas are not cascaded — and bounded in practice: the scheduler
+ * (Task 3.4 §3.4) and backfill recompute a *contiguous* range in chronological
+ * order, so after a normal backfill or scheduled run every period's delta is
+ * correct. Only an isolated re-run of a single past period leaves the immediately
+ * following period stale until it too is recomputed. A future scheduler that
+ * re-runs N+1 whenever N is re-run would close this gap; it is out of scope for
+ * Task 3.3 (deltas) and tracked as debt rather than built here.
  */
 
 import type Database from 'better-sqlite3';
@@ -43,6 +51,23 @@ export function pctChange(
         return null;
     }
     return round(((current - previous) / Math.max(previous, floor)) * 100, 2);
+}
+
+/**
+ * `pctChange` specialised for count metrics that default to 0 and are never null
+ * (commits, PRs merged, tool interactions). When BOTH periods are 0 the metric
+ * was simply absent on both sides — a git-only developer has no tool
+ * interactions, a tool-only developer no commits — so reporting a "0% change"
+ * would fabricate a comparison from no data. Return null instead, matching how
+ * the rate metrics (acceptance rate, cost-per-PR) stay null when their source
+ * data is absent. A real value on either side (activity starting or stopping)
+ * still produces a delta via the normal `pctChange` path.
+ */
+export function countPctChange(current: number, previous: number, floor: number): number | null {
+    if (current === 0 && previous === 0) {
+        return null;
+    }
+    return pctChange(current, previous, floor);
 }
 
 /**
@@ -102,20 +127,15 @@ export function computeDeveloperDeltas(
         return {...NULL_DEVELOPER_DELTAS};
     }
     return {
-        // interaction_delta_pct is null when neither period had any tool
-        // interactions: total_interactions is a count that defaults to 0 (never
-        // null), so without this guard a git-only developer — the launch reality —
-        // would show a fabricated "0% change" forever. Null here mirrors how
-        // avg_acceptance_rate / cost_per_pr stay null when there is no tool/PR
-        // data, keeping the engine's "don't fabricate from absent data" posture.
-        // A real signal on either side (usage starting or stopping) still deltas.
-        interaction_delta_pct:
-            current.total_interactions === 0 && previous.total_interactions === 0
-                ? null
-                : pctChange(current.total_interactions, previous.total_interactions, 1),
+        // The three count-derived pct deltas use countPctChange so a metric that
+        // was absent on both sides (zero both periods) yields null, not a
+        // fabricated 0% — uniform across interactions, commits, and PRs so a
+        // git-only or tool-only developer never shows a phantom 0% change for the
+        // dimension they don't have data in.
+        interaction_delta_pct: countPctChange(current.total_interactions, previous.total_interactions, 1),
         acceptance_rate_delta: pointDelta(current.avg_acceptance_rate, previous.avg_acceptance_rate),
-        commit_velocity_delta_pct: pctChange(current.total_commits, previous.total_commits, 1),
-        prs_merged_delta_pct: pctChange(current.total_prs_merged, previous.total_prs_merged, 1),
+        commit_velocity_delta_pct: countPctChange(current.total_commits, previous.total_commits, 1),
+        prs_merged_delta_pct: countPctChange(current.total_prs_merged, previous.total_prs_merged, 1),
         churn_rate_delta: pointDelta(current.avg_code_churn, previous.avg_code_churn),
         ai_signature_delta: pointDelta(current.avg_ai_signature_score, previous.avg_ai_signature_score),
         cost_per_pr_delta_pct: pctChange(current.cost_per_pr, previous.cost_per_pr, 0.01),
@@ -146,6 +166,9 @@ export function computeTeamDeltas(
     if (previous === null) {
         return {utilization_rate_delta: null, maturity_score_delta: null};
     }
+    // No count-style both-zero guard here (unlike the developer count deltas):
+    // both team metrics are rates/scores fed through pointDelta, which already
+    // null-propagates when either side is null, so there is nothing to fabricate.
     return {
         utilization_rate_delta: pointDelta(current.utilization_rate, previous.utilization_rate),
         maturity_score_delta: pointDelta(current.ai_maturity_score, previous.ai_maturity_score),
