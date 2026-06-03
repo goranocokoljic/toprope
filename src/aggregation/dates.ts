@@ -150,6 +150,113 @@ export function priorYear(year: string): string {
     return String(Number(year) - 1);
 }
 
+/** The calendar month (`YYYY-MM`) a day falls in. */
+export function monthOf(date: string): string {
+    assertValidDate(date);
+    return date.slice(0, 7);
+}
+
+/** The calendar quarter (`YYYY-Q[1-4]`) a day falls in. */
+export function quarterOf(date: string): string {
+    assertValidDate(date);
+    const [year, mon] = date.split('-').map(Number);
+    const q = Math.floor((mon - 1) / 3) + 1; // months 1–3→Q1, 4–6→Q2, …
+    return `${year}-Q${q}`;
+}
+
+/** The calendar year (`YYYY`) a day falls in. */
+export function yearOf(date: string): string {
+    assertValidDate(date);
+    return date.slice(0, 4);
+}
+
+/** The calendar month after `month` (`YYYY-MM`), e.g. `2026-12` → `2027-01`. */
+export function nextMonth(month: string): string {
+    if (!MONTH_RE.test(month)) {
+        throw new Error(`Invalid month (expected YYYY-MM): ${month}`);
+    }
+    const [year, mon] = month.split('-').map(Number);
+    // mon is 1-based, so Date's 0-based month index `mon` is the month after this one.
+    const d = new Date(Date.UTC(year, mon, 1));
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+/** The calendar quarter after `quarter` (`YYYY-Q[1-4]`), e.g. `2026-Q4` → `2027-Q1`. */
+export function nextQuarter(quarter: string): string {
+    if (!QUARTER_RE.test(quarter)) {
+        throw new Error(`Invalid quarter (expected YYYY-Q[1-4]): ${quarter}`);
+    }
+    const [year, q] = quarter.split('-Q').map(Number);
+    return q === 4 ? `${year + 1}-Q1` : `${year}-Q${q + 1}`;
+}
+
+/**
+ * Every ISO week start (Monday) whose week intersects the inclusive [from, to]
+ * window, in chronological order. The first entry is `isoWeekStart(from)` — the
+ * Monday of the week `from` falls in, which may precede `from`; computing that
+ * week's aggregate is correct since the rollup folds the whole canonical ISO
+ * week from the immutable daily snapshots. Always returns at least one week.
+ * Backfill walks these in order so each week's deltas see the prior week's row.
+ */
+export function enumerateWeekStarts(from: string, to: string): string[] {
+    assertDateRange(from, to);
+    const weeks: string[] = [];
+    let weekStart = isoWeekStart(from);
+    while (weekStart <= to) {
+        weeks.push(weekStart);
+        weekStart = addDays(weekStart, 7);
+    }
+    return weeks;
+}
+
+/**
+ * Every calendar month (`YYYY-MM`) that intersects the inclusive [from, to]
+ * window, in chronological order — from `from`'s month through `to`'s month.
+ */
+export function enumerateMonths(from: string, to: string): string[] {
+    assertDateRange(from, to);
+    const months: string[] = [];
+    const last = monthOf(to);
+    let month = monthOf(from);
+    // YYYY-MM keys are zero-padded, so lexicographic <= is chronological.
+    while (month <= last) {
+        months.push(month);
+        month = nextMonth(month);
+    }
+    return months;
+}
+
+/**
+ * Every calendar quarter (`YYYY-Q[1-4]`) that intersects the inclusive [from, to]
+ * window, in chronological order — from `from`'s quarter through `to`'s quarter.
+ */
+export function enumerateQuarters(from: string, to: string): string[] {
+    assertDateRange(from, to);
+    const quarters: string[] = [];
+    const last = quarterOf(to);
+    let quarter = quarterOf(from);
+    // YYYY-Q[1-4] keys compare lexicographically in chronological order.
+    while (quarter <= last) {
+        quarters.push(quarter);
+        quarter = nextQuarter(quarter);
+    }
+    return quarters;
+}
+
+/**
+ * Every calendar year (`YYYY`) that intersects the inclusive [from, to] window,
+ * in chronological order — from `from`'s year through `to`'s year.
+ */
+export function enumerateYears(from: string, to: string): string[] {
+    assertDateRange(from, to);
+    const years: string[] = [];
+    const last = Number(yearOf(to));
+    for (let year = Number(yearOf(from)); year <= last; year++) {
+        years.push(String(year));
+    }
+    return years;
+}
+
 /** Number of days in the calendar month containing `date` (YYYY-MM-DD). */
 export function daysInMonth(date: string): number {
     assertValidDate(date);
