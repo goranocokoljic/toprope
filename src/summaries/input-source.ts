@@ -237,6 +237,15 @@ function hasSnapshotData(
  * metrics, the prior period's metrics for deltas (null when the prior period has
  * no snapshot data — a genuine first period), and the org benchmark, then hands
  * them to buildSummaryInput, which enforces the privacy allowlist on the result.
+ *
+ * Cost note: for an org scope this folds the developer pool more than once — the
+ * cost-per-PR benchmark (computed here and threaded into `current` to avoid one
+ * re-fold), the org aggregate's current+prior folds, and the per-team
+ * org-average-maturity pass. This is the same consistency-over-throughput
+ * trade-off team-period.ts documents (every figure folded directly from snapshots
+ * so the numbers can't drift): trivial at launch scale, and a future large-org
+ * path would thread a single per-period member fold through all three. Kept simple
+ * deliberately rather than optimised pre-emptively.
  */
 export function buildSummaryInputForTarget(
     db: Database.Database,

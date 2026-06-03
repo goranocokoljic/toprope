@@ -184,6 +184,13 @@ export function runAggregationForPeriod(
     // dies between the commit above and this call, affected summaries stay
     // is_stale = 0 until the period is next recomputed (which re-runs this check).
     // Acceptable because every recompute self-heals it and is_stale is advisory.
+    //
+    // Scope of the guarantee: staleness is keyed on *snapshot* recompute. The
+    // summary input also folds the developer registry, so a registry-only change
+    // (a late developer import / team reassignment inside an already-summarised
+    // period) that isn't accompanied by an aggregate recompute is NOT auto-detected
+    // here. Such cases need an explicit regenerate; checkSummaryStaleness re-hashes
+    // a single record on demand if a periodic sweep is added later.
     markStaleSummariesForRecompute(db, period, periodKey);
 
     return {period, periodKey, rowsWritten: rows.length};

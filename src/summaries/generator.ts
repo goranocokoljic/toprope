@@ -87,8 +87,25 @@ export async function generateSummary(
 
     const prompt = buildSummaryPrompt(payload, options.focus ? {focus: options.focus} : undefined);
 
+    // Resolving/constructing the client can throw on a misconfiguration (no
+    // model_name, unsupported provider, non-http endpoint — resolveSummaryModel
+    // surfaces those loudly by design). Fold that into the same discriminated
+    // failure the operational path returns, so generateSummary NEVER throws for a
+    // model/config problem: the CLI prints a clean line and a future scheduler/API
+    // caller gets {ok:false} rather than an exception. Not retryable — a config
+    // error won't fix itself on the next tick.
+    let client: SummaryModelClient;
+    try {
+        client = createClient(summaries, target.level);
+    } catch (err) {
+        return {
+            ok: false,
+            retryable: false,
+            error: `Summary model not configured for ${target.level}: ${err instanceof Error ? err.message : String(err)}`,
+        };
+    }
+
     // Call the model BEFORE any write so a failure can't leave a partial row.
-    const client = createClient(summaries, target.level);
     const result = await client.generate(prompt);
     if (!result.ok) {
         return {ok: false, error: result.error, retryable: result.retryable};

@@ -143,6 +143,20 @@ describe('generateSummary', () => {
         expect(rows.n).toBe(0);
     });
 
+    it('returns a clean non-retryable failure (no throw, no row) when the model is misconfigured', async () => {
+        // No createClient override → the real factory runs; an empty summaries
+        // config has no model_name, so resolveSummaryModel throws. The generator
+        // must fold that into {ok:false}, not propagate the exception.
+        const result = await generateSummary(db, {}, TARGET, {now: () => NOW});
+        expect(result.ok).toBe(false);
+        if (!result.ok) {
+            expect(result.retryable).toBe(false);
+            expect(result.error).toMatch(/not configured/);
+        }
+        const rows = db.prepare('SELECT COUNT(*) AS n FROM summaries').get() as {n: number};
+        expect(rows.n).toBe(0);
+    });
+
     it('regenerates an existing row in place (same id, updated text)', async () => {
         await generateSummary(
             db,
