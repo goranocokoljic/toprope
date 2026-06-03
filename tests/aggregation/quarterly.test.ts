@@ -183,6 +183,31 @@ describe('computeQuarterlyAggregate', () => {
         expect(row.wasted_spend).toBeCloseTo(106.45, 2);
     });
 
+    it('treats a disjoint re-grant of the same tool as one logical seat spanning the gap', () => {
+        // Documents the held-span approximation: a seat revoked early then
+        // re-assigned later in the quarter is one logical (dev, tool) seat, and
+        // its held span covers the gap. wasted_spend stays exact (per-row).
+        addDeveloper(db, 'dev-1', 'backend');
+        addSubscription(db, 'dev-1', {
+            tool: 'copilot',
+            monthly_cost: 30,
+            seat_assigned_at: '2026-01-01T00:00:00.000Z',
+            seat_revoked_at: '2026-04-10T00:00:00.000Z',
+        });
+        addSubscription(db, 'dev-1', {
+            tool: 'copilot',
+            monthly_cost: 30,
+            seat_assigned_at: '2026-06-20T00:00:00.000Z',
+        });
+
+        const row = computeQuarterlyAggregate(db, 'backend', QUARTER, NOW);
+
+        expect(row.unused_seat_count).toBe(1); // one logical seat, not two
+        // Only truly-held days are billed: Apr 1..9 (9 days) + Jun 20..30 (11 days)
+        // at $30/mo → 9 + 11 = $20. The gap is not charged.
+        expect(row.wasted_spend).toBe(20);
+    });
+
     it('excludes seats of developers who joined the team after the period end', () => {
         // dev-future joined in Q3 but holds a seat assigned before the Q2 end.
         // They are not in Q2's head-count, so their seat must not appear in waste.
