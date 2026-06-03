@@ -23,6 +23,7 @@ import {registerLeaderboardRoutes} from './dashboard/api/leaderboard';
 import {registerAdminRoutes} from './dashboard/api/admin';
 import {registerDashboardStatic} from './dashboard/static';
 import {startScheduler} from './scheduler/scheduler';
+import {startAggregationScheduler} from './aggregation/scheduler';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, './storage/migrations');
 
@@ -94,10 +95,21 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
     // Serve the built React dashboard (Phase 2) at /dashboard, if present.
     registerDashboardStatic(app);
 
-    if (config.connectors && dbPath !== ':memory:') {
-        const tasks = startScheduler(config as GovProxyConfig, dbPath);
+    if (dbPath !== ':memory:') {
+        // Connector syncs only run when a connectors block is configured.
+        const connectorTasks = config.connectors
+            ? startScheduler(config as GovProxyConfig, dbPath)
+            : [];
+        // Aggregation rollups run on their own period boundaries (04:00+ UTC),
+        // deliberately after the connector syncs so each rollup folds a
+        // daily-snapshot table the day's sync has already populated. They are
+        // gated only on a persistent DB, NOT on connector presence: rollups fold
+        // whatever daily snapshots exist (git-only/expense-only deployments
+        // included), so coupling them to a connectors block would silently
+        // starve the trend tables.
+        const aggregationTasks = startAggregationScheduler(dbPath);
         app.addHook('onClose', () => {
-            for (const task of tasks) task.stop();
+            for (const task of [...connectorTasks, ...aggregationTasks]) task.stop();
         });
     }
 
