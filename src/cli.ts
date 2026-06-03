@@ -30,6 +30,7 @@ import {
     resolveAlert,
 } from './expenses/waste-detector';
 import {evaluatePlanRoi} from './expenses/plan-roi';
+import {runBackfill, type BackfillProgress} from './aggregation/backfill';
 import {hashPassword, validatePasswordStrength, generateTempPassword} from './auth/password';
 import {createUser, getActiveUserByEmail, countAdmins} from './auth/users';
 
@@ -906,6 +907,65 @@ wasteCommand
             db.close();
         }
         if (exitCode !== 0) process.exit(exitCode);
+    });
+
+const aggregateCommand = program.command('aggregate').description('Compute trend aggregates');
+
+aggregateCommand
+    .command('backfill')
+    .description(
+        'Compute historical aggregates (weekly, monthly, quarterly, yearly) from existing daily snapshots. ' +
+            'Backfill the oldest range first and without gaps: deltas are not cascaded, so running a later ' +
+            'range before an earlier adjacent one leaves the boundary delta uncompared.',
+    )
+    .option('--from <date>', 'Inclusive range start (YYYY-MM-DD). Defaults to 12 months before --to')
+    .option('--to <date>', 'Inclusive range end (YYYY-MM-DD). Defaults to today (UTC)')
+    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .action((options: {from?: string; to?: string; config: string}) => {
+        const configPath = path.resolve(process.cwd(), options.config);
+        const config = loadConfig(configPath);
+        const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
+        const db = openDb(dbPath);
+        try {
+            runMigrations(db, MIGRATIONS_DIR);
+
+            // Print a per-level running counter. On a TTY the line is rewritten in
+            // place; otherwise (captured logs) print one line per level boundary so
+            // the output stays readable without a stream of overwrites.
+            const isTty = Boolean(process.stdout.isTTY);
+            const labels: Record<BackfillProgress['level'], string> = {
+                weekly: 'Weekly   ',
+                monthly: 'Monthly  ',
+                quarterly: 'Quarterly',
+                yearly: 'Yearly   ',
+            };
+            const onProgress = (p: BackfillProgress): void => {
+                const line = `  ${labels[p.level]}  ${p.levelIndex}/${p.levelTotal}  (overall ${p.overallIndex}/${p.overallTotal})`;
+                if (isTty) {
+                    process.stdout.write(`\r${line}`);
+                    if (p.levelIndex === p.levelTotal) process.stdout.write('\n');
+                    return;
+                }
+                // Non-TTY (captured logs / CI): \r can't rewrite a line in a file, so
+                // print discrete milestones — first and last period of each level,
+                // plus every 20th — to show liveness during a long pass without a
+                // flood of one line per period.
+                if (p.levelIndex === 1 || p.levelIndex === p.levelTotal || p.levelIndex % 20 === 0) {
+                    console.log(line);
+                }
+            };
+
+            const result = runBackfill(db, {from: options.from, to: options.to, onProgress});
+
+            console.log(
+                `Backfill complete (${result.from} → ${result.to}): ` +
+                    `${result.periodsProcessed} periods processed ` +
+                    `(${result.weeks} weekly, ${result.months} monthly, ${result.quarters} quarterly, ${result.years} yearly), ` +
+                    `${result.rowsWritten} aggregate row(s) written.`,
+            );
+        } finally {
+            db.close();
+        }
     });
 
 program
