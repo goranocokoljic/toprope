@@ -24,6 +24,7 @@ import {registerAdminRoutes} from './dashboard/api/admin';
 import {registerDashboardStatic} from './dashboard/static';
 import {startScheduler} from './scheduler/scheduler';
 import {startAggregationScheduler} from './aggregation/scheduler';
+import {startSummaryScheduler} from './summaries/scheduler';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, './storage/migrations');
 
@@ -108,8 +109,14 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
         // included), so coupling them to a connectors block would silently
         // starve the trend tables.
         const aggregationTasks = startAggregationScheduler(dbPath);
+        // Summary auto-generation (weekly + monthly) fires just after the matching
+        // aggregation job, generating each scope's narrative for the just-completed
+        // period. Gated on summaries config (a disabled level registers no task);
+        // quarterly/yearly are on-demand only and never scheduled here.
+        const summaryTasks = startSummaryScheduler(dbPath, config.summaries);
         app.addHook('onClose', () => {
-            for (const task of [...connectorTasks, ...aggregationTasks]) task.stop();
+            for (const task of [...connectorTasks, ...aggregationTasks, ...summaryTasks])
+                task.stop();
         });
     }
 
