@@ -8,6 +8,10 @@ import {
     yearRange,
     daysInMonth,
     assertDateRange,
+    priorWeekStart,
+    priorMonth,
+    priorQuarter,
+    priorYear,
 } from '../../src/aggregation/dates';
 
 describe('isoWeekStart', () => {
@@ -63,6 +67,11 @@ describe('monthRange', () => {
     it('throws on a malformed month', () => {
         expect(() => monthRange('2026-5')).toThrow();
         expect(() => monthRange('2026-05-01')).toThrow();
+    });
+
+    it('throws on an out-of-range month rather than rolling it into a valid key', () => {
+        expect(() => monthRange('2026-13')).toThrow();
+        expect(() => monthRange('2026-00')).toThrow();
     });
 });
 
@@ -125,5 +134,62 @@ describe('assertDateRange', () => {
     it('throws on a malformed or empty bound', () => {
         expect(() => assertDateRange('', '2026-05-10')).toThrow();
         expect(() => assertDateRange('2026-05-04', 'nope')).toThrow();
+    });
+});
+
+describe('priorWeekStart', () => {
+    it('steps back exactly one ISO week', () => {
+        expect(priorWeekStart('2026-05-04')).toBe('2026-04-27');
+    });
+
+    it('steps back across a year boundary', () => {
+        expect(priorWeekStart('2026-01-05')).toBe('2025-12-29');
+    });
+
+    it('throws on a malformed date', () => {
+        expect(() => priorWeekStart('2026-05')).toThrow();
+    });
+});
+
+describe('priorMonth', () => {
+    it('steps back one month within a year', () => {
+        expect(priorMonth('2026-05')).toBe('2026-04');
+    });
+
+    it('rolls over to December of the prior year', () => {
+        expect(priorMonth('2026-01')).toBe('2025-12');
+    });
+
+    it('throws on a malformed month', () => {
+        expect(() => priorMonth('2026-13-01')).toThrow();
+    });
+
+    it('throws on an out-of-range month (shape-valid but month > 12 or 00)', () => {
+        expect(() => priorMonth('2026-13')).toThrow();
+        expect(() => priorMonth('2026-00')).toThrow();
+    });
+});
+
+describe('priorQuarter', () => {
+    it('steps back one quarter within a year', () => {
+        expect(priorQuarter('2026-Q3')).toBe('2026-Q2');
+    });
+
+    it('rolls over to Q4 of the prior year', () => {
+        expect(priorQuarter('2026-Q1')).toBe('2025-Q4');
+    });
+
+    it('throws on a malformed quarter', () => {
+        expect(() => priorQuarter('2026-Q5')).toThrow();
+    });
+});
+
+describe('priorYear', () => {
+    it('steps back one year', () => {
+        expect(priorYear('2026')).toBe('2025');
+    });
+
+    it('throws on a malformed year', () => {
+        expect(() => priorYear('26')).toThrow();
     });
 });

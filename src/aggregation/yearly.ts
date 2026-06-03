@@ -14,8 +14,9 @@
  */
 
 import type Database from 'better-sqlite3';
-import {yearRange} from './dates';
+import {yearRange, priorYear} from './dates';
 import {computeTeamPeriodMetrics, listTeams, type MaturityBasis} from './team-period';
+import {teamDeltas} from './deltas';
 
 export interface YearlyAggregateRow {
     id: string;
@@ -84,6 +85,14 @@ export function computeYearlyAggregate(
     const {start, end} = yearRange(year);
     const metrics = computeTeamPeriodMetrics(db, team, start, end);
 
+    const aiMaturityScore: number | null = null; // Task 3.4
+    // Final step: deltas vs the prior year's stored aggregate (null on first year).
+    // maturity_score_delta stays null until Task 3.4 emits the score.
+    const deltas = teamDeltas(db, 'yearly_aggregates', 'year', team, priorYear(year), {
+        utilization_rate: metrics.utilization_rate,
+        ai_maturity_score: aiMaturityScore,
+    });
+
     const row: YearlyAggregateRow = {
         id: `yearly:${team}:${year}`,
         team,
@@ -97,10 +106,10 @@ export function computeYearlyAggregate(
         avg_code_churn: metrics.avg_code_churn,
         avg_ai_signature_score: metrics.avg_ai_signature_score,
         cost_per_pr: metrics.cost_per_pr,
-        ai_maturity_score: null, // Task 3.4
+        ai_maturity_score: aiMaturityScore,
         ai_maturity_basis: 'git_estimate',
-        utilization_rate_delta: null, // Task 3.3
-        maturity_score_delta: null, // Task 3.3
+        utilization_rate_delta: deltas.utilization_rate_delta,
+        maturity_score_delta: deltas.maturity_score_delta,
         computed_at: now.toISOString(),
     };
     upsertRow(db, row);
