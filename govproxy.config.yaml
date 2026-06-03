@@ -64,21 +64,28 @@ aggregation:
 
 summaries:
   enabled: false
+  # Default to a LOCAL model (Ollama) for privacy — the model only ever receives
+  # aggregate numbers, never code or commit contents, and keeping it local means
+  # no data leaves the network. See docs/summaries-model.md for the default model
+  # choice and infrastructure requirements.
   model:
-    type: "anthropic"
-    model_name: "claude-haiku-4-5-20251001"
-    api_key: "${SUMMARY_MODEL_API_KEY}"
+    type: "ollama"
+    endpoint: "http://localhost:11434"
+    model_name: "llama3.1:70b"     # larger local model — quality for monthly+
+    # api_key: "${SUMMARY_MODEL_API_KEY}"   # only needed for anthropic/openai
   weekly:
     enabled: true
     auto_generate: true
+    model_name: "llama3.1:8b"      # small/fast local model for frequent weekly output
   monthly:
     enabled: true
     auto_generate: true
-    model_name: "claude-sonnet-4-20250514"
   quarterly:
     enabled: true
-    auto_generate: true
-    model_name: "claude-sonnet-4-20250514"
+    auto_generate: false
+  yearly:
+    enabled: true
+    auto_generate: false
 
 alerts:
   slack:

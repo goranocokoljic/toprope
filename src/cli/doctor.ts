@@ -5,6 +5,7 @@ import {getMigrationStatus} from '../storage/migrator';
 import {resolveGitProviderConfigs} from '../connectors/git/providers/config';
 import {createGitProvider} from '../connectors/git/providers/factory';
 import type {GitProvider, GitProviderConfig} from '../connectors/git/providers/types';
+import {trimTrailingSlash} from '../summaries/model-client';
 
 interface CheckResult {
     label: string;
@@ -457,7 +458,7 @@ async function checkSummaryModel(config: GovProxyConfig): Promise<CheckResult> {
         return pass('Summary model', 'Summaries disabled — skipped');
     }
 
-    const modelType = summaries.model?.type ?? 'anthropic';
+    const modelType = summaries.model?.type ?? 'ollama';
     const apiKey = summaries.model?.api_key;
 
     if (modelType === 'anthropic') {
@@ -468,8 +469,9 @@ async function checkSummaryModel(config: GovProxyConfig): Promise<CheckResult> {
                 'Set summaries.model.api_key in config.',
             );
         }
+        const baseUrl = trimTrailingSlash(summaries.model?.endpoint ?? 'https://api.anthropic.com');
         try {
-            const res = await fetch('https://api.anthropic.com/v1/models', {
+            const res = await fetch(`${baseUrl}/v1/models`, {
                 headers: {
                     'x-api-key': apiKey,
                     'anthropic-version': '2023-06-01',
@@ -501,7 +503,7 @@ async function checkSummaryModel(config: GovProxyConfig): Promise<CheckResult> {
     }
 
     if (modelType === 'ollama') {
-        const baseUrl = 'http://localhost:11434';
+        const baseUrl = trimTrailingSlash(summaries.model?.endpoint ?? 'http://localhost:11434');
         try {
             const res = await fetch(`${baseUrl}/api/tags`, {
                 signal: AbortSignal.timeout(5_000),
@@ -519,6 +521,37 @@ async function checkSummaryModel(config: GovProxyConfig): Promise<CheckResult> {
                 'Summary model',
                 `Cannot reach Ollama at ${baseUrl}`,
                 'Start Ollama with: ollama serve',
+            );
+        }
+    }
+
+    if (modelType === 'openai') {
+        const baseUrl = trimTrailingSlash(summaries.model?.endpoint ?? 'https://api.openai.com');
+        try {
+            const res = await fetch(`${baseUrl}/v1/models`, {
+                headers: apiKey ? {authorization: `Bearer ${apiKey}`} : {},
+                signal: AbortSignal.timeout(8_000),
+            });
+            if (res.status === 401) {
+                return fail(
+                    'Summary model',
+                    'OpenAI key invalid (401)',
+                    'Set a valid key under summaries.model.api_key in config.',
+                );
+            }
+            if (!res.ok) {
+                return fail(
+                    'Summary model',
+                    `OpenAI endpoint returned ${res.status}`,
+                    `Verify summaries.model.endpoint (${baseUrl}) and api_key.`,
+                );
+            }
+            return pass('Summary model', `OpenAI endpoint reachable (${summaries.model?.model_name ?? 'default'})`);
+        } catch (err) {
+            return fail(
+                'Summary model',
+                `Cannot reach OpenAI endpoint at ${baseUrl}: ${err instanceof Error ? err.message : String(err)}`,
+                'Check the endpoint URL and your network connection.',
             );
         }
     }

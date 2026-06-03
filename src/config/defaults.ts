@@ -36,13 +36,23 @@ export const defaultConfig: GovProxyConfig = {
     },
     summaries: {
         enabled: false,
+        // Default to a LOCAL model (Ollama) for privacy — the model only ever
+        // receives aggregate numbers, and keeping it local guarantees no data
+        // leaves the network. The base model_name is the larger, higher-quality
+        // local model used for the executive-facing levels (monthly+); see
+        // docs/summaries-model.md for the model choice and infra requirements.
         model: {
-            type: 'anthropic',
-            model_name: 'claude-haiku-4-5-20251001',
+            type: 'ollama',
+            endpoint: 'http://localhost:11434',
+            model_name: 'llama3.1:70b',
         },
-        weekly: { enabled: true, auto_generate: true },
-        monthly: { enabled: true, auto_generate: true, model_name: 'claude-sonnet-4-20250514' },
-        quarterly: { enabled: true, auto_generate: true, model_name: 'claude-sonnet-4-20250514' },
+        // Weekly overrides to a small/fast local model — short, frequent output
+        // where quality matters less than turnaround. Monthly/quarterly/yearly
+        // inherit the larger base model.
+        weekly: { enabled: true, auto_generate: true, model_name: 'llama3.1:8b' },
+        monthly: { enabled: true, auto_generate: true },
+        quarterly: { enabled: true, auto_generate: true },
+        yearly: { enabled: true, auto_generate: false },
     },
     alerts: {
         slack: { enabled: false },
