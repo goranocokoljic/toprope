@@ -94,8 +94,8 @@ export interface SummaryModelConfig {
     // 'ollama' (default, local) | 'anthropic' | 'openai'.
     type?: string;
     // Base URL of the model endpoint. For ollama this is the local server
-    // (default http://localhost:11434); for openai a compatible base URL.
-    // Ignored for anthropic, which always uses the official API host.
+    // (default http://localhost:11434); for openai a compatible base URL; for
+    // anthropic a gateway/proxy URL (defaults to the official API host).
     endpoint?: string;
     model_name?: string;
     api_key?: string;
