@@ -55,7 +55,10 @@ describe('computeYearlyAggregate', () => {
         // Signature team mean: dev-1 mean(0.5,0.7)=0.6, dev-2 0.9 → mean(0.6,0.9)=0.75.
         expect(row.avg_ai_signature_score).toBe(0.75);
         expect(row.ai_maturity_basis).toBe('git_estimate');
-        expect(row.ai_maturity_score).toBeNull();
+        // Maturity is now computed (Task 3.4) — an in-range git estimate, not null.
+        expect(row.ai_maturity_score).toBeTypeOf('number');
+        expect(row.ai_maturity_score!).toBeGreaterThanOrEqual(0);
+        expect(row.ai_maturity_score!).toBeLessThanOrEqual(100);
         expect(row.utilization_rate_delta).toBeNull();
         expect(row.computed_at).toBe(NOW.toISOString());
     });

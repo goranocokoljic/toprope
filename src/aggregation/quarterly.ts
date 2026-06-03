@@ -7,18 +7,19 @@
  * recomputes and overwrites that one row — idempotent and safe to backfill.
  *
  * Quarterly (and yearly) aggregates are team-level, unlike the per-developer
- * weekly/monthly rollups. The team metrics are folded by computeTeamPeriodMetrics
- * and the period waste figures by computePeriodWaste.
+ * weekly/monthly rollups. The team metrics are folded by computeTeamPeriodMetrics,
+ * the period waste figures by computePeriodWaste, and the AI maturity score by
+ * computeTeamMaturity (Task 3.4).
  *
- * ai_maturity_score / *_delta columns are owned by later tasks (3.4 maturity,
- * 3.3 deltas) and left NULL here. ai_maturity_basis is set to 'git_estimate' —
- * at launch every aggregate is a git-only estimate.
+ * ai_maturity_basis is 'git_estimate' — at launch every aggregate is a git-only
+ * estimate. The *_delta columns are owned by Task 3.3 (deltas).
  */
 
 import type Database from 'better-sqlite3';
 import {quarterRange, priorQuarter} from './dates';
 import {computeTeamPeriodMetrics, listTeams, type MaturityBasis} from './team-period';
 import {computePeriodWaste} from './waste-period';
+import {computeOrgAvgCostPerPr, computeTeamMaturity} from './maturity';
 import {teamDeltas} from './deltas';
 
 export interface QuarterlyAggregateRow {
@@ -82,23 +83,44 @@ function upsertRow(db: Database.Database, row: QuarterlyAggregateRow): void {
  * Compute and persist one team's quarterly aggregate for `quarter`
  * (`YYYY-Q1`..`YYYY-Q4`). Returns the row written. A team with no qualifying
  * developers yields a zero/null row — valid and idempotent, not an error.
+ *
+ * `orgAvgCostPerPr` is the cost_per_pr benchmark averaged across all teams for
+ * this quarter, the input to the maturity score's cost_efficiency component.
+ * Omit it (the single-team path) and it is computed here; the all-teams driver
+ * computes it once and passes it down so the cross-team fold runs only once.
+ * Note `null` is a real value (no team had PRs) and is honoured — only
+ * `undefined` triggers the on-demand compute.
  */
 export function computeQuarterlyAggregate(
     db: Database.Database,
     team: string,
     quarter: string,
     now: Date = new Date(),
+    orgAvgCostPerPr?: number | null,
 ): QuarterlyAggregateRow {
     const {start, end} = quarterRange(quarter);
     const metrics = computeTeamPeriodMetrics(db, team, start, end);
     const waste = computePeriodWaste(db, team, start, end);
 
-    const aiMaturityScore: number | null = null; // Task 3.4
+    const orgAvg = orgAvgCostPerPr === undefined ? computeOrgAvgCostPerPr(db, start, end) : orgAvgCostPerPr;
+    // Maturity must be computed before the deltas, which compare this quarter's
+    // score against the prior quarter's stored one.
+    const maturity = computeTeamMaturity(db, {
+        table: 'quarterly_aggregates',
+        periodColumn: 'quarter',
+        team,
+        previousPeriod: priorQuarter(quarter),
+        start,
+        end,
+        metrics,
+        orgAvgCostPerPr: orgAvg,
+    });
+
     // Final step: deltas vs the prior quarter's stored aggregate (null on first
-    // quarter). maturity_score_delta stays null until Task 3.4 emits the score.
+    // quarter, or whenever either side's score is null).
     const deltas = teamDeltas(db, 'quarterly_aggregates', 'quarter', team, priorQuarter(quarter), {
         utilization_rate: metrics.utilization_rate,
-        ai_maturity_score: aiMaturityScore,
+        ai_maturity_score: maturity.ai_maturity_score,
     });
 
     const row: QuarterlyAggregateRow = {
@@ -116,8 +138,8 @@ export function computeQuarterlyAggregate(
         avg_code_churn: metrics.avg_code_churn,
         total_prs_merged: metrics.total_prs_merged,
         cost_per_pr: metrics.cost_per_pr,
-        ai_maturity_score: aiMaturityScore,
-        ai_maturity_basis: 'git_estimate',
+        ai_maturity_score: maturity.ai_maturity_score,
+        ai_maturity_basis: maturity.ai_maturity_basis,
         utilization_rate_delta: deltas.utilization_rate_delta,
         maturity_score_delta: deltas.maturity_score_delta,
         computed_at: now.toISOString(),
@@ -128,12 +150,15 @@ export function computeQuarterlyAggregate(
 
 /**
  * Compute and persist the quarterly aggregate for every team for `quarter`.
- * Returns all rows written, in team-name order.
+ * Returns all rows written, in team-name order. The org-average cost-per-PR
+ * benchmark is computed once for the quarter and shared across teams.
  */
 export function computeAllQuarterlyAggregates(
     db: Database.Database,
     quarter: string,
     now: Date = new Date(),
 ): QuarterlyAggregateRow[] {
-    return listTeams(db).map((team) => computeQuarterlyAggregate(db, team, quarter, now));
+    const {start, end} = quarterRange(quarter);
+    const orgAvg = computeOrgAvgCostPerPr(db, start, end);
+    return listTeams(db).map((team) => computeQuarterlyAggregate(db, team, quarter, now, orgAvg));
 }
