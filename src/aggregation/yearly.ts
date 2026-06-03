@@ -140,6 +140,12 @@ export function computeYearlyAggregate(
  * Compute and persist the yearly aggregate for every team for `year`. Returns all
  * rows written, in team-name order. The org-average cost-per-PR benchmark is
  * computed once for the year and shared across teams.
+ *
+ * Cost note: as in the quarterly driver, computeOrgAvgCostPerPr folds every team
+ * once for the benchmark and each computeYearlyAggregate folds its team again for
+ * the row — each team folded twice per period. The same launch-scale-acceptable
+ * trade-off team-period.ts documents; a single-fold path is the future
+ * optimisation for large-org backfills.
  */
 export function computeAllYearlyAggregates(
     db: Database.Database,

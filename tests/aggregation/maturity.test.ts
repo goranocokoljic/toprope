@@ -260,6 +260,33 @@ describe('computeTeamMaturity — DB glue', () => {
         expect(result.ai_maturity_basis).toBe('git_estimate');
     });
 
+    it('treats a prior row with a NULL total_prs_merged as a neutral trend (no fabricated comparison)', () => {
+        // total_prs_merged is nullable in the schema; a prior row carrying NULL must
+        // fall back to a neutral output_health, not throw or propagate NaN.
+        addDeveloper(db, 'dev-1', 'backend');
+        db.prepare(
+            `INSERT INTO quarterly_aggregates (id, team, quarter, total_prs_merged, ai_maturity_basis, computed_at)
+             VALUES ('quarterly:backend:2026-Q1', 'backend', '2026-Q1', NULL, 'git_estimate', ?)`,
+        ).run(NOW.toISOString());
+        addGitSnapshot(db, 'dev-1', '2026-05-10', {commits: 5, prs_merged: 15});
+
+        const {start, end} = quarterRange(QUARTER);
+        const metrics = computeTeamPeriodMetrics(db, 'backend', start, end);
+        const result = computeTeamMaturity(db, {
+            table: 'quarterly_aggregates',
+            periodColumn: 'quarter',
+            team: 'backend',
+            previousPeriod: '2026-Q1',
+            start,
+            end,
+            metrics,
+            orgAvgCostPerPr: null,
+        });
+
+        expect(result.components.output_health).toBe(0.5);
+        expect(result.ai_maturity_score).not.toBeNull();
+    });
+
     it('uses a neutral PR trend when there is no prior stored period', () => {
         addDeveloper(db, 'dev-1', 'backend');
         addGitSnapshot(db, 'dev-1', '2026-05-10', {commits: 5, prs_merged: 15});

@@ -59,7 +59,15 @@ export const COMPONENT_WEIGHTS = {
     cost_efficiency: 0.1,
 } as const;
 
-/** Neutral 0.5 — used when a component has no data to push the score either way. */
+/**
+ * Neutral 0.5 — used when a component has no git signal to push the score either
+ * way. This is a deliberate, score-wide refinement of the issue's literal
+ * formulas: output_health, churn_quality, and cost_efficiency each fall back to
+ * NEUTRAL when their input is absent (no prior period, no churn data, no
+ * benchmark) rather than to the formula's zero-input value. e.g. literal
+ * `clamp(1 - avg_code_churn)` would read a churn-less git-only period as a
+ * flawless 1.0; NEUTRAL avoids rewarding (or penalising) data we don't have.
+ */
 const NEUTRAL = 0.5;
 
 /** Each component's normalized [0,1] value, retained for transparency/tests. */
@@ -239,11 +247,15 @@ export function computeTeamMaturity(
 
     const prior = db
         .prepare(`SELECT total_prs_merged FROM ${table} WHERE team = ? AND ${periodColumn} = ?`)
-        .get(team, previousPeriod) as {total_prs_merged: number} | undefined;
-    // No prior row (first period or an un-rolled gap) → null trend → neutral output_health.
-    const prsMergedDeltaPct = prior
-        ? countPctChange(metrics.total_prs_merged, prior.total_prs_merged, 1)
-        : null;
+        // total_prs_merged is INTEGER DEFAULT 0 but nullable in the schema, so the
+        // column type is honestly number|null — the engine's own upsert never writes
+        // null, but typing it so means the null trend below is handled, not asserted away.
+        .get(team, previousPeriod) as {total_prs_merged: number | null} | undefined;
+    // No prior row (first period / un-rolled gap) or a null prior PR count → null
+    // trend → neutral output_health, never a fabricated comparison.
+    const priorPrsMerged = prior?.total_prs_merged ?? null;
+    const prsMergedDeltaPct =
+        priorPrsMerged === null ? null : countPctChange(metrics.total_prs_merged, priorPrsMerged, 1);
 
     return computeMaturityScore({
         developer_count: metrics.developer_count,

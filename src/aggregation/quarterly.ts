@@ -152,6 +152,15 @@ export function computeQuarterlyAggregate(
  * Compute and persist the quarterly aggregate for every team for `quarter`.
  * Returns all rows written, in team-name order. The org-average cost-per-PR
  * benchmark is computed once for the quarter and shared across teams.
+ *
+ * Cost note: computeOrgAvgCostPerPr folds every team once to build the
+ * benchmark, then each computeQuarterlyAggregate folds its team again for the
+ * row — so each team is folded twice per period. This is the same
+ * consistency-over-throughput trade-off team-period.ts already documents:
+ * trivial at launch scale, and acceptable rather than threading precomputed
+ * metrics through both the benchmark and the row path. A future large-org
+ * backfill that wants the single-fold path would fold each team once, derive the
+ * benchmark from those metrics, and reuse them to build the rows.
  */
 export function computeAllQuarterlyAggregates(
     db: Database.Database,
