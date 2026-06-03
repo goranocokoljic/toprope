@@ -16,9 +16,10 @@
  */
 
 import type Database from 'better-sqlite3';
-import {quarterRange} from './dates';
+import {quarterRange, priorQuarter} from './dates';
 import {computeTeamPeriodMetrics, listTeams, type MaturityBasis} from './team-period';
 import {computePeriodWaste} from './waste-period';
+import {teamDeltas} from './deltas';
 
 export interface QuarterlyAggregateRow {
     id: string;
@@ -92,6 +93,14 @@ export function computeQuarterlyAggregate(
     const metrics = computeTeamPeriodMetrics(db, team, start, end);
     const waste = computePeriodWaste(db, team, start, end);
 
+    const aiMaturityScore: number | null = null; // Task 3.4
+    // Final step: deltas vs the prior quarter's stored aggregate (null on first
+    // quarter). maturity_score_delta stays null until Task 3.4 emits the score.
+    const deltas = teamDeltas(db, 'quarterly_aggregates', 'quarter', team, priorQuarter(quarter), {
+        utilization_rate: metrics.utilization_rate,
+        ai_maturity_score: aiMaturityScore,
+    });
+
     const row: QuarterlyAggregateRow = {
         id: `quarterly:${team}:${quarter}`,
         team,
@@ -107,10 +116,10 @@ export function computeQuarterlyAggregate(
         avg_code_churn: metrics.avg_code_churn,
         total_prs_merged: metrics.total_prs_merged,
         cost_per_pr: metrics.cost_per_pr,
-        ai_maturity_score: null, // Task 3.4
+        ai_maturity_score: aiMaturityScore,
         ai_maturity_basis: 'git_estimate',
-        utilization_rate_delta: null, // Task 3.3
-        maturity_score_delta: null, // Task 3.3
+        utilization_rate_delta: deltas.utilization_rate_delta,
+        maturity_score_delta: deltas.maturity_score_delta,
         computed_at: now.toISOString(),
     };
     upsertRow(db, row);
