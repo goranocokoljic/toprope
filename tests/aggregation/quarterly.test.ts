@@ -60,7 +60,10 @@ describe('computeQuarterlyAggregate', () => {
         // Team churn = mean of per-developer period means: dev-1 mean(0.2,0.4)=0.3, dev-2 0.6.
         expect(row.avg_code_churn).toBe(0.45);
         expect(row.ai_maturity_basis).toBe('git_estimate');
-        expect(row.ai_maturity_score).toBeNull();
+        // Maturity is now computed (Task 3.4) — an in-range git estimate, not null.
+        expect(row.ai_maturity_score).toBeTypeOf('number');
+        expect(row.ai_maturity_score!).toBeGreaterThanOrEqual(0);
+        expect(row.ai_maturity_score!).toBeLessThanOrEqual(100);
         expect(row.utilization_rate_delta).toBeNull();
         expect(row.maturity_score_delta).toBeNull();
         expect(row.computed_at).toBe(NOW.toISOString());

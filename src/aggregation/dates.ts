@@ -156,3 +156,16 @@ export function daysInMonth(date: string): number {
     const [year, mon] = date.split('-').map(Number);
     return new Date(Date.UTC(year, mon, 0)).getUTCDate();
 }
+
+/**
+ * Number of days in the inclusive [start, end] window — the "possible active
+ * days" of a period. Both bounds count, so a single-day window is 1 and a full
+ * calendar quarter is ~90. Used by the maturity score's adoption_consistency
+ * component (active_days / possible_days). Guards the range like the snapshot
+ * queries so a reversed or malformed window fails loudly.
+ */
+export function inclusiveDayCount(start: string, end: string): number {
+    assertDateRange(start, end);
+    const ms = Date.parse(`${end}T00:00:00.000Z`) - Date.parse(`${start}T00:00:00.000Z`);
+    return Math.round(ms / 86_400_000) + 1;
+}
