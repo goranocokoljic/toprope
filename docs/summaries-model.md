@@ -103,13 +103,19 @@ git-only period (`ai_maturity_basis = git_estimate`):
   individual mentions only;
 - states deltas only when present (first periods say *"no prior comparison"*).
 
-Once a period is `mixed` or `measured` (tool connectors online), the preamble
-relaxes the ban because those fields then exist.
+Only a fully `measured` period (all metrics backed by direct tool data) relaxes the
+ban. A `mixed` period — *partial* direct usage — keeps the ban, because the
+numbers-only payload carries no per-tool usage figure to substantiate those terms
+for any given number; lumping `mixed` in with `measured` would silently switch the
+guard off while fabrication is still possible.
 
 The prompt is a *soft* instruction. The *hard* enforcement is the output guard,
 `assertNoFabricatedUsageLanguage(text, payload)` / `findFabricatedUsageLanguage`,
-which scans generated text for the forbidden vocabulary and rejects a git-only
-summary that contains any of it. The summary generator (Task 3.9) runs this guard
+which scans generated text for the forbidden vocabulary and rejects a non-measured
+summary that contains any of it. It is a fixed-phrase **tripwire, not a guarantee**:
+it fails open against paraphrases the catalog doesn't list (the prompt is the real
+control), so the generator (Task 3.9) must treat a clean result as "no *known*
+forbidden phrase," not "verified compliant." The summary generator runs this guard
 on model output before persisting.
 
 ### Manual spot-check against the real local model
@@ -117,18 +123,21 @@ on model output before persisting.
 The automated tests drive the prompt → model → guard path with a *mocked* model so
 assertions are deterministic. Because a mock can't reveal whether a *real* model
 honours the tier constraints, do a manual spot-check after changing the prompts or
-the default model:
+the default model. Until the `summary generate`/`show` CLI lands in Task 3.9, render
+a prompt and POST it to the local model directly:
 
 ```bash
 ollama serve                 # ensure the local endpoint is up
-# Generate a weekly summary for a git-only scope against the real local model:
-npx govproxy summary generate --level weekly --period 2026-W21 --scope team:backend
-npx govproxy summary show    --level weekly --period 2026-W21 --scope team:backend
+# Render a prompt with buildSummaryPrompt(payload) for a git-only scope, then:
+curl http://localhost:11434/api/generate \
+  -d '{"model":"llama3.1:8b","prompt":"<rendered prompt>","stream":false}'
 ```
 
-> The `summary generate`/`show` CLI lands in Task 3.9. Until then, render a prompt
-> with `buildSummaryPrompt(payload)` and POST it to Ollama directly
-> (`curl http://localhost:11434/api/generate -d '{"model":"llama3.1:8b","prompt":"…","stream":false}'`).
+> Once Task 3.9 ships, the same spot-check is one command:
+> ```bash
+> npx govproxy summary generate --level weekly --period 2026-W21 --scope team:backend
+> npx govproxy summary show     --level weekly --period 2026-W21 --scope team:backend
+> ```
 
 Read the output and confirm by eye that it:
 

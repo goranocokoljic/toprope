@@ -4,6 +4,7 @@ import {
     findFabricatedUsageLanguage,
     assertNoFabricatedUsageLanguage,
     isGitOnly,
+    directUsageSubstantiated,
     FABRICATED_USAGE_TERMS,
     LEVEL_BRIEFS,
     type PromptOptions,
@@ -55,10 +56,15 @@ const ALL_LEVELS: SummaryLevel[] = ['weekly', 'monthly', 'quarterly', 'yearly'];
 
 /**
  * A mocked Ollama model whose response text we control, so adversarial assertions
- * are stable (no real model). Returns the canned `response` for any prompt.
+ * are stable (no real model). Returns the canned `response` for any prompt and
+ * captures the prompt actually sent, so a test can prove the generation came from
+ * the real `buildSummaryPrompt` output rather than a bare string literal.
  */
-function mockModel(response: string): SummaryModelClient {
-    const fetchImpl = vi.fn(async () => {
+function mockModel(response: string): {client: SummaryModelClient; sentPrompt: () => string} {
+    let captured = '';
+    const fetchImpl = vi.fn(async (_url: string, init?: {body?: string}) => {
+        const body = init?.body ? (JSON.parse(init.body) as {prompt?: string}) : {};
+        captured = body.prompt ?? '';
         return {
             ok: true,
             status: 200,
@@ -71,7 +77,10 @@ function mockModel(response: string): SummaryModelClient {
         endpoint: 'http://localhost:11434',
         model_name: 'llama3.1:8b',
     };
-    return new SummaryModelClient(config, {fetchImpl, logger: {warn: () => undefined}});
+    return {
+        client: new SummaryModelClient(config, {fetchImpl, logger: {warn: () => undefined}}),
+        sentPrompt: () => captured,
+    };
 }
 
 describe('LEVEL_BRIEFS', () => {
@@ -174,19 +183,33 @@ describe('buildSummaryPrompt — deltas vs first period', () => {
     });
 });
 
-describe('buildSummaryPrompt — measured/mixed tiers relax the ban', () => {
+describe('buildSummaryPrompt — only the measured tier relaxes the ban', () => {
     it('permits direct-usage description when the period is measured', () => {
         const prompt = buildSummaryPrompt(payloadFor('monthly', {basis: 'measured'}));
         expect(prompt).not.toMatch(/Direct tool-usage data is NOT connected/i);
+        expect(prompt).not.toMatch(/MUST NOT use/);
         expect(prompt).toMatch(/you may describe them as measured/i);
+    });
+
+    it('still bans direct-usage language for the mixed tier (partial usage, no per-tool fields)', () => {
+        const prompt = buildSummaryPrompt(payloadFor('monthly', {basis: 'mixed'}));
+        expect(prompt).toMatch(/only PARTIALLY connected/i);
+        expect(prompt).toMatch(/MUST NOT use/);
+        expect(prompt).not.toMatch(/you may describe them as measured/i);
     });
 });
 
-describe('isGitOnly', () => {
-    it('is true for the git_estimate launch basis and false otherwise', () => {
+describe('isGitOnly / directUsageSubstantiated', () => {
+    it('isGitOnly is true only for the git_estimate launch basis', () => {
         expect(isGitOnly(payloadFor('weekly', {basis: 'git_estimate'}))).toBe(true);
         expect(isGitOnly(payloadFor('weekly', {basis: 'mixed'}))).toBe(false);
         expect(isGitOnly(payloadFor('weekly', {basis: 'measured'}))).toBe(false);
+    });
+
+    it('directUsageSubstantiated is true only for the fully-measured basis', () => {
+        expect(directUsageSubstantiated(payloadFor('weekly', {basis: 'git_estimate'}))).toBe(false);
+        expect(directUsageSubstantiated(payloadFor('weekly', {basis: 'mixed'}))).toBe(false);
+        expect(directUsageSubstantiated(payloadFor('weekly', {basis: 'measured'}))).toBe(true);
     });
 });
 
@@ -217,7 +240,26 @@ describe('findFabricatedUsageLanguage — output guard', () => {
         expect(findFabricatedUsageLanguage(benign, gitOnly)).toEqual([]);
     });
 
-    it('permits the same terms when the period is measured (fields exist)', () => {
+    it('matches multi-word phrases across line wraps and irregular whitespace', () => {
+        // A multi-page narrative wraps mid-phrase; a literal-single-space matcher
+        // would miss these. The guard must still catch them.
+        const wrapped = 'Copilot performance was strong: the acceptance\nrate climbed all quarter.';
+        expect(findFabricatedUsageLanguage(wrapped, gitOnly)).toContain('acceptance rate');
+        const doubleSpaced = 'There were many  suggestions  accepted this month.';
+        expect(findFabricatedUsageLanguage(doubleSpaced, gitOnly)).toContain('suggestions accepted');
+        const nbspText = `The acceptance${String.fromCharCode(0x00a0)}rate was high.`;
+        expect(findFabricatedUsageLanguage(nbspText, gitOnly)).toContain('acceptance rate');
+    });
+
+    it('still guards the mixed tier — partial usage does not substantiate the terms', () => {
+        const mixed = payloadFor('weekly', {basis: 'mixed'});
+        const bad = 'The acceptance rate was 34% across many interactions.';
+        const found = findFabricatedUsageLanguage(bad, mixed);
+        expect(found).toContain('acceptance rate');
+        expect(found).toContain('interactions');
+    });
+
+    it('permits the same terms only when the period is fully measured (fields exist)', () => {
         const measured = payloadFor('weekly', {basis: 'measured'});
         const bad = 'The acceptance rate was 34% across many interactions.';
         expect(findFabricatedUsageLanguage(bad, measured)).toEqual([]);
@@ -261,9 +303,13 @@ describe('adversarial: full prompt → mocked model → guard', () => {
             'PRs merged. Code churn eased to 11% and the estimated AI-assistance signal edged up. One developer was ' +
             'inactive — worth a check-in. These figures are based on git activity and expense data, since direct tool ' +
             "usage isn't yet connected.";
-        const model = mockModel(compliant);
+        const {client, sentPrompt} = mockModel(compliant);
 
-        const result = await model.generate(buildSummaryPrompt(payload));
+        const result = await client.generate(buildSummaryPrompt(payload));
+        // The generation must have come from the real prompt builder — confirm the
+        // tier ban clause actually reached the model, not just a hand-written string.
+        expect(sentPrompt()).toMatch(/MUST NOT use/);
+        expect(sentPrompt()).toContain('git analysis + expense data; no direct tool usage');
         expect(result.ok).toBe(true);
         if (result.ok) {
             expect(findFabricatedUsageLanguage(result.text, payload)).toEqual([]);
@@ -276,9 +322,9 @@ describe('adversarial: full prompt → mocked model → guard', () => {
         const offending =
             'Copilot performed well: the acceptance rate hit 41% across thousands of interactions, with many ' +
             'suggestions accepted.';
-        const model = mockModel(offending);
+        const {client} = mockModel(offending);
 
-        const result = await model.generate(buildSummaryPrompt(payload));
+        const result = await client.generate(buildSummaryPrompt(payload));
         expect(result.ok).toBe(true);
         if (result.ok) {
             expect(() => assertNoFabricatedUsageLanguage(result.text, payload)).toThrowError(

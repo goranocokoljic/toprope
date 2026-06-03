@@ -75,15 +75,30 @@ export const FABRICATED_USAGE_TERMS: readonly string[] = [
 ];
 
 /**
- * The numbers-only payload carries no per-tool direct-usage fields yet; the
- * maturity basis is the signal for whether any direct tool usage backs the
- * period. `git_estimate` is the launch state — purely git + expense derived, no
- * direct usage — so the forbidden vocabulary is disallowed. Once a period is
- * `mixed` or `measured`, direct tool-usage data exists and the terms are
- * permissible (they describe fields that are then present and non-null).
+ * `git_estimate` is the launch state — purely git + expense derived, no direct
+ * usage at all — so the preamble gets the strongest "direct tool usage is NOT
+ * connected" wording. (`mixed`/`measured` get softer wording; see
+ * `directUsageSubstantiated`.)
  */
 export function isGitOnly(payload: SummaryInputPayload): boolean {
     return payload.metrics.ai_maturity_basis === 'git_estimate';
+}
+
+/**
+ * Whether direct-tool-usage vocabulary is substantiated by the payload — the
+ * gate for both the preamble's relaxed wording and the output guard. Keyed on the
+ * maturity basis: only `measured` (fully backed by direct tool data) substantiates
+ * those terms. `git_estimate` clearly does not, and crucially neither does `mixed`
+ * — "partial direct tool usage" means some figures are still git-inferred, and the
+ * numbers-only payload carries NO per-tool direct-usage fields to tell which is
+ * which, so a "mixed" period cannot honestly use "acceptance rate" about any given
+ * number. Lumping `mixed` in with `measured` would silently switch the guard off
+ * while fabrication is still possible; this keeps the guard on for everything but
+ * a fully-measured period. (When per-tool fields are added to the payload, this
+ * can become per-field nullness-aware.)
+ */
+export function directUsageSubstantiated(payload: SummaryInputPayload): boolean {
+    return payload.metrics.ai_maturity_basis === 'measured';
 }
 
 /** Per-level briefing: audience, target length/depth, and the level's emphasis. */
@@ -147,23 +162,31 @@ export const LEVEL_BRIEFS: Readonly<Record<SummaryInputPayload['period']['level'
  * told it may reference those metrics because the fields then exist.
  */
 function buildPreamble(payload: SummaryInputPayload): string {
-    const gitOnly = isGitOnly(payload);
-
-    const usageClause = gitOnly
-        ? [
-              `Direct tool-usage data is NOT connected for this period. The numbers are derived from ${payload.data_basis}.`,
-              'You MUST NOT use the words or concepts "acceptance rate," "interactions," "suggestions accepted," or any',
-              'other direct-tool-usage metric. Those describe measured interactions with an AI tool, which this data',
-              'does not contain. Refer instead to git-derived signals as exactly what they are: "commit activity,"',
-              '"merged PRs," "code churn," and the "estimated AI-assistance signal." Do not imply that any figure was',
-              'measured directly from an AI tool.',
-          ].join('\n')
-        : [
-              `The numbers are derived from ${payload.data_basis}.`,
-              'Where direct tool-usage metrics are present in the input, you may describe them as measured; where a',
-              'figure is git-derived, describe it as such ("commit activity," "merged PRs," "code churn," "estimated',
-              'AI-assistance signal"). Never imply a measurement the input does not contain.',
-          ].join('\n');
+    // The first sentence is tier-specific; the ban that follows is identical for
+    // every tier that doesn't fully substantiate direct usage (git_estimate AND
+    // mixed), because the payload carries no per-tool direct-usage fields either way.
+    let usageClause: string;
+    if (directUsageSubstantiated(payload)) {
+        usageClause = [
+            `The numbers are derived from ${payload.data_basis}.`,
+            'Where direct tool-usage metrics are present in the input, you may describe them as measured; where a',
+            'figure is git-derived, describe it as such ("commit activity," "merged PRs," "code churn," "estimated',
+            'AI-assistance signal"). Never imply a measurement the input does not contain.',
+        ].join('\n');
+    } else {
+        const lead = isGitOnly(payload)
+            ? `Direct tool-usage data is NOT connected for this period. The numbers are derived from ${payload.data_basis}.`
+            : `Direct tool-usage data is only PARTIALLY connected for this period, and this payload carries only ` +
+              `aggregate git-derived numbers (${payload.data_basis}) — no per-tool usage figure you could cite.`;
+        usageClause = [
+            lead,
+            'You MUST NOT use the words or concepts "acceptance rate," "interactions," "suggestions accepted," or any',
+            'other direct-tool-usage metric. Those describe measured interactions with an AI tool, which this data',
+            'does not contain. Refer instead to git-derived signals as exactly what they are: "commit activity,"',
+            '"merged PRs," "code churn," and the "estimated AI-assistance signal." Do not imply that any figure was',
+            'measured directly from an AI tool.',
+        ].join('\n');
+    }
 
     return [
         'You are GovProxy, an AI-adoption analyst. You write a clear, factual narrative from the aggregate metrics',
@@ -238,10 +261,15 @@ export function buildSummaryPrompt(payload: SummaryInputPayload, options?: Promp
 /**
  * Build a whole-word/phrase, case-insensitive matcher for one forbidden term.
  * Word boundaries (`\b`) keep "interactions" from matching inside an unrelated
- * longer word and keep matching insensitive to surrounding punctuation.
+ * longer word and keep matching insensitive to surrounding punctuation. The space
+ * between words of a multi-word phrase is compiled as `\s+`, not a literal single
+ * space, so a phrase the model line-wraps, double-spaces, or joins with a
+ * non-breaking space ("the acceptance\nrate climbed") still matches — multi-page
+ * narratives wrap mid-phrase routinely, and a literal-space match would let those
+ * slip through.
  */
 function termPattern(term: string): RegExp {
-    const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ +/g, '\\s+');
     return new RegExp(`\\b${escaped}\\b`, 'i');
 }
 
@@ -252,14 +280,20 @@ const TERM_PATTERNS: ReadonlyArray<{term: string; pattern: RegExp}> = FABRICATED
 
 /**
  * Scan generated narrative for fabricated direct-usage language. Returns the list
- * of forbidden terms found (empty = clean). For a git-only payload (the launch
- * state) every term in `FABRICATED_USAGE_TERMS` is forbidden; for a measured/mixed
- * payload the terms are permissible (the fields then exist), so this returns empty
- * without scanning. This is the deterministic check behind the adversarial test
- * and the guard the generator runs on real model output.
+ * of forbidden terms found (empty = clean). Every term in `FABRICATED_USAGE_TERMS`
+ * is forbidden unless the period fully substantiates direct usage
+ * (`directUsageSubstantiated`, i.e. the `measured` tier) — so git_estimate AND
+ * mixed periods are scanned, and only a fully-measured period is exempt.
+ *
+ * This is a BACKSTOP, not a guarantee. It is a fixed-phrase blocklist (fail-open):
+ * a model that paraphrases ("accepted 34% of suggestions," "adoption rate") emits
+ * fabrication this scan never sees. The real control is the prompt; this is a
+ * deterministic tripwire that catches the catalogued phrasings and anchors the
+ * adversarial test. A clean result means "no known forbidden phrase," NOT "verified
+ * compliant" — callers (the generator, Task 3.9) must treat it that way.
  */
 export function findFabricatedUsageLanguage(text: string, payload: SummaryInputPayload): string[] {
-    if (!isGitOnly(payload)) return [];
+    if (directUsageSubstantiated(payload)) return [];
     const found: string[] = [];
     for (const {term, pattern} of TERM_PATTERNS) {
         if (pattern.test(text)) found.push(term);
@@ -269,15 +303,17 @@ export function findFabricatedUsageLanguage(text: string, payload: SummaryInputP
 
 /**
  * Throwing form of {@link findFabricatedUsageLanguage}. Used as a hard gate on
- * model output before a git-only summary is stored — a violation means the model
- * ignored the prompt's tier constraint and the text must not be persisted as-is.
+ * model output before a summary for a non-measured period is stored — a violation
+ * means the model ignored the prompt's tier constraint and the text must not be
+ * persisted as-is. (Like the underlying scan, this is a tripwire for known phrasings,
+ * not proof of compliance.)
  */
 export function assertNoFabricatedUsageLanguage(text: string, payload: SummaryInputPayload): void {
     const found = findFabricatedUsageLanguage(text, payload);
     if (found.length > 0) {
         throw new Error(
             `Generated ${payload.period.level} summary for ${payload.scope.name} contains fabricated direct-usage ` +
-                `language not supported by the git-only data: ${found.map((t) => `"${t}"`).join(', ')}`,
+                `language not supported by the ${payload.data_basis} data: ${found.map((t) => `"${t}"`).join(', ')}`,
         );
     }
 }
