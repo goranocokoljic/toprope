@@ -107,6 +107,45 @@ export function yearRange(year: string): DateRange {
     return {start: `${year}-01-01`, end: `${year}-12-31`};
 }
 
+/**
+ * The ISO week start (Monday) of the week immediately before the one beginning
+ * at `weekStart` — the "previous comparable period" for weekly deltas. `weekStart`
+ * must already be a canonical Monday (as stored in weekly_aggregates.week_start).
+ */
+export function priorWeekStart(weekStart: string): string {
+    assertValidDate(weekStart);
+    return addDays(weekStart, -7);
+}
+
+/** The calendar month before `month` (`YYYY-MM`), e.g. `2026-01` → `2025-12`. */
+export function priorMonth(month: string): string {
+    if (!MONTH_RE.test(month)) {
+        throw new Error(`Invalid month (expected YYYY-MM): ${month}`);
+    }
+    const [year, mon] = month.split('-').map(Number);
+    // Month 0 of the same year is December of the prior year, so subtracting one
+    // from the 1-based month and normalising via Date handles the year rollover.
+    const d = new Date(Date.UTC(year, mon - 2, 1));
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+/** The calendar quarter before `quarter` (`YYYY-Q[1-4]`), e.g. `2026-Q1` → `2025-Q4`. */
+export function priorQuarter(quarter: string): string {
+    if (!QUARTER_RE.test(quarter)) {
+        throw new Error(`Invalid quarter (expected YYYY-Q[1-4]): ${quarter}`);
+    }
+    const [year, q] = quarter.split('-Q').map(Number);
+    return q === 1 ? `${year - 1}-Q4` : `${year}-Q${q - 1}`;
+}
+
+/** The calendar year before `year` (`YYYY`), e.g. `2026` → `2025`. */
+export function priorYear(year: string): string {
+    if (!YEAR_RE.test(year)) {
+        throw new Error(`Invalid year (expected YYYY): ${year}`);
+    }
+    return String(Number(year) - 1);
+}
+
 /** Number of days in the calendar month containing `date` (YYYY-MM-DD). */
 export function daysInMonth(date: string): number {
     assertValidDate(date);

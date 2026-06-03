@@ -13,7 +13,8 @@
 
 import type Database from 'better-sqlite3';
 import {computePeriodMetrics, type PeriodMetrics, type DataQuality} from './compute';
-import {monthRange, isoWeekStart} from './dates';
+import {monthRange, isoWeekStart, priorMonth} from './dates';
+import {developerDeltas, type DeveloperDeltas} from './deltas';
 
 export interface MonthlyAggregateRow {
     id: string;
@@ -35,6 +36,13 @@ export interface MonthlyAggregateRow {
     cost_per_pr: number | null;
     is_active: 0 | 1;
     data_quality: DataQuality;
+    interaction_delta_pct: number | null;
+    acceptance_rate_delta: number | null;
+    commit_velocity_delta_pct: number | null;
+    prs_merged_delta_pct: number | null;
+    churn_rate_delta: number | null;
+    ai_signature_delta: number | null;
+    cost_per_pr_delta_pct: number | null;
     computed_at: string;
 }
 
@@ -56,6 +64,7 @@ function buildRow(
     developer: DeveloperRow,
     month: string,
     metrics: PeriodMetrics,
+    deltas: DeveloperDeltas,
     computedAt: string,
 ): MonthlyAggregateRow {
     return {
@@ -78,6 +87,7 @@ function buildRow(
         cost_per_pr: metrics.cost_per_pr,
         is_active: metrics.is_active,
         data_quality: metrics.data_quality,
+        ...deltas,
         computed_at: computedAt,
     };
 }
@@ -89,13 +99,17 @@ function upsertRow(db: Database.Database, row: MonthlyAggregateRow): void {
             total_interactions, avg_acceptance_rate, tools_used, estimated_total_cost,
             total_commits, total_lines_added, total_prs_merged, avg_code_churn,
             avg_ai_signature_score, subscription_cost, cost_per_pr, is_active,
-            data_quality, computed_at
+            data_quality, interaction_delta_pct, acceptance_rate_delta,
+            commit_velocity_delta_pct, prs_merged_delta_pct, churn_rate_delta,
+            ai_signature_delta, cost_per_pr_delta_pct, computed_at
         ) VALUES (
             @id, @developer_id, @month, @team, @active_days, @active_weeks,
             @total_interactions, @avg_acceptance_rate, @tools_used, @estimated_total_cost,
             @total_commits, @total_lines_added, @total_prs_merged, @avg_code_churn,
             @avg_ai_signature_score, @subscription_cost, @cost_per_pr, @is_active,
-            @data_quality, @computed_at
+            @data_quality, @interaction_delta_pct, @acceptance_rate_delta,
+            @commit_velocity_delta_pct, @prs_merged_delta_pct, @churn_rate_delta,
+            @ai_signature_delta, @cost_per_pr_delta_pct, @computed_at
         )
         ON CONFLICT(developer_id, month) DO UPDATE SET
             team = excluded.team,
@@ -114,6 +128,13 @@ function upsertRow(db: Database.Database, row: MonthlyAggregateRow): void {
             cost_per_pr = excluded.cost_per_pr,
             is_active = excluded.is_active,
             data_quality = excluded.data_quality,
+            interaction_delta_pct = excluded.interaction_delta_pct,
+            acceptance_rate_delta = excluded.acceptance_rate_delta,
+            commit_velocity_delta_pct = excluded.commit_velocity_delta_pct,
+            prs_merged_delta_pct = excluded.prs_merged_delta_pct,
+            churn_rate_delta = excluded.churn_rate_delta,
+            ai_signature_delta = excluded.ai_signature_delta,
+            cost_per_pr_delta_pct = excluded.cost_per_pr_delta_pct,
             computed_at = excluded.computed_at`,
     ).run(row);
 }
@@ -138,7 +159,16 @@ export function computeMonthlyAggregate(
 
     const {start, end} = monthRange(month);
     const metrics = computePeriodMetrics(db, developerId, start, end);
-    const row = buildRow(developer, month, metrics, now.toISOString());
+    // Final step: deltas vs the prior month's stored aggregate (null on first month).
+    const deltas = developerDeltas(
+        db,
+        'monthly_aggregates',
+        'month',
+        developerId,
+        priorMonth(month),
+        metrics,
+    );
+    const row = buildRow(developer, month, metrics, deltas, now.toISOString());
     upsertRow(db, row);
     return row;
 }
