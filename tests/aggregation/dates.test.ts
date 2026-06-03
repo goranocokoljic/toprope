@@ -12,6 +12,15 @@ import {
     priorMonth,
     priorQuarter,
     priorYear,
+    monthOf,
+    quarterOf,
+    yearOf,
+    nextMonth,
+    nextQuarter,
+    enumerateWeekStarts,
+    enumerateMonths,
+    enumerateQuarters,
+    enumerateYears,
 } from '../../src/aggregation/dates';
 
 describe('isoWeekStart', () => {
@@ -191,5 +200,120 @@ describe('priorYear', () => {
 
     it('throws on a malformed year', () => {
         expect(() => priorYear('26')).toThrow();
+    });
+});
+
+describe('period extractors', () => {
+    it('monthOf returns the YYYY-MM of a day', () => {
+        expect(monthOf('2026-06-03')).toBe('2026-06');
+    });
+
+    it('quarterOf maps months to calendar quarters', () => {
+        expect(quarterOf('2026-01-15')).toBe('2026-Q1');
+        expect(quarterOf('2026-03-31')).toBe('2026-Q1');
+        expect(quarterOf('2026-04-01')).toBe('2026-Q2');
+        expect(quarterOf('2026-09-30')).toBe('2026-Q3');
+        expect(quarterOf('2026-10-01')).toBe('2026-Q4');
+        expect(quarterOf('2026-12-31')).toBe('2026-Q4');
+    });
+
+    it('yearOf returns the YYYY of a day', () => {
+        expect(yearOf('2026-06-03')).toBe('2026');
+    });
+
+    it('extractors reject malformed input', () => {
+        expect(() => monthOf('2026/06/03')).toThrow();
+        expect(() => quarterOf('not-a-date')).toThrow();
+        expect(() => yearOf('2026-13-01')).toThrow();
+    });
+});
+
+describe('nextMonth / nextQuarter', () => {
+    it('nextMonth steps forward within a year', () => {
+        expect(nextMonth('2026-01')).toBe('2026-02');
+    });
+
+    it('nextMonth rolls over the year', () => {
+        expect(nextMonth('2026-12')).toBe('2027-01');
+    });
+
+    it('nextMonth throws on a malformed month', () => {
+        expect(() => nextMonth('2026-13')).toThrow();
+    });
+
+    it('nextQuarter steps forward within a year', () => {
+        expect(nextQuarter('2026-Q1')).toBe('2026-Q2');
+    });
+
+    it('nextQuarter rolls over the year', () => {
+        expect(nextQuarter('2026-Q4')).toBe('2027-Q1');
+    });
+
+    it('nextQuarter throws on a malformed quarter', () => {
+        expect(() => nextQuarter('2026-Q0')).toThrow();
+    });
+});
+
+describe('enumerateWeekStarts', () => {
+    it('returns the Monday of the week containing from, even if it precedes from', () => {
+        // 2026-06-03 is a Wednesday; its ISO week starts Monday 2026-06-01.
+        expect(enumerateWeekStarts('2026-06-03', '2026-06-03')).toEqual(['2026-06-01']);
+    });
+
+    it('walks consecutive Mondays through the range, chronologically', () => {
+        expect(enumerateWeekStarts('2026-06-01', '2026-06-21')).toEqual([
+            '2026-06-01',
+            '2026-06-08',
+            '2026-06-15',
+        ]);
+    });
+
+    it('includes the week whose Monday is on or before to but extends past it', () => {
+        // to = Tue 2026-06-16; the week starting Mon 2026-06-15 is included.
+        const weeks = enumerateWeekStarts('2026-06-01', '2026-06-16');
+        expect(weeks).toEqual(['2026-06-01', '2026-06-08', '2026-06-15']);
+    });
+
+    it('throws on a reversed range', () => {
+        expect(() => enumerateWeekStarts('2026-06-10', '2026-06-01')).toThrow();
+    });
+});
+
+describe('enumerateMonths', () => {
+    it('returns every month from from through to, chronologically across a year boundary', () => {
+        expect(enumerateMonths('2025-11-15', '2026-02-03')).toEqual([
+            '2025-11',
+            '2025-12',
+            '2026-01',
+            '2026-02',
+        ]);
+    });
+
+    it('returns a single month when from and to share it', () => {
+        expect(enumerateMonths('2026-06-01', '2026-06-30')).toEqual(['2026-06']);
+    });
+});
+
+describe('enumerateQuarters', () => {
+    it('returns every quarter from from through to across a year boundary', () => {
+        expect(enumerateQuarters('2025-11-15', '2026-05-01')).toEqual([
+            '2025-Q4',
+            '2026-Q1',
+            '2026-Q2',
+        ]);
+    });
+
+    it('returns a single quarter when from and to share it', () => {
+        expect(enumerateQuarters('2026-04-01', '2026-06-30')).toEqual(['2026-Q2']);
+    });
+});
+
+describe('enumerateYears', () => {
+    it('returns every year from from through to', () => {
+        expect(enumerateYears('2024-06-01', '2026-02-01')).toEqual(['2024', '2025', '2026']);
+    });
+
+    it('returns a single year when from and to share it', () => {
+        expect(enumerateYears('2026-01-01', '2026-12-31')).toEqual(['2026']);
     });
 });
