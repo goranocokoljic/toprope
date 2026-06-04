@@ -230,8 +230,11 @@ describe('ManagerOverview — adoption trend', () => {
         // Initial fetch is the default 30d preset.
         await waitFor(() => expect(trendCalls().some((u) => u.includes('range=30d'))).toBe(true));
 
-        // Switching the range issues a fresh, differently-keyed query.
-        fireEvent.click(screen.getByRole('button', {name: '90d'}));
+        // Switching the range issues a fresh, differently-keyed query. The page
+        // now has two time-range selectors (adoption + maturity trends); scope to
+        // the first, the adoption-trend one this test drives.
+        const adoptionSelector = screen.getAllByTestId('time-range-selector')[0];
+        fireEvent.click(within(adoptionSelector).getByRole('button', {name: '90d'}));
         await waitFor(() => expect(trendCalls().some((u) => u.includes('range=90d'))).toBe(true));
     });
 });

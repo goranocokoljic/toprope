@@ -338,7 +338,10 @@ describe('TeamDetail', () => {
                 .filter((u) => new URL(u, 'http://localhost').pathname === '/api/teams/frontend/trend');
 
         await waitFor(() => expect(trendCalls().some((u) => u.includes('range=30d'))).toBe(true));
-        fireEvent.click(screen.getByRole('button', {name: '90d'}));
+        // The page now carries two time-range selectors (adoption + maturity
+        // trends); scope to the first, the adoption-trend one this test drives.
+        const adoptionSelector = screen.getAllByTestId('time-range-selector')[0];
+        fireEvent.click(within(adoptionSelector).getByRole('button', {name: '90d'}));
         await waitFor(() => expect(trendCalls().some((u) => u.includes('range=90d'))).toBe(true));
     });
 

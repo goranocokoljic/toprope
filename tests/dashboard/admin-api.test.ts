@@ -301,6 +301,19 @@ describe('admin API', () => {
             expect(res.statusCode).toBe(409);
         });
 
+        it("rejects the reserved name 'org' (case-insensitively)", async () => {
+            for (const name of ['org', 'ORG', 'Org']) {
+                const res = await app.inject({
+                    method: 'POST',
+                    url: '/api/admin/teams',
+                    headers: authHeaders(adminToken),
+                    payload: {name},
+                });
+                expect(res.statusCode).toBe(400);
+                expect(res.json().message).toMatch(/reserved/i);
+            }
+        });
+
         it('rejects a non-string field with 400 instead of silently dropping it', async () => {
             const res = await app.inject({
                 method: 'PATCH',

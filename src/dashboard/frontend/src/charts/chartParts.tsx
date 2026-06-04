@@ -42,7 +42,10 @@ export function ChartTooltip({active, label, payload, valueFormatter, hideName}:
                         />
                         {!hideName && entry.name !== undefined ? <span>{entry.name}</span> : null}
                         <span className="ml-auto font-medium text-foreground">
-                            {entry.value === undefined ? '—' : format(entry.value)}
+                            {/* `== null` catches both undefined and a null gap value
+                                (e.g. a maturity quarter with no score) so the tooltip
+                                reads "—" rather than coercing null to a misleading 0. */}
+                            {entry.value == null ? '—' : format(entry.value)}
                         </span>
                     </li>
                 ))}

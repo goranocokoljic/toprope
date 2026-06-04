@@ -13,6 +13,7 @@ import type {
     Leaderboard,
     LeaderboardAvailability,
     LeaderboardMetric,
+    MaturityTrend,
     MeActivity,
     MeJourney,
     MeOverview,
@@ -21,6 +22,9 @@ import type {
     OverviewData,
     OverviewTrend,
     PaginatedResponse,
+    SummaryDetail,
+    SummaryLevel,
+    SummaryListItem,
     TeamDetail,
     TeamListItem,
     TeamProviders,
@@ -471,6 +475,51 @@ export const api = {
     /** Personal git activity totals + per-provider breakdown (My Activity, Task 2.9). */
     async getMeActivity(params: TimeRangeQuery): Promise<MeActivity> {
         const body = await request<ApiEnvelope<MeActivity>>(`/api/me/activity${timeRangeQueryString(params)}`);
+        return body.data;
+    },
+
+    // --- Phase 3: maturity trend + AI summaries (Task 3.12) ---
+    /**
+     * Maturity score over a time window for a scope — a real team name or the
+     * literal `org` for the developer-count-weighted org roll-up. Honestly
+     * labeled a git-based estimate by the UI via each point's `basis`.
+     */
+    async getMaturityTrend(scope: string, params: TimeRangeQuery): Promise<MaturityTrend> {
+        const body = await request<ApiEnvelope<MaturityTrend>>(
+            `/api/maturity/${encodeURIComponent(scope)}/trend${timeRangeQueryString(params)}`,
+        );
+        return body.data;
+    },
+
+    /**
+     * Summaries for a scope, most recent first. `scope` is the API token: 'org'
+     * or 'team:<name>'. The panel filters cadences client-side, so the optional
+     * server-side ?level= filter is intentionally not surfaced here.
+     */
+    async getSummaries(filter: {scope: string}): Promise<SummaryListItem[]> {
+        const search = new URLSearchParams({scope: filter.scope});
+        const body = await request<ApiEnvelope<SummaryListItem[]>>(`/api/summaries?${search.toString()}`);
+        return body.data;
+    },
+
+    /** One summary's full narrative text + metadata. */
+    async getSummary(id: string): Promise<SummaryDetail> {
+        const body = await request<ApiEnvelope<SummaryDetail>>(`/api/summaries/${encodeURIComponent(id)}`);
+        return body.data;
+    },
+
+    /** Regenerate an existing summary, optionally with a focus instruction. */
+    async regenerateSummary(id: string, focus?: string): Promise<SummaryDetail> {
+        const body = await postJson<ApiEnvelope<SummaryDetail>>(
+            `/api/summaries/${encodeURIComponent(id)}/regenerate`,
+            focus ? {focus} : {},
+        );
+        return body.data;
+    },
+
+    /** Generate a summary on demand (used for quarterly/yearly). */
+    async generateSummary(input: {level: SummaryLevel; period: string; scope: string}): Promise<SummaryDetail> {
+        const body = await postJson<ApiEnvelope<SummaryDetail>>('/api/summaries/generate', input);
         return body.data;
     },
 
