@@ -7,6 +7,8 @@ import {CoveragePanel} from '../components/CoveragePanel';
 import {CoverageBadge} from '../components/CoverageBadge';
 import {DataTable, type Column} from '../components/DataTable';
 import {TimeRangeSelector} from '../components/TimeRangeSelector';
+import {MaturityTrendCard} from '../components/MaturityTrendCard';
+import {SummariesPanel} from '../components/SummariesPanel';
 import {TrendChart, type ChartDatum} from '../charts/TrendChart';
 import {DistributionChart, type DistributionSlice} from '../charts/DistributionChart';
 import {SkeletonChart, SkeletonStatCard, SkeletonText} from '../components/Skeleton';
@@ -336,6 +338,12 @@ export function ManagerOverview(): JSX.Element {
                 <>
                     <MetricCards data={data} />
                     <AdoptionTrend />
+                    <MaturityTrendCard
+                        scope="org"
+                        title="AI maturity trend"
+                        subtitle="Org-wide AI maturity score over time."
+                    />
+                    <SummariesPanel scope="org" />
                     <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
                         <div className="lg:col-span-2">
                             <ToolDistributionCard />

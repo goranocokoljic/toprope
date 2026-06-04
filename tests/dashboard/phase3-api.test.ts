@@ -422,6 +422,112 @@ describe('Phase 3 API (Task 3.11)', () => {
         });
     });
 
+    // ── maturity trend: org scope (Task 3.12 / #81) ───────────────────────────
+    describe('GET /api/maturity/org/trend', () => {
+        /** Quarterly row with an explicit developer_count so weighting is testable. */
+        function seedQuarterlyWeighted(
+            team: string,
+            quarter: string,
+            score: number | null,
+            devs: number,
+        ): void {
+            db.prepare(
+                `INSERT INTO quarterly_aggregates (id, team, quarter, developer_count, ai_maturity_score, ai_maturity_basis, computed_at)
+                 VALUES (?, ?, ?, ?, ?, 'git_estimate', ?)`,
+            ).run(`quarterly:${team}:${quarter}`, team, quarter, devs, score, NOW);
+        }
+
+        it('folds teams into a developer-count-weighted org score per quarter', async () => {
+            // 2026-Q1: frontend 60 (4 devs) + backend 80 (1 dev) → (240+80)/5 = 64.
+            seedQuarterlyWeighted('frontend', '2026-Q1', 60, 4);
+            seedQuarterlyWeighted('backend', '2026-Q1', 80, 1);
+            // 2026-Q2: frontend 70 (4 devs) + backend 90 (1 dev) → (280+90)/5 = 74.
+            seedQuarterlyWeighted('frontend', '2026-Q2', 70, 4);
+            seedQuarterlyWeighted('backend', '2026-Q2', 90, 1);
+
+            const res = await app.inject({
+                method: 'GET',
+                url: '/api/maturity/org/trend?range=lifetime',
+                headers: authHeaders(adminToken),
+            });
+            expect(res.statusCode).toBe(200);
+            const points = res.json().data.points;
+            expect(points.map((p: {period: string}) => p.period)).toEqual(['2026-Q1', '2026-Q2']);
+            expect(points[0].score).toBe(64);
+            expect(points[0].basis).toBe('git_estimate');
+            expect(points[0].score_delta).toBe(null);
+            // Org delta is the difference of org scores: 74 - 64 = 10.
+            expect(points[1].score).toBe(74);
+            expect(points[1].score_delta).toBe(10);
+        });
+
+        it('carries a delta on the first windowed point against a prior quarter outside the window', async () => {
+            // Q1 (50) sits outside the window; Q2 (60) is the first point shown.
+            seedQuarterlyWeighted('frontend', '2026-Q1', 50, 2);
+            seedQuarterlyWeighted('frontend', '2026-Q2', 60, 2);
+            const res = await app.inject({
+                method: 'GET',
+                // A window covering only Q2 (Apr–Jun 2026).
+                url: '/api/maturity/org/trend?range=custom&from=2026-04-01&to=2026-06-30',
+                headers: authHeaders(adminToken),
+            });
+            expect(res.statusCode).toBe(200);
+            const points = res.json().data.points;
+            expect(points.map((p: {period: string}) => p.period)).toEqual(['2026-Q2']);
+            // Delta is computed across the full series before windowing, so the
+            // first shown point still reflects the true prior quarter: 60 - 50 = 10.
+            expect(points[0].score_delta).toBe(10);
+        });
+
+        it('ignores teams with a null score and skips a no-score quarter for the score', async () => {
+            seedQuarterlyWeighted('frontend', '2026-Q1', 50, 2);
+            seedQuarterlyWeighted('backend', '2026-Q1', null, 3); // null score → not weighted in
+            const res = await app.inject({
+                method: 'GET',
+                url: '/api/maturity/org/trend?range=lifetime',
+                headers: authHeaders(adminToken),
+            });
+            expect(res.statusCode).toBe(200);
+            const points = res.json().data.points;
+            // Only frontend contributes, so the org score is frontend's score.
+            expect(points[0].score).toBe(50);
+        });
+
+        it('reports a mixed basis once a contributing team upgrades past git_estimate', async () => {
+            seedQuarterlyWeighted('frontend', '2026-Q1', 60, 2);
+            db.prepare(
+                `INSERT INTO quarterly_aggregates (id, team, quarter, developer_count, ai_maturity_score, ai_maturity_basis, computed_at)
+                 VALUES ('quarterly:backend:2026-Q1', 'backend', '2026-Q1', 2, 80, 'mixed', ?)`,
+            ).run(NOW);
+            const res = await app.inject({
+                method: 'GET',
+                url: '/api/maturity/org/trend?range=lifetime',
+                headers: authHeaders(adminToken),
+            });
+            expect(res.statusCode).toBe(200);
+            expect(res.json().data.points[0].basis).toBe('mixed');
+        });
+
+        it('returns an empty series (not 404) when no quarters exist', async () => {
+            const res = await app.inject({
+                method: 'GET',
+                url: '/api/maturity/org/trend?range=lifetime',
+                headers: authHeaders(adminToken),
+            });
+            expect(res.statusCode).toBe(200);
+            expect(res.json().data.points).toEqual([]);
+        });
+
+        it('403s for the developer role', async () => {
+            const res = await app.inject({
+                method: 'GET',
+                url: '/api/maturity/org/trend?range=lifetime',
+                headers: authHeaders(devToken),
+            });
+            expect(res.statusCode).toBe(403);
+        });
+    });
+
     // ── summaries: list + detail ──────────────────────────────────────────────
     describe('GET /api/summaries', () => {
         beforeEach(() => {
