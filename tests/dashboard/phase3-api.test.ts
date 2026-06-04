@@ -461,6 +461,24 @@ describe('Phase 3 API (Task 3.11)', () => {
             expect(points[1].score_delta).toBe(10);
         });
 
+        it('carries a delta on the first windowed point against a prior quarter outside the window', async () => {
+            // Q1 (50) sits outside the window; Q2 (60) is the first point shown.
+            seedQuarterlyWeighted('frontend', '2026-Q1', 50, 2);
+            seedQuarterlyWeighted('frontend', '2026-Q2', 60, 2);
+            const res = await app.inject({
+                method: 'GET',
+                // A window covering only Q2 (Apr–Jun 2026).
+                url: '/api/maturity/org/trend?range=custom&from=2026-04-01&to=2026-06-30',
+                headers: authHeaders(adminToken),
+            });
+            expect(res.statusCode).toBe(200);
+            const points = res.json().data.points;
+            expect(points.map((p: {period: string}) => p.period)).toEqual(['2026-Q2']);
+            // Delta is computed across the full series before windowing, so the
+            // first shown point still reflects the true prior quarter: 60 - 50 = 10.
+            expect(points[0].score_delta).toBe(10);
+        });
+
         it('ignores teams with a null score and skips a no-score quarter for the score', async () => {
             seedQuarterlyWeighted('frontend', '2026-Q1', 50, 2);
             seedQuarterlyWeighted('backend', '2026-Q1', null, 3); // null score → not weighted in

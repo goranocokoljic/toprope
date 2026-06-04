@@ -23,6 +23,13 @@ import {
 
 const MAX_NAME_LENGTH = 100;
 
+// 'org' is a reserved scope token across the Phase 3 API: the summaries scope
+// grammar ('org' | 'team:<name>') and the maturity-trend route both read a bare
+// 'org' as the organization-wide roll-up, never a team. Reserving the name here
+// keeps a team from being created that those endpoints could never address as
+// itself (its maturity/summaries would be shadowed by the org fold).
+const RESERVED_TEAM_NAMES = new Set(['org']);
+
 function withDeveloperCount(db: Database.Database, team: Team): Record<string, unknown> {
     const row = db
         .prepare('SELECT COUNT(*) AS cnt FROM developers WHERE team = ?')
@@ -46,6 +53,9 @@ export function registerAdminTeamRoutes(app: FastifyInstance, db: Database.Datab
         if (!name) return badRequest(reply, 'Team name is required');
         if (name.length > MAX_NAME_LENGTH) {
             return badRequest(reply, `Team name must be at most ${MAX_NAME_LENGTH} characters`);
+        }
+        if (RESERVED_TEAM_NAMES.has(name.toLowerCase())) {
+            return badRequest(reply, `'${name}' is a reserved name and cannot be used for a team`);
         }
         if (teamExists(db, name)) {
             return conflict(reply, `Team '${name}' already exists`);

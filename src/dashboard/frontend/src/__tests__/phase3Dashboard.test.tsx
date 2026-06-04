@@ -218,5 +218,10 @@ describe('SummariesPanel (team, compact)', () => {
         expect(within(card).getByText('Monthly · 2026-05')).toBeInTheDocument();
         // Compact mode shows no on-demand generation form.
         expect(screen.queryByText('Generate a report on demand')).not.toBeInTheDocument();
+        // The team scope token must reach the API (not just rely on the mock).
+        const summaryCall = fetchMock.mock.calls
+            .map((c) => new URL(String(c[0]), 'http://localhost'))
+            .find((u) => u.pathname === '/api/summaries');
+        expect(summaryCall?.searchParams.get('scope')).toBe('team:backend');
     });
 });

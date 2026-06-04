@@ -87,11 +87,16 @@ export function MaturityTrendCard({scope, title, subtitle}: MaturityTrendCardPro
     );
 }
 
-/** Most recent recorded basis, or git_estimate when none is present. */
-function latestBasis(points: MaturityTrendPoint[]): MaturityBasis | null {
+/**
+ * Most recent recorded basis, falling back to git_estimate when no point carries
+ * one — the estimate framing is the floor, never measurement, so this always
+ * resolves to a concrete basis (never null).
+ */
+function latestBasis(points: MaturityTrendPoint[]): MaturityBasis {
     for (let i = points.length - 1; i >= 0; i -= 1) {
-        if (points[i].basis) {
-            return points[i].basis;
+        const basis = points[i].basis;
+        if (basis) {
+            return basis;
         }
     }
     return 'git_estimate';

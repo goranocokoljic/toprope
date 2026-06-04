@@ -30,14 +30,15 @@ export function useMaturityTrend(scope: string, range: TimeRangeValue): UseQuery
 }
 
 /**
- * Summaries for a scope, newest first, optionally narrowed to one level. `scope`
- * is the summaries API token ('org' | 'team:<name>'); `level` undefined lists
- * every cadence and caches under the 'all' key.
+ * Summaries for a scope, newest first. `scope` is the summaries API token
+ * ('org' | 'team:<name>'). The panel selects cadences (latest weekly/monthly,
+ * history) from this single list in-memory, so no server-side level filter is
+ * needed here.
  */
-export function useSummaries(scope: string, level?: SummaryLevel): UseQueryResult<SummaryListItem[], Error> {
+export function useSummaries(scope: string): UseQueryResult<SummaryListItem[], Error> {
     return useQuery({
-        queryKey: queryKeys.summaries(scope, level ?? 'all'),
-        queryFn: () => api.getSummaries(level ? {scope, level} : {scope}),
+        queryKey: queryKeys.summaries(scope),
+        queryFn: () => api.getSummaries({scope}),
     });
 }
 

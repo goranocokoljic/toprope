@@ -38,9 +38,9 @@ export const queryKeys = {
     // Phase 3 (Task 3.12): maturity trend + AI summaries.
     // Maturity trend is keyed by scope ('org' or a team) + resolved window.
     maturityTrend: (scope: string, window: string) => ['maturity', 'trend', scope, window] as const,
-    // Summary list is keyed by scope + level ('all' when unfiltered); the detail
-    // is keyed by id so an expanded narrative caches independently of the list.
-    summaries: (scope: string, level: string) => ['summaries', 'list', scope, level] as const,
+    // Summary list is keyed by scope; the detail is keyed by id so an expanded
+    // narrative caches independently of the list.
+    summaries: (scope: string) => ['summaries', 'list', scope] as const,
     summary: (id: string) => ['summaries', 'detail', id] as const,
     // Admin Management (Task 2.13).
     adminUsers: ['admin', 'users'] as const,

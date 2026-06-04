@@ -1,4 +1,4 @@
-import {useState} from 'react';
+import {useId, useState} from 'react';
 import {Badge} from './Badge';
 import {SkeletonText} from './Skeleton';
 import {ErrorState} from './ErrorState';
@@ -28,6 +28,11 @@ export function SummaryCard({item, defaultExpanded = false}: SummaryCardProps): 
     const [expanded, setExpanded] = useState(defaultExpanded);
     const [focus, setFocus] = useState('');
     const regenerate = useRegenerateSummary();
+    // The latest weekly/monthly are surfaced prominently AND repeated in the
+    // history list, so the same summary can mount twice. useId gives each card a
+    // collision-free id for the focus input/label rather than deriving it from
+    // item.id (which would duplicate across the two renders).
+    const inputId = useId();
 
     // Fetch the full narrative only once expanded. Reuse the regenerate result
     // when present so the freshly generated text shows without a second fetch.
@@ -98,12 +103,12 @@ export function SummaryCard({item, defaultExpanded = false}: SummaryCardProps): 
                     ) : null}
 
                     <div className="mt-4 border-t border-border pt-3">
-                        <label className="block text-xs font-medium text-muted" htmlFor={`focus-${item.id}`}>
+                        <label className="block text-xs font-medium text-muted" htmlFor={inputId}>
                             Regenerate with an optional focus
                         </label>
                         <div className="mt-1 flex flex-wrap items-center gap-2">
                             <input
-                                id={`focus-${item.id}`}
+                                id={inputId}
                                 type="text"
                                 value={focus}
                                 onChange={(e) => setFocus(e.target.value)}

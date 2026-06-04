@@ -111,6 +111,12 @@ function roundScore(value: number): number {
  * `git_estimate` until a contributing team reports a stronger basis (then
  * `mixed`). A quarter with no score carries a null basis and does not become the
  * baseline for the next quarter's delta.
+ *
+ * A quarter whose contributing teams all had scores but a total weight of 0
+ * (every developer_count 0/null) maps to a null score by design — without a
+ * weight there is no honest way to combine the team scores, so the org point is
+ * omitted rather than guessed. developer_count is reliably written today
+ * (quarterly.ts), so this is a defensive edge, not a live path.
  */
 function foldOrgQuarters(rows: OrgQuarterRow[]): QuarterRow[] {
     const result: QuarterRow[] = [];
@@ -118,6 +124,9 @@ function foldOrgQuarters(rows: OrgQuarterRow[]): QuarterRow[] {
     for (const row of rows) {
         const weight = row.weight ?? 0;
         const score = weight > 0 && row.weighted !== null ? roundScore(row.weighted / weight) : null;
+        // Re-round the delta: 0.1 isn't exact in IEEE-754, so subtracting two
+        // already-one-decimal scores (e.g. 64.3 - 64.1) can still surface binary
+        // noise like 0.19999999999999998 — round it back to a clean tenth.
         const delta = score !== null && prevScore !== null ? roundScore(score - prevScore) : null;
         result.push({
             quarter: row.quarter,

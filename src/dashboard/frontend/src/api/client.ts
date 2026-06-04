@@ -492,12 +492,12 @@ export const api = {
     },
 
     /**
-     * Summaries for a scope, most recent first, optionally filtered by level.
-     * `scope` is the API token: 'org' or 'team:<name>'.
+     * Summaries for a scope, most recent first. `scope` is the API token: 'org'
+     * or 'team:<name>'. The panel filters cadences client-side, so the optional
+     * server-side ?level= filter is intentionally not surfaced here.
      */
-    async getSummaries(filter: {scope: string; level?: SummaryLevel}): Promise<SummaryListItem[]> {
+    async getSummaries(filter: {scope: string}): Promise<SummaryListItem[]> {
         const search = new URLSearchParams({scope: filter.scope});
-        if (filter.level) search.set('level', filter.level);
         const body = await request<ApiEnvelope<SummaryListItem[]>>(`/api/summaries?${search.toString()}`);
         return body.data;
     },
