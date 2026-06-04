@@ -86,9 +86,9 @@ function orgQuarters(db: Database.Database): OrgQuarterRow[] {
         .prepare(
             `SELECT quarter,
                     SUM(CASE WHEN ai_maturity_score IS NOT NULL
-                             THEN ai_maturity_score * COALESCE(developer_count, 0) ELSE 0 END) AS weighted,
+                             THEN ai_maturity_score * developer_count ELSE 0 END) AS weighted,
                     SUM(CASE WHEN ai_maturity_score IS NOT NULL
-                             THEN COALESCE(developer_count, 0) ELSE 0 END) AS weight,
+                             THEN developer_count ELSE 0 END) AS weight,
                     SUM(CASE WHEN ai_maturity_score IS NOT NULL
                              AND ai_maturity_basis IS NOT NULL
                              AND ai_maturity_basis <> 'git_estimate' THEN 1 ELSE 0 END) AS non_git
@@ -110,13 +110,8 @@ function roundScore(value: number): number {
  * delta against the previous quarter that had a score, and a basis that stays
  * `git_estimate` until a contributing team reports a stronger basis (then
  * `mixed`). A quarter with no score carries a null basis and does not become the
- * baseline for the next quarter's delta.
- *
- * A quarter whose contributing teams all had scores but a total weight of 0
- * (every developer_count 0/null) maps to a null score by design — without a
- * weight there is no honest way to combine the team scores, so the org point is
- * omitted rather than guessed. developer_count is reliably written today
- * (quarterly.ts), so this is a defensive edge, not a live path.
+ * baseline for the next quarter's delta. The `weight > 0` guard also avoids a
+ * divide-by-zero if a quarter ever has scores but no developers to weight by.
  */
 function foldOrgQuarters(rows: OrgQuarterRow[]): QuarterRow[] {
     const result: QuarterRow[] = [];

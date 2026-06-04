@@ -55,15 +55,13 @@ export function useSummary(id: string | null): UseQueryResult<SummaryDetail, Err
 }
 
 /** Invalidate every summaries list + the affected detail after a (re)generation. */
-function invalidateSummaries(qc: ReturnType<typeof useQueryClient>, id?: string): void {
+function invalidateSummaries(qc: ReturnType<typeof useQueryClient>, id: string): void {
     // One list per scope (keyed ['summaries','list',scope]). The mutation result
     // doesn't tell us which scope's list a (re)generation belongs to, so invalidate
     // the whole 'summaries/list' prefix — a regenerate flips is_stale and a generate
     // can add a row to whichever scope list is mounted (org and/or a team).
     void qc.invalidateQueries({queryKey: ['summaries', 'list']});
-    if (id) {
-        void qc.invalidateQueries({queryKey: queryKeys.summary(id)});
-    }
+    void qc.invalidateQueries({queryKey: queryKeys.summary(id)});
 }
 
 /** Regenerate a summary (optional focus), refreshing the detail + lists. */
