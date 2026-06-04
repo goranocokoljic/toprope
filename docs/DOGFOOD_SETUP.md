@@ -158,6 +158,97 @@ equivalent of this smoke test lives in `tests/integration/` and runs in CI.
 
 ---
 
+## 8. Trends & AI summaries (Phase 3) (10 min)
+
+Phase 3 adds pre-computed **aggregates** (weekly / monthly / quarterly / yearly),
+an **AI maturity score** per team, and locally-generated **narrative summaries**.
+At launch every developer is git-only (MEDIUM tier), so all of this is derived
+from git activity + expense data and is labelled a **git-based estimate** — no
+direct tool-usage numbers are invented. The end-to-end behaviour is covered by
+`tests/integration/phase3-pipeline.test.ts`.
+
+### 8a. Backfill historical trends
+
+Once `sync all` has pulled your git history, compute all historical aggregates in
+one pass so the dashboard has trend depth immediately instead of accumulating it
+forward over weeks:
+
+```powershell
+npx govproxy aggregate backfill          # trailing 12 months (default)
+# npx govproxy aggregate backfill --from 2024-01-01 --to 2025-12-31
+```
+
+Backfill is idempotent — re-running overwrites, never duplicates. After it runs,
+the maturity trend and long-range views load from pre-computed rows (sub-200ms
+reads), not by re-folding daily snapshots.
+
+> **Maturity score** is a **git-based estimate** everywhere it appears. See
+> `docs/MATURITY_CALIBRATION.md` for how to read it (it is adoption-dominated at
+> launch) and when to re-calibrate.
+
+### 8b. Configure local summaries
+
+Summaries default to a **local Ollama model** so nothing — no code, no commit
+contents, only aggregate numbers — ever leaves your network. Add a `summaries`
+block to `govproxy.config.yaml`:
+
+```yaml
+summaries:
+  enabled: true
+  model:
+    type: ollama                      # ollama (default, local) | anthropic | openai
+    endpoint: http://localhost:11434  # local Ollama server
+    model_name: llama3.1:70b          # a larger local model for executive-facing prose
+  weekly:   { model_name: llama3.1:8b }   # optional: keep weekly on a small/fast model
+  monthly:  {}                            # inherits the base model
+  quarterly: {}
+  yearly:   {}
+```
+
+Pull the model first (`ollama pull llama3.1:70b`) and confirm it runs on your
+dogfood box. If the endpoint is unreachable, generation is skipped and logged —
+it never crashes the scheduler — and the summary is simply retried next run. See
+`docs/summaries-model.md` for provider details and sizing notes.
+
+### 8c. Generate & view summaries
+
+Weekly and monthly summaries **auto-generate on schedule** (after the matching
+aggregation job) when the server is running, so a manager opens Monday morning to
+a summary already waiting. Quarterly and yearly are **on-demand** — generate them
+when you need them:
+
+```powershell
+# on-demand (quarterly / yearly are never auto-generated)
+npx govproxy summary generate --level quarterly --period 2026-Q2 --scope team:backend
+npx govproxy summary generate --level yearly    --period 2026    --scope org
+
+# read a stored summary
+npx govproxy summary show --level monthly --period 2026-05 --scope org
+```
+
+In the dashboard, the **maturity trend chart** (Organization Overview + Team
+Detail) and the **Summaries panel** surface all of this, with a regenerate button
+(optional focus) and a "git-based estimate" / MEDIUM-confidence label. A summary
+whose underlying aggregate later changes (late-arriving data) is flagged
+**stale** with a regenerate affordance.
+
+### 8d. Schedules (UTC), for reference
+
+| Job | When | Produces |
+|-----|------|----------|
+| Weekly aggregation | Mon 04:00 | prior ISO week |
+| Weekly summary | Mon 04:15 | prior week, all scopes |
+| Monthly aggregation | 1st 04:30 | prior month |
+| Monthly summary | 1st 04:45 | prior month, all scopes |
+| Quarterly aggregation | quarter start 05:00 | prior quarter |
+| Yearly aggregation | Jan 1 05:00 | prior year |
+
+Quarterly/yearly **summaries** are intentionally not scheduled — generate them on
+demand. All jobs are idempotent and isolated (one failing job never blocks the
+others).
+
+---
+
 ## Health check
 
 `GET http://localhost:8080/health` must always return `{"status":"ok"}`. Use it
