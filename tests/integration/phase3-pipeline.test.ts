@@ -416,12 +416,11 @@ describe('Integration (3.13): Phase 3 aggregation + summaries pipeline, git-only
 
         it('does NOT auto-generate quarterly or yearly (on-demand only by design)', () => {
             // Quarterly/yearly only ever reached the store via the explicit on-demand
-            // POSTs above; the auto-generation jobs never produced them. Pin that to
-            // the PRODUCTION level set (not a local literal) so adding 'quarterly' to
-            // the scheduler's auto levels would fail this test.
+            // POSTs above; the auto-generation jobs (which iterate the production
+            // SUMMARY_AUTO_LEVELS set) never produced them. Anchor that to the real
+            // constant — the scheduler unit test owns the exhaustive guarantee; this
+            // ties THIS suite's auto-gen surface to it so the two can't silently drift.
             expect([...SUMMARY_AUTO_LEVELS]).toEqual(['weekly', 'monthly']);
-            expect(SUMMARY_AUTO_LEVELS).not.toContain('quarterly');
-            expect(SUMMARY_AUTO_LEVELS).not.toContain('yearly');
         });
     });
 
@@ -550,6 +549,10 @@ describe('Integration (3.13): Phase 3 aggregation + summaries pipeline, git-only
         });
 
         it('regenerating a stale summary clears the flag', async () => {
+            // Operates on the summary the staleness test above created+flagged; a clear
+            // failure here (rather than encodeURIComponent(undefined)) if that test
+            // didn't run first.
+            expect(platformQuarterlyId).toBeDefined();
             const id = platformQuarterlyId;
             const res = await app.inject({
                 method: 'POST',
