@@ -124,9 +124,7 @@ function foldOrgQuarters(rows: OrgQuarterRow[]): QuarterRow[] {
     for (const row of rows) {
         const weight = row.weight ?? 0;
         const score = weight > 0 && row.weighted !== null ? roundScore(row.weighted / weight) : null;
-        // Re-round the delta: 0.1 isn't exact in IEEE-754, so subtracting two
-        // already-one-decimal scores (e.g. 64.3 - 64.1) can still surface binary
-        // noise like 0.19999999999999998 — round it back to a clean tenth.
+        // Re-round: subtracting two one-decimal scores can leave IEEE-754 noise.
         const delta = score !== null && prevScore !== null ? roundScore(score - prevScore) : null;
         result.push({
             quarter: row.quarter,
