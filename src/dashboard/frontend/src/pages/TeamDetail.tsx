@@ -7,6 +7,8 @@ import {Badge} from '../components/Badge';
 import {DataTable, type Column} from '../components/DataTable';
 import {TimeRangeSelector} from '../components/TimeRangeSelector';
 import {CoverageBadge} from '../components/CoverageBadge';
+import {MaturityTrendCard} from '../components/MaturityTrendCard';
+import {SummariesPanel} from '../components/SummariesPanel';
 import {TrendChart, type ChartDatum} from '../charts/TrendChart';
 import {SkeletonChart, SkeletonStatCard, SkeletonTable, SkeletonText} from '../components/Skeleton';
 import {ErrorState} from '../components/ErrorState';
@@ -345,6 +347,12 @@ export function TeamDetail(): JSX.Element {
                 <>
                     <SummaryCards team={data} />
                     <AdoptionTrend team={team} />
+                    <MaturityTrendCard
+                        scope={team}
+                        title="AI maturity trend"
+                        subtitle="This team's AI maturity score over time."
+                    />
+                    <SummariesPanel scope={`team:${team}`} compact />
                     <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
                         <div className="lg:col-span-2">
                             <DeveloperList team={data} />

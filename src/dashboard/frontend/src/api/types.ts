@@ -516,3 +516,75 @@ export interface AdminDataSources {
     connectors: CoverageConnector[];
     git_providers: CoverageGitProvider[];
 }
+
+// --- Phase 3: maturity trend + AI summaries (Task 3.12) ------------------
+
+/**
+ * What the maturity score was computed from. At launch everything is a
+ * `git_estimate` (inferred from git activity); the label upgrades to `mixed`
+ * and then `measured` as tool connectors come online. Mirrors the backend
+ * MaturityBasis (src/aggregation/team-period.ts).
+ */
+export type MaturityBasis = 'git_estimate' | 'mixed' | 'measured';
+
+/** One quarter on the maturity-trend axis. From /api/maturity/:scope/trend. */
+export interface MaturityTrendPoint {
+    /** Quarter key, e.g. "2026-Q2". */
+    period: string;
+    /** Quarter span (inclusive YYYY-MM-DD), for tooltips/overlap reasoning. */
+    start: string;
+    end: string;
+    /** 0–100 score, or null when the period has no computed score. */
+    score: number | null;
+    basis: MaturityBasis | null;
+    /** Change vs the previous scored quarter, or null with no prior. */
+    score_delta: number | null;
+}
+
+/**
+ * Maturity score over a resolved window, one point per quarter. `team` echoes
+ * the requested scope — a real team name or the literal `org` (the
+ * developer-count-weighted org roll-up). From /api/maturity/:scope/trend.
+ */
+export interface MaturityTrend {
+    team: string;
+    range: TimeRangeKind;
+    from: string;
+    to: string;
+    points: MaturityTrendPoint[];
+}
+
+/** The four summary cadences. Mirrors the backend SummaryLevel. */
+export type SummaryLevel = 'weekly' | 'monthly' | 'quarterly' | 'yearly';
+
+/** Summary scope token: org-wide or a specific team. */
+export type SummaryScopeKind = 'org' | 'team';
+
+/**
+ * A summary list row: metadata + staleness + the basis/tier it was generated
+ * under (recorded at generation time; null only for legacy rows). The heavy
+ * narrative text is omitted here — fetch the detail for it. `is_stale` is the
+ * raw SQLite integer flag (0/1). From GET /api/summaries.
+ */
+export interface SummaryListItem {
+    id: string;
+    scope: SummaryScopeKind;
+    scope_name: string;
+    period_type: SummaryLevel;
+    period_value: string;
+    model_used: string;
+    generated_at: string;
+    regenerated_count: number;
+    is_stale: 0 | 1;
+    basis: MaturityBasis | null;
+    /** data_quality tier the narrative was written under ('high'|'medium'|'low'|null). */
+    tier: string | null;
+    /** Human-readable data basis sentence, or null when the basis is unknown. */
+    data_basis: string | null;
+}
+
+/** A full summary: the list row plus the narrative text + input hash. */
+export interface SummaryDetail extends SummaryListItem {
+    summary_text: string;
+    input_hash: string | null;
+}
