@@ -47,7 +47,11 @@ import {registerMaturityRoutes} from '../../src/dashboard/api/maturity';
 import {registerSummaryRoutes} from '../../src/dashboard/api/summaries';
 import {runBackfill} from '../../src/aggregation/backfill';
 import {runAggregationForPeriod} from '../../src/aggregation/scheduler';
-import {runSummaryAutoGenerationJob, type SummaryAutoLogger} from '../../src/summaries/scheduler';
+import {
+    runSummaryAutoGenerationJob,
+    SUMMARY_AUTO_LEVELS,
+    type SummaryAutoLogger,
+} from '../../src/summaries/scheduler';
 import {generateSummary} from '../../src/summaries/generator';
 import {buildSummaryInputForTarget} from '../../src/summaries/input-source';
 import {buildSummaryPrompt, findFabricatedUsageLanguage} from '../../src/summaries/prompts';
@@ -411,14 +415,13 @@ describe('Integration (3.13): Phase 3 aggregation + summaries pipeline, git-only
         });
 
         it('does NOT auto-generate quarterly or yearly (on-demand only by design)', () => {
-            // The auto-generation level set is the closed weekly/monthly pair; the
-            // job for the other two levels does not exist. Guard the design fact at
-            // the type/runtime boundary by asserting no scheduled rows appeared for
-            // them except the ones we explicitly generated on demand above.
-            // (Belt-and-braces with the dedicated scheduler unit test.)
-            const autoLevels = ['weekly', 'monthly'];
-            expect(autoLevels).not.toContain('quarterly');
-            expect(autoLevels).not.toContain('yearly');
+            // Quarterly/yearly only ever reached the store via the explicit on-demand
+            // POSTs above; the auto-generation jobs never produced them. Pin that to
+            // the PRODUCTION level set (not a local literal) so adding 'quarterly' to
+            // the scheduler's auto levels would fail this test.
+            expect([...SUMMARY_AUTO_LEVELS]).toEqual(['weekly', 'monthly']);
+            expect(SUMMARY_AUTO_LEVELS).not.toContain('quarterly');
+            expect(SUMMARY_AUTO_LEVELS).not.toContain('yearly');
         });
     });
 
@@ -438,18 +441,11 @@ describe('Integration (3.13): Phase 3 aggregation + summaries pipeline, git-only
             expect(prompt).toContain(payload.data_basis);
         });
 
-        it('the guard passes a clean git narrative and flags a fabricated one', () => {
-            const payload = buildSummaryInputForTarget(db, {
-                level: 'monthly',
-                period: JUST_COMPLETED_MONTH,
-                scope: {type: 'org', name: 'org'},
-            });
-            expect(findFabricatedUsageLanguage(CLEAN_NARRATIVE, payload)).toEqual([]);
-            const found = findFabricatedUsageLanguage(FABRICATED_NARRATIVE, payload);
-            expect(found).toContain('acceptance rate');
-            expect(found).toContain('interactions');
-        });
-
+        // The pure findFabricatedUsageLanguage clean-pass/fabricated-flag behaviour is
+        // covered by the unit suite (tests/summaries/prompts.test.ts). Here we verify
+        // the same guard END TO END against the real generated payload: the generator
+        // rejects fabricated output below, and the stored-scan test confirms every
+        // persisted narrative is clean.
         it('the generator REJECTS fabricated model output and stores nothing', async () => {
             const target = {level: 'quarterly' as const, period: QUARTER, scope: {type: 'team' as const, name: 'frontend'}};
             const before = count("SELECT COUNT(*) AS n FROM summaries WHERE scope_name = 'frontend' AND period_value = '2026-Q2'");
@@ -511,6 +507,11 @@ describe('Integration (3.13): Phase 3 aggregation + summaries pipeline, git-only
 
     // ── 6. Staleness flagging end to end ──────────────────────────────────────
     describe('staleness flagging', () => {
+        // The id the first test generates, reused by the regenerate test below
+        // (these two share the same summary by design) so neither hardcodes the
+        // store's id-scheme string.
+        let platformQuarterlyId: string;
+
         it('flags a dependent summary stale when its underlying aggregate changes', async () => {
             // Generate a fresh quarterly summary for platform Q2 (not stale).
             const gen = await app.inject({
@@ -521,6 +522,7 @@ describe('Integration (3.13): Phase 3 aggregation + summaries pipeline, git-only
             });
             expect(gen.statusCode).toBe(200);
             const id = gen.json().data.id as string;
+            platformQuarterlyId = id;
             expect(gen.json().data.is_stale).toBe(0);
 
             // Late-arriving git data lands inside Q2 for a platform developer, then
@@ -548,7 +550,7 @@ describe('Integration (3.13): Phase 3 aggregation + summaries pipeline, git-only
         });
 
         it('regenerating a stale summary clears the flag', async () => {
-            const id = 'summary:team:platform:quarterly:2026-Q2';
+            const id = platformQuarterlyId;
             const res = await app.inject({
                 method: 'POST',
                 url: `/api/summaries/${encodeURIComponent(id)}/regenerate`,
@@ -622,6 +624,26 @@ describe('Integration (3.13): Phase 3 aggregation + summaries pipeline, git-only
             const res = await app.inject({method: 'GET', url, headers: developer});
             expect(res.statusCode, url).toBe(403);
         }
+    });
+
+    it('denies the developer role the admin summary-generation POST routes', async () => {
+        // The same admin surfaces the suite drives as the manager must 403 for a
+        // developer — completing the privacy claim for every endpoint the diff touches.
+        const generate = await app.inject({
+            method: 'POST',
+            url: '/api/summaries/generate',
+            headers: developer,
+            payload: {level: 'quarterly', period: QUARTER, scope: 'team:backend'},
+        });
+        expect(generate.statusCode).toBe(403);
+
+        const regenerate = await app.inject({
+            method: 'POST',
+            url: `/api/summaries/${encodeURIComponent('summary:team:backend:quarterly:2026-Q2')}/regenerate`,
+            headers: developer,
+            payload: {},
+        });
+        expect(regenerate.statusCode).toBe(403);
     });
 });
 
