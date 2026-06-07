@@ -25,6 +25,7 @@ function disabledConfig(): GovProxyConfig {
             copilot: {enabled: false},
             claude_code: {enabled: false},
             windsurf: {enabled: false},
+            cursor: {enabled: false},
             git: {enabled: false},
         },
         expenses: {},

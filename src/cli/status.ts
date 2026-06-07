@@ -90,6 +90,12 @@ function collectStatus(db: Database.Database, config: GovProxyConfig): StatusDat
             devsTracked: devsPerToolMap.get('windsurf') ?? 0,
         },
         {
+            name: 'Cursor',
+            enabled: config.connectors.cursor.enabled,
+            lastSync: getLastSync(db, 'cursor_last_sync'),
+            devsTracked: devsPerToolMap.get('cursor') ?? 0,
+        },
+        {
             name: 'Git',
             enabled: config.connectors.git.enabled,
             lastSync: getLastSync(db, 'git_last_sync'),

@@ -27,6 +27,12 @@ connectors:
     sync_interval: "daily"
     sync_time: "03:00"
 
+  cursor:
+    enabled: true
+    service_key: "${CURSOR_SERVICE_KEY}"
+    sync_interval: "daily"
+    sync_time: "03:15"
+
   git:
     enabled: true
     provider: "github"

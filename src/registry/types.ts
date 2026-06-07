@@ -13,6 +13,7 @@ export interface ExternalIds {
     copilot?: string;
     claude?: string;
     windsurf?: string;
+    cursor?: string;
     bitbucket?: string;
     gitlab?: string;
     // Comma-separated list of additional git commit emails used to match

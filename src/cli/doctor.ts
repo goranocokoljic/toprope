@@ -296,6 +296,60 @@ async function checkWindsurfKey(config: GovProxyConfig): Promise<CheckResult> {
     }
 }
 
+async function checkCursorKey(config: GovProxyConfig): Promise<CheckResult> {
+    const {cursor} = config.connectors;
+    if (!cursor.enabled) {
+        return pass('Cursor service key', 'Cursor connector disabled — skipped');
+    }
+
+    const serviceKey = cursor.service_key ?? process.env.CURSOR_SERVICE_KEY ?? '';
+
+    if (!serviceKey) {
+        return fail(
+            'Cursor service key',
+            'No service key configured',
+            'Set connectors.cursor.service_key in config or export CURSOR_SERVICE_KEY=<key>',
+        );
+    }
+
+    const today = new Date().toISOString().slice(0, 10);
+    const yesterday = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+
+    try {
+        const res = await fetch('https://api.cursor.com/analytics/v1/analytics/users/usage', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                service_key: serviceKey,
+                start_date: yesterday,
+                end_date: today,
+            }),
+            signal: AbortSignal.timeout(10_000),
+        });
+        if (res.status === 401 || res.status === 403) {
+            return fail(
+                'Cursor service key',
+                `Key is invalid or lacks analytics permissions (${res.status})`,
+                'Generate a new Cursor service key with analytics access in the Cursor admin dashboard.',
+            );
+        }
+        if (!res.ok) {
+            return fail(
+                'Cursor service key',
+                `Cursor API returned ${res.status}`,
+                'Check the service key and that your Cursor plan includes Analytics API access.',
+            );
+        }
+        return pass('Cursor service key', 'Valid with analytics access');
+    } catch (err) {
+        return fail(
+            'Cursor service key',
+            `Network error: ${err instanceof Error ? err.message : String(err)}`,
+            'Check your network connection.',
+        );
+    }
+}
+
 function gitProviderIdentifier(pc: GitProviderConfig): string {
     switch (pc.type) {
         case 'github':
@@ -577,6 +631,7 @@ export async function runDoctor(
     checks.push(await checkCopilotAccess(config));
     checks.push(await checkAnthropicKey(config));
     checks.push(await checkWindsurfKey(config));
+    checks.push(await checkCursorKey(config));
     checks.push(...(await checkGitProviders(config)));
     checks.push(await checkSummaryModel(config));
 

@@ -13,6 +13,7 @@ export const defaultConfig: GovProxyConfig = {
         copilot: { enabled: false, sync_interval: 'daily', sync_time: '02:00' },
         claude_code: { enabled: false, sync_interval: 'daily', sync_time: '02:30' },
         windsurf: { enabled: false, sync_interval: 'daily', sync_time: '03:00' },
+        cursor: { enabled: false, sync_interval: 'daily', sync_time: '03:15' },
         git: { enabled: false, sync_interval: 'daily', sync_time: '03:30', repos: [] },
     },
     expenses: {

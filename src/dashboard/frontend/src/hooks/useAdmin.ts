@@ -100,6 +100,7 @@ export function useUpdateAdminDeveloperIdentities(): UseMutationResult<
             copilot?: string;
             claude?: string;
             windsurf?: string;
+            cursor?: string;
             bitbucket?: string;
             gitlab?: string;
             git_emails?: string[];

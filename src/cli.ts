@@ -13,6 +13,7 @@ import {seedTeamsFromConfig} from './registry/config-seeder';
 import {CopilotSync} from './connectors/copilot/sync';
 import {ClaudeCodeSync} from './connectors/claude-code/sync';
 import {WindsurfSync} from './connectors/windsurf/sync';
+import {CursorSync} from './connectors/cursor/sync';
 import {GitSync} from './connectors/git/sync';
 import {runPipeline} from './scheduler/sync-pipeline';
 import {importCsv} from './expenses/importer';
@@ -305,6 +306,7 @@ devCommand
     .option('--copilot <username>', 'GitHub Copilot username')
     .option('--claude <email>', 'Claude Code email')
     .option('--windsurf <email>', 'Windsurf email')
+    .option('--cursor <email>', 'Cursor email/identifier')
     .option('--github <username>', 'GitHub username')
     .option('--bitbucket <username>', 'Bitbucket username/nickname')
     .option('--gitlab <username>', 'GitLab username')
@@ -316,6 +318,7 @@ devCommand
             copilot?: string;
             claude?: string;
             windsurf?: string;
+            cursor?: string;
             github?: string;
             bitbucket?: string;
             gitlab?: string;
@@ -329,13 +332,14 @@ devCommand
                     options.copilot ||
                     options.claude ||
                     options.windsurf ||
+                    options.cursor ||
                     options.github ||
                     options.bitbucket ||
                     options.gitlab ||
                     options.gitEmail.length > 0;
                 if (!hasUpdate) {
                     console.error(
-                        'Error: at least one of --copilot, --claude, --windsurf, --github, --bitbucket, --gitlab, or --git-email must be provided.',
+                        'Error: at least one of --copilot, --claude, --windsurf, --cursor, --github, --bitbucket, --gitlab, or --git-email must be provided.',
                     );
                     process.exit(1);
                 }
@@ -367,6 +371,7 @@ devCommand
                     copilot: options.copilot,
                     claude: options.claude,
                     windsurf: options.windsurf,
+                    cursor: options.cursor,
                     github: options.github,
                     bitbucket: options.bitbucket,
                     gitlab: options.gitlab,
@@ -480,7 +485,7 @@ const syncCommand = program.command('sync').description('Sync data from connecto
 
 syncCommand
     .command('all')
-    .description('Run full sync pipeline: Copilot → Claude Code → Windsurf → Git')
+    .description('Run full sync pipeline: Copilot → Claude Code → Windsurf → Cursor → Git')
     .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
     .action(async (options: {config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
@@ -494,6 +499,7 @@ syncCommand
                 new CopilotSync(config.connectors.copilot),
                 new ClaudeCodeSync(config.connectors.claude_code),
                 new WindsurfSync(config.connectors.windsurf),
+                new CursorSync(config.connectors.cursor),
                 new GitSync(config.connectors.git),
             ];
             const results = await runPipeline(db, connectors);
@@ -597,6 +603,35 @@ syncCommand
             if (result.errors.length > 0) {
                 for (const e of result.errors) {
                     console.error(`[windsurf] error: ${e}`);
+                }
+                hasErrors = true;
+            }
+        } finally {
+            db.close();
+        }
+        if (hasErrors) process.exit(1);
+    });
+
+syncCommand
+    .command('cursor')
+    .description('Pull data from Cursor Analytics API')
+    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .action(async (options: {config: string}) => {
+        const configPath = path.resolve(process.cwd(), options.config);
+        const config = loadConfig(configPath);
+        const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
+        const db = openDb(dbPath);
+        let hasErrors = false;
+        try {
+            runMigrations(db, MIGRATIONS_DIR);
+            const syncer = new CursorSync(config.connectors.cursor);
+            const result = await syncer.sync(db);
+            console.log(
+                `[cursor] sync complete — ${result.snapshotsWritten} written, ${result.snapshotsSkipped} skipped`,
+            );
+            if (result.errors.length > 0) {
+                for (const e of result.errors) {
+                    console.error(`[cursor] error: ${e}`);
                 }
                 hasErrors = true;
             }

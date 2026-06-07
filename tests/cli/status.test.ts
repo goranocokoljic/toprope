@@ -24,6 +24,7 @@ function baseConfig(): GovProxyConfig {
             copilot: {enabled: true},
             claude_code: {enabled: true},
             windsurf: {enabled: false},
+            cursor: {enabled: false},
             git: {enabled: true},
         },
         expenses: {},

@@ -6,6 +6,7 @@ import {runMigrations} from '../storage/migrator';
 import {CopilotSync} from '../connectors/copilot/sync';
 import {ClaudeCodeSync} from '../connectors/claude-code/sync';
 import {WindsurfSync} from '../connectors/windsurf/sync';
+import {CursorSync} from '../connectors/cursor/sync';
 import {GitSync} from '../connectors/git/sync';
 import {runPipeline} from './sync-pipeline';
 import {evaluatePlanRoi} from '../expenses/plan-roi';
@@ -24,7 +25,7 @@ interface ScheduledConnector {
     makeConnector: () => ReturnType<typeof makeCopilotSync>;
 }
 
-type AnySync = CopilotSync | ClaudeCodeSync | WindsurfSync | GitSync;
+type AnySync = CopilotSync | ClaudeCodeSync | WindsurfSync | CursorSync | GitSync;
 function makeCopilotSync(config: GovProxyConfig): AnySync {
     return new CopilotSync(config.connectors.copilot);
 }
@@ -48,6 +49,12 @@ export function buildConnectorSchedule(config: GovProxyConfig): ScheduledConnect
             enabled: config.connectors.windsurf?.enabled ?? false,
             syncTime: config.connectors.windsurf?.sync_time ?? '03:00',
             makeConnector: () => new WindsurfSync(config.connectors.windsurf),
+        },
+        {
+            name: 'cursor',
+            enabled: config.connectors.cursor?.enabled ?? false,
+            syncTime: config.connectors.cursor?.sync_time ?? '03:15',
+            makeConnector: () => new CursorSync(config.connectors.cursor),
         },
         {
             name: 'git',
