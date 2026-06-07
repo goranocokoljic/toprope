@@ -134,6 +134,12 @@ export class CursorSync implements ConnectorInterface {
         const emailToDevId = buildEmailToDevIdMap(db);
         const storeRawData = true;
 
+        // Re-fetch from the last sync DAY so an in-progress day gets picked up
+        // again. Note: because upsertSnapshot uses ON CONFLICT DO NOTHING, the
+        // first snapshot written for a given day wins permanently — a mid-day
+        // manual `sync cursor` freezes that day's partial counts until the date
+        // rolls over. The 03:15 scheduled run sits before meaningful daily
+        // activity, so this is benign for the normal path.
         const sinceRaw = getLastSyncTime(db);
         const startDate = sinceRaw ? sinceRaw.slice(0, 10) : defaultSinceDate();
         const endDate = toDateStr(new Date());
@@ -143,12 +149,14 @@ export class CursorSync implements ConnectorInterface {
             metrics = await client.getUserMetrics(startDate, endDate);
         } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
+            // Include the date window so a mid-pagination failure (which discards
+            // all pages and writes nothing) is diagnosable from the log alone.
             if (message.includes('permission denied')) {
                 errors.push(
                     `[cursor] Permission error: ${message}. Check that your service key has analytics access.`,
                 );
             } else {
-                errors.push(`Failed to fetch metrics: ${message}`);
+                errors.push(`Failed to fetch metrics for ${startDate}..${endDate}: ${message}`);
             }
             return {
                 connector: CONNECTOR_NAME,

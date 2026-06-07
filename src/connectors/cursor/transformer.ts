@@ -21,6 +21,20 @@ export interface ToolSnapshot {
 
 const TOOL = 'cursor';
 
+// The API response is an untrusted boundary: a missing field or a numeric
+// string would otherwise flow into INTEGER columns or produce a NaN
+// acceptance_rate. Coerce counts to non-negative integers and cost to a finite
+// number before any arithmetic or persistence.
+function asCount(value: unknown): number {
+    const n = typeof value === 'number' ? value : Number(value);
+    return Number.isFinite(n) && n > 0 ? Math.trunc(n) : 0;
+}
+
+function asCost(value: unknown): number | null {
+    const n = typeof value === 'number' ? value : Number(value);
+    return Number.isFinite(n) && n > 0 ? n : null;
+}
+
 export function transformMetrics(
     metrics: CursorUserMetrics[],
     emailToDevId: Map<string, string>,
@@ -32,8 +46,10 @@ export function transformMetrics(
         const developerId = emailToDevId.get(entry.email);
         if (!developerId) continue;
 
-        const interactionCount = entry.autocomplete_shown;
-        const acceptanceCount = entry.autocomplete_accepted;
+        const interactionCount = asCount(entry.autocomplete_shown);
+        const acceptanceCount = asCount(entry.autocomplete_accepted);
+        const composerRequests = asCount(entry.composer_requests);
+        const chatRequests = asCount(entry.chat_requests);
         const acceptanceRate =
             interactionCount > 0 ? acceptanceCount / interactionCount : null;
 
@@ -41,21 +57,16 @@ export function transformMetrics(
         // but only using autocomplete"): keep autocomplete vs Composer vs chat
         // distinct.
         const featuresUsed: Record<string, number> = {
-            autocomplete: entry.autocomplete_accepted,
-            composer: entry.composer_requests,
-            chat: entry.chat_requests,
+            autocomplete: acceptanceCount,
+            composer: composerRequests,
+            chat: chatRequests,
         };
 
         const isActive =
-            interactionCount > 0 ||
-            entry.composer_requests > 0 ||
-            entry.chat_requests > 0
-                ? 1
-                : 0;
+            interactionCount > 0 || composerRequests > 0 || chatRequests > 0 ? 1 : 0;
 
         const models = entry.models_used;
         const hasModels = models != null && Object.keys(models).length > 0;
-        const cost = entry.estimated_cost;
 
         snapshots.push({
             id: randomUUID(),
@@ -70,7 +81,7 @@ export function transformMetrics(
             acceptance_rate: acceptanceRate,
             features_used: JSON.stringify(featuresUsed),
             models_used: hasModels ? JSON.stringify(models) : null,
-            estimated_cost: cost != null && cost > 0 ? cost : null,
+            estimated_cost: asCost(entry.estimated_cost),
             tokens_consumed: null,
             raw_data: storeRawData ? JSON.stringify(entry) : null,
         });
