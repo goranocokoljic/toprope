@@ -50,7 +50,19 @@ function upsertSnapshot(db: Database.Database, snap: ToolSnapshot): 'written' | 
               interaction_count, acceptance_count, acceptance_rate, features_used,
               models_used, estimated_cost, tokens_consumed, raw_data)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(developer_id, date, tool) DO NOTHING`,
+             ON CONFLICT(developer_id, date, tool) DO UPDATE SET
+               data_source = excluded.data_source,
+               data_quality = excluded.data_quality,
+               is_active = excluded.is_active,
+               interaction_count = excluded.interaction_count,
+               acceptance_count = excluded.acceptance_count,
+               acceptance_rate = excluded.acceptance_rate,
+               features_used = excluded.features_used,
+               models_used = excluded.models_used,
+               estimated_cost = excluded.estimated_cost,
+               tokens_consumed = excluded.tokens_consumed,
+               raw_data = excluded.raw_data
+             WHERE tool_snapshots.data_source = 'self_report'`,
         )
         .run(
             snap.id,

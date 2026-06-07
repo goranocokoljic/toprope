@@ -49,6 +49,12 @@ function upsertSnapshot(db: Database.Database, snap: ToolSnapshot): 'written' | 
             )
             .get(snap.developer_id, snap.date, snap.tool) != null;
 
+    // Unconditional DO UPDATE (last-writer-wins): a re-sync refreshes the day.
+    // data_source/data_quality are in the SET so an API write landing on a
+    // self_report-sourced row relabels it api/high (API wins over a self-report).
+    // Cursor/Windsurf instead guard with `WHERE data_source = 'self_report'` to
+    // keep first-writer-wins among API writes — an intentional, pre-existing
+    // per-connector divergence.
     db.prepare(
         `INSERT INTO tool_snapshots
              (id, developer_id, date, tool, data_source, data_quality, is_active,
@@ -56,6 +62,8 @@ function upsertSnapshot(db: Database.Database, snap: ToolSnapshot): 'written' | 
               models_used, estimated_cost, tokens_consumed, raw_data)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(developer_id, date, tool) DO UPDATE SET
+               data_source = excluded.data_source,
+               data_quality = excluded.data_quality,
                is_active = excluded.is_active,
                interaction_count = excluded.interaction_count,
                acceptance_count = excluded.acceptance_count,
