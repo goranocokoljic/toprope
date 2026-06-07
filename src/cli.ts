@@ -7,7 +7,7 @@ import {runMigrations, getMigrationStatus} from './storage/migrator';
 import {printStatus} from './cli/status';
 import {runDoctor} from './cli/doctor';
 import {addTeam, listTeams, teamExists} from './registry/teams';
-import {addDeveloper, listDevelopers, getDeveloperById, linkDeveloper, findByExternalId, findByEmail} from './registry/developers';
+import {addDeveloper, listDevelopers, linkDeveloper, findByExternalId, findByEmail} from './registry/developers';
 import {discoverOrgMembers} from './registry/discovery';
 import {seedTeamsFromConfig} from './registry/config-seeder';
 import {CopilotSync} from './connectors/copilot/sync';
@@ -44,10 +44,30 @@ import {createUser, getActiveUserByEmail, countAdmins} from './auth/users';
 import {generateSummary} from './summaries/generator';
 import {getSummaryByTarget} from './summaries/store';
 import {parseLevel, parseScope, validatePeriod, type SummaryTarget} from './summaries/target';
+import {
+    createSelfReport,
+    getSelfReportsForDeveloper,
+    SelfReportError,
+    SELF_REPORT_TOOLS,
+    type SelfReportInterface,
+} from './selfreport/core';
+import {resolveSelfDeveloperId} from './selfreport/identity';
 
 // Commander option collector for repeatable flags (e.g. --git-email).
 function collectValue(value: string, previous: string[]): string[] {
     return previous.concat([value]);
+}
+
+// Parse a CLI flag that must be a positive integer, rejecting garbage (e.g.
+// "30min", "", "1e3") at the boundary rather than letting Number() coerce it
+// silently. Throws SelfReportError so callers' existing handling reports a clean
+// message and a non-zero exit.
+function parsePositiveIntFlag(name: string, value: string): number {
+    const trimmed = value.trim();
+    if (!/^\d+$/.test(trimmed) || Number(trimmed) <= 0) {
+        throw new SelfReportError(`${name} must be a positive integer.`);
+    }
+    return Number(trimmed);
 }
 
 const program = new Command();
@@ -1187,6 +1207,130 @@ summaryCommand
         }
         if (!found) process.exit(1);
     });
+
+const logCommand = program
+    .command('log')
+    .description('Log your own AI tool usage (self-report)');
+
+logCommand
+    .description(
+        'Log your own AI tool usage for a day (self-report). Identity comes from ' +
+            'GOVPROXY_DEVELOPER_ID or GOVPROXY_DEVELOPER_EMAIL — you can only log for yourself.',
+    )
+    // Not a requiredOption: this command also hosts the `list` subcommand, and a
+    // required option on the parent would be enforced even when invoking `log
+    // list`. We validate --tool manually in the action instead.
+    .option('--tool <tool>', `Tool used: ${SELF_REPORT_TOOLS.join(' | ')}`)
+    .option('--minutes <n>', 'Optional rough effort in minutes')
+    .option('--task <text>', 'Optional private task descriptor (never shared with managers or models)')
+    .option('--date <date>', 'Usage date (YYYY-MM-DD). Defaults to today (UTC).')
+    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .action(
+        (options: {
+            tool?: string;
+            minutes?: string;
+            task?: string;
+            date?: string;
+            config: string;
+        }) => {
+            if (!options.tool) {
+                console.error("Error: required option '--tool <tool>' not specified.");
+                process.exitCode = 1;
+                return;
+            }
+            const configPath = path.resolve(process.cwd(), options.config);
+            const db = openRegistryDb(configPath);
+            try {
+                const developerId = resolveSelfDeveloperId(db);
+                const minutes =
+                    options.minutes !== undefined
+                        ? parsePositiveIntFlag('--minutes', options.minutes)
+                        : null;
+                const result = createSelfReport(db, {
+                    developerId,
+                    tool: options.tool,
+                    minutes,
+                    taskDescriptor: options.task ?? null,
+                    date: options.date,
+                    sourceInterface: 'cli' satisfies SelfReportInterface,
+                });
+                const {report, snapshot} = result;
+                console.log(
+                    `Logged ${report.tool} usage for ${report.date}` +
+                        (report.minutes != null ? ` (${report.minutes} min)` : '') +
+                        '.',
+                );
+                if (snapshot === 'api_wins') {
+                    console.log(
+                        '  Note: API data already exists for this tool/date — it takes precedence. ' +
+                            'Your self-report is kept on record but did not change the snapshot.',
+                    );
+                } else if (snapshot === 'already_self_report') {
+                    console.log('  You were already marked active for this tool/date.');
+                } else {
+                    console.log('  You are now marked active for this tool/date.');
+                }
+            } catch (err) {
+                if (err instanceof SelfReportError) {
+                    console.error(`Error: ${err.message}`);
+                    process.exitCode = 1;
+                    return;
+                }
+                throw err;
+            } finally {
+                db.close();
+            }
+        },
+    );
+
+logCommand
+    .command('list')
+    .description("Show your own self-reports (including private task descriptors)")
+    .option('--tool <tool>', 'Filter by tool')
+    .option('--from <date>', 'Inclusive start date (YYYY-MM-DD)')
+    .option('--to <date>', 'Inclusive end date (YYYY-MM-DD)')
+    .option('--limit <n>', 'Maximum number of entries to show', '50')
+    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .action(
+        (options: {tool?: string; from?: string; to?: string; limit: string; config: string}) => {
+            const configPath = path.resolve(process.cwd(), options.config);
+            const db = openRegistryDb(configPath);
+            try {
+                const developerId = resolveSelfDeveloperId(db);
+                const limit = parsePositiveIntFlag('--limit', options.limit);
+                const reports = getSelfReportsForDeveloper(db, developerId, {
+                    tool: options.tool,
+                    from: options.from,
+                    to: options.to,
+                    limit,
+                });
+                if (reports.length === 0) {
+                    console.log('No self-reports found.');
+                    return;
+                }
+                const col = (s: string, width: number): string => s.padEnd(width).slice(0, width);
+                console.log('Your self-reports:');
+                console.log('─'.repeat(72));
+                console.log(`${col('Date', 12)}${col('Tool', 14)}${col('Minutes', 10)}Task`);
+                console.log('─'.repeat(72));
+                for (const r of reports) {
+                    const minutes = r.minutes != null ? String(r.minutes) : '—';
+                    console.log(
+                        `${col(r.date, 12)}${col(r.tool, 14)}${col(minutes, 10)}${r.task_descriptor ?? '—'}`,
+                    );
+                }
+            } catch (err) {
+                if (err instanceof SelfReportError) {
+                    console.error(`Error: ${err.message}`);
+                    process.exitCode = 1;
+                    return;
+                }
+                throw err;
+            } finally {
+                db.close();
+            }
+        },
+    );
 
 program
     .command('status')

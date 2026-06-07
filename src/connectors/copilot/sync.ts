@@ -31,6 +31,12 @@ function setLastSyncTime(db: Database.Database, time: string): void {
 }
 
 function upsertSnapshot(db: Database.Database, snap: ToolSnapshot): 'written' | 'skipped' {
+    // Copilot/Claude Code use an UNCONDITIONAL DO UPDATE (last-writer-wins): a
+    // re-sync refreshes the day's measured data. data_source/data_quality are in
+    // the SET so that when this API write lands on a self_report-sourced row, the
+    // row is relabeled api/high (API wins over a self-report). Cursor/Windsurf
+    // instead guard with `WHERE data_source = 'self_report'` to keep first-writer-
+    // wins among API writes — an intentional, pre-existing per-connector divergence.
     const result = db
         .prepare(
             `INSERT INTO tool_snapshots
@@ -39,6 +45,8 @@ function upsertSnapshot(db: Database.Database, snap: ToolSnapshot): 'written' | 
               models_used, estimated_cost, tokens_consumed, raw_data)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(developer_id, date, tool) DO UPDATE SET
+               data_source = excluded.data_source,
+               data_quality = excluded.data_quality,
                is_active = excluded.is_active,
                interaction_count = excluded.interaction_count,
                acceptance_count = excluded.acceptance_count,
