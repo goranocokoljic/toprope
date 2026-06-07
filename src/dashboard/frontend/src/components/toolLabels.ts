@@ -10,6 +10,7 @@ const TOOL_LABELS: Record<string, string> = {
     copilot: 'Copilot',
     claude_code: 'Claude Code',
     windsurf: 'Windsurf',
+    cursor: 'Cursor',
 };
 
 const PROVIDER_LABELS: Record<string, string> = {
@@ -35,6 +36,8 @@ const FEATURE_LABELS: Record<string, string> = {
     autocomplete: 'Autocomplete',
     cascade: 'Cascade (agent)',
     flows: 'Flows',
+    // Cursor
+    composer: 'Composer (agent)',
     // Claude Code
     commits: 'Commits',
     prs_created: 'PRs created',

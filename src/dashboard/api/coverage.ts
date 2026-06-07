@@ -2,7 +2,7 @@ import type {FastifyInstance} from 'fastify';
 import type Database from 'better-sqlite3';
 import {isAdmin, forbidden} from './guards';
 
-const CONNECTORS = ['copilot', 'claude_code', 'windsurf'] as const;
+const CONNECTORS = ['copilot', 'claude_code', 'windsurf', 'cursor'] as const;
 const GIT_PROVIDERS = ['github', 'bitbucket', 'gitlab'] as const;
 const GIT_CONNECTOR = 'git';
 

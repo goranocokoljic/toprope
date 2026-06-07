@@ -26,7 +26,7 @@ import type {OverviewData, ToolDistributionEntry, WasteTeamSummary} from '../api
 // Each id must match the tool string the backend writes into tool_snapshots
 // (see each connector's transformer, e.g. claude-code → 'claude_code'); the
 // human-facing chip text is derived via the shared `toolLabel` table.
-const KNOWN_CONNECTORS = ['copilot', 'claude_code', 'windsurf'] as const;
+const KNOWN_CONNECTORS = ['copilot', 'claude_code', 'windsurf', 'cursor'] as const;
 
 /**
  * Count of collected tool snapshots backing the overview. The API's

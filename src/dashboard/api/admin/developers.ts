@@ -24,9 +24,9 @@ import {
 // Git-attribution providers must be unique across developers, or commit
 // attribution becomes ambiguous (same rule the Phase 1 registry enforces).
 const ATTRIBUTION_PROVIDERS = ['github', 'bitbucket', 'gitlab'] as const;
-// Tool identities (Copilot/Claude/Windsurf) are not attribution keys; they are
-// not subject to the uniqueness check.
-const ALL_PROVIDERS = [...ATTRIBUTION_PROVIDERS, 'copilot', 'claude', 'windsurf'] as const;
+// Tool identities (Copilot/Claude/Windsurf/Cursor) are not attribution keys;
+// they are not subject to the uniqueness check.
+const ALL_PROVIDERS = [...ATTRIBUTION_PROVIDERS, 'copilot', 'claude', 'windsurf', 'cursor'] as const;
 
 export function registerAdminDeveloperRoutes(app: FastifyInstance, db: Database.Database): void {
     app.get('/api/admin/developers', async (request, reply) => {

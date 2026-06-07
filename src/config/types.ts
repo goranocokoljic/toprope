@@ -28,6 +28,10 @@ export interface WindsurfConnectorConfig extends ConnectorBaseConfig {
     service_key?: string;
 }
 
+export interface CursorConnectorConfig extends ConnectorBaseConfig {
+    service_key?: string;
+}
+
 export interface GitAnalysisConfig {
     churn_window_hours?: number;
     ai_signature_enabled?: boolean;
@@ -50,6 +54,7 @@ export interface ConnectorsConfig {
     copilot: CopilotConnectorConfig;
     claude_code: ClaudeCodeConnectorConfig;
     windsurf: WindsurfConnectorConfig;
+    cursor: CursorConnectorConfig;
     git: GitConnectorConfig;
 }
 

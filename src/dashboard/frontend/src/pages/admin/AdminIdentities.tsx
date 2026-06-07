@@ -21,6 +21,7 @@ interface IdentityDraft {
     copilot: string;
     claude: string;
     windsurf: string;
+    cursor: string;
     bitbucket: string;
     gitlab: string;
     gitEmails: string;
@@ -33,6 +34,7 @@ function draftFor(dev: AdminDeveloper): IdentityDraft {
         copilot: ext.copilot ?? '',
         claude: ext.claude ?? '',
         windsurf: ext.windsurf ?? '',
+        cursor: ext.cursor ?? '',
         bitbucket: ext.bitbucket ?? '',
         gitlab: ext.gitlab ?? '',
         gitEmails: ext.git_emails ?? '',
@@ -60,6 +62,7 @@ function IdentityEditor({dev}: {dev: AdminDeveloper}): JSX.Element {
                 copilot: draft.copilot,
                 claude: draft.claude,
                 windsurf: draft.windsurf,
+                cursor: draft.cursor,
                 bitbucket: draft.bitbucket,
                 gitlab: draft.gitlab,
                 // Split the comma/whitespace-separated list into individual emails;
@@ -89,6 +92,7 @@ function IdentityEditor({dev}: {dev: AdminDeveloper}): JSX.Element {
                         <TextField label="Copilot username" value={draft.copilot} onChange={(v) => set('copilot', v)} />
                         <TextField label="Claude Code email" value={draft.claude} onChange={(v) => set('claude', v)} />
                         <TextField label="Windsurf email" value={draft.windsurf} onChange={(v) => set('windsurf', v)} />
+                        <TextField label="Cursor email" value={draft.cursor} onChange={(v) => set('cursor', v)} />
                     </div>
                 </div>
                 <div>
