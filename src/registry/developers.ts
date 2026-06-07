@@ -131,6 +131,7 @@ export interface LinkUpdates {
     copilot?: string;
     claude?: string;
     windsurf?: string;
+    cursor?: string;
     bitbucket?: string;
     gitlab?: string;
     // Additional git commit emails; appended to any existing ones.
@@ -157,12 +158,13 @@ export interface IdentityUpdates {
     copilot?: string;
     claude?: string;
     windsurf?: string;
+    cursor?: string;
     bitbucket?: string;
     gitlab?: string;
     gitEmails?: string[];
 }
 
-const PROVIDER_KEYS = ['github', 'copilot', 'claude', 'windsurf', 'bitbucket', 'gitlab'] as const;
+const PROVIDER_KEYS = ['github', 'copilot', 'claude', 'windsurf', 'cursor', 'bitbucket', 'gitlab'] as const;
 
 /**
  * Replace a developer's identity mapping from the admin UI. Each provided
@@ -219,6 +221,7 @@ export function linkDeveloper(
     if (updates.copilot !== undefined) existing.copilot = updates.copilot;
     if (updates.claude !== undefined) existing.claude = updates.claude;
     if (updates.windsurf !== undefined) existing.windsurf = updates.windsurf;
+    if (updates.cursor !== undefined) existing.cursor = updates.cursor;
     if (updates.bitbucket !== undefined) existing.bitbucket = updates.bitbucket;
     if (updates.gitlab !== undefined) existing.gitlab = updates.gitlab;
     if (updates.gitEmails && updates.gitEmails.length > 0) {

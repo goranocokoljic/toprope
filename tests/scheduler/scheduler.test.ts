@@ -21,10 +21,16 @@ describe('parseSyncTimeToCron', () => {
 });
 
 describe('buildConnectorSchedule', () => {
-    it('returns four connectors', () => {
+    it('returns five connectors', () => {
         const schedule = buildConnectorSchedule(makeConfig());
-        expect(schedule).toHaveLength(4);
-        expect(schedule.map((s) => s.name)).toEqual(['copilot', 'claude_code', 'windsurf', 'git']);
+        expect(schedule).toHaveLength(5);
+        expect(schedule.map((s) => s.name)).toEqual([
+            'copilot',
+            'claude_code',
+            'windsurf',
+            'cursor',
+            'git',
+        ]);
     });
 
     it('uses connector sync_time from config', () => {
@@ -39,13 +45,15 @@ describe('buildConnectorSchedule', () => {
         delete config.connectors.copilot.sync_time;
         delete config.connectors.claude_code.sync_time;
         delete config.connectors.windsurf.sync_time;
+        delete config.connectors.cursor.sync_time;
         delete config.connectors.git.sync_time;
 
         const schedule = buildConnectorSchedule(config);
         expect(schedule[0].syncTime).toBe('02:00');
         expect(schedule[1].syncTime).toBe('02:30');
         expect(schedule[2].syncTime).toBe('03:00');
-        expect(schedule[3].syncTime).toBe('03:30');
+        expect(schedule[3].syncTime).toBe('03:15');
+        expect(schedule[4].syncTime).toBe('03:30');
     });
 
     it('reflects enabled state from config', () => {

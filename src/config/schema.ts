@@ -22,7 +22,7 @@ export const configSchema: Record<string, unknown> = {
         },
         connectors: {
             type: 'object',
-            required: ['copilot', 'claude_code', 'windsurf', 'git'],
+            required: ['copilot', 'claude_code', 'windsurf', 'cursor', 'git'],
             properties: {
                 copilot: {
                     type: 'object',
@@ -39,6 +39,13 @@ export const configSchema: Record<string, unknown> = {
                     },
                 },
                 windsurf: {
+                    type: 'object',
+                    required: ['enabled'],
+                    properties: {
+                        enabled: {type: 'boolean'},
+                    },
+                },
+                cursor: {
                     type: 'object',
                     required: ['enabled'],
                     properties: {
