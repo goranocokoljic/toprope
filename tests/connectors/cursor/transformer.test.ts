@@ -144,6 +144,62 @@ describe('transformMetrics (cursor)', () => {
         expect(empty.models_used).toBeNull();
     });
 
+    it('sets models_used to null when the field is not an object', () => {
+        const map = new Map([[EMAIL, DEV_ID]]);
+        // Untrusted JSON: a string/array must not be coerced into a bogus map.
+        const [str] = transformMetrics(
+            [makeEntry({models_used: 'gpt-4o' as unknown as Record<string, number>})],
+            map,
+            false,
+        );
+        const [arr] = transformMetrics(
+            [makeEntry({models_used: ['gpt-4o'] as unknown as Record<string, number>})],
+            map,
+            false,
+        );
+
+        expect(str.models_used).toBeNull();
+        expect(arr.models_used).toBeNull();
+    });
+
+    it('coerces non-finite/string/negative counts to safe integers', () => {
+        const map = new Map([[EMAIL, DEV_ID]]);
+        const [snap] = transformMetrics(
+            [
+                makeEntry({
+                    autocomplete_shown: '120' as unknown as number,
+                    autocomplete_accepted: 50.9,
+                    composer_requests: -3 as unknown as number,
+                    chat_requests: NaN as unknown as number,
+                }),
+            ],
+            map,
+            false,
+        );
+
+        expect(snap.interaction_count).toBe(120);
+        expect(snap.acceptance_count).toBe(50);
+        const features = JSON.parse(snap.features_used!) as Record<string, number>;
+        expect(features.composer).toBe(0);
+        expect(features.chat).toBe(0);
+    });
+
+    it('skips entries whose date is malformed (protects the conflict key)', () => {
+        const map = new Map([[EMAIL, DEV_ID]]);
+        const result = transformMetrics(
+            [
+                makeEntry({date: '2024-01-15T00:00:00Z'}),
+                makeEntry({date: 'not-a-date'}),
+                makeEntry({date: '2024-01-16'}),
+            ],
+            map,
+            false,
+        );
+
+        expect(result).toHaveLength(1);
+        expect(result[0].date).toBe('2024-01-16');
+    });
+
     it('sets estimated_cost when positive, null otherwise', () => {
         const map = new Map([[EMAIL, DEV_ID]]);
         const [withCost] = transformMetrics([makeEntry({estimated_cost: 5.5})], map, false);

@@ -21,18 +21,36 @@ export interface ToolSnapshot {
 
 const TOOL = 'cursor';
 
-// The API response is an untrusted boundary: a missing field or a numeric
-// string would otherwise flow into INTEGER columns or produce a NaN
-// acceptance_rate. Coerce counts to non-negative integers and cost to a finite
-// number before any arithmetic or persistence.
+// The API response is an untrusted boundary — the client casts the JSON with
+// `as CursorUsageResponse` without a runtime check, so a missing field or a
+// numeric string can reach here and would otherwise write a non-integer into an
+// INTEGER column or a NaN acceptance_rate. These coercers narrow `unknown`
+// before any arithmetic or persistence.
+
+// → a non-negative integer; any non-finite, negative, or zero input yields 0.
 function asCount(value: unknown): number {
     const n = typeof value === 'number' ? value : Number(value);
     return Number.isFinite(n) && n > 0 ? Math.trunc(n) : 0;
 }
 
+// → a positive cost, or null; any non-finite, negative, or zero input yields null.
 function asCost(value: unknown): number | null {
     const n = typeof value === 'number' ? value : Number(value);
     return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+// `date` is part of the ON CONFLICT(developer_id, date, tool) idempotency key, so
+// a malformed or alternately-formatted value (e.g. a full timestamp) would
+// defeat dedupe and let two rows land for the same dev/day. Require a strict
+// YYYY-MM-DD calendar date.
+function isIsoDate(value: unknown): value is string {
+    return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
+
+// Untrusted JSON: `models_used` is typed Record<string, number> but could arrive
+// as a string/array/number. Only a plain object yields a usable model breakdown.
+function isModelMap(value: unknown): value is Record<string, number> {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 export function transformMetrics(
@@ -45,6 +63,9 @@ export function transformMetrics(
     for (const entry of metrics) {
         const developerId = emailToDevId.get(entry.email);
         if (!developerId) continue;
+        // Skip rows with a malformed date rather than risk a duplicate snapshot
+        // for the day (the date is part of the conflict key).
+        if (!isIsoDate(entry.date)) continue;
 
         const interactionCount = asCount(entry.autocomplete_shown);
         const acceptanceCount = asCount(entry.autocomplete_accepted);
@@ -66,7 +87,7 @@ export function transformMetrics(
             interactionCount > 0 || composerRequests > 0 || chatRequests > 0 ? 1 : 0;
 
         const models = entry.models_used;
-        const hasModels = models != null && Object.keys(models).length > 0;
+        const hasModels = isModelMap(models) && Object.keys(models).length > 0;
 
         snapshots.push({
             id: randomUUID(),
