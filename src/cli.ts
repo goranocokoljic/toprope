@@ -58,6 +58,18 @@ function collectValue(value: string, previous: string[]): string[] {
     return previous.concat([value]);
 }
 
+// Parse a CLI flag that must be a positive integer, rejecting garbage (e.g.
+// "30min", "", "1e3") at the boundary rather than letting Number() coerce it
+// silently. Throws SelfReportError so callers' existing handling reports a clean
+// message and a non-zero exit.
+function parsePositiveIntFlag(name: string, value: string): number {
+    const trimmed = value.trim();
+    if (!/^\d+$/.test(trimmed) || Number(trimmed) <= 0) {
+        throw new SelfReportError(`${name} must be a positive integer.`);
+    }
+    return Number(trimmed);
+}
+
 const program = new Command();
 
 program
@@ -1230,10 +1242,14 @@ logCommand
             const db = openRegistryDb(configPath);
             try {
                 const developerId = resolveSelfDeveloperId(db);
+                const minutes =
+                    options.minutes !== undefined
+                        ? parsePositiveIntFlag('--minutes', options.minutes)
+                        : null;
                 const result = createSelfReport(db, {
                     developerId,
                     tool: options.tool,
-                    minutes: options.minutes !== undefined ? Number(options.minutes) : null,
+                    minutes,
                     taskDescriptor: options.task ?? null,
                     date: options.date,
                     sourceInterface: 'cli' satisfies SelfReportInterface,
@@ -1281,12 +1297,12 @@ logCommand
             const db = openRegistryDb(configPath);
             try {
                 const developerId = resolveSelfDeveloperId(db);
-                const limit = Number(options.limit);
+                const limit = parsePositiveIntFlag('--limit', options.limit);
                 const reports = getSelfReportsForDeveloper(db, developerId, {
                     tool: options.tool,
                     from: options.from,
                     to: options.to,
-                    limit: Number.isInteger(limit) && limit > 0 ? limit : 50,
+                    limit,
                 });
                 if (reports.length === 0) {
                     console.log('No self-reports found.');

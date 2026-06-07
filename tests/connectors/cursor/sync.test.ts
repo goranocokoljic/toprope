@@ -5,6 +5,7 @@ import {runMigrations} from '../../../src/storage/migrator';
 import {addTeam} from '../../../src/registry/teams';
 import {addDeveloper, linkDeveloper} from '../../../src/registry/developers';
 import {CursorSync} from '../../../src/connectors/cursor/sync';
+import {createSelfReport} from '../../../src/selfreport/core';
 import type {CursorUserMetrics, CursorUsageResponse} from '../../../src/connectors/cursor/client';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../../src/storage/migrations');
@@ -119,6 +120,52 @@ describe('CursorSync', () => {
         expect(first.snapshotsWritten).toBe(1);
         expect(second.snapshotsWritten).toBe(0);
         expect(second.snapshotsSkipped).toBe(1);
+    });
+
+    it('API data wins over an earlier self-report (overwrites the self_report snapshot)', async () => {
+        const email = 'alice@company.com';
+        const devId = seedDev(db, email);
+
+        // A self-report lands first for the same dev/date/tool.
+        createSelfReport(db, {
+            developerId: devId,
+            tool: 'cursor',
+            date: '2024-01-15',
+            minutes: 30,
+            sourceInterface: 'cli',
+        });
+        const before = db
+            .prepare('SELECT data_source, interaction_count FROM tool_snapshots WHERE developer_id = ?')
+            .get(devId) as {data_source: string; interaction_count: number | null};
+        expect(before.data_source).toBe('self_report');
+
+        // The API sync then arrives with measured data for that same day.
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async () =>
+                makeOkResponse(makeUsageResponse([makeEntry(email, {date: '2024-01-15'})])),
+            ),
+        );
+        const result = await new CursorSync(makeConfig()).sync(db);
+
+        expect(result.snapshotsWritten).toBe(1);
+        // Still exactly one row, now API/high with the measured counts — the
+        // self-report placeholder was replaced, not duplicated or frozen.
+        expect(countSnapshots(db)).toBe(1);
+        const after = db
+            .prepare(
+                'SELECT data_source, data_quality, interaction_count FROM tool_snapshots WHERE developer_id = ?',
+            )
+            .get(devId) as {data_source: string; data_quality: string; interaction_count: number};
+        expect(after.data_source).toBe('api');
+        expect(after.data_quality).toBe('high');
+        expect(after.interaction_count).toBe(100);
+
+        // The raw self-report is still on record.
+        const reports = db
+            .prepare('SELECT COUNT(*) AS n FROM self_reports WHERE developer_id = ?')
+            .get(devId) as {n: number};
+        expect(reports.n).toBe(1);
     });
 
     it('skips entries for unknown developers', async () => {

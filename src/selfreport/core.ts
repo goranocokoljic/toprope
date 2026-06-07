@@ -184,10 +184,16 @@ export function createSelfReport(
  * Aggregate a self-report into tool_snapshots under the API-wins rule. Returns
  * the outcome. Must run inside the createSelfReport transaction.
  *
- * Note on the reverse ordering: a later API sync uses ON CONFLICT DO NOTHING and
- * will not overwrite a self_report snapshot that landed first. In normal
- * operation the scheduled API sync runs before daily self-reporting activity, so
- * API data is in place first and this aggregation correctly defers to it.
+ * API wins in BOTH orderings:
+ *  - self-report after API: the INSERT below hits ON CONFLICT and does nothing,
+ *    so an existing API (or prior self-report) snapshot is left untouched.
+ *  - API after self-report: the connector upserts overwrite a self_report-sourced
+ *    snapshot with their measured data (DO UPDATE ... WHERE data_source =
+ *    'self_report'), so a self-report that landed first is replaced, not frozen.
+ *
+ * Using INSERT ... ON CONFLICT DO NOTHING (rather than SELECT-then-INSERT) keeps
+ * this atomic and idempotent even against a concurrent writer on another
+ * connection — there is no window for a UNIQUE violation.
  */
 function aggregateIntoSnapshot(
     db: Database.Database,
@@ -195,37 +201,30 @@ function aggregateIntoSnapshot(
     date: string,
     tool: string,
 ): SnapshotOutcome {
+    // Append a self-reported snapshot only when none exists yet. is_active = 1 for
+    // the day; interaction_count / features_used stay null (we don't fabricate
+    // measured counts from a time estimate). task_descriptor is deliberately NOT
+    // written here — it stays private on the raw self_report row.
+    const result = db
+        .prepare(
+            `INSERT INTO tool_snapshots
+             (id, developer_id, date, tool, data_source, data_quality, is_active,
+              interaction_count, acceptance_count, acceptance_rate, features_used,
+              models_used, estimated_cost, tokens_consumed, raw_data)
+             VALUES (?, ?, ?, ?, ?, ?, 1, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)
+             ON CONFLICT(developer_id, date, tool) DO NOTHING`,
+        )
+        .run(randomUUID(), developerId, date, tool, SELF_REPORT_SOURCE, SELF_REPORT_QUALITY);
+
+    if (result.changes > 0) return 'created';
+
+    // A snapshot already existed — classify the outcome for the caller's message.
     const existing = db
         .prepare(
             'SELECT data_source FROM tool_snapshots WHERE developer_id = ? AND date = ? AND tool = ?',
         )
         .get(developerId, date, tool) as {data_source: string} | undefined;
-
-    if (existing) {
-        // API data wins: never overwrite a measured snapshot with a self-report.
-        if (existing.data_source !== SELF_REPORT_SOURCE) return 'api_wins';
-        // A prior self-report snapshot already marks the dev active for the day;
-        // keep it active (idempotent — no fabricated counts to accumulate).
-        db.prepare(
-            `UPDATE tool_snapshots SET is_active = 1
-             WHERE developer_id = ? AND date = ? AND tool = ? AND data_source = ?`,
-        ).run(developerId, date, tool, SELF_REPORT_SOURCE);
-        return 'already_self_report';
-    }
-
-    // No snapshot yet → create one marked self-reported / medium quality.
-    // interaction_count and features_used are left null: we don't fabricate
-    // measured counts from a self-reported time estimate. task_descriptor is
-    // deliberately NOT copied here — it stays private on the raw self_report.
-    db.prepare(
-        `INSERT INTO tool_snapshots
-         (id, developer_id, date, tool, data_source, data_quality, is_active,
-          interaction_count, acceptance_count, acceptance_rate, features_used,
-          models_used, estimated_cost, tokens_consumed, raw_data)
-         VALUES (?, ?, ?, ?, ?, ?, 1, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)`,
-    ).run(randomUUID(), developerId, date, tool, SELF_REPORT_SOURCE, SELF_REPORT_QUALITY);
-
-    return 'created';
+    return existing?.data_source === SELF_REPORT_SOURCE ? 'already_self_report' : 'api_wins';
 }
 
 export interface GetSelfReportsOptions {
