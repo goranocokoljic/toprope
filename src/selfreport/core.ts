@@ -125,6 +125,9 @@ export function createSelfReport(
             `Unknown tool '${input.tool}'. Expected one of: ${SELF_REPORT_TOOLS.join(', ')}.`,
         );
     }
+    // The TS type already narrows sourceInterface for the CLI caller, but this is
+    // an exported boundary: the Slack bot (Task 4.2) will pass a value derived at
+    // runtime, so validate it here rather than trusting the type alone.
     if (!SELF_REPORT_INTERFACES.includes(input.sourceInterface)) {
         throw new SelfReportError(
             `Unknown source interface '${input.sourceInterface}'. Expected one of: ${SELF_REPORT_INTERFACES.join(', ')}.`,
