@@ -323,4 +323,17 @@ describe('importCsv — billing model inference flag', () => {
         expect(result.inferredBillingModel).toBe(2);
         expect(activeSub(db, ids.alice, 'cursor')?.billing_model_inferred).toBe(1);
     });
+
+    it('flags an explicit-but-unrecognized billing model as inferred and warns', () => {
+        const result = importCsvInline(
+            db,
+            'developer_email,tool,plan,monthly_cost,billing_model\n' +
+                'alice@example.com,copilot,business,19,corp-card-2\n',
+        );
+        expect(result.inferredBillingModel).toBe(1);
+        expect(result.warnings.some((w) => w.includes('unrecognized billing_model'))).toBe(true);
+        const sub = activeSub(db, ids.alice, 'copilot');
+        expect(sub?.billing_model).toBe('unknown');
+        expect(sub?.billing_model_inferred).toBe(1);
+    });
 });

@@ -91,10 +91,11 @@ export function parseCsvLine(line: string): string[] {
     return fields;
 }
 
-function normalizeBillingModel(value: string): string {
+/** Normalize a billing model to a canonical value, or null if unrecognized. */
+function normalizeBillingModel(value: string): string | null {
     const normalized = value.toLowerCase().replace(/[\s-]+/g, '_');
     if (VALID_BILLING_MODELS.has(normalized)) return normalized;
-    return BILLING_MODEL_ALIASES[normalized] ?? 'unknown';
+    return BILLING_MODEL_ALIASES[normalized] ?? null;
 }
 
 /**
@@ -236,22 +237,34 @@ function normalizePeriod(raw: string): string {
 interface BillingDecision {
     model: string;
     inferred: boolean;
+    // True when an explicit cell value was present but did not map to a known
+    // billing model — so the caller can warn that the value was dropped to unknown.
+    unrecognized: boolean;
 }
 
 /**
- * Determine a charge's billing model. An explicit, present billing_model cell is
- * authoritative (inferred = false), even if its value is unrecognized (→ unknown).
- * Otherwise the model is inferred (inferred = true) from the profile's
- * default_billing_model, falling back to 'unknown' when there is nothing to go on.
+ * Determine a charge's billing model:
+ * - An explicit cell that maps to a known model is authoritative (inferred = false).
+ * - An explicit cell that does NOT map (e.g. "corp-card-2") is neither known nor a
+ *   deliberate inference — it becomes 'unknown', flagged inferred = true AND
+ *   unrecognized = true so the caller can surface that the value was dropped.
+ * - No explicit cell → inferred from the profile's default_billing_model (or
+ *   'unknown' when there is nothing to go on); inferred = true.
  */
 function decideBillingModel(rawBillingModel: string | undefined, profile: ImportProfile): BillingDecision {
     if (rawBillingModel !== undefined && rawBillingModel.trim()) {
-        return {model: normalizeBillingModel(rawBillingModel), inferred: false};
+        const normalized = normalizeBillingModel(rawBillingModel);
+        if (normalized) return {model: normalized, inferred: false, unrecognized: false};
+        return {model: 'unknown', inferred: true, unrecognized: true};
     }
     if (profile.default_billing_model && profile.default_billing_model.trim()) {
-        return {model: normalizeBillingModel(profile.default_billing_model), inferred: true};
+        return {
+            model: normalizeBillingModel(profile.default_billing_model) ?? 'unknown',
+            inferred: true,
+            unrecognized: false,
+        };
     }
-    return {model: 'unknown', inferred: true};
+    return {model: 'unknown', inferred: true, unrecognized: false};
 }
 
 /** Monthly cost for a recurring charge given its explicit cost/amount and type. */
@@ -270,8 +283,6 @@ export interface ImportOptions {
     // Named import profile to use (built-in: standard | expensify | concur, plus
     // any configured). Defaults to 'standard'.
     profile?: string;
-    // Recorded on each ledger row for provenance (defaults to the file path).
-    sourceFile?: string;
 }
 
 export function importCsv(
@@ -285,7 +296,6 @@ export function importCsv(
     }
 
     const profile = resolveProfile(options.profile ?? 'standard', expensesConfig);
-    const sourceFile = options.sourceFile ?? filePath;
 
     const content = fs.readFileSync(filePath, 'utf-8');
     const lines = content.split(/\r?\n/);
@@ -388,6 +398,12 @@ export function importCsv(
                 fieldIndex.billing_model !== undefined ? cell(row, 'billing_model') : undefined,
                 profile,
             );
+            if (billing.unrecognized) {
+                result.warnings.push(
+                    `Line ${originalLineNum}: unrecognized billing_model '${cell(row, 'billing_model')}' ` +
+                        '— stored as unknown (inferred)',
+                );
+            }
 
             const matchResult = matcher.match(email, name);
 
@@ -396,6 +412,13 @@ export function importCsv(
             // id) so the key is stable whether or not the row matched — otherwise
             // a charge imported while unmatched, then re-imported after the
             // developer is registered, would key differently and double-count.
+            //
+            // NOTE: one-time charges have monthly_cost = null, and a source with
+            // no amount column has amount = null, so amountForKey is empty. Two
+            // distinct amount-less one-time charges for the same dev+tool+period
+            // therefore collapse to one key and the second is treated as a
+            // duplicate. This is an accepted limitation — without an amount or a
+            // finer period there is nothing to tell them apart.
             const amountForKey = amount ?? monthlyCost;
             const devKey = email
                 ? `email:${email.toLowerCase()}`
@@ -428,7 +451,7 @@ export function importCsv(
                 match_status: matchResult ? 'matched' : 'unmatched',
                 match_method: matchResult ? matchResult.method : null,
                 source_profile: profile.name,
-                source_file: sourceFile,
+                source_file: filePath,
             });
 
             if (billing.inferred) result.inferredBillingModel++;
