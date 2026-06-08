@@ -35,6 +35,20 @@ function money(value: number | null): string {
     return value != null ? `$${value.toFixed(2)}` : '—';
 }
 
+/**
+ * The human-readable `message` from the result's details JSON (the most
+ * actionable field — why it was flagged), or null when absent/unparseable.
+ */
+function detailMessage(details: string | null): string | null {
+    if (!details) return null;
+    try {
+        const parsed = JSON.parse(details) as {message?: unknown};
+        return typeof parsed.message === 'string' ? parsed.message : null;
+    } catch {
+        return null;
+    }
+}
+
 function RunForm(): JSX.Element {
     const run = useRunReconciliation();
     const [period, setPeriod] = useState('');
@@ -48,7 +62,7 @@ function RunForm(): JSX.Element {
         });
     }
 
-    const periodInvalid = period.trim() !== '' && !/^\d{4}-\d{2}$/.test(period.trim());
+    const periodInvalid = period.trim() !== '' && !/^\d{4}-(0[1-9]|1[0-2])$/.test(period.trim());
     const tolInvalid =
         tolerance.trim() !== '' && (!Number.isFinite(Number(tolerance)) || Number(tolerance) < 0);
 
@@ -181,7 +195,14 @@ export function AdminReconciliation(): JSX.Element {
                         {(results.data ?? []).map((r) => (
                             <tr key={r.id} className="border-b border-border/60 align-top">
                                 <Td>{r.period}</Td>
-                                <Td>{TYPE_LABELS[r.result_type]}</Td>
+                                <Td>
+                                    {TYPE_LABELS[r.result_type]}
+                                    {detailMessage(r.details) ? (
+                                        <span className="mt-0.5 block text-xs text-muted">
+                                            {detailMessage(r.details)}
+                                        </span>
+                                    ) : null}
+                                </Td>
                                 <Td>{r.developer_name ?? <span className="text-muted">—</span>}</Td>
                                 <Td>{r.tool ?? <span className="text-muted">—</span>}</Td>
                                 <Td>{money(r.expense_amount)}</Td>

@@ -17,7 +17,7 @@ const VALID_STATUSES: readonly (ReconciliationStatus | 'all')[] = [
     'ignored',
     'all',
 ];
-const PERIOD_RE = /^\d{4}-\d{2}$/;
+const PERIOD_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
 
 /**
  * Admin Reconciliation API (Task 4.4 / #99). Exposes the expense-vs-registry

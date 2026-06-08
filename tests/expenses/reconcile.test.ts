@@ -101,6 +101,9 @@ describe('reconcilePeriod', () => {
     it('rejects a malformed period', () => {
         expect(() => reconcilePeriod(db, '2026-6')).toThrow(/Expected YYYY-MM/);
         expect(() => reconcilePeriod(db, 'June')).toThrow();
+        // Impossible months are rejected at the boundary.
+        expect(() => reconcilePeriod(db, '2026-13')).toThrow();
+        expect(() => reconcilePeriod(db, '2026-00')).toThrow();
     });
 
     it('flags an expense with no matching subscription', () => {
@@ -210,6 +213,132 @@ describe('reconcilePeriod', () => {
         expect(summary.byType.subscription_no_expense).toBe(1);
         expect(summary.byType.cost_discrepancy).toBe(1);
         expect(summary.created).toBe(3);
+    });
+
+    it('picks the latest-assigned seat on a mid-period plan change (no phantom discrepancy)', () => {
+        // Plan change inside June: old $19 seat revoked, new $39 seat assigned the
+        // same day. Both rows overlap the month; SUM-ing them would be $58 and
+        // manufacture a discrepancy against the single $39 expense charge.
+        insertSub(db, {
+            developerId: alice,
+            tool: 'copilot',
+            monthlyCost: 19,
+            assignedAt: '2026-05-01T00:00:00.000Z',
+            revokedAt: '2026-06-15T00:00:00.000Z',
+        });
+        insertSub(db, {
+            developerId: alice,
+            tool: 'copilot',
+            monthlyCost: 39,
+            assignedAt: '2026-06-15T00:00:00.000Z',
+        });
+        insertCharge(db, {developerId: alice, tool: 'copilot', monthlyCost: 39});
+
+        const summary = reconcilePeriod(db, PERIOD);
+        expect(summary.created).toBe(0);
+        expect(summary.byType.cost_discrepancy).toBe(0);
+    });
+
+    it('uses the period-end seat billing model (not MIN) for the no-expense check', () => {
+        // Earlier company_managed seat, later reimbursed seat, both overlap June.
+        // MIN(billing_model) would pick 'company_managed' and wrongly suppress.
+        insertSub(db, {
+            developerId: alice,
+            tool: 'copilot',
+            monthlyCost: 19,
+            billingModel: 'company_managed',
+            assignedAt: '2026-05-01T00:00:00.000Z',
+            revokedAt: '2026-06-10T00:00:00.000Z',
+        });
+        insertSub(db, {
+            developerId: alice,
+            tool: 'copilot',
+            monthlyCost: 19,
+            billingModel: 'reimbursed',
+            assignedAt: '2026-06-10T00:00:00.000Z',
+        });
+        const summary = reconcilePeriod(db, PERIOD);
+        expect(summary.byType.subscription_no_expense).toBe(1);
+    });
+
+    it('does not flag when the period-end seat is company-managed (earlier seat reimbursed)', () => {
+        insertSub(db, {
+            developerId: alice,
+            tool: 'copilot',
+            monthlyCost: 19,
+            billingModel: 'reimbursed',
+            assignedAt: '2026-05-01T00:00:00.000Z',
+            revokedAt: '2026-06-10T00:00:00.000Z',
+        });
+        insertSub(db, {
+            developerId: alice,
+            tool: 'copilot',
+            monthlyCost: 19,
+            billingModel: 'company_managed',
+            assignedAt: '2026-06-10T00:00:00.000Z',
+        });
+        const summary = reconcilePeriod(db, PERIOD);
+        expect(summary.created).toBe(0);
+    });
+
+    it('does not flag an annually-billed seat in a later month within the coverage window', () => {
+        insertSub(db, {
+            developerId: alice,
+            tool: 'copilot',
+            monthlyCost: 20,
+            billingModel: 'reimbursed',
+            assignedAt: '2026-01-01T00:00:00.000Z',
+        });
+        // Annual charge billed in January (monthly_cost = amount/12) covers June.
+        insertCharge(db, {
+            developerId: alice,
+            tool: 'copilot',
+            monthlyCost: 20,
+            chargeType: 'recurring_annual',
+            period: '2026-01',
+        });
+        const summary = reconcilePeriod(db, PERIOD);
+        expect(summary.created).toBe(0);
+    });
+
+    it('flags subscription_no_expense once the annual coverage window has lapsed', () => {
+        insertSub(db, {
+            developerId: alice,
+            tool: 'copilot',
+            monthlyCost: 20,
+            billingModel: 'reimbursed',
+            assignedAt: '2025-01-01T00:00:00.000Z',
+        });
+        // A 2025-01 annual charge does NOT cover 2026-06 (more than 12 months on).
+        insertCharge(db, {
+            developerId: alice,
+            tool: 'copilot',
+            monthlyCost: 20,
+            chargeType: 'recurring_annual',
+            period: '2025-01',
+        });
+        const summary = reconcilePeriod(db, PERIOD);
+        expect(summary.byType.subscription_no_expense).toBe(1);
+    });
+
+    it('surfaces a cost_discrepancy with cost_unknown when one side has no cost', () => {
+        insertSub(db, {developerId: alice, tool: 'copilot', monthlyCost: null, billingModel: 'reimbursed'});
+        insertCharge(db, {developerId: alice, tool: 'copilot', monthlyCost: 20});
+
+        const summary = reconcilePeriod(db, PERIOD);
+        expect(summary.byType.cost_discrepancy).toBe(1);
+        const [r] = listReconciliationResults(db);
+        expect(r.expense_amount).toBe(20);
+        expect(r.registry_amount).toBeNull();
+        const details = JSON.parse(r.details ?? '{}');
+        expect(details.cost_unknown).toBe(true);
+    });
+
+    it('does not flag when both sides lack a cost', () => {
+        insertSub(db, {developerId: alice, tool: 'copilot', monthlyCost: null, billingModel: 'reimbursed'});
+        insertCharge(db, {developerId: alice, tool: 'copilot', monthlyCost: null});
+        const summary = reconcilePeriod(db, PERIOD);
+        expect(summary.created).toBe(0);
     });
 
     it('is idempotent: re-running does not duplicate open results', () => {
