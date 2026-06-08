@@ -30,6 +30,7 @@ import type {
     SummaryDetail,
     SummaryLevel,
     SummaryListItem,
+    TeamComparison,
     TeamDetail,
     TeamListItem,
     TeamProviders,
@@ -189,6 +190,24 @@ export const api = {
         const body = await request<ApiEnvelope<TeamTrend>>(
             `/api/teams/${encodeURIComponent(team)}/trend${timeRangeQueryString(params)}`,
         );
+        return body.data;
+    },
+
+    /**
+     * Rich side-by-side comparison of 2–4 teams over a time window (admin). The
+     * caller passes the selected team names; the server validates the 2–4 bound
+     * and assembles per-metric rows, tiers, and one trend line per team.
+     */
+    async getCompare(teams: string[], params: TimeRangeQuery): Promise<TeamComparison> {
+        const search = new URLSearchParams();
+        search.set('teams', teams.join(','));
+        if (params.range) {
+            search.set('range', params.range);
+        } else {
+            if (params.from) search.set('from', params.from);
+            if (params.to) search.set('to', params.to);
+        }
+        const body = await request<ApiEnvelope<TeamComparison>>(`/api/compare?${search.toString()}`);
         return body.data;
     },
 
