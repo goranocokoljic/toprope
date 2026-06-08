@@ -350,6 +350,11 @@ devCommand
             const configPath = path.resolve(process.cwd(), options.config);
             const db = openRegistryDb(configPath);
             try {
+                // Normalize the Slack id once so the uniqueness conflict check and
+                // the stored value (linkDeveloper also trims) compare the SAME
+                // string — otherwise a padded `--slack " U "` slips past the check
+                // and can map two developers to one Slack id (wrong-developer risk).
+                const slack = options.slack?.trim() || undefined;
                 const hasUpdate =
                     options.copilot ||
                     options.claude ||
@@ -358,7 +363,7 @@ devCommand
                     options.github ||
                     options.bitbucket ||
                     options.gitlab ||
-                    options.slack ||
+                    slack ||
                     options.gitEmail.length > 0;
                 if (!hasUpdate) {
                     console.error(
@@ -370,7 +375,7 @@ devCommand
                     {provider: 'github', value: options.github},
                     {provider: 'bitbucket', value: options.bitbucket},
                     {provider: 'gitlab', value: options.gitlab},
-                    {provider: 'slack', value: options.slack},
+                    {provider: 'slack', value: slack},
                 ];
                 for (const {provider, value} of conflictChecks) {
                     if (!value) continue;
@@ -399,7 +404,7 @@ devCommand
                     github: options.github,
                     bitbucket: options.bitbucket,
                     gitlab: options.gitlab,
-                    slack: options.slack,
+                    slack,
                     gitEmails: options.gitEmail,
                 });
                 if (!dev) {

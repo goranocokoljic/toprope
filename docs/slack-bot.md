@@ -52,11 +52,22 @@ slack:
 ## Linking developers
 
 Map each developer to their Slack user id (find it in their Slack profile →
-"Copy member ID"):
+"Copy member ID"). Linking is **CLI-only** — the admin dashboard identity editor
+does not currently expose Slack:
 
 ```
 govproxy dev link --id <developer-id> --slack U0123ABCD
 ```
 
 A Slack id can be linked to only one developer; attempting to reuse one is
-rejected, exactly like the other provider identities.
+rejected, exactly like the other provider identities. The value is trimmed on
+both the conflict check and the write, so surrounding whitespace can't create a
+duplicate mapping.
+
+## Confirmations are best-effort
+
+After a successful log, the bot sends a confirmation DM, and the daily prompt is
+posted via `chat.postMessage`. These are best-effort: a Slack delivery failure is
+logged but never rolls back an already-committed report (and DMing a user may
+require the bot to be reachable in a DM). The self-report is the source of truth,
+not the confirmation message.
