@@ -304,6 +304,16 @@ export interface AggregationSchedulerOptions {
     migrationsDir?: string;
     /** Injectable clock for resolving the just-completed period; defaults to wall clock. */
     now?: () => Date;
+    /**
+     * Optional anomaly Slack notifier (Task 4.8), invoked after a SUCCESSFUL
+     * weekly job (the weekly scan has just run). Takes no period: it sweeps every
+     * open, unannounced team anomaly rather than one period's, so a delivery
+     * missed on a prior week still goes out. Fire-and-forget by contract — it owns
+     * its own DB handle, so it is called AFTER this job's handle closes and any
+     * error inside it must never affect the aggregation result. Absent → no
+     * anomaly alerts (the launch/no-Slack default).
+     */
+    notifier?: () => void;
 }
 
 /**
@@ -336,16 +346,17 @@ export function runScheduledAggregationJob(
         logger.jobFailure(period, justCompletedPeriod(period, now), err);
         return null;
     }
+    let result: ScheduledJobResult;
     try {
         runMigrations(db, migrationsDir);
         // runScheduledJob is self-isolating and never throws.
-        return runScheduledJob(db, period, now, logger);
+        result = runScheduledJob(db, period, now, logger);
     } catch (err) {
         // Guards only the migration step (the one call above that can throw) so a
         // migration error still logs rather than escaping into node-cron.
         const periodKey = justCompletedPeriod(period, now);
         logger.jobFailure(period, periodKey, err);
-        return {
+        result = {
             period,
             periodKey,
             rowsWritten: 0,
@@ -355,6 +366,19 @@ export function runScheduledAggregationJob(
     } finally {
         db.close();
     }
+
+    // Anomaly Slack alerts (Task 4.8): fire AFTER the job's DB handle closes (the
+    // notifier owns its own handle) and only on a successful weekly job, where the
+    // scan that produced the anomalies has just run. Best-effort: a notifier
+    // failure is logged against the level but never changes the job's result.
+    if (result.ok && period === 'weekly' && options.notifier) {
+        try {
+            options.notifier();
+        } catch (err) {
+            logger.jobFailure(period, result.periodKey, err);
+        }
+    }
+    return result;
 }
 
 /**

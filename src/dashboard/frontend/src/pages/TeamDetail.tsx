@@ -1,5 +1,7 @@
 import {Link, useParams} from 'react-router-dom';
 import {useTeamDetail, useTeamProviders, useTeamTrend, useTeamWaste} from '../hooks/useTeamData';
+import {useAnomalies} from '../hooks/useAnomalies';
+import {severityTone, severityLabel} from '../components/anomalies';
 import {useTimeRange} from '../hooks/useTimeRange';
 import {ApiError} from '../api/client';
 import {Card, StatCard} from '../components/Card';
@@ -286,6 +288,44 @@ function WasteAlerts({team}: {team: string}): JSX.Element {
     );
 }
 
+// --- Inline anomaly flags --------------------------------------------------
+
+/**
+ * Inline anomaly flags for the team (Task 4.8). Reads the open team-anomaly list
+ * and shows the ones for THIS team beside its metrics — a severity-toned flag per
+ * affected metric, with the honest basis label and a link to the full panel. Only
+ * rendered when the team has open anomalies, so a clean team shows nothing.
+ */
+function AnomalyFlags({team}: {team: string}): JSX.Element | null {
+    const {data} = useAnomalies('open');
+    const flags = (data ?? []).filter((a) => a.team === team);
+    if (flags.length === 0) return null;
+
+    return (
+        <Card title="Anomaly flags">
+            <ul className="space-y-2">
+                {flags.map((a) => (
+                    <li key={a.id} className="flex items-start justify-between gap-3" data-testid="team-anomaly-flag">
+                        <span className="flex flex-wrap items-center gap-2">
+                            <Badge tone={severityTone(a.severity)}>{severityLabel(a.severity)}</Badge>
+                            <span className="text-sm text-foreground">{a.description}</span>
+                        </span>
+                        <Badge tone="neutral" title="What this anomaly is derived from">
+                            {a.basis_label}
+                        </Badge>
+                    </li>
+                ))}
+            </ul>
+            <Link
+                to="/manager/anomalies"
+                className="mt-3 inline-block text-sm font-medium text-accent hover:underline"
+            >
+                View anomalies →
+            </Link>
+        </Card>
+    );
+}
+
 // --- Page ------------------------------------------------------------------
 
 function LoadingDetail(): JSX.Element {
@@ -346,6 +386,7 @@ export function TeamDetail(): JSX.Element {
             {!isPending && !isError && data ? (
                 <>
                     <SummaryCards team={data} />
+                    <AnomalyFlags team={team} />
                     <AdoptionTrend team={team} />
                     <MaturityTrendCard
                         scope={team}

@@ -65,6 +65,8 @@ describe('settings store', () => {
                     'survey_plan_change_auto',
                     'survey_anomaly_auto',
                     'survey_managers_can_override',
+                    'anomaly_alerts_enabled',
+                    'anomaly_managers_can_override',
                 ].sort(),
             );
         });
