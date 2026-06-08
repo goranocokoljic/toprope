@@ -6,6 +6,11 @@ import {buildDailyPromptMessage} from './blocks';
 
 const DEFAULT_PROMPT_TIME = '16:00';
 
+// HH:MM, 00:00–23:59. Guards the admin-edited daily_prompt.time before it reaches
+// cron.schedule, which would otherwise throw on a malformed expression and abort
+// server startup (the prompt is optional — a typo must not take the server down).
+const HH_MM = /^([01]\d|2[0-3]):[0-5]\d$/;
+
 /**
  * Post the daily self-report prompt to each configured channel. Each channel is
  * independent — a failure posting to one is logged and the rest still go out.
@@ -39,17 +44,26 @@ export interface StartDailyPromptOptions {
  * explicitly opted in and actually deliverable.
  */
 export function startSlackDailyPrompt(
-    config: SlackBotConfig,
+    config: SlackBotConfig | undefined,
     options: StartDailyPromptOptions = {},
 ): ReturnType<typeof cron.schedule>[] {
-    if (!config.enabled || !config.daily_prompt?.enabled) return [];
+    if (!config?.enabled || !config.daily_prompt?.enabled) return [];
 
     const channels = config.daily_prompt.channels ?? [];
     if (channels.length === 0) return [];
     if (!options.client && !config.bot_token) return [];
 
     const client = options.client ?? createSlackClient(config.bot_token ?? '');
-    const cronExpr = parseSyncTimeToCron(config.daily_prompt.time ?? DEFAULT_PROMPT_TIME);
+
+    const configuredTime = config.daily_prompt.time ?? DEFAULT_PROMPT_TIME;
+    let time = configuredTime;
+    if (!HH_MM.test(time)) {
+        console.error(
+            `[slack] invalid daily_prompt.time '${configuredTime}' (expected HH:MM) — falling back to ${DEFAULT_PROMPT_TIME}.`,
+        );
+        time = DEFAULT_PROMPT_TIME;
+    }
+    const cronExpr = parseSyncTimeToCron(time);
 
     const task = cron.schedule(
         cronExpr,

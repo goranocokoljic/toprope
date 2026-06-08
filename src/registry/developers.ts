@@ -235,7 +235,9 @@ export function linkDeveloper(
     if (updates.cursor !== undefined) existing.cursor = updates.cursor;
     if (updates.bitbucket !== undefined) existing.bitbucket = updates.bitbucket;
     if (updates.gitlab !== undefined) existing.gitlab = updates.gitlab;
-    if (updates.slack !== undefined) existing.slack = updates.slack;
+    // Trim the Slack id on write so it matches the trimmed lookup in
+    // findBySlackUserId — a padded value must not become an unresolvable mapping.
+    if (updates.slack !== undefined) existing.slack = updates.slack.trim();
     if (updates.gitEmails && updates.gitEmails.length > 0) {
         const current = existing.git_emails ? existing.git_emails.split(',') : [];
         existing.git_emails = joinGitEmails([...current, ...updates.gitEmails]);

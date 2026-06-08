@@ -7,9 +7,9 @@ export interface SlackClient {
     openView(triggerId: string, view: SlackView): Promise<void>;
     // Post a message to a channel or DM (channel = a channel id or a user id for a DM).
     postMessage(channel: string, text: string, blocks?: SlackBlock[]): Promise<void>;
-    // POST a JSON payload to an interaction's response_url (e.g. to delete the
-    // original message when a prompt is dismissed).
-    respond(responseUrl: string, body: Record<string, unknown>): Promise<void>;
+    // Delete the message behind an interaction's response_url (used to dismiss the
+    // daily prompt).
+    deleteMessage(responseUrl: string): Promise<void>;
 }
 
 const SLACK_API_BASE = 'https://slack.com/api';
@@ -62,11 +62,11 @@ export function createSlackClient(botToken: string): SlackClient {
                 ...(blocks ? {blocks} : {}),
             });
         },
-        async respond(responseUrl, body): Promise<void> {
+        async deleteMessage(responseUrl): Promise<void> {
             const res = await fetch(responseUrl, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json; charset=utf-8'},
-                body: JSON.stringify(body),
+                body: JSON.stringify({delete_original: true}),
             });
             if (!res.ok) {
                 throw new Error(`Slack response_url HTTP ${res.status}`);

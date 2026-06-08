@@ -14,9 +14,6 @@ export const ACTION_MINUTES = 'minutes_select';
 export const BLOCK_TASK = 'task_block';
 export const ACTION_TASK = 'task_input';
 
-// The slash command developers invoke. Exposed for docs/help text.
-export const SLASH_COMMAND = '/govproxy-log';
-
 // Human labels for each self-reportable tool, in the order they appear in the form.
 const TOOL_LABELS: Record<SelfReportTool, string> = {
     copilot: 'GitHub Copilot',

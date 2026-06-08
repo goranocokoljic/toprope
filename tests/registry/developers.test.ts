@@ -383,6 +383,14 @@ describe('slack identity mapping', () => {
         expect(findBySlackUserId(db, '   ')).toBeNull();
     });
 
+    it('trims a padded slack id on write so it resolves on lookup', () => {
+        const dev = addDeveloper(db, 'Alice', 'frontend');
+        linkDeveloper(db, dev.id, {slack: '  U_ALICE  '});
+        const stored = getDeveloperById(db, dev.id);
+        expect(stored?.external_ids.slack).toBe('U_ALICE');
+        expect(findBySlackUserId(db, 'U_ALICE')?.id).toBe(dev.id);
+    });
+
     it('finds a slack-linked developer via findByExternalId for conflict checks', () => {
         const dev = addDeveloper(db, 'Bob', 'frontend');
         linkDeveloper(db, dev.id, {slack: 'U_BOB'});

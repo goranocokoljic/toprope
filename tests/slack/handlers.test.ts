@@ -239,15 +239,14 @@ describe('handleInteraction — block actions', () => {
             actions: [{action_id: ACTION_DISMISS_PROMPT}],
         };
         await handleInteraction(payload, {db, client});
-        expect(client.respondCalls).toHaveLength(1);
-        expect(client.respondCalls[0].responseUrl).toBe('https://hooks.slack.test/abc');
-        expect(client.respondCalls[0].body).toMatchObject({delete_original: true});
+        expect(client.deleteMessageCalls).toHaveLength(1);
+        expect(client.deleteMessageCalls[0].responseUrl).toBe('https://hooks.slack.test/abc');
     });
 
     it('acknowledges an unknown interaction type without side effects', async () => {
         const result = await handleInteraction({type: 'something_else'}, {db, client});
         expect(result.status).toBe(200);
         expect(client.openViewCalls).toHaveLength(0);
-        expect(client.respondCalls).toHaveLength(0);
+        expect(client.deleteMessageCalls).toHaveLength(0);
     });
 });

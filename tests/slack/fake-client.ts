@@ -10,9 +10,8 @@ export interface PostMessageCall {
     text: string;
     blocks?: SlackBlock[];
 }
-export interface RespondCall {
+export interface DeleteMessageCall {
     responseUrl: string;
-    body: Record<string, unknown>;
 }
 
 // Recording fake of SlackClient for handler/route tests. By default every call
@@ -21,11 +20,11 @@ export interface RespondCall {
 export class FakeSlackClient implements SlackClient {
     openViewCalls: OpenViewCall[] = [];
     postMessageCalls: PostMessageCall[] = [];
-    respondCalls: RespondCall[] = [];
+    deleteMessageCalls: DeleteMessageCall[] = [];
 
     openViewError: Error | null = null;
     postMessageError: Error | null = null;
-    respondError: Error | null = null;
+    deleteMessageError: Error | null = null;
 
     async openView(triggerId: string, view: SlackView): Promise<void> {
         this.openViewCalls.push({triggerId, view});
@@ -35,8 +34,8 @@ export class FakeSlackClient implements SlackClient {
         this.postMessageCalls.push({channel, text, blocks});
         if (this.postMessageError) throw this.postMessageError;
     }
-    async respond(responseUrl: string, body: Record<string, unknown>): Promise<void> {
-        this.respondCalls.push({responseUrl, body});
-        if (this.respondError) throw this.respondError;
+    async deleteMessage(responseUrl: string): Promise<void> {
+        this.deleteMessageCalls.push({responseUrl});
+        if (this.deleteMessageError) throw this.deleteMessageError;
     }
 }

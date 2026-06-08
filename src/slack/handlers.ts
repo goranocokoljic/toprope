@@ -117,12 +117,13 @@ export async function handleInteraction(
     deps: SlackHandlerDeps,
 ): Promise<SlackHandlerResult> {
     const obj = asRecord(payload);
+    if (!obj) return ACK;
     const type = getString(obj, 'type');
     if (type === 'view_submission') {
-        return handleViewSubmission(obj as Record<string, unknown>, deps);
+        return handleViewSubmission(obj, deps);
     }
     if (type === 'block_actions') {
-        return handleBlockActions(obj as Record<string, unknown>, deps);
+        return handleBlockActions(obj, deps);
     }
     // Unknown interaction types are acknowledged so Slack doesn't retry.
     return ACK;
@@ -208,14 +209,13 @@ export async function handleViewSubmission(
         throw err;
     }
 
-    // Confirmation DM is best-effort: the report is already committed, so a Slack
-    // hiccup here must not turn a successful log into an error for the user.
+    // Confirmation DM is best-effort and fire-and-forget: the report is already
+    // committed, and Slack expects the view_submission response within ~3s — so we
+    // must NOT block the modal-closing ACK on a (possibly slow) chat.postMessage.
     const confirmation = buildConfirmationText(tool, minutes, date, snapshot);
-    try {
-        await deps.client.postMessage(slackUserId, confirmation);
-    } catch (err) {
-        logError(deps, 'failed to post confirmation DM', err);
-    }
+    void deps.client
+        .postMessage(slackUserId, confirmation)
+        .catch((err) => logError(deps, 'failed to post confirmation DM', err));
 
     // Empty 200 closes the modal cleanly.
     return ACK;
@@ -265,7 +265,7 @@ export async function handleBlockActions(
     if (actionId === ACTION_DISMISS_PROMPT && responseUrl) {
         // Dismissible: delete the original prompt message so it doesn't linger.
         try {
-            await deps.client.respond(responseUrl, {delete_original: true});
+            await deps.client.deleteMessage(responseUrl);
         } catch (err) {
             logError(deps, 'failed to dismiss prompt', err);
         }

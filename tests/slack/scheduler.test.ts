@@ -36,9 +36,23 @@ describe('startSlackDailyPrompt gating', () => {
         expect(startSlackDailyPrompt({enabled: true, daily_prompt: {enabled: true, channels: []}}, {client})).toEqual([]);
     });
 
+    it('does nothing when config is undefined', () => {
+        expect(startSlackDailyPrompt(undefined, {client})).toEqual([]);
+    });
+
     it('schedules a task when enabled with channels', () => {
         const tasks = startSlackDailyPrompt(
             {enabled: true, daily_prompt: {enabled: true, time: '16:00', channels: ['C1']}},
+            {client},
+        );
+        expect(tasks).toHaveLength(1);
+        tasks.forEach((t) => t.stop());
+    });
+
+    it('falls back to the default time (no throw) when the configured time is malformed', () => {
+        // A bad time must not crash scheduling/server startup.
+        const tasks = startSlackDailyPrompt(
+            {enabled: true, daily_prompt: {enabled: true, time: '25:99', channels: ['C1']}},
             {client},
         );
         expect(tasks).toHaveLength(1);

@@ -131,8 +131,9 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
         // period. Gated on summaries config (a disabled level registers no task);
         // quarterly/yearly are on-demand only and never scheduled here.
         const summaryTasks = startSummaryScheduler(dbPath, config.summaries);
-        // Optional end-of-day Slack prompt (gated on slack + daily_prompt config).
-        const slackPromptTasks = config.slack ? startSlackDailyPrompt(config.slack) : [];
+        // Optional end-of-day Slack prompt. startSlackDailyPrompt self-gates on
+        // slack.enabled + daily_prompt.enabled + channels, returning [] otherwise.
+        const slackPromptTasks = startSlackDailyPrompt(config.slack);
         app.addHook('onClose', () => {
             for (const task of [
                 ...connectorTasks,
