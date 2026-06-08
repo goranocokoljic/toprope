@@ -350,12 +350,19 @@ export function declineSurvey(
     surveyId: string,
     developerId: string,
 ): RespondOutcome {
-    const survey = getSurveyById(db, surveyId);
-    if (!survey) return 'not_found';
-    if (survey.developer_id !== developerId) return 'forbidden';
-    if (survey.status !== 'sent') return 'invalid_status';
-    db.prepare("UPDATE surveys SET status = 'declined' WHERE id = ?").run(surveyId);
-    return 'ok';
+    const tx = db.transaction((): RespondOutcome => {
+        const survey = getSurveyById(db, surveyId);
+        if (!survey) return 'not_found';
+        if (survey.developer_id !== developerId) return 'forbidden';
+        if (survey.status !== 'sent') return 'invalid_status';
+        // Guard the transition on status too, symmetric with respondToSurvey, so
+        // a concurrent answer/decline can't both land.
+        db.prepare("UPDATE surveys SET status = 'declined' WHERE id = ? AND status = 'sent'").run(
+            surveyId,
+        );
+        return 'ok';
+    });
+    return tx();
 }
 
 function normalizeText(text: string | null | undefined): string | null {

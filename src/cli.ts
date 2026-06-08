@@ -1608,6 +1608,9 @@ surveyCommand
             console.log(`  Auto-sent:           ${summary.autoSent}`);
             console.log(`  Queued for manager:  ${summary.queued}`);
             console.log(`  Skipped (duplicate): ${summary.duplicates}`);
+            if (summary.retried > 0) {
+                console.log(`  Stranded retried:    ${summary.retried} (recovered ${summary.recovered})`);
+            }
             if (summary.undeliverable > 0) {
                 console.log(`  Undeliverable:       ${summary.undeliverable} (left queued)`);
             }

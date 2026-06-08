@@ -23,8 +23,8 @@ import {
     createSurvey,
     getSurveyById,
     hasRecentOpenSurvey,
+    listSurveys,
     markSurveySent,
-    type SurveyWithContext,
 } from './store';
 import {buildSurveyQuestion} from './templates';
 import type {SurveyTriggerCandidate, TriggerDetectionOptions} from './triggers';
@@ -111,7 +111,33 @@ export async function sendSurvey(deps: DispatchDeps, surveyId: string): Promise<
         }
     }
 
+    // No channel could deliver. Log it so a stranded survey leaves a trace
+    // (otherwise an auto-send that never reaches the developer is invisible).
+    logErr(deps, `Survey ${survey.id} is undeliverable (no Slack id and no email/emailer); left queued`);
     return {delivered: false, reason: 'undeliverable'};
+}
+
+/**
+ * Re-attempt delivery of surveys that are still queued but should have
+ * auto-sent — i.e. an automated-trigger survey whose team setting is auto, left
+ * queued by a prior failed/undeliverable send. This is what lets a transient
+ * Slack/email outage self-heal on the next sweep instead of stranding the survey
+ * forever (it would otherwise be deduped, never recreated, and never retried).
+ * Manual surveys are skipped: they wait for an explicit manager send.
+ */
+export async function resendStrandedAutoSurveys(
+    deps: DispatchDeps,
+): Promise<{retried: number; recovered: number}> {
+    let retried = 0;
+    let recovered = 0;
+    for (const survey of listSurveys(deps.db, {status: 'queued'})) {
+        if (!isAutomatedTriggerType(survey.trigger_type as SurveyTriggerType)) continue;
+        if (!isAutoSend(deps.db, survey.trigger_type as SurveyTriggerType, survey.team)) continue;
+        retried++;
+        const result = await sendSurvey(deps, survey.id);
+        if (result.delivered) recovered++;
+    }
+    return {retried, recovered};
 }
 
 export type DispatchResult =
@@ -197,17 +223,25 @@ export interface SweepSummary {
     queued: number;
     duplicates: number;
     undeliverable: number;
+    // Stranded auto-surveys re-attempted this sweep, and how many of those
+    // finally went out (a transient outage self-healing).
+    retried: number;
+    recovered: number;
 }
 
 /**
- * Detect every data-backed trigger and dispatch each candidate. Returns a
- * summary suitable for a CLI/scheduler report. Anomaly triggers are not included
- * (their source, Task 4.7, isn't built — see triggers.ts).
+ * Detect every data-backed trigger and dispatch each candidate, then re-attempt
+ * any auto-surveys still stranded in the queue from a prior failed send. Returns
+ * a summary suitable for a CLI/scheduler report. Anomaly triggers are not
+ * included (their source, Task 4.7, isn't built — see triggers.ts).
  */
 export async function runTriggerSweep(
     deps: DispatchDeps,
     options: TriggerDetectionOptions & CreateAndDispatchOptions = {},
 ): Promise<SweepSummary> {
+    // Retry stranded auto-surveys first, so a candidate deduped against an
+    // existing queued survey doesn't mask that the survey never actually sent.
+    const {retried, recovered} = await resendStrandedAutoSurveys(deps);
     const candidates = detectAllTriggers(deps.db, options);
     const summary: SweepSummary = {
         candidates: candidates.length,
@@ -216,6 +250,8 @@ export async function runTriggerSweep(
         queued: 0,
         duplicates: 0,
         undeliverable: 0,
+        retried,
+        recovered,
     };
 
     for (const candidate of candidates) {
@@ -242,6 +278,3 @@ export async function runTriggerSweep(
 function thirtyDaysAgoIso(): string {
     return new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
 }
-
-// Re-export the manager-view row type for API/CLI convenience.
-export type {SurveyWithContext};

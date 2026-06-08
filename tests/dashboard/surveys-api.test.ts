@@ -144,6 +144,29 @@ describe('survey API', () => {
         expect(data[0].status).toBe('declined');
     });
 
+    it('rejects an over-long manager question and an over-long response', async () => {
+        const admin = await login(app, 'admin@test.com');
+        const tooLongQuestion = 'x'.repeat(2001);
+        const badCreate = await app.inject({
+            method: 'POST',
+            url: '/api/surveys',
+            headers: authHeaders(admin),
+            payload: {developerId: 'alice', questionText: tooLongQuestion},
+        });
+        expect(badCreate.statusCode).toBe(400);
+
+        const survey = createManualSurvey(db, {developerId: 'alice', questionText: 'Q?'});
+        markSurveySent(db, survey!.id, 'email');
+        const alice = await login(app, 'alice@test.com');
+        const badRespond = await app.inject({
+            method: 'POST',
+            url: `/api/me/surveys/${survey!.id}/respond`,
+            headers: authHeaders(alice),
+            payload: {text: 'y'.repeat(4001)},
+        });
+        expect(badRespond.statusCode).toBe(400);
+    });
+
     it('manager can dismiss a queued survey', async () => {
         const survey = createManualSurvey(db, {developerId: 'alice', questionText: 'Q?'});
         const admin = await login(app, 'admin@test.com');

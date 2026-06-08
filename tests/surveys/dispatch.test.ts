@@ -12,6 +12,7 @@ import {
     createManualSurvey,
     createAndDispatch,
     isAutoSend,
+    resendStrandedAutoSurveys,
     runTriggerSweep,
     sendSurvey,
     type DispatchDeps,
@@ -257,6 +258,47 @@ describe('runTriggerSweep', () => {
         const summary = await runTriggerSweep({db, slackClient: slack});
         expect(summary.autoSent).toBe(1);
         expect(slack.postMessageCalls).toHaveLength(1);
+        db.close();
+    });
+
+    it('retries a stranded auto-survey on the next sweep and recovers it', async () => {
+        const db = makeDb();
+        setGlobalSetting(db, 'survey_usage_drop_auto', true);
+        const dev = addDeveloper(db, 'Alice', 'eng', 'alice@example.com').id;
+        linkDeveloper(db, dev, {slack: 'U_ALICE'});
+        insertMonthlyDrop(db, dev);
+
+        // First sweep: Slack down and no emailer → survey stranded queued.
+        const slack = new FakeSlackClient();
+        slack.postMessageError = new Error('slack down');
+        const first = await runTriggerSweep({db, slackClient: slack, log: () => {}});
+        expect(first.created).toBe(1);
+        expect(first.autoSent).toBe(0);
+        expect(first.undeliverable).toBe(1);
+        expect(listSurveys(db, {status: 'queued'})).toHaveLength(1);
+
+        // Slack recovers: next sweep retries the stranded survey and sends it.
+        slack.postMessageError = null;
+        const second = await runTriggerSweep({db, slackClient: slack, log: () => {}});
+        expect(second.retried).toBe(1);
+        expect(second.recovered).toBe(1);
+        // The re-detected candidate is deduped against the now-sent survey.
+        expect(second.created).toBe(0);
+        expect(listSurveys(db, {status: 'sent'})).toHaveLength(1);
+        db.close();
+    });
+
+    it('resendStrandedAutoSurveys ignores manual + non-auto queued surveys', async () => {
+        const db = makeDb();
+        // usage_drop auto OFF (default) → a queued usage_drop survey is NOT a
+        // stranded auto-send; a manual survey is never auto-sent either.
+        const dev = addDeveloper(db, 'Alice', 'eng', 'alice@example.com').id;
+        linkDeveloper(db, dev, {slack: 'U_ALICE'});
+        createManualSurvey(db, {developerId: dev, questionText: 'Q?'});
+        const slack = new FakeSlackClient();
+        const result = await resendStrandedAutoSurveys({db, slackClient: slack});
+        expect(result.retried).toBe(0);
+        expect(slack.postMessageCalls).toHaveLength(0);
         db.close();
     });
 });

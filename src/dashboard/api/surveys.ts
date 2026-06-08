@@ -1,8 +1,7 @@
-import type {FastifyInstance, FastifyReply, FastifyRequest} from 'fastify';
+import type {FastifyInstance, FastifyReply} from 'fastify';
 import type Database from 'better-sqlite3';
 import {getDeveloperById} from '../../registry/developers';
 import {
-    createAndDispatch,
     createManualSurvey,
     runTriggerSweep,
     sendSurvey,
@@ -24,7 +23,15 @@ import {
     type SurveyChoice,
     type SurveyStatus,
 } from '../../surveys/types';
-import {forbidden, isAdmin} from './guards';
+import {forbidden, isAdmin, requireDeveloperId} from './guards';
+import {badRequest, conflict, notFound} from './admin/helpers';
+
+// Boundary caps on the one untrusted free-text fields (developer response text
+// and a manager-authored question). Without these, an authenticated caller can
+// persist an unbounded string that's then surfaced verbatim to every manager
+// read. Generous enough for a real answer; small enough to stop storage abuse.
+const MAX_RESPONSE_TEXT = 4000;
+const MAX_QUESTION_TEXT = 2000;
 
 /**
  * Data-prompted survey endpoints (Task 4.3 / #98).
@@ -103,6 +110,9 @@ export function registerSurveyRoutes(
             const questionText = typeof body.questionText === 'string' ? body.questionText.trim() : '';
             if (!developerId) return badRequest(reply, 'developerId is required');
             if (!questionText) return badRequest(reply, 'questionText is required');
+            if (questionText.length > MAX_QUESTION_TEXT) {
+                return badRequest(reply, `questionText must be at most ${MAX_QUESTION_TEXT} characters`);
+            }
             const choices = parseChoices(body.choices);
             const survey = createManualSurvey(db, {developerId, questionText, choices});
             if (!survey) return notFound(reply, 'Developer not found');
@@ -165,6 +175,9 @@ export function registerSurveyRoutes(
             if (!responseChoice && !responseText) {
                 return badRequest(reply, 'Provide a choice or text');
             }
+            if (responseText && responseText.length > MAX_RESPONSE_TEXT) {
+                return badRequest(reply, `text must be at most ${MAX_RESPONSE_TEXT} characters`);
+            }
             const outcome = respondToSurvey(db, request.params.id, developerId, {
                 responseChoice,
                 responseText,
@@ -181,9 +194,6 @@ export function registerSurveyRoutes(
         return mapOutcome(reply, outcome, () => ({data: {id: request.params.id, status: 'declined'}}));
     });
 }
-
-// Re-export so the server can wire detection + auto-dispatch on demand.
-export {createAndDispatch};
 
 // --- helpers ------------------------------------------------------------------
 
@@ -212,26 +222,6 @@ function parseChoices(raw: unknown): SurveyChoice[] | undefined {
     return out.length > 0 ? out : undefined;
 }
 
-/**
- * Resolve the session's developer id, or send the appropriate error and return
- * null — mirrors the pattern in me.ts (401 unauthenticated, 404 no linked dev).
- */
-function requireDeveloperId(request: FastifyRequest, reply: FastifyReply): string | null {
-    if (!request.authUser) {
-        reply.status(401).send({error: 'Unauthorized', message: 'Authentication required'});
-        return null;
-    }
-    const developerId = request.authUser.developerId;
-    if (!developerId) {
-        reply.status(404).send({
-            error: 'Not Found',
-            message: 'No developer profile linked to this account',
-        });
-        return null;
-    }
-    return developerId;
-}
-
 function mapOutcome(
     reply: FastifyReply,
     outcome: RespondOutcome,
@@ -248,17 +238,12 @@ function mapOutcome(
             return notFound(reply, 'Survey not found');
         case 'invalid_status':
             return conflict(reply, 'Survey is not awaiting a response');
+        default:
+            // Exhaustive over RespondOutcome — a new member becomes a compile error.
+            return assertNever(outcome);
     }
 }
 
-function badRequest(reply: FastifyReply, message: string): FastifyReply {
-    return reply.status(400).send({error: 'Bad Request', message});
-}
-
-function notFound(reply: FastifyReply, message: string): FastifyReply {
-    return reply.status(404).send({error: 'Not Found', message});
-}
-
-function conflict(reply: FastifyReply, message: string): FastifyReply {
-    return reply.status(409).send({error: 'Conflict', message});
+function assertNever(value: never): never {
+    throw new Error(`Unhandled respond outcome: ${String(value)}`);
 }

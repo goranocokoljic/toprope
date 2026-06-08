@@ -33,6 +33,7 @@ import {startSlackDailyPrompt} from './slack/scheduler';
 import {createSlackClient} from './slack/client';
 import {registerSurveyRoutes} from './dashboard/api/surveys';
 import {createLogEmailer} from './surveys/email';
+import {startSurveyScheduler} from './surveys/scheduler';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, './storage/migrations');
 
@@ -152,12 +153,17 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
         // Optional end-of-day Slack prompt. startSlackDailyPrompt self-gates on
         // slack.enabled + daily_prompt.enabled + channels, returning [] otherwise.
         const slackPromptTasks = startSlackDailyPrompt(config.slack);
+        // Optional daily survey trigger sweep (Task 4.3). Self-gates on
+        // surveys.enabled, returning [] otherwise. Runs detection + dispatch and
+        // retries stranded auto-surveys.
+        const surveyTasks = startSurveyScheduler(dbPath, config as GovProxyConfig);
         app.addHook('onClose', () => {
             for (const task of [
                 ...connectorTasks,
                 ...aggregationTasks,
                 ...summaryTasks,
                 ...slackPromptTasks,
+                ...surveyTasks,
             ])
                 task.stop();
         });
