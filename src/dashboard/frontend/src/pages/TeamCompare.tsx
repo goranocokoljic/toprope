@@ -11,7 +11,7 @@ import {ErrorState} from '../components/ErrorState';
 import {EmptyState} from '../components/EmptyState';
 import {toolLabel} from '../components/toolLabels';
 import {formatCurrency, formatPercent, formatCount, formatDateTick} from '../components/format';
-import {tierLabel, tierTone, tierDescription} from '../components/tier';
+import {tierLabel, tierTone, tierDescription, tierBreakdownSummary} from '../components/tier';
 import {maturityBasisLabel, maturityBasisDescription} from '../components/maturity';
 import {mergeCompareTrends} from '../compare/mergeTrends';
 import {MIN_COMPARE_TEAMS, MAX_COMPARE_TEAMS} from '../compare/limits';
@@ -165,7 +165,10 @@ const METRIC_ROWS: MetricRow[] = [
     {
         key: 'maturity',
         label: 'AI maturity score',
-        note: 'git-based estimate at launch',
+        // The basis (git-based estimate) is shown per cell by MaturityValue; the
+        // note clarifies the score is the latest overlapping quarter, not a
+        // window average.
+        note: 'latest quarter',
         value: (m) => <MaturityValue metrics={m} />,
     },
     {
@@ -178,6 +181,10 @@ const METRIC_ROWS: MetricRow[] = [
 function ComparisonTable({teams}: {teams: CompareTeam[]}): JSX.Element {
     return (
         <Card title="Side-by-side metrics">
+            <p className="mb-3 text-xs text-muted">
+                Each team&apos;s data-quality tier reflects its current connection (all-time), not the selected
+                range — metrics below are scoped to the range.
+            </p>
             <div className="overflow-x-auto rounded-card border border-border">
                 <table className="w-full border-collapse text-sm">
                     <caption className="sr-only">
@@ -199,7 +206,12 @@ function ComparisonTable({teams}: {teams: CompareTeam[]}): JSX.Element {
                                 >
                                     <div className="flex flex-col items-end gap-1">
                                         <span className="text-sm font-semibold text-foreground">{team.name}</span>
-                                        <Badge tone={tierTone(team.tier)} title={tierDescription(team.tier)}>
+                                        <Badge
+                                            tone={tierTone(team.tier)}
+                                            title={`${tierDescription(team.tier)} (${tierBreakdownSummary(
+                                                team.tier_breakdown,
+                                            )}). Reflects current connection, not the selected range.`}
+                                        >
                                             {tierLabel(team.tier)}
                                         </Badge>
                                     </div>
@@ -347,7 +359,8 @@ export function TeamCompare(): JSX.Element {
                                         <div className="mb-2">
                                             <h2 className="text-sm font-semibold text-foreground">Adoption trend</h2>
                                             <p className="mt-0.5 text-xs text-muted">
-                                                Active developers per team over time — one line each.
+                                                Developers active on AI tools per team over time — one line each.
+                                                Git-only activity is in the metrics above, not this line.
                                             </p>
                                         </div>
                                         <OverlaidTrend teams={compare.data.teams} />

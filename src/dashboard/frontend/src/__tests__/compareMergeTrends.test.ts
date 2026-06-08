@@ -36,7 +36,10 @@ describe('mergeCompareTrends', () => {
             teamWithTrend('beta', [{date: '2026-05-03', active_developers: 5}]),
         ]);
 
-        expect(merged.series.map((s) => s.key)).toEqual(['alpha', 'beta']);
+        // Series keys are namespaced (so a team can't shadow the x-key); the
+        // legend label stays the bare team name.
+        expect(merged.series.map((s) => s.key)).toEqual(['team:alpha', 'team:beta']);
+        expect(merged.series.map((s) => s.label)).toEqual(['alpha', 'beta']);
         // Dates are the sorted union of both teams' dates.
         expect(merged.data.map((d) => d.date)).toEqual(['2026-05-01', '2026-05-02', '2026-05-03']);
     });
@@ -49,9 +52,19 @@ describe('mergeCompareTrends', () => {
 
         // alpha is absent on 05-02, beta absent on 05-01 → both fill 0.
         expect(merged.data).toEqual([
-            {date: '2026-05-01', alpha: 2, beta: 0},
-            {date: '2026-05-02', alpha: 0, beta: 5},
+            {date: '2026-05-01', 'team:alpha': 2, 'team:beta': 0},
+            {date: '2026-05-02', 'team:alpha': 0, 'team:beta': 5},
         ]);
+    });
+
+    it('namespaces the series key so a team named "date" cannot shadow the x-axis', () => {
+        const merged = mergeCompareTrends([
+            teamWithTrend('date', [{date: '2026-05-01', active_developers: 2}]),
+            teamWithTrend('beta', [{date: '2026-05-01', active_developers: 4}]),
+        ]);
+        // The 'date' x value survives; the team's series lands under 'team:date'.
+        expect(merged.data).toEqual([{date: '2026-05-01', 'team:date': 2, 'team:beta': 4}]);
+        expect(merged.series.map((s) => s.key)).toEqual(['team:date', 'team:beta']);
     });
 
     it('returns no rows when no team has any trend points', () => {

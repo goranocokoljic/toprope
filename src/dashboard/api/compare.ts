@@ -27,8 +27,10 @@ import type {FastifyInstance} from 'fastify';
 import type Database from 'better-sqlite3';
 import {parseTimeRange, TimeRangeError, type TimeRangeInput} from './range';
 import {isAdmin, forbidden} from './guards';
+import {developerDataRanks, rankToTier} from './coverage';
+import {teamTrend as toolActiveTrend} from './trends';
 import {computeTeamPeriodMetrics} from '../../aggregation/team-period';
-import {quarterRange} from '../../aggregation/dates';
+import {quarterOverlaps} from '../../aggregation/dates';
 
 /** A comparison holds at least 2 and at most 4 teams (see module header). */
 export const MIN_COMPARE_TEAMS = 2;
@@ -82,21 +84,19 @@ interface CompareTeam {
     trend: CompareTrendPoint[];
 }
 
-const RANK_TO_TIER: Record<number, DataQualityTier> = {3: 'high', 2: 'medium', 1: 'low', 0: 'none'};
-
 /**
  * Each team's data-quality tier and the per-developer breakdown behind it.
  *
- * A developer's tier is their BEST available signal — API tool data = high
- * (tool_snapshots.data_quality), git activity = medium, an expense-only
- * subscription = low, nothing = none — exactly as /api/coverage classifies the
- * org. The team tier is then the MINIMUM best-signal across the developers that
- * have any data (rank > 0): the team's combined metrics are only as trustworthy
- * as their weakest contributing source, so `high` means fully connected. A team
- * whose developers all have no data reads `none`.
+ * A developer's tier is their BEST available signal (see coverage.ts
+ * `developerDataRanks`: API tool data = high, git = medium, expense-only = low,
+ * nothing = none). The team tier is then the MINIMUM best-signal across the
+ * developers that have any data (rank > 0): the team's combined metrics are only
+ * as trustworthy as their weakest contributing source, so `high` means fully
+ * connected. A team whose developers all have no data reads `none`.
  *
  * Computed all-time (not windowed): "is this team connected" is a current
- * property of the team, the same posture as the coverage snapshot.
+ * property of the team, the same posture as the coverage snapshot — so the UI
+ * labels the tier a current/all-time signal, not a windowed metric.
  */
 export function computeTeamTiers(
     db: Database.Database,
@@ -112,35 +112,9 @@ export function computeTeamTiers(
         .prepare(`SELECT id, team FROM developers WHERE team IN (${placeholders})`)
         .all(...teams) as {id: string; team: string}[];
 
-    const toolRows = db
-        .prepare(
-            `SELECT developer_id,
-                    MAX(CASE data_quality
-                            WHEN 'high' THEN 3
-                            WHEN 'medium' THEN 2
-                            WHEN 'low' THEN 1
-                            ELSE 0 END) AS rank
-             FROM tool_snapshots
-             GROUP BY developer_id`,
-        )
-        .all() as {developer_id: string; rank: number}[];
-    const toolRank = new Map(toolRows.map((r) => [r.developer_id, r.rank]));
-
-    const gitDevs = new Set(
-        (db.prepare('SELECT DISTINCT developer_id FROM git_snapshots').all() as {developer_id: string}[]).map(
-            (r) => r.developer_id,
-        ),
-    );
-    const expenseDevs = new Set(
-        (
-            db
-                .prepare(
-                    `SELECT DISTINCT developer_id FROM subscriptions
-                     WHERE developer_id IS NOT NULL AND seat_revoked_at IS NULL`,
-                )
-                .all() as {developer_id: string}[]
-        ).map((r) => r.developer_id),
-    );
+    // One shared per-developer rank map (the single home for the data-quality
+    // model), folded by team here into a breakdown + weakest-link tier.
+    const ranks = developerDataRanks(db);
 
     // Seed every requested team so one with no developers still gets a row.
     for (const team of teams) {
@@ -151,14 +125,10 @@ export function computeTeamTiers(
     const minRank = new Map<string, number>(teams.map((t) => [t, Number.POSITIVE_INFINITY]));
 
     for (const dev of devs) {
-        const rank = Math.max(
-            toolRank.get(dev.id) ?? 0,
-            gitDevs.has(dev.id) ? 2 : 0,
-            expenseDevs.has(dev.id) ? 1 : 0,
-        );
+        const rank = ranks.get(dev.id) ?? 0;
         const entry = result.get(dev.team);
         if (!entry) continue;
-        entry.breakdown[RANK_TO_TIER[rank]] += 1;
+        entry.breakdown[rankToTier(rank)] += 1;
         if (rank > 0) {
             minRank.set(dev.team, Math.min(minRank.get(dev.team) ?? Number.POSITIVE_INFINITY, rank));
         }
@@ -168,13 +138,18 @@ export function computeTeamTiers(
         const min = minRank.get(team) ?? Number.POSITIVE_INFINITY;
         const entry = result.get(team);
         if (entry) {
-            entry.tier = Number.isFinite(min) ? RANK_TO_TIER[min] : 'none';
+            entry.tier = Number.isFinite(min) ? rankToTier(min) : 'none';
         }
     }
     return result;
 }
 
-/** Distinct tools the team was active on during [from, to], in name order. */
+/**
+ * Distinct tools the team was active on during [from, to], in name order. Scoped
+ * by the developer's CURRENT team — the same attribution `computeTeamPeriodMetrics`
+ * uses — and the in-window snapshot dates guarantee the developer existed in the
+ * window, so this population is a consistent subset of the metric fold's.
+ */
 function teamToolMix(db: Database.Database, team: string, from: string, to: string): string[] {
     const rows = db
         .prepare(
@@ -188,19 +163,18 @@ function teamToolMix(db: Database.Database, team: string, from: string, to: stri
     return rows.map((r) => r.tool);
 }
 
-/** Per-team active-developer series over [from, to], ascending by date. */
-function teamTrend(db: Database.Database, team: string, from: string, to: string): CompareTrendPoint[] {
-    return db
-        .prepare(
-            `SELECT ts.date AS date,
-                    COUNT(DISTINCT CASE WHEN ts.is_active = 1 THEN ts.developer_id END) AS active_developers
-             FROM tool_snapshots ts
-             JOIN developers d ON d.id = ts.developer_id
-             WHERE d.team = ? AND ts.date >= ? AND ts.date <= ?
-             GROUP BY ts.date
-             ORDER BY ts.date`,
-        )
-        .all(team, from, to) as CompareTrendPoint[];
+/**
+ * Per-team active-developer series over [from, to] (the overlaid adoption line),
+ * reusing the org/team trend query from trends.ts so the comparison's line can't
+ * drift from the team-detail adoption trend. Tool-snapshot `is_active` only —
+ * the UI labels this line "developers active on AI tools" to distinguish it from
+ * the metrics block's active-developer count, which also counts git activity.
+ */
+function teamActiveTrend(db: Database.Database, team: string, from: string, to: string): CompareTrendPoint[] {
+    return toolActiveTrend(db, team, from, to).map((r) => ({
+        date: r.date,
+        active_developers: r.active_developers,
+    }));
 }
 
 interface QuarterRow {
@@ -232,10 +206,9 @@ function teamMaturity(
 
     let chosen: QuarterRow | null = null;
     for (const row of rows) {
-        const span = quarterRange(row.quarter);
-        // Overlap: quarter.start <= to AND quarter.end >= from. Rows are
-        // chronological, so the last overlapping row wins (most recent).
-        if (span.start <= to && span.end >= from) {
+        // Rows are chronological, so the last overlapping row wins (most recent).
+        // Shared overlap rule with the maturity trend so the two can't drift.
+        if (quarterOverlaps(row.quarter, from, to)) {
             chosen = row;
         }
     }
@@ -305,15 +278,13 @@ export function registerCompareRoutes(app: FastifyInstance, db: Database.Databas
             });
         }
 
-        // Every requested team must exist; report the first unknown by name.
-        const known = new Set(
-            (
-                db
-                    .prepare(`SELECT name FROM teams WHERE name IN (${teams.map(() => '?').join(',')})`)
-                    .all(...teams) as {name: string}[]
-            ).map((r) => r.name),
-        );
-        const missing = teams.find((t) => !known.has(t));
+        // Fetch each team's metadata once; its presence doubles as the existence
+        // check, so the first requested team with no row is the unknown one.
+        const meta = db
+            .prepare(`SELECT name, department, manager FROM teams WHERE name IN (${teams.map(() => '?').join(',')})`)
+            .all(...teams) as {name: string; department: string | null; manager: string | null}[];
+        const metaByName = new Map(meta.map((m) => [m.name, m]));
+        const missing = teams.find((t) => !metaByName.has(t));
         if (missing) {
             return reply.status(404).send({error: 'Not Found', message: `Team '${missing}' not found`});
         }
@@ -329,12 +300,13 @@ export function registerCompareRoutes(app: FastifyInstance, db: Database.Databas
         }
 
         const tiers = computeTeamTiers(db, teams);
-        const meta = db
-            .prepare(`SELECT name, department, manager FROM teams WHERE name IN (${teams.map(() => '?').join(',')})`)
-            .all(...teams) as {name: string; department: string | null; manager: string | null}[];
-        const metaByName = new Map(meta.map((m) => [m.name, m]));
 
         const result: CompareTeam[] = teams.map((team) => {
+            // NOTE: `metrics` carries a per-developer `members` array (individual
+            // data). Only the team-level scalars below are copied into the
+            // response — never spread `metrics`, or individual rows would leak
+            // into this manager/team-aggregate payload. Privacy rests on this
+            // explicit allowlist.
             const metrics = computeTeamPeriodMetrics(db, team, range.from, range.to);
             const maturity = teamMaturity(db, team, range.from, range.to);
             const tierInfo = tiers.get(team) ?? {
@@ -360,7 +332,7 @@ export function registerCompareRoutes(app: FastifyInstance, db: Database.Databas
                     ai_maturity_basis: maturity.basis,
                     tool_mix: teamToolMix(db, team, range.from, range.to),
                 },
-                trend: teamTrend(db, team, range.from, range.to),
+                trend: teamActiveTrend(db, team, range.from, range.to),
             };
         });
 

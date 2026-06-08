@@ -1,5 +1,5 @@
 import type {BadgeTone} from './Badge';
-import type {DataQualityTier} from '../api/types';
+import type {DataQualityTier, TierBreakdown} from '../api/types';
 
 /**
  * Presentation helpers for a team's data-quality tier (Task 4.9). A tier badge
@@ -56,4 +56,19 @@ export function tierDescription(tier: DataQualityTier): string {
         default:
             return 'No data-bearing developers on this team yet.';
     }
+}
+
+/**
+ * Compact per-developer breakdown behind a team's tier, e.g. "2 API · 1 git".
+ * Surfaced on the tier badge so the weakest-link tier doesn't hide that a team
+ * is mostly-connected. Omits empty buckets; "no developers" when the team has
+ * none.
+ */
+export function tierBreakdownSummary(breakdown: TierBreakdown): string {
+    const parts: string[] = [];
+    if (breakdown.high > 0) parts.push(`${breakdown.high} API`);
+    if (breakdown.medium > 0) parts.push(`${breakdown.medium} git`);
+    if (breakdown.low > 0) parts.push(`${breakdown.low} expense`);
+    if (breakdown.none > 0) parts.push(`${breakdown.none} no data`);
+    return parts.length > 0 ? parts.join(' · ') : 'no developers';
 }

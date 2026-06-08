@@ -7,6 +7,14 @@ export interface MergedTrend {
 }
 
 /**
+ * Series keys are namespaced so a team name can never shadow the x-axis field
+ * ('date') or any other reserved datum key — a team literally named "date" would
+ * otherwise overwrite the axis value. Team names are free-text, so the prefix is
+ * the safe boundary. The legend still shows the bare team name via `label`.
+ */
+const SERIES_KEY_PREFIX = 'team:';
+
+/**
  * Merge each compared team's active-developer trend into one overlaid dataset:
  * a row per calendar date in the union of all teams' dates, with one keyed
  * series per team. A date a team has no snapshot for fills 0 — under the daily-
@@ -14,8 +22,7 @@ export interface MergedTrend {
  * honest value and keeps the overlaid lines continuous and comparable.
  *
  * Series carry no explicit color, so <TrendChart> assigns each its themed
- * categorical color by index (consistent light/dark). The team name is the
- * series key; `xKey` is always 'date'.
+ * categorical color by index (consistent light/dark). `xKey` is always 'date'.
  */
 export function mergeCompareTrends(teams: CompareTeam[]): MergedTrend {
     const dates = new Set<string>();
@@ -31,12 +38,15 @@ export function mergeCompareTrends(teams: CompareTeam[]): MergedTrend {
     const data: ChartDatum[] = sortedDates.map((date) => {
         const row: ChartDatum = {date};
         teams.forEach((team, i) => {
-            row[team.name] = byTeam[i].get(date) ?? 0;
+            row[`${SERIES_KEY_PREFIX}${team.name}`] = byTeam[i].get(date) ?? 0;
         });
         return row;
     });
 
-    const series: ChartSeries[] = teams.map((team) => ({key: team.name, label: team.name}));
+    const series: ChartSeries[] = teams.map((team) => ({
+        key: `${SERIES_KEY_PREFIX}${team.name}`,
+        label: team.name,
+    }));
 
     return {data, series};
 }
