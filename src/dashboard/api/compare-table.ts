@@ -139,13 +139,6 @@ function joinTeamsToPeriod(db: Database.Database, period: string): JoinedRow[] {
         .all(period) as JoinedRow[];
 }
 
-/** All overseen teams in name order (used when no period has been rolled up yet). */
-function listTeamMeta(db: Database.Database): {name: string; department: string | null; manager: string | null}[] {
-    return db
-        .prepare('SELECT name, department, manager FROM teams ORDER BY name')
-        .all() as {name: string; department: string | null; manager: string | null}[];
-}
-
 /** Project a joined row's metric columns into the response metrics, or null when absent. */
 function metricsFromRow(row: JoinedRow): CompareTableMetrics | null {
     if (!row.has_row) {
@@ -191,23 +184,12 @@ export function registerCompareTableRoutes(app: FastifyInstance, db: Database.Da
             period = periods[0] ?? null;
         }
 
-        // List every overseen team. The tier is all-time, so it is attached even
-        // for a period with no rows (or before any rollup has run).
-        const meta = period !== null ? joinTeamsToPeriod(db, period) : listTeamMeta(db).map((m) => ({
-            ...m,
-            has_row: 0,
-            developer_count: null,
-            active_developer_count: null,
-            utilization_rate: null,
-            total_subscription_cost: null,
-            cost_per_pr: null,
-            avg_code_churn: null,
-            total_prs_merged: null,
-            ai_maturity_score: null,
-            ai_maturity_basis: null,
-            wasted_spend: null,
-            unused_seat_count: null,
-        } as JoinedRow));
+        // List every overseen team joined to its row for the period. When no
+        // period has been rolled up yet (period === null), bind a sentinel that
+        // matches no quarter: the LEFT JOIN then yields exactly one all-null,
+        // has_row=0 row per team — the same shape, so no separate code path is
+        // needed. The tier is all-time, attached below regardless of the period.
+        const meta = joinTeamsToPeriod(db, period ?? '');
 
         const tiers = computeTeamTiers(db, meta.map((m) => m.name));
 

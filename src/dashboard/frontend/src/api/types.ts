@@ -717,8 +717,13 @@ export interface CompareTableMetrics {
     total_prs_merged: number | null;
     /** Latest period maturity score; null when none computed. */
     ai_maturity_score: number | null;
-    /** Basis for that score — 'git_estimate' at launch (honesty label). */
-    ai_maturity_basis: MaturityBasis | null;
+    /**
+     * Basis for that score — 'git_estimate' at launch (honesty label). Typed
+     * `string` (not the closed MaturityBasis union) because the backend column
+     * is unconstrained TEXT: the maturity formatters narrow it, with a safe
+     * default for any unrecognized value, rather than asserting the union here.
+     */
+    ai_maturity_basis: string | null;
     /** Estimated monthly spend wasted on unused/underused seats this period. */
     wasted_spend: number | null;
     /** Count of seats flagged unused this period. */

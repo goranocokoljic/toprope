@@ -164,12 +164,39 @@ describe('TeamCompareTable', () => {
         await waitFor(() => expect(rowOrder()).toEqual(['alpha', 'bravo', 'charlie']));
 
         const utilHeader = screen.getByRole('button', {name: /Utilization/});
-        // Ascending: missing (charlie) ranks lowest, then bravo 20%, then alpha 90%.
+        // Ascending: bravo 20%, alpha 90%, then missing (charlie) LAST.
         fireEvent.click(utilHeader);
-        expect(rowOrder()).toEqual(['charlie', 'bravo', 'alpha']);
-        // Descending: alpha 90%, bravo 20%, missing last.
+        expect(rowOrder()).toEqual(['bravo', 'alpha', 'charlie']);
+        // Descending: alpha 90%, bravo 20%, missing STILL last (not flipped to front).
         fireEvent.click(utilHeader);
         expect(rowOrder()).toEqual(['alpha', 'bravo', 'charlie']);
+    });
+
+    it('sorts multiple no-data teams to the end deterministically, in both directions', async () => {
+        // Two teams have metrics, two have none — the large-org case the sentinel
+        // must survive without a NaN comparison (regression for the -Infinity bug).
+        const table: CompareTable = {
+            period: '2026-Q1',
+            available_periods: ['2026-Q1'],
+            teams: [
+                team('alpha', 'high', fullMetrics({utilization_rate: 0.3})),
+                team('bravo', 'high', fullMetrics({utilization_rate: 0.9})),
+                team('delta', 'none', null),
+                team('gamma', 'none', null),
+            ],
+        };
+        vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(table)));
+        renderPage();
+        await waitFor(() => expect(rowOrder()).toEqual(['alpha', 'bravo', 'delta', 'gamma']));
+
+        const utilHeader = screen.getByRole('button', {name: /Utilization/});
+        // Ascending: 0.3, 0.9, then the two no-data teams last (stable name order).
+        fireEvent.click(utilHeader);
+        expect(rowOrder()).toEqual(['alpha', 'bravo', 'delta', 'gamma']);
+        // Descending: non-null flip, but the no-data teams STAY last (not flipped
+        // to the front) and keep their stable relative order — no NaN reshuffle.
+        fireEvent.click(utilHeader);
+        expect(rowOrder()).toEqual(['bravo', 'alpha', 'delta', 'gamma']);
     });
 
     it('sorts by AI maturity independently of utilization', async () => {
@@ -177,8 +204,8 @@ describe('TeamCompareTable', () => {
         await waitFor(() => expect(rowOrder()).toEqual(['alpha', 'bravo', 'charlie']));
 
         const maturityHeader = screen.getByRole('button', {name: /AI maturity/});
-        fireEvent.click(maturityHeader); // asc: charlie (none), bravo 40, alpha 80
-        expect(rowOrder()).toEqual(['charlie', 'bravo', 'alpha']);
+        fireEvent.click(maturityHeader); // asc: bravo 40, alpha 80, charlie (none) last
+        expect(rowOrder()).toEqual(['bravo', 'alpha', 'charlie']);
     });
 
     it('changes the underlying aggregates when the period changes', async () => {

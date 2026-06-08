@@ -8,7 +8,7 @@ import {SkeletonTable} from '../components/Skeleton';
 import {ErrorState} from '../components/ErrorState';
 import {EmptyState} from '../components/EmptyState';
 import {formatCurrency, formatPercent} from '../components/format';
-import {utilizationTier} from '../components/utilization';
+import {UtilizationCell} from '../components/UtilizationCell';
 import {tierLabel, tierTone, tierDescription, tierBreakdownSummary} from '../components/tier';
 import {maturityBasisLabel, maturityBasisDescription} from '../components/maturity';
 import type {CompareTableTeam, DataQualityTier} from '../api/types';
@@ -23,41 +23,17 @@ import type {CompareTableTeam, DataQualityTier} from '../api/types';
  * A metric is missing in two honest ways, both rendered as an em dash: the team
  * has no aggregate row for the period (`metrics === null`), or a particular
  * column is null within the row (no members → utilization, no PRs → cost-per-PR,
- * no computed score → maturity). For sorting, a missing value ranks LOWEST
- * (Number.NEGATIVE_INFINITY) so the order is deterministic in both directions —
- * ascending floats no-data rows to the top, descending sinks them to the bottom.
+ * no computed score → maturity). For sorting, a missing value is returned as
+ * `null` from the column accessor, and the shared `DataTable` sorts such rows to
+ * the END in BOTH directions — so a no-data team never reads as the best or
+ * worst ranked value.
  */
-
-/** Missing values sort to the lowest rank, deterministically, in either direction. */
-const MISSING_SORT = Number.NEGATIVE_INFINITY;
 
 /** Order tiers by data-quality strength so the Tier column sorts sensibly. */
 const TIER_RANK: Record<DataQualityTier, number> = {high: 3, medium: 2, low: 1, none: 0};
 
-// Full literal class strings (Tailwind can't see dynamically-built names).
-const UTILIZATION_DOT: Record<'success' | 'warning' | 'danger', string> = {
-    success: 'bg-success',
-    warning: 'bg-warning',
-    danger: 'bg-danger',
-};
-
 function Dash(): JSX.Element {
     return <span className="text-muted">—</span>;
-}
-
-function UtilizationCell({rate}: {rate: number | null}): JSX.Element {
-    if (rate === null) {
-        return <Dash />;
-    }
-    const tier = utilizationTier(rate);
-    const dot = UTILIZATION_DOT[tier.tone as 'success' | 'warning' | 'danger'];
-    return (
-        <span className="inline-flex items-center gap-2">
-            <span aria-hidden className={`h-2 w-2 rounded-full ${dot}`} />
-            <span className="tabular-nums text-foreground">{formatPercent(rate)}</span>
-            <Badge tone={tier.tone}>{tier.label}</Badge>
-        </span>
-    );
 }
 
 function MaturityCell({team}: {team: CompareTableTeam}): JSX.Element {
@@ -116,13 +92,13 @@ const COLUMNS: Column<CompareTableTeam>[] = [
     {
         key: 'utilization',
         header: 'Utilization',
-        accessor: (t) => t.metrics?.utilization_rate ?? MISSING_SORT,
+        accessor: (t) => t.metrics?.utilization_rate ?? null,
         render: (t) => <UtilizationCell rate={t.metrics?.utilization_rate ?? null} />,
     },
     {
         key: 'active',
         header: 'Active devs',
-        accessor: (t) => t.metrics?.active_developer_count ?? MISSING_SORT,
+        accessor: (t) => t.metrics?.active_developer_count ?? null,
         align: 'right',
         render: (t) =>
             t.metrics === null ? (
@@ -137,7 +113,7 @@ const COLUMNS: Column<CompareTableTeam>[] = [
     {
         key: 'cost',
         header: 'Total cost',
-        accessor: (t) => t.metrics?.total_subscription_cost ?? MISSING_SORT,
+        accessor: (t) => t.metrics?.total_subscription_cost ?? null,
         align: 'right',
         render: (t) =>
             t.metrics?.total_subscription_cost == null ? (
@@ -149,7 +125,7 @@ const COLUMNS: Column<CompareTableTeam>[] = [
     {
         key: 'cost_per_pr',
         header: 'Cost / PR',
-        accessor: (t) => t.metrics?.cost_per_pr ?? MISSING_SORT,
+        accessor: (t) => t.metrics?.cost_per_pr ?? null,
         align: 'right',
         render: (t) =>
             t.metrics?.cost_per_pr == null ? (
@@ -161,7 +137,7 @@ const COLUMNS: Column<CompareTableTeam>[] = [
     {
         key: 'churn',
         header: 'Churn',
-        accessor: (t) => t.metrics?.avg_code_churn ?? MISSING_SORT,
+        accessor: (t) => t.metrics?.avg_code_churn ?? null,
         align: 'right',
         render: (t) =>
             t.metrics?.avg_code_churn == null ? (
@@ -173,14 +149,14 @@ const COLUMNS: Column<CompareTableTeam>[] = [
     {
         key: 'maturity',
         header: 'AI maturity',
-        accessor: (t) => t.metrics?.ai_maturity_score ?? MISSING_SORT,
+        accessor: (t) => t.metrics?.ai_maturity_score ?? null,
         align: 'right',
         render: (t) => <MaturityCell team={t} />,
     },
     {
         key: 'waste',
         header: 'Waste',
-        accessor: (t) => t.metrics?.wasted_spend ?? MISSING_SORT,
+        accessor: (t) => t.metrics?.wasted_spend ?? null,
         align: 'right',
         render: (t) => <WasteCell waste={t.metrics?.wasted_spend ?? null} />,
     },
