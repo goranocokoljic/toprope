@@ -133,4 +133,31 @@ describe('anomaly store', () => {
             expect(setAnomalyStatus(db, 'no-such-id', 'resolved')).toBe(false);
         });
     });
+
+    describe('ordering', () => {
+        it('ranks severity high > notable > info, not lexically', () => {
+            upsertAnomaly(db, baseInput({metric: 'commits', severity: 'notable'}));
+            upsertAnomaly(db, baseInput({metric: 'churn', severity: 'high'}));
+            upsertAnomaly(db, baseInput({metric: 'prs_merged', severity: 'info'}));
+            // Pin all rows to the same detected_at so the severity rank is the
+            // sole tiebreak (lexical ordering would have put 'high' last).
+            db.prepare("UPDATE anomalies SET detected_at = '2026-05-04T00:00:00.000Z'").run();
+            const order = listAnomalies(db).map((a) => a.severity);
+            expect(order).toEqual(['high', 'notable', 'info']);
+        });
+    });
+
+    describe('detected_at is first-detection, preserved across re-detection', () => {
+        it('keeps the original detected_at on re-upsert while refreshing measurement', () => {
+            upsertAnomaly(db, baseInput());
+            // Backdate to a known first-detection time.
+            db.prepare("UPDATE anomalies SET detected_at = '2026-04-01T00:00:00.000Z'").run();
+
+            upsertAnomaly(db, baseInput({observedValue: 99, deviation: 5.5, severity: 'notable'}));
+            const row = listAnomalies(db)[0];
+            expect(row.detected_at).toBe('2026-04-01T00:00:00.000Z'); // not bumped
+            expect(row.observed_value).toBe(99); // measurement refreshed
+            expect(row.severity).toBe('notable');
+        });
+    });
 });

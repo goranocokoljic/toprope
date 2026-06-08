@@ -8,9 +8,12 @@
  * Idempotency. A (scope, scope_id, metric, period) coordinate maps to at most
  * one row (UNIQUE index from migration 023). Re-running a period UPSERTs that one
  * row instead of inserting a duplicate, so a scheduled retry or a manual re-scan
- * is safe. Crucially, `status` is human workflow state and is PRESERVED across
- * re-detection — an acknowledged anomaly that re-fires with identical data stays
- * acknowledged; only the recomputed measurement fields and detected_at refresh.
+ * is safe. Crucially, `status` AND `detected_at` are preserved across
+ * re-detection: an acknowledged anomaly that re-fires with identical data stays
+ * acknowledged, and detected_at keeps its FIRST-detection time (a retry/re-scan
+ * never bumps it) so "how long has this been open" stays answerable. Only the
+ * recomputed measurement fields (method/observed/expected/deviation/severity/
+ * basis) refresh on conflict.
  */
 
 import type Database from 'better-sqlite3';
@@ -45,10 +48,10 @@ function nowIso(): string {
 
 /**
  * Insert or refresh the single anomaly row for its coordinate. On conflict the
- * measurement fields (method/observed/expected/deviation/severity/basis) and
- * detected_at are updated, but `status` is left untouched so prior human triage
- * survives re-detection. The row id is a fresh UUID only on first insert; a
- * re-detection keeps the original id.
+ * measurement fields (method/observed/expected/deviation/severity/basis) are
+ * updated, but `status` and `detected_at` are left untouched so prior human
+ * triage and the original first-detection time survive re-detection. The row id
+ * is a fresh UUID only on first insert; a re-detection keeps the original id.
  */
 export function upsertAnomaly(db: Database.Database, input: UpsertAnomalyInput): void {
     db.prepare(
@@ -62,8 +65,7 @@ export function upsertAnomaly(db: Database.Database, input: UpsertAnomalyInput):
             expected_value = excluded.expected_value,
             deviation = excluded.deviation,
             severity = excluded.severity,
-            basis = excluded.basis,
-            detected_at = excluded.detected_at`,
+            basis = excluded.basis`,
     ).run(
         randomUUID(),
         input.scope,
@@ -131,7 +133,12 @@ export function listAnomalies(db: Database.Database, filter: AnomalyListFilter =
         params.push(filter.period);
     }
     const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
-    let sql = `SELECT * FROM anomalies ${where} ORDER BY detected_at DESC, severity DESC`;
+    // Severity is a text enum, so a plain `severity DESC` would order it
+    // LEXICALLY (high < info < notable) and sink the most severe band to the
+    // bottom. Rank it explicitly so high > notable > info, then newest first.
+    let sql = `SELECT * FROM anomalies ${where}
+               ORDER BY detected_at DESC,
+                        CASE severity WHEN 'high' THEN 3 WHEN 'notable' THEN 2 ELSE 1 END DESC`;
     if (filter.limit !== undefined && Number.isInteger(filter.limit) && filter.limit > 0) {
         sql += ' LIMIT ?';
         params.push(filter.limit);

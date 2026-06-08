@@ -52,7 +52,7 @@ interface WeeklyRow {
     avg_ai_signature_score: number | null;
     total_interactions: number;
     avg_acceptance_rate: number | null;
-    estimated_total_cost: number | null;
+    subscription_cost: number | null;
 }
 
 function developerMetricValue(row: WeeklyRow, metric: AnomalyMetric): number | null {
@@ -70,7 +70,13 @@ function developerMetricValue(row: WeeklyRow, metric: AnomalyMetric): number | n
         case 'acceptance_rate':
             return row.avg_acceptance_rate;
         case 'cost':
-            return row.estimated_total_cost;
+            // Subscription (seat) cost — the same quantity the team scope reads
+            // (total_subscription_cost), so a developer-vs-team cost anomaly is
+            // comparable, and it carries a real value at launch. estimated_total_cost
+            // (tool/API spend) is null until a connector emits it, which would leave
+            // the developer cost metric dead. basis stays git_estimate per the
+            // issue's "git-derived + cost metrics → git_estimate" grouping.
+            return row.subscription_cost;
         default:
             return null;
     }
@@ -189,7 +195,7 @@ function scanDevelopers(db: Database.Database, period: string, tally: AnomalySca
             .prepare(
                 `SELECT week_start, total_commits, total_prs_merged, avg_code_churn,
                         avg_ai_signature_score, total_interactions, avg_acceptance_rate,
-                        estimated_total_cost
+                        subscription_cost
                  FROM weekly_aggregates
                  WHERE developer_id = ? AND week_start <= ?
                  ORDER BY week_start DESC`,

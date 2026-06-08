@@ -33,7 +33,7 @@ function insertWeekly(db: Database.Database, devId: string, team: string, week: 
     db.prepare(
         `INSERT INTO weekly_aggregates
            (id, developer_id, week_start, team, total_commits, total_prs_merged,
-            total_interactions, avg_code_churn, estimated_total_cost, computed_at)
+            total_interactions, avg_code_churn, subscription_cost, computed_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
         `${devId}-${week}`,

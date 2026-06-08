@@ -264,6 +264,12 @@ export function runScheduledJob(
         // it is best-effort: a scan failure is logged but never fails the
         // aggregation job that succeeded above, mirroring the staleness sweep's
         // after-the-commit, swallow-its-own-errors contract.
+        //
+        // Cost note: the scan re-folds each team's metrics live for the baseline
+        // window (no weekly team-aggregate table exists), so the weekly job's wall
+        // time now includes that O(window × developers) team re-fold. Trivial at
+        // launch scale; a large org may want a precomputed weekly team aggregate to
+        // keep it off this path.
         if (period === 'weekly') {
             try {
                 const scan = runAnomalyScanForPeriod(db, periodKey);
