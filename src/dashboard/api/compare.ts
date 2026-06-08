@@ -141,11 +141,9 @@ export function computeTeamTiers(
 
 /**
  * Distinct tools the team was active on during [from, to], in name order. Scoped
- * by the developer's CURRENT team — the same attribution `computeTeamPeriodMetrics`
- * uses. It does not replicate the fold's explicit `created_at <= end` membership
- * filter, but the requirement of an in-window `is_active` snapshot makes it a
- * best-effort subset in practice: a snapshot's date implies the developer
- * existed by then. No `created_at` guard is enforced here.
+ * to the same population as the metric fold: the developer's CURRENT team plus
+ * the fold's `created_at <= end` membership guard (see `getTeamDevelopers`), so
+ * tool_mix can never name a developer the metrics block excludes.
  */
 function teamToolMix(db: Database.Database, team: string, from: string, to: string): string[] {
     const rows = db
@@ -153,10 +151,11 @@ function teamToolMix(db: Database.Database, team: string, from: string, to: stri
             `SELECT DISTINCT ts.tool AS tool
              FROM tool_snapshots ts
              JOIN developers d ON d.id = ts.developer_id
-             WHERE d.team = ? AND ts.is_active = 1 AND ts.date >= ? AND ts.date <= ?
+             WHERE d.team = ? AND substr(d.created_at, 1, 10) <= ?
+               AND ts.is_active = 1 AND ts.date >= ? AND ts.date <= ?
              ORDER BY ts.tool`,
         )
-        .all(team, from, to) as {tool: string}[];
+        .all(team, to, from, to) as {tool: string}[];
     return rows.map((r) => r.tool);
 }
 
