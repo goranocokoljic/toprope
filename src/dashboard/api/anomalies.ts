@@ -67,8 +67,9 @@ function transition(
         return reply.status(404).send({error: 'Not Found', message: `Anomaly '${id}' not found`});
     }
     setAnomalyStatus(db, id, status);
-    const updated = getAnomalyById(db, id);
-    return {data: updated ? toItem(updated) : null};
+    // Only `status` changed; echo the in-memory record with it updated rather
+    // than re-reading the row.
+    return {data: toItem({...record, status})};
 }
 
 export function registerAnomalyRoutes(app: FastifyInstance, db: Database.Database): void {

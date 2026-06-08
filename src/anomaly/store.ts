@@ -46,6 +46,12 @@ function nowIso(): string {
     return new Date().toISOString();
 }
 
+// Severity tiebreak ranking used by every "newest first" read below. severity is
+// a text enum, so a lexical `severity DESC` would order it high < info < notable
+// and sink the most severe band; this CASE ranks it high > notable > info so a
+// same-timestamp tie surfaces the worst first.
+const SEVERITY_RANK_SQL = `CASE severity WHEN 'high' THEN 3 WHEN 'notable' THEN 2 ELSE 1 END`;
+
 /**
  * Insert or refresh the single anomaly row for its coordinate. On conflict the
  * measurement fields (method/observed/expected/deviation/severity/basis) are
@@ -143,14 +149,9 @@ export function listAnomalies(db: Database.Database, filter: AnomalyListFilter =
         params.push(filter.period);
     }
     const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
-    // Newest first, with severity as the tiebreak among same-timestamp rows.
-    // The severity tiebreak is an explicit CASE rank rather than `severity DESC`:
-    // severity is a text enum, so a lexical sort would order it high < info <
-    // notable and sink the most severe band to the bottom of a tie. The CASE
-    // ranks it high > notable > info so a tie surfaces the worst first.
+    // Newest first, with the shared severity rank as the same-timestamp tiebreak.
     let sql = `SELECT * FROM anomalies ${where}
-               ORDER BY detected_at DESC,
-                        CASE severity WHEN 'high' THEN 3 WHEN 'notable' THEN 2 ELSE 1 END DESC`;
+               ORDER BY detected_at DESC, ${SEVERITY_RANK_SQL} DESC`;
     if (filter.limit !== undefined && Number.isInteger(filter.limit) && filter.limit > 0) {
         sql += ' LIMIT ?';
         params.push(filter.limit);
@@ -171,11 +172,6 @@ export function setAnomalyStatus(db: Database.Database, id: string, status: Anom
 export function getAnomalyById(db: Database.Database, id: string): AnomalyRecord | undefined {
     return db.prepare('SELECT * FROM anomalies WHERE id = ?').get(id) as AnomalyRecord | undefined;
 }
-
-// Severity tiebreak: high > notable > info. A text-enum DESC would sort lexically
-// (high < info < notable) and sink the worst band, so both surfacing reads below
-// rank it explicitly, newest-first within a band.
-const SEVERITY_RANK_SQL = `CASE severity WHEN 'high' THEN 3 WHEN 'notable' THEN 2 ELSE 1 END`;
 
 /**
  * Open, surfaceable (notable/high), not-yet-announced TEAM anomalies — the work

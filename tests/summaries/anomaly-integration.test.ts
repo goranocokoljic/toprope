@@ -109,6 +109,22 @@ describe('summary anomaly integration', () => {
         void prompt;
     });
 
+    it('LAUNCH INVARIANT: a git-only fold carries no measured-basis label (the forbidden-term collision can not occur)', () => {
+        // The interactions/acceptance_rate labels intentionally embed
+        // FABRICATED_USAGE_TERMS substrings ("interactions"/"suggestion
+        // acceptance"); that is safe ONLY because those metrics are measured-basis
+        // and cannot appear in a git-only period. Lock that: a git-only fold (every
+        // anomaly git_estimate basis) renders neither measured label.
+        const payload = build([
+            anomaly({metric: 'commits', severity: 'high'}),
+            anomaly({id: 'a2', metric: 'cost', severity: 'notable', method: 'percentage_change', observed_value: 580, expected_value: 400}),
+        ]);
+        expect(payload.anomalies.every((a) => a.basis === 'git_estimate')).toBe(true);
+        const block = formatSummaryInput(payload).toLowerCase();
+        expect(block).not.toContain('tool interactions');
+        expect(block).not.toContain('suggestion acceptance rate');
+    });
+
     it('every string in the anomaly payload is a validated enum (no free text leaks)', () => {
         const payload = build([anomaly({metric: 'commits', severity: 'high'})]);
         // The team name is the only operator-supplied label; everything on an

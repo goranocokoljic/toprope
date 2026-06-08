@@ -188,7 +188,7 @@ function buildAnomalyNotifier(
     dbPath: string,
     config: GovProxyConfig,
     app: FastifyInstance,
-): ((period: string) => void) | undefined {
+): (() => void) | undefined {
     const slack = config.slack;
     if (!slack?.enabled || !slack.bot_token) return undefined;
     const channels = slack.anomaly_alerts?.channels ?? [];
@@ -196,7 +196,7 @@ function buildAnomalyNotifier(
 
     const client = createSlackClient(slack.bot_token);
     const dashboardUrl = slack.anomaly_alerts?.dashboard_url;
-    return (_period: string): void => {
+    return (): void => {
         const db = openDb(dbPath);
         void notifyNewAnomalies({db, slackClient: client, channels, dashboardUrl})
             .catch((err) => app.log.error({err}, '[anomaly:notify] failed'))

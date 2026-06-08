@@ -305,13 +305,15 @@ export interface AggregationSchedulerOptions {
     /** Injectable clock for resolving the just-completed period; defaults to wall clock. */
     now?: () => Date;
     /**
-     * Optional anomaly Slack notifier (Task 4.8), invoked with the week_start
-     * after a SUCCESSFUL weekly job (the weekly scan has just run). Fire-and-forget
-     * by contract: it owns its own DB handle, so it is called AFTER this job's
-     * handle closes and any error inside it must never affect the aggregation
-     * result. Absent → no anomaly alerts (the launch/no-Slack default).
+     * Optional anomaly Slack notifier (Task 4.8), invoked after a SUCCESSFUL
+     * weekly job (the weekly scan has just run). Takes no period: it sweeps every
+     * open, unannounced team anomaly rather than one period's, so a delivery
+     * missed on a prior week still goes out. Fire-and-forget by contract — it owns
+     * its own DB handle, so it is called AFTER this job's handle closes and any
+     * error inside it must never affect the aggregation result. Absent → no
+     * anomaly alerts (the launch/no-Slack default).
      */
-    notifier?: (period: string) => void;
+    notifier?: () => void;
 }
 
 /**
@@ -371,7 +373,7 @@ export function runScheduledAggregationJob(
     // failure is logged against the level but never changes the job's result.
     if (result.ok && period === 'weekly' && options.notifier) {
         try {
-            options.notifier(result.periodKey);
+            options.notifier();
         } catch (err) {
             logger.jobFailure(period, result.periodKey, err);
         }

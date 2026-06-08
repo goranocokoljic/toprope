@@ -21,6 +21,18 @@ import type {AnomalyBasis, AnomalyMetric, AnomalySeverity} from './types';
  * the git signals they are ("commit activity," not "usage"); the cost metric is a
  * subscription-spend figure; `interactions` / `acceptance_rate` keep their
  * measured-tool names because they only carry real values with a connector online.
+ *
+ * INTENTIONAL COLLISION (read before "fixing"): the `interactions` and
+ * `acceptance_rate` labels deliberately contain substrings that appear in the
+ * summary layer's FABRICATED_USAGE_TERMS blocklist (src/summaries/prompts.ts) —
+ * "tool interactions" / "suggestion acceptance rate". This is safe because those
+ * two metrics are `measured`-basis: the engine only ever flags them once a tool
+ * connector emits real values, so they cannot appear in a git-only summary, which
+ * is the tier the fabrication guard polices. A fold that surfaces one is, by
+ * definition, a period with measured tool data, where the term is substantiated
+ * and honest. The anomaly-integration test locks the launch invariant (git-only
+ * folds carry no measured-basis label); do NOT sanitise these labels to dodge the
+ * blocklist — that would mislabel a real measured metric.
  */
 export const METRIC_LABELS: Record<AnomalyMetric, string> = {
     commits: 'commit activity',
