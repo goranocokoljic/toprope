@@ -10,7 +10,9 @@ import type {DataQualityTier, TierBreakdown} from '../api/types';
  * The tiers mirror the platform data-quality model: high = API tool data,
  * medium = git analysis, low = expense-only, none = no data. A team's tier is
  * the weakest best-signal among its data-bearing developers, so `high` means
- * every contributing developer is connected (see compute.ts on the backend).
+ * every contributing developer is connected (the rule lives in the backend
+ * `computeTeamTiers` in dashboard/api/compare.ts, folding `developerDataRanks`
+ * from dashboard/api/coverage.ts).
  */
 
 /** Short chip text for a tier. */

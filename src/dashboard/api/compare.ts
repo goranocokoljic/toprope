@@ -121,25 +121,20 @@ export function computeTeamTiers(
         result.set(team, {tier: 'none', breakdown: {high: 0, medium: 0, low: 0, none: 0}});
     }
 
-    // Track the minimum data-bearing rank per team (Infinity = no data yet).
-    const minRank = new Map<string, number>(teams.map((t) => [t, Number.POSITIVE_INFINITY]));
-
     for (const dev of devs) {
-        const rank = ranks.get(dev.id) ?? 0;
         const entry = result.get(dev.team);
         if (!entry) continue;
-        entry.breakdown[rankToTier(rank)] += 1;
-        if (rank > 0) {
-            minRank.set(dev.team, Math.min(minRank.get(dev.team) ?? Number.POSITIVE_INFINITY, rank));
-        }
+        entry.breakdown[rankToTier(ranks.get(dev.id) ?? 0)] += 1;
     }
 
-    for (const team of teams) {
-        const min = minRank.get(team) ?? Number.POSITIVE_INFINITY;
-        const entry = result.get(team);
-        if (entry) {
-            entry.tier = Number.isFinite(min) ? rankToTier(min) : 'none';
-        }
+    // Weakest-link tier = the LOWEST tier any data-bearing developer falls into,
+    // which the breakdown counts already encode: a low-tier developer drags the
+    // team to 'low', else medium, else high; 'none' only when no developer is
+    // data-bearing. (The order is weakest-first by design — a single git-only
+    // developer keeps a team off 'high'.) No separate min-rank tracker needed.
+    for (const entry of result.values()) {
+        const b = entry.breakdown;
+        entry.tier = b.low ? 'low' : b.medium ? 'medium' : b.high ? 'high' : 'none';
     }
     return result;
 }
@@ -147,8 +142,10 @@ export function computeTeamTiers(
 /**
  * Distinct tools the team was active on during [from, to], in name order. Scoped
  * by the developer's CURRENT team — the same attribution `computeTeamPeriodMetrics`
- * uses — and the in-window snapshot dates guarantee the developer existed in the
- * window, so this population is a consistent subset of the metric fold's.
+ * uses. It does not replicate the fold's explicit `created_at <= end` membership
+ * filter, but the requirement of an in-window `is_active` snapshot makes it a
+ * best-effort subset in practice: a snapshot's date implies the developer
+ * existed by then. No `created_at` guard is enforced here.
  */
 function teamToolMix(db: Database.Database, team: string, from: string, to: string): string[] {
     const rows = db

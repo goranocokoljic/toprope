@@ -361,6 +361,39 @@ describe('Team comparison API (Task 4.9)', () => {
         expect(res.statusCode).toBe(403);
     });
 
+    it('assembles a shaped no-data result for a window with no snapshots', async () => {
+        // A future window has no snapshots for either team; the assembly path
+        // must return nulls/zeros/empties (not NaN or a throw), and delta — a
+        // team with a developer but no data at all — must read tier 'none'.
+        const res = await app.inject({
+            method: 'GET',
+            url: '/api/compare?teams=alpha,delta&range=custom&from=2099-01-01&to=2099-01-31',
+            headers: authHeaders(adminToken),
+        });
+        expect(res.statusCode).toBe(200);
+        const body = res.json();
+
+        const alpha = team(body, 'alpha');
+        // alpha has developers but none active in this window.
+        expect(alpha.metrics.developer_count).toBe(2);
+        expect(alpha.metrics.active_developer_count).toBe(0);
+        expect(alpha.metrics.utilization_rate).toBe(0);
+        expect(alpha.metrics.total_prs_merged).toBe(0);
+        expect(alpha.metrics.cost_per_pr).toBeNull(); // 0 PRs → null, not a divide
+        expect(alpha.metrics.avg_code_churn).toBeNull();
+        expect(alpha.metrics.tool_mix).toEqual([]);
+        expect(alpha.metrics.ai_maturity_score).toBeNull(); // no quarter overlaps
+        expect(alpha.trend).toEqual([]);
+
+        const delta = team(body, 'delta');
+        // One developer, no data of any kind → utilization null (no /0 NaN), none tier.
+        expect(delta.metrics.developer_count).toBe(1);
+        expect(delta.metrics.utilization_rate).toBe(0);
+        expect(delta.tier).toBe('none');
+        expect(delta.metrics.tool_mix).toEqual([]);
+        expect(delta.trend).toEqual([]);
+    });
+
     it('serves a comparison well under the 2s budget', async () => {
         const start = performance.now();
         const res = await app.inject({
