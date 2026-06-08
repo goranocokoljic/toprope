@@ -54,6 +54,7 @@ import {computeAllMonthlyAggregates} from './monthly';
 import {computeAllQuarterlyAggregates} from './quarterly';
 import {computeAllYearlyAggregates} from './yearly';
 import {markStaleSummariesForRecompute} from '../summaries/staleness';
+import {runAnomalyScanForPeriod} from '../anomaly/scan';
 
 export type AggregationPeriod = 'weekly' | 'monthly' | 'quarterly' | 'yearly';
 
@@ -257,6 +258,24 @@ export function runScheduledJob(
     try {
         const {rowsWritten} = runAggregationForPeriod(db, period, periodKey, now);
         logger.jobSuccess(period, periodKey, rowsWritten, Date.now() - startedAt);
+        // Anomaly detection (Task 4.7) runs on the weekly period after its
+        // aggregates land — the weekly rollup is the source the scan reads. Only
+        // the weekly job triggers it (the engine's period unit is the week), and
+        // it is best-effort: a scan failure is logged but never fails the
+        // aggregation job that succeeded above, mirroring the staleness sweep's
+        // after-the-commit, swallow-its-own-errors contract.
+        if (period === 'weekly') {
+            try {
+                const scan = runAnomalyScanForPeriod(db, periodKey);
+                console.log(
+                    `[anomaly:scan] done — period ${scan.period}, ${scan.flagged} flagged, ` +
+                        `${scan.cleared} cleared, ${scan.buildingBaseline} building-baseline`,
+                );
+            } catch (scanErr) {
+                const msg = scanErr instanceof Error ? scanErr.message : String(scanErr);
+                console.error(`[anomaly:scan] FAILED — period ${periodKey}: ${msg}`);
+            }
+        }
         return {period, periodKey, rowsWritten, ok: true};
     } catch (err) {
         logger.jobFailure(period, periodKey, err);
