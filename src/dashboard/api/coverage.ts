@@ -6,14 +6,20 @@ const CONNECTORS = ['copilot', 'claude_code', 'windsurf', 'cursor'] as const;
 const GIT_PROVIDERS = ['github', 'bitbucket', 'gitlab'] as const;
 const GIT_CONNECTOR = 'git';
 
-interface DataQualityCoverage {
+export interface DataQualityCoverage {
     high: number;
     medium: number;
     low: number;
     none: number;
 }
 
-function rankToTier(rank: number): keyof DataQualityCoverage {
+/**
+ * Map a developer's best-signal rank (0–3) to its tier label. Shared so every
+ * surface that classifies a developer (the coverage snapshot, the team-compare
+ * tier) reads the same boundaries. high=API(3), medium=git(2), low=expense(1),
+ * none(0).
+ */
+export function rankToTier(rank: number): keyof DataQualityCoverage {
     if (rank >= 3) return 'high';
     if (rank === 2) return 'medium';
     if (rank === 1) return 'low';
@@ -21,14 +27,16 @@ function rankToTier(rank: number): keyof DataQualityCoverage {
 }
 
 /**
- * Per-developer data quality: each registered developer is bucketed by their
- * BEST available signal — API tool data = high (from tool_snapshots.data_quality),
- * git data = medium, an expense-only subscription = low, nothing = none.
+ * Each registered developer's BEST available signal as a rank (0–3): API tool
+ * data = 3 (from tool_snapshots.data_quality), git activity = 2, an expense-only
+ * subscription = 1, nothing = 0. git_snapshots carry no per-row quality column,
+ * so any git activity is the medium tier per the data-quality model.
  *
- * git_snapshots carry no per-row quality column, so any git activity counts as
- * the medium tier per the data-quality model (high=API, medium=git, low=expense).
+ * The single home for "how strong is a developer's data" — both the org coverage
+ * snapshot and the per-team comparison tier (compare.ts) fold this map, so the
+ * data-quality model can't drift between them.
  */
-function computeDataQuality(db: Database.Database): DataQualityCoverage {
+export function developerDataRanks(db: Database.Database): Map<string, number> {
     const developers = db.prepare('SELECT id FROM developers').all() as {id: string}[];
 
     const toolRows = db
@@ -62,13 +70,23 @@ function computeDataQuality(db: Database.Database): DataQualityCoverage {
         ).map((r) => r.developer_id),
     );
 
-    const counts: DataQualityCoverage = {high: 0, medium: 0, low: 0, none: 0};
+    const ranks = new Map<string, number>();
     for (const dev of developers) {
-        const rank = Math.max(
-            toolRank.get(dev.id) ?? 0,
-            gitDevs.has(dev.id) ? 2 : 0,
-            expenseDevs.has(dev.id) ? 1 : 0,
+        ranks.set(
+            dev.id,
+            Math.max(toolRank.get(dev.id) ?? 0, gitDevs.has(dev.id) ? 2 : 0, expenseDevs.has(dev.id) ? 1 : 0),
         );
+    }
+    return ranks;
+}
+
+/**
+ * Org-wide per-developer data-quality counts: each developer bucketed by their
+ * best available signal (see {@link developerDataRanks}).
+ */
+function computeDataQuality(db: Database.Database): DataQualityCoverage {
+    const counts: DataQualityCoverage = {high: 0, medium: 0, low: 0, none: 0};
+    for (const rank of developerDataRanks(db).values()) {
         counts[rankToTier(rank)] += 1;
     }
     return counts;

@@ -32,7 +32,7 @@ import type {FastifyInstance} from 'fastify';
 import type Database from 'better-sqlite3';
 import {parseTimeRange, TimeRangeError, type TimeRangeInput} from './range';
 import {isAdmin, forbidden} from './guards';
-import {quarterRange} from '../../aggregation/dates';
+import {quarterRange, quarterOverlaps} from '../../aggregation/dates';
 
 /** The scope token that folds every team into a single org-wide line. */
 const ORG_SCOPE = 'org';
@@ -152,8 +152,9 @@ function windowQuarters(quarters: QuarterRow[], from: string, to: string): Trend
     for (const row of quarters) {
         const span = quarterRange(row.quarter);
         // A quarter belongs in the series when its calendar span overlaps the
-        // resolved window: quarter.start <= to AND quarter.end >= from.
-        if (span.start <= to && span.end >= from) {
+        // resolved window (shared rule, so it can't drift from the team
+        // comparison's maturity selection).
+        if (quarterOverlaps(row.quarter, from, to)) {
             points.push({
                 period: row.quarter,
                 start: span.start,

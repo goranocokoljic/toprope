@@ -3,7 +3,7 @@ import type Database from 'better-sqlite3';
 import {parseTimeRange, TimeRangeError, type TimeRangeInput} from './range';
 import {isAdmin, forbidden} from './guards';
 
-interface TrendRow {
+export interface TrendRow {
     date: string;
     active_developers: number;
     interactions: number;
@@ -29,7 +29,7 @@ function orgTrend(db: Database.Database, from: string, to: string): TrendRow[] {
         .all(from, to) as TrendRow[];
 }
 
-function teamTrend(db: Database.Database, team: string, from: string, to: string): TrendRow[] {
+export function teamTrend(db: Database.Database, team: string, from: string, to: string): TrendRow[] {
     return db
         .prepare(
             `SELECT ts.date AS date,

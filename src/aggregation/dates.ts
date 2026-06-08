@@ -108,6 +108,18 @@ export function quarterRange(quarter: string): DateRange {
     return {start, end};
 }
 
+/**
+ * Whether a quarter's calendar span overlaps an inclusive [from, to] window:
+ * quarter.start <= to AND quarter.end >= from. The single home for the
+ * "is this quarter in the window" rule the maturity trend and the team
+ * comparison both apply, so the two can't drift. All inputs are `YYYY-MM-DD`,
+ * compared lexically (same order as chronologically).
+ */
+export function quarterOverlaps(quarter: string, from: string, to: string): boolean {
+    const span = quarterRange(quarter);
+    return span.start <= to && span.end >= from;
+}
+
 /** Inclusive [Jan 1, Dec 31] day range for a calendar year (`YYYY`). */
 export function yearRange(year: string): DateRange {
     if (!YEAR_RE.test(year)) {
