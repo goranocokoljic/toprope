@@ -1,0 +1,3 @@
+email,employee,merchant,category,amount,currency,frequency,date
+alice@example.com,Alice Smith,cursor,pro,20,USD,monthly,2026-06-01
+bob@example.com,Bob Jones,copilot,business,228,USD,annual,2026-06-03

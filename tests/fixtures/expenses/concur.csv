@@ -1,0 +1,3 @@
+employee email,employee name,vendor,expense type,approved amount,currency,frequency,transaction date
+jane@example.com,Jane Doe,windsurf,pro,20,USD,monthly,2026-06-15
+alice@example.com,Alice Smith,claude_code,max,200,USD,monthly,2026-06-15
