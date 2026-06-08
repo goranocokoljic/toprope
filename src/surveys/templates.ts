@@ -134,18 +134,33 @@ function anomalyQuestion(context: Record<string, unknown>): SurveyQuestion {
     };
 }
 
+// A manager-authored manual survey is the one place untrusted free-text choices
+// can enter. Bound their length and count HERE, at the template (the single
+// place every caller funnels through), so a future non-HTTP caller — a CLI
+// --choice flag, say — can't bypass the API-layer cap.
+const MAX_MANUAL_CHOICE_TEXT = 200;
+const MAX_MANUAL_CHOICES = 10;
+
 function manualQuestion(context: Record<string, unknown>): SurveyQuestion {
     // A manager-authored question rides in context.question_text; choices, if
-    // supplied, are validated by the caller. Fall back to a neutral default.
+    // supplied, are bounded here. Fall back to a neutral default.
     const questionText =
         asString(context.question_text) ?? "Your manager would like a little context on your AI tool usage.";
     const rawChoices = Array.isArray(context.choices) ? context.choices : [];
     const choices: SurveyChoice[] = [];
     for (const c of rawChoices) {
+        if (choices.length >= MAX_MANUAL_CHOICES) break;
         if (c && typeof c === 'object') {
             const value = asString((c as Record<string, unknown>).value);
             const label = asString((c as Record<string, unknown>).label);
-            if (value && label) choices.push({value, label});
+            if (
+                value &&
+                label &&
+                value.length <= MAX_MANUAL_CHOICE_TEXT &&
+                label.length <= MAX_MANUAL_CHOICE_TEXT
+            ) {
+                choices.push({value, label});
+            }
         }
     }
     return {questionText, choices: choices.length > 0 ? choices : [OTHER]};

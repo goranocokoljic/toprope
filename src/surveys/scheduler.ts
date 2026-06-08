@@ -52,13 +52,9 @@ export async function runScheduledSurveySweep(
     }
     try {
         runMigrations(db, options.migrationsDir ?? DEFAULT_MIGRATIONS_DIR);
-        return await runTriggerSweep(
-            buildSurveyDispatchDeps(db, config, {
-                slackClient: options.slackClient,
-                emailer: options.emailer,
-                log: options.log,
-            }),
-        );
+        // `options` carries the SurveyDispatchOverrides fields (plus migrationsDir,
+        // which the builder structurally ignores), so pass it straight through.
+        return await runTriggerSweep(buildSurveyDispatchDeps(db, config, options));
     } catch (err) {
         log('survey sweep failed', err);
         return null;

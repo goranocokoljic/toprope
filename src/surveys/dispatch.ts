@@ -195,6 +195,11 @@ export async function resendStrandedAutoSurveys(
         // sweep would just be noise. They wait, untouched, for a manager send or
         // for the developer to gain a channel. Only genuinely retryable surveys
         // (a real channel that transiently failed) are re-sent here.
+        //
+        // v1 limitation: a survey whose channel *exists but always rejects* (a
+        // stale Slack id, a permanently-bouncing address) is retried each sweep
+        // with no attempt cap. Acceptable for a daily cron; a delivery_attempts
+        // column would bound it if the volume ever warrants.
         const developer = getDeveloperById(deps.db, survey.developer_id);
         if (!developer || !hasDeliverableChannel(deps, developer)) continue;
         retried++;
@@ -328,9 +333,10 @@ export async function runTriggerSweep(
         if (result.dispatched) {
             summary.autoSent++;
         } else if (result.send && !result.send.delivered) {
-            // auto-send was on but delivery failed → still queued, flag it
+            // auto-send was on but delivery failed → counted as undeliverable
+            // only (it sits in the queue, but reporting it under both
+            // `undeliverable` and `queued` would double-count the same survey).
             summary.undeliverable++;
-            summary.queued++;
         } else {
             summary.queued++;
         }
