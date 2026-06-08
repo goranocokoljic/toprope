@@ -6,6 +6,7 @@ import {
     runTriggerSweep,
     sendSurvey,
     type DispatchDeps,
+    type SurveyDispatchOverrides,
 } from '../../surveys/dispatch';
 import {
     declineSurvey,
@@ -32,6 +33,10 @@ import {badRequest, conflict, notFound} from './admin/helpers';
 // read. Generous enough for a real answer; small enough to stop storage abuse.
 const MAX_RESPONSE_TEXT = 4000;
 const MAX_QUESTION_TEXT = 2000;
+// A manual survey's tap-to-answer options are manager-authored free text too;
+// bound their length and count so they can't be an unbounded-storage vector.
+const MAX_CHOICE_TEXT = 200;
+const MAX_CHOICES = 10;
 
 /**
  * Data-prompted survey endpoints (Task 4.3 / #98).
@@ -48,12 +53,9 @@ const MAX_QUESTION_TEXT = 2000;
  *
  * The shared `dispatchDeps` carry the optional Slack client + emailer so send
  * actions can actually deliver; they're injected by the server at registration.
+ * The deps are exactly the dispatch deps minus the DB handle (supplied here).
  */
-export interface SurveyRoutesDeps {
-    slackClient?: DispatchDeps['slackClient'];
-    emailer?: DispatchDeps['emailer'];
-    log?: DispatchDeps['log'];
-}
+export type SurveyRoutesDeps = SurveyDispatchOverrides;
 
 export function registerSurveyRoutes(
     app: FastifyInstance,
@@ -211,10 +213,20 @@ function parseChoices(raw: unknown): SurveyChoice[] | undefined {
     if (!Array.isArray(raw)) return undefined;
     const out: SurveyChoice[] = [];
     for (const c of raw) {
+        if (out.length >= MAX_CHOICES) break;
         if (c && typeof c === 'object') {
             const value = (c as Record<string, unknown>).value;
             const label = (c as Record<string, unknown>).label;
-            if (typeof value === 'string' && typeof label === 'string' && value && label) {
+            // Bound both fields: a manager could otherwise persist arbitrarily
+            // long option text that's stored and surfaced to every manager read.
+            if (
+                typeof value === 'string' &&
+                typeof label === 'string' &&
+                value &&
+                label &&
+                value.length <= MAX_CHOICE_TEXT &&
+                label.length <= MAX_CHOICE_TEXT
+            ) {
                 out.push({value, label});
             }
         }

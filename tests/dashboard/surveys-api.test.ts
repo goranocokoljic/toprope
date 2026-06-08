@@ -167,6 +167,26 @@ describe('survey API', () => {
         expect(badRespond.statusCode).toBe(400);
     });
 
+    it('drops over-long manual choices instead of storing them', async () => {
+        const admin = await login(app, 'admin@test.com');
+        const create = await app.inject({
+            method: 'POST',
+            url: '/api/surveys',
+            headers: authHeaders(admin),
+            payload: {
+                developerId: 'alice',
+                questionText: 'Pick one',
+                choices: [
+                    {value: 'ok', label: 'Fine'},
+                    {value: 'x', label: 'y'.repeat(201)}, // over the per-choice cap
+                ],
+            },
+        });
+        expect(create.statusCode).toBe(201);
+        const survey = (create.json() as {data: {choices: {value: string}[]}}).data;
+        expect(survey.choices.map((c) => c.value)).toEqual(['ok']);
+    });
+
     it('manager can dismiss a queued survey', async () => {
         const survey = createManualSurvey(db, {developerId: 'alice', questionText: 'Q?'});
         const admin = await login(app, 'admin@test.com');

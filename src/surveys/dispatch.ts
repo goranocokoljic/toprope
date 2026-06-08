@@ -14,11 +14,13 @@
  * of a sweep, so one undeliverable survey can't abort the batch.
  */
 import type Database from 'better-sqlite3';
+import type {Developer} from '../registry/types';
 import {getDeveloperById} from '../registry/developers';
 import {resolveSetting} from '../settings/store';
-import type {SlackClient} from '../slack/client';
+import {createSlackClient, type SlackClient} from '../slack/client';
+import type {GovProxyConfig} from '../config/types';
 import {buildSurveyMessage, deliverSurveyByEmail} from './delivery';
-import type {Emailer} from './email';
+import {createLogEmailer, type Emailer} from './email';
 import {
     createSurvey,
     getSurveyById,
@@ -49,6 +51,41 @@ export interface DispatchDeps {
 
 function logErr(deps: DispatchDeps, message: string, err?: unknown): void {
     (deps.log ?? ((m, e) => console.error(`[surveys] ${m}`, e ?? '')))(message, err);
+}
+
+// Delivery deps minus the DB handle — the part wiring sites (server/CLI/
+// scheduler) construct from config or inject for tests.
+export type SurveyDispatchOverrides = Omit<DispatchDeps, 'db'>;
+
+/**
+ * The Slack client for survey delivery, derived from config: a real client only
+ * when the bot is enabled with a token, otherwise undefined (delivery then falls
+ * back to email). One place for this conditional so the server, CLI, and
+ * scheduler don't each re-derive it.
+ */
+export function surveySlackClientFromConfig(config: GovProxyConfig): SlackClient | undefined {
+    return config.slack?.enabled && config.slack.bot_token
+        ? createSlackClient(config.slack.bot_token)
+        : undefined;
+}
+
+/**
+ * Build the full dispatch deps for a given DB + config, applying any test/wiring
+ * overrides. Slack from config (unless overridden), the logging emailer as the
+ * email fallback (unless overridden). Shared by the CLI and the scheduler; the
+ * server reuses the override shape directly for its route registration.
+ */
+export function buildSurveyDispatchDeps(
+    db: Database.Database,
+    config: GovProxyConfig,
+    overrides: SurveyDispatchOverrides = {},
+): DispatchDeps {
+    return {
+        db,
+        slackClient: overrides.slackClient ?? surveySlackClientFromConfig(config),
+        emailer: overrides.emailer ?? createLogEmailer(),
+        log: overrides.log,
+    };
 }
 
 // Resolve the auto-send setting for a trigger type + team. Settings only exist
@@ -91,8 +128,12 @@ export async function sendSurvey(deps: DispatchDeps, surveyId: string): Promise<
         try {
             await deps.slackClient.postMessage(slackUserId, text, blocks);
             // Only flip status after a confirmed delivery, so a failed send leaves
-            // the survey queued for retry rather than silently "sent".
-            markSurveySent(deps.db, survey.id, 'slack');
+            // the survey queued for retry rather than silently "sent". markSurveySent
+            // is status-guarded; if it returns false a concurrent send already
+            // claimed this survey, so report that rather than a second success.
+            if (!markSurveySent(deps.db, survey.id, 'slack')) {
+                return {delivered: false, reason: 'not_queued'};
+            }
             return {delivered: true, delivery: 'slack'};
         } catch (err) {
             logErr(deps, `Slack delivery failed for survey ${survey.id}; trying email`, err);
@@ -103,7 +144,9 @@ export async function sendSurvey(deps: DispatchDeps, surveyId: string): Promise<
     if (developer.email && deps.emailer) {
         try {
             await deliverSurveyByEmail(deps.emailer, developer.email, survey);
-            markSurveySent(deps.db, survey.id, 'email');
+            if (!markSurveySent(deps.db, survey.id, 'email')) {
+                return {delivered: false, reason: 'not_queued'};
+            }
             return {delivered: true, delivery: 'email'};
         } catch (err) {
             logErr(deps, `Email delivery failed for survey ${survey.id}`, err);
@@ -115,6 +158,20 @@ export async function sendSurvey(deps: DispatchDeps, surveyId: string): Promise<
     // (otherwise an auto-send that never reaches the developer is invisible).
     logErr(deps, `Survey ${survey.id} is undeliverable (no Slack id and no email/emailer); left queued`);
     return {delivered: false, reason: 'undeliverable'};
+}
+
+/**
+ * Whether a survey could be delivered to this developer with the given deps —
+ * i.e. there is at least one usable channel (a linked Slack id + a Slack client,
+ * or an email + an emailer). Used to skip the auto-retry for surveys that are
+ * *structurally* undeliverable (no channel at all), so they aren't re-attempted
+ * and re-error-logged on every sweep. A transient channel failure is different —
+ * the channel exists, so such a survey is still retried.
+ */
+function hasDeliverableChannel(deps: DispatchDeps, developer: Developer): boolean {
+    if (developer.external_ids.slack && deps.slackClient) return true;
+    if (developer.email && deps.emailer) return true;
+    return false;
 }
 
 /**
@@ -133,6 +190,13 @@ export async function resendStrandedAutoSurveys(
     for (const survey of listSurveys(deps.db, {status: 'queued'})) {
         if (!isAutomatedTriggerType(survey.trigger_type as SurveyTriggerType)) continue;
         if (!isAutoSend(deps.db, survey.trigger_type as SurveyTriggerType, survey.team)) continue;
+        // Skip surveys with no usable channel: retrying can't help until the
+        // developer is linked, so re-attempting (and re-error-logging) them every
+        // sweep would just be noise. They wait, untouched, for a manager send or
+        // for the developer to gain a channel. Only genuinely retryable surveys
+        // (a real channel that transiently failed) are re-sent here.
+        const developer = getDeveloperById(deps.db, survey.developer_id);
+        if (!developer || !hasDeliverableChannel(deps, developer)) continue;
         retried++;
         const result = await sendSurvey(deps, survey.id);
         if (result.delivered) recovered++;

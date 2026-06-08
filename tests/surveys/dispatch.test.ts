@@ -9,14 +9,17 @@ import {setGlobalSetting, setTeamSetting} from '../../src/settings/store';
 import {FakeSlackClient} from '../slack/fake-client';
 import type {Emailer, OutboundEmail} from '../../src/surveys/email';
 import {
+    buildSurveyDispatchDeps,
     createManualSurvey,
     createAndDispatch,
     isAutoSend,
     resendStrandedAutoSurveys,
     runTriggerSweep,
     sendSurvey,
+    surveySlackClientFromConfig,
     type DispatchDeps,
 } from '../../src/surveys/dispatch';
+import type {GovProxyConfig} from '../../src/config/types';
 import {getSurveyById, listSurveys} from '../../src/surveys/store';
 import type {SurveyTriggerCandidate} from '../../src/surveys/triggers';
 
@@ -299,6 +302,71 @@ describe('runTriggerSweep', () => {
         const result = await resendStrandedAutoSurveys({db, slackClient: slack});
         expect(result.retried).toBe(0);
         expect(slack.postMessageCalls).toHaveLength(0);
+        db.close();
+    });
+
+    it('does not retry a stranded auto-survey when the developer has no channel', async () => {
+        const db = makeDb();
+        setGlobalSetting(db, 'survey_usage_drop_auto', true);
+        // Dev has an email but no linked Slack id, and deps provide no emailer →
+        // structurally undeliverable.
+        const dev = addDeveloper(db, 'Alice', 'eng', 'alice@example.com').id;
+        insertMonthlyDrop(db, dev);
+        const slack = new FakeSlackClient();
+        const first = await runTriggerSweep({db, slackClient: slack, log: () => {}});
+        expect(first.undeliverable).toBe(1);
+        // Next sweep: no usable channel, so the survey is skipped, not re-attempted.
+        const second = await runTriggerSweep({db, slackClient: slack, log: () => {}});
+        expect(second.retried).toBe(0);
+        db.close();
+    });
+
+    it('sendSurvey reports not_queued (not a second success) when the row was concurrently sent', async () => {
+        const db = makeDb();
+        const dev = addDeveloper(db, 'Alice', 'eng', 'alice@example.com').id;
+        linkDeveloper(db, dev, {slack: 'U_ALICE'});
+        const survey = createManualSurvey(db, {developerId: dev, questionText: 'Q?'});
+        const slack = new FakeSlackClient();
+        // Simulate a concurrent claim: flip the survey to sent during the post.
+        slack.postMessageCalls = [];
+        const origPost = slack.postMessage.bind(slack);
+        slack.postMessage = async (channel, text, blocks): Promise<void> => {
+            db.prepare("UPDATE surveys SET status = 'sent' WHERE id = ?").run(survey!.id);
+            return origPost(channel, text, blocks);
+        };
+        const result = await sendSurvey({db, slackClient: slack}, survey!.id);
+        expect(result.delivered).toBe(false);
+        if (result.delivered) return;
+        expect(result.reason).toBe('not_queued');
+        db.close();
+    });
+});
+
+describe('buildSurveyDispatchDeps / surveySlackClientFromConfig', () => {
+    function cfg(partial: Partial<GovProxyConfig>): GovProxyConfig {
+        return partial as GovProxyConfig;
+    }
+
+    it('derives no Slack client when the bot is disabled or tokenless', () => {
+        expect(surveySlackClientFromConfig(cfg({}))).toBeUndefined();
+        expect(surveySlackClientFromConfig(cfg({slack: {enabled: false}}))).toBeUndefined();
+        expect(surveySlackClientFromConfig(cfg({slack: {enabled: true}}))).toBeUndefined();
+    });
+
+    it('derives a Slack client when enabled with a token', () => {
+        expect(
+            surveySlackClientFromConfig(cfg({slack: {enabled: true, bot_token: 'xoxb-x'}})),
+        ).toBeDefined();
+    });
+
+    it('buildSurveyDispatchDeps falls back to a log emailer and honors overrides', () => {
+        const db = makeDb();
+        const deps = buildSurveyDispatchDeps(db, cfg({slack: {enabled: false}}));
+        expect(deps.emailer).toBeDefined();
+        expect(deps.slackClient).toBeUndefined();
+        const slack = new FakeSlackClient();
+        const overridden = buildSurveyDispatchDeps(db, cfg({}), {slackClient: slack});
+        expect(overridden.slackClient).toBe(slack);
         db.close();
     });
 });

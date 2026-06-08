@@ -4,10 +4,10 @@ import type Database from 'better-sqlite3';
 import {openDb} from '../storage/db';
 import {runMigrations} from '../storage/migrator';
 import {parseSyncTimeToCron} from '../scheduler/scheduler';
-import {createSlackClient, type SlackClient} from '../slack/client';
+import type {SlackClient} from '../slack/client';
 import type {GovProxyConfig} from '../config/types';
-import {createLogEmailer, type Emailer} from './email';
-import {runTriggerSweep, type DispatchDeps, type SweepSummary} from './dispatch';
+import type {Emailer} from './email';
+import {buildSurveyDispatchDeps, runTriggerSweep, type SweepSummary} from './dispatch';
 
 /**
  * Scheduled survey trigger sweep (Task 4.3 / #98).
@@ -31,27 +31,6 @@ export interface SurveySchedulerOptions {
     log?: (message: string, err?: unknown) => void;
 }
 
-// Build the Slack client + emailer for survey delivery, exactly as the server
-// does: Slack when the bot is enabled with a token, with the logging emailer as
-// the email fallback.
-function buildDispatchDeps(
-    db: Database.Database,
-    config: GovProxyConfig,
-    options: SurveySchedulerOptions,
-): DispatchDeps {
-    const slackClient =
-        options.slackClient ??
-        (config.slack?.enabled && config.slack.bot_token
-            ? createSlackClient(config.slack.bot_token)
-            : undefined);
-    return {
-        db,
-        slackClient,
-        emailer: options.emailer ?? createLogEmailer(),
-        log: options.log,
-    };
-}
-
 /**
  * Run one sweep end-to-end against `dbPath`: open a short-lived DB handle, apply
  * migrations, run the sweep, and close. Never throws — a failure is logged and
@@ -73,7 +52,13 @@ export async function runScheduledSurveySweep(
     }
     try {
         runMigrations(db, options.migrationsDir ?? DEFAULT_MIGRATIONS_DIR);
-        return await runTriggerSweep(buildDispatchDeps(db, config, options));
+        return await runTriggerSweep(
+            buildSurveyDispatchDeps(db, config, {
+                slackClient: options.slackClient,
+                emailer: options.emailer,
+                log: options.log,
+            }),
+        );
     } catch (err) {
         log('survey sweep failed', err);
         return null;

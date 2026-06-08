@@ -30,9 +30,9 @@ import {startAggregationScheduler} from './aggregation/scheduler';
 import {startSummaryScheduler} from './summaries/scheduler';
 import {registerSlackRoutes} from './slack/routes';
 import {startSlackDailyPrompt} from './slack/scheduler';
-import {createSlackClient} from './slack/client';
 import {registerSurveyRoutes} from './dashboard/api/surveys';
 import {createLogEmailer} from './surveys/email';
+import {surveySlackClientFromConfig} from './surveys/dispatch';
 import {startSurveyScheduler} from './surveys/scheduler';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, './storage/migrations');
@@ -111,12 +111,8 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
     // fallback (a logging emailer until a real transport is wired). The Slack
     // client is constructed only when the bot is enabled with a token, so
     // delivery cleanly degrades to email otherwise.
-    const surveySlackClient =
-        config.slack?.enabled && config.slack.bot_token
-            ? createSlackClient(config.slack.bot_token)
-            : undefined;
     registerSurveyRoutes(app, db, {
-        slackClient: surveySlackClient,
+        slackClient: surveySlackClientFromConfig(config as GovProxyConfig),
         emailer: createLogEmailer((line) => app.log.info(line)),
         log: (message, err) => app.log.error({err}, `[surveys] ${message}`),
     });

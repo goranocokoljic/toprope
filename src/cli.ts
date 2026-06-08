@@ -59,14 +59,12 @@ import {
 } from './selfreport/core';
 import {resolveSelfDeveloperId} from './selfreport/identity';
 import {
+    buildSurveyDispatchDeps,
     createManualSurvey,
     runTriggerSweep,
     sendSurvey,
-    type DispatchDeps,
 } from './surveys/dispatch';
 import {dismissSurvey, getSurveyById, listSurveys} from './surveys/store';
-import {createLogEmailer} from './surveys/email';
-import {createSlackClient} from './slack/client';
 import type {GovProxyConfig} from './config/types';
 
 // Commander option collector for repeatable flags (e.g. --git-email).
@@ -1569,23 +1567,16 @@ program
         if (!passed) process.exit(1);
     });
 
-// Build survey dispatch deps from config: a Slack client when the bot is
-// enabled with a token, plus the email fallback. Mirrors the server wiring so
-// CLI-driven sends use the same delivery preference (Slack first, email second).
+// CLI-driven survey sends use the shared dispatch-deps builder, so they apply
+// the same delivery preference (Slack first when configured, else email) as the
+// server and scheduler. Logs go to the console for CLI visibility.
 function buildDispatchDeps(
     db: ReturnType<typeof openDb>,
     config: GovProxyConfig,
-): DispatchDeps {
-    const slackClient =
-        config.slack?.enabled && config.slack.bot_token
-            ? createSlackClient(config.slack.bot_token)
-            : undefined;
-    return {
-        db,
-        slackClient,
-        emailer: createLogEmailer(),
+): ReturnType<typeof buildSurveyDispatchDeps> {
+    return buildSurveyDispatchDeps(db, config, {
         log: (message, err) => console.error(`[surveys] ${message}`, err ?? ''),
-    };
+    });
 }
 
 const surveyCommand = program
