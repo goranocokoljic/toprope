@@ -13,6 +13,10 @@ export interface PostMessageCall {
 export interface DeleteMessageCall {
     responseUrl: string;
 }
+export interface ReplaceMessageCall {
+    responseUrl: string;
+    text: string;
+}
 
 // Recording fake of SlackClient for handler/route tests. By default every call
 // succeeds; set a `*Error` to make the matching method reject (to exercise the
@@ -21,10 +25,12 @@ export class FakeSlackClient implements SlackClient {
     openViewCalls: OpenViewCall[] = [];
     postMessageCalls: PostMessageCall[] = [];
     deleteMessageCalls: DeleteMessageCall[] = [];
+    replaceMessageCalls: ReplaceMessageCall[] = [];
 
     openViewError: Error | null = null;
     postMessageError: Error | null = null;
     deleteMessageError: Error | null = null;
+    replaceMessageError: Error | null = null;
 
     async openView(triggerId: string, view: SlackView): Promise<void> {
         this.openViewCalls.push({triggerId, view});
@@ -37,5 +43,9 @@ export class FakeSlackClient implements SlackClient {
     async deleteMessage(responseUrl: string): Promise<void> {
         this.deleteMessageCalls.push({responseUrl});
         if (this.deleteMessageError) throw this.deleteMessageError;
+    }
+    async replaceMessage(responseUrl: string, text: string): Promise<void> {
+        this.replaceMessageCalls.push({responseUrl, text});
+        if (this.replaceMessageError) throw this.replaceMessageError;
     }
 }

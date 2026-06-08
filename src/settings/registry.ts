@@ -73,6 +73,44 @@ export const GLOBAL_SETTINGS: Record<string, SettingDef> = {
         default: false,
         teamOverridable: false,
     },
+    // Data-prompted surveys (Task 4.3 / #98): one auto-send flag per automated
+    // trigger type. `true` → a triggered survey is sent automatically; `false`
+    // (the default) → it's queued for a manager to review and send. Each is
+    // global-default + per-team override, gated by survey_managers_can_override.
+    survey_usage_drop_auto: {
+        key: 'survey_usage_drop_auto',
+        type: 'boolean',
+        default: false,
+        teamOverridable: true,
+        overrideGovernedBy: 'survey_managers_can_override',
+    },
+    survey_unused_new_seat_auto: {
+        key: 'survey_unused_new_seat_auto',
+        type: 'boolean',
+        default: false,
+        teamOverridable: true,
+        overrideGovernedBy: 'survey_managers_can_override',
+    },
+    survey_plan_change_auto: {
+        key: 'survey_plan_change_auto',
+        type: 'boolean',
+        default: false,
+        teamOverridable: true,
+        overrideGovernedBy: 'survey_managers_can_override',
+    },
+    survey_anomaly_auto: {
+        key: 'survey_anomaly_auto',
+        type: 'boolean',
+        default: false,
+        teamOverridable: true,
+        overrideGovernedBy: 'survey_managers_can_override',
+    },
+    survey_managers_can_override: {
+        key: 'survey_managers_can_override',
+        type: 'boolean',
+        default: false,
+        teamOverridable: false,
+    },
 };
 
 export interface PreferenceDef {
