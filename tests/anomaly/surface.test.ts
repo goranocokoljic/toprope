@@ -6,7 +6,6 @@ import {
     describeAnomaly,
     isSurfaceable,
     metricLabel,
-    severityRank,
 } from '../../src/anomaly/surface';
 import {FABRICATED_USAGE_TERMS} from '../../src/summaries/prompts';
 import type {AnomalyMetric} from '../../src/anomaly/types';
@@ -33,11 +32,6 @@ describe('anomaly surface — severity gating', () => {
         expect(isSurfaceable('high')).toBe(true);
         expect(isSurfaceable('notable')).toBe(true);
         expect(isSurfaceable('info')).toBe(false);
-    });
-
-    it('ranks severity high > notable > info', () => {
-        expect(severityRank('high')).toBeGreaterThan(severityRank('notable'));
-        expect(severityRank('notable')).toBeGreaterThan(severityRank('info'));
     });
 });
 

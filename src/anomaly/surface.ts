@@ -56,13 +56,6 @@ export function basisLabel(basis: AnomalyBasis): string {
     return basis === 'git_estimate' ? 'git-based estimate' : 'measured tool data';
 }
 
-/** Severity ordering, least → most severe. */
-const SEVERITY_RANK: Record<AnomalySeverity, number> = {info: 1, notable: 2, high: 3};
-
-export function severityRank(severity: AnomalySeverity): number {
-    return SEVERITY_RANK[severity];
-}
-
 /** The severities that push out to Slack and into summaries. */
 export type SurfaceableSeverity = 'notable' | 'high';
 
