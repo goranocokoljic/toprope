@@ -186,6 +186,17 @@ export interface SlackBotConfig {
     daily_prompt?: SlackDailyPromptConfig;
 }
 
+// Data-prompted surveys (Task 4.3). Opt-in scheduled trigger sweep: when
+// enabled, the server runs survey trigger detection + dispatch on a daily cron,
+// so auto-send surveys actually go out (and stranded ones are retried) without a
+// manual `govproxy survey run`. Disabled by default — sweeps are operator-driven
+// until switched on.
+export interface SurveysConfig {
+    enabled?: boolean;
+    // HH:MM in UTC for the daily sweep. Defaults to 09:00 when omitted.
+    sweep_time?: string;
+}
+
 export interface DashboardAuthConfig {
     type?: string;
     // Legacy Phase 1 single admin password. Superseded by per-user accounts
@@ -219,6 +230,7 @@ export interface GovProxyConfig {
     summaries: SummariesConfig;
     alerts: AlertsConfig;
     slack: SlackBotConfig;
+    surveys?: SurveysConfig;
     dashboard: DashboardConfig;
     teams: TeamConfig[];
 }

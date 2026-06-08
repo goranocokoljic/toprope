@@ -17,3 +17,29 @@ export function isAdmin(request: FastifyRequest): boolean {
 export function forbidden(reply: FastifyReply, message = 'Admin privileges required'): void {
     reply.status(403).send({error: 'Forbidden', message});
 }
+
+/**
+ * Resolve the session's developer id for a /api/me/* route, or send the
+ * appropriate error and return null. 401 when unauthenticated (defence-in-depth
+ * behind the middleware), 404 when the account has no linked developer (the
+ * linked developer was removed → FK SET NULL) — a 404 rather than a leak of
+ * anyone's data.
+ *
+ * This is the single home for the "developer id comes ONLY from the session,
+ * never from a request param/body" rule, shared by every self-service route so
+ * the privacy-critical logic lives in exactly one place.
+ */
+export function requireDeveloperId(request: FastifyRequest, reply: FastifyReply): string | null {
+    if (!request.authUser) {
+        reply.status(401).send({error: 'Unauthorized', message: 'Authentication required'});
+        return null;
+    }
+    const developerId = request.authUser.developerId;
+    if (!developerId) {
+        reply
+            .status(404)
+            .send({error: 'Not Found', message: 'No developer profile linked to this account'});
+        return null;
+    }
+    return developerId;
+}

@@ -1,6 +1,8 @@
 import type Database from 'better-sqlite3';
 import {findBySlackUserId} from '../registry/developers';
 import {createSelfReport, SelfReportError, type SnapshotOutcome} from '../selfreport/core';
+import {ACTION_SURVEY_ANSWER_PREFIX, ACTION_SURVEY_DECLINE} from '../surveys/delivery';
+import {declineSurvey, getSurveyById, respondToSurvey} from '../surveys/store';
 import type {SlackClient} from './client';
 import {
     ACTION_DISMISS_PROMPT,
@@ -272,5 +274,71 @@ export async function handleBlockActions(
         return ACK;
     }
 
+    // Data-prompted survey buttons (Task 4.3): an answer choice or a decline. The
+    // survey id rides in the button value; the chosen option is the action_id
+    // suffix. Identity is the clicking Slack user — a developer can only answer
+    // their OWN survey (enforced in respondToSurvey/declineSurvey by id).
+    if (actionId && (actionId.startsWith(ACTION_SURVEY_ANSWER_PREFIX) || actionId === ACTION_SURVEY_DECLINE)) {
+        const surveyId = getString(first, 'value');
+        const slackUserId = getString(asRecord(payload['user']), 'id');
+        await handleSurveyAction(deps, actionId, surveyId, slackUserId, responseUrl);
+        return ACK;
+    }
+
     return ACK;
+}
+
+/**
+ * Apply a survey button click: resolve the clicking Slack user to a developer,
+ * then record their answer or decline. All failures are logged, never thrown —
+ * the interaction is best-effort and must always ACK so Slack doesn't retry. The
+ * original message is updated (via response_url) to confirm and remove the now-
+ * spent buttons.
+ */
+async function handleSurveyAction(
+    deps: SlackHandlerDeps,
+    actionId: string,
+    surveyId: string | undefined,
+    slackUserId: string | undefined,
+    responseUrl: string | undefined,
+): Promise<void> {
+    if (!surveyId || !slackUserId) return;
+    const developer = findBySlackUserId(deps.db, slackUserId);
+    if (!developer) return;
+
+    let confirmation: string | undefined;
+    try {
+        if (actionId === ACTION_SURVEY_DECLINE) {
+            const outcome = declineSurvey(deps.db, surveyId, developer.id);
+            if (outcome === 'ok') confirmation = 'Thanks — no problem at all. Marked as no answer.';
+        } else {
+            const choiceValue = actionId.slice(ACTION_SURVEY_ANSWER_PREFIX.length);
+            const survey = getSurveyById(deps.db, surveyId);
+            // Only honor the click if the survey belongs to this developer; the
+            // label (for the confirmation) is looked up from the survey's choices.
+            if (survey && survey.developer_id === developer.id) {
+                const outcome = respondToSurvey(deps.db, surveyId, developer.id, {
+                    responseChoice: choiceValue,
+                });
+                if (outcome === 'ok') {
+                    const label = survey.choices.find((c) => c.value === choiceValue)?.label;
+                    confirmation = label
+                        ? `Thanks for the context — noted *${label}*.`
+                        : 'Thanks for the context.';
+                }
+            }
+        }
+    } catch (err) {
+        logError(deps, 'failed to record survey action', err);
+        return;
+    }
+
+    // Replace the original message so the buttons can't be clicked twice.
+    if (confirmation && responseUrl) {
+        try {
+            await deps.client.replaceMessage(responseUrl, confirmation);
+        } catch (err) {
+            logError(deps, 'failed to confirm survey response', err);
+        }
+    }
 }

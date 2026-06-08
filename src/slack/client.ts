@@ -10,6 +10,9 @@ export interface SlackClient {
     // Delete the message behind an interaction's response_url (used to dismiss the
     // daily prompt).
     deleteMessage(responseUrl: string): Promise<void>;
+    // Replace the message behind an interaction's response_url with new text and
+    // no blocks (used to confirm a survey answer and retire its buttons).
+    replaceMessage(responseUrl: string, text: string): Promise<void>;
 }
 
 const SLACK_API_BASE = 'https://slack.com/api';
@@ -67,6 +70,18 @@ export function createSlackClient(botToken: string): SlackClient {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json; charset=utf-8'},
                 body: JSON.stringify({delete_original: true}),
+            });
+            if (!res.ok) {
+                throw new Error(`Slack response_url HTTP ${res.status}`);
+            }
+        },
+        async replaceMessage(responseUrl, text): Promise<void> {
+            const res = await fetch(responseUrl, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json; charset=utf-8'},
+                // replace_original swaps the original message in place; sending no
+                // blocks clears the buttons so the survey can't be answered twice.
+                body: JSON.stringify({replace_original: true, text, blocks: []}),
             });
             if (!res.ok) {
                 throw new Error(`Slack response_url HTTP ${res.status}`);

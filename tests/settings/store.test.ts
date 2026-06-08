@@ -60,6 +60,11 @@ describe('settings store', () => {
                     'roi_managers_can_override',
                     'roi_settling_days',
                     'roi_threshold',
+                    'survey_usage_drop_auto',
+                    'survey_unused_new_seat_auto',
+                    'survey_plan_change_auto',
+                    'survey_anomaly_auto',
+                    'survey_managers_can_override',
                 ].sort(),
             );
         });
