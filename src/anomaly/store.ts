@@ -112,7 +112,17 @@ export interface AnomalyListFilter {
     limit?: number;
 }
 
-/** List anomalies, most recent first, filtered by the given coordinates. */
+/**
+ * List anomalies, most recent first, filtered by the given coordinates.
+ *
+ * PRIVACY CONTRACT: a developer-scope anomaly is individual data, visible only
+ * to that developer (managers see team aggregates only). This function does NOT
+ * enforce that on its own — `{scope: 'developer'}` with no `scopeId` returns
+ * every developer's anomalies, which is correct for the admin/operator CLI but a
+ * cross-developer leak if exposed over HTTP. Any request-facing caller (Task 4.8
+ * surfacing) MUST pin `scopeId` to the authenticated developer for developer-scope
+ * reads, or restrict the route to admins.
+ */
 export function listAnomalies(db: Database.Database, filter: AnomalyListFilter = {}): AnomalyRecord[] {
     const clauses: string[] = [];
     const params: unknown[] = [];
@@ -133,9 +143,11 @@ export function listAnomalies(db: Database.Database, filter: AnomalyListFilter =
         params.push(filter.period);
     }
     const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
-    // Severity is a text enum, so a plain `severity DESC` would order it
-    // LEXICALLY (high < info < notable) and sink the most severe band to the
-    // bottom. Rank it explicitly so high > notable > info, then newest first.
+    // Newest first, with severity as the tiebreak among same-timestamp rows.
+    // The severity tiebreak is an explicit CASE rank rather than `severity DESC`:
+    // severity is a text enum, so a lexical sort would order it high < info <
+    // notable and sink the most severe band to the bottom of a tie. The CASE
+    // ranks it high > notable > info so a tie surfaces the worst first.
     let sql = `SELECT * FROM anomalies ${where}
                ORDER BY detected_at DESC,
                         CASE severity WHEN 'high' THEN 3 WHEN 'notable' THEN 2 ELSE 1 END DESC`;
