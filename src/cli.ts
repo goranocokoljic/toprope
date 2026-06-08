@@ -19,6 +19,11 @@ import {runPipeline} from './scheduler/sync-pipeline';
 import {importCsv} from './expenses/importer';
 import {listUnmatchedCharges, resolveCharge, findUnmatchedIdByPrefix} from './expenses/resolution-queue';
 import {
+    reconcilePeriod,
+    latestExpensePeriod,
+    type ReconciliationResultType,
+} from './expenses/reconcile';
+import {
     listSubscriptions,
     getDeveloperCostSummaries,
     getTeamCostSummaries,
@@ -821,6 +826,74 @@ expensesCommand
                 if (res.subscriptionCreated && res.charge.monthly_cost === null) {
                     console.warn(
                         '  ⚠  This charge has no resolvable cost — the subscription was created with no monthly cost.',
+                    );
+                }
+            }
+        } catch (err) {
+            console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+            failed = true;
+        } finally {
+            db.close();
+        }
+        if (failed) process.exit(1);
+    });
+
+expensesCommand
+    .command('reconcile')
+    .description('Reconcile imported expenses against the subscription registry')
+    .option('--period <YYYY-MM>', 'Period to reconcile (defaults to the latest expense period)')
+    .option('--tolerance <amount>', 'Cost-discrepancy tolerance in dollars (overrides config)')
+    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .action((options: {period?: string; tolerance?: string; config: string}) => {
+        const configPath = path.resolve(process.cwd(), options.config);
+        const config = loadConfig(configPath);
+        const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
+        const db = openDb(dbPath);
+        let failed = false;
+        try {
+            runMigrations(db, MIGRATIONS_DIR);
+
+            const period = options.period ?? latestExpensePeriod(db);
+            if (!period) {
+                console.error(
+                    'No period to reconcile. Import expenses first, or pass --period YYYY-MM.',
+                );
+                failed = true;
+            }
+
+            let tolerance: number | undefined;
+            if (!failed && options.tolerance !== undefined) {
+                tolerance = Number(options.tolerance);
+                if (!Number.isFinite(tolerance) || tolerance < 0) {
+                    console.error('--tolerance must be a non-negative number.');
+                    failed = true;
+                }
+            }
+            // Fall back to the configured tolerance when no flag was given.
+            if (!failed && tolerance === undefined) {
+                tolerance = config.expenses.reconciliation?.cost_tolerance;
+            }
+
+            if (!failed && period) {
+                const summary = reconcilePeriod(db, period, {tolerance});
+                const labels: Record<ReconciliationResultType, string> = {
+                    expense_no_subscription: 'expense w/o subscription',
+                    subscription_no_expense: 'subscription w/o expense',
+                    cost_discrepancy: 'cost discrepancy',
+                };
+                console.log(
+                    `Reconciled ${summary.period} (tolerance $${summary.tolerance.toFixed(2)})`,
+                );
+                console.log(
+                    `  ${summary.created} new result(s)  |  ${summary.skipped} already tracked (skipped)`,
+                );
+                for (const type of Object.keys(labels) as ReconciliationResultType[]) {
+                    console.log(`    ${labels[type].padEnd(26)} ${summary.byType[type]}`);
+                }
+                if (summary.created > 0) {
+                    console.log('');
+                    console.log(
+                        'Review open results in the Admin → Reconciliation screen, or via GET /api/admin/reconciliation.',
                     );
                 }
             }

@@ -48,4 +48,7 @@ export const queryKeys = {
     adminDevelopers: ['admin', 'developers'] as const,
     adminSubscriptions: ['admin', 'subscriptions'] as const,
     adminDataSources: ['admin', 'data-sources'] as const,
+    // Expense reconciliation (Task 4.4): keyed by status so switching the filter
+    // refetches the right slice of the queue.
+    adminReconciliation: (status: string) => ['admin', 'reconciliation', status] as const,
 };

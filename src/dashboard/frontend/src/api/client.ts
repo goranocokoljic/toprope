@@ -22,6 +22,9 @@ import type {
     OverviewData,
     OverviewTrend,
     PaginatedResponse,
+    ReconciliationResult,
+    ReconciliationRunSummary,
+    ReconciliationStatus,
     SummaryDetail,
     SummaryLevel,
     SummaryListItem,
@@ -445,6 +448,38 @@ export const api = {
     // --- Admin: data sources (read-only) ---
     async getAdminDataSources(): Promise<AdminDataSources> {
         const body = await request<ApiEnvelope<AdminDataSources>>('/api/admin/data-sources');
+        return body.data;
+    },
+
+    // --- Admin: expense reconciliation (Task 4.4 / #99) ---
+    async getReconciliation(status: ReconciliationStatus | 'all'): Promise<ReconciliationResult[]> {
+        const body = await request<ApiEnvelope<ReconciliationResult[]>>(
+            `/api/admin/reconciliation?status=${encodeURIComponent(status)}`,
+        );
+        return body.data;
+    },
+
+    async runReconciliation(input: {period?: string; tolerance?: number}): Promise<ReconciliationRunSummary> {
+        const body = await postJson<ApiEnvelope<ReconciliationRunSummary>>(
+            '/api/admin/reconciliation/run',
+            input,
+        );
+        return body.data;
+    },
+
+    async resolveReconciliation(id: string, resolution: string): Promise<ReconciliationResult> {
+        const body = await postJson<ApiEnvelope<ReconciliationResult>>(
+            `/api/admin/reconciliation/${encodeURIComponent(id)}/resolve`,
+            {resolution},
+        );
+        return body.data;
+    },
+
+    async ignoreReconciliation(id: string, note?: string): Promise<ReconciliationResult> {
+        const body = await postJson<ApiEnvelope<ReconciliationResult>>(
+            `/api/admin/reconciliation/${encodeURIComponent(id)}/ignore`,
+            note ? {note} : {},
+        );
         return body.data;
     },
 

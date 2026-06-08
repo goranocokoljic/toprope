@@ -16,6 +16,7 @@ import {AdminUsers} from './pages/admin/AdminUsers';
 import {AdminTeams} from './pages/admin/AdminTeams';
 import {AdminIdentities} from './pages/admin/AdminIdentities';
 import {AdminSubscriptions} from './pages/admin/AdminSubscriptions';
+import {AdminReconciliation} from './pages/admin/AdminReconciliation';
 import {AdminDataSources} from './pages/admin/AdminDataSources';
 import {RequireAdmin} from './components/RequireAdmin';
 import {NotFound} from './pages/NotFound';
@@ -93,6 +94,14 @@ export function App(): JSX.Element {
                     element={
                         <RequireAdmin>
                             <AdminSubscriptions />
+                        </RequireAdmin>
+                    }
+                />
+                <Route
+                    path="admin/reconciliation"
+                    element={
+                        <RequireAdmin>
+                            <AdminReconciliation />
                         </RequireAdmin>
                     }
                 />

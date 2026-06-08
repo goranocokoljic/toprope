@@ -518,6 +518,44 @@ export interface AdminDataSources {
     git_providers: CoverageGitProvider[];
 }
 
+// --- Admin: expense reconciliation (Task 4.4 / #99) ----------------------
+
+export type ReconciliationResultType =
+    | 'expense_no_subscription'
+    | 'subscription_no_expense'
+    | 'cost_discrepancy';
+
+export type ReconciliationStatus = 'open' | 'resolved' | 'ignored';
+
+/** One reconciliation result joined with its developer, from GET /api/admin/reconciliation. */
+export interface ReconciliationResult {
+    id: string;
+    run_at: string;
+    period: string;
+    result_type: ReconciliationResultType;
+    developer_id: string | null;
+    developer_name: string | null;
+    developer_email: string | null;
+    team: string | null;
+    tool: string | null;
+    expense_amount: number | null;
+    registry_amount: number | null;
+    details: string | null;
+    status: ReconciliationStatus;
+    resolution: string | null;
+    resolved_at: string | null;
+}
+
+/** Summary returned by POST /api/admin/reconciliation/run. */
+export interface ReconciliationRunSummary {
+    period: string;
+    run_at: string;
+    tolerance: number;
+    created: number;
+    skipped: number;
+    byType: Record<ReconciliationResultType, number>;
+}
+
 // --- Phase 3: maturity trend + AI summaries (Task 3.12) ------------------
 
 /**

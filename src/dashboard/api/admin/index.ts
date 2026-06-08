@@ -5,6 +5,7 @@ import {registerAdminTeamRoutes} from './teams';
 import {registerAdminDeveloperRoutes} from './developers';
 import {registerAdminSubscriptionRoutes} from './subscriptions';
 import {registerAdminDataSourceRoutes} from './data-sources';
+import {registerAdminReconciliationRoutes} from './reconciliation';
 
 /**
  * Admin Management API (Task 2.13 / #48). Wraps the Phase 1 user/team/developer/
@@ -19,4 +20,5 @@ export function registerAdminRoutes(app: FastifyInstance, db: Database.Database)
     registerAdminDeveloperRoutes(app, db);
     registerAdminSubscriptionRoutes(app, db);
     registerAdminDataSourceRoutes(app, db);
+    registerAdminReconciliationRoutes(app, db);
 }
