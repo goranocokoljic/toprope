@@ -4,6 +4,7 @@ import {ManagerOverview} from './pages/ManagerOverview';
 import {TeamsList} from './pages/TeamsList';
 import {TeamDetail} from './pages/TeamDetail';
 import {TeamCompare} from './pages/TeamCompare';
+import {TeamCompareTable} from './pages/TeamCompareTable';
 import {WasteDetection} from './pages/WasteDetection';
 import {Anomalies} from './pages/Anomalies';
 import {ComingSoon} from './pages/ComingSoon';
@@ -37,6 +38,7 @@ export function App(): JSX.Element {
                 <Route path="manager" element={<ManagerOverview />} />
                 <Route path="manager/teams" element={<TeamsList />} />
                 <Route path="manager/compare" element={<TeamCompare />} />
+                <Route path="manager/rank-teams" element={<TeamCompareTable />} />
                 <Route path="manager/teams/:team" element={<TeamDetail />} />
                 <Route
                     path="manager/developers/:id"

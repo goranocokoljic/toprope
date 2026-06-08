@@ -10,6 +10,7 @@ import type {
     AnomalyStatus,
     ApiEnvelope,
     AuthUser,
+    CompareTable,
     CoverageData,
     GlobalSettings,
     Leaderboard,
@@ -208,6 +209,18 @@ export const api = {
             if (params.to) search.set('to', params.to);
         }
         const body = await request<ApiEnvelope<TeamComparison>>(`/api/compare?${search.toString()}`);
+        return body.data;
+    },
+
+    /**
+     * Sortable all-teams ranking table for one period (admin). Reads the
+     * pre-computed quarterly rollup, so it stays fast for many teams. Omit
+     * `period` to get the latest rolled-up quarter; the response echoes the
+     * resolved period and lists the available quarters for the selector.
+     */
+    async getCompareTable(period?: string): Promise<CompareTable> {
+        const qs = period ? `?period=${encodeURIComponent(period)}` : '';
+        const body = await request<ApiEnvelope<CompareTable>>(`/api/teams/compare-table${qs}`);
         return body.data;
     },
 

@@ -9,9 +9,11 @@ export interface Column<T> {
     /**
      * Value used for the default cell text AND for sorting. Provide for any
      * sortable column. Columns with only `render` and no `accessor` are not
-     * sortable.
+     * sortable. Return `null` for a row with no value in this column — such rows
+     * always sort to the END, in BOTH directions (see the sort comparator), so a
+     * "no data" row never reads as the best or worst ranked value.
      */
-    accessor?: (row: T) => string | number;
+    accessor?: (row: T) => string | number | null;
     /** Custom cell renderer; falls back to the accessor value. */
     render?: (row: T) => ReactNode;
     align?: 'left' | 'right' | 'center';
@@ -72,8 +74,21 @@ export function DataTable<T>({
         }
         const accessor = col.accessor;
         const factor = sort.direction === 'asc' ? 1 : -1;
-        // Copy before sorting so we never mutate the caller's array.
-        return [...rows].sort((a, b) => factor * compareValues(accessor(a), accessor(b)));
+        // Copy before sorting so we never mutate the caller's array. Null
+        // accessor values ("no data") sort to the END in both directions —
+        // handled OUTSIDE the direction factor so they never flip to the front
+        // on a descending sort, and so two nulls compare equal (a total order;
+        // never a NaN from e.g. -Infinity − -Infinity).
+        return [...rows].sort((a, b) => {
+            const av = accessor(a);
+            const bv = accessor(b);
+            const aNull = av === null;
+            const bNull = bv === null;
+            if (aNull || bNull) {
+                return aNull === bNull ? 0 : aNull ? 1 : -1;
+            }
+            return factor * compareValues(av, bv);
+        });
     }, [rows, columns, sort]);
 
     function toggleSort(key: string): void {

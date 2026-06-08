@@ -10,8 +10,13 @@ import type {MaturityBasis} from '../api/types';
  * the same basis reads.
  */
 
-/** Short chip text for a basis — what the line/score is built from. */
-export function maturityBasisLabel(basis: MaturityBasis | null): string {
+/**
+ * Short chip text for a basis — what the line/score is built from. Accepts a raw
+ * `string` (not just the closed union) because some sources read the basis from
+ * an unconstrained TEXT column; an unrecognized value falls through to the honest
+ * "Estimate" default rather than implying measurement.
+ */
+export function maturityBasisLabel(basis: MaturityBasis | string | null): string {
     switch (basis) {
         case 'git_estimate':
             return 'Git-based estimate';
@@ -30,7 +35,7 @@ export function maturityBasisLabel(basis: MaturityBasis | null): string {
  * the backend deriveDataBasis copy (src/summaries/input-builder.ts) so the
  * dashboard and the generated narratives describe the same basis identically.
  */
-export function maturityBasisDescription(basis: MaturityBasis | null): string {
+export function maturityBasisDescription(basis: MaturityBasis | string | null): string {
     switch (basis) {
         case 'git_estimate':
             return 'Based on git analysis and expense data — no direct tool usage is connected yet, so this is an estimate, not a measurement.';
