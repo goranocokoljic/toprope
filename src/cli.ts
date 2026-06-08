@@ -17,6 +17,7 @@ import {CursorSync} from './connectors/cursor/sync';
 import {GitSync} from './connectors/git/sync';
 import {runPipeline} from './scheduler/sync-pipeline';
 import {importCsv} from './expenses/importer';
+import {listUnmatchedCharges, resolveCharge} from './expenses/resolution-queue';
 import {
     listSubscriptions,
     getDeveloperCostSummaries,
@@ -706,23 +707,128 @@ const expensesCommand = program.command('expenses').description('Manage expense 
 expensesCommand
     .command('import <file>')
     .description('Import subscriptions from a CSV file')
+    .option('--profile <name>', 'Import profile: standard | expensify | concur (or a configured one)', 'standard')
     .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
-    .action((file: string, options: {config: string}) => {
+    .action((file: string, options: {profile: string; config: string}) => {
+        const configPath = path.resolve(process.cwd(), options.config);
+        const config = loadConfig(configPath);
+        const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
+        const db = openDb(dbPath);
+        let failed = false;
+        try {
+            runMigrations(db, MIGRATIONS_DIR);
+            const filePath = path.resolve(process.cwd(), file);
+            const result = importCsv(db, filePath, config.expenses, {profile: options.profile});
+            console.log(`Import complete (profile: ${result.profile})`);
+            console.log(
+                `  ${result.imported} subscription(s) imported  |  ${result.matched} matched  |  ` +
+                    `${result.unmatched} unmatched (queued)  |  ${result.duplicates} duplicate(s) skipped`,
+            );
+            console.log(
+                `  ${result.recurring} recurring  |  ${result.oneTime} one-time  |  ` +
+                    `${result.inferredBillingModel} with inferred billing model`,
+            );
+            for (const warning of result.warnings) {
+                console.warn(`  ⚠  ${warning}`);
+            }
+            if (result.unmatched > 0) {
+                console.log('');
+                console.log(
+                    `${result.unmatched} row(s) need resolution. Run \`govproxy expenses unmatched\` to review.`,
+                );
+            }
+        } catch (err) {
+            console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+            failed = true;
+        } finally {
+            db.close();
+        }
+        if (failed) process.exit(1);
+    });
+
+expensesCommand
+    .command('unmatched')
+    .description('List expense charges queued for manual resolution')
+    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .action((options: {config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const config = loadConfig(configPath);
         const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
         const db = openDb(dbPath);
         try {
             runMigrations(db, MIGRATIONS_DIR);
-            const filePath = path.resolve(process.cwd(), file);
-            const result = importCsv(db, filePath, config.expenses);
-            console.log(`Import complete: ${result.imported} imported, ${result.skipped} skipped`);
-            for (const warning of result.warnings) {
-                console.warn(`  ⚠  ${warning}`);
+            const charges = listUnmatchedCharges(db);
+            if (charges.length === 0) {
+                console.log('No unmatched charges. Everything is resolved.');
+                return;
             }
+            const col = (s: string, width: number): string => s.padEnd(width).slice(0, width);
+            console.log('Unmatched charges (queued for resolution):');
+            console.log('─'.repeat(80));
+            console.log(
+                `${col('ID', 12)}${col('Source row', 26)}${col('Tool', 12)}${col('Plan', 12)}Cost/mo`,
+            );
+            console.log('─'.repeat(80));
+            for (const c of charges) {
+                const who = c.raw_email ?? c.raw_name ?? '(unknown)';
+                const cost = c.monthly_cost != null ? `$${c.monthly_cost.toFixed(2)}` : '—';
+                console.log(
+                    `${col(c.id.slice(0, 8), 12)}${col(who, 26)}${col(c.tool, 12)}${col(c.plan ?? '—', 12)}${cost}`,
+                );
+            }
+            console.log('─'.repeat(80));
+            console.log(
+                'Resolve with `govproxy expenses resolve <charge-id> --dev <developer-id>`.',
+            );
         } finally {
             db.close();
         }
+    });
+
+expensesCommand
+    .command('resolve <charge-id>')
+    .description('Assign a queued unmatched charge to a developer')
+    .requiredOption('--dev <developer-id>', 'Developer ID to attribute the charge to')
+    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .action((chargeId: string, options: {dev: string; config: string}) => {
+        const configPath = path.resolve(process.cwd(), options.config);
+        const config = loadConfig(configPath);
+        const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
+        const db = openDb(dbPath);
+        let failed = false;
+        try {
+            runMigrations(db, MIGRATIONS_DIR);
+            // Support the 8-char short id shown by `expenses unmatched`.
+            let fullId = chargeId;
+            if (chargeId.length < 36) {
+                const row = db
+                    .prepare(
+                        `SELECT id FROM expense_charges WHERE id LIKE ? AND match_status = 'unmatched' AND resolved_at IS NULL LIMIT 1`,
+                    )
+                    .get(`${chargeId}%`) as {id: string} | undefined;
+                if (!row) {
+                    console.error(`No unmatched charge found matching id: ${chargeId}`);
+                    failed = true;
+                } else {
+                    fullId = row.id;
+                }
+            }
+            if (!failed) {
+                const res = resolveCharge(db, fullId, options.dev);
+                console.log(
+                    `Charge ${fullId.slice(0, 8)} resolved → developer ${options.dev}.` +
+                        (res.subscriptionCreated
+                            ? ` Subscription for ${res.charge.tool} created/updated.`
+                            : ' (one-time charge — recorded, no subscription created.)'),
+                );
+            }
+        } catch (err) {
+            console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+            failed = true;
+        } finally {
+            db.close();
+        }
+        if (failed) process.exit(1);
     });
 
 expensesCommand

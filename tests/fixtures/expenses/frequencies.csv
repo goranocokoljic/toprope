@@ -1,0 +1,4 @@
+developer_email,tool,plan,amount,frequency,billing_model
+alice@example.com,cursor,pro,20,monthly,personal
+bob@example.com,copilot,enterprise,468,annual,company_managed
+jane@example.com,claude_code,credits,50,one-time,reimbursed

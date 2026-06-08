@@ -12,6 +12,9 @@ export interface Subscription {
     tool: string;
     plan: string | null;
     billing_model: string;
+    // 1 when billing_model was inferred (import profile/heuristics) rather than
+    // read verbatim from the source. 0 when explicit/known. Stored as INTEGER.
+    billing_model_inferred: number;
     monthly_cost: number | null;
     seat_assigned_at: string | null;
     seat_revoked_at: string | null;
@@ -23,6 +26,9 @@ export interface UpsertData {
     tool: string;
     plan: string | null;
     billing_model: string;
+    // Optional; defaults to false (explicit). Callers that infer the billing
+    // model (the expense importer) pass true so the seat is flagged.
+    billing_model_inferred?: boolean;
     monthly_cost: number | null;
     data_source: string;
 }
@@ -110,14 +116,16 @@ function insertSubscription(
     assignedAt: string,
 ): Subscription {
     const id = randomUUID();
+    const inferred = data.billing_model_inferred ? 1 : 0;
     db.prepare(
-        'INSERT INTO subscriptions (id, developer_id, tool, plan, billing_model, monthly_cost, seat_assigned_at, seat_revoked_at, data_source) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)',
+        'INSERT INTO subscriptions (id, developer_id, tool, plan, billing_model, billing_model_inferred, monthly_cost, seat_assigned_at, seat_revoked_at, data_source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)',
     ).run(
         id,
         data.developer_id,
         data.tool,
         data.plan,
         data.billing_model,
+        inferred,
         data.monthly_cost,
         assignedAt,
         data.data_source,
@@ -129,6 +137,7 @@ function insertSubscription(
         tool: data.tool,
         plan: data.plan,
         billing_model: data.billing_model,
+        billing_model_inferred: inferred,
         monthly_cost: data.monthly_cost,
         seat_assigned_at: assignedAt,
         seat_revoked_at: null,
@@ -216,16 +225,19 @@ export function upsertSubscription(db: Database.Database, data: UpsertData): Sub
 
         if (!isMaterialChange(existing, data)) {
             // Same plan + cost. Patch only metadata if it drifted; otherwise no-op.
+            const inferred = data.billing_model_inferred ? 1 : 0;
             if (
                 existing.billing_model !== data.billing_model ||
+                existing.billing_model_inferred !== inferred ||
                 existing.data_source !== data.data_source
             ) {
                 db.prepare(
-                    'UPDATE subscriptions SET billing_model = ?, data_source = ? WHERE id = ?',
-                ).run(data.billing_model, data.data_source, existing.id);
+                    'UPDATE subscriptions SET billing_model = ?, billing_model_inferred = ?, data_source = ? WHERE id = ?',
+                ).run(data.billing_model, inferred, data.data_source, existing.id);
                 return {
                     ...existing,
                     billing_model: data.billing_model,
+                    billing_model_inferred: inferred,
                     data_source: data.data_source,
                 };
             }

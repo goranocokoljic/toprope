@@ -75,12 +75,34 @@ export interface ColumnMappingConfig {
     plan?: string;
     monthly_cost?: string;
     billing_model?: string;
+    // Richer import (Task 4.5) — all optional, used when present:
+    developer_name?: string; // for name-variant matching when email is absent/unmatched
+    amount?: string; // raw charge amount; combined with frequency to derive monthly_cost
+    frequency?: string; // recurring/one-time hint (monthly | annual | one-time | …)
+    period?: string; // billing-period or charge-date column; normalized for dedup
+    currency?: string; // recorded on the charge ledger (no conversion is performed)
+}
+
+// A named import profile (Task 4.5). Lets one config import from several expense
+// systems (Expensify, SAP Concur, a manual sheet) by selecting a profile whose
+// column_mapping matches that system's export.
+export interface ImportProfileConfig {
+    column_mapping?: ColumnMappingConfig;
+    // Billing model assumed for this source when a row carries none — e.g. an
+    // expense-reimbursement export (Expensify/Concur) implies `reimbursed`. When
+    // applied, the resulting subscription is flagged billing_model_inferred.
+    default_billing_model?: string;
+    // Charge frequency assumed when a row has no frequency column/value.
+    default_frequency?: string;
 }
 
 export interface ExpensesConfig {
     import_path?: string;
     subscription_defaults?: SubscriptionDefaultsConfig;
+    // Legacy single mapping — still honored as the 'standard' profile's mapping.
     column_mapping?: ColumnMappingConfig;
+    // Named profiles, merged over the built-in profiles (standard/expensify/concur).
+    import_profiles?: Record<string, ImportProfileConfig>;
 }
 
 export interface AggregationScheduleConfig {
