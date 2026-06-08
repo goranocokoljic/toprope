@@ -211,6 +211,50 @@ export type WasteResolutionReason =
     | 'monitor_longer'
     | 'dismissed';
 
+// --- Anomaly surfacing (Task 4.8) ---------------------------------------
+
+export type AnomalySeverity = 'info' | 'notable' | 'high';
+export type AnomalyBasis = 'git_estimate' | 'measured';
+export type AnomalyStatus = 'open' | 'acknowledged' | 'resolved';
+export type AnomalyMethod = 'statistical' | 'percentage_change';
+export type AnomalyMetric =
+    | 'commits'
+    | 'prs_merged'
+    | 'churn'
+    | 'ai_signature'
+    | 'interactions'
+    | 'acceptance_rate'
+    | 'cost';
+
+/**
+ * A team anomaly as surfaced to the manager panel (Task 4.8). Mirrors the
+ * enriched shape from /api/anomalies (src/dashboard/api/anomalies.ts): the raw
+ * row plus the honest basis label, a plain-language description, and the
+ * direction/percentage the inline flags read. Team-scope only — developer-scope
+ * anomalies are individual data and never reach this manager surface.
+ */
+export interface AnomalyAlert {
+    id: string;
+    scope: 'team';
+    scope_id: string;
+    team: string;
+    metric: AnomalyMetric;
+    metric_label: string;
+    period: string;
+    method: AnomalyMethod;
+    observed_value: number;
+    expected_value: number;
+    deviation: number;
+    change_pct: number | null;
+    direction: 'increase' | 'decrease';
+    severity: AnomalySeverity;
+    basis: AnomalyBasis;
+    basis_label: string;
+    status: AnomalyStatus;
+    detected_at: string;
+    description: string;
+}
+
 // --- Developer "My Dashboard" (Task 2.8) --------------------------------
 
 export type TrendDirection = 'up' | 'down' | 'flat';

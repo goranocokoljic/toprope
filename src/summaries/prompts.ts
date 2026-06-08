@@ -233,6 +233,11 @@ function buildPreamble(payload: SummaryInputPayload): string {
         '   describe any individual evaluatively, comparatively, or negatively.',
         '',
         '6. STAY IN THE CONCISE ANALYTICAL VOICE. No hype, no filler, no recommendations unsupported by the numbers.',
+        '',
+        '7. NOTABLE ANOMALIES. If the input lists anomalies flagged this period, mention them in plain language using the',
+        '   exact honest wording the input gives (e.g. "commit activity dropped 60%"). Keep the same tier discipline: a',
+        '   git-based anomaly is a git signal, never measured tool usage. Do not invent anomalies the input does not list,',
+        "   and if no anomalies are listed, don't mention any.",
     ].join('\n');
 }
 

@@ -16,6 +16,7 @@ const MANAGER_ITEMS: NavItem[] = [
     {to: '/manager', label: 'Overview'},
     {to: '/manager/teams', label: 'Teams'},
     {to: '/manager/waste', label: 'Waste'},
+    {to: '/manager/anomalies', label: 'Anomalies'},
 ];
 // Appended to the manager section ONLY when the leaderboard is available
 // (Task 2.17). The leaderboard ships off by default; when off it must leave no

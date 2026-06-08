@@ -4,6 +4,7 @@ import {ManagerOverview} from './pages/ManagerOverview';
 import {TeamsList} from './pages/TeamsList';
 import {TeamDetail} from './pages/TeamDetail';
 import {WasteDetection} from './pages/WasteDetection';
+import {Anomalies} from './pages/Anomalies';
 import {ComingSoon} from './pages/ComingSoon';
 import {DeveloperDashboard} from './pages/DeveloperDashboard';
 import {MyTools} from './pages/MyTools';
@@ -45,6 +46,7 @@ export function App(): JSX.Element {
                     }
                 />
                 <Route path="manager/waste" element={<WasteDetection />} />
+                <Route path="manager/anomalies" element={<Anomalies />} />
                 <Route
                     path="manager/leaderboard"
                     element={

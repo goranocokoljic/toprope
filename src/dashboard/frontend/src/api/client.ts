@@ -6,6 +6,8 @@ import type {
     AdminTeam,
     AdminUser,
     AdminUserWithTempPassword,
+    AnomalyAlert,
+    AnomalyStatus,
     ApiEnvelope,
     AuthUser,
     CoverageData,
@@ -556,6 +558,33 @@ export const api = {
     /** Generate a summary on demand (used for quarterly/yearly). */
     async generateSummary(input: {level: SummaryLevel; period: string; scope: string}): Promise<SummaryDetail> {
         const body = await postJson<ApiEnvelope<SummaryDetail>>('/api/summaries/generate', input);
+        return body.data;
+    },
+
+    // --- Anomaly surfacing (Task 4.8) ---
+    /** Team anomalies by status (default open) — the manager panel + inline flags. */
+    async getAnomalies(status: AnomalyStatus = 'open'): Promise<AnomalyAlert[]> {
+        const body = await request<ApiEnvelope<AnomalyAlert[]>>(
+            `/api/anomalies?status=${encodeURIComponent(status)}`,
+        );
+        return body.data;
+    },
+
+    /** Mark an anomaly acknowledged (drops it from the open list). */
+    async acknowledgeAnomaly(id: string): Promise<AnomalyAlert> {
+        const body = await postJson<ApiEnvelope<AnomalyAlert>>(
+            `/api/anomalies/${encodeURIComponent(id)}/acknowledge`,
+            {},
+        );
+        return body.data;
+    },
+
+    /** Mark an anomaly resolved (drops it from the open list). */
+    async resolveAnomaly(id: string): Promise<AnomalyAlert> {
+        const body = await postJson<ApiEnvelope<AnomalyAlert>>(
+            `/api/anomalies/${encodeURIComponent(id)}/resolve`,
+            {},
+        );
         return body.data;
     },
 

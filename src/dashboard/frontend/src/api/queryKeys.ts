@@ -13,6 +13,10 @@ export const queryKeys = {
     // Waste Detection screen (Task 2.7): active alert list + resolved audit trail.
     wasteAlerts: ['waste', 'alerts'] as const,
     wasteResolved: ['waste', 'resolved'] as const,
+    // Anomaly surfacing (Task 4.8): keyed by status so the open/acknowledged/
+    // resolved views cache independently. The team-detail inline flags reuse the
+    // open list (same key), so acting on one anomaly refreshes both surfaces.
+    anomalies: (status: string) => ['anomalies', status] as const,
     // Teams list + per-team detail surfaces (Task 2.6).
     teams: ['teams'] as const,
     teamDetail: (team: string) => ['teams', 'detail', team] as const,

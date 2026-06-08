@@ -1,4 +1,6 @@
 import {SELF_REPORT_TOOLS, type SelfReportTool} from '../selfreport/core';
+import type {AnomalyRecord} from '../anomaly/types';
+import {basisLabel, describeAnomaly} from '../anomaly/surface';
 
 // Identifiers shared between the form builders here and the submission parser in
 // handlers.ts. Keeping them in one place avoids the form and the parser drifting
@@ -115,6 +117,66 @@ export function buildLogModal(privateMetadata = ''): SlackView {
             },
         ],
     };
+}
+
+// Human label + emoji per surfaceable severity for the alert headline.
+const SEVERITY_PRESENTATION: Record<'notable' | 'high', {emoji: string; label: string}> = {
+    high: {emoji: '🔴', label: 'High'},
+    notable: {emoji: '🟠', label: 'Notable'},
+};
+
+function anomalyDashboardLink(dashboardUrl: string | undefined): string | undefined {
+    if (!dashboardUrl) return undefined;
+    // Trim a trailing slash so we don't emit a double slash in the deep link.
+    const base = dashboardUrl.replace(/\/+$/, '');
+    return `${base}/dashboard/manager/anomalies`;
+}
+
+/**
+ * Build the concise anomaly alert message pushed to a manager's Slack channel
+ * (Task 4.8). One line each for scope, what changed, severity, basis, and a
+ * dashboard deep link when a base URL is configured. Tier-honest by construction:
+ * the "what changed" sentence comes from describeAnomaly, which never uses
+ * fabricated tool-usage wording for a git-derived metric. Only notable/high
+ * anomalies are ever passed here (the notifier filters info out).
+ */
+export function buildAnomalyAlertMessage(
+    anomaly: AnomalyRecord,
+    dashboardUrl?: string,
+): {text: string; blocks: SlackBlock[]} {
+    const severity = anomaly.severity === 'high' ? 'high' : 'notable';
+    const present = SEVERITY_PRESENTATION[severity];
+    const change = describeAnomaly(anomaly);
+    const basis = basisLabel(anomaly.basis);
+    const text = `${present.emoji} ${present.label} anomaly — Team ${anomaly.scope_id}: ${change}`;
+
+    const detailLines = [
+        `${present.emoji} *${present.label} anomaly* · Team *${anomaly.scope_id}*`,
+        change,
+        `_Basis: ${basis} · detected ${anomaly.detected_at.slice(0, 10)}_`,
+    ];
+    const blocks: SlackBlock[] = [
+        {
+            type: 'section',
+            text: {type: 'mrkdwn', text: detailLines.join('\n')},
+        },
+    ];
+
+    const link = anomalyDashboardLink(dashboardUrl);
+    if (link) {
+        blocks.push({
+            type: 'actions',
+            elements: [
+                {
+                    type: 'button',
+                    text: {type: 'plain_text', text: 'View in dashboard'},
+                    url: link,
+                },
+            ],
+        });
+    }
+
+    return {text, blocks};
 }
 
 /**

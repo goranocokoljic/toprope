@@ -166,3 +166,65 @@ export function setAnomalyStatus(db: Database.Database, id: string, status: Anom
     const result = db.prepare('UPDATE anomalies SET status = ? WHERE id = ?').run(status, id);
     return result.changes > 0;
 }
+
+/** Fetch one anomaly by its primary key, or undefined if it doesn't exist. */
+export function getAnomalyById(db: Database.Database, id: string): AnomalyRecord | undefined {
+    return db.prepare('SELECT * FROM anomalies WHERE id = ?').get(id) as AnomalyRecord | undefined;
+}
+
+// Severity tiebreak: high > notable > info. A text-enum DESC would sort lexically
+// (high < info < notable) and sink the worst band, so both surfacing reads below
+// rank it explicitly, newest-first within a band.
+const SEVERITY_RANK_SQL = `CASE severity WHEN 'high' THEN 3 WHEN 'notable' THEN 2 ELSE 1 END`;
+
+/**
+ * Open, surfaceable (notable/high), not-yet-announced TEAM anomalies — the work
+ * list for the Slack notifier (Task 4.8). Scoped to team anomalies only: a
+ * developer-scope anomaly is individual data (privacy model), so it is never
+ * pushed to a manager alert channel. Most severe / most recent first.
+ */
+export function listUnnotifiedTeamAnomalies(db: Database.Database): AnomalyRecord[] {
+    return db
+        .prepare(
+            `SELECT * FROM anomalies
+             WHERE scope = 'team' AND status = 'open'
+               AND severity IN ('notable', 'high') AND notified_at IS NULL
+             ORDER BY ${SEVERITY_RANK_SQL} DESC, detected_at DESC`,
+        )
+        .all() as AnomalyRecord[];
+}
+
+/** Stamp an anomaly as announced to Slack at `at` (ISO). Idempotent on the id. */
+export function markAnomalyNotified(db: Database.Database, id: string, at: string): void {
+    db.prepare('UPDATE anomalies SET notified_at = ? WHERE id = ?').run(at, id);
+}
+
+/**
+ * Surfaceable (notable/high) TEAM anomalies whose week falls in an inclusive
+ * period range — the source the summary input builder folds in (Task 4.8). Team
+ * scope only, for the same privacy reason as the notifier: a summary is a
+ * manager-facing team/org narrative. `team` pins one team; null spans every team
+ * (the org summary). Resolved anomalies are excluded — a summary narrates what
+ * was anomalous in the period, not what a manager has already closed out.
+ */
+export function listSurfaceableTeamAnomalies(
+    db: Database.Database,
+    team: string | null,
+    startPeriod: string,
+    endPeriod: string,
+): AnomalyRecord[] {
+    const params: unknown[] = [startPeriod, endPeriod];
+    let teamClause = '';
+    if (team !== null) {
+        teamClause = ' AND scope_id = ?';
+        params.push(team);
+    }
+    return db
+        .prepare(
+            `SELECT * FROM anomalies
+             WHERE scope = 'team' AND severity IN ('notable', 'high') AND status != 'resolved'
+               AND period >= ? AND period <= ?${teamClause}
+             ORDER BY ${SEVERITY_RANK_SQL} DESC, detected_at DESC`,
+        )
+        .all(...params) as AnomalyRecord[];
+}
