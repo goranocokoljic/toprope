@@ -28,6 +28,8 @@ import {registerDashboardStatic} from './dashboard/static';
 import {startScheduler} from './scheduler/scheduler';
 import {startAggregationScheduler} from './aggregation/scheduler';
 import {startSummaryScheduler} from './summaries/scheduler';
+import {registerSlackRoutes} from './slack/routes';
+import {startSlackDailyPrompt} from './slack/scheduler';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, './storage/migrations');
 
@@ -100,6 +102,14 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
     registerMaturityRoutes(app, db);
     registerSummaryRoutes(app, db, config.summaries);
 
+    // Slack self-reporting bot (Task 4.2): slash command + interactive form,
+    // authenticated by Slack request signature rather than the session gate.
+    // Registered only when enabled so the urlencoded parser/routes don't exist
+    // on deployments that don't use Slack.
+    if (config.slack?.enabled) {
+        registerSlackRoutes(app, db, config.slack);
+    }
+
     // Serve the built React dashboard (Phase 2) at /dashboard, if present.
     registerDashboardStatic(app);
 
@@ -121,8 +131,16 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
         // period. Gated on summaries config (a disabled level registers no task);
         // quarterly/yearly are on-demand only and never scheduled here.
         const summaryTasks = startSummaryScheduler(dbPath, config.summaries);
+        // Optional end-of-day Slack prompt. startSlackDailyPrompt self-gates on
+        // slack.enabled + daily_prompt.enabled + channels, returning [] otherwise.
+        const slackPromptTasks = startSlackDailyPrompt(config.slack);
         app.addHook('onClose', () => {
-            for (const task of [...connectorTasks, ...aggregationTasks, ...summaryTasks])
+            for (const task of [
+                ...connectorTasks,
+                ...aggregationTasks,
+                ...summaryTasks,
+                ...slackPromptTasks,
+            ])
                 task.stop();
         });
     }

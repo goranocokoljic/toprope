@@ -16,6 +16,9 @@ export interface ExternalIds {
     cursor?: string;
     bitbucket?: string;
     gitlab?: string;
+    // Slack user id (e.g. "U0123ABCD") for mapping a self-report from the Slack
+    // bot (Task 4.2) back to this developer.
+    slack?: string;
     // Comma-separated list of additional git commit emails used to match
     // commits to this developer (beyond the primary `email` column).
     git_emails?: string;

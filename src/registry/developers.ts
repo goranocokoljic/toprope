@@ -92,7 +92,7 @@ export function getDeveloperById(db: Database.Database, id: string): Developer |
 // commit attribution ambiguous).
 export function findByExternalId(
     db: Database.Database,
-    provider: 'github' | 'bitbucket' | 'gitlab',
+    provider: 'github' | 'bitbucket' | 'gitlab' | 'slack',
     value: string,
 ): Developer | null {
     const rows = db.prepare('SELECT * FROM developers').all() as DeveloperRow[];
@@ -105,6 +105,15 @@ export function findByExternalId(
 
 export function findByGithubUsername(db: Database.Database, github: string): Developer | null {
     return findByExternalId(db, 'github', github);
+}
+
+// Find the developer mapped to a given Slack user id. Used by the Slack bot
+// (Task 4.2) to attribute a self-report to the right developer. Returns null
+// when no developer is linked to that Slack id (the "unlinked user" path).
+export function findBySlackUserId(db: Database.Database, slackUserId: string): Developer | null {
+    const target = slackUserId.trim();
+    if (!target) return null;
+    return findByExternalId(db, 'slack', target);
 }
 
 // Find a developer who already owns a git commit email — either as their
@@ -134,6 +143,7 @@ export interface LinkUpdates {
     cursor?: string;
     bitbucket?: string;
     gitlab?: string;
+    slack?: string;
     // Additional git commit emails; appended to any existing ones.
     gitEmails?: string[];
 }
@@ -161,10 +171,11 @@ export interface IdentityUpdates {
     cursor?: string;
     bitbucket?: string;
     gitlab?: string;
+    slack?: string;
     gitEmails?: string[];
 }
 
-const PROVIDER_KEYS = ['github', 'copilot', 'claude', 'windsurf', 'cursor', 'bitbucket', 'gitlab'] as const;
+const PROVIDER_KEYS = ['github', 'copilot', 'claude', 'windsurf', 'cursor', 'bitbucket', 'gitlab', 'slack'] as const;
 
 /**
  * Replace a developer's identity mapping from the admin UI. Each provided
@@ -224,6 +235,9 @@ export function linkDeveloper(
     if (updates.cursor !== undefined) existing.cursor = updates.cursor;
     if (updates.bitbucket !== undefined) existing.bitbucket = updates.bitbucket;
     if (updates.gitlab !== undefined) existing.gitlab = updates.gitlab;
+    // Trim the Slack id on write so it matches the trimmed lookup in
+    // findBySlackUserId — a padded value must not become an unresolvable mapping.
+    if (updates.slack !== undefined) existing.slack = updates.slack.trim();
     if (updates.gitEmails && updates.gitEmails.length > 0) {
         const current = existing.git_emails ? existing.git_emails.split(',') : [];
         existing.git_emails = joinGitEmails([...current, ...updates.gitEmails]);

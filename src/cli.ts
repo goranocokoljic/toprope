@@ -330,6 +330,7 @@ devCommand
     .option('--github <username>', 'GitHub username')
     .option('--bitbucket <username>', 'Bitbucket username/nickname')
     .option('--gitlab <username>', 'GitLab username')
+    .option('--slack <user-id>', 'Slack user id (for the self-reporting bot)')
     .option('--git-email <email>', 'Additional git commit email (repeatable)', collectValue, [])
     .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
     .action(
@@ -342,12 +343,18 @@ devCommand
             github?: string;
             bitbucket?: string;
             gitlab?: string;
+            slack?: string;
             gitEmail: string[];
             config: string;
         }) => {
             const configPath = path.resolve(process.cwd(), options.config);
             const db = openRegistryDb(configPath);
             try {
+                // Normalize the Slack id once so the uniqueness conflict check and
+                // the stored value (linkDeveloper also trims) compare the SAME
+                // string — otherwise a padded `--slack " U "` slips past the check
+                // and can map two developers to one Slack id (wrong-developer risk).
+                const slack = options.slack?.trim() || undefined;
                 const hasUpdate =
                     options.copilot ||
                     options.claude ||
@@ -356,17 +363,19 @@ devCommand
                     options.github ||
                     options.bitbucket ||
                     options.gitlab ||
+                    slack ||
                     options.gitEmail.length > 0;
                 if (!hasUpdate) {
                     console.error(
-                        'Error: at least one of --copilot, --claude, --windsurf, --cursor, --github, --bitbucket, --gitlab, or --git-email must be provided.',
+                        'Error: at least one of --copilot, --claude, --windsurf, --cursor, --github, --bitbucket, --gitlab, --slack, or --git-email must be provided.',
                     );
                     process.exit(1);
                 }
-                const conflictChecks: Array<{provider: 'github' | 'bitbucket' | 'gitlab'; value?: string}> = [
+                const conflictChecks: Array<{provider: 'github' | 'bitbucket' | 'gitlab' | 'slack'; value?: string}> = [
                     {provider: 'github', value: options.github},
                     {provider: 'bitbucket', value: options.bitbucket},
                     {provider: 'gitlab', value: options.gitlab},
+                    {provider: 'slack', value: slack},
                 ];
                 for (const {provider, value} of conflictChecks) {
                     if (!value) continue;
@@ -395,6 +404,7 @@ devCommand
                     github: options.github,
                     bitbucket: options.bitbucket,
                     gitlab: options.gitlab,
+                    slack,
                     gitEmails: options.gitEmail,
                 });
                 if (!dev) {

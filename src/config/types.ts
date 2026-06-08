@@ -133,6 +133,29 @@ export interface AlertsConfig {
     waste_threshold?: number;
 }
 
+// Optional end-of-day gentle prompt that nudges developers to self-report. Opt-in
+// (disabled by default) and dismissible — never nagging. Posts to the configured
+// channels (channel IDs); if none are set the prompt is effectively a no-op.
+export interface SlackDailyPromptConfig {
+    enabled?: boolean;
+    // HH:MM in UTC. Defaults to 16:00 (end-of-day-ish) when omitted.
+    time?: string;
+    // Slack channel IDs (e.g. "C0123ABCD") to post the prompt into.
+    channels?: string[];
+}
+
+// Slack bot for self-reporting (Task 4.2). Distinct from `alerts.slack`, which is
+// an incoming-webhook for waste alerts — this is a full bot with a slash command
+// and interactive forms, authenticated by a bot token + signing secret.
+export interface SlackBotConfig {
+    enabled?: boolean;
+    // Bot user OAuth token (xoxb-…). Used to call views.open / chat.postMessage.
+    bot_token?: string;
+    // App signing secret. Used to verify every inbound Slack request (HMAC).
+    signing_secret?: string;
+    daily_prompt?: SlackDailyPromptConfig;
+}
+
 export interface DashboardAuthConfig {
     type?: string;
     // Legacy Phase 1 single admin password. Superseded by per-user accounts
@@ -165,6 +188,7 @@ export interface GovProxyConfig {
     aggregation: AggregationConfig;
     summaries: SummariesConfig;
     alerts: AlertsConfig;
+    slack: SlackBotConfig;
     dashboard: DashboardConfig;
     teams: TeamConfig[];
 }

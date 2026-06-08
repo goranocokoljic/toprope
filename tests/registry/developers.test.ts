@@ -11,6 +11,7 @@ import {
     findByGithubUsername,
     findByExternalId,
     findByEmail,
+    findBySlackUserId,
 } from '../../src/registry/developers';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../src/storage/migrations');
@@ -353,5 +354,47 @@ describe('duplicate detection', () => {
         const duplicate = findByGithubUsername(db, 'alice-gh');
         expect(duplicate).not.toBeNull();
         expect(duplicate!.external_ids.github).toBe('alice-gh');
+    });
+});
+
+describe('slack identity mapping', () => {
+    let db: Database.Database;
+
+    beforeEach(() => {
+        db = makeDb();
+        seedTeam(db);
+    });
+
+    afterEach(() => {
+        db.close();
+    });
+
+    it('links a slack user id and resolves it back to the developer', () => {
+        const dev = addDeveloper(db, 'Alice', 'frontend', 'alice@example.com');
+        linkDeveloper(db, dev.id, {slack: 'U_ALICE'});
+        const found = findBySlackUserId(db, 'U_ALICE');
+        expect(found?.id).toBe(dev.id);
+        expect(found?.external_ids.slack).toBe('U_ALICE');
+    });
+
+    it('returns null for an unmapped or blank slack id', () => {
+        addDeveloper(db, 'Alice', 'frontend');
+        expect(findBySlackUserId(db, 'U_NOBODY')).toBeNull();
+        expect(findBySlackUserId(db, '   ')).toBeNull();
+    });
+
+    it('trims a padded slack id on write so it resolves on lookup', () => {
+        const dev = addDeveloper(db, 'Alice', 'frontend');
+        linkDeveloper(db, dev.id, {slack: '  U_ALICE  '});
+        const stored = getDeveloperById(db, dev.id);
+        expect(stored?.external_ids.slack).toBe('U_ALICE');
+        expect(findBySlackUserId(db, 'U_ALICE')?.id).toBe(dev.id);
+    });
+
+    it('finds a slack-linked developer via findByExternalId for conflict checks', () => {
+        const dev = addDeveloper(db, 'Bob', 'frontend');
+        linkDeveloper(db, dev.id, {slack: 'U_BOB'});
+        const conflict = findByExternalId(db, 'slack', 'U_BOB');
+        expect(conflict?.id).toBe(dev.id);
     });
 });
