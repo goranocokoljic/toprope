@@ -38,6 +38,8 @@ import {
 } from './expenses/waste-detector';
 import {evaluatePlanRoi} from './expenses/plan-roi';
 import {runBackfill, type BackfillProgress} from './aggregation/backfill';
+import {runAnomalyScanForPeriod} from './anomaly/scan';
+import {listAnomalies} from './anomaly/store';
 import {
     AGGREGATION_PERIODS,
     type AggregationPeriod,
@@ -1732,6 +1734,100 @@ surveyCommand
                 const answer = [choice, text].filter(Boolean).join(' — ') || '(no detail)';
                 console.log(`[${s.trigger_type}] ${s.developer_name ?? s.developer_id}: ${answer}`);
                 console.log(`    Q: ${s.question_text}`);
+            }
+        } finally {
+            db.close();
+        }
+    });
+
+const anomalyCommand = program
+    .command('anomaly')
+    .description('Detect and review metric anomalies (usage drops, runaway spend, etc.)');
+
+// Manual trigger for an anomaly scan — the same code path the scheduler runs
+// after the weekly aggregation. With no --period it scans the just-completed
+// ISO week; --period takes any date in the target week (canonicalised to the
+// week's Monday). Idempotent: re-running a period never duplicates anomalies.
+anomalyCommand
+    .command('scan')
+    .description('Scan a weekly period for anomalies across all developers and teams')
+    .option(
+        '--period <date>',
+        'Any date (YYYY-MM-DD) in the target ISO week. Defaults to the just-completed week.',
+    )
+    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .action((options: {period?: string; config: string}) => {
+        const now = new Date();
+        // Default to the just-completed week — what the scheduled scan would run
+        // now. Resolve (and validate) before touching the DB so a malformed
+        // --period is rejected without opening the file or running migrations.
+        let period: string;
+        try {
+            period = options.period ?? justCompletedPeriod('weekly', now);
+        } catch (err) {
+            console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+            process.exit(1);
+        }
+        const configPath = path.resolve(process.cwd(), options.config);
+        const db = openRegistryDb(configPath);
+        try {
+            const result = runAnomalyScanForPeriod(db, period);
+            console.log(
+                `Anomaly scan complete — week ${result.period}: ` +
+                    `${result.flagged} flagged, ${result.cleared} cleared, ` +
+                    `${result.buildingBaseline} building-baseline, ` +
+                    `${result.evaluated} metric series evaluated.`,
+            );
+        } catch (err) {
+            console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+            process.exit(1);
+        } finally {
+            db.close();
+        }
+    });
+
+anomalyCommand
+    .command('list')
+    .description('List detected anomalies (newest first)')
+    .option('--scope <scope>', 'Filter by scope: developer | team')
+    .option('--status <status>', 'Filter by status: open | acknowledged | resolved')
+    .option('--period <week>', 'Filter by week_start (YYYY-MM-DD)')
+    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .action((options: {scope?: string; status?: string; period?: string; config: string}) => {
+        if (options.scope && options.scope !== 'developer' && options.scope !== 'team') {
+            console.error("Error: --scope must be 'developer' or 'team'.");
+            process.exit(1);
+        }
+        if (
+            options.status &&
+            !['open', 'acknowledged', 'resolved'].includes(options.status)
+        ) {
+            console.error("Error: --status must be 'open', 'acknowledged', or 'resolved'.");
+            process.exit(1);
+        }
+        const configPath = path.resolve(process.cwd(), options.config);
+        const db = openRegistryDb(configPath);
+        try {
+            const anomalies = listAnomalies(db, {
+                scope: options.scope as 'developer' | 'team' | undefined,
+                status: options.status as 'open' | 'acknowledged' | 'resolved' | undefined,
+                period: options.period,
+            });
+            if (anomalies.length === 0) {
+                console.log('No anomalies match.');
+                return;
+            }
+            console.log('Anomalies:');
+            console.log('─'.repeat(96));
+            for (const a of anomalies) {
+                const dev =
+                    a.method === 'statistical'
+                        ? `z=${a.deviation} (mean ${a.expected_value})`
+                        : `${a.deviation}% vs ${a.expected_value}`;
+                console.log(
+                    `[${a.severity}] ${a.scope}:${a.scope_id} ${a.metric} @ ${a.period} ` +
+                        `— observed ${a.observed_value}, ${dev} [${a.basis}] (${a.status})`,
+                );
             }
         } finally {
             db.close();
