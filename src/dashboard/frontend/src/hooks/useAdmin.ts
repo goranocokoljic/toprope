@@ -15,6 +15,9 @@ import type {
     AdminTeam,
     AdminUser,
     AdminUserWithTempPassword,
+    ReconciliationResult,
+    ReconciliationRunSummary,
+    ReconciliationStatus,
 } from '../api/types';
 
 /**
@@ -154,4 +157,56 @@ export function useEndAdminSubscription(): UseMutationResult<AdminSubscription, 
 // --- Data sources (read-only) ---
 export function useAdminDataSources(): UseQueryResult<AdminDataSources, Error> {
     return useQuery({queryKey: queryKeys.adminDataSources, queryFn: api.getAdminDataSources});
+}
+
+// --- Expense reconciliation (Task 4.4 / #99) ---
+export function useReconciliation(
+    status: ReconciliationStatus | 'all',
+): UseQueryResult<ReconciliationResult[], Error> {
+    return useQuery({
+        queryKey: queryKeys.adminReconciliation(status),
+        queryFn: () => api.getReconciliation(status),
+    });
+}
+
+/**
+ * Invalidate every reconciliation query (all status filters) after a mutation,
+ * so a run/resolve/ignore is reflected regardless of which filter is active.
+ */
+function useInvalidateReconciliation(): () => void {
+    const qc = useQueryClient();
+    return () => void qc.invalidateQueries({queryKey: ['admin', 'reconciliation']});
+}
+
+export function useRunReconciliation(): UseMutationResult<
+    ReconciliationRunSummary,
+    Error,
+    {period?: string; tolerance?: number}
+> {
+    const invalidate = useInvalidateReconciliation();
+    return useMutation({mutationFn: api.runReconciliation, onSuccess: invalidate});
+}
+
+export function useResolveReconciliation(): UseMutationResult<
+    ReconciliationResult,
+    Error,
+    {id: string; resolution: string}
+> {
+    const invalidate = useInvalidateReconciliation();
+    return useMutation({
+        mutationFn: ({id, resolution}) => api.resolveReconciliation(id, resolution),
+        onSuccess: invalidate,
+    });
+}
+
+export function useIgnoreReconciliation(): UseMutationResult<
+    ReconciliationResult,
+    Error,
+    {id: string; note?: string}
+> {
+    const invalidate = useInvalidateReconciliation();
+    return useMutation({
+        mutationFn: ({id, note}) => api.ignoreReconciliation(id, note),
+        onSuccess: invalidate,
+    });
 }

@@ -95,6 +95,13 @@ export interface ImportProfileConfig {
     default_frequency?: string;
 }
 
+export interface ReconciliationConfig {
+    // Cost tolerance ($) for flagging a cost_discrepancy (Task 4.4). A registry
+    // vs expense difference at or below this is treated as rounding noise and not
+    // flagged. Defaults to DEFAULT_COST_TOLERANCE ($1) when unset.
+    cost_tolerance?: number;
+}
+
 export interface ExpensesConfig {
     import_path?: string;
     subscription_defaults?: SubscriptionDefaultsConfig;
@@ -102,6 +109,8 @@ export interface ExpensesConfig {
     column_mapping?: ColumnMappingConfig;
     // Named profiles, merged over the built-in profiles (standard/expensify/concur).
     import_profiles?: Record<string, ImportProfileConfig>;
+    // Expense reconciliation tuning (Task 4.4).
+    reconciliation?: ReconciliationConfig;
 }
 
 export interface AggregationScheduleConfig {

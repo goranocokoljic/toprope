@@ -37,6 +37,7 @@ const ADMIN_SECTION: NavSection = {
         {to: '/admin/teams', label: 'Teams'},
         {to: '/admin/identities', label: 'Identities'},
         {to: '/admin/subscriptions', label: 'Subscriptions'},
+        {to: '/admin/reconciliation', label: 'Reconciliation'},
         {to: '/admin/data-sources', label: 'Data Sources'},
         {to: '/settings', label: 'Settings'},
     ],
