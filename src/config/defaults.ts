@@ -59,6 +59,10 @@ export const defaultConfig: GovProxyConfig = {
         slack: { enabled: false },
         waste_threshold: 14,
     },
+    slack: {
+        enabled: false,
+        daily_prompt: { enabled: false, time: '16:00', channels: [] },
+    },
     dashboard: {
         enabled: true,
         auth: { type: 'session', session_ttl_hours: 168, cookie_secure: false },

@@ -99,6 +99,20 @@ alerts:
     webhook_url: "${SLACK_WEBHOOK_URL}"
   waste_threshold: 14
 
+# Slack self-reporting bot (Task 4.2). Distinct from alerts.slack (a one-way
+# webhook for waste alerts): this is a full bot with the /govproxy-log slash
+# command and an interactive logging form. Developers must be linked to their
+# Slack user id (`govproxy dev link --id <dev-id> --slack <U…>`) before they can
+# log. See docs/slack-bot.md for the Slack app setup.
+slack:
+  enabled: false
+  bot_token: "${SLACK_BOT_TOKEN}"          # xoxb-… bot user OAuth token
+  signing_secret: "${SLACK_SIGNING_SECRET}" # verifies every inbound request
+  daily_prompt:
+    enabled: false        # opt-in, dismissible end-of-day nudge
+    time: "16:00"         # HH:MM UTC
+    channels: []          # Slack channel ids (e.g. ["C0123ABCD"]) to post into
+
 dashboard:
   enabled: true
   auth:
