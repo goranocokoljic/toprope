@@ -8,8 +8,8 @@ import {SkeletonTable} from '../components/Skeleton';
 import {ErrorState} from '../components/ErrorState';
 import {EmptyState} from '../components/EmptyState';
 import {toolLabel} from '../components/toolLabels';
-import {utilizationTier} from '../components/utilization';
-import {formatCurrency, formatPercent} from '../components/format';
+import {UtilizationCell} from '../components/UtilizationCell';
+import {formatCurrency} from '../components/format';
 import type {TeamListItem, WasteTeamSummary} from '../api/types';
 
 /**
@@ -22,25 +22,6 @@ interface TeamRow extends TeamListItem {
     alert_count: number;
     /** Whether waste data was available at all (vs failed to load). */
     waste_known: boolean;
-}
-
-// Full literal class strings (Tailwind can't see dynamically-built names).
-const UTILIZATION_DOT: Record<'success' | 'warning' | 'danger', string> = {
-    success: 'bg-success',
-    warning: 'bg-warning',
-    danger: 'bg-danger',
-};
-
-function UtilizationCell({rate}: {rate: number}): JSX.Element {
-    const tier = utilizationTier(rate);
-    const dot = UTILIZATION_DOT[tier.tone as 'success' | 'warning' | 'danger'];
-    return (
-        <span className="inline-flex items-center gap-2">
-            <span aria-hidden className={`h-2 w-2 rounded-full ${dot}`} />
-            <span className="tabular-nums text-foreground">{formatPercent(rate)}</span>
-            <Badge tone={tier.tone}>{tier.label}</Badge>
-        </span>
-    );
 }
 
 function ToolMixCell({tools}: {tools: string[]}): JSX.Element {
