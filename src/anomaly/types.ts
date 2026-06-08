@@ -55,4 +55,10 @@ export interface AnomalyRecord {
     basis: AnomalyBasis;
     status: AnomalyStatus;
     detected_at: string;
+    /**
+     * When this anomaly was pushed to its Slack alert channel(s), or null if it
+     * has not been announced yet (Task 4.8). Preserved across re-detection so a
+     * re-scan never re-spams; see migration 024 and src/anomaly/notify.ts.
+     */
+    notified_at: string | null;
 }

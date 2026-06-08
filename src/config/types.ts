@@ -174,6 +174,19 @@ export interface SlackDailyPromptConfig {
     channels?: string[];
 }
 
+// Anomaly Slack alerts (Task 4.8). The channel(s) notable/high anomalies are
+// pushed to (reusing the 4.2 bot's token), and the dashboard base URL used to
+// deep-link the alert to the anomalies panel. No channels configured → the
+// notifier has nowhere to deliver and is a no-op (the per-team
+// anomaly_alerts_enabled setting still gates whether a deliverable alert sends).
+export interface SlackAnomalyAlertsConfig {
+    // Slack channel IDs (e.g. "C0123ABCD") to post anomaly alerts into.
+    channels?: string[];
+    // Dashboard base URL (e.g. "https://govproxy.example.com") used to build the
+    // "view in dashboard" link. Omitted → the alert carries no deep link.
+    dashboard_url?: string;
+}
+
 // Slack bot for self-reporting (Task 4.2). Distinct from `alerts.slack`, which is
 // an incoming-webhook for waste alerts — this is a full bot with a slash command
 // and interactive forms, authenticated by a bot token + signing secret.
@@ -184,6 +197,8 @@ export interface SlackBotConfig {
     // App signing secret. Used to verify every inbound Slack request (HMAC).
     signing_secret?: string;
     daily_prompt?: SlackDailyPromptConfig;
+    // Anomaly alert channel + dashboard link config (Task 4.8).
+    anomaly_alerts?: SlackAnomalyAlertsConfig;
 }
 
 // Data-prompted surveys (Task 4.3). Opt-in scheduled trigger sweep: when

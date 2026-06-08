@@ -36,6 +36,21 @@ import type {DataQuality} from '../aggregation/compute';
 import type {MaturityBasis} from '../aggregation/team-period';
 import {pctChange, countPctChange, pointDelta} from '../aggregation/deltas';
 import type {SummaryLevel} from './model-client';
+import type {
+    AnomalyBasis,
+    AnomalyMethod,
+    AnomalyMetric,
+    AnomalyRecord,
+} from '../anomaly/types';
+import {
+    anomalyDirection,
+    basisLabel,
+    changePercent,
+    describeAnomaly,
+    isSurfaceable,
+    type AnomalyDirection,
+    type SurfaceableSeverity,
+} from '../anomaly/surface';
 
 /**
  * The numeric metrics a summary is built from — a numbers-only subset shared by
@@ -91,6 +106,25 @@ export interface SummaryDeltas {
     maturity_score_delta: number | null;
 }
 
+/**
+ * One anomaly folded into a summary payload (Task 4.8). NUMBERS + CLOSED ENUMS
+ * ONLY — every string field is a fixed enum validated by the privacy gate, so
+ * nothing free-text (a team name, a label) rides along here; the team/org name
+ * already lives on `scope`. Only notable/high anomalies are carried (info is
+ * filtered out upstream), so `severity` is the surfaceable subset.
+ */
+export interface SummaryAnomaly {
+    metric: AnomalyMetric;
+    severity: SurfaceableSeverity;
+    basis: AnomalyBasis;
+    method: AnomalyMethod;
+    direction: AnomalyDirection;
+    /** Whole-percent change vs expected; null when no usable baseline. */
+    change_pct: number | null;
+    observed_value: number;
+    expected_value: number;
+}
+
 /** The compact, numbers-only payload handed to the prompt/model. */
 export interface SummaryInputPayload {
     period: {
@@ -123,6 +157,27 @@ export interface SummaryInputPayload {
     data_basis: string;
     /** The data-quality tier this period was computed at. */
     data_quality: DataQuality;
+    /**
+     * Notable/high anomalies flagged for this scope in the period (Task 4.8).
+     * Empty when none. Numbers-only by construction; the prompt narrates these in
+     * plain, tier-honest language.
+     */
+    anomalies: SummaryAnomaly[];
+}
+
+/** Map a persisted anomaly into the numbers-only summary shape. */
+function toSummaryAnomaly(record: AnomalyRecord): SummaryAnomaly {
+    return {
+        metric: record.metric,
+        // Caller filters to surfaceable; the cast records that invariant.
+        severity: record.severity as SurfaceableSeverity,
+        basis: record.basis,
+        method: record.method,
+        direction: anomalyDirection(record.observed_value, record.expected_value),
+        change_pct: changePercent(record.observed_value, record.expected_value),
+        observed_value: record.observed_value,
+        expected_value: record.expected_value,
+    };
 }
 
 /**
@@ -185,12 +240,17 @@ export function buildSummaryInput(params: {
     current: AggregateMetrics;
     prior: AggregateMetrics | null;
     benchmark?: SummaryBenchmark;
+    /** Anomalies flagged for this scope/period; filtered to notable/high here. */
+    anomalies?: AnomalyRecord[];
 }): SummaryInputPayload {
     const {level, periodLabel, start, end, scope, current, prior} = params;
     const benchmark: SummaryBenchmark = params.benchmark ?? {
         org_avg_cost_per_pr: null,
         org_avg_maturity_score: null,
     };
+    // Defence in depth: filter to surfaceable severities even though the caller's
+    // query already does, so an info anomaly can never reach a summary narrative.
+    const anomalies = (params.anomalies ?? []).filter((a) => isSurfaceable(a.severity)).map(toSummaryAnomaly);
 
     const payload: SummaryInputPayload = {
         period: {level, label: periodLabel, start, end},
@@ -215,6 +275,7 @@ export function buildSummaryInput(params: {
         is_first_period: prior === null,
         data_basis: deriveDataBasis(current.ai_maturity_basis),
         data_quality: current.data_quality,
+        anomalies,
     };
     // Enforce the privacy allowlist on our own output, so the numbers-only
     // guarantee holds at construction time rather than depending on a downstream
@@ -249,6 +310,14 @@ export function formatSummaryInput(payload: SummaryInputPayload): string {
     if (payload.is_first_period) {
         lines.push('Note: first period for this scope — no prior-period comparison available.');
     }
+    if (payload.anomalies.length > 0) {
+        lines.push('Anomalies flagged this period:');
+        for (const a of payload.anomalies) {
+            // describeAnomaly uses the honest metric label (a git signal is named
+            // as such), so this line carries no fabricated tool-usage wording.
+            lines.push(`- ${describeAnomaly(a)} (${a.severity}, ${basisLabel(a.basis)})`);
+        }
+    }
     return lines.join('\n');
 }
 
@@ -281,6 +350,23 @@ const ALLOWED_LEVELS: ReadonlySet<string> = new Set(['weekly', 'monthly', 'quart
 const ALLOWED_SCOPE_TYPES: ReadonlySet<string> = new Set(['team', 'org']);
 const ALLOWED_BASES: ReadonlySet<string> = new Set(['git_estimate', 'mixed', 'measured']);
 const ALLOWED_QUALITIES: ReadonlySet<string> = new Set(['high', 'medium', 'low']);
+
+// Anomaly enum allowlists (Task 4.8). Every string on a SummaryAnomaly is one of
+// these closed sets — there is no free-text field — so the gate validates each
+// and the completeness backstop sees them as recognised values.
+const ALLOWED_METRICS: ReadonlySet<string> = new Set([
+    'commits',
+    'prs_merged',
+    'churn',
+    'ai_signature',
+    'interactions',
+    'acceptance_rate',
+    'cost',
+]);
+const ALLOWED_ANOMALY_SEVERITIES: ReadonlySet<string> = new Set(['notable', 'high']);
+const ALLOWED_ANOMALY_BASES: ReadonlySet<string> = new Set(['git_estimate', 'measured']);
+const ALLOWED_METHODS: ReadonlySet<string> = new Set(['statistical', 'percentage_change']);
+const ALLOWED_DIRECTIONS: ReadonlySet<string> = new Set(['increase', 'decrease']);
 
 /** The only strings `data_basis` may hold — every sentence deriveDataBasis emits. */
 const ALLOWED_DATA_BASIS: ReadonlySet<string> = new Set([
@@ -353,6 +439,16 @@ export function assertNumbersOnly(payload: SummaryInputPayload): void {
     if (!ALLOWED_DATA_BASIS.has(payload.data_basis)) reject('data_basis', payload.data_basis);
     if (!ALLOWED_QUALITIES.has(payload.data_quality)) reject('data_quality', payload.data_quality);
 
+    // Per-anomaly: every string field is a closed enum. Validate each so a value
+    // in the wrong field (or an unexpected severity like 'info') fails the gate.
+    for (const a of payload.anomalies) {
+        if (!ALLOWED_METRICS.has(a.metric)) reject('anomaly.metric', a.metric);
+        if (!ALLOWED_ANOMALY_SEVERITIES.has(a.severity)) reject('anomaly.severity', a.severity);
+        if (!ALLOWED_ANOMALY_BASES.has(a.basis)) reject('anomaly.basis', a.basis);
+        if (!ALLOWED_METHODS.has(a.method)) reject('anomaly.method', a.method);
+        if (!ALLOWED_DIRECTIONS.has(a.direction)) reject('anomaly.direction', a.direction);
+    }
+
     // Completeness backstop: every string actually present must be one we just
     // validated. Catches a newly-added string-typed field the checks above don't
     // yet cover — it fails closed instead of going to the model unvalidated.
@@ -367,6 +463,15 @@ export function assertNumbersOnly(payload: SummaryInputPayload): void {
         payload.data_basis,
         payload.data_quality,
     ]);
+    // The anomaly enum strings are validated above; register them so the
+    // completeness pass recognises them rather than flagging them as escapees.
+    for (const a of payload.anomalies) {
+        validated.add(a.metric);
+        validated.add(a.severity);
+        validated.add(a.basis);
+        validated.add(a.method);
+        validated.add(a.direction);
+    }
     for (const str of collectStringValues(payload)) {
         if (!validated.has(str)) reject('(unrecognized field)', str);
     }

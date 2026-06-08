@@ -29,6 +29,7 @@ import {computeMaturityScore, computeOrgAvgCostPerPr} from '../aggregation/matur
 import {countPctChange} from '../aggregation/deltas';
 import {inclusiveDayCount} from '../aggregation/dates';
 import {periodRange, priorPeriod, type SummaryTarget} from './target';
+import {listSurfaceableTeamAnomalies} from '../anomaly/store';
 import {
     buildSummaryInput,
     type AggregateMetrics,
@@ -263,6 +264,25 @@ export function buildSummaryInputForTarget(
         ? computeScopeAggregate(db, scope, level, priorKey)
         : null;
 
+    // Notable/high anomalies whose week falls in this period (Task 4.8). Anomalies
+    // are detected at TEAM scope on a weekly cadence; the start/end of the summary
+    // period bound which weeks count. A team summary pins its own team; an org
+    // summary spans every team (null). Folded into the numbers-only payload, so
+    // the privacy gate validates them before they can reach the model.
+    //
+    // Two deliberate edges: (1) an org fold is team-BLIND — SummaryAnomaly drops
+    // scope_id for the numbers-only guarantee, so the org narrative can't name
+    // which team an anomaly belongs to (the privacy trade-off). (2) An anomaly's
+    // period is its week_start Monday, matched with period >= start AND <= end, so
+    // a week whose Monday falls in the prior month attaches to that prior month's
+    // summary, not this one — bucket-by-Monday, consistent with the weekly cadence.
+    const anomalies = listSurfaceableTeamAnomalies(
+        db,
+        scope.type === 'team' ? scope.name : null,
+        start,
+        end,
+    );
+
     return buildSummaryInput({
         level,
         periodLabel: period,
@@ -275,5 +295,6 @@ export function buildSummaryInputForTarget(
             org_avg_cost_per_pr: orgAvgCostPerPr,
             org_avg_maturity_score: computeOrgAvgMaturity(db, level, period, orgAvgCostPerPr),
         },
+        anomalies,
     });
 }

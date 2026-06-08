@@ -111,6 +111,24 @@ export const GLOBAL_SETTINGS: Record<string, SettingDef> = {
         default: false,
         teamOverridable: false,
     },
+    // Anomaly surfacing (Task 4.8 / #103): whether notable/high anomalies push a
+    // Slack alert to the manager for a team. Global-default + per-team override,
+    // gated by anomaly_managers_can_override. Off by default — alerting is opt-in
+    // (and additionally requires a configured Slack bot + alert channel; the
+    // setting only governs whether a deliverable alert is sent).
+    anomaly_alerts_enabled: {
+        key: 'anomaly_alerts_enabled',
+        type: 'boolean',
+        default: false,
+        teamOverridable: true,
+        overrideGovernedBy: 'anomaly_managers_can_override',
+    },
+    anomaly_managers_can_override: {
+        key: 'anomaly_managers_can_override',
+        type: 'boolean',
+        default: false,
+        teamOverridable: false,
+    },
 };
 
 export interface PreferenceDef {

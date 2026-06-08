@@ -46,6 +46,12 @@ function nowIso(): string {
     return new Date().toISOString();
 }
 
+// Severity tiebreak ranking used by every "newest first" read below. severity is
+// a text enum, so a lexical `severity DESC` would order it high < info < notable
+// and sink the most severe band; this CASE ranks it high > notable > info so a
+// same-timestamp tie surfaces the worst first.
+const SEVERITY_RANK_SQL = `CASE severity WHEN 'high' THEN 3 WHEN 'notable' THEN 2 ELSE 1 END`;
+
 /**
  * Insert or refresh the single anomaly row for its coordinate. On conflict the
  * measurement fields (method/observed/expected/deviation/severity/basis) are
@@ -143,14 +149,9 @@ export function listAnomalies(db: Database.Database, filter: AnomalyListFilter =
         params.push(filter.period);
     }
     const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
-    // Newest first, with severity as the tiebreak among same-timestamp rows.
-    // The severity tiebreak is an explicit CASE rank rather than `severity DESC`:
-    // severity is a text enum, so a lexical sort would order it high < info <
-    // notable and sink the most severe band to the bottom of a tie. The CASE
-    // ranks it high > notable > info so a tie surfaces the worst first.
+    // Newest first, with the shared severity rank as the same-timestamp tiebreak.
     let sql = `SELECT * FROM anomalies ${where}
-               ORDER BY detected_at DESC,
-                        CASE severity WHEN 'high' THEN 3 WHEN 'notable' THEN 2 ELSE 1 END DESC`;
+               ORDER BY detected_at DESC, ${SEVERITY_RANK_SQL} DESC`;
     if (filter.limit !== undefined && Number.isInteger(filter.limit) && filter.limit > 0) {
         sql += ' LIMIT ?';
         params.push(filter.limit);
@@ -165,4 +166,61 @@ export function listAnomalies(db: Database.Database, filter: AnomalyListFilter =
 export function setAnomalyStatus(db: Database.Database, id: string, status: AnomalyStatus): boolean {
     const result = db.prepare('UPDATE anomalies SET status = ? WHERE id = ?').run(status, id);
     return result.changes > 0;
+}
+
+/** Fetch one anomaly by its primary key, or undefined if it doesn't exist. */
+export function getAnomalyById(db: Database.Database, id: string): AnomalyRecord | undefined {
+    return db.prepare('SELECT * FROM anomalies WHERE id = ?').get(id) as AnomalyRecord | undefined;
+}
+
+/**
+ * Open, surfaceable (notable/high), not-yet-announced TEAM anomalies — the work
+ * list for the Slack notifier (Task 4.8). Scoped to team anomalies only: a
+ * developer-scope anomaly is individual data (privacy model), so it is never
+ * pushed to a manager alert channel. Most severe / most recent first.
+ */
+export function listUnnotifiedTeamAnomalies(db: Database.Database): AnomalyRecord[] {
+    return db
+        .prepare(
+            `SELECT * FROM anomalies
+             WHERE scope = 'team' AND status = 'open'
+               AND severity IN ('notable', 'high') AND notified_at IS NULL
+             ORDER BY ${SEVERITY_RANK_SQL} DESC, detected_at DESC`,
+        )
+        .all() as AnomalyRecord[];
+}
+
+/** Stamp an anomaly as announced to Slack at `at` (ISO). Idempotent on the id. */
+export function markAnomalyNotified(db: Database.Database, id: string, at: string): void {
+    db.prepare('UPDATE anomalies SET notified_at = ? WHERE id = ?').run(at, id);
+}
+
+/**
+ * Surfaceable (notable/high) TEAM anomalies whose week falls in an inclusive
+ * period range — the source the summary input builder folds in (Task 4.8). Team
+ * scope only, for the same privacy reason as the notifier: a summary is a
+ * manager-facing team/org narrative. `team` pins one team; null spans every team
+ * (the org summary). Resolved anomalies are excluded — a summary narrates what
+ * was anomalous in the period, not what a manager has already closed out.
+ */
+export function listSurfaceableTeamAnomalies(
+    db: Database.Database,
+    team: string | null,
+    startPeriod: string,
+    endPeriod: string,
+): AnomalyRecord[] {
+    const params: unknown[] = [startPeriod, endPeriod];
+    let teamClause = '';
+    if (team !== null) {
+        teamClause = ' AND scope_id = ?';
+        params.push(team);
+    }
+    return db
+        .prepare(
+            `SELECT * FROM anomalies
+             WHERE scope = 'team' AND severity IN ('notable', 'high') AND status != 'resolved'
+               AND period >= ? AND period <= ?${teamClause}
+             ORDER BY ${SEVERITY_RANK_SQL} DESC, detected_at DESC`,
+        )
+        .all(...params) as AnomalyRecord[];
 }

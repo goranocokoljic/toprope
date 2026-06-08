@@ -24,7 +24,10 @@ import {registerAdminRoutes} from './dashboard/api/admin';
 import {registerAggregateRoutes} from './dashboard/api/aggregates';
 import {registerMaturityRoutes} from './dashboard/api/maturity';
 import {registerSummaryRoutes} from './dashboard/api/summaries';
+import {registerAnomalyRoutes} from './dashboard/api/anomalies';
 import {registerDashboardStatic} from './dashboard/static';
+import {createSlackClient} from './slack/client';
+import {notifyNewAnomalies} from './anomaly/notify';
 import {startScheduler} from './scheduler/scheduler';
 import {startAggregationScheduler} from './aggregation/scheduler';
 import {startSummaryScheduler} from './summaries/scheduler';
@@ -105,6 +108,8 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
     registerAggregateRoutes(app, db);
     registerMaturityRoutes(app, db);
     registerSummaryRoutes(app, db, config.summaries);
+    // Anomaly surfacing (Task 4.8): manager panel + acknowledge/resolve.
+    registerAnomalyRoutes(app, db);
 
     // Data-prompted surveys (Task 4.3): manager queue + developer self-service.
     // Survey delivery prefers the Slack bot when configured, with an email
@@ -140,7 +145,9 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
         // whatever daily snapshots exist (git-only/expense-only deployments
         // included), so coupling them to a connectors block would silently
         // starve the trend tables.
-        const aggregationTasks = startAggregationScheduler(dbPath);
+        const aggregationTasks = startAggregationScheduler(dbPath, {
+            notifier: buildAnomalyNotifier(dbPath, config as GovProxyConfig, app),
+        });
         // Summary auto-generation (weekly + monthly) fires just after the matching
         // aggregation job, generating each scope's narrative for the just-completed
         // period. Gated on summaries config (a disabled level registers no task);
@@ -166,6 +173,35 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
     }
 
     return app;
+}
+
+/**
+ * Build the anomaly Slack notifier the weekly aggregation job fires (Task 4.8),
+ * or undefined when alerting can't deliver (Slack bot disabled / no token / no
+ * channels). The returned callback is fire-and-forget: it opens its OWN
+ * short-lived DB handle (the aggregation job's handle has already closed by the
+ * time it runs) and detaches the async dispatch, logging failures rather than
+ * letting them escape into the cron handler. The per-team `anomaly_alerts_enabled`
+ * setting is still the final gate inside notifyNewAnomalies.
+ */
+function buildAnomalyNotifier(
+    dbPath: string,
+    config: GovProxyConfig,
+    app: FastifyInstance,
+): (() => void) | undefined {
+    const slack = config.slack;
+    if (!slack?.enabled || !slack.bot_token) return undefined;
+    const channels = slack.anomaly_alerts?.channels ?? [];
+    if (channels.length === 0) return undefined;
+
+    const client = createSlackClient(slack.bot_token);
+    const dashboardUrl = slack.anomaly_alerts?.dashboard_url;
+    return (): void => {
+        const db = openDb(dbPath);
+        void notifyNewAnomalies({db, slackClient: client, channels, dashboardUrl})
+            .catch((err) => app.log.error({err}, '[anomaly:notify] failed'))
+            .finally(() => db.close());
+    };
 }
 
 async function main(): Promise<void> {
