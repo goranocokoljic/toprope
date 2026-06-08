@@ -24,6 +24,7 @@ import {registerAdminRoutes} from './dashboard/api/admin';
 import {registerAggregateRoutes} from './dashboard/api/aggregates';
 import {registerMaturityRoutes} from './dashboard/api/maturity';
 import {registerCompareRoutes} from './dashboard/api/compare';
+import {registerCompareTableRoutes} from './dashboard/api/compare-table';
 import {registerSummaryRoutes} from './dashboard/api/summaries';
 import {registerAnomalyRoutes} from './dashboard/api/anomalies';
 import {registerDashboardStatic} from './dashboard/static';
@@ -109,6 +110,7 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
     registerAggregateRoutes(app, db);
     registerMaturityRoutes(app, db);
     registerCompareRoutes(app, db);
+    registerCompareTableRoutes(app, db);
     registerSummaryRoutes(app, db, config.summaries);
     // Anomaly surfacing (Task 4.8): manager panel + acknowledge/resolve.
     registerAnomalyRoutes(app, db);

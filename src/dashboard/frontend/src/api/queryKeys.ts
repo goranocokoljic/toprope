@@ -28,6 +28,10 @@ export const queryKeys = {
     // window so changing either the selection or the range refetches.
     teamCompare: (teams: string[], window: string) =>
         ['teams', 'compare', teams.join(','), window] as const,
+    // Sortable all-teams ranking table (Task 4.10): keyed by the selected period
+    // so changing the period refetches. 'latest' stands in before a period is
+    // resolved (initial load defaults to the most recent rolled-up quarter).
+    teamCompareTable: (period: string) => ['teams', 'compare-table', period] as const,
     globalSettings: ['settings', 'global'] as const,
     teamSettings: (team: string) => ['settings', 'team', team] as const,
     // Optional leaderboard (Task 2.17): availability probe + per-team ranked view.

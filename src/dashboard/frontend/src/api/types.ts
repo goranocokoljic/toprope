@@ -698,6 +698,59 @@ export interface TeamComparison {
     teams: CompareTeam[];
 }
 
+// --- Team comparison — sortable all-teams table (Task 4.10 / #105) ---------
+
+/**
+ * One team's pre-computed metrics for the selected period, read from the
+ * quarterly_aggregates rollup. From /api/teams/compare-table. Every numeric
+ * column is nullable: a period can legitimately have no members (utilization),
+ * no PRs (cost-per-PR), or no computed maturity score yet.
+ */
+export interface CompareTableMetrics {
+    developer_count: number;
+    active_developer_count: number;
+    /** active / total, or null when the team had no members in the period. */
+    utilization_rate: number | null;
+    total_subscription_cost: number | null;
+    cost_per_pr: number | null;
+    avg_code_churn: number | null;
+    total_prs_merged: number | null;
+    /** Latest period maturity score; null when none computed. */
+    ai_maturity_score: number | null;
+    /** Basis for that score — 'git_estimate' at launch (honesty label). */
+    ai_maturity_basis: MaturityBasis | null;
+    /** Estimated monthly spend wasted on unused/underused seats this period. */
+    wasted_spend: number | null;
+    /** Count of seats flagged unused this period. */
+    unused_seat_count: number | null;
+}
+
+/**
+ * One row of the all-teams table: identity, the team's current (all-time)
+ * data-quality tier, and the selected period's metrics (null when the team has
+ * no aggregate row for that period). From /api/teams/compare-table.
+ */
+export interface CompareTableTeam {
+    name: string;
+    department: string | null;
+    manager: string | null;
+    tier: DataQualityTier;
+    tier_breakdown: TierBreakdown;
+    metrics: CompareTableMetrics | null;
+}
+
+/**
+ * The sortable all-teams ranking table for one period. `period` is the resolved
+ * quarter (null only when no period has been rolled up yet); `available_periods`
+ * lists the rolled-up quarters, most recent first, to drive the period selector.
+ * From /api/teams/compare-table.
+ */
+export interface CompareTable {
+    period: string | null;
+    available_periods: string[];
+    teams: CompareTableTeam[];
+}
+
 /** The four summary cadences. Mirrors the backend SummaryLevel. */
 export type SummaryLevel = 'weekly' | 'monthly' | 'quarterly' | 'yearly';
 
