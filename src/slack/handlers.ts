@@ -1,6 +1,6 @@
 import type Database from 'better-sqlite3';
 import {findBySlackUserId} from '../registry/developers';
-import {createSelfReport, SelfReportError} from '../selfreport/core';
+import {createSelfReport, SelfReportError, type SnapshotOutcome} from '../selfreport/core';
 import type {SlackClient} from './client';
 import {
     ACTION_DISMISS_PROMPT,
@@ -191,7 +191,7 @@ export async function handleViewSubmission(
     const task = plainTextValue(state, BLOCK_TASK, ACTION_TASK) ?? null;
     const date = getString(view, 'private_metadata') || todayUtc();
 
-    let snapshot: string;
+    let snapshot: SnapshotOutcome;
     try {
         const result = createSelfReport(deps.db, {
             developerId: developer.id,
@@ -225,7 +225,7 @@ export function buildConfirmationText(
     tool: string,
     minutes: number | null,
     date: string,
-    snapshot: string,
+    snapshot: SnapshotOutcome,
 ): string {
     const effort = minutes != null ? ` (~${minutes} min)` : '';
     let text = `:white_check_mark: Logged *${tool}* usage for ${date}${effort}.`;

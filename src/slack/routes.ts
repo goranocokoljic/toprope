@@ -60,6 +60,14 @@ export function registerSlackRoutes(
             'slack.enabled is true but slack.signing_secret is not set — all Slack requests will be rejected.',
         );
     }
+    // Symmetric with the signing-secret check: without a bot token the bot is
+    // enabled but inert (views.open/chat.postMessage all fail), so surface it at
+    // registration rather than letting every slash command fail opaquely later.
+    if (!options.client && !config.bot_token) {
+        app.log.warn(
+            'slack.enabled is true but slack.bot_token is not set — the bot cannot open forms or post messages.',
+        );
+    }
     const client = options.client ?? createSlackClient(config.bot_token ?? '');
     const deps: SlackHandlerDeps = {db, client, log: (m, e) => app.log.error({err: e}, `[slack] ${m}`)};
 
