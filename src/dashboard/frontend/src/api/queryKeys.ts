@@ -24,6 +24,10 @@ export const queryKeys = {
     teamTrend: (team: string, window: string) => ['teams', 'trend', team, window] as const,
     teamProviders: (team: string) => ['teams', 'providers', team] as const,
     teamWaste: (team: string) => ['teams', 'waste', team] as const,
+    // Rich team comparison (Task 4.9): keyed by the selected teams + resolved
+    // window so changing either the selection or the range refetches.
+    teamCompare: (teams: string[], window: string) =>
+        ['teams', 'compare', teams.join(','), window] as const,
     globalSettings: ['settings', 'global'] as const,
     teamSettings: (team: string) => ['settings', 'team', team] as const,
     // Optional leaderboard (Task 2.17): availability probe + per-team ranked view.

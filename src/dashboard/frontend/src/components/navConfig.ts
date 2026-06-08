@@ -15,6 +15,7 @@ export interface NavSection {
 const MANAGER_ITEMS: NavItem[] = [
     {to: '/manager', label: 'Overview'},
     {to: '/manager/teams', label: 'Teams'},
+    {to: '/manager/compare', label: 'Compare'},
     {to: '/manager/waste', label: 'Waste'},
     {to: '/manager/anomalies', label: 'Anomalies'},
 ];

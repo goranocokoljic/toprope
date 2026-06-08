@@ -637,6 +637,67 @@ export interface MaturityTrend {
     points: MaturityTrendPoint[];
 }
 
+// --- Team comparison — rich side-by-side (Task 4.9 / #104) ----------------
+
+/**
+ * A team's data-quality tier, mirroring the backend DataQualityTier
+ * (src/dashboard/api/compare.ts). `high` = every contributing developer has
+ * API-grade data (fully connected); `medium` = git-only is the weakest signal;
+ * `low` = expense-only is the weakest; `none` = no data-bearing developers.
+ */
+export type DataQualityTier = 'high' | 'medium' | 'low' | 'none';
+
+/** Per-developer tier counts behind a team's overall tier. */
+export interface TierBreakdown {
+    high: number;
+    medium: number;
+    low: number;
+    none: number;
+}
+
+/** The compared metrics for one team over the window. From /api/compare. */
+export interface CompareTeamMetrics {
+    developer_count: number;
+    active_developer_count: number;
+    /** active / total, or null when the team had no members in the window. */
+    utilization_rate: number | null;
+    total_subscription_cost: number;
+    cost_per_pr: number | null;
+    avg_code_churn: number | null;
+    total_prs_merged: number;
+    /** Latest maturity score overlapping the window; null when none computed. */
+    ai_maturity_score: number | null;
+    /** Basis for that score — 'git_estimate' at launch (honesty label). */
+    ai_maturity_basis: MaturityBasis | null;
+    /** Distinct tools the team was active on during the window. */
+    tool_mix: string[];
+}
+
+/** One day on a team's overlaid adoption-trend line. From /api/compare. */
+export interface CompareTrendPoint {
+    date: string;
+    active_developers: number;
+}
+
+/** One compared team: identity, tier, metrics, and its trend line. */
+export interface CompareTeam {
+    name: string;
+    department: string | null;
+    manager: string | null;
+    tier: DataQualityTier;
+    tier_breakdown: TierBreakdown;
+    metrics: CompareTeamMetrics;
+    trend: CompareTrendPoint[];
+}
+
+/** A 2–4 team side-by-side comparison over a resolved window. From /api/compare. */
+export interface TeamComparison {
+    range: TimeRangeKind;
+    from: string;
+    to: string;
+    teams: CompareTeam[];
+}
+
 /** The four summary cadences. Mirrors the backend SummaryLevel. */
 export type SummaryLevel = 'weekly' | 'monthly' | 'quarterly' | 'yearly';
 
