@@ -58,6 +58,14 @@ import {
     type SelfReportInterface,
 } from './selfreport/core';
 import {resolveSelfDeveloperId} from './selfreport/identity';
+import {
+    buildSurveyDispatchDeps,
+    createManualSurvey,
+    runTriggerSweep,
+    sendSurvey,
+} from './surveys/dispatch';
+import {dismissSurvey, getSurveyById, listSurveys} from './surveys/store';
+import type {GovProxyConfig} from './config/types';
 
 // Commander option collector for repeatable flags (e.g. --git-email).
 function collectValue(value: string, previous: string[]): string[] {
@@ -1557,6 +1565,177 @@ program
             db.close();
         }
         if (!passed) process.exit(1);
+    });
+
+// CLI-driven survey sends use the shared dispatch-deps builder, so they apply
+// the same delivery preference (Slack first when configured, else email) as the
+// server and scheduler. Logs go to the console for CLI visibility.
+function buildDispatchDeps(
+    db: ReturnType<typeof openDb>,
+    config: GovProxyConfig,
+): ReturnType<typeof buildSurveyDispatchDeps> {
+    return buildSurveyDispatchDeps(db, config, {
+        log: (message, err) => console.error(`[surveys] ${message}`, err ?? ''),
+    });
+}
+
+const surveyCommand = program
+    .command('survey')
+    .description('Data-prompted surveys: detect triggers, review the queue, and send');
+
+surveyCommand
+    .command('run')
+    .description('Detect survey triggers and dispatch them (auto-send or queue per settings)')
+    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .action(async (options: {config: string}) => {
+        const configPath = path.resolve(process.cwd(), options.config);
+        const config = loadConfig(configPath);
+        const db = openRegistryDb(configPath);
+        try {
+            const summary = await runTriggerSweep(buildDispatchDeps(db, config));
+            console.log('Survey trigger sweep:');
+            console.log(`  Candidates detected: ${summary.candidates}`);
+            console.log(`  Surveys created:     ${summary.created}`);
+            console.log(`  Auto-sent:           ${summary.autoSent}`);
+            console.log(`  Queued for manager:  ${summary.queued}`);
+            console.log(`  Skipped (duplicate): ${summary.duplicates}`);
+            if (summary.retried > 0) {
+                console.log(`  Stranded retried:    ${summary.retried} (recovered ${summary.recovered})`);
+            }
+            if (summary.undeliverable > 0) {
+                console.log(`  Undeliverable:       ${summary.undeliverable} (left queued)`);
+            }
+        } finally {
+            db.close();
+        }
+    });
+
+surveyCommand
+    .command('queue')
+    .description('List surveys awaiting a manager to send (status=queued)')
+    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .action((options: {config: string}) => {
+        const configPath = path.resolve(process.cwd(), options.config);
+        const db = openRegistryDb(configPath);
+        try {
+            const queued = listSurveys(db, {status: 'queued'});
+            if (queued.length === 0) {
+                console.log('No queued surveys.');
+                return;
+            }
+            console.log('Queued surveys:');
+            console.log('─'.repeat(96));
+            for (const s of queued) {
+                console.log(`${s.id}  [${s.trigger_type}]  ${s.developer_name ?? s.developer_id} (${s.team ?? '—'})`);
+                console.log(`    ${s.question_text}`);
+            }
+        } finally {
+            db.close();
+        }
+    });
+
+surveyCommand
+    .command('send <survey-id>')
+    .description('Send a queued survey to its developer (Slack preferred, email fallback)')
+    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .action(async (surveyId: string, options: {config: string}) => {
+        const configPath = path.resolve(process.cwd(), options.config);
+        const config = loadConfig(configPath);
+        const db = openRegistryDb(configPath);
+        try {
+            const survey = getSurveyById(db, surveyId);
+            if (!survey) {
+                console.error(`Error: survey '${surveyId}' not found.`);
+                process.exitCode = 1;
+                return;
+            }
+            if (survey.status !== 'queued') {
+                console.error(`Error: survey is '${survey.status}', not queued.`);
+                process.exitCode = 1;
+                return;
+            }
+            const result = await sendSurvey(buildDispatchDeps(db, config), surveyId);
+            if (result.delivered) {
+                console.log(`Sent survey ${surveyId} via ${result.delivery}.`);
+            } else {
+                console.error(`Error: could not deliver survey (${result.reason}).`);
+                process.exitCode = 1;
+            }
+        } finally {
+            db.close();
+        }
+    });
+
+surveyCommand
+    .command('create')
+    .description('Create a manual survey for a developer (queued for you to send)')
+    .requiredOption('--developer <id>', 'Developer id to survey')
+    .requiredOption('--question <text>', 'The question to ask')
+    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .action((options: {developer: string; question: string; config: string}) => {
+        const configPath = path.resolve(process.cwd(), options.config);
+        const db = openRegistryDb(configPath);
+        try {
+            const survey = createManualSurvey(db, {
+                developerId: options.developer,
+                questionText: options.question,
+            });
+            if (!survey) {
+                console.error(`Error: developer '${options.developer}' not found.`);
+                process.exitCode = 1;
+                return;
+            }
+            console.log(`Created manual survey ${survey.id} (queued). Send it with:`);
+            console.log(`  govproxy survey send ${survey.id}`);
+        } finally {
+            db.close();
+        }
+    });
+
+surveyCommand
+    .command('dismiss <survey-id>')
+    .description('Dismiss a queued survey without sending it')
+    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .action((surveyId: string, options: {config: string}) => {
+        const configPath = path.resolve(process.cwd(), options.config);
+        const db = openRegistryDb(configPath);
+        try {
+            if (dismissSurvey(db, surveyId)) {
+                console.log(`Dismissed survey ${surveyId}.`);
+            } else {
+                console.error(`Error: survey '${surveyId}' not found or not queued.`);
+                process.exitCode = 1;
+            }
+        } finally {
+            db.close();
+        }
+    });
+
+surveyCommand
+    .command('responses')
+    .description('Show answered surveys with their response (context next to the data)')
+    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .action((options: {config: string}) => {
+        const configPath = path.resolve(process.cwd(), options.config);
+        const db = openRegistryDb(configPath);
+        try {
+            const answered = listSurveys(db, {status: 'answered'});
+            if (answered.length === 0) {
+                console.log('No answered surveys yet.');
+                return;
+            }
+            console.log('Answered surveys:');
+            console.log('─'.repeat(96));
+            for (const s of answered) {
+                const choice = s.response?.response_choice;
+                const text = s.response?.response_text;
+                const answer = [choice, text].filter(Boolean).join(' — ') || '(no detail)';
+                console.log(`[${s.trigger_type}] ${s.developer_name ?? s.developer_id}: ${answer}`);
+                console.log(`    Q: ${s.question_text}`);
+            }
+        } finally {
+            db.close();
+        }
     });
 
 program.parseAsync().catch((err: unknown) => {

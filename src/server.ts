@@ -30,6 +30,10 @@ import {startAggregationScheduler} from './aggregation/scheduler';
 import {startSummaryScheduler} from './summaries/scheduler';
 import {registerSlackRoutes} from './slack/routes';
 import {startSlackDailyPrompt} from './slack/scheduler';
+import {registerSurveyRoutes} from './dashboard/api/surveys';
+import {createLogEmailer} from './surveys/email';
+import {surveySlackClientFromConfig} from './surveys/dispatch';
+import {startSurveyScheduler} from './surveys/scheduler';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, './storage/migrations');
 
@@ -102,6 +106,17 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
     registerMaturityRoutes(app, db);
     registerSummaryRoutes(app, db, config.summaries);
 
+    // Data-prompted surveys (Task 4.3): manager queue + developer self-service.
+    // Survey delivery prefers the Slack bot when configured, with an email
+    // fallback (a logging emailer until a real transport is wired). The Slack
+    // client is constructed only when the bot is enabled with a token, so
+    // delivery cleanly degrades to email otherwise.
+    registerSurveyRoutes(app, db, {
+        slackClient: surveySlackClientFromConfig(config as GovProxyConfig),
+        emailer: createLogEmailer((line) => app.log.info(line)),
+        log: (message, err) => app.log.error({err}, `[surveys] ${message}`),
+    });
+
     // Slack self-reporting bot (Task 4.2): slash command + interactive form,
     // authenticated by Slack request signature rather than the session gate.
     // Registered only when enabled so the urlencoded parser/routes don't exist
@@ -134,12 +149,17 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
         // Optional end-of-day Slack prompt. startSlackDailyPrompt self-gates on
         // slack.enabled + daily_prompt.enabled + channels, returning [] otherwise.
         const slackPromptTasks = startSlackDailyPrompt(config.slack);
+        // Optional daily survey trigger sweep (Task 4.3). Self-gates on
+        // surveys.enabled, returning [] otherwise. Runs detection + dispatch and
+        // retries stranded auto-surveys.
+        const surveyTasks = startSurveyScheduler(dbPath, config as GovProxyConfig);
         app.addHook('onClose', () => {
             for (const task of [
                 ...connectorTasks,
                 ...aggregationTasks,
                 ...summaryTasks,
                 ...slackPromptTasks,
+                ...surveyTasks,
             ])
                 task.stop();
         });

@@ -9,6 +9,7 @@ import {
     getMeTools,
 } from './developer-views';
 import {parseTimeRange, TimeRangeError, type TimeRangeInput} from './range';
+import {requireDeveloperId} from './guards';
 
 /**
  * Self-service endpoints for the logged-in developer (Task 2.4 / #39).
@@ -27,24 +28,6 @@ function notFound(reply: FastifyReply): void {
     reply
         .status(404)
         .send({error: 'Not Found', message: 'No developer profile linked to this account'});
-}
-
-/**
- * Resolve the session's developer id, or send the appropriate error and return
- * null. 401 when unauthenticated (defence-in-depth behind the middleware), 404
- * when the account has no linked developer.
- */
-function requireDeveloperId(request: FastifyRequest, reply: FastifyReply): string | null {
-    if (!request.authUser) {
-        reply.status(401).send({error: 'Unauthorized', message: 'Authentication required'});
-        return null;
-    }
-    const developerId = request.authUser.developerId;
-    if (!developerId) {
-        notFound(reply);
-        return null;
-    }
-    return developerId;
 }
 
 export function registerMeRoutes(app: FastifyInstance, db: Database.Database): void {
