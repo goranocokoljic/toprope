@@ -341,6 +341,83 @@ describe('reconcilePeriod', () => {
         expect(summary.created).toBe(0);
     });
 
+    it('does not double-count when a monthly and an annual charge coexist for the same dev/tool', () => {
+        insertSub(db, {
+            developerId: alice,
+            tool: 'copilot',
+            monthlyCost: 20,
+            billingModel: 'reimbursed',
+            assignedAt: '2026-01-01T00:00:00.000Z',
+        });
+        // Annual charge billed in January (covers June) AND a June monthly charge.
+        insertCharge(db, {
+            developerId: alice,
+            tool: 'copilot',
+            monthlyCost: 20,
+            chargeType: 'recurring_annual',
+            period: '2026-01',
+        });
+        insertCharge(db, {developerId: alice, tool: 'copilot', monthlyCost: 20, period: PERIOD});
+
+        // Expense must resolve to the monthly $20 (not $40 = monthly + annual),
+        // so it matches the $20 seat and produces no phantom discrepancy.
+        const summary = reconcilePeriod(db, PERIOD);
+        expect(summary.created).toBe(0);
+    });
+
+    it('picks the active seat over a same-day-revoked seat (deterministic tiebreak)', () => {
+        // Two seats share seat_assigned_at; one is revoked, one active. The active
+        // one (reimbursed) must win, not an id-order accident.
+        insertSub(db, {
+            developerId: alice,
+            tool: 'copilot',
+            monthlyCost: 19,
+            billingModel: 'company_managed',
+            assignedAt: '2026-06-10T00:00:00.000Z',
+            revokedAt: '2026-06-10T00:00:00.000Z',
+        });
+        insertSub(db, {
+            developerId: alice,
+            tool: 'copilot',
+            monthlyCost: 39,
+            billingModel: 'reimbursed',
+            assignedAt: '2026-06-10T00:00:00.000Z',
+        });
+        const summary = reconcilePeriod(db, PERIOD);
+        expect(summary.byType.subscription_no_expense).toBe(1);
+    });
+
+    it('an ignored cost_unknown result does not suppress a later real discrepancy', () => {
+        // Seat with no cost + a real charge → cost_unknown discrepancy; ignore it.
+        insertSub(db, {
+            developerId: alice,
+            tool: 'copilot',
+            monthlyCost: null,
+            billingModel: 'reimbursed',
+            assignedAt: '2026-06-01T00:00:00.000Z',
+        });
+        insertCharge(db, {developerId: alice, tool: 'copilot', monthlyCost: 20});
+        reconcilePeriod(db, PERIOD);
+        const [unknown] = listReconciliationResults(db);
+        expect(JSON.parse(unknown.details ?? '{}').cost_unknown).toBe(true);
+        ignoreReconciliationResult(db, unknown.id, 'cost not loaded yet');
+
+        // Registry cost is later filled in with a value that genuinely diverges.
+        insertSub(db, {
+            developerId: alice,
+            tool: 'copilot',
+            monthlyCost: 50,
+            billingModel: 'reimbursed',
+            assignedAt: '2026-06-20T00:00:00.000Z',
+        });
+        const second = reconcilePeriod(db, PERIOD);
+        // The real ($20 vs $50) discrepancy is NOT masked by the ignored unknown.
+        expect(second.byType.cost_discrepancy).toBe(1);
+        const open = listReconciliationResults(db, {status: 'open'});
+        expect(open).toHaveLength(1);
+        expect(JSON.parse(open[0].details ?? '{}').cost_unknown).toBeUndefined();
+    });
+
     it('is idempotent: re-running does not duplicate open results', () => {
         insertCharge(db, {developerId: alice, tool: 'cursor', monthlyCost: 20});
         const first = reconcilePeriod(db, PERIOD);

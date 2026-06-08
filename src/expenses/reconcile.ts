@@ -134,15 +134,28 @@ function getPeriodExpenses(db: Database.Database, period: string): ExpenseAgg[] 
             `SELECT developer_id, tool,
                     SUM(monthly_cost) AS amount,
                     COUNT(*) AS charge_count
-             FROM expense_charges
+             FROM expense_charges e
              WHERE developer_id IS NOT NULL
                AND (
-                 (charge_type = 'recurring_annual' AND period >= ? AND period <= ?)
-                 OR (charge_type NOT IN ('recurring_annual', 'one_time') AND period = ?)
+                 (charge_type = 'recurring_monthly' AND period = ?)
+                 OR (
+                   charge_type = 'recurring_annual'
+                   AND period >= ? AND period <= ?
+                   -- Annual coverage is a fallback: only when this dev/tool has no
+                   -- monthly charge for the exact period. Otherwise an annual row
+                   -- (from an earlier month in the window) and the period's monthly
+                   -- row would both be summed, double-counting the expense and
+                   -- manufacturing a phantom cost_discrepancy.
+                   AND NOT EXISTS (
+                     SELECT 1 FROM expense_charges m
+                     WHERE m.developer_id = e.developer_id AND m.tool = e.tool
+                       AND m.charge_type = 'recurring_monthly' AND m.period = ?
+                   )
+                 )
                )
              GROUP BY developer_id, tool`,
         )
-        .all(annualWindowStart, period, period) as ExpenseAgg[];
+        .all(period, annualWindowStart, period, period) as ExpenseAgg[];
 }
 
 /**
@@ -171,7 +184,13 @@ function getPeriodSubscriptions(db: Database.Database, period: string): SubAgg[]
                  SELECT developer_id, tool, monthly_cost, billing_model,
                         ROW_NUMBER() OVER (
                             PARTITION BY developer_id, tool
-                            ORDER BY seat_assigned_at DESC, id DESC
+                            -- Latest-assigned seat = plan in effect at period end.
+                            -- Tie-break deterministically (id is a random UUID, not
+                            -- a sequence): prefer the still-active seat, then a
+                            -- stable id order.
+                            ORDER BY seat_assigned_at DESC,
+                                     (seat_revoked_at IS NULL) DESC,
+                                     id DESC
                         ) AS rn
                  FROM subscriptions
                  WHERE (seat_assigned_at IS NULL OR substr(seat_assigned_at, 1, 7) <= ?)
@@ -188,6 +207,12 @@ function getPeriodSubscriptions(db: Database.Database, period: string): SubAgg[]
  * deliberately-suppressed condition suppressed. A previously *resolved*
  * condition that recurs is allowed to re-open, since the underlying problem came
  * back. NULL-safe on developer_id/tool via `IS`.
+ *
+ * A cost_discrepancy whose cost could not be verified (details.cost_unknown) is
+ * a DIFFERENT condition from one with a real computed difference, so the
+ * cost_unknown flag is part of the identity. Otherwise ignoring a "cost unknown"
+ * result would later suppress a genuine over/under-charge once the missing cost
+ * is filled in and the amounts actually diverge.
  */
 function conditionAlreadyTracked(
     db: Database.Database,
@@ -195,16 +220,18 @@ function conditionAlreadyTracked(
     type: ReconciliationResultType,
     developerId: string | null,
     tool: string | null,
+    costUnknown: boolean,
 ): boolean {
     const row = db
         .prepare(
             `SELECT 1 FROM reconciliation_results
              WHERE period = ? AND result_type = ?
                AND developer_id IS ? AND tool IS ?
+               AND COALESCE(json_extract(details, '$.cost_unknown'), 0) = ?
                AND status IN ('open', 'ignored')
              LIMIT 1`,
         )
-        .get(period, type, developerId, tool);
+        .get(period, type, developerId, tool, costUnknown ? 1 : 0);
     return row !== undefined;
 }
 
@@ -214,6 +241,10 @@ interface NewResult {
     tool: string | null;
     expense_amount: number | null;
     registry_amount: number | null;
+    // When true, this is a cost_discrepancy that could not be verified because
+    // one side had no cost — kept distinct in the idempotency identity (and
+    // recorded as details.cost_unknown) so it never masks a real discrepancy.
+    cost_unknown?: boolean;
     details: Record<string, unknown>;
 }
 
@@ -288,7 +319,16 @@ export function reconcilePeriod(
         }
 
         const emit = (r: NewResult): void => {
-            if (conditionAlreadyTracked(db, period, r.result_type, r.developer_id, r.tool)) {
+            if (
+                conditionAlreadyTracked(
+                    db,
+                    period,
+                    r.result_type,
+                    r.developer_id,
+                    r.tool,
+                    r.cost_unknown ?? false,
+                )
+            ) {
                 summary.skipped += 1;
                 return;
             }
@@ -349,32 +389,34 @@ export function reconcilePeriod(
             // (a registered seat with no cost, or a charge with no resolvable
             // amount, would otherwise produce no result of any type).
             if (exp && sub) {
-                const bothKnown = exp.amount != null && sub.amount != null;
-                if (bothKnown) {
-                    const diff = Math.abs((exp.amount as number) - (sub.amount as number));
+                const expCost = exp.amount;
+                const subCost = sub.amount;
+                if (expCost != null && subCost != null) {
+                    const diff = Math.abs(expCost - subCost);
                     if (diff > tolerance) {
                         emit({
                             result_type: 'cost_discrepancy',
                             developer_id: exp.developer_id,
                             tool: exp.tool,
-                            expense_amount: exp.amount,
-                            registry_amount: sub.amount,
+                            expense_amount: expCost,
+                            registry_amount: subCost,
                             details: {
                                 difference: Number(diff.toFixed(2)),
                                 tolerance,
                                 billing_model: sub.billing_model,
-                                message: `Expense ($${exp.amount}) and registry ($${sub.amount}) differ beyond tolerance.`,
+                                message: `Expense ($${expCost.toFixed(2)}) and registry ($${subCost.toFixed(2)}) differ beyond tolerance.`,
                             },
                         });
                     }
-                } else if (exp.amount != null || sub.amount != null) {
+                } else if (expCost != null || subCost != null) {
                     // Exactly one side known — the other is an unverifiable cost.
                     emit({
                         result_type: 'cost_discrepancy',
                         developer_id: exp.developer_id,
                         tool: exp.tool,
-                        expense_amount: exp.amount,
-                        registry_amount: sub.amount,
+                        expense_amount: expCost,
+                        registry_amount: subCost,
+                        cost_unknown: true,
                         details: {
                             cost_unknown: true,
                             billing_model: sub.billing_model,
