@@ -14,7 +14,6 @@ export interface ExpenseCharge {
     tool: string;
     plan: string | null;
     amount: number | null;
-    currency: string | null;
     period: string | null;
     charge_type: ChargeType;
     monthly_cost: number | null;
@@ -37,7 +36,6 @@ export interface NewCharge {
     tool: string;
     plan: string | null;
     amount: number | null;
-    currency: string | null;
     period: string | null;
     charge_type: ChargeType;
     monthly_cost: number | null;
@@ -62,10 +60,10 @@ export function insertCharge(db: Database.Database, charge: NewCharge): string {
     const id = randomUUID();
     db.prepare(
         `INSERT INTO expense_charges
-           (id, dedup_key, developer_id, raw_email, raw_name, tool, plan, amount, currency,
+           (id, dedup_key, developer_id, raw_email, raw_name, tool, plan, amount,
             period, charge_type, monthly_cost, billing_model, billing_model_inferred,
             match_status, match_method, source_profile, source_file, resolved_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
     ).run(
         id,
         charge.dedup_key,
@@ -75,7 +73,6 @@ export function insertCharge(db: Database.Database, charge: NewCharge): string {
         charge.tool,
         charge.plan,
         charge.amount,
-        charge.currency,
         charge.period,
         charge.charge_type,
         charge.monthly_cost,
@@ -112,7 +109,30 @@ export function getChargeById(db: Database.Database, id: string): ExpenseCharge 
     return row ?? null;
 }
 
+/**
+ * Resolve the short id shown by `expenses unmatched` (the first 8 chars of a
+ * charge id) to a full unmatched, unresolved charge id. Returns null when the
+ * prefix is malformed or matches nothing.
+ *
+ * The prefix is validated to charge-id characters (`[0-9a-f-]`) before it is used
+ * in a LIKE pattern, so a `%`/`_` wildcard can't match an arbitrary charge. An
+ * ORDER BY keeps the result deterministic if a prefix is somehow ambiguous.
+ */
+export function findUnmatchedIdByPrefix(db: Database.Database, prefix: string): string | null {
+    if (!/^[0-9a-f-]+$/i.test(prefix)) return null;
+    const row = db
+        .prepare(
+            `SELECT id FROM expense_charges
+             WHERE id LIKE ? AND match_status = 'unmatched' AND resolved_at IS NULL
+             ORDER BY created_at, id LIMIT 1`,
+        )
+        .get(`${prefix}%`) as {id: string} | undefined;
+    return row?.id ?? null;
+}
+
 export interface ResolveResult {
+    // The charge as it was before resolution (its tool/cost are what the caller
+    // reports). The match_status/developer_id mutation is applied in the DB.
     charge: ExpenseCharge;
     subscriptionCreated: boolean;
 }
@@ -168,9 +188,6 @@ export function resolveCharge(
             subscriptionCreated = true;
         }
 
-        return {
-            charge: {...charge, developer_id: developerId, match_status: 'matched', match_method: 'manual', resolved_at: now},
-            subscriptionCreated,
-        };
+        return {charge, subscriptionCreated};
     })();
 }

@@ -12,8 +12,18 @@ describe('resolveProfile', () => {
         for (const name of Object.keys(BUILTIN_PROFILES)) {
             const profile = resolveProfile(name, {});
             expect(profile.name).toBe(name);
-            expect(profile.column_mapping.tool).toBeDefined();
+            expect(profile.column_mapping).toBeTypeOf('object');
         }
+    });
+
+    it('standard uses an empty mapping (field names are their own columns)', () => {
+        const profile = resolveProfile('standard', {});
+        expect(profile.column_mapping).toEqual({});
+    });
+
+    it('vendor profiles remap the tool column', () => {
+        expect(resolveProfile('expensify', {}).column_mapping.tool).toBe('merchant');
+        expect(resolveProfile('concur', {}).column_mapping.tool).toBe('vendor');
     });
 
     it('throws on an unknown profile name and lists available ones', () => {

@@ -80,7 +80,6 @@ export interface ColumnMappingConfig {
     amount?: string; // raw charge amount; combined with frequency to derive monthly_cost
     frequency?: string; // recurring/one-time hint (monthly | annual | one-time | …)
     period?: string; // billing-period or charge-date column; normalized for dedup
-    currency?: string; // recorded on the charge ledger (no conversion is performed)
 }
 
 // A named import profile (Task 4.5). Lets one config import from several expense

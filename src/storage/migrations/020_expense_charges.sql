@@ -26,7 +26,6 @@ CREATE TABLE expense_charges (
     tool TEXT NOT NULL,
     plan TEXT,
     amount REAL,                     -- raw charge amount as imported
-    currency TEXT,
     period TEXT,                     -- normalized billing period (e.g. 2026-06) or ''
     charge_type TEXT NOT NULL,       -- recurring_monthly | recurring_annual | one_time
     monthly_cost REAL,               -- normalized monthly cost (NULL for one_time)
@@ -40,5 +39,8 @@ CREATE TABLE expense_charges (
     created_at TEXT NOT NULL
 );
 
-CREATE INDEX idx_expense_charges_dedup ON expense_charges(dedup_key);
+-- UNIQUE so the "one ledger row per unique charge" invariant is enforced by the
+-- schema, not only by the importer's read-then-insert. A second insert of the
+-- same dedup_key fails loudly instead of silently double-counting.
+CREATE UNIQUE INDEX idx_expense_charges_dedup ON expense_charges(dedup_key);
 CREATE INDEX idx_expense_charges_match_status ON expense_charges(match_status);

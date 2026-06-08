@@ -42,7 +42,6 @@ const STANDARD_FIELDS = [
     'billing_model',
     'frequency',
     'period',
-    'currency',
 ] as const;
 
 type StandardField = (typeof STANDARD_FIELDS)[number];
@@ -202,24 +201,35 @@ function buildMatcher(db: Database.Database): DeveloperMatcher {
     };
 }
 
-/** Parse a money string ("$1,234.50") to a number, or null if not parseable. */
+/**
+ * Parse a money string ("$1,234.50") to a non-negative number, or null if not
+ * parseable or negative. Negative values (refunds/credits) are rejected rather
+ * than opening a subscription with a negative monthly cost — the caller decides
+ * how to surface that. Only `$` and thousands `,` are stripped; locale formats
+ * that use `,` as the decimal separator are not supported.
+ */
 function parseMoney(raw: string): number | null {
     const cleaned = raw.replace(/[$,]/g, '').trim();
     if (!cleaned) return null;
     const parsed = parseFloat(cleaned);
-    return isNaN(parsed) ? null : parsed;
+    if (isNaN(parsed) || parsed < 0) return null;
+    return parsed;
 }
 
 /**
- * Normalize a period/charge-date cell into a dedup-stable key. A YYYY-MM-DD (or
- * longer ISO) value collapses to its YYYY-MM month — so the same monthly charge
- * keys identically regardless of which day it posted. Anything else is used
- * trimmed/lowercased as-is. Empty when no period column is mapped/present.
+ * Normalize a period/charge-date cell into a dedup-stable key. A date collapses
+ * to its YYYY-MM month — so the same monthly charge keys identically regardless
+ * of which day it posted. Both ISO (YYYY-MM-DD) and US (MM/DD/YYYY) formats are
+ * recognized, since the built-in vendor profiles map a transaction-date column
+ * straight into the period. Anything else is used trimmed/lowercased as-is.
+ * Empty when no period column is mapped/present.
  */
 function normalizePeriod(raw: string): string {
     const v = raw.trim();
-    const isoMatch = /^(\d{4})-(\d{2})-\d{2}/.exec(v);
-    if (isoMatch) return `${isoMatch[1]}-${isoMatch[2]}`;
+    const iso = /^(\d{4})-(\d{2})-\d{2}/.exec(v);
+    if (iso) return `${iso[1]}-${iso[2]}`;
+    const us = /^(\d{1,2})\/(\d{1,2})\/(\d{4})/.exec(v);
+    if (us) return `${us[3]}-${us[1].padStart(2, '0')}`;
     return v.toLowerCase();
 }
 
@@ -351,7 +361,6 @@ export function importCsv(
             }
 
             const plan = cell(row, 'plan') || null;
-            const currency = cell(row, 'currency') || null;
             const period = normalizePeriod(cell(row, 'period'));
             const chargeType = classifyFrequency(cell(row, 'frequency'), profile.default_frequency);
 
@@ -382,13 +391,15 @@ export function importCsv(
 
             const matchResult = matcher.match(email, name);
 
-            // Dedup key: developer (id when matched, else email/name) + tool + period + amount.
+            // Dedup key: raw row identity + tool + period + amount. Keyed on the
+            // RAW email/name as it appears in the row (not the matched developer
+            // id) so the key is stable whether or not the row matched — otherwise
+            // a charge imported while unmatched, then re-imported after the
+            // developer is registered, would key differently and double-count.
             const amountForKey = amount ?? monthlyCost;
-            const devKey = matchResult
-                ? matchResult.dev.id
-                : email
-                  ? `email:${email.toLowerCase()}`
-                  : `name:${normalizeName(name)}`;
+            const devKey = email
+                ? `email:${email.toLowerCase()}`
+                : `name:${normalizeName(name)}`;
             const dedupKey = `${devKey}|${tool.toLowerCase()}|${period}|${amountForKey ?? ''}`;
 
             if (chargeExists(db, dedupKey)) {
@@ -409,7 +420,6 @@ export function importCsv(
                 tool,
                 plan,
                 amount,
-                currency,
                 period: period || null,
                 charge_type: chargeType,
                 monthly_cost: monthlyCost,
@@ -437,11 +447,30 @@ export function importCsv(
 
             result.matched++;
 
+            // Name-only matches are lower confidence than an email match (two
+            // people can share a display name). Surface it so the attribution can
+            // be verified — the ambiguous case is already refused by the matcher.
+            if (matchResult.method === 'name') {
+                result.warnings.push(
+                    `Line ${originalLineNum}: matched '${name}' to developer by name — verify attribution`,
+                );
+            }
+
             // One-time charges are recorded in the ledger but do not open a
             // recurring subscription.
             if (chargeType === 'one_time') {
                 result.skipped++;
                 continue;
+            }
+
+            // A recurring charge with no resolvable cost opens a seat that
+            // contributes $0 to cost-over-time — flag it rather than let it slip
+            // in silently.
+            if (monthlyCost === null) {
+                result.warnings.push(
+                    `Line ${originalLineNum}: recurring ${tool} charge has no resolvable cost ` +
+                        '(no amount/monthly_cost/default) — subscription created with no cost',
+                );
             }
 
             try {
@@ -463,6 +492,18 @@ export function importCsv(
             }
         }
     })();
+
+    // Without a period column the dedup key collapses to developer+tool+amount, so
+    // a re-import of unchanged rows looks identical to the first import and every
+    // row is reported as a duplicate. This is safe (the subscription upsert is
+    // idempotent) but surprising — explain it, but only when it actually bit.
+    if (result.duplicates > 0 && fieldIndex.period === undefined) {
+        result.warnings.push(
+            `Profile '${profile.name}' has no period column, so re-imported rows can't be ` +
+                'distinguished from new monthly charges and are treated as duplicates. ' +
+                'Map a period/date column to track recurring charges by month.',
+        );
+    }
 
     return result;
 }

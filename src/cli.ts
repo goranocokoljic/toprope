@@ -17,7 +17,7 @@ import {CursorSync} from './connectors/cursor/sync';
 import {GitSync} from './connectors/git/sync';
 import {runPipeline} from './scheduler/sync-pipeline';
 import {importCsv} from './expenses/importer';
-import {listUnmatchedCharges, resolveCharge} from './expenses/resolution-queue';
+import {listUnmatchedCharges, resolveCharge, findUnmatchedIdByPrefix} from './expenses/resolution-queue';
 import {
     listSubscriptions,
     getDeveloperCostSummaries,
@@ -798,19 +798,16 @@ expensesCommand
         let failed = false;
         try {
             runMigrations(db, MIGRATIONS_DIR);
-            // Support the 8-char short id shown by `expenses unmatched`.
+            // Support the 8-char short id shown by `expenses unmatched`. A full
+            // 36-char id is used directly; anything shorter is treated as a prefix.
             let fullId = chargeId;
             if (chargeId.length < 36) {
-                const row = db
-                    .prepare(
-                        `SELECT id FROM expense_charges WHERE id LIKE ? AND match_status = 'unmatched' AND resolved_at IS NULL LIMIT 1`,
-                    )
-                    .get(`${chargeId}%`) as {id: string} | undefined;
-                if (!row) {
+                const resolved = findUnmatchedIdByPrefix(db, chargeId);
+                if (!resolved) {
                     console.error(`No unmatched charge found matching id: ${chargeId}`);
                     failed = true;
                 } else {
-                    fullId = row.id;
+                    fullId = resolved;
                 }
             }
             if (!failed) {
@@ -821,6 +818,11 @@ expensesCommand
                             ? ` Subscription for ${res.charge.tool} created/updated.`
                             : ' (one-time charge — recorded, no subscription created.)'),
                 );
+                if (res.subscriptionCreated && res.charge.monthly_cost === null) {
+                    console.warn(
+                        '  ⚠  This charge has no resolvable cost — the subscription was created with no monthly cost.',
+                    );
+                }
             }
         } catch (err) {
             console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);

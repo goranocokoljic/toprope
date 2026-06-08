@@ -12,7 +12,6 @@ import {
     resolveCharge,
     getChargeById,
 } from '../../src/expenses/resolution-queue';
-import type {ExpensesConfig} from '../../src/config/types';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../src/storage/migrations');
 const FIXTURES_DIR = path.resolve(__dirname, '../fixtures/expenses');
@@ -157,13 +156,30 @@ describe('importCsv — duplicate detection', () => {
     });
 
     it('dedups matching charges across imports while accepting genuinely new ones', () => {
-        const config: ExpensesConfig = {subscription_defaults: {}};
-        importCsv(db, path.join(FIXTURES_DIR, 'standard.csv'), config);
-        const result = importCsv(db, path.join(FIXTURES_DIR, 'name-variant.csv'), config);
-        // name-variant: "Alice Smith" copilot business 19 → same dev+tool+amount as
-        // standard.csv → duplicate; "Jane Doe" windsurf 20 → genuinely new charge.
-        expect(result.duplicates).toBe(1);
-        expect(result.imported).toBe(1);
+        // First import: alice has copilot business 19 (standard.csv).
+        importCsv(db, path.join(FIXTURES_DIR, 'standard.csv'), {subscription_defaults: {}});
+        // Re-import the same alice/copilot/19 charge (duplicate) plus a new one.
+        const result = importCsvInline(
+            db,
+            'developer_email,tool,plan,monthly_cost,billing_model\n' +
+                'alice@example.com,copilot,business,19,company_managed\n' +
+                'alice@example.com,windsurf,pro,20,company_managed\n',
+        );
+        expect(result.duplicates).toBe(1); // copilot 19 already imported
+        expect(result.imported).toBe(1); // windsurf 20 is new
+    });
+
+    it('does not warn about duplicates when there is nothing duplicated', () => {
+        const result = importCsv(db, path.join(FIXTURES_DIR, 'standard.csv'), {});
+        expect(result.duplicates).toBe(0);
+        expect(result.warnings.some((w) => w.includes('no period column'))).toBe(false);
+    });
+
+    it('explains the no-period duplicate behavior on a re-import', () => {
+        importCsv(db, path.join(FIXTURES_DIR, 'standard.csv'), {});
+        const second = importCsv(db, path.join(FIXTURES_DIR, 'standard.csv'), {});
+        expect(second.duplicates).toBe(4);
+        expect(second.warnings.some((w) => w.includes('no period column'))).toBe(true);
     });
 });
 

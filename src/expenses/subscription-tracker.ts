@@ -182,13 +182,14 @@ function recordPlanChangeEvent(
  * transition, so it is applied in place rather than spawning a revoke+create
  * (and is never recorded as a plan-change event, to keep the ROI signal clean).
  *
- * The monthly_cost comparison is exact (`!==`). This is safe for the only
- * caller that flows real data — the expense importer parses costs with
- * parseFloat over identical CSV strings on re-import, so an unchanged row
- * yields a bit-identical float and does not trip a spurious transition. If a
- * future caller feeds a *computed* rate (e.g. proration), switch to an epsilon
- * compare here so floating-point noise (19.99 vs 19.990000001) isn't read as a
- * downgrade-then-upgrade.
+ * The monthly_cost comparison is exact (`!==`). This stays correct for the
+ * expense importer even though it now feeds a *computed* rate for annual charges
+ * (amount / 12): the division is deterministic, so re-importing the same annual
+ * row yields a bit-identical float and does not trip a spurious transition. The
+ * exact compare would only become unsafe for a caller that feeds a rate derived
+ * from *varying* inputs (e.g. true proration over different day counts) where
+ * 19.99 vs 19.990000001 could appear — switch to an epsilon compare here if such
+ * a caller is added.
  */
 function isMaterialChange(existing: Subscription, data: UpsertData): boolean {
     return existing.plan !== data.plan || existing.monthly_cost !== data.monthly_cost;

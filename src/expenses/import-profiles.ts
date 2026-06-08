@@ -1,4 +1,4 @@
-import type {ColumnMappingConfig, ExpensesConfig, ImportProfileConfig} from '../config/types';
+import type {ColumnMappingConfig, ExpensesConfig} from '../config/types';
 
 // A fully-resolved import profile the importer works against. Unlike the config
 // shape, column_mapping is always present (possibly empty) and the profile has a
@@ -21,20 +21,13 @@ export type ChargeType = 'recurring_monthly' | 'recurring_annual' | 'one_time';
 //   default to `reimbursed` when the row carries no explicit billing model.
 // - concur: a typical SAP Concur export. Also a reimbursement system.
 export const BUILTIN_PROFILES: Record<string, ImportProfile> = {
+    // The canonical GovProxy format: every column already uses the standard field
+    // name, so an empty mapping is correct — buildFieldIndex falls back to the
+    // field's own name when it isn't remapped. The legacy top-level
+    // `expenses.column_mapping` is layered over this in resolveProfile.
     standard: {
         name: 'standard',
-        column_mapping: {
-            developer_email: 'developer_email',
-            developer_name: 'developer_name',
-            tool: 'tool',
-            plan: 'plan',
-            monthly_cost: 'monthly_cost',
-            amount: 'amount',
-            billing_model: 'billing_model',
-            frequency: 'frequency',
-            period: 'period',
-            currency: 'currency',
-        },
+        column_mapping: {},
     },
     expensify: {
         name: 'expensify',
@@ -44,7 +37,6 @@ export const BUILTIN_PROFILES: Record<string, ImportProfile> = {
             tool: 'merchant',
             plan: 'category',
             amount: 'amount',
-            currency: 'currency',
             frequency: 'frequency',
             period: 'date',
         },
@@ -58,7 +50,6 @@ export const BUILTIN_PROFILES: Record<string, ImportProfile> = {
             tool: 'vendor',
             plan: 'expense type',
             amount: 'approved amount',
-            currency: 'currency',
             frequency: 'frequency',
             period: 'transaction date',
         },
@@ -97,7 +88,9 @@ export function resolveProfile(name: string, config: ExpensesConfig): ImportProf
     }
 
     if (configured) {
-        columnMapping = mergeMapping(columnMapping, configured);
+        if (configured.column_mapping) {
+            columnMapping = {...columnMapping, ...configured.column_mapping};
+        }
         if (configured.default_billing_model !== undefined) {
             defaultBillingModel = configured.default_billing_model;
         }
@@ -107,11 +100,6 @@ export function resolveProfile(name: string, config: ExpensesConfig): ImportProf
     }
 
     return {name: key, column_mapping: columnMapping, default_billing_model: defaultBillingModel, default_frequency: defaultFrequency};
-}
-
-function mergeMapping(base: ColumnMappingConfig, configured: ImportProfileConfig): ColumnMappingConfig {
-    if (!configured.column_mapping) return base;
-    return {...base, ...configured.column_mapping};
 }
 
 /** All profile names known for the given config (built-ins + configured), deduped. */
