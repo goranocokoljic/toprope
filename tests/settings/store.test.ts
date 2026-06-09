@@ -7,6 +7,7 @@ import {
     getRoiConfigForTeam,
     getTeamOverrides,
     getUserPreferences,
+    isGovernedFlagOn,
     isLeaderboardEnabledForTeam,
     isTeamOverrideAllowed,
     clearOverridesGovernedBy,
@@ -66,6 +67,7 @@ describe('settings store', () => {
                     'survey_anomaly_auto',
                     'survey_managers_can_override',
                     'anomaly_alerts_enabled',
+                    'anomaly_alert_min_severity',
                     'anomaly_managers_can_override',
                 ].sort(),
             );
@@ -112,6 +114,12 @@ describe('settings store', () => {
             setTeamSetting(db, 'frontend', 'roi_threshold', 9);
             expect(resolveSetting(db, 'roi_threshold')).toBe(3.0);
             expect(resolveSetting(db, 'roi_threshold', null)).toBe(3.0);
+        });
+
+        it('isGovernedFlagOn reads a managers_can_* flag directly', () => {
+            expect(isGovernedFlagOn(db, 'anomaly_managers_can_override')).toBe(false);
+            setGlobalSetting(db, 'anomaly_managers_can_override', true);
+            expect(isGovernedFlagOn(db, 'anomaly_managers_can_override')).toBe(true);
         });
 
         it('isTeamOverrideAllowed reflects the governing flag', () => {
@@ -179,6 +187,36 @@ describe('settings store', () => {
             expect(getRoiConfigForTeam(db, 'frontend')).toEqual({threshold: 2, settlingDays: 14});
             // Org-wide (no team) uses globals/defaults.
             expect(getRoiConfigForTeam(db)).toEqual({threshold: 2, settlingDays: 30});
+        });
+    });
+
+    // Task 4.12: the enum-typed setting (string value from a closed set) shares
+    // the same persistence + governed-override resolution as the scalar keys.
+    describe('enum setting (anomaly_alert_min_severity)', () => {
+        it('defaults to notable and persists a valid value', () => {
+            expect(getGlobalSetting(db, 'anomaly_alert_min_severity')).toBe('notable');
+            setGlobalSetting(db, 'anomaly_alert_min_severity', 'high');
+            expect(getGlobalSetting(db, 'anomaly_alert_min_severity')).toBe('high');
+        });
+
+        it('team override honored only when anomaly_managers_can_override is on', () => {
+            setGlobalSetting(db, 'anomaly_alert_min_severity', 'notable');
+            setTeamSetting(db, 'frontend', 'anomaly_alert_min_severity', 'high');
+
+            // Flag off → the stored override is inert, global value wins.
+            expect(resolveSetting(db, 'anomaly_alert_min_severity', 'frontend')).toBe('notable');
+
+            // Flag on → override honored.
+            setGlobalSetting(db, 'anomaly_managers_can_override', true);
+            expect(resolveSetting(db, 'anomaly_alert_min_severity', 'frontend')).toBe('high');
+        });
+
+        it('a stored value outside the allowed set falls back to the default on read', () => {
+            // Hand-write an invalid value straight into the table (bypassing coercion).
+            db.prepare(
+                "INSERT INTO settings (scope, scope_name, key, value, updated_at) VALUES ('global','','anomaly_alert_min_severity',?, ?)",
+            ).run(JSON.stringify('catastrophic'), '2026-01-01T00:00:00.000Z');
+            expect(getGlobalSetting(db, 'anomaly_alert_min_severity')).toBe('notable');
         });
     });
 

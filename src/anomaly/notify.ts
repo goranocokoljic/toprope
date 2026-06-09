@@ -7,9 +7,12 @@
  * scan: a re-scan of the same week re-detects the same anomalies but they are
  * already stamped notified, so nothing re-fires.
  *
- * Three gates decide whether an anomaly actually sends:
- *   1. Severity — only notable/high reach here (the store query filters info out),
- *      so low-severity noise never pings a manager.
+ * Four gates decide whether an anomaly actually sends:
+ *   1. Severity floor — only notable/high reach here (the store query filters info
+ *      out), and the per-team `anomaly_alert_min_severity` setting (Task 4.12) can
+ *      raise the floor to `high`, suppressing notable alerts for teams that only
+ *      want the most severe. A suppressed anomaly is left UNNOTIFIED, so lowering
+ *      the floor later announces the still-open ones.
  *   2. Settings — the per-team `anomaly_alerts_enabled` (global default + team
  *      override) must be on. A team with alerts off is skipped and left
  *      UNNOTIFIED, so flipping the setting on later announces the still-open ones.
@@ -48,6 +51,8 @@ export interface AnomalyNotifyResult {
     notified: number;
     /** Skipped because the team's anomaly_alerts_enabled setting is off. */
     skippedSettings: number;
+    /** Skipped because below the team's anomaly_alert_min_severity floor. */
+    skippedSeverity: number;
     /** Skipped because no channel/client could deliver (left for retry). */
     skippedUndeliverable: number;
 }
@@ -71,12 +76,23 @@ export async function notifyNewAnomalies(deps: AnomalyNotifyDeps): Promise<Anoma
         candidates: candidates.length,
         notified: 0,
         skippedSettings: 0,
+        skippedSeverity: 0,
         skippedUndeliverable: 0,
     };
 
     const deliverable = Boolean(deps.slackClient) && deps.channels.length > 0;
 
     for (const anomaly of candidates) {
+        // Gate 1: the team's severity floor. `high` suppresses notable anomalies;
+        // `notable` (default) lets both through. Suppressed anomalies stay
+        // UNNOTIFIED so lowering the floor later still announces them.
+        if (
+            resolveSetting(deps.db, 'anomaly_alert_min_severity', anomaly.scope_id) === 'high' &&
+            anomaly.severity !== 'high'
+        ) {
+            result.skippedSeverity += 1;
+            continue;
+        }
         // Gate 2: the team's effective alert setting (global default + override).
         if (resolveSetting(deps.db, 'anomaly_alerts_enabled', anomaly.scope_id) !== true) {
             result.skippedSettings += 1;

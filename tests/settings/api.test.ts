@@ -295,4 +295,205 @@ describe('settings API', () => {
             expect(adminPrefs.json().data.dark_mode).toBe(false);
         });
     });
+
+    // Task 4.12: the enum setting flows through the same flat global/team routes.
+    describe('enum setting (anomaly_alert_min_severity)', () => {
+        it('admin can patch the enum and it persists; bad value is rejected', async () => {
+            const ok = await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/global',
+                headers: authHeaders(adminToken),
+                payload: {anomaly_alert_min_severity: 'high'},
+            });
+            expect(ok.statusCode).toBe(200);
+            expect(ok.json().data.anomaly_alert_min_severity).toBe('high');
+
+            const bad = await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/global',
+                headers: authHeaders(adminToken),
+                payload: {anomaly_alert_min_severity: 'catastrophic'},
+            });
+            expect(bad.statusCode).toBe(400);
+        });
+    });
+
+    // Task 4.12: the structured anomaly config gets its own admin-gated routes.
+    describe('anomaly detection config API', () => {
+        it('admin reads the effective global config; non-admin is forbidden', async () => {
+            const res = await app.inject({
+                method: 'GET',
+                url: '/api/settings/anomaly',
+                headers: authHeaders(adminToken),
+            });
+            expect(res.statusCode).toBe(200);
+            expect(res.json().data.engine).toEqual({minBaselinePeriods: 4, statisticalHighZ: 2.5});
+            expect(res.json().data.metrics.length).toBeGreaterThan(0);
+
+            const dev = await app.inject({
+                method: 'GET',
+                url: '/api/settings/anomaly',
+                headers: authHeaders(devToken),
+            });
+            expect(dev.statusCode).toBe(403);
+        });
+
+        it('admin patches global metric config + engine params; persists', async () => {
+            const res = await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/anomaly',
+                headers: authHeaders(adminToken),
+                payload: {metrics: {commits: {threshold: 3.5}}, engine: {minBaselinePeriods: 6}},
+            });
+            expect(res.statusCode).toBe(200);
+            const commits = res.json().data.metrics.find((m: {metric: string}) => m.metric === 'commits');
+            expect(commits.config.threshold).toBe(3.5);
+            expect(res.json().data.engine.minBaselinePeriods).toBe(6);
+
+            const reread = await app.inject({
+                method: 'GET',
+                url: '/api/settings/anomaly',
+                headers: authHeaders(adminToken),
+            });
+            const c2 = reread.json().data.metrics.find((m: {metric: string}) => m.metric === 'commits');
+            expect(c2.config.threshold).toBe(3.5);
+        });
+
+        it('rejects an unknown metric, unknown field, and out-of-range value', async () => {
+            const unknownMetric = await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/anomaly',
+                headers: authHeaders(adminToken),
+                payload: {metrics: {nope: {threshold: 3}}},
+            });
+            expect(unknownMetric.statusCode).toBe(400);
+
+            const unknownField = await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/anomaly',
+                headers: authHeaders(adminToken),
+                payload: {metrics: {commits: {bogus: 1}}},
+            });
+            expect(unknownField.statusCode).toBe(400);
+
+            const badThreshold = await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/anomaly',
+                headers: authHeaders(adminToken),
+                payload: {metrics: {commits: {threshold: 0}}},
+            });
+            expect(badThreshold.statusCode).toBe(400);
+        });
+
+        it('per-team anomaly PATCH is gated by anomaly_managers_can_override', async () => {
+            // Flag off → 403.
+            const blocked = await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/anomaly/team/frontend',
+                headers: authHeaders(adminToken),
+                payload: {metrics: {commits: {threshold: 9}}},
+            });
+            expect(blocked.statusCode).toBe(403);
+            expect(blocked.json().message).toMatch(/anomaly_managers_can_override/);
+
+            // Enable the flag, then the override is accepted and resolves for the team.
+            await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/global',
+                headers: authHeaders(adminToken),
+                payload: {anomaly_managers_can_override: true},
+            });
+            const ok = await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/anomaly/team/frontend',
+                headers: authHeaders(adminToken),
+                payload: {metrics: {commits: {threshold: 9}}},
+            });
+            expect(ok.statusCode).toBe(200);
+            const commits = ok.json().data.metrics.find((m: {metric: string}) => m.metric === 'commits');
+            expect(commits.config.threshold).toBe(9);
+            expect(ok.json().data.overridable).toBe(true);
+        });
+
+        it('404 for an unknown team', async () => {
+            await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/global',
+                headers: authHeaders(adminToken),
+                payload: {anomaly_managers_can_override: true},
+            });
+            const res = await app.inject({
+                method: 'GET',
+                url: '/api/settings/anomaly/team/ghost-team',
+                headers: authHeaders(adminToken),
+            });
+            expect(res.statusCode).toBe(404);
+        });
+
+        it('team GET surfaces raw stored overrides distinct from resolved values', async () => {
+            await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/global',
+                headers: authHeaders(adminToken),
+                payload: {anomaly_managers_can_override: true},
+            });
+            await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/anomaly/team/frontend',
+                headers: authHeaders(adminToken),
+                payload: {metrics: {commits: {threshold: 9}}},
+            });
+            const res = await app.inject({
+                method: 'GET',
+                url: '/api/settings/anomaly/team/frontend',
+                headers: authHeaders(adminToken),
+            });
+            expect(res.statusCode).toBe(200);
+            // Raw override shows only what the team set; resolved shows the effective value.
+            expect(res.json().data.overrides.metrics.commits).toEqual({threshold: 9});
+            const commits = res.json().data.metrics.find((m: {metric: string}) => m.metric === 'commits');
+            expect(commits.config.threshold).toBe(9);
+        });
+
+        it('disabling anomaly_managers_can_override discards structured team overrides (no resurrection)', async () => {
+            // Enable, write a team override, confirm it resolves.
+            await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/global',
+                headers: authHeaders(adminToken),
+                payload: {anomaly_managers_can_override: true},
+            });
+            await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/anomaly/team/frontend',
+                headers: authHeaders(adminToken),
+                payload: {metrics: {commits: {threshold: 9}}, engine: {minBaselinePeriods: 10}},
+            });
+
+            // Admin turns the flag off → the structured team rows are discarded.
+            await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/global',
+                headers: authHeaders(adminToken),
+                payload: {anomaly_managers_can_override: false},
+            });
+
+            // Re-enable: resolution falls back to defaults, the old override is gone.
+            await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/global',
+                headers: authHeaders(adminToken),
+                payload: {anomaly_managers_can_override: true},
+            });
+            const res = await app.inject({
+                method: 'GET',
+                url: '/api/settings/anomaly/team/frontend',
+                headers: authHeaders(adminToken),
+            });
+            const commits = res.json().data.metrics.find((m: {metric: string}) => m.metric === 'commits');
+            expect(commits.config.threshold).toBe(2.0);
+            expect(res.json().data.engine.minBaselinePeriods).toBe(4);
+            expect(res.json().data.overrides).toEqual({metrics: {}, engine: {}});
+        });
+    });
 });

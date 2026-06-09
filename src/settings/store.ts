@@ -115,6 +115,17 @@ export function getTeamOverrides(db: Database.Database, team: string): Record<st
 }
 
 /**
+ * Whether a managers_can_* governing flag is currently on. The single place the
+ * "is this override-governing flag enabled" check lives, so both the registry
+ * path (isTeamOverrideAllowed, below) and structured config outside the registry
+ * (the anomaly per-metric/engine overrides in src/anomaly/config.ts) resolve it
+ * the same way instead of each re-deriving `getGlobalSetting(...) === true`.
+ */
+export function isGovernedFlagOn(db: Database.Database, flagKey: string): boolean {
+    return getGlobalSetting(db, flagKey) === true;
+}
+
+/**
  * Whether a per-team override of `key` is currently permitted: the key must be
  * team-overridable and, if it has a governing flag, that global flag must be on.
  */
@@ -126,7 +137,7 @@ export function isTeamOverrideAllowed(db: Database.Database, key: string): boole
     if (!def.overrideGovernedBy) {
         return true;
     }
-    return getGlobalSetting(db, def.overrideGovernedBy) === true;
+    return isGovernedFlagOn(db, def.overrideGovernedBy);
 }
 
 /**

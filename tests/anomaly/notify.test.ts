@@ -142,4 +142,55 @@ describe('notifyNewAnomalies', () => {
         expect(result.skippedUndeliverable).toBe(1);
         expect(listAnomalies(db)[0].notified_at).toBeNull();
     });
+
+    // Task 4.12: anomaly_alert_min_severity raises the floor. 'high' suppresses
+    // notable anomalies (left unnotified), while 'notable' lets both through.
+    describe('anomaly_alert_min_severity floor', () => {
+        it("'high' suppresses notable but still posts high", async () => {
+            setGlobalSetting(db, 'anomaly_alerts_enabled', true);
+            setGlobalSetting(db, 'anomaly_alert_min_severity', 'high');
+            upsertAnomaly(db, teamAnomaly({metric: 'commits', severity: 'high'}));
+            upsertAnomaly(db, teamAnomaly({metric: 'cost', severity: 'notable', method: 'percentage_change'}));
+
+            const {client, posts} = fakeSlack();
+            const result = await notifyNewAnomalies({db, slackClient: client, channels: ['C1']});
+
+            expect(result.notified).toBe(1);
+            expect(result.skippedSeverity).toBe(1);
+            expect(posts).toHaveLength(1);
+            // The suppressed notable one stays unnotified so lowering the floor
+            // later still announces it.
+            const notable = listAnomalies(db).find((a) => a.severity === 'notable');
+            expect(notable?.notified_at).toBeNull();
+        });
+
+        it("default 'notable' posts both notable and high", async () => {
+            setGlobalSetting(db, 'anomaly_alerts_enabled', true);
+            upsertAnomaly(db, teamAnomaly({metric: 'commits', severity: 'high'}));
+            upsertAnomaly(db, teamAnomaly({metric: 'cost', severity: 'notable', method: 'percentage_change'}));
+
+            const {client, posts} = fakeSlack();
+            const result = await notifyNewAnomalies({db, slackClient: client, channels: ['C1']});
+
+            expect(result.notified).toBe(2);
+            expect(result.skippedSeverity).toBe(0);
+            expect(posts).toHaveLength(2);
+        });
+
+        it('honors a per-team severity floor when the override flag is on', async () => {
+            setGlobalSetting(db, 'anomaly_alerts_enabled', true);
+            setGlobalSetting(db, 'anomaly_managers_can_override', true);
+            // Team raises its own floor to high; a notable anomaly is suppressed.
+            db.prepare(
+                "INSERT INTO settings (scope, scope_name, key, value, updated_at) VALUES ('team','frontend','anomaly_alert_min_severity',?, '2026-01-01T00:00:00.000Z')",
+            ).run(JSON.stringify('high'));
+            upsertAnomaly(db, teamAnomaly({metric: 'cost', severity: 'notable', method: 'percentage_change'}));
+
+            const {client, posts} = fakeSlack();
+            const result = await notifyNewAnomalies({db, slackClient: client, channels: ['C1']});
+
+            expect(result.skippedSeverity).toBe(1);
+            expect(posts).toHaveLength(0);
+        });
+    });
 });

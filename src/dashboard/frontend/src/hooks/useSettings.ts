@@ -7,7 +7,7 @@ import {
 } from '@tanstack/react-query';
 import {api} from '../api/client';
 import {queryKeys} from '../api/queryKeys';
-import type {GlobalSettings, TeamSettings} from '../api/types';
+import type {AnomalyConfig, AnomalyConfigPatch, GlobalSettings, TeamSettings} from '../api/types';
 
 export function useGlobalSettings(): UseQueryResult<GlobalSettings, Error> {
     return useQuery({
@@ -56,6 +56,23 @@ export function useUpdateTeamSettings(
         mutationFn: (patch: Partial<GlobalSettings>) => api.patchTeamSettings(team, patch),
         onSuccess: (data) => {
             queryClient.setQueryData(queryKeys.teamSettings(team), data);
+        },
+    });
+}
+
+export function useAnomalyConfig(): UseQueryResult<AnomalyConfig, Error> {
+    return useQuery({
+        queryKey: queryKeys.anomalyConfig,
+        queryFn: api.getAnomalyConfig,
+    });
+}
+
+export function useUpdateAnomalyConfig(): UseMutationResult<AnomalyConfig, Error, AnomalyConfigPatch> {
+    const queryClient = useQueryClient();
+    return useMutation({
+        mutationFn: (patch: AnomalyConfigPatch) => api.patchAnomalyConfig(patch),
+        onSuccess: (data) => {
+            queryClient.setQueryData(queryKeys.anomalyConfig, data);
         },
     });
 }

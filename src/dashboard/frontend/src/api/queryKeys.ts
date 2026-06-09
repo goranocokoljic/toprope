@@ -34,6 +34,8 @@ export const queryKeys = {
     teamCompareTable: (period: string) => ['teams', 'compare-table', period] as const,
     globalSettings: ['settings', 'global'] as const,
     teamSettings: (team: string) => ['settings', 'team', team] as const,
+    // Structured anomaly detection config (Task 4.12): per-metric + engine knobs.
+    anomalyConfig: ['settings', 'anomaly'] as const,
     // Optional leaderboard (Task 2.17): availability probe + per-team ranked view.
     leaderboardAvailability: ['leaderboard', 'availability'] as const,
     leaderboard: (team: string, metric: string) => ['leaderboard', team, metric] as const,
