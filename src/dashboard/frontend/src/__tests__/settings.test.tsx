@@ -8,7 +8,7 @@ import {MemoryRouter} from 'react-router-dom';
 import {Preferences} from '../pages/Preferences';
 import {Settings} from '../pages/Settings';
 import {ThemeProvider} from '../theme/ThemeProvider';
-import type {GlobalSettings, TeamSettings, UserPreferences} from '../api/types';
+import type {AnomalyConfig, GlobalSettings, TeamSettings, UserPreferences} from '../api/types';
 
 const DEFAULT_PREFS: UserPreferences = {default_time_range: '30d', dark_mode: false};
 
@@ -18,6 +18,27 @@ const DEFAULT_GLOBAL: GlobalSettings = {
     roi_threshold: 3.0,
     roi_settling_days: 30,
     roi_managers_can_override: false,
+    survey_usage_drop_auto: false,
+    survey_unused_new_seat_auto: false,
+    survey_plan_change_auto: false,
+    survey_anomaly_auto: false,
+    survey_managers_can_override: false,
+    anomaly_alerts_enabled: false,
+    anomaly_alert_min_severity: 'notable',
+    anomaly_managers_can_override: false,
+};
+
+// Minimal effective anomaly config for the AnomalyDetectionPanel fetch.
+const DEFAULT_ANOMALY: AnomalyConfig = {
+    metrics: [
+        {
+            metric: 'commits',
+            scopes: ['developer', 'team'],
+            basis: 'git_estimate',
+            config: {method: 'statistical', threshold: 2, baselineWindow: 8},
+        },
+    ],
+    engine: {minBaselinePeriods: 4, statisticalHighZ: 2.5},
 };
 
 let prefs: UserPreferences;
@@ -43,6 +64,12 @@ function teamSettings(): TeamSettings {
             roi_threshold: global.roi_managers_can_override,
             roi_settling_days: global.roi_managers_can_override,
             roi_managers_can_override: false,
+            survey_usage_drop_auto: global.survey_managers_can_override,
+            survey_unused_new_seat_auto: global.survey_managers_can_override,
+            survey_plan_change_auto: global.survey_managers_can_override,
+            survey_anomaly_auto: global.survey_managers_can_override,
+            anomaly_alerts_enabled: global.anomaly_managers_can_override,
+            anomaly_alert_min_severity: global.anomaly_managers_can_override,
         },
     };
 }
@@ -60,6 +87,9 @@ beforeEach(() => {
                 prefs = {...prefs, ...(bodyObj as Partial<UserPreferences>)};
             }
             return json({data: prefs});
+        }
+        if (u.includes('/api/settings/anomaly')) {
+            return json({data: DEFAULT_ANOMALY});
         }
         if (u.includes('/api/settings/global')) {
             if (method === 'PATCH') {
@@ -182,7 +212,7 @@ describe('Settings page', () => {
 
     it('disables a team override row when the governing flag is off', async () => {
         renderSettings();
-        const select = await screen.findByRole('combobox');
+        const select = await screen.findByRole('combobox', {name: 'Team'});
         // The team options arrive asynchronously; wait before selecting so the
         // value actually takes (a select rejects values with no matching option).
         await screen.findByRole('option', {name: 'frontend'});
@@ -197,7 +227,7 @@ describe('Settings page', () => {
         // Enable the governing flag so the roi_threshold row is editable.
         global = {...DEFAULT_GLOBAL, roi_managers_can_override: true};
         renderSettings();
-        const select = await screen.findByRole('combobox');
+        const select = await screen.findByRole('combobox', {name: 'Team'});
         await screen.findByRole('option', {name: 'frontend'});
         fireEvent.change(select, {target: {value: 'frontend'}});
 

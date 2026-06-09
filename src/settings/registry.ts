@@ -9,9 +9,9 @@
  * model and type coercion stay consistent in one place.
  */
 
-export type SettingType = 'boolean' | 'number';
+export type SettingType = 'boolean' | 'number' | 'enum';
 
-export type SettingValue = boolean | number;
+export type SettingValue = boolean | number | string;
 
 export interface SettingDef {
     key: string;
@@ -32,6 +32,8 @@ export interface SettingDef {
     max?: number;
     /** Require a whole number (e.g. a day count) for numeric settings. */
     integer?: boolean;
+    /** Closed set of allowed values for `enum` settings (string-valued). */
+    allowed?: readonly string[];
 }
 
 export const GLOBAL_SETTINGS: Record<string, SettingDef> = {
@@ -123,6 +125,19 @@ export const GLOBAL_SETTINGS: Record<string, SettingDef> = {
         teamOverridable: true,
         overrideGovernedBy: 'anomaly_managers_can_override',
     },
+    // Minimum severity that triggers a Slack anomaly alert (Task 4.12 / #107).
+    // `notable` (the default) alerts on both notable and high anomalies; `high`
+    // suppresses notable ones so only the most severe page a manager. Resolved
+    // per team alongside anomaly_alerts_enabled and gated by the same
+    // anomaly_managers_can_override flag.
+    anomaly_alert_min_severity: {
+        key: 'anomaly_alert_min_severity',
+        type: 'enum',
+        default: 'notable',
+        allowed: ['notable', 'high'],
+        teamOverridable: true,
+        overrideGovernedBy: 'anomaly_managers_can_override',
+    },
     anomaly_managers_can_override: {
         key: 'anomaly_managers_can_override',
         type: 'boolean',
@@ -184,6 +199,15 @@ export function coerceSettingValue(def: SettingDef, raw: unknown): CoercionResul
     if (def.type === 'boolean') {
         if (typeof raw !== 'boolean') {
             return {ok: false, error: `${def.key} must be a boolean`};
+        }
+        return {ok: true, value: raw};
+    }
+    if (def.type === 'enum') {
+        if (typeof raw !== 'string') {
+            return {ok: false, error: `${def.key} must be a string`};
+        }
+        if (def.allowed && !def.allowed.includes(raw)) {
+            return {ok: false, error: `${def.key} must be one of: ${def.allowed.join(', ')}`};
         }
         return {ok: true, value: raw};
     }

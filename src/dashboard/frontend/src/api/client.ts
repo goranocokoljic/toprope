@@ -7,6 +7,8 @@ import type {
     AdminUser,
     AdminUserWithTempPassword,
     AnomalyAlert,
+    AnomalyConfig,
+    AnomalyConfigPatch,
     AnomalyStatus,
     ApiEnvelope,
     AuthUser,
@@ -331,6 +333,17 @@ export const api = {
             `/api/settings/team/${encodeURIComponent(team)}`,
             patch,
         );
+        return body.data;
+    },
+
+    // --- Anomaly detection config (Task 4.12) ---
+    async getAnomalyConfig(): Promise<AnomalyConfig> {
+        const body = await request<ApiEnvelope<AnomalyConfig>>('/api/settings/anomaly');
+        return body.data;
+    },
+
+    async patchAnomalyConfig(patch: AnomalyConfigPatch): Promise<AnomalyConfig> {
+        const body = await patchJson<ApiEnvelope<AnomalyConfig>>('/api/settings/anomaly', patch);
         return body.data;
     },
 

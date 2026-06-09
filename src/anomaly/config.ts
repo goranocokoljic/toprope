@@ -19,12 +19,19 @@
  * We write/read these rows directly rather than through the settings *registry*
  * (src/settings/registry.ts), because that registry models flat scalar keys and
  * gates team overrides behind managers_can_* flags — both a poor fit for the
- * structured per-metric config here. The admin-gating of who may set these is a
- * Task 4.12 (Settings Extensions) concern; this module owns only the storage and
- * resolution. The same global→team precedence is reproduced here.
+ * structured per-metric config here. The same global→team precedence is
+ * reproduced here.
+ *
+ * Task 4.12 (Settings Extensions) wires the admin permission model in: a per-team
+ * override (metric config OR engine params) is honored only when the global
+ * `anomaly_managers_can_override` flag is on, mirroring the registry's
+ * managers_can_* gate. The flag lives in the settings registry; this module reads
+ * it via getGlobalSetting so the structured config and the flat keys share one
+ * source of truth for who may override.
  */
 
 import type Database from 'better-sqlite3';
+import {getGlobalSetting} from '../settings/store';
 import type {AnomalyBasis, AnomalyMetric, AnomalyScope} from './types';
 import type {EngineParams, MetricConfig} from './engine';
 
@@ -207,6 +214,19 @@ function metricOverrideFor(
     return coerceMetricOverride(map[metric]);
 }
 
+/**
+ * Whether per-team anomaly overrides (metric config + engine params) are
+ * currently permitted — the global `anomaly_managers_can_override` flag is on.
+ * This is the same gate the settings registry applies to its managers_can_*
+ * keys, reused here so the structured config honors one permission model. When
+ * off, a stored team row is ignored at resolution time (it cannot change the
+ * effective value), matching how the flat settings store treats a disallowed
+ * override.
+ */
+export function isTeamAnomalyOverrideAllowed(db: Database.Database): boolean {
+    return getGlobalSetting(db, 'anomaly_managers_can_override') === true;
+}
+
 // --- resolution (the public API the scan layer uses) --------------------------
 
 /**
@@ -222,7 +242,12 @@ export function resolveMetricConfig(
 ): MetricConfig {
     const base = METRIC_DEFS[metric].defaults;
     const globalOverride = metricOverrideFor(db, 'global', '', metric);
-    const teamOverride = team ? metricOverrideFor(db, 'team', team, metric) : {};
+    // A team override is honored only when the admin has enabled
+    // anomaly_managers_can_override; otherwise the team layer is dropped and
+    // resolution falls through to global ← default (a stored team row becomes
+    // inert rather than silently taking effect).
+    const teamOverride =
+        team && isTeamAnomalyOverrideAllowed(db) ? metricOverrideFor(db, 'team', team, metric) : {};
     return {...base, ...globalOverride, ...teamOverride};
 }
 
@@ -233,9 +258,12 @@ export function resolveMetricConfig(
  */
 export function resolveEngineParams(db: Database.Database, team?: string | null): EngineParams {
     const globalOverride = coerceEngineParamsOverride(readJsonRow(db, 'global', '', ENGINE_PARAMS_KEY));
-    const teamOverride = team
-        ? coerceEngineParamsOverride(readJsonRow(db, 'team', team, ENGINE_PARAMS_KEY))
-        : {};
+    // Gated identically to per-metric config: the team layer applies only when
+    // anomaly_managers_can_override is on.
+    const teamOverride =
+        team && isTeamAnomalyOverrideAllowed(db)
+            ? coerceEngineParamsOverride(readJsonRow(db, 'team', team, ENGINE_PARAMS_KEY))
+            : {};
     return {...DEFAULT_ENGINE_PARAMS, ...globalOverride, ...teamOverride};
 }
 
@@ -290,4 +318,135 @@ export function setGlobalEngineParams(db: Database.Database, partial: Partial<En
 /** Set (merge) a per-team engine params override. */
 export function setTeamEngineParams(db: Database.Database, team: string, partial: Partial<EngineParams>): void {
     setEngineParams(db, 'team', team, partial);
+}
+
+// --- strict validation for the settings API (Task 4.12 / #107) ----------------
+//
+// The coerceMetricOverride / coerceEngineParamsOverride helpers above silently
+// DROP bad fields, which is right for resolution (a hand-edited row degrades
+// gracefully). An API needs the opposite: reject an explicit bad value with a
+// clear message instead of swallowing it. These validators do that, returning a
+// Coerced<Partial<...>> the route turns into a 400. Unknown keys are rejected so
+// a typo can't be silently ignored.
+
+export type Validated<T> = {ok: true; value: T} | {ok: false; error: string};
+
+const METRIC_FIELDS = new Set(['method', 'threshold', 'baselineWindow', 'percentageBaseline']);
+
+/** Validate an untrusted per-metric config patch (all fields optional). */
+export function validateMetricConfigPatch(raw: unknown): Validated<Partial<MetricConfig>> {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        return {ok: false, error: 'metric config must be an object'};
+    }
+    const obj = raw as Record<string, unknown>;
+    const out: Partial<MetricConfig> = {};
+    for (const key of Object.keys(obj)) {
+        if (!METRIC_FIELDS.has(key)) {
+            return {ok: false, error: `unknown metric config field: ${key}`};
+        }
+    }
+    if ('method' in obj) {
+        if (obj.method !== 'statistical' && obj.method !== 'percentage_change') {
+            return {ok: false, error: "method must be 'statistical' or 'percentage_change'"};
+        }
+        out.method = obj.method;
+    }
+    if ('threshold' in obj) {
+        if (typeof obj.threshold !== 'number' || !Number.isFinite(obj.threshold) || obj.threshold <= 0) {
+            return {ok: false, error: 'threshold must be a number > 0'};
+        }
+        out.threshold = obj.threshold;
+    }
+    if ('baselineWindow' in obj) {
+        if (
+            typeof obj.baselineWindow !== 'number' ||
+            !Number.isInteger(obj.baselineWindow) ||
+            obj.baselineWindow < 2
+        ) {
+            return {ok: false, error: 'baselineWindow must be a whole number >= 2'};
+        }
+        out.baselineWindow = obj.baselineWindow;
+    }
+    if ('percentageBaseline' in obj) {
+        if (obj.percentageBaseline !== 'prior' && obj.percentageBaseline !== 'average') {
+            return {ok: false, error: "percentageBaseline must be 'prior' or 'average'"};
+        }
+        out.percentageBaseline = obj.percentageBaseline;
+    }
+    return {ok: true, value: out};
+}
+
+const ENGINE_FIELDS = new Set(['minBaselinePeriods', 'statisticalHighZ']);
+
+/** Validate an untrusted engine-params patch (all fields optional). */
+export function validateEngineParamsPatch(raw: unknown): Validated<Partial<EngineParams>> {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        return {ok: false, error: 'engine params must be an object'};
+    }
+    const obj = raw as Record<string, unknown>;
+    const out: Partial<EngineParams> = {};
+    for (const key of Object.keys(obj)) {
+        if (!ENGINE_FIELDS.has(key)) {
+            return {ok: false, error: `unknown engine param: ${key}`};
+        }
+    }
+    if ('minBaselinePeriods' in obj) {
+        if (
+            typeof obj.minBaselinePeriods !== 'number' ||
+            !Number.isInteger(obj.minBaselinePeriods) ||
+            obj.minBaselinePeriods < 1
+        ) {
+            return {ok: false, error: 'minBaselinePeriods must be a whole number >= 1'};
+        }
+        out.minBaselinePeriods = obj.minBaselinePeriods;
+    }
+    if ('statisticalHighZ' in obj) {
+        if (
+            typeof obj.statisticalHighZ !== 'number' ||
+            !Number.isFinite(obj.statisticalHighZ) ||
+            obj.statisticalHighZ <= 0
+        ) {
+            return {ok: false, error: 'statisticalHighZ must be a number > 0'};
+        }
+        out.statisticalHighZ = obj.statisticalHighZ;
+    }
+    return {ok: true, value: out};
+}
+
+// --- snapshot for the settings API --------------------------------------------
+
+export interface MetricConfigSnapshot {
+    metric: AnomalyMetric;
+    scopes: readonly AnomalyScope[];
+    basis: AnomalyBasis;
+    /** The effective config for this metric (resolution applied). */
+    config: MetricConfig;
+}
+
+export interface AnomalyConfigSnapshot {
+    metrics: MetricConfigSnapshot[];
+    engine: EngineParams;
+}
+
+/**
+ * The effective anomaly configuration the settings UI renders — every metric's
+ * resolved detection config plus the resolved engine params. With `team` set,
+ * resolution applies the per-team layer (gated by anomaly_managers_can_override);
+ * without it, the global picture. Metrics are returned in registry order.
+ */
+export function getAnomalyConfigSnapshot(db: Database.Database, team?: string | null): AnomalyConfigSnapshot {
+    return {
+        metrics: Object.values(METRIC_DEFS).map((def) => ({
+            metric: def.metric,
+            scopes: def.scopes,
+            basis: def.basis,
+            config: resolveMetricConfig(db, def.metric, team),
+        })),
+        engine: resolveEngineParams(db, team),
+    };
+}
+
+/** The closed set of metric keys, for API validation of a patch's metric map. */
+export function isAnomalyMetric(key: string): key is AnomalyMetric {
+    return Object.prototype.hasOwnProperty.call(METRIC_DEFS, key);
 }

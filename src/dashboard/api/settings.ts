@@ -1,6 +1,6 @@
 import type {FastifyInstance, FastifyReply, FastifyRequest} from 'fastify';
 import type Database from 'better-sqlite3';
-import {GLOBAL_SETTINGS, coercePreferenceValue, coerceSettingValue, getPreferenceDef, getSettingDef} from '../../settings/registry';
+import {GLOBAL_SETTINGS, coercePreferenceValue, coerceSettingValue, getPreferenceDef, getSettingDef, type SettingValue} from '../../settings/registry';
 import {
     clearOverridesGovernedBy,
     getAllGlobalSettings,
@@ -12,6 +12,20 @@ import {
     setTeamSetting,
     setUserPreference,
 } from '../../settings/store';
+import {
+    getAnomalyConfigSnapshot,
+    isAnomalyMetric,
+    isTeamAnomalyOverrideAllowed,
+    setGlobalEngineParams,
+    setGlobalMetricConfig,
+    setTeamEngineParams,
+    setTeamMetricConfig,
+    validateEngineParamsPatch,
+    validateMetricConfigPatch,
+    type Validated,
+} from '../../anomaly/config';
+import type {EngineParams, MetricConfig} from '../../anomaly/engine';
+import type {AnomalyMetric} from '../../anomaly/types';
 
 /**
  * Settings & preferences endpoints (Task 2.16 / #51).
@@ -54,6 +68,57 @@ function asPatchBody(body: unknown): Record<string, unknown> | null {
     return body as Record<string, unknown>;
 }
 
+interface AnomalyPatch {
+    metrics: {metric: AnomalyMetric; partial: Partial<MetricConfig>}[];
+    engine?: Partial<EngineParams>;
+}
+
+/**
+ * Validate an anomaly-config PATCH body of shape
+ * `{ metrics?: { <metric>: <partial> }, engine?: <partial> }`. Everything is
+ * validated before anything is written (all-or-nothing): an unknown metric key,
+ * an unrecognized field, or an out-of-range value rejects the whole request.
+ */
+function parseAnomalyPatch(body: unknown): Validated<AnomalyPatch> {
+    const obj = asPatchBody(body);
+    if (!obj) {
+        return {ok: false, error: 'Request body must be an object'};
+    }
+    for (const key of Object.keys(obj)) {
+        if (key !== 'metrics' && key !== 'engine') {
+            return {ok: false, error: `Unknown anomaly config field: ${key}`};
+        }
+    }
+    const out: AnomalyPatch = {metrics: []};
+
+    if ('metrics' in obj) {
+        const metrics = obj.metrics;
+        if (typeof metrics !== 'object' || metrics === null || Array.isArray(metrics)) {
+            return {ok: false, error: 'metrics must be an object of metric → config'};
+        }
+        for (const [metric, raw] of Object.entries(metrics as Record<string, unknown>)) {
+            if (!isAnomalyMetric(metric)) {
+                return {ok: false, error: `Unknown anomaly metric: ${metric}`};
+            }
+            const result = validateMetricConfigPatch(raw);
+            if (!result.ok) {
+                return {ok: false, error: `${metric}: ${result.error}`};
+            }
+            out.metrics.push({metric, partial: result.value});
+        }
+    }
+
+    if ('engine' in obj) {
+        const result = validateEngineParamsPatch(obj.engine);
+        if (!result.ok) {
+            return {ok: false, error: result.error};
+        }
+        out.engine = result.value;
+    }
+
+    return {ok: true, value: out};
+}
+
 export function registerSettingsRoutes(app: FastifyInstance, db: Database.Database): void {
     // --- Global settings (admin only) -------------------------------------
     app.get('/api/settings/global', async (request, reply) => {
@@ -73,7 +138,7 @@ export function registerSettingsRoutes(app: FastifyInstance, db: Database.Databa
         }
 
         // Validate everything before writing anything (atomic update).
-        const updates: {key: string; value: boolean | number}[] = [];
+        const updates: {key: string; value: SettingValue}[] = [];
         for (const [key, raw] of Object.entries(body)) {
             const def = getSettingDef(key);
             if (!def) {
@@ -153,7 +218,7 @@ export function registerSettingsRoutes(app: FastifyInstance, db: Database.Databa
             // write. If any key is unknown, non-overridable, governed by an
             // off flag, or invalid, the whole PATCH is rejected and nothing is
             // persisted — a partial multi-key update never happens.
-            const updates: {key: string; value: boolean | number}[] = [];
+            const updates: {key: string; value: SettingValue}[] = [];
             for (const [key, raw] of Object.entries(body)) {
                 const def = getSettingDef(key);
                 if (!def) {
@@ -189,6 +254,102 @@ export function registerSettingsRoutes(app: FastifyInstance, db: Database.Databa
                     team,
                     effective: resolveAllForTeam(db, team),
                     overrides: getTeamOverrides(db, team),
+                },
+            };
+        },
+    );
+
+    // --- Anomaly detection config (admin only) ----------------------------
+    //
+    // The per-metric detection config and global engine params are STRUCTURED
+    // (a per-metric map + a knobs object), so they don't fit the flat key/value
+    // settings table the routes above serve. They live in their own settings rows
+    // (src/anomaly/config.ts) and get their own GET/PATCH here. The permission
+    // model is the same: admin-only, and a per-team override is additionally gated
+    // by the global anomaly_managers_can_override flag.
+    app.get('/api/settings/anomaly', async (request, reply) => {
+        if (!isAdmin(request)) {
+            return forbidden(reply, 'Admin privileges required');
+        }
+        return {data: getAnomalyConfigSnapshot(db)};
+    });
+
+    app.patch<{Body: unknown}>('/api/settings/anomaly', async (request, reply) => {
+        if (!isAdmin(request)) {
+            return forbidden(reply, 'Admin privileges required');
+        }
+        const parsed = parseAnomalyPatch(request.body);
+        if (!parsed.ok) {
+            return badRequest(reply, parsed.error);
+        }
+        db.transaction(() => {
+            for (const {metric, partial} of parsed.value.metrics) {
+                setGlobalMetricConfig(db, metric, partial);
+            }
+            if (parsed.value.engine) {
+                setGlobalEngineParams(db, parsed.value.engine);
+            }
+        })();
+        return {data: getAnomalyConfigSnapshot(db)};
+    });
+
+    app.get<{Params: {team: string}}>('/api/settings/anomaly/team/:team', async (request, reply) => {
+        if (!isAdmin(request)) {
+            return forbidden(reply, 'Admin privileges required');
+        }
+        const {team} = request.params;
+        const exists = db.prepare('SELECT 1 FROM teams WHERE name = ?').get(team);
+        if (!exists) {
+            return reply.status(404).send({error: 'Not Found', message: `Team '${team}' not found`});
+        }
+        return {
+            data: {
+                team,
+                ...getAnomalyConfigSnapshot(db, team),
+                // Whether per-team anomaly overrides are currently permitted, so
+                // the UI can disable the controls when the flag is off.
+                overridable: isTeamAnomalyOverrideAllowed(db),
+            },
+        };
+    });
+
+    app.patch<{Params: {team: string}; Body: unknown}>(
+        '/api/settings/anomaly/team/:team',
+        async (request, reply) => {
+            if (!isAdmin(request)) {
+                return forbidden(reply, 'Admin privileges required');
+            }
+            const {team} = request.params;
+            const exists = db.prepare('SELECT 1 FROM teams WHERE name = ?').get(team);
+            if (!exists) {
+                return reply.status(404).send({error: 'Not Found', message: `Team '${team}' not found`});
+            }
+            // Per-team anomaly overrides require the admin-controlled flag, exactly
+            // like the flat managers_can_* gate above.
+            if (!isTeamAnomalyOverrideAllowed(db)) {
+                return forbidden(
+                    reply,
+                    "Per-team anomaly overrides are disabled. An admin must enable " +
+                        "'anomaly_managers_can_override' before teams can override anomaly config.",
+                );
+            }
+            const parsed = parseAnomalyPatch(request.body);
+            if (!parsed.ok) {
+                return badRequest(reply, parsed.error);
+            }
+            db.transaction(() => {
+                for (const {metric, partial} of parsed.value.metrics) {
+                    setTeamMetricConfig(db, team, metric, partial);
+                }
+                if (parsed.value.engine) {
+                    setTeamEngineParams(db, team, parsed.value.engine);
+                }
+            })();
+            return {
+                data: {
+                    team,
+                    ...getAnomalyConfigSnapshot(db, team),
+                    overridable: isTeamAnomalyOverrideAllowed(db),
                 },
             };
         },

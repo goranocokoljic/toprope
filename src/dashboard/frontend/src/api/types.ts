@@ -458,13 +458,30 @@ export interface AuthUser {
 
 // --- Settings & preferences (Task 2.16) ---------------------------------
 
-/** Global settings as returned by GET /api/settings/global. */
+/** Severity floor for anomaly Slack alerts (Task 4.12). */
+export type AnomalyAlertMinSeverity = 'notable' | 'high';
+
+/**
+ * Global settings as returned by GET /api/settings/global. Mirrors the backend
+ * registry (src/settings/registry.ts) — every key the admin can configure
+ * globally, including the survey/anomaly extensions added in Phase 4.
+ */
 export interface GlobalSettings {
     leaderboard_enabled: boolean;
     leaderboard_managers_can_enable: boolean;
     roi_threshold: number;
     roi_settling_days: number;
     roi_managers_can_override: boolean;
+    // Surveys (Task 4.3 / 4.12): auto-send per automated trigger type.
+    survey_usage_drop_auto: boolean;
+    survey_unused_new_seat_auto: boolean;
+    survey_plan_change_auto: boolean;
+    survey_anomaly_auto: boolean;
+    survey_managers_can_override: boolean;
+    // Anomaly alerts (Task 4.8 / 4.12).
+    anomaly_alerts_enabled: boolean;
+    anomaly_alert_min_severity: AnomalyAlertMinSeverity;
+    anomaly_managers_can_override: boolean;
 }
 
 /** Per-team settings view: resolved values, raw overrides, and override gates. */
@@ -475,6 +492,43 @@ export interface TeamSettings {
     // Only team-overridable keys appear; each value is whether its governing
     // managers_can_* flag is currently on.
     overridable: Partial<Record<keyof GlobalSettings, boolean>>;
+}
+
+// --- Anomaly detection config (Task 4.12) -------------------------------
+// Reuses AnomalyMethod / AnomalyMetric / AnomalyBasis from the 4.8 block above.
+
+/** Effective detection config for one metric. */
+export interface MetricConfig {
+    method: AnomalyMethod;
+    threshold: number;
+    baselineWindow: number;
+    percentageBaseline?: 'prior' | 'average';
+}
+
+/** Global engine knobs shared across metrics. */
+export interface AnomalyEngineParams {
+    minBaselinePeriods: number;
+    statisticalHighZ: number;
+}
+
+/** One metric's snapshot row in the anomaly config response. */
+export interface MetricConfigSnapshot {
+    metric: string;
+    scopes: string[];
+    basis: string;
+    config: MetricConfig;
+}
+
+/** GET /api/settings/anomaly — the effective global anomaly config. */
+export interface AnomalyConfig {
+    metrics: MetricConfigSnapshot[];
+    engine: AnomalyEngineParams;
+}
+
+/** A PATCH body for the anomaly config endpoints. */
+export interface AnomalyConfigPatch {
+    metrics?: Record<string, Partial<MetricConfig>>;
+    engine?: Partial<AnomalyEngineParams>;
 }
 
 /**
