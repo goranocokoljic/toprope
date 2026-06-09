@@ -1,5 +1,5 @@
 import type Database from 'better-sqlite3';
-import {developerDataRank, rankToTier} from './coverage';
+import {developerDataRanks, rankToTier} from './coverage';
 import {getMeJourney, type MeJourney} from './developer-views';
 
 /**
@@ -230,12 +230,14 @@ export function detectAnnotations(trajectory: JourneyTrajectoryPoint[]): Journey
 /**
  * The developer's data-quality tier from their BEST available signal — tool API
  * data → high, git activity → medium, a live expense-only seat → low, nothing →
- * none. Delegates to the canonical {@link developerDataRank}/{@link rankToTier}
- * pair so the journey can never drift from the org coverage snapshot's model.
- * This is what labels a launch-era (git-only) journey an estimate.
+ * none. Reuses the canonical {@link developerDataRanks}/{@link rankToTier} pair
+ * (one home for the data-quality model) so the journey can never drift from the
+ * org coverage snapshot. This is what labels a launch-era (git-only) journey an
+ * estimate. A journey is a single request, so folding the whole-org rank map and
+ * indexing one id is cheap and keeps the rank computation in exactly one place.
  */
 export function developerTier(db: Database.Database, developerId: string): JourneyTier {
-    return rankToTier(developerDataRank(db, developerId));
+    return rankToTier(developerDataRanks(db).get(developerId) ?? 0);
 }
 
 /**
@@ -309,8 +311,15 @@ export function getDeveloperJourney(
     now: Date = new Date(),
 ): DeveloperJourney {
     const base = getMeJourney(db, developerId);
-    const daily = getDailyActivity(db, developerId);
     const tier = developerTier(db, developerId);
+
+    // Drop any activity dated after the present: a snapshot can only be dated
+    // today or earlier, so a future date is clock skew or a bad import. Filtering
+    // here keeps bounds and trajectory consistent — neither reports a future
+    // "activity" the chart can't show — and is the single guard against
+    // future-dated rows for the whole assembly.
+    const today = now.toISOString().slice(0, 10);
+    const daily = getDailyActivity(db, developerId).filter((d) => d.date <= today);
 
     const activeDays = daily.filter((d) => d.active);
     const firstActivity = activeDays.length > 0 ? activeDays[0].date : null;
@@ -318,12 +327,9 @@ export function getDeveloperJourney(
 
     let trajectory: JourneyTrajectoryPoint[] = [];
     if (firstActivity && lastActivity) {
-        // Always run to the present week (the hard upper bound): an inactive tail
-        // after the last active day shows as a real drop-off, AND a single
-        // future-dated row (clock skew, bad import) can't extend the series past
-        // now — buildTrajectory only walks [firstWeek, nowWeek], so any week
-        // beyond now is dropped rather than emitting thousands of empty points.
-        const nowWeek = weekStartOf(now.toISOString().slice(0, 10));
+        // Always run to the present week so an inactive tail after the last active
+        // day shows as a real drop-off, never clamped to the last active week.
+        const nowWeek = weekStartOf(today);
         trajectory = buildTrajectory(daily, weekStartOf(firstActivity), nowWeek);
     }
 
