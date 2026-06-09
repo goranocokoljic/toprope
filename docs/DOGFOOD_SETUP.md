@@ -18,9 +18,9 @@ same window you run the commands from.
 - **Node.js 20+** and **npm** (`node -v`).
 - **Git access** to your repos and an **app password / access token** for the
   provider that hosts them (Bitbucket, GitHub, or GitLab).
-- API tokens for whichever AI tools you pay for (Copilot, Claude Code, Windsurf).
-  You can dogfood with a subset — connectors you leave `enabled: false` are
-  simply skipped.
+- API tokens for whichever AI tools you pay for (Copilot, Claude Code, Windsurf,
+  Cursor). You can dogfood with a subset — connectors you leave `enabled: false`
+  are simply skipped.
 
 ---
 
@@ -62,6 +62,9 @@ $env:GITHUB_API_TOKEN       = "ghp_..."        # if GitHub is enabled
 $env:COPILOT_API_TOKEN      = "..."            # if Copilot is enabled
 $env:CLAUDE_CODE_API_TOKEN  = "..."            # if Claude Code is enabled
 $env:WINDSURF_API_TOKEN     = "..."            # if Windsurf is enabled
+$env:CURSOR_SERVICE_KEY     = "..."            # if Cursor is enabled (Phase 4)
+$env:SLACK_BOT_TOKEN        = "xoxb-..."       # if the Slack bot is enabled (Phase 4)
+$env:SLACK_SIGNING_SECRET   = "..."            # if the Slack bot is enabled (Phase 4)
 $env:DASHBOARD_PASSWORD     = "..."            # only if your config references it
 ```
 
@@ -246,6 +249,115 @@ whose underlying aggregate later changes (late-arriving data) is flagged
 Quarterly/yearly **summaries** are intentionally not scheduled — generate them on
 demand. All jobs are idempotent and isolated (one failing job never blocks the
 others).
+
+---
+
+## 9. Complete the data picture (Phase 4) (15 min)
+
+Phase 4 closes the launch blind spots — personal/reimbursed accounts, tools
+without admin access, non-committing AI use — and adds proactive analytics. Every
+feature stays **tier-aware**: it labels its data basis and never invents
+direct-usage numbers. The end-to-end behaviour is covered by
+`tests/integration/phase4-pipeline.test.ts`.
+
+### 9a. Cursor connector
+
+Cursor is a first-class connector (api/HIGH tier, full parity with
+Copilot/Claude Code/Windsurf). Enable it in `connectors`:
+
+```yaml
+connectors:
+  cursor:
+    enabled: true
+    service_key: "${CURSOR_SERVICE_KEY}"   # Cursor Analytics API service key
+```
+
+Link each developer's Cursor identity (`npx govproxy dev link --id <dev-id>
+--cursor jane@company.com`), then `npx govproxy sync all` pulls it like any other
+connector. `doctor` validates the key.
+
+### 9b. Self-reporting (CLI + Slack)
+
+Developers on tools you can't reach by API (personal Cursor, ChatGPT, a reimbursed
+seat) can self-report usage in seconds. It lands as a `self_report`/**MEDIUM**
+snapshot — honestly marked, never fabricating measured counts — and the
+**API-wins rule** guarantees a self-report never overrides (or is overridden into)
+measured API data: if a connector later syncs the same day, the measured row wins.
+
+```powershell
+# CLI: log usage for yourself
+npx govproxy log --tool cursor --minutes 90 --task "refactored auth"
+```
+
+For the **Slack bot** (slash command + interactive form), add a top-level `slack`
+block (distinct from `alerts.slack`, which is the waste-alert webhook):
+
+```yaml
+slack:
+  enabled: true
+  bot_token: "${SLACK_BOT_TOKEN}"          # xoxb-… bot user OAuth token
+  signing_secret: "${SLACK_SIGNING_SECRET}" # verifies every inbound request
+```
+
+The bot routes register only when `slack.enabled` is true.
+
+### 9c. Richer expense import + reconciliation
+
+The importer recognizes multiple expense-export profiles (e.g. `standard`,
+`expensify`, `concur`), normalizes annual charges to monthly, dedups, and infers
+the billing model. Reconciliation then compares charges against the subscription
+registry for a period and flags mismatches so total spend is trustworthy:
+
+```powershell
+npx govproxy expenses import expenses.csv --profile expensify
+npx govproxy expenses reconcile --period 2026-06
+```
+
+Three mismatch types surface (`expense_no_subscription`, `subscription_no_expense`,
+`cost_discrepancy`); each has a **resolve / ignore** workflow in the Admin UI.
+Re-running reconciliation is idempotent (it never duplicates open results).
+
+### 9d. Anomaly detection
+
+Anomalies fire when a metric deviates from its own baseline — both **statistical**
+(z-score) and **percentage-change** methods, configurable per metric in Settings.
+A **minimum-baseline guard** suppresses early-weeks false positives until enough
+prior periods exist, so a freshly-onboarded team doesn't generate noise. Anomalies
+carry an honest basis (`git_estimate` at launch); developer-scope anomalies stay
+private, team-scope surface to managers in the dashboard panel, optional Slack
+alerts (notable/high only), and the AI summaries.
+
+To route anomaly Slack alerts, add `anomaly_alerts` under the `slack` block:
+
+```yaml
+slack:
+  enabled: true
+  bot_token: "${SLACK_BOT_TOKEN}"
+  anomaly_alerts:
+    channels: ["C0123ABCD"]                # Slack channel IDs
+    dashboard_url: "http://localhost:8080" # base URL for the "view in dashboard" deep link
+```
+
+### 9e. Data-prompted surveys
+
+When a trigger fires (usage drop, unused new seat, plan change, anomaly), GovProxy
+can ask the developer a short question ("your usage dropped 40% — did you switch
+tools?"). Each trigger is **manual by default** (queued for manager approval) or
+**auto-send** per a Settings toggle (global default + per-team override under the
+manager-permission model); delivery prefers Slack with an email fallback. The
+developer's response is captured and shown to the manager as context next to the
+triggering data. Enable with a top-level `surveys` block and review the queue
+under the manager's Surveys panel.
+
+### 9f. Team comparison & adoption journey
+
+- **Team comparison:** pick 2–4 teams for a rich side-by-side (every metric, tool
+  mix, overlaid trend, per-team tier with the weakest-link rule), or open the
+  sortable all-teams table for a quarter.
+- **Adoption journey:** each developer sees their own timeline from first AI
+  activity to now — trajectory, tool/plan transitions, and annotated moments
+  (first active week, sustained ramp, plateau). Managers can open the aggregate
+  journey for any developer; a developer is confined to their own.
 
 ---
 
