@@ -3,11 +3,11 @@ import {AppShell} from './components/AppShell';
 import {ManagerOverview} from './pages/ManagerOverview';
 import {TeamsList} from './pages/TeamsList';
 import {TeamDetail} from './pages/TeamDetail';
+import {DeveloperDetail} from './pages/DeveloperDetail';
 import {TeamCompare} from './pages/TeamCompare';
 import {TeamCompareTable} from './pages/TeamCompareTable';
 import {WasteDetection} from './pages/WasteDetection';
 import {Anomalies} from './pages/Anomalies';
-import {ComingSoon} from './pages/ComingSoon';
 import {DeveloperDashboard} from './pages/DeveloperDashboard';
 import {MyTools} from './pages/MyTools';
 import {MyActivity} from './pages/MyActivity';
@@ -40,15 +40,7 @@ export function App(): JSX.Element {
                 <Route path="manager/compare" element={<TeamCompare />} />
                 <Route path="manager/rank-teams" element={<TeamCompareTable />} />
                 <Route path="manager/teams/:team" element={<TeamDetail />} />
-                <Route
-                    path="manager/developers/:id"
-                    element={
-                        <ComingSoon
-                            title="Developer Detail"
-                            description="Per-developer aggregate adoption — arrives in a later Phase 2 task."
-                        />
-                    }
-                />
+                <Route path="manager/developers/:id" element={<DeveloperDetail />} />
                 <Route path="manager/waste" element={<WasteDetection />} />
                 <Route path="manager/anomalies" element={<Anomalies />} />
                 <Route

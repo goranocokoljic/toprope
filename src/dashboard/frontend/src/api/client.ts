@@ -12,13 +12,14 @@ import type {
     AuthUser,
     CompareTable,
     CoverageData,
+    DeveloperIdentity,
+    DeveloperJourney,
     GlobalSettings,
     Leaderboard,
     LeaderboardAvailability,
     LeaderboardMetric,
     MaturityTrend,
     MeActivity,
-    MeJourney,
     MeOverview,
     MeTimeline,
     MeTools,
@@ -530,9 +531,33 @@ export const api = {
         return body.data;
     },
 
-    /** Personal adoption journey: per-tool status + lifecycle milestones. */
-    async getMeJourney(): Promise<MeJourney> {
-        const body = await request<ApiEnvelope<MeJourney>>('/api/me/journey');
+    /**
+     * Personal adoption journey (Task 4.11): per-tool status + lifecycle
+     * milestones, plus the timeline bounds, weekly trajectory, annotated key
+     * moments, and data tier.
+     */
+    async getMeJourney(): Promise<DeveloperJourney> {
+        const body = await request<ApiEnvelope<DeveloperJourney>>('/api/me/journey');
+        return body.data;
+    },
+
+    /**
+     * Manager's aggregate view of a developer's adoption journey (Task 4.11).
+     * Same shape as the developer's own journey — no prompt content, nothing
+     * rankable — framed as journey/health on the manager surface.
+     */
+    async getDeveloperJourney(id: string): Promise<DeveloperJourney> {
+        const body = await request<ApiEnvelope<DeveloperJourney>>(
+            `/api/developers/${encodeURIComponent(id)}/journey`,
+        );
+        return body.data;
+    },
+
+    /** Developer identity (name/team) for the manager developer-detail header. */
+    async getDeveloperIdentity(id: string): Promise<DeveloperIdentity> {
+        const body = await request<ApiEnvelope<DeveloperIdentity>>(
+            `/api/developers/${encodeURIComponent(id)}`,
+        );
         return body.data;
     },
 

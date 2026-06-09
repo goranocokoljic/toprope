@@ -1,6 +1,7 @@
 import type {FastifyInstance} from 'fastify';
 import type Database from 'better-sqlite3';
 import {getDeveloperDetail, getDeveloperTimeline} from './developer-detail';
+import {getDeveloperJourney} from './journey';
 
 export function registerDeveloperRoutes(app: FastifyInstance, db: Database.Database): void {
     app.get<{Params: {id: string}}>('/api/developers/:id', async (request, reply) => {
@@ -19,5 +20,21 @@ export function registerDeveloperRoutes(app: FastifyInstance, db: Database.Datab
             return reply.status(404).send({error: 'Not Found', message: `Developer '${id}' not found`});
         }
         return {data: timeline};
+    });
+
+    // Manager's aggregate view of a developer's adoption journey (Task 4.11 /
+    // #106). Same payload as the developer's own /api/me/journey — it carries no
+    // prompt content and nothing rankable, only the developer's activity over
+    // time — so the manager surface differs purely in framing. This route is
+    // admin-only by the session middleware (developers are confined to /api/me).
+    app.get<{Params: {id: string}}>('/api/developers/:id/journey', async (request, reply) => {
+        const {id} = request.params;
+        // 404 on an unknown id rather than returning an empty journey, matching
+        // the sibling detail/timeline routes.
+        const exists = db.prepare('SELECT 1 FROM developers WHERE id = ?').get(id) !== undefined;
+        if (!exists) {
+            return reply.status(404).send({error: 'Not Found', message: `Developer '${id}' not found`});
+        }
+        return {data: getDeveloperJourney(db, id)};
     });
 }
