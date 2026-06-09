@@ -12,7 +12,8 @@ import {toolLabel} from '../components/toolLabels';
 import {formatCurrency, formatPercent, formatDateTick} from '../components/format';
 import {inclusiveDayCount, presetValue} from '../timeRange/range';
 import {earliestJourneyStart} from '../components/meHelpers';
-import type {MeJourney, MeJourneyEvent, MeJourneyTool, MeOverview, MeTimeline} from '../api/types';
+import {JourneyTimeline} from '../components/JourneyTimeline';
+import type {MeOverview, MeTimeline} from '../api/types';
 
 /**
  * Developer "My Dashboard" (Task 2.8). The developer's private landing screen:
@@ -53,15 +54,6 @@ function weekActiveDays(timeline: MeTimeline | undefined): number | null {
         }
     }
     return count;
-}
-
-/** 'YYYY-MM-DD' → "March 2026" for milestone labels; passes through bad input. */
-function formatMonthYear(value: string): string {
-    const date = new Date(`${value}T00:00:00.000Z`);
-    if (Number.isNaN(date.getTime())) {
-        return value;
-    }
-    return new Intl.DateTimeFormat(undefined, {month: 'long', year: 'numeric', timeZone: 'UTC'}).format(date);
 }
 
 // --- Personal stat cards ---------------------------------------------------
@@ -120,104 +112,6 @@ function StatCards({month, weekDays}: {month: MeOverview; weekDays: number | nul
                 hint="estimated monthly spend"
             />
         </div>
-    );
-}
-
-// --- Adoption journey ------------------------------------------------------
-
-/** A signed monthly-cost delta like "+$180/mo", or null when costs are absent. */
-function costDelta(oldCost: number | null, newCost: number | null): string | null {
-    if (oldCost === null || newCost === null) {
-        return null;
-    }
-    const delta = newCost - oldCost;
-    if (delta === 0) {
-        return null;
-    }
-    const sign = delta > 0 ? '+' : '−';
-    return `${sign}${formatCurrency(Math.abs(delta))}/mo`;
-}
-
-function journeyEventText(event: MeJourneyEvent): {title: string; detail: string | null} {
-    const tool = toolLabel(event.tool);
-    if (event.type === 'started') {
-        return {title: `Started using ${tool}`, detail: null};
-    }
-    if (event.type === 'tool_switch') {
-        const from = event.from_tool ? toolLabel(event.from_tool) : 'another tool';
-        return {title: `Switched from ${from} to ${tool}`, detail: costDelta(event.old_monthly_cost, event.new_monthly_cost)};
-    }
-    // plan_change
-    const from = event.from_plan ?? 'previous plan';
-    const to = event.to_plan ?? 'a new plan';
-    return {title: `${tool}: ${from} → ${to}`, detail: costDelta(event.old_monthly_cost, event.new_monthly_cost)};
-}
-
-function ToolSummary({tool}: {tool: MeJourneyTool}): JSX.Element {
-    const parts: string[] = [];
-    if (tool.started_on) {
-        parts.push(`since ${formatMonthYear(tool.started_on)}`);
-    }
-    if (tool.active && tool.current_plan) {
-        parts.push(tool.current_plan);
-    }
-    return (
-        <span
-            className={[
-                'inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium',
-                tool.active ? 'bg-accent-soft text-accent' : 'bg-surface-raised text-muted',
-            ].join(' ')}
-        >
-            <span className="font-semibold">{toolLabel(tool.tool)}</span>
-            {parts.length > 0 ? <span className="text-muted">{parts.join(' · ')}</span> : null}
-        </span>
-    );
-}
-
-function AdoptionJourney({journey}: {journey: MeJourney}): JSX.Element {
-    return (
-        <Card title="My adoption journey">
-            <p className="-mt-2 mb-4 text-xs text-muted">
-                When you started with each tool and how your setup has evolved.
-            </p>
-
-            {journey.tools.length > 0 ? (
-                <div className="mb-5 flex flex-wrap gap-2" data-testid="journey-tools">
-                    {journey.tools.map((tool) => (
-                        <ToolSummary key={tool.tool} tool={tool} />
-                    ))}
-                </div>
-            ) : null}
-
-            {journey.events.length > 0 ? (
-                <ol className="space-y-4" data-testid="journey-timeline">
-                    {journey.events.map((event, i) => {
-                        const {title, detail} = journeyEventText(event);
-                        return (
-                            <li key={`${event.date}-${event.type}-${event.tool}-${i}`} className="flex gap-3">
-                                <div className="flex flex-col items-center">
-                                    <span aria-hidden className="mt-1 h-2.5 w-2.5 rounded-full bg-accent" />
-                                    {i < journey.events.length - 1 ? (
-                                        <span aria-hidden className="mt-1 w-px flex-1 bg-border" />
-                                    ) : null}
-                                </div>
-                                <div className="pb-1">
-                                    <p className="text-xs font-medium uppercase tracking-wider text-muted">
-                                        {formatMonthYear(event.date)}
-                                    </p>
-                                    <p className="text-sm font-medium text-foreground">{title}</p>
-                                    {detail ? <p className="text-xs text-muted">{detail}</p> : null}
-                                </div>
-                            </li>
-                        );
-                    })}
-                </ol>
-            ) : (
-                <p className="text-sm text-muted">
-                    Your journey starts here — milestones will appear as your tool usage is tracked.
-                </p>
-            )}
-        </Card>
     );
 }
 
@@ -373,7 +267,7 @@ export function DeveloperDashboard(): JSX.Element {
                         </div>
                     ) : null}
                     <StatCards month={month.data} weekDays={weekDays} />
-                    {journey.data ? <AdoptionJourney journey={journey.data} /> : null}
+                    {journey.data ? <JourneyTimeline journey={journey.data} framing="self" /> : null}
                     <ActivityTrend earliest={earliest} />
                 </>
             ) : null}

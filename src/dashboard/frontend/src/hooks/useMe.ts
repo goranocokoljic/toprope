@@ -1,7 +1,7 @@
 import {useQuery, type UseQueryResult} from '@tanstack/react-query';
 import {api, type TimeRangeQuery} from '../api/client';
 import {queryKeys} from '../api/queryKeys';
-import type {MeActivity, MeJourney, MeOverview, MeTimeline, MeTools} from '../api/types';
+import type {DeveloperJourney, MeActivity, MeOverview, MeTimeline, MeTools} from '../api/types';
 import type {TimeRangeValue} from '../timeRange/range';
 import {trendQuery, trendWindowKey} from '../timeRange/trendQuery';
 
@@ -36,8 +36,8 @@ export function useMeTimeline(range: TimeRangeValue): UseQueryResult<MeTimeline,
     });
 }
 
-/** Personal adoption journey: per-tool status + lifecycle milestones. */
-export function useMeJourney(): UseQueryResult<MeJourney, Error> {
+/** Personal adoption journey: per-tool status, milestones, trajectory, and tier. */
+export function useMeJourney(): UseQueryResult<DeveloperJourney, Error> {
     return useQuery({
         queryKey: queryKeys.meJourney,
         queryFn: api.getMeJourney,

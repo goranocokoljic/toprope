@@ -399,6 +399,53 @@ export interface MeJourney {
     events: MeJourneyEvent[];
 }
 
+/** First→last detected AI activity — the span of the journey timeline. */
+export interface JourneyBounds {
+    first_activity: string | null;
+    last_activity: string | null;
+}
+
+/** One week of the adoption-journey activity trajectory. */
+export interface JourneyTrajectoryPoint {
+    week_start: string;
+    active_days: number;
+    interactions: number;
+    commits: number;
+    ai_signature_score: number | null;
+}
+
+export type JourneyAnnotationType = 'first_active_week' | 'sustained_ramp' | 'plateau';
+
+/** A key moment annotated on the trajectory. */
+export interface JourneyAnnotation {
+    type: JourneyAnnotationType;
+    week_start: string;
+    label: string;
+}
+
+/** Data-quality tier of the journey (high=tool API … none=no data). */
+export type JourneyTier = DataQualityTier;
+
+/**
+ * The rich adoption journey (Task 4.11): the base per-tool/lifecycle journey plus
+ * the timeline bounds, weekly trajectory, annotated key moments, and data tier.
+ * Backs both /api/me/journey (own) and /api/developers/:id/journey (manager).
+ */
+export interface DeveloperJourney extends MeJourney {
+    bounds: JourneyBounds;
+    trajectory: JourneyTrajectoryPoint[];
+    annotations: JourneyAnnotation[];
+    tier: JourneyTier;
+}
+
+/** Minimal developer identity for the manager developer-detail header. */
+export interface DeveloperIdentity {
+    id: string;
+    name: string;
+    email: string | null;
+    team: string;
+}
+
 export type UserRole = 'admin' | 'developer';
 
 /** The current session identity, as returned by GET /api/auth/me. */

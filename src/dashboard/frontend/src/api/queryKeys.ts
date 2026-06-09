@@ -43,6 +43,10 @@ export const queryKeys = {
     meOverview: (window: string) => ['me', 'overview', window] as const,
     meTimeline: (window: string) => ['me', 'timeline', window] as const,
     meJourney: ['me', 'journey'] as const,
+    // Manager developer-detail (Task 4.11): per-developer identity + journey,
+    // keyed by id so each developer caches independently.
+    developerIdentity: (id: string) => ['developers', id, 'identity'] as const,
+    developerJourney: (id: string) => ['developers', id, 'journey'] as const,
     // Developer "My Tools" + "My Activity" (Task 2.9). Window-keyed so changing
     // the time range refetches.
     meTools: (window: string) => ['me', 'tools', window] as const,
