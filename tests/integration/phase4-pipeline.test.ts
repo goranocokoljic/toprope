@@ -80,7 +80,6 @@ class FakeEmailer implements Emailer {
 
 interface CursorEntryOverrides {
     date?: string;
-    autocomplete_shown?: number;
 }
 
 function cursorEntry(email: string, overrides: CursorEntryOverrides = {}): CursorUserMetrics {
@@ -88,7 +87,7 @@ function cursorEntry(email: string, overrides: CursorEntryOverrides = {}): Curso
         user_id: 'cur-user-1',
         email,
         date: overrides.date ?? '2026-05-12',
-        autocomplete_shown: overrides.autocomplete_shown ?? 100,
+        autocomplete_shown: 100,
         autocomplete_accepted: 45,
         composer_requests: 8,
         chat_requests: 15,
@@ -656,6 +655,11 @@ describe('Phase 4 E2E (4.13): comparison + journey + performance', () => {
     });
 
     // ── performance: every new view answers well under the 2s budget ─────────
+    // A smoke check at the dogfood-shape seed above (a handful of teams/developers),
+    // not a scale benchmark: it guards against an endpoint that hangs, 500s, or does
+    // unbounded blocking work, and pins the issue's "< 2s on real data" acceptance
+    // criterion. Large-N query-shape regressions are the remit of
+    // tests/integration/performance.test.ts, not this close-out check.
     it('answers the new dashboard views well under the 2s budget', async () => {
         async function timed(url: string, headers: Record<string, string>): Promise<{status: number; ms: number}> {
             const start = performance.now();
@@ -728,14 +732,18 @@ describe('Phase 4 E2E (4.13): tier-awareness — anomaly summaries carry no fabr
             ],
         });
 
-        // The rendered input block — the data the model narrates — must be clean of
-        // every Phase 3 forbidden direct-usage term.
-        const block = formatSummaryInput(payload).toLowerCase();
+        // Render the input block — the data the model narrates — once, then check it
+        // two complementary ways. The explicit term loop is the literal "reuse the
+        // Phase 3 forbidden-terms catalogue" the issue calls for (mirrors
+        // anomaly-integration.test.ts), with a clear per-term failure message; the
+        // production guard (findFabricatedUsageLanguage) is the stronger end-to-end
+        // assertion over the same rendered text.
+        const rendered = formatSummaryInput(payload);
+        const block = rendered.toLowerCase();
         for (const term of FABRICATED_USAGE_TERMS) {
             expect(block, `forbidden term leaked: ${term}`).not.toContain(term);
         }
-        // The whole block is independently clean per the production guard.
-        expect(findFabricatedUsageLanguage(formatSummaryInput(payload), payload)).toEqual([]);
+        expect(findFabricatedUsageLanguage(rendered, payload)).toEqual([]);
         // Sanity: the honest git wording IS present.
         expect(block).toContain('commit activity dropped');
         // The prompt builds without throwing the numbers-only / privacy guard.

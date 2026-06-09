@@ -335,7 +335,7 @@ slack:
   bot_token: "${SLACK_BOT_TOKEN}"
   anomaly_alerts:
     channels: ["C0123ABCD"]                # Slack channel IDs
-    dashboard_base_url: "http://localhost:8080"
+    dashboard_url: "http://localhost:8080" # base URL for the "view in dashboard" deep link
 ```
 
 ### 9e. Data-prompted surveys
