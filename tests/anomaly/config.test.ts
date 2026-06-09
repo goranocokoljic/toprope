@@ -4,7 +4,9 @@ import {makeTestDb, seedFixtures} from '../dashboard/fixtures';
 import {
     DEFAULT_ENGINE_PARAMS,
     METRIC_DEFS,
+    clearTeamAnomalyOverrides,
     getAnomalyConfigSnapshot,
+    getTeamAnomalyOverrides,
     isTeamAnomalyOverrideAllowed,
     metricsForScope,
     resolveEngineParams,
@@ -198,6 +200,70 @@ describe('anomaly config', () => {
             setTeamMetricConfig(db, 'frontend', 'commits', {threshold: 4});
             const snap = getAnomalyConfigSnapshot(db, 'frontend');
             expect(snap.metrics.find((m) => m.metric === 'commits')?.config.threshold).toBe(4);
+        });
+    });
+
+    // Task 4.12 review (SO-1): the structured config must match the flat path's
+    // flag-off cleanup, so a stored team override cannot resurrect on re-enable.
+    describe('clearTeamAnomalyOverrides', () => {
+        it('deletes structured team overrides so a re-enable cannot resurrect them', () => {
+            setGlobalSetting(db, 'anomaly_managers_can_override', true);
+            setTeamMetricConfig(db, 'frontend', 'commits', {threshold: 9});
+            setTeamEngineParams(db, 'frontend', {minBaselinePeriods: 10});
+            expect(resolveMetricConfig(db, 'commits', 'frontend').threshold).toBe(9);
+
+            // Admin turns the flag off → overrides discarded, not just suppressed.
+            clearTeamAnomalyOverrides(db);
+            setGlobalSetting(db, 'anomaly_managers_can_override', false);
+
+            // Re-enabling falls back to defaults, not the old stored override.
+            setGlobalSetting(db, 'anomaly_managers_can_override', true);
+            expect(resolveMetricConfig(db, 'commits', 'frontend').threshold).toBe(2.0);
+            expect(resolveEngineParams(db, 'frontend').minBaselinePeriods).toBe(
+                DEFAULT_ENGINE_PARAMS.minBaselinePeriods,
+            );
+            expect(getTeamAnomalyOverrides(db, 'frontend')).toEqual({metrics: {}, engine: {}});
+        });
+
+        it('clears every team, not just one', () => {
+            setGlobalSetting(db, 'anomaly_managers_can_override', true);
+            setTeamMetricConfig(db, 'frontend', 'commits', {threshold: 9});
+            setTeamMetricConfig(db, 'backend', 'commits', {threshold: 7});
+            clearTeamAnomalyOverrides(db);
+            expect(getTeamAnomalyOverrides(db, 'frontend').metrics).toEqual({});
+            expect(getTeamAnomalyOverrides(db, 'backend').metrics).toEqual({});
+        });
+    });
+
+    // Task 4.12 review (SO-2): raw stored overrides, distinct from resolved values.
+    describe('getTeamAnomalyOverrides', () => {
+        it('returns only the fields a team actually set, dropping invalid ones', () => {
+            setTeamMetricConfig(db, 'frontend', 'commits', {threshold: 5, baselineWindow: 6});
+            setTeamEngineParams(db, 'frontend', {minBaselinePeriods: 12});
+            const raw = getTeamAnomalyOverrides(db, 'frontend');
+            expect(raw.metrics.commits).toEqual({threshold: 5, baselineWindow: 6});
+            expect(raw.engine).toEqual({minBaselinePeriods: 12});
+            // A team with nothing stored returns empty maps.
+            expect(getTeamAnomalyOverrides(db, 'backend')).toEqual({metrics: {}, engine: {}});
+        });
+    });
+
+    // Task 4.12 review (SO-3): a method switch must not leave stale
+    // percentageBaseline in the STORED override row (asserted on the raw override,
+    // not the resolved value — resolution legitimately inherits the registry
+    // default's percentageBaseline, which the engine ignores under statistical).
+    describe('percentageBaseline normalization on method switch', () => {
+        it('drops percentageBaseline from the stored row once the method is statistical', () => {
+            setGlobalSetting(db, 'anomaly_managers_can_override', true);
+            setTeamMetricConfig(db, 'frontend', 'cost', {method: 'percentage_change', percentageBaseline: 'average'});
+            expect(getTeamAnomalyOverrides(db, 'frontend').metrics.cost).toEqual({
+                method: 'percentage_change',
+                percentageBaseline: 'average',
+            });
+
+            // Switch the method to statistical → the stale percentageBaseline is gone.
+            setTeamMetricConfig(db, 'frontend', 'cost', {method: 'statistical'});
+            expect(getTeamAnomalyOverrides(db, 'frontend').metrics.cost).toEqual({method: 'statistical'});
         });
     });
 });

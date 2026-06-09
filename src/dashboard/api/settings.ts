@@ -13,7 +13,10 @@ import {
     setUserPreference,
 } from '../../settings/store';
 import {
+    ANOMALY_OVERRIDE_FLAG,
+    clearTeamAnomalyOverrides,
     getAnomalyConfigSnapshot,
+    getTeamAnomalyOverrides,
     isAnomalyMetric,
     isTeamAnomalyOverrideAllowed,
     setGlobalEngineParams,
@@ -158,6 +161,12 @@ export function registerSettingsRoutes(app: FastifyInstance, db: Database.Databa
                 // it gated, so a later re-enable can't silently resurrect them.
                 if (u.value === false) {
                     clearOverridesGovernedBy(db, u.key);
+                    // The structured anomaly config lives outside the registry but
+                    // shares this same flag, so clear its team rows too — keeping
+                    // flag-off semantics identical across both override mechanisms.
+                    if (u.key === ANOMALY_OVERRIDE_FLAG) {
+                        clearTeamAnomalyOverrides(db);
+                    }
                 }
             }
         })();
@@ -306,6 +315,9 @@ export function registerSettingsRoutes(app: FastifyInstance, db: Database.Databa
             data: {
                 team,
                 ...getAnomalyConfigSnapshot(db, team),
+                // The raw stored team overrides (not the resolved values above), so
+                // the admin UI can see exactly what a team has set vs. inherited.
+                overrides: getTeamAnomalyOverrides(db, team),
                 // Whether per-team anomaly overrides are currently permitted, so
                 // the UI can disable the controls when the flag is off.
                 overridable: isTeamAnomalyOverrideAllowed(db),
@@ -349,6 +361,7 @@ export function registerSettingsRoutes(app: FastifyInstance, db: Database.Databa
                 data: {
                     team,
                     ...getAnomalyConfigSnapshot(db, team),
+                    overrides: getTeamAnomalyOverrides(db, team),
                     overridable: isTeamAnomalyOverrideAllowed(db),
                 },
             };

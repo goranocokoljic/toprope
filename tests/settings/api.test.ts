@@ -429,5 +429,71 @@ describe('settings API', () => {
             });
             expect(res.statusCode).toBe(404);
         });
+
+        it('team GET surfaces raw stored overrides distinct from resolved values', async () => {
+            await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/global',
+                headers: authHeaders(adminToken),
+                payload: {anomaly_managers_can_override: true},
+            });
+            await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/anomaly/team/frontend',
+                headers: authHeaders(adminToken),
+                payload: {metrics: {commits: {threshold: 9}}},
+            });
+            const res = await app.inject({
+                method: 'GET',
+                url: '/api/settings/anomaly/team/frontend',
+                headers: authHeaders(adminToken),
+            });
+            expect(res.statusCode).toBe(200);
+            // Raw override shows only what the team set; resolved shows the effective value.
+            expect(res.json().data.overrides.metrics.commits).toEqual({threshold: 9});
+            const commits = res.json().data.metrics.find((m: {metric: string}) => m.metric === 'commits');
+            expect(commits.config.threshold).toBe(9);
+        });
+
+        it('disabling anomaly_managers_can_override discards structured team overrides (no resurrection)', async () => {
+            // Enable, write a team override, confirm it resolves.
+            await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/global',
+                headers: authHeaders(adminToken),
+                payload: {anomaly_managers_can_override: true},
+            });
+            await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/anomaly/team/frontend',
+                headers: authHeaders(adminToken),
+                payload: {metrics: {commits: {threshold: 9}}, engine: {minBaselinePeriods: 10}},
+            });
+
+            // Admin turns the flag off → the structured team rows are discarded.
+            await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/global',
+                headers: authHeaders(adminToken),
+                payload: {anomaly_managers_can_override: false},
+            });
+
+            // Re-enable: resolution falls back to defaults, the old override is gone.
+            await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/global',
+                headers: authHeaders(adminToken),
+                payload: {anomaly_managers_can_override: true},
+            });
+            const res = await app.inject({
+                method: 'GET',
+                url: '/api/settings/anomaly/team/frontend',
+                headers: authHeaders(adminToken),
+            });
+            const commits = res.json().data.metrics.find((m: {metric: string}) => m.metric === 'commits');
+            expect(commits.config.threshold).toBe(2.0);
+            expect(res.json().data.engine.minBaselinePeriods).toBe(4);
+            expect(res.json().data.overrides).toEqual({metrics: {}, engine: {}});
+        });
     });
 });

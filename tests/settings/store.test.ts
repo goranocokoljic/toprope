@@ -7,6 +7,7 @@ import {
     getRoiConfigForTeam,
     getTeamOverrides,
     getUserPreferences,
+    isGovernedFlagOn,
     isLeaderboardEnabledForTeam,
     isTeamOverrideAllowed,
     clearOverridesGovernedBy,
@@ -113,6 +114,12 @@ describe('settings store', () => {
             setTeamSetting(db, 'frontend', 'roi_threshold', 9);
             expect(resolveSetting(db, 'roi_threshold')).toBe(3.0);
             expect(resolveSetting(db, 'roi_threshold', null)).toBe(3.0);
+        });
+
+        it('isGovernedFlagOn reads a managers_can_* flag directly', () => {
+            expect(isGovernedFlagOn(db, 'anomaly_managers_can_override')).toBe(false);
+            setGlobalSetting(db, 'anomaly_managers_can_override', true);
+            expect(isGovernedFlagOn(db, 'anomaly_managers_can_override')).toBe(true);
         });
 
         it('isTeamOverrideAllowed reflects the governing flag', () => {

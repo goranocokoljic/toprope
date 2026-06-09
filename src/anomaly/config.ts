@@ -31,12 +31,20 @@
  */
 
 import type Database from 'better-sqlite3';
-import {getGlobalSetting} from '../settings/store';
+import {isGovernedFlagOn} from '../settings/store';
 import type {AnomalyBasis, AnomalyMetric, AnomalyScope} from './types';
 import type {EngineParams, MetricConfig} from './engine';
 
 const CONFIG_KEY = 'anomaly_config';
 const ENGINE_PARAMS_KEY = 'anomaly_engine_params';
+
+/**
+ * The global managers_can_* flag governing per-team anomaly overrides. This is
+ * the SAME flag the registry declares as `overrideGovernedBy` for the flat
+ * anomaly keys (anomaly_alerts_enabled, anomaly_alert_min_severity), named once
+ * here so the structured config and the flat settings stay in lockstep.
+ */
+export const ANOMALY_OVERRIDE_FLAG = 'anomaly_managers_can_override';
 
 export interface MetricDef {
     metric: AnomalyMetric;
@@ -224,7 +232,7 @@ function metricOverrideFor(
  * override.
  */
 export function isTeamAnomalyOverrideAllowed(db: Database.Database): boolean {
-    return getGlobalSetting(db, 'anomaly_managers_can_override') === true;
+    return isGovernedFlagOn(db, ANOMALY_OVERRIDE_FLAG);
 }
 
 // --- resolution (the public API the scan layer uses) --------------------------
@@ -277,7 +285,16 @@ function setMetricConfig(
     partial: Partial<MetricConfig>,
 ): void {
     const map = readJsonRow(db, scope, scopeName, CONFIG_KEY) ?? {};
-    map[metric] = {...(coerceMetricOverride(map[metric])), ...partial};
+    const merged = {...coerceMetricOverride(map[metric]), ...partial};
+    // percentageBaseline only applies to percentage_change. If the effective
+    // method is statistical, drop a lingering percentageBaseline so a
+    // statistical→percentage_change→statistical round-trip can't leave stale,
+    // misleading dead data in the stored row (it would be ignored at resolution
+    // but confuses anyone reading the row).
+    if (merged.method !== 'percentage_change') {
+        delete merged.percentageBaseline;
+    }
+    map[metric] = merged;
     writeJsonRow(db, scope, scopeName, CONFIG_KEY, map);
 }
 
@@ -318,6 +335,52 @@ export function setGlobalEngineParams(db: Database.Database, partial: Partial<En
 /** Set (merge) a per-team engine params override. */
 export function setTeamEngineParams(db: Database.Database, team: string, partial: Partial<EngineParams>): void {
     setEngineParams(db, 'team', team, partial);
+}
+
+/**
+ * Delete every per-team structured anomaly override (metric config + engine
+ * params), across all teams. Called when an admin turns
+ * anomaly_managers_can_override off, so the structured config matches the flat
+ * settings' clearOverridesGovernedBy behavior: disabling the flag DISCARDS the
+ * overrides it gated rather than leaving inert rows that would silently resurrect
+ * on a later re-enable. Without this, the structured config and the flat keys
+ * (which share the flag) would diverge on flag-off semantics.
+ */
+export function clearTeamAnomalyOverrides(db: Database.Database): void {
+    db.prepare(
+        "DELETE FROM settings WHERE scope = 'team' AND key IN (?, ?)",
+    ).run(CONFIG_KEY, ENGINE_PARAMS_KEY);
+}
+
+export interface TeamAnomalyOverrides {
+    /** Raw stored per-metric overrides (only the fields a team actually set). */
+    metrics: Partial<Record<AnomalyMetric, Partial<MetricConfig>>>;
+    /** Raw stored engine-params override (only the fields a team actually set). */
+    engine: Partial<EngineParams>;
+}
+
+/**
+ * The RAW stored per-team overrides (not resolved/effective values), so an admin
+ * UI can see exactly what a team has set — distinct from getAnomalyConfigSnapshot,
+ * which only ever returns resolved values. Unknown/invalid stored fields are
+ * dropped (coerced) so the shape is always trustworthy.
+ */
+export function getTeamAnomalyOverrides(db: Database.Database, team: string): TeamAnomalyOverrides {
+    const metricsMap = readJsonRow(db, 'team', team, CONFIG_KEY);
+    const metrics: Partial<Record<AnomalyMetric, Partial<MetricConfig>>> = {};
+    if (metricsMap) {
+        for (const key of Object.keys(metricsMap)) {
+            if (!isAnomalyMetric(key)) continue;
+            const coerced = coerceMetricOverride(metricsMap[key]);
+            if (Object.keys(coerced).length > 0) {
+                metrics[key] = coerced;
+            }
+        }
+    }
+    return {
+        metrics,
+        engine: coerceEngineParamsOverride(readJsonRow(db, 'team', team, ENGINE_PARAMS_KEY)),
+    };
 }
 
 // --- strict validation for the settings API (Task 4.12 / #107) ----------------
