@@ -72,7 +72,7 @@ function asPatchBody(body: unknown): Record<string, unknown> | null {
 }
 
 interface AnomalyPatch {
-    metrics: {metric: AnomalyMetric; partial: Partial<MetricConfig>}[];
+    metrics: Partial<Record<AnomalyMetric, Partial<MetricConfig>>>;
     engine?: Partial<EngineParams>;
 }
 
@@ -81,6 +81,7 @@ interface AnomalyPatch {
  * `{ metrics?: { <metric>: <partial> }, engine?: <partial> }`. Everything is
  * validated before anything is written (all-or-nothing): an unknown metric key,
  * an unrecognized field, or an out-of-range value rejects the whole request.
+ * Returns the validated config keyed by metric, ready to write field-by-field.
  */
 function parseAnomalyPatch(body: unknown): Validated<AnomalyPatch> {
     const obj = asPatchBody(body);
@@ -92,7 +93,7 @@ function parseAnomalyPatch(body: unknown): Validated<AnomalyPatch> {
             return {ok: false, error: `Unknown anomaly config field: ${key}`};
         }
     }
-    const out: AnomalyPatch = {metrics: []};
+    const out: AnomalyPatch = {metrics: {}};
 
     if ('metrics' in obj) {
         const metrics = obj.metrics;
@@ -107,7 +108,7 @@ function parseAnomalyPatch(body: unknown): Validated<AnomalyPatch> {
             if (!result.ok) {
                 return {ok: false, error: `${metric}: ${result.error}`};
             }
-            out.metrics.push({metric, partial: result.value});
+            out.metrics[metric] = result.value;
         }
     }
 
@@ -120,6 +121,13 @@ function parseAnomalyPatch(body: unknown): Validated<AnomalyPatch> {
     }
 
     return {ok: true, value: out};
+}
+
+/** Iterate the validated metric entries with their narrowed AnomalyMetric key. */
+function metricEntries(
+    patch: AnomalyPatch,
+): [AnomalyMetric, Partial<MetricConfig>][] {
+    return Object.entries(patch.metrics) as [AnomalyMetric, Partial<MetricConfig>][];
 }
 
 export function registerSettingsRoutes(app: FastifyInstance, db: Database.Database): void {
@@ -292,7 +300,7 @@ export function registerSettingsRoutes(app: FastifyInstance, db: Database.Databa
             return badRequest(reply, parsed.error);
         }
         db.transaction(() => {
-            for (const {metric, partial} of parsed.value.metrics) {
+            for (const [metric, partial] of metricEntries(parsed.value)) {
                 setGlobalMetricConfig(db, metric, partial);
             }
             if (parsed.value.engine) {
@@ -350,7 +358,7 @@ export function registerSettingsRoutes(app: FastifyInstance, db: Database.Databa
                 return badRequest(reply, parsed.error);
             }
             db.transaction(() => {
-                for (const {metric, partial} of parsed.value.metrics) {
+                for (const [metric, partial] of metricEntries(parsed.value)) {
                     setTeamMetricConfig(db, team, metric, partial);
                 }
                 if (parsed.value.engine) {

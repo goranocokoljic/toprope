@@ -265,5 +265,38 @@ describe('anomaly config', () => {
             setTeamMetricConfig(db, 'frontend', 'cost', {method: 'statistical'});
             expect(getTeamAnomalyOverrides(db, 'frontend').metrics.cost).toEqual({method: 'statistical'});
         });
+
+        it('keeps a standalone percentageBaseline when the EFFECTIVE method is percentage_change', () => {
+            // `cost` defaults to percentage_change. Setting only percentageBaseline
+            // (no method) is a valid change and must NOT be discarded — regression
+            // guard for judging against the override-row method instead of the
+            // effective one.
+            setGlobalSetting(db, 'anomaly_managers_can_override', true);
+            setTeamMetricConfig(db, 'frontend', 'cost', {percentageBaseline: 'average'});
+            expect(getTeamAnomalyOverrides(db, 'frontend').metrics.cost).toEqual({
+                percentageBaseline: 'average',
+            });
+
+            // A statistical metric (commits) drops a (nonsensical) percentageBaseline.
+            setTeamMetricConfig(db, 'frontend', 'commits', {percentageBaseline: 'average'});
+            expect(getTeamAnomalyOverrides(db, 'frontend').metrics.commits).toBeUndefined();
+        });
+    });
+
+    // Task 4.12 review (SEC-1): numeric knobs are bounded above, mirroring the
+    // registry's max coercion, so an admin can't set a pathological scan window.
+    describe('validator upper bounds', () => {
+        it('rejects out-of-range-high metric values', () => {
+            expect(validateMetricConfigPatch({threshold: 100000}).ok).toBe(false);
+            expect(validateMetricConfigPatch({baselineWindow: 100000000}).ok).toBe(false);
+            // In-range values still pass.
+            expect(validateMetricConfigPatch({threshold: 50, baselineWindow: 12}).ok).toBe(true);
+        });
+
+        it('rejects out-of-range-high engine values', () => {
+            expect(validateEngineParamsPatch({minBaselinePeriods: 2000000000}).ok).toBe(false);
+            expect(validateEngineParamsPatch({statisticalHighZ: 1000}).ok).toBe(false);
+            expect(validateEngineParamsPatch({minBaselinePeriods: 8, statisticalHighZ: 3}).ok).toBe(true);
+        });
     });
 });

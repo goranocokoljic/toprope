@@ -286,12 +286,14 @@ function setMetricConfig(
 ): void {
     const map = readJsonRow(db, scope, scopeName, CONFIG_KEY) ?? {};
     const merged = {...coerceMetricOverride(map[metric]), ...partial};
-    // percentageBaseline only applies to percentage_change. If the effective
-    // method is statistical, drop a lingering percentageBaseline so a
-    // statistical→percentage_change→statistical round-trip can't leave stale,
-    // misleading dead data in the stored row (it would be ignored at resolution
-    // but confuses anyone reading the row).
-    if (merged.method !== 'percentage_change') {
+    // percentageBaseline only applies to percentage_change. If the EFFECTIVE
+    // method (the override's method, else the registry default) is statistical,
+    // drop a lingering percentageBaseline so a method round-trip can't leave
+    // stale dead data in the row. Must use the effective method, not merged.method
+    // alone: a metric like `cost` defaults to percentage_change, so setting only
+    // {percentageBaseline} (no method) is a valid change we must NOT discard.
+    const effectiveMethod = merged.method ?? METRIC_DEFS[metric].defaults.method;
+    if (effectiveMethod !== 'percentage_change') {
         delete merged.percentageBaseline;
     }
     map[metric] = merged;
@@ -394,6 +396,14 @@ export function getTeamAnomalyOverrides(db: Database.Database, team: string): Te
 
 export type Validated<T> = {ok: true; value: T} | {ok: false; error: string};
 
+// Upper bounds for the numeric knobs, mirroring the registry's bounded coercion
+// (SettingDef.max) so an admin can't set a pathological value the scan would
+// then iterate/buffer over. Generous but finite: a baseline window of 104 is two
+// years of weekly periods; a threshold of 1000 matches the registry's roi cap.
+const MAX_THRESHOLD = 1000;
+const MAX_BASELINE_WINDOW = 104;
+const MAX_HIGH_Z = 10;
+
 const METRIC_FIELDS = new Set(['method', 'threshold', 'baselineWindow', 'percentageBaseline']);
 
 /** Validate an untrusted per-metric config patch (all fields optional). */
@@ -415,8 +425,13 @@ export function validateMetricConfigPatch(raw: unknown): Validated<Partial<Metri
         out.method = obj.method;
     }
     if ('threshold' in obj) {
-        if (typeof obj.threshold !== 'number' || !Number.isFinite(obj.threshold) || obj.threshold <= 0) {
-            return {ok: false, error: 'threshold must be a number > 0'};
+        if (
+            typeof obj.threshold !== 'number' ||
+            !Number.isFinite(obj.threshold) ||
+            obj.threshold <= 0 ||
+            obj.threshold > MAX_THRESHOLD
+        ) {
+            return {ok: false, error: `threshold must be a number in (0, ${MAX_THRESHOLD}]`};
         }
         out.threshold = obj.threshold;
     }
@@ -424,9 +439,10 @@ export function validateMetricConfigPatch(raw: unknown): Validated<Partial<Metri
         if (
             typeof obj.baselineWindow !== 'number' ||
             !Number.isInteger(obj.baselineWindow) ||
-            obj.baselineWindow < 2
+            obj.baselineWindow < 2 ||
+            obj.baselineWindow > MAX_BASELINE_WINDOW
         ) {
-            return {ok: false, error: 'baselineWindow must be a whole number >= 2'};
+            return {ok: false, error: `baselineWindow must be a whole number in [2, ${MAX_BASELINE_WINDOW}]`};
         }
         out.baselineWindow = obj.baselineWindow;
     }
@@ -457,9 +473,10 @@ export function validateEngineParamsPatch(raw: unknown): Validated<Partial<Engin
         if (
             typeof obj.minBaselinePeriods !== 'number' ||
             !Number.isInteger(obj.minBaselinePeriods) ||
-            obj.minBaselinePeriods < 1
+            obj.minBaselinePeriods < 1 ||
+            obj.minBaselinePeriods > MAX_BASELINE_WINDOW
         ) {
-            return {ok: false, error: 'minBaselinePeriods must be a whole number >= 1'};
+            return {ok: false, error: `minBaselinePeriods must be a whole number in [1, ${MAX_BASELINE_WINDOW}]`};
         }
         out.minBaselinePeriods = obj.minBaselinePeriods;
     }
@@ -467,9 +484,10 @@ export function validateEngineParamsPatch(raw: unknown): Validated<Partial<Engin
         if (
             typeof obj.statisticalHighZ !== 'number' ||
             !Number.isFinite(obj.statisticalHighZ) ||
-            obj.statisticalHighZ <= 0
+            obj.statisticalHighZ <= 0 ||
+            obj.statisticalHighZ > MAX_HIGH_Z
         ) {
-            return {ok: false, error: 'statisticalHighZ must be a number > 0'};
+            return {ok: false, error: `statisticalHighZ must be a number in (0, ${MAX_HIGH_Z}]`};
         }
         out.statisticalHighZ = obj.statisticalHighZ;
     }
