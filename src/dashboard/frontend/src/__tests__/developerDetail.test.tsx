@@ -131,10 +131,14 @@ describe('Manager DeveloperDetail (Task 4.11)', () => {
         expect(within(screen.getByTestId('journey-timeline')).getByText('Started using Copilot')).toBeInTheDocument();
     });
 
-    it('shows a not-found state for an unknown developer', async () => {
+    it('shows a not-found state for an unknown developer, with no bogus header', async () => {
         installFetch({notFound: true});
         renderPage();
 
         expect(await screen.findByText('Developer not found')).toBeInTheDocument();
+        // The identity header must NOT render for a developer we couldn't load —
+        // no "dev-1 · adoption journey" title beside the not-found state.
+        expect(screen.queryByRole('heading', {name: 'dev-1'})).not.toBeInTheDocument();
+        expect(screen.queryByText(/adoption journey/i)).not.toBeInTheDocument();
     });
 });

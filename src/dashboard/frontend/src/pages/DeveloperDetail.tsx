@@ -41,12 +41,21 @@ export function DeveloperDetail(): JSX.Element {
                 <Link to="/manager/teams" className="text-sm text-accent hover:underline">
                     ← Teams
                 </Link>
-                <h1 className="mt-1 text-2xl font-semibold text-foreground">{identity.data?.name ?? id}</h1>
-                <p className="mt-1 text-sm text-muted">
-                    {identity.data?.team
-                        ? `${identity.data.team} · adoption journey`
-                        : 'Developer adoption journey'}
-                </p>
+                {/* The identity header is suppressed on a load failure so the page
+                    never shows a title for a developer it couldn't load (e.g. a
+                    404 would otherwise read "dev-1's journey" beside "not found"). */}
+                {!isError ? (
+                    <>
+                        <h1 className="mt-1 text-2xl font-semibold text-foreground">
+                            {identity.data?.name ?? id}
+                        </h1>
+                        <p className="mt-1 text-sm text-muted">
+                            {identity.data?.team
+                                ? `${identity.data.team} · adoption journey`
+                                : 'Developer adoption journey'}
+                        </p>
+                    </>
+                ) : null}
             </div>
 
             {isPending ? <LoadingDetail /> : null}

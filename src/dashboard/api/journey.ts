@@ -1,5 +1,5 @@
 import type Database from 'better-sqlite3';
-import {rankToTier} from './coverage';
+import {developerDataRank, rankToTier} from './coverage';
 import {getMeJourney, type MeJourney} from './developer-views';
 
 /**
@@ -228,39 +228,14 @@ export function detectAnnotations(trajectory: JourneyTrajectoryPoint[]): Journey
 }
 
 /**
- * The developer's data-quality tier from their BEST available signal, using the
- * same rank boundaries as the org coverage snapshot ({@link rankToTier}): tool
- * API data → high, git activity → medium, a live expense-only seat → low, nothing
- * → none. This is what labels a launch-era journey an estimate.
+ * The developer's data-quality tier from their BEST available signal — tool API
+ * data → high, git activity → medium, a live expense-only seat → low, nothing →
+ * none. Delegates to the canonical {@link developerDataRank}/{@link rankToTier}
+ * pair so the journey can never drift from the org coverage snapshot's model.
+ * This is what labels a launch-era (git-only) journey an estimate.
  */
 export function developerTier(db: Database.Database, developerId: string): JourneyTier {
-    const toolRank =
-        (
-            db
-                .prepare(
-                    `SELECT MAX(CASE data_quality
-                                    WHEN 'high' THEN 3
-                                    WHEN 'medium' THEN 2
-                                    WHEN 'low' THEN 1
-                                    ELSE 0 END) AS rank
-                     FROM tool_snapshots
-                     WHERE developer_id = ?`,
-                )
-                .get(developerId) as {rank: number | null}
-        ).rank ?? 0;
-
-    const hasGit =
-        db.prepare('SELECT 1 FROM git_snapshots WHERE developer_id = ? LIMIT 1').get(developerId) !==
-        undefined;
-    const hasExpense =
-        db
-            .prepare(
-                `SELECT 1 FROM subscriptions
-                 WHERE developer_id = ? AND seat_revoked_at IS NULL LIMIT 1`,
-            )
-            .get(developerId) !== undefined;
-
-    return rankToTier(Math.max(toolRank, hasGit ? 2 : 0, hasExpense ? 1 : 0));
+    return rankToTier(developerDataRank(db, developerId));
 }
 
 /**
@@ -319,11 +294,6 @@ function getDailyActivity(db: Database.Database, developerId: string): DailyActi
     return Array.from(byDate.values()).sort((a, b) => a.date.localeCompare(b.date));
 }
 
-/** The later of two YYYY-MM-DD dates (lexical = chronological for this format). */
-function maxDate(a: string, b: string): string {
-    return a >= b ? a : b;
-}
-
 /**
  * Assemble the full developer adoption journey. `now` is injectable so the
  * trajectory's "to present" upper bound is deterministic in tests; in production
@@ -348,11 +318,13 @@ export function getDeveloperJourney(
 
     let trajectory: JourneyTrajectoryPoint[] = [];
     if (firstActivity && lastActivity) {
+        // Always run to the present week (the hard upper bound): an inactive tail
+        // after the last active day shows as a real drop-off, AND a single
+        // future-dated row (clock skew, bad import) can't extend the series past
+        // now — buildTrajectory only walks [firstWeek, nowWeek], so any week
+        // beyond now is dropped rather than emitting thousands of empty points.
         const nowWeek = weekStartOf(now.toISOString().slice(0, 10));
-        // Extend to the present so an inactive tail (a drop-off after the last
-        // active day) is visible, never clamped to the last active week.
-        const lastWeek = maxDate(weekStartOf(lastActivity), nowWeek);
-        trajectory = buildTrajectory(daily, weekStartOf(firstActivity), lastWeek);
+        trajectory = buildTrajectory(daily, weekStartOf(firstActivity), nowWeek);
     }
 
     return {

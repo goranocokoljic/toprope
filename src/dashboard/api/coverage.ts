@@ -81,6 +81,43 @@ export function developerDataRanks(db: Database.Database): Map<string, number> {
 }
 
 /**
+ * One developer's BEST available signal as a rank (0–3), using the SAME boundaries
+ * as {@link developerDataRanks} — tool API quality, then git activity (2), then a
+ * live expense-only seat (1), else 0. The single-developer counterpart for callers
+ * that need just one id (e.g. the adoption-journey tier) without folding the whole
+ * org map, so the data-quality model stays in one place and can't drift.
+ */
+export function developerDataRank(db: Database.Database, developerId: string): number {
+    const toolRank =
+        (
+            db
+                .prepare(
+                    `SELECT MAX(CASE data_quality
+                                    WHEN 'high' THEN 3
+                                    WHEN 'medium' THEN 2
+                                    WHEN 'low' THEN 1
+                                    ELSE 0 END) AS rank
+                     FROM tool_snapshots
+                     WHERE developer_id = ?`,
+                )
+                .get(developerId) as {rank: number | null}
+        ).rank ?? 0;
+
+    const hasGit =
+        db.prepare('SELECT 1 FROM git_snapshots WHERE developer_id = ? LIMIT 1').get(developerId) !==
+        undefined;
+    const hasExpense =
+        db
+            .prepare(
+                `SELECT 1 FROM subscriptions
+                 WHERE developer_id = ? AND seat_revoked_at IS NULL LIMIT 1`,
+            )
+            .get(developerId) !== undefined;
+
+    return Math.max(toolRank, hasGit ? 2 : 0, hasExpense ? 1 : 0);
+}
+
+/**
  * Org-wide per-developer data-quality counts: each developer bucketed by their
  * best available signal (see {@link developerDataRanks}).
  */

@@ -103,6 +103,43 @@ describe('journey pure helpers', () => {
             expect(ann.find((a) => a.type === 'plateau')?.week_start).toBe('2024-01-01');
             expect(ann.some((a) => a.type === 'sustained_ramp')).toBe(false);
         });
+
+        it('treats a near-flat run just inside the 20% band as a plateau, just outside as not', () => {
+            // [10,9,10]: range 1, mean 9.67, 0.2·mean ≈ 1.93 → 1 ≤ 1.93 → plateau.
+            const inside = [point('2024-01-01', 10), point('2024-01-08', 9), point('2024-01-15', 10)];
+            expect(detectAnnotations(inside).some((a) => a.type === 'plateau')).toBe(true);
+            // [10,8,10]: range 2, mean 9.33, 0.2·mean ≈ 1.87 → 2 > 1.87 → not a plateau.
+            const outside = [point('2024-01-01', 10), point('2024-01-08', 8), point('2024-01-15', 10)];
+            expect(detectAnnotations(outside).some((a) => a.type === 'plateau')).toBe(false);
+        });
+
+        it('annotates both a ramp and a later plateau on a ramp-then-settle curve', () => {
+            // The realistic adoption shape: rise, then settle into a steady rhythm.
+            const traj = [
+                point('2024-01-01', 2),
+                point('2024-01-08', 5),
+                point('2024-01-15', 9),
+                point('2024-01-22', 9),
+                point('2024-01-29', 9),
+            ];
+            const ann = detectAnnotations(traj);
+            // Ramp anchored at the first rising window (2<5<9).
+            expect(ann.find((a) => a.type === 'sustained_ramp')?.week_start).toBe('2024-01-01');
+            // Plateau anchored at the first flat window ([9,9,9]).
+            expect(ann.find((a) => a.type === 'plateau')?.week_start).toBe('2024-01-15');
+        });
+
+        it('does not mistake a gap (zero-activity weeks) for a plateau', () => {
+            // Three consecutive zero weeks are inactive, not a flat rhythm.
+            const traj = [
+                point('2024-01-01', 6),
+                point('2024-01-08', 0, false),
+                point('2024-01-15', 0, false),
+                point('2024-01-22', 0, false),
+            ];
+            const ann = detectAnnotations(traj);
+            expect(ann.some((a) => a.type === 'plateau')).toBe(false);
+        });
     });
 });
 
@@ -237,6 +274,18 @@ describe('getDeveloperJourney (assembly)', () => {
         expect(journey.trajectory.length).toBeGreaterThan(1);
         expect(journey.trajectory[0].week_start).toBe(weekStartOf('2026-03-10'));
         // Extends to the week of "now", not clamped to the last active week.
+        expect(journey.trajectory[journey.trajectory.length - 1].week_start).toBe(weekStartOf('2026-05-30'));
+    });
+
+    it('clamps the trajectory to the present — a future-dated row cannot explode the series', () => {
+        seedTool(db, {developer: 'alice', date: '2026-03-10', interactions: 8});
+        // A bad/clock-skewed row dated far in the future must not extend the
+        // weekly walk to thousands of points; the series stops at the present.
+        seedGit(db, {developer: 'alice', date: '2099-01-01', commits: 1});
+
+        const journey = getDeveloperJourney(db, 'alice', FIXED_NOW);
+        // ~12 weeks from 2026-03-10 to 2026-05-30, not 3,800+.
+        expect(journey.trajectory.length).toBeLessThan(20);
         expect(journey.trajectory[journey.trajectory.length - 1].week_start).toBe(weekStartOf('2026-05-30'));
     });
 
