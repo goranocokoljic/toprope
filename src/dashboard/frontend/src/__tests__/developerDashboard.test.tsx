@@ -8,7 +8,7 @@ import {MemoryRouter} from 'react-router-dom';
 
 import {DeveloperDashboard} from '../pages/DeveloperDashboard';
 import {ThemeProvider} from '../theme/ThemeProvider';
-import type {MeJourney, MeOverview, MeTimeline, UserPreferences} from '../api/types';
+import type {DeveloperJourney, MeOverview, MeTimeline, UserPreferences} from '../api/types';
 
 // --- Fixtures --------------------------------------------------------------
 
@@ -22,7 +22,15 @@ const MONTH_OVERVIEW: MeOverview = {
     estimated_monthly_cost: 34,
 };
 
-const JOURNEY: MeJourney = {
+const JOURNEY: DeveloperJourney = {
+    bounds: {first_activity: '2026-03-01', last_activity: '2026-05-28'},
+    tier: 'high',
+    trajectory: [
+        {week_start: '2026-03-02', active_days: 2, interactions: 30, commits: 3, ai_signature_score: 0.4},
+        {week_start: '2026-03-09', active_days: 4, interactions: 55, commits: 5, ai_signature_score: 0.5},
+        {week_start: '2026-03-16', active_days: 5, interactions: 80, commits: 6, ai_signature_score: 0.55},
+    ],
+    annotations: [{type: 'first_active_week', week_start: '2026-03-02', label: 'First active week'}],
     tools: [
         {
             tool: 'copilot',
@@ -106,10 +114,20 @@ function jsonResponse(body: unknown): Response {
 
 interface Overrides {
     monthOverview?: MeOverview;
-    journey?: MeJourney;
+    journey?: DeveloperJourney;
     timeline?: MeTimeline;
     failOverview?: boolean;
 }
+
+/** An empty journey (no history) with all enriched fields present. */
+const EMPTY_JOURNEY: DeveloperJourney = {
+    tools: [],
+    events: [],
+    bounds: {first_activity: null, last_activity: null},
+    trajectory: [],
+    annotations: [],
+    tier: 'none',
+};
 
 let fetchMock: Mock;
 
@@ -230,6 +248,18 @@ describe('DeveloperDashboard — adoption journey', () => {
         // Tool switch.
         expect(within(timeline).getByText('Switched from Copilot to Windsurf')).toBeInTheDocument();
     });
+
+    it('renders the enriched timeline: tier label, trajectory, and annotated key moments', async () => {
+        renderPage();
+
+        // Tier badge (high — API) from the journey's data tier.
+        expect(await screen.findByText('High — API')).toBeInTheDocument();
+        // Weekly activity trajectory chart.
+        expect(screen.getByTestId('journey-trajectory')).toBeInTheDocument();
+        // Annotated key moment.
+        const annotations = screen.getByTestId('journey-annotations');
+        expect(within(annotations).getByText(/First active week/)).toBeInTheDocument();
+    });
 });
 
 describe('DeveloperDashboard — activity trend', () => {
@@ -249,7 +279,7 @@ describe('DeveloperDashboard — cold-start & low-data', () => {
     it('shows a "building your history" panel when nothing is tracked yet', async () => {
         installFetch({
             monthOverview: {...MONTH_OVERVIEW, active_days: 0, primary_tools: []},
-            journey: {tools: [], events: []},
+            journey: EMPTY_JOURNEY,
         });
         renderPage();
 
@@ -266,6 +296,12 @@ describe('DeveloperDashboard — cold-start & low-data', () => {
         const startedOn = new Date(Date.now() - 3 * 86_400_000).toISOString().slice(0, 10);
         installFetch({
             journey: {
+                bounds: {first_activity: startedOn, last_activity: startedOn},
+                tier: 'medium',
+                trajectory: [
+                    {week_start: startedOn, active_days: 1, interactions: 4, commits: 1, ai_signature_score: 0.3},
+                ],
+                annotations: [{type: 'first_active_week', week_start: startedOn, label: 'First active week'}],
                 tools: [
                     {
                         tool: 'copilot',

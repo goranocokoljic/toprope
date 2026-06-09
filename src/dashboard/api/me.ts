@@ -4,10 +4,10 @@ import {getDeveloperDetail, getDeveloperTimelineWindow} from './developer-detail
 import {
     earliestDeveloperDate,
     getMeActivity,
-    getMeJourney,
     getMeOverview,
     getMeTools,
 } from './developer-views';
+import {getDeveloperJourney} from './journey';
 import {parseTimeRange, TimeRangeError, type TimeRangeInput} from './range';
 import {requireDeveloperId} from './guards';
 
@@ -105,7 +105,7 @@ export function registerMeRoutes(app: FastifyInstance, db: Database.Database): v
         if (!developerId) {
             return reply;
         }
-        return {data: getMeJourney(db, developerId)};
+        return {data: getDeveloperJourney(db, developerId)};
     });
 
     app.get<{Querystring: TimeRangeInput}>('/api/me/activity', async (request, reply) => {
