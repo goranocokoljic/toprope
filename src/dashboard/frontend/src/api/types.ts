@@ -455,6 +455,17 @@ export interface DeveloperPRReviewCoaching {
     ai_assisted: PRReviewVariantTrajectory;
 }
 
+/**
+ * /api/me/pr-coaching response. Pillar 2 (PR/review coaching) can be disabled
+ * org-wide or per team (Task 5.10); when it is, the server returns only
+ * `{enabled:false}` with no trajectory, and the page shows an off-state instead
+ * of the coaching. The `enabled` discriminator lets the UI narrow safely before
+ * touching the trajectory fields.
+ */
+export type MyPRReviewCoaching =
+    | {enabled: false}
+    | ({enabled: true} & DeveloperPRReviewCoaching);
+
 /** One period of a team aggregate — suppressed (no numbers) or pooled team figures. */
 export interface TeamCoachingAggregatePoint {
     period: string;
@@ -486,6 +497,16 @@ export interface TeamPRReviewCoaching {
     all_pr: TeamCoachingVariantTrajectory;
     ai_assisted: TeamCoachingVariantTrajectory;
 }
+
+/**
+ * /api/coaching/pr-review/{org,team} response. Pillar 2 gating (Task 5.10)
+ * applies to the manager aggregate too: when the pillar is off the server returns
+ * `{enabled:false}` with no aggregate, so the surface is hidden everywhere, not
+ * just on the developer's own view.
+ */
+export type TeamPRReviewCoachingResponse =
+    | {enabled: false}
+    | ({enabled: true} & TeamPRReviewCoaching);
 
 /** First→last detected AI activity — the span of the journey timeline. */
 export interface JourneyBounds {
@@ -570,7 +591,24 @@ export interface GlobalSettings {
     anomaly_alerts_enabled: boolean;
     anomaly_alert_min_severity: AnomalyAlertMinSeverity;
     anomaly_managers_can_override: boolean;
+    // Coaching policy (Task 5.10): the org boundary for the Phase 5 coaching
+    // features. Developers make their own choices (CoachingPreferences) within it.
+    coaching_pillar1_enabled: boolean;
+    coaching_pillar2_enabled: boolean;
+    coaching_capture_permitted: boolean;
+    coaching_cloud_analysis_permitted: boolean;
+    showcase_enabled: boolean;
+    showcase_scope_permitted: ShowcaseScope;
+    nudge_default_frequency: NudgeFrequency;
+    nudge_dismissible_default: boolean;
+    coaching_managers_can_override: boolean;
 }
+
+/** Closed value sets for the coaching enum settings/preferences (Task 5.10). */
+export type ShowcaseScope = 'team_only' | 'org_wide';
+export type NudgeFrequency = 'low' | 'normal' | 'high';
+export type CaptureMechanism = 'local_agent' | 'editor_extension';
+export type CaptureRecoveryChoice = 'no_recovery' | 'recovery_path';
 
 /** Per-team settings view: resolved values, raw overrides, and override gates. */
 export interface TeamSettings {
@@ -634,6 +672,28 @@ export interface UserPreferences {
     default_time_range: TimeRangePreset;
     dark_mode: boolean;
 }
+
+// --- Developer coaching preferences (Task 5.10 / #131) ------------------
+
+/**
+ * One developer coaching preference, resolved against the org boundary. `value`
+ * is the effective value after gating; `stored` is the developer's own choice;
+ * `blocked` (+ `reason`) is set when an org policy currently forbids the choice,
+ * which the UI uses to disable the control and explain why.
+ */
+export interface ResolvedCoachingPreference {
+    key: string;
+    value: boolean | string;
+    stored: boolean | string;
+    blocked: boolean;
+    reason?: string;
+}
+
+/** GET/PATCH /api/me/coaching-preferences — keyed by preference name. */
+export type CoachingPreferences = Record<string, ResolvedCoachingPreference>;
+
+/** A PATCH body for the coaching-preferences endpoint. */
+export type CoachingPreferencesPatch = Record<string, boolean | string>;
 
 // --- Optional leaderboard (Task 2.17) -----------------------------------
 

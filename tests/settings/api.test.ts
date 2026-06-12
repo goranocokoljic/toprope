@@ -496,4 +496,208 @@ describe('settings API', () => {
             expect(res.json().data.overrides).toEqual({metrics: {}, engine: {}});
         });
     });
+
+    // Task 5.10 / #131: org coaching policy + developer coaching preferences.
+    describe('coaching settings & preferences', () => {
+        it('exposes org coaching settings with privacy-safe defaults', async () => {
+            const res = await app.inject({
+                method: 'GET',
+                url: '/api/settings/global',
+                headers: authHeaders(adminToken),
+            });
+            expect(res.json().data).toMatchObject({
+                coaching_pillar1_enabled: true,
+                coaching_pillar2_enabled: true,
+                coaching_capture_permitted: false,
+                coaching_cloud_analysis_permitted: false,
+                showcase_scope_permitted: 'team_only',
+                nudge_default_frequency: 'normal',
+            });
+        });
+
+        it('a developer cannot change org coaching policy', async () => {
+            const res = await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/global',
+                headers: authHeaders(devToken),
+                payload: {coaching_capture_permitted: true},
+            });
+            expect(res.statusCode).toBe(403);
+            // The global value is untouched.
+            const reread = await app.inject({
+                method: 'GET',
+                url: '/api/settings/global',
+                headers: authHeaders(adminToken),
+            });
+            expect(reread.json().data.coaching_capture_permitted).toBe(false);
+        });
+
+        it('a developer reads and writes only their OWN coaching preferences', async () => {
+            const get = await app.inject({
+                method: 'GET',
+                url: '/api/me/coaching-preferences',
+                headers: authHeaders(devToken),
+            });
+            expect(get.statusCode).toBe(200);
+            expect(get.json().data.nudges_enabled.value).toBe(true);
+
+            const patch = await app.inject({
+                method: 'PATCH',
+                url: '/api/me/coaching-preferences',
+                headers: authHeaders(devToken),
+                payload: {nudges_enabled: false, nudge_frequency: 'high'},
+            });
+            expect(patch.statusCode).toBe(200);
+            expect(patch.json().data.nudges_enabled.stored).toBe(false);
+            expect(patch.json().data.nudge_frequency.stored).toBe('high');
+        });
+
+        it('a developer opt-in the org forbids is stored but reported blocked', async () => {
+            const patch = await app.inject({
+                method: 'PATCH',
+                url: '/api/me/coaching-preferences',
+                headers: authHeaders(devToken),
+                payload: {cloud_analysis_opt_in: true},
+            });
+            expect(patch.statusCode).toBe(200);
+            const cloud = patch.json().data.cloud_analysis_opt_in;
+            expect(cloud.value).toBe(false); // org forbids → not honored
+            expect(cloud.blocked).toBe(true);
+            expect(cloud.reason).toMatch(/cloud/i);
+
+            // Admin permits cloud analysis → the developer's stored opt-in takes effect.
+            await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/global',
+                headers: authHeaders(adminToken),
+                payload: {coaching_cloud_analysis_permitted: true},
+            });
+            const reread = await app.inject({
+                method: 'GET',
+                url: '/api/me/coaching-preferences',
+                headers: authHeaders(devToken),
+            });
+            expect(reread.json().data.cloud_analysis_opt_in.value).toBe(true);
+            expect(reread.json().data.cloud_analysis_opt_in.blocked).toBe(false);
+        });
+
+        it('honors a developer opt-in via the PER-TEAM org boundary, not just the global one', async () => {
+            // dev-1 (alice) is seeded on team `frontend` (fixtures). This exercises the
+            // full HTTP join developer → team → resolution: the developer's opt-in is
+            // forbidden globally but PERMITTED for their team via a per-team override, so
+            // resolution must honor the team boundary — proving the route resolves against
+            // the developer's actual team, not the global default.
+            const dev = await app.inject({
+                method: 'PATCH',
+                url: '/api/me/coaching-preferences',
+                headers: authHeaders(devToken),
+                payload: {cloud_analysis_opt_in: true},
+            });
+            expect(dev.statusCode).toBe(200);
+            // Global forbids cloud analysis → blocked while only the global default applies.
+            expect(dev.json().data.cloud_analysis_opt_in.value).toBe(false);
+            expect(dev.json().data.cloud_analysis_opt_in.blocked).toBe(true);
+
+            // Admin enables per-team overrides, then permits cloud analysis for `frontend`
+            // ONLY — the global default stays false.
+            await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/global',
+                headers: authHeaders(adminToken),
+                payload: {coaching_managers_can_override: true},
+            });
+            const teamPatch = await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/team/frontend',
+                headers: authHeaders(adminToken),
+                payload: {coaching_cloud_analysis_permitted: true},
+            });
+            expect(teamPatch.statusCode).toBe(200);
+
+            // The developer (on frontend) now resolves to honored — proving resolution
+            // used the TEAM boundary, since the global permission is still false.
+            const reread = await app.inject({
+                method: 'GET',
+                url: '/api/me/coaching-preferences',
+                headers: authHeaders(devToken),
+            });
+            expect(reread.json().data.cloud_analysis_opt_in.value).toBe(true);
+            expect(reread.json().data.cloud_analysis_opt_in.blocked).toBe(false);
+
+            // Confirm the global default genuinely remained false (not silently flipped),
+            // so the honored value above can only have come from the team override.
+            const global = await app.inject({
+                method: 'GET',
+                url: '/api/settings/global',
+                headers: authHeaders(adminToken),
+            });
+            expect(global.json().data.coaching_cloud_analysis_permitted).toBe(false);
+        });
+
+        it('a blocked capture enum resolves to its neutral value, never the developer\'s stored choice', async () => {
+            // With capture forbidden org-wide (default), a stored mechanism/recovery choice
+            // must not leak through as the effective value — it collapses to the neutral
+            // default so no consumer acts on a real capture mechanism while capture is off.
+            const patch = await app.inject({
+                method: 'PATCH',
+                url: '/api/me/coaching-preferences',
+                headers: authHeaders(devToken),
+                payload: {capture_mechanism: 'editor_extension', capture_recovery_choice: 'recovery_path'},
+            });
+            expect(patch.statusCode).toBe(200);
+            const mech = patch.json().data.capture_mechanism;
+            const rec = patch.json().data.capture_recovery_choice;
+            // Stored carries the developer's choice; the effective value is the safe default.
+            expect(mech.stored).toBe('editor_extension');
+            expect(mech.blocked).toBe(true);
+            expect(mech.value).toBe('local_agent');
+            expect(rec.stored).toBe('recovery_path');
+            expect(rec.blocked).toBe(true);
+            expect(rec.value).toBe('no_recovery');
+        });
+
+        it('rejects an unknown coaching preference key', async () => {
+            const res = await app.inject({
+                method: 'PATCH',
+                url: '/api/me/coaching-preferences',
+                headers: authHeaders(devToken),
+                payload: {not_a_pref: true},
+            });
+            expect(res.statusCode).toBe(400);
+        });
+
+        it('an admin without a developer profile gets 404 on coaching preferences', async () => {
+            const res = await app.inject({
+                method: 'GET',
+                url: '/api/me/coaching-preferences',
+                headers: authHeaders(adminToken),
+            });
+            expect(res.statusCode).toBe(404);
+        });
+
+        it('disabling pillar 2 org-wide hides the developer PR-coaching surface', async () => {
+            // Enabled by default → the surface reports enabled.
+            const before = await app.inject({
+                method: 'GET',
+                url: '/api/me/pr-coaching',
+                headers: authHeaders(devToken),
+            });
+            expect(before.json().data.enabled).toBe(true);
+
+            await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/global',
+                headers: authHeaders(adminToken),
+                payload: {coaching_pillar2_enabled: false},
+            });
+
+            const after = await app.inject({
+                method: 'GET',
+                url: '/api/me/pr-coaching',
+                headers: authHeaders(devToken),
+            });
+            expect(after.json().data.enabled).toBe(false);
+            expect(after.json().data.all_pr).toBeUndefined();
+        });
+    });
 });

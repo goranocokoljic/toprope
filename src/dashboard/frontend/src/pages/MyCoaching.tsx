@@ -162,7 +162,19 @@ export function MyCoaching(): JSX.Element {
             ) : null}
 
             {!coaching.isPending && !coaching.isError && coaching.data ? (
-                <CoachingContent data={coaching.data} />
+                coaching.data.enabled ? (
+                    <CoachingContent data={coaching.data} />
+                ) : (
+                    // Pillar 2 disabled org-wide or for this team (Task 5.10): show an
+                    // explicit off-state rather than coaching, and never touch the
+                    // (absent) trajectory fields.
+                    <StatePanel
+                        tone="neutral"
+                        testId="my-coaching-disabled"
+                        title="PR/review coaching is turned off"
+                        description="Your organization has disabled PR/review coaching. If you think it should be available, reach out to your admin."
+                    />
+                )
             ) : null}
         </div>
     );

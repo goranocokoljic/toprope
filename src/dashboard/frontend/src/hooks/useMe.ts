@@ -3,7 +3,7 @@ import {api, type TimeRangeQuery} from '../api/client';
 import {queryKeys} from '../api/queryKeys';
 import type {
     DeveloperJourney,
-    DeveloperPRReviewCoaching,
+    MyPRReviewCoaching,
     MeActivity,
     MeOverview,
     MeTimeline,
@@ -71,7 +71,7 @@ export function useMeActivity(range: TimeRangeValue): UseQueryResult<MeActivity,
 /** The developer's own PR/review coaching trajectory (Task 5.3), keyed by unit. */
 export function useMyPRReviewCoaching(
     unit: PRReviewPeriodUnit,
-): UseQueryResult<DeveloperPRReviewCoaching, Error> {
+): UseQueryResult<MyPRReviewCoaching, Error> {
     return useQuery({
         queryKey: queryKeys.mePRCoaching(unit),
         queryFn: () => api.getMyPRReviewCoaching(unit),

@@ -5,7 +5,7 @@ import type {
     PRReviewPeriodUnit,
     TeamDetail,
     TeamListItem,
-    TeamPRReviewCoaching,
+    TeamPRReviewCoachingResponse,
     TeamProviders,
     TeamTrend,
     WasteAlert,
@@ -66,7 +66,7 @@ export function useTeamWaste(team: string): UseQueryResult<WasteAlert[], Error> 
 export function useTeamPRReviewCoaching(
     scope: string,
     unit: PRReviewPeriodUnit,
-): UseQueryResult<TeamPRReviewCoaching, Error> {
+): UseQueryResult<TeamPRReviewCoachingResponse, Error> {
     return useQuery({
         queryKey: queryKeys.teamPRCoaching(scope, unit),
         queryFn: () => api.getTeamPRReviewCoaching(scope, unit),
