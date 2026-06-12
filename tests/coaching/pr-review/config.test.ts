@@ -61,6 +61,20 @@ describe('PR review thresholds config', () => {
         expect(resolved.baselinePeriods).toBe(4);
     });
 
+    it('drops rate-like thresholds outside [0,1] — absurd values cannot disable the signals', () => {
+        db.prepare(
+            `INSERT INTO settings (scope, scope_name, key, value, updated_at)
+             VALUES ('global', '', 'pr_review_thresholds', ?, ?)`,
+        ).run(
+            JSON.stringify({rejectThreshold: 50, churnHighThreshold: 9, aiSignatureThreshold: -0.1}),
+            new Date().toISOString(),
+        );
+        const resolved = resolvePRReviewThresholds(db);
+        expect(resolved.rejectThreshold).toBe(DEFAULT_PR_REVIEW_THRESHOLDS.rejectThreshold);
+        expect(resolved.churnHighThreshold).toBe(DEFAULT_PR_REVIEW_THRESHOLDS.churnHighThreshold);
+        expect(resolved.aiSignatureThreshold).toBe(DEFAULT_PR_REVIEW_THRESHOLDS.aiSignatureThreshold);
+    });
+
     it('survives a malformed stored row (falls back to defaults)', () => {
         db.prepare(
             `INSERT INTO settings (scope, scope_name, key, value, updated_at)

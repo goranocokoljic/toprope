@@ -236,6 +236,19 @@ describe('PR/review metrics hookup (Task 5.2)', () => {
         expect(rows.map((r) => r.scope_variant).sort()).toEqual(['ai_assisted_pr', 'all_pr']);
     });
 
+    it('the weekly job also recomputes trailing weeks so late-arriving verdicts land', () => {
+        // 2026-05-27 falls in ISO week 2026-W22 — one week before the
+        // just-closed W23. The trailing recompute must re-fold it.
+        seedPRRecord('dev-1', '1', '2026-05-27T08:00:00.000Z');
+
+        const result = runScheduledJob(db, 'weekly', WEEKLY_NOW, recordingLogger());
+
+        expect(result.ok).toBe(true);
+        expect(
+            count(db, "SELECT COUNT(*) AS n FROM pr_review_metrics WHERE period = '2026-W22'"),
+        ).toBe(2);
+    });
+
     it('the monthly job computes pr_review_metrics for the just-closed month', () => {
         seedPRRecord('dev-1', '2', '2026-05-15T08:00:00.000Z');
 

@@ -16,8 +16,9 @@
  *
  * "Requiring changes" and "sent back" both derive from the providers' single
  * normalized changes-requested signal (a PR with >= 1 changes_requested review
- * event). They are computed and stored separately per the schema so the two
- * can diverge if a richer rework signal (e.g. post-review commits) lands later.
+ * event), so rework_rate and review_rejection_rate carry the same value in V1.
+ * The schema keeps two columns (per issue #123) so a richer rework signal
+ * (e.g. post-review commits) can split them later without a migration.
  *
  * Combined signal (churn + review) — the disambiguator:
  *   prs_total < min_prs                → insufficient_data
@@ -77,7 +78,7 @@ export function selectAiAssistedPRs(prs: PRData[], aiSignatureThreshold: number)
 export function commentDensity(prs: PRData[]): number | null {
     if (prs.length === 0) return null;
     const totalComments = prs.reduce((s, pr) => s + pr.reviewCommentCount, 0);
-    return totalComments / Math.max(prs.length, 1);
+    return totalComments / prs.length;
 }
 
 /**
@@ -119,11 +120,12 @@ export function computeVariantMetrics(
     const prsTotal = prs.length;
     const prsMerged = prs.filter((pr) => pr.state === 'merged').length;
 
-    const requiringChanges = prs.filter(wasSentBack).length;
     const sentBack = prs.filter(wasSentBack).length;
-
-    const reworkRate = prsTotal === 0 ? null : requiringChanges / Math.max(prsTotal, 1);
-    const rejectionRate = prsTotal === 0 ? null : sentBack / Math.max(prsTotal, 1);
+    const sentBackRate = prsTotal === 0 ? null : sentBack / prsTotal;
+    // One value feeds both rates in V1 (see header) — kept as two fields so
+    // they can diverge when a richer rework signal lands.
+    const reworkRate = sentBackRate;
+    const rejectionRate = sentBackRate;
 
     const avgReviewRounds = mean(prs.map((pr) => pr.reviewRounds));
     const density = commentDensity(prs);

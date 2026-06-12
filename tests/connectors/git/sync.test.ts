@@ -705,7 +705,7 @@ describe('GitSync', () => {
             expect(records[0].review_rounds).toBe(2);
         });
 
-        it('still records the PR when the review fetch fails (verdicts default to zero)', async () => {
+        it('still records the PR when the review fetch fails, and surfaces the failure as a sync error', async () => {
             seedDev(db, 'alice');
             const createGitProvider = await getCreateGitProvider();
             const provider = makeMockProvider({
@@ -716,13 +716,53 @@ describe('GitSync', () => {
             });
             createGitProvider.mockReturnValue(provider);
 
-            await new GitSync(makeGithubConfig()).sync(db);
+            const result = await new GitSync(makeGithubConfig()).sync(db);
 
             const records = getPRRecords();
             expect(records).toHaveLength(1);
             expect(records[0].changes_requested_count).toBe(0);
             // Comments alone still count as review activity
             expect(records[0].review_rounds).toBe(1);
+            // The failure is not silent — a token missing the reviews scope
+            // must not masquerade as a clean review history.
+            expect(result.errors.some((e) => /review verdicts/.test(e))).toBe(true);
+        });
+
+        it('a failed review fetch on re-sync preserves previously-observed verdict data', async () => {
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            const goodProvider = makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+                getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+                getReviewComments: vi.fn().mockResolvedValue([
+                    makeProviderReviewComment('bob'),
+                    makeProviderReviewComment('bob'),
+                ]),
+                getPRReviews: vi.fn().mockResolvedValue([
+                    {author: {name: '', email: '', username: 'bob'}, state: 'changes_requested', submittedAt: '2024-01-15T12:00:00Z', prId: '1'},
+                ]),
+            });
+            createGitProvider.mockReturnValue(goodProvider);
+            await new GitSync(makeGithubConfig()).sync(db);
+            expect(getPRRecords()[0].changes_requested_count).toBe(1);
+            expect(getPRRecords()[0].review_rounds).toBe(2);
+
+            // Re-sync with both fetches failing (rate limit, revoked scope…).
+            const badProvider = makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+                getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+                getReviewComments: vi.fn().mockRejectedValue(new Error('rate limited')),
+                getPRReviews: vi.fn().mockRejectedValue(new Error('rate limited')),
+            });
+            createGitProvider.mockReturnValue(badProvider);
+            await new GitSync(makeGithubConfig()).sync(db);
+
+            // The bad sync must not rewrite real review history as "clean".
+            const records = getPRRecords();
+            expect(records).toHaveLength(1);
+            expect(records[0].review_comment_count).toBe(2);
+            expect(records[0].changes_requested_count).toBe(1);
+            expect(records[0].review_rounds).toBe(2);
         });
 
         it('skips PRs from authors with no developer record', async () => {

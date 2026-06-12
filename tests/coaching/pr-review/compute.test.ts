@@ -304,6 +304,43 @@ describe('computePRReviewMetricsForPeriod', () => {
         expect(row.avg_time_to_merge_hours).toBe(24);
     });
 
+    it('retracts rows for a developer whose PRs were re-attributed out of the period', () => {
+        const wrongDev = seedDev(db, 'wrong');
+        const rightDev = seedDev(db, 'right');
+        for (let i = 1; i <= 3; i++) {
+            seedPR(db, {developerId: wrongDev, prId: `${i}`, createdAt: `2026-05-0${i}T08:00:00Z`, mergedAt: `2026-05-0${i}T20:00:00Z`, ttmHours: 12});
+        }
+
+        computePRReviewMetricsForPeriod(db, 'monthly', '2026-05');
+        expect(getRow(db, wrongDev, '2026-05', 'all_pr').prs_total).toBe(3);
+
+        // Registry correction: the PRs were really rightDev's. The sync
+        // re-attributes pr_records; the recompute must not leave wrongDev's
+        // rows behind with numbers derived from PRs no longer theirs.
+        db.prepare('UPDATE pr_records SET developer_id = ?').run(rightDev);
+        computePRReviewMetricsForPeriod(db, 'monthly', '2026-05');
+
+        expect(getRow(db, rightDev, '2026-05', 'all_pr').prs_total).toBe(3);
+        const stale = db
+            .prepare('SELECT COUNT(*) AS n FROM pr_review_metrics WHERE developer_id = ?')
+            .get(wrongDev) as {n: number};
+        expect(stale.n).toBe(0);
+    });
+
+    it("extends an open PR's AI window to today, not just its creation day", () => {
+        const dev = seedDev(db, 'alice');
+        // Open PR created 05-04; the developer's scored activity lands later
+        // in the window. With a creation-day-only window the estimate would be
+        // null; created→today covers it.
+        seedPR(db, {developerId: dev, prId: 'open-1', createdAt: '2026-05-04T08:00:00Z', state: 'open'});
+        seedSnapshot(db, {developerId: dev, date: '2026-05-08', aiScore: 0.9});
+        setPRReviewThresholds(db, {minPrs: 1});
+
+        computePRReviewMetricsForPeriod(db, 'monthly', '2026-05', new Date('2026-05-20T04:00:00Z'));
+
+        expect(getRow(db, dev, '2026-05', 'ai_assisted_pr').prs_total).toBe(1);
+    });
+
     it('supports weekly periods keyed by ISO week label (YYYY-Www)', () => {
         const dev = seedDev(db, 'alice');
         // 2026-W19 spans 2026-05-04 (Mon) .. 2026-05-10 (Sun)

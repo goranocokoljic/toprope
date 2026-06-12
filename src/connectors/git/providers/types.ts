@@ -46,13 +46,14 @@ export interface GitReviewComment {
 
 /**
  * Normalized review verdict states across providers:
- *   - GitHub: PR review states APPROVED / CHANGES_REQUESTED / COMMENTED
+ *   - GitHub: PR review states APPROVED / CHANGES_REQUESTED
  *   - Bitbucket: activity entries with `approval` / `changes_requested`
  *   - GitLab: system notes "approved this merge request" / "requested changes"
- * Anything that is review activity but not an explicit verdict maps to
- * 'commented'.
+ * Only explicit verdicts are events — comment-level review activity is
+ * deliberately excluded on every provider (it is covered by
+ * getReviewComments), so the event stream is provider-equivalent.
  */
-export type GitReviewState = 'approved' | 'changes_requested' | 'commented';
+export type GitReviewState = 'approved' | 'changes_requested';
 
 export interface GitPRReview {
     author: GitAuthor;

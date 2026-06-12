@@ -145,14 +145,12 @@ interface RawComment {
 }
 
 // One entry of GET /pullrequests/{id}/activity. Each entry carries exactly one
-// of these keys: `approval` (an approve event), `changes_requested` (a
-// request-changes event), `comment`, or `update`. Only the first two are
-// review verdicts; comments are already covered by getReviewComments.
+// key: `approval` (an approve event), `changes_requested` (a request-changes
+// event), `comment`, or `update`. Only the first two are review verdicts;
+// comments are already covered by getReviewComments.
 interface RawActivityEntry {
-    approval?: {date: string; user: RawParticipant | null};
-    changes_requested?: {date: string; user: RawParticipant | null};
-    comment?: unknown;
-    update?: unknown;
+    approval?: {date?: string; user: RawParticipant | null};
+    changes_requested?: {date?: string; user: RawParticipant | null};
 }
 
 function normalizePRState(bbState: string): string {
@@ -330,6 +328,10 @@ export class BitbucketProvider implements GitProvider {
                     author: participantToAuthor(pr.author),
                     state: normalizedState,
                     createdAt: pr.created_on,
+                    // Approximation: the PR list payload has no merge timestamp,
+                    // so updated_on stands in. Post-merge activity bumps it, so
+                    // consumers persisting a time-to-merge must keep the FIRST
+                    // observed value (see upsertPRRecord in ../sync.ts).
                     mergedAt: normalizedState === 'merged' ? pr.updated_on : null,
                     closedAt: normalizedState === 'closed' ? pr.updated_on : null,
                     reviewers: (pr.reviewers ?? []).map(participantToAuthor),
@@ -366,14 +368,16 @@ export class BitbucketProvider implements GitProvider {
 
         const reviews: GitPRReview[] = [];
         for (const entry of entries) {
-            if (entry.approval) {
+            // Entries lacking a date can't be ordered — skip rather than crash
+            // the whole verdict fetch for the PR.
+            if (entry.approval?.date) {
                 reviews.push({
                     author: participantToAuthor(entry.approval.user),
                     state: 'approved',
                     submittedAt: entry.approval.date,
                     prId,
                 });
-            } else if (entry.changes_requested) {
+            } else if (entry.changes_requested?.date) {
                 reviews.push({
                     author: participantToAuthor(entry.changes_requested.user),
                     state: 'changes_requested',
@@ -385,8 +389,11 @@ export class BitbucketProvider implements GitProvider {
         }
 
         // The activity feed is newest-first; return oldest-first to match the
-        // other providers' submission order.
-        return reviews.sort((a, b) => a.submittedAt.localeCompare(b.submittedAt));
+        // other providers' submission order. Numeric compare, not lexicographic:
+        // Bitbucket timestamps carry offsets (+00:00-style).
+        return reviews.sort(
+            (a, b) => Date.parse(a.submittedAt) - Date.parse(b.submittedAt),
+        );
     }
 
     async getCommitDiff(repo: string, commitSha: string): Promise<GitFileDiff[]> {

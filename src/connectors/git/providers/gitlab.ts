@@ -405,16 +405,21 @@ export class GitLabProvider implements GitProvider {
             if (hasNextPage) page = parseInt(nextPage!, 10);
         }
 
-        // GitLab exposes review verdicts as system notes on the MR. Normalize
-        // the two verdict bodies; everything else (comments are covered by
-        // getReviewComments, unapprovals don't add a round) is skipped.
+        // GitLab exposes review verdicts as system notes on the MR — there is
+        // no structured verdict field in the notes API, so this matches the
+        // system-note wording (verified against GitLab 16.x/17.x SaaS).
+        // startsWith, not equality: GitLab occasionally appends detail to
+        // system notes, and a wording extension must degrade to "still
+        // matches", not to a silent zero-verdict undercount. Everything else
+        // (comments are covered by getReviewComments, unapprovals don't add a
+        // round) is skipped.
         const reviews: GitPRReview[] = [];
         for (const n of notes) {
             if (!n.system) continue;
             let state: GitReviewState;
-            if (n.body === 'approved this merge request') {
+            if (n.body.startsWith('approved this merge request')) {
                 state = 'approved';
-            } else if (n.body === 'requested changes') {
+            } else if (n.body.startsWith('requested changes')) {
                 state = 'changes_requested';
             } else {
                 continue;

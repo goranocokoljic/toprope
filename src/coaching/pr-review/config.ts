@@ -46,8 +46,12 @@ function readJsonRow(db: Database.Database, key: string): Record<string, unknown
 function coerceOverride(raw: Record<string, unknown> | null): Partial<PRReviewThresholds> {
     if (!raw) return {};
     const out: Partial<PRReviewThresholds> = {};
+    // The three rate-like thresholds compare against [0,1] ratios (churn rate,
+    // rejection rate, AI-signature score). A value outside [0,1] would silently
+    // make a signal unreachable (e.g. rejectThreshold 50 disables 'struggling'),
+    // so out-of-range values are dropped like any other invalid field.
     const ratio = (v: unknown): v is number =>
-        typeof v === 'number' && Number.isFinite(v) && v >= 0;
+        typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 1;
     if (ratio(raw.churnHighThreshold)) out.churnHighThreshold = raw.churnHighThreshold;
     if (ratio(raw.rejectThreshold)) out.rejectThreshold = raw.rejectThreshold;
     if (ratio(raw.aiSignatureThreshold)) out.aiSignatureThreshold = raw.aiSignatureThreshold;
@@ -73,7 +77,11 @@ export function resolvePRReviewThresholds(db: Database.Database): PRReviewThresh
     return {...DEFAULT_PR_REVIEW_THRESHOLDS, ...coerceOverride(readJsonRow(db, THRESHOLDS_KEY))};
 }
 
-/** Set (merge) the global thresholds override. */
+/**
+ * Set (merge) the global thresholds override. Used by tests and the future
+ * coaching-settings surface (Task 5.10), mirroring the anomaly config's
+ * setters that predated their Task 4.12 settings-API wiring.
+ */
 export function setPRReviewThresholds(
     db: Database.Database,
     partial: Partial<PRReviewThresholds>,

@@ -1,6 +1,5 @@
 import {describe, it, expect} from 'vitest';
 import {
-    EPSILON,
     commentDensity,
     computeCombinedSignal,
     computeVariantMetrics,
@@ -188,9 +187,3 @@ describe('computeCombinedSignal — the churn + review disambiguator', () => {
     });
 });
 
-describe('EPSILON', () => {
-    it('is small and positive', () => {
-        expect(EPSILON).toBeGreaterThan(0);
-        expect(EPSILON).toBeLessThan(1e-6);
-    });
-});

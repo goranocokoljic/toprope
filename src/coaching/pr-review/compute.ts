@@ -120,17 +120,21 @@ function prepareStatements(db: Database.Database): Statements {
 /**
  * Load a developer's PRs for a day range, annotated with the per-PR AI
  * signature estimate (mean daily ai_signature_score over the PR's active
- * window; null when the window has no scored git activity).
+ * window; null when the window has no scored git activity). The window is
+ * created → merged/closed; for a still-open PR it extends to `today` so the
+ * estimate covers the work actually done so far, not just the creation day.
  */
 function loadAnnotatedPRs(
     stmts: Statements,
     developerId: string,
     range: DateRange,
+    today: string,
 ): PRData[] {
     const rows = stmts.prsInRange.all(developerId, range.start, range.end) as PRRecordRow[];
     return rows.map((row) => {
         const windowStart = row.created_at.slice(0, 10);
-        const windowEnd = (row.merged_at ?? row.closed_at ?? row.created_at).slice(0, 10);
+        const closedDay = row.merged_at ?? row.closed_at;
+        const windowEnd = closedDay ? closedDay.slice(0, 10) : today;
         const ai = stmts.aiSignature.get(
             developerId,
             windowStart,
@@ -152,32 +156,45 @@ function loadAnnotatedPRs(
     });
 }
 
+interface BaselineDensities {
+    allPr: number | null;
+    aiAssisted: number | null;
+}
+
+function meanOrNull(values: number[]): number | null {
+    if (values.length === 0) return null;
+    return values.reduce((s, d) => s + d, 0) / values.length;
+}
+
 /**
- * The developer's OWN trailing comment density (within-developer baseline):
- * the mean of the per-period densities over the prior `baselinePeriods`
- * periods, counting only periods where the developer actually had PRs (an
- * idle week is no evidence about density). Recomputed live from pr_records so
- * the result is deterministic regardless of which metric rows already exist.
- * Null when no prior period has any PRs — the first period has no baseline.
+ * The developer's OWN trailing comment densities (within-developer baseline),
+ * for both variants in one walk: the mean of the per-period densities over the
+ * prior `baselinePeriods` periods, counting only periods where the developer
+ * actually had PRs in that variant's scope (an idle week is no evidence about
+ * density). Recomputed live from pr_records so the result is deterministic
+ * regardless of which metric rows already exist. Null when no prior period has
+ * any PRs — the first period has no baseline.
  */
-function trailingBaselineDensity(
+function trailingBaselineDensities(
     stmts: Statements,
     developerId: string,
     unit: PRReviewPeriodUnit,
     period: string,
     thresholds: PRReviewThresholds,
-    selectPRs: (prs: PRData[]) => PRData[],
-): number | null {
-    const densities: number[] = [];
+    today: string,
+): BaselineDensities {
+    const allDensities: number[] = [];
+    const aiDensities: number[] = [];
     let key = period;
     for (let i = 0; i < thresholds.baselinePeriods; i++) {
         key = priorPeriod(unit, key);
-        const prs = selectPRs(loadAnnotatedPRs(stmts, developerId, periodRange(unit, key)));
-        const density = commentDensity(prs);
-        if (density !== null) densities.push(density);
+        const prs = loadAnnotatedPRs(stmts, developerId, periodRange(unit, key), today);
+        const all = commentDensity(prs);
+        if (all !== null) allDensities.push(all);
+        const ai = commentDensity(selectAiAssistedPRs(prs, thresholds.aiSignatureThreshold));
+        if (ai !== null) aiDensities.push(ai);
     }
-    if (densities.length === 0) return null;
-    return densities.reduce((s, d) => s + d, 0) / densities.length;
+    return {allPr: meanOrNull(allDensities), aiAssisted: meanOrNull(aiDensities)};
 }
 
 function writeMetrics(
@@ -215,7 +232,10 @@ function writeMetrics(
  * coaching on no data); a developer whose PRs are all non-AI still gets an
  * ai_assisted_pr row (prs_total 0 → insufficient_data) so the variant pair
  * stays complete and the separation explicit. Idempotent: re-running a period
- * recomputes and overwrites via the (developer, period, scope_variant) key.
+ * recomputes and overwrites via the (developer, period, scope_variant) key,
+ * and deletes rows for developers who no longer have PRs in the period (e.g.
+ * after a registry correction re-attributed their PRs) so a recompute never
+ * leaves another developer's numbers behind.
  */
 export function computePRReviewMetricsForPeriod(
     db: Database.Database,
@@ -227,6 +247,7 @@ export function computePRReviewMetricsForPeriod(
     const thresholds = resolvePRReviewThresholds(db);
     const stmts = prepareStatements(db);
     const computedAt = now.toISOString();
+    const today = computedAt.slice(0, 10);
 
     const developerRows = db
         .prepare(
@@ -237,8 +258,19 @@ export function computePRReviewMetricsForPeriod(
 
     let rowsWritten = 0;
     const run = db.transaction(() => {
+        // Retract rows the recompute will not regenerate: a developer whose
+        // PRs were re-attributed out of this period must not keep metrics
+        // derived from PRs that are no longer theirs.
+        const ids = developerRows.map((r) => r.id);
+        const placeholders = ids.map(() => '?').join(', ');
+        db.prepare(
+            ids.length === 0
+                ? 'DELETE FROM pr_review_metrics WHERE period = ?'
+                : `DELETE FROM pr_review_metrics WHERE period = ? AND developer_id NOT IN (${placeholders})`,
+        ).run(period, ...ids);
+
         for (const {id: developerId} of developerRows) {
-            const allPRs = loadAnnotatedPRs(stmts, developerId, range);
+            const allPRs = loadAnnotatedPRs(stmts, developerId, range, today);
             if (allPRs.length === 0) continue;
             const aiPRs = selectAiAssistedPRs(allPRs, thresholds.aiSignatureThreshold);
 
@@ -249,19 +281,15 @@ export function computePRReviewMetricsForPeriod(
                 given: number;
             };
 
-            const allBaseline = trailingBaselineDensity(
-                stmts, developerId, unit, period, thresholds, (prs) => prs,
-            );
-            const aiBaseline = trailingBaselineDensity(
-                stmts, developerId, unit, period, thresholds,
-                (prs) => selectAiAssistedPRs(prs, thresholds.aiSignatureThreshold),
+            const baselines = trailingBaselineDensities(
+                stmts, developerId, unit, period, thresholds, today,
             );
 
             const allMetrics = computeVariantMetrics(
-                'all_pr', allPRs, churnRow.churn, allBaseline, thresholds,
+                'all_pr', allPRs, churnRow.churn, baselines.allPr, thresholds,
             );
             const aiMetrics = computeVariantMetrics(
-                'ai_assisted_pr', aiPRs, churnRow.churn, aiBaseline, thresholds,
+                'ai_assisted_pr', aiPRs, churnRow.churn, baselines.aiAssisted, thresholds,
             );
 
             writeMetrics(stmts, developerId, period, allMetrics, givenRow.given, computedAt);

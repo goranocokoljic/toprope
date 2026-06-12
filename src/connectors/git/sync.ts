@@ -249,8 +249,14 @@ interface PRRecordInput {
     closedAt: string | null;
     reviewCommentCount: number;
     changesRequestedCount: number;
-    /** Normalized review verdict events (approve/CR/comment reviews). */
+    /** Normalized review verdict events (approved / changes_requested). */
     reviewEventCount: number;
+    // Whether the comment / verdict fetches succeeded. On failure the counts
+    // above are zero BY ABSENCE, not by observation — the upsert must not let
+    // them clobber previously-observed values (a transient API failure would
+    // otherwise rewrite real review history as "clean reviews").
+    commentsOk: boolean;
+    reviewsOk: boolean;
 }
 
 interface ProviderFetchResult {
@@ -343,9 +349,12 @@ async function fetchProviderData(
             );
         }
 
+        let commentFetchFailures = 0;
+        let reviewFetchFailures = 0;
         for (const pr of rawPRs) {
             allPRs.push(toAnalysisPR(pr));
             let prCommentCount = 0;
+            let commentsOk = true;
             try {
                 const comments = await provider.getReviewComments(repoName, pr.id);
                 prCommentCount = comments.length;
@@ -353,14 +362,17 @@ async function fetchProviderData(
                     allReviewComments.push(toAnalysisReviewComment(c));
                 }
             } catch {
-                // Review comment fetch failed — skip for this PR
+                // Review comment fetch failed — counted and surfaced below
+                commentsOk = false;
+                commentFetchFailures++;
             }
 
             // Review verdict events (Task 5.2). Best-effort like comments: a
-            // failed fetch leaves the PR with zero verdict events rather than
-            // dropping the record.
+            // failed fetch still records the PR, flagged so the upsert
+            // preserves previously-observed verdict data.
             let changesRequestedCount = 0;
             let reviewEventCount = 0;
+            let reviewsOk = true;
             try {
                 const reviews = await provider.getPRReviews(repoName, pr.id);
                 reviewEventCount = reviews.length;
@@ -368,7 +380,8 @@ async function fetchProviderData(
                     (r) => r.state === 'changes_requested',
                 ).length;
             } catch {
-                // Review fetch failed — record the PR without verdict data
+                reviewsOk = false;
+                reviewFetchFailures++;
             }
 
             allPRRecords.push({
@@ -384,7 +397,23 @@ async function fetchProviderData(
                 reviewCommentCount: prCommentCount,
                 changesRequestedCount,
                 reviewEventCount,
+                commentsOk,
+                reviewsOk,
             });
+        }
+
+        // Surface fetch failures (aggregated per repo so a rate-limited run
+        // doesn't produce one error per PR). A silent failure here would be
+        // indistinguishable from a clean review history downstream.
+        if (commentFetchFailures > 0) {
+            errors.push(
+                `[${providerType}/${repoName}] Failed to fetch review comments for ${commentFetchFailures} PR(s)`,
+            );
+        }
+        if (reviewFetchFailures > 0) {
+            errors.push(
+                `[${providerType}/${repoName}] Failed to fetch review verdicts for ${reviewFetchFailures} PR(s)`,
+            );
         }
     }
 
@@ -402,9 +431,13 @@ async function fetchProviderData(
  * Review cycles for a PR: 0 when it never saw any review activity; otherwise
  * one initial review round plus one more per "changes requested" send-back.
  */
-function reviewRounds(record: PRRecordInput): number {
-    if (record.reviewEventCount === 0 && record.reviewCommentCount === 0) return 0;
-    return 1 + record.changesRequestedCount;
+function computeReviewRounds(
+    reviewEventCount: number,
+    reviewCommentCount: number,
+    changesRequestedCount: number,
+): number {
+    if (reviewEventCount === 0 && reviewCommentCount === 0) return 0;
+    return 1 + changesRequestedCount;
 }
 
 function timeToMergeHours(record: PRRecordInput): number | null {
@@ -414,12 +447,55 @@ function timeToMergeHours(record: PRRecordInput): number | null {
     return ms / 3_600_000;
 }
 
+/**
+ * Project constraint: all timestamps in UTC ISO. Bitbucket/GitLab can emit
+ * offset timestamps (+02:00-style); normalize so the day-attribution in the
+ * coaching engine (substr of the date part) is a UTC day, not a local one.
+ * Unparseable input passes through untouched rather than becoming garbage.
+ */
+function toUtcIso(timestamp: string): string;
+function toUtcIso(timestamp: string | null): string | null;
+function toUtcIso(timestamp: string | null): string | null {
+    if (timestamp === null) return null;
+    const ms = Date.parse(timestamp);
+    return Number.isNaN(ms) ? timestamp : new Date(ms).toISOString();
+}
+
+interface PRRecordExistingRow {
+    review_comment_count: number;
+    review_rounds: number;
+    changes_requested_count: number;
+}
+
 function upsertPRRecord(
     db: Database.Database,
     record: PRRecordInput,
     developerId: string,
     syncedAt: string,
 ): void {
+    // A failed comment/verdict fetch yields zeros by absence, not observation.
+    // Carry forward the previously-observed values for the failed dimension so
+    // one bad sync can't rewrite real review history as "clean reviews".
+    let commentCount = record.reviewCommentCount;
+    let crCount = record.changesRequestedCount;
+    let eventCount = record.reviewEventCount;
+    if (!record.commentsOk || !record.reviewsOk) {
+        const existing = db
+            .prepare(
+                `SELECT review_comment_count, review_rounds, changes_requested_count
+                 FROM pr_records WHERE provider = ? AND repo = ? AND pr_id = ?`,
+            )
+            .get(record.provider, record.repo, record.prId) as PRRecordExistingRow | undefined;
+        if (existing) {
+            if (!record.commentsOk) commentCount = existing.review_comment_count;
+            if (!record.reviewsOk) {
+                crCount = existing.changes_requested_count;
+                // The prior rounds imply whether verdict events existed.
+                eventCount = existing.review_rounds > 0 ? 1 : 0;
+            }
+        }
+    }
+
     db.prepare(
         `INSERT INTO pr_records
          (id, developer_id, provider, repo, pr_id, state, created_at, merged_at, closed_at,
@@ -434,7 +510,10 @@ function upsertPRRecord(
            review_comment_count = excluded.review_comment_count,
            review_rounds = excluded.review_rounds,
            changes_requested_count = excluded.changes_requested_count,
-           time_to_merge_hours = excluded.time_to_merge_hours,
+           -- Keep the FIRST observed time-to-merge: it never legitimately
+           -- changes after merge, and Bitbucket's merge timestamp is
+           -- approximated by updated_on, which post-merge activity inflates.
+           time_to_merge_hours = COALESCE(pr_records.time_to_merge_hours, excluded.time_to_merge_hours),
            synced_at = excluded.synced_at`,
     ).run(
         randomUUID(),
@@ -443,12 +522,12 @@ function upsertPRRecord(
         record.repo,
         record.prId,
         record.state,
-        record.createdAt,
-        record.mergedAt,
-        record.closedAt,
-        record.reviewCommentCount,
-        reviewRounds(record),
-        record.changesRequestedCount,
+        toUtcIso(record.createdAt),
+        toUtcIso(record.mergedAt),
+        toUtcIso(record.closedAt),
+        commentCount,
+        computeReviewRounds(eventCount, commentCount, crCount),
+        crCount,
         timeToMergeHours(record),
         syncedAt,
     );

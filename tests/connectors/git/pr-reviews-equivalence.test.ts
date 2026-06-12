@@ -61,7 +61,7 @@ describe('getPRReviews — cross-provider normalization', () => {
         expect(essence(reviews)).toEqual(EXPECTED);
     });
 
-    it('GitHub: COMMENTED and DISMISSED states map to commented', async () => {
+    it('GitHub: COMMENTED and DISMISSED states are skipped — only explicit verdicts are events, matching the other providers', async () => {
         stubFetch([
             {user: {login: 'bob'}, state: 'COMMENTED', submitted_at: T1},
             {user: {login: 'bob'}, state: 'DISMISSED', submitted_at: T2},
@@ -73,7 +73,39 @@ describe('getPRReviews — cross-provider normalization', () => {
         });
 
         const reviews = await provider.getPRReviews('repo', '7');
-        expect(reviews.map((r) => r.state)).toEqual(['commented', 'commented']);
+        expect(reviews).toHaveLength(0);
+    });
+
+    it('Bitbucket: activity entries lacking a date are skipped, not crashed on', async () => {
+        stubFetch({
+            values: [
+                {approval: {user: {nickname: 'bob'}}}, // no date
+                {changes_requested: {date: T1, user: {nickname: 'bob'}}},
+            ],
+        });
+        const provider = new BitbucketProvider({
+            type: 'bitbucket',
+            workspace: 'ws',
+            auth: {type: 'access_token', token: 't'},
+        });
+
+        const reviews = await provider.getPRReviews('repo', '7');
+        expect(essence(reviews)).toEqual([{state: 'changes_requested', submittedAt: T1, prId: '7'}]);
+    });
+
+    it('GitLab: extended system-note wording still matches (startsWith, not equality)', async () => {
+        stubFetch([
+            {system: true, body: 'requested changes from @bob', created_at: T1, author: {username: 'bob', name: 'Bob'}, type: null},
+            {system: true, body: 'approved this merge request via the API', created_at: T2, author: {username: 'bob', name: 'Bob'}, type: null},
+        ]);
+        const provider = new GitLabProvider({
+            type: 'gitlab',
+            group: 'grp',
+            auth: {type: 'personal_access_token', token: 't'},
+        });
+
+        const reviews = await provider.getPRReviews('grp/repo', '7');
+        expect(essence(reviews)).toEqual(EXPECTED);
     });
 
     it('Bitbucket: activity entries normalize to the canonical sequence (newest-first feed)', async () => {

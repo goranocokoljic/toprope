@@ -40,6 +40,7 @@ import type Database from 'better-sqlite3';
 import {openDb} from '../storage/db';
 import {runMigrations} from '../storage/migrator';
 import {
+    addDays,
     isoWeekStart,
     isoWeekLabel,
     monthOf,
@@ -285,22 +286,41 @@ export function runScheduledJob(
             }
         }
         // PR/review outcome metrics (Task 5.2) run after the weekly and monthly
-        // aggregates land, on the same period the job just computed. Best-effort
-        // with the same contract as the anomaly scan: a failure is logged but
-        // never fails the aggregation job that succeeded above. The weekly job's
-        // period key is a week_start date; the metrics are keyed by the ISO week
-        // label (YYYY-Www) per the pr_review_metrics schema.
+        // aggregates land. Best-effort with the same contract as the anomaly
+        // scan: a failure is logged but never fails the aggregation job that
+        // succeeded above. The weekly job's period key is a week_start date;
+        // the metrics are keyed by the ISO week label (YYYY-Www).
+        //
+        // Each run recomputes the just-closed period AND a trailing window of
+        // prior periods (3 more weeks / 1 more month). A PR's verdict keeps
+        // converging after its home period closes — reviews and the merge often
+        // land days later — and the per-PR records stay fresh (the providers
+        // window by updated time), so re-folding recent periods is what makes
+        // the stored metrics track the PRs' final outcomes instead of freezing
+        // a photograph taken hours after period close. The engine's UPSERT +
+        // stale-row retraction make every recompute safe.
         if (period === 'weekly' || period === 'monthly') {
-            const metricsPeriod = period === 'weekly' ? isoWeekLabel(periodKey) : periodKey;
             try {
-                const result = computePRReviewMetricsForPeriod(db, period, metricsPeriod, now);
-                console.log(
-                    `[pr-review:metrics] done — period ${result.period}, ` +
-                        `${result.developers} developer(s), ${result.rowsWritten} row(s)`,
-                );
+                const metricsPeriods: string[] = [];
+                if (period === 'weekly') {
+                    for (let weeksBack = 0; weeksBack < 4; weeksBack++) {
+                        metricsPeriods.push(
+                            isoWeekLabel(addDays(periodKey, -7 * weeksBack)),
+                        );
+                    }
+                } else {
+                    metricsPeriods.push(periodKey, priorMonth(periodKey));
+                }
+                for (const metricsPeriod of metricsPeriods) {
+                    const result = computePRReviewMetricsForPeriod(db, period, metricsPeriod, now);
+                    console.log(
+                        `[pr-review:metrics] done — period ${result.period}, ` +
+                            `${result.developers} developer(s), ${result.rowsWritten} row(s)`,
+                    );
+                }
             } catch (metricsErr) {
                 const msg = metricsErr instanceof Error ? metricsErr.message : String(metricsErr);
-                console.error(`[pr-review:metrics] FAILED — period ${metricsPeriod}: ${msg}`);
+                console.error(`[pr-review:metrics] FAILED — base period ${periodKey}: ${msg}`);
             }
         }
         return {period, periodKey, rowsWritten, ok: true};

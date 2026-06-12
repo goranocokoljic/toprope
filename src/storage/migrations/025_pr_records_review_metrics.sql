@@ -45,9 +45,13 @@ CREATE TABLE pr_review_metrics (
     avg_comment_density REAL,             -- review comments / PR, this period
     comment_density_vs_baseline REAL,     -- ratio to developer's own baseline
     avg_time_to_merge_hours REAL,
-    review_comments_given INTEGER,        -- reciprocity signal
-    -- Combination signal (churn already in git_snapshots)
-    avg_churn REAL,                       -- mean churn for these PRs' commits
+    -- Reciprocity signal: comments GIVEN over the whole period. Period-scoped,
+    -- not PR-scoped — identical on both variant rows of a developer+period.
+    review_comments_given INTEGER,
+    -- Combination signal. Approximation: the developer's mean daily churn over
+    -- the period (git_snapshots), NOT the churn of exactly these PRs' commits —
+    -- commits are not linked to PRs by the provider layer.
+    avg_churn REAL,
     combined_signal TEXT,                 -- struggling | healthy_iteration |
                                           -- effective | insufficient_data
     -- Confidence

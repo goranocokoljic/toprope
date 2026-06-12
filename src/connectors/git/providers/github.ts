@@ -169,18 +169,20 @@ interface RawReview {
 }
 
 /**
- * GitHub review states → normalized verdicts. APPROVED and CHANGES_REQUESTED
- * are explicit verdicts; COMMENTED, DISMISSED, PENDING and anything future map
- * to 'commented' (review activity without a standing verdict).
+ * GitHub review states → normalized verdicts. Only APPROVED and
+ * CHANGES_REQUESTED are verdict events; COMMENTED, DISMISSED, PENDING and
+ * anything future are skipped (null) so GitHub's event stream matches what
+ * Bitbucket and GitLab can express — comment-level activity is already
+ * covered by getReviewComments on all providers.
  */
-function normalizeReviewState(state: string): GitReviewState {
+function normalizeReviewState(state: string): GitReviewState | null {
     switch (state) {
         case 'APPROVED':
             return 'approved';
         case 'CHANGES_REQUESTED':
             return 'changes_requested';
         default:
-            return 'commented';
+            return null;
     }
 }
 
@@ -403,13 +405,15 @@ export class GitHubProvider implements GitProvider {
             for (const r of page) {
                 // PENDING reviews have no submitted_at — not yet a review event.
                 if (!r.submitted_at) continue;
+                const state = normalizeReviewState(r.state);
+                if (!state) continue;
                 reviews.push({
                     author: {
                         name: '',
                         email: '',
                         username: r.user?.login ?? '',
                     },
-                    state: normalizeReviewState(r.state),
+                    state,
                     submittedAt: r.submitted_at,
                     prId,
                 });
