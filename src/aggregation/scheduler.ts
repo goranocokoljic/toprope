@@ -40,13 +40,13 @@ import type Database from 'better-sqlite3';
 import {openDb} from '../storage/db';
 import {runMigrations} from '../storage/migrator';
 import {
-    addDays,
     isoWeekStart,
     isoWeekLabel,
     monthOf,
     quarterOf,
     yearOf,
     priorWeekStart,
+    priorIsoWeek,
     priorMonth,
     priorQuarter,
     priorYear,
@@ -312,14 +312,14 @@ export function runScheduledJob(
             try {
                 const metricsPeriods: string[] = [];
                 if (period === 'weekly') {
-                    // Weekly periodKey is a week_start *date*, not a YYYY-Www
-                    // label, so we step back by whole weeks and re-label rather
-                    // than folding priorIsoWeek (which operates on labels). This
-                    // mirrors priorIsoWeek's intent on a date-keyed input.
-                    for (let weeksBack = 0; weeksBack < 4; weeksBack++) {
-                        metricsPeriods.push(
-                            isoWeekLabel(addDays(periodKey, -7 * weeksBack)),
-                        );
+                    // periodKey is a week_start date; convert to a YYYY-Www label
+                    // once, then walk back with priorIsoWeek — structurally
+                    // parallel to the monthly priorMonth fold below.
+                    let wk = isoWeekLabel(periodKey);
+                    metricsPeriods.push(wk);
+                    for (let i = 0; i < 3; i++) {
+                        wk = priorIsoWeek(wk);
+                        metricsPeriods.push(wk);
                     }
                 } else {
                     metricsPeriods.push(periodKey, priorMonth(periodKey));

@@ -619,7 +619,6 @@ describe('GitSync', () => {
             review_comment_count: number;
             review_rounds: number;
             changes_requested_count: number;
-            review_event_count: number;
             merged_at: string | null;
             time_to_merge_hours: number | null;
         }
@@ -767,36 +766,42 @@ describe('GitSync', () => {
             expect(records[0].review_rounds).toBe(2);
         });
 
-        it('persists the observed review_event_count and carries it forward on a failed re-sync', async () => {
+        it('restores the prior review_rounds verdict when only the verdict fetch fails (no stale/fresh blend)', async () => {
             seedDev(db, 'alice');
             const createGitProvider = await getCreateGitProvider();
-            // Two verdict events, neither a send-back (e.g. two approvals): the
-            // observed event count is 2, but changes_requested_count is 0 and
-            // review_rounds is 1. Reverse-engineering the event count from
-            // review_rounds would wrongly recover 1, not 2 — so persist it.
+            // First good sync: two send-backs → review_rounds 3, with no review
+            // comments yet.
             const goodProvider = makeMockProvider({
                 listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
                 getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
                 getPRReviews: vi.fn().mockResolvedValue([
-                    {author: {name: '', email: '', username: 'bob'}, state: 'approved', submittedAt: '2024-01-15T12:00:00Z', prId: '1'},
-                    {author: {name: '', email: '', username: 'carol'}, state: 'approved', submittedAt: '2024-01-16T09:00:00Z', prId: '1'},
+                    {author: {name: '', email: '', username: 'bob'}, state: 'changes_requested', submittedAt: '2024-01-15T12:00:00Z', prId: '1'},
+                    {author: {name: '', email: '', username: 'carol'}, state: 'changes_requested', submittedAt: '2024-01-15T13:00:00Z', prId: '1'},
+                    {author: {name: '', email: '', username: 'bob'}, state: 'approved', submittedAt: '2024-01-16T09:00:00Z', prId: '1'},
                 ]),
             });
             createGitProvider.mockReturnValue(goodProvider);
             await new GitSync(makeGithubConfig()).sync(db);
-            expect(getPRRecords()[0].review_event_count).toBe(2);
-            expect(getPRRecords()[0].changes_requested_count).toBe(0);
+            expect(getPRRecords()[0].review_rounds).toBe(3);
+            expect(getPRRecords()[0].changes_requested_count).toBe(2);
 
-            // Re-sync with the verdict fetch failing: the observed count must be
-            // preserved, not reset to zero or inferred from review_rounds.
-            const badProvider = makeMockProvider({
+            // Re-sync: comments NOW arrive (fresh), but the verdict fetch fails.
+            // The rounds must be restored from the last observed verdict (3), not
+            // recomputed from the fresh comment count alone — which would collapse
+            // a 3-round PR to 1 and erase the send-back history.
+            const mixedProvider = makeMockProvider({
                 listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
                 getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+                getReviewComments: vi.fn().mockResolvedValue([makeProviderReviewComment('bob')]),
                 getPRReviews: vi.fn().mockRejectedValue(new Error('rate limited')),
             });
-            createGitProvider.mockReturnValue(badProvider);
+            createGitProvider.mockReturnValue(mixedProvider);
             await new GitSync(makeGithubConfig()).sync(db);
-            expect(getPRRecords()[0].review_event_count).toBe(2);
+
+            const rec = getPRRecords()[0];
+            expect(rec.review_comment_count).toBe(1); // fresh comment count applied
+            expect(rec.changes_requested_count).toBe(2); // verdict carried forward
+            expect(rec.review_rounds).toBe(3); // verdict-derived rounds preserved
         });
 
         it('freezes merged_at against a provider re-reporting a later merge timestamp', async () => {

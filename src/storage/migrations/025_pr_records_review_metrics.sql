@@ -18,14 +18,11 @@ CREATE TABLE pr_records (
     closed_at TEXT,
     review_comment_count INTEGER NOT NULL DEFAULT 0,
     -- Review cycles: 0 = never reviewed; otherwise 1 + changes_requested_count.
+    -- Persisted so a partial-fetch carry-forward can restore this verdict-derived
+    -- value directly rather than recomputing it from a mix of fresh/stale inputs.
     review_rounds INTEGER NOT NULL DEFAULT 0,
     -- Number of normalized "changes requested" review events on this PR.
     changes_requested_count INTEGER NOT NULL DEFAULT 0,
-    -- Observed count of review verdict events (any state). Persisted as its own
-    -- column so a partial-fetch carry-forward can restore the OBSERVED value
-    -- rather than reverse-engineering it from review_rounds (which would assume
-    -- review_rounds == 1 + changes_requested_count for every historical row).
-    review_event_count INTEGER NOT NULL DEFAULT 0,
     time_to_merge_hours REAL,
     synced_at TEXT NOT NULL,
     UNIQUE(provider, repo, pr_id)

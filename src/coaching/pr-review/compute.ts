@@ -121,20 +121,23 @@ function prepareStatements(db: Database.Database): Statements {
  * Load a developer's PRs for a day range, annotated with the per-PR AI
  * signature estimate (mean daily ai_signature_score over the PR's active
  * window; null when the window has no scored git activity). The window is
- * created → merged/closed; for a still-open PR it extends to `today` so the
- * estimate covers the work actually done so far, not just the creation day.
+ * created → merged/closed; for a still-open PR it extends to `asOf` so the
+ * estimate covers the work actually done up to that point, not just the
+ * creation day. `asOf` is "today" for the current period, but the period's
+ * own end for a historical baseline period — otherwise a still-open PR would
+ * fold in activity from after the baseline period it is meant to describe.
  */
 function loadAnnotatedPRs(
     stmts: Statements,
     developerId: string,
     range: DateRange,
-    today: string,
+    asOf: string,
 ): PRData[] {
     const rows = stmts.prsInRange.all(developerId, range.start, range.end) as PRRecordRow[];
     return rows.map((row) => {
         const windowStart = row.created_at.slice(0, 10);
         const closedDay = row.merged_at ?? row.closed_at;
-        const windowEnd = closedDay ? closedDay.slice(0, 10) : today;
+        const windowEnd = closedDay ? closedDay.slice(0, 10) : asOf;
         const ai = stmts.aiSignature.get(
             developerId,
             windowStart,
@@ -181,14 +184,16 @@ function trailingBaselineDensities(
     unit: PRReviewPeriodUnit,
     period: string,
     thresholds: PRReviewThresholds,
-    today: string,
 ): BaselineDensities {
     const allDensities: number[] = [];
     const aiDensities: number[] = [];
     let key = period;
     for (let i = 0; i < thresholds.baselinePeriods; i++) {
         key = priorPeriod(unit, key);
-        const prs = loadAnnotatedPRs(stmts, developerId, periodRange(unit, key), today);
+        const range = periodRange(unit, key);
+        // Cap an open PR's AI window at this baseline period's end, not today,
+        // so the period's density reflects only activity within it.
+        const prs = loadAnnotatedPRs(stmts, developerId, range, range.end);
         const all = commentDensity(prs);
         if (all !== null) allDensities.push(all);
         const ai = commentDensity(selectAiAssistedPRs(prs, thresholds.aiSignatureThreshold));
@@ -282,7 +287,7 @@ export function computePRReviewMetricsForPeriod(
             };
 
             const baselines = trailingBaselineDensities(
-                stmts, developerId, unit, period, thresholds, today,
+                stmts, developerId, unit, period, thresholds,
             );
 
             const allMetrics = computeVariantMetrics(

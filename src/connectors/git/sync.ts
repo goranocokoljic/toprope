@@ -463,7 +463,7 @@ function toUtcIso(timestamp: string | null): string | null {
 
 interface PRRecordExistingRow {
     review_comment_count: number;
-    review_event_count: number;
+    review_rounds: number;
     changes_requested_count: number;
 }
 
@@ -478,20 +478,28 @@ function upsertPRRecord(
     // one bad sync can't rewrite real review history as "clean reviews".
     let commentCount = record.reviewCommentCount;
     let crCount = record.changesRequestedCount;
-    let eventCount = record.reviewEventCount;
+    let rounds = computeReviewRounds(record.reviewEventCount, commentCount, crCount);
     if (!record.commentsOk || !record.reviewsOk) {
         const existing = db
             .prepare(
-                `SELECT review_comment_count, review_event_count, changes_requested_count
+                `SELECT review_comment_count, review_rounds, changes_requested_count
                  FROM pr_records WHERE provider = ? AND repo = ? AND pr_id = ?`,
             )
             .get(record.provider, record.repo, record.prId) as PRRecordExistingRow | undefined;
         if (existing) {
             if (!record.commentsOk) commentCount = existing.review_comment_count;
             if (!record.reviewsOk) {
+                // Verdict events weren't observed this sync — restore the last
+                // verdict-derived round count and changes-requested count as a
+                // unit. Recomputing rounds from a fresh comment count alone
+                // (which can't raise rounds past 1) would blend stale and fresh
+                // state into a row that never matched any single observation.
                 crCount = existing.changes_requested_count;
-                // Restore the OBSERVED event count, not an inference from rounds.
-                eventCount = existing.review_event_count;
+                rounds = existing.review_rounds;
+            } else {
+                // Verdicts observed; only comments are stale — recompute from
+                // the authoritative fresh verdict data.
+                rounds = computeReviewRounds(record.reviewEventCount, commentCount, crCount);
             }
         }
     }
@@ -499,9 +507,8 @@ function upsertPRRecord(
     db.prepare(
         `INSERT INTO pr_records
          (id, developer_id, provider, repo, pr_id, state, created_at, merged_at, closed_at,
-          review_comment_count, review_rounds, changes_requested_count, review_event_count,
-          time_to_merge_hours, synced_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          review_comment_count, review_rounds, changes_requested_count, time_to_merge_hours, synced_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(provider, repo, pr_id) DO UPDATE SET
            developer_id = excluded.developer_id,
            state = excluded.state,
@@ -515,7 +522,6 @@ function upsertPRRecord(
            review_comment_count = excluded.review_comment_count,
            review_rounds = excluded.review_rounds,
            changes_requested_count = excluded.changes_requested_count,
-           review_event_count = excluded.review_event_count,
            -- Keep the FIRST observed time-to-merge: it never legitimately
            -- changes after merge, and Bitbucket's merge timestamp is
            -- approximated by updated_on, which post-merge activity inflates.
@@ -532,9 +538,8 @@ function upsertPRRecord(
         toUtcIso(record.mergedAt),
         toUtcIso(record.closedAt),
         commentCount,
-        computeReviewRounds(eventCount, commentCount, crCount),
+        rounds,
         crCount,
-        eventCount,
         timeToMergeHours(record),
         syncedAt,
     );
