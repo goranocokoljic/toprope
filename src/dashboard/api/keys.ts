@@ -342,20 +342,29 @@ export function registerKeyRoutes(app: FastifyInstance, db: Database.Database): 
                 message: 'You chose no-recovery: there is no recovery flow whose outcome could be recorded.',
             });
         }
-        if (!hasOpenRecovery(db, developerId)) {
-            return reply.status(409).send({
-                error: 'Conflict',
-                code: 'no_recovery_in_progress',
-                message: 'No recovery is in progress; initiate a recovery before reporting its outcome.',
-            });
-        }
         const obj = asObject(request.body);
         const outcome = obj?.outcome;
         if (outcome !== 'completed' && outcome !== 'failed') {
             return badRequest(reply, "outcome must be 'completed' or 'failed'") ?? reply;
         }
         const event = outcome === 'completed' ? 'recovery_completed' : 'recovery_failed';
-        const logged = logRecoveryEvent(db, developerId, event, request.authUser!.userId);
+        // Re-check "a recovery is open" and write the outcome in ONE transaction, so
+        // exactly one outcome can close one initiate even if two complete requests
+        // arrive together: the check-then-insert can't interleave with another's
+        // insert. Returns null when there is no open recovery → 409.
+        const logged = db.transaction(() => {
+            if (!hasOpenRecovery(db, developerId)) {
+                return null;
+            }
+            return logRecoveryEvent(db, developerId, event, request.authUser!.userId);
+        })();
+        if (!logged) {
+            return reply.status(409).send({
+                error: 'Conflict',
+                code: 'no_recovery_in_progress',
+                message: 'No recovery is in progress; initiate a recovery before reporting its outcome.',
+            });
+        }
         return {data: logged};
     });
 

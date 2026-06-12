@@ -286,6 +286,24 @@ describe('Capture key API (Task 5.5)', () => {
         expect(events.map((e) => e.event).sort()).toEqual(['recovery_completed', 'recovery_initiated']);
     });
 
+    it('re-keying recovery_path → no_recovery blocks complete even with a stale open initiate (guard order)', async () => {
+        const {body} = recoveryPathBody();
+        await app.inject({method: 'POST', url: '/api/me/capture-key', headers: auth(aliceToken), payload: body});
+        // Open a recovery, then re-register as no_recovery — the append-only log keeps
+        // the stale recovery_initiated row.
+        await app.inject({method: 'POST', url: '/api/me/capture-key/recovery/initiate', headers: auth(aliceToken)});
+        await app.inject({method: 'POST', url: '/api/me/capture-key', headers: auth(aliceToken), payload: {key_id: 'k2', recovery_choice: 'no_recovery', acknowledge_unrecoverable: true}});
+
+        // The live no_recovery posture is checked before the (stale) open-recovery state,
+        // so no outcome can be appended.
+        const res = await app.inject({method: 'POST', url: '/api/me/capture-key/recovery/complete', headers: auth(aliceToken), payload: {outcome: 'completed'}});
+        expect(res.statusCode).toBe(409);
+        expect(res.json().code).toBe('no_recovery_path');
+        // Only the original recovery_initiated remains; no fabricated outcome was logged.
+        const events = (await app.inject({method: 'GET', url: '/api/me/capture-key/recovery-log', headers: auth(aliceToken)})).json().data as Array<{event: string}>;
+        expect(events.map((e) => e.event)).toEqual(['recovery_initiated']);
+    });
+
     it('rejects recovery_meta whose algo/kdf/base64 a future recovery could not unwrap (SO-1)', async () => {
         const make = (metaPatch: Record<string, unknown>): Record<string, unknown> => {
             const {body} = recoveryPathBody();

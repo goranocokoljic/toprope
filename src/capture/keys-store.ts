@@ -194,6 +194,12 @@ export function logRecoveryEvent(
  * making their own audit no longer a faithful record of real flows. The latest
  * event is taken by (occurred_at, rowid) — the same monotonic ordering the log
  * view uses — so a same-millisecond initiate is still recognized as the latest.
+ *
+ * This deliberately does NOT re-check the current recovery posture: the append-only
+ * log can retain a stale `recovery_initiated` from before a developer re-keyed to
+ * `no_recovery`. Every caller (the complete route) gates on the live
+ * `recovery_path` posture FIRST, so a re-keyed no_recovery developer is rejected
+ * before reaching here — the guard ORDER is load-bearing; don't reorder it.
  */
 export function hasOpenRecovery(db: Database.Database, developerId: string): boolean {
     const row = db
