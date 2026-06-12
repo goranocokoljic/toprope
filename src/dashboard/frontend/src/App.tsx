@@ -11,6 +11,8 @@ import {Anomalies} from './pages/Anomalies';
 import {DeveloperDashboard} from './pages/DeveloperDashboard';
 import {MyTools} from './pages/MyTools';
 import {MyActivity} from './pages/MyActivity';
+import {MyCoaching} from './pages/MyCoaching';
+import {TeamCoaching} from './pages/TeamCoaching';
 import {Preferences} from './pages/Preferences';
 import {Settings} from './pages/Settings';
 import {Leaderboard} from './pages/Leaderboard';
@@ -43,6 +45,7 @@ export function App(): JSX.Element {
                 <Route path="manager/developers/:id" element={<DeveloperDetail />} />
                 <Route path="manager/waste" element={<WasteDetection />} />
                 <Route path="manager/anomalies" element={<Anomalies />} />
+                <Route path="manager/coaching" element={<TeamCoaching />} />
                 <Route
                     path="manager/leaderboard"
                     element={
@@ -54,6 +57,7 @@ export function App(): JSX.Element {
                 <Route path="developer" element={<DeveloperDashboard />} />
                 <Route path="developer/tools" element={<MyTools />} />
                 <Route path="developer/activity" element={<MyActivity />} />
+                <Route path="developer/coaching" element={<MyCoaching />} />
                 <Route path="preferences" element={<Preferences />} />
                 <Route
                     path="settings"

@@ -10,6 +10,8 @@ import {
 import {getDeveloperJourney} from './journey';
 import {parseTimeRange, TimeRangeError, type TimeRangeInput} from './range';
 import {requireDeveloperId} from './guards';
+import {getDeveloperPRReviewCoaching} from '../../coaching/pr-review/coaching';
+import {parsePeriodUnit, type PeriodUnitInput} from './coaching-params';
 
 /**
  * Self-service endpoints for the logged-in developer (Task 2.4 / #39).
@@ -106,6 +108,22 @@ export function registerMeRoutes(app: FastifyInstance, db: Database.Database): v
             return reply;
         }
         return {data: getDeveloperJourney(db, developerId)};
+    });
+
+    /**
+     * The developer's PRIVATE PR/review coaching: their own rework/review
+     * trajectory over time, both scope variants kept separate (all_pr factual /
+     * ai_assisted_pr inferred). Session-scoped like every /api/me route — the id
+     * comes only from the session, so a developer can never reach anyone else's
+     * coaching. `unit` selects weekly or monthly periods (default monthly).
+     */
+    app.get<{Querystring: PeriodUnitInput}>('/api/me/pr-coaching', async (request, reply) => {
+        const developerId = requireDeveloperId(request, reply);
+        if (!developerId) {
+            return reply;
+        }
+        const unit = parsePeriodUnit(request.query.unit);
+        return {data: getDeveloperPRReviewCoaching(db, developerId, unit)};
     });
 
     app.get<{Querystring: TimeRangeInput}>('/api/me/activity', async (request, reply) => {
