@@ -186,7 +186,18 @@ export function TeamCoaching(): JSX.Element {
             ) : null}
 
             {!coaching.isPending && !coaching.isError && coaching.data ? (
-                <CoachingBody data={coaching.data} />
+                coaching.data.enabled ? (
+                    <CoachingBody data={coaching.data} />
+                ) : (
+                    // Pillar 2 disabled org-wide or for this team (Task 5.10): the
+                    // aggregate is hidden here too, not just on the developer view.
+                    <StatePanel
+                        tone="neutral"
+                        testId="team-coaching-disabled"
+                        title="PR/review coaching is turned off"
+                        description="PR/review coaching is disabled for this scope, so no team aggregate is shown."
+                    />
+                )
             ) : null}
         </div>
     );

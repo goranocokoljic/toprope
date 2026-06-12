@@ -15,6 +15,10 @@ import {
     setGlobalSetting,
     setTeamSetting,
     setUserPreference,
+    resolveDeveloperPreferences,
+    setDeveloperPreference,
+    isCoachingPillar1Enabled,
+    isCoachingPillar2Enabled,
 } from '../../src/settings/store';
 import {createUser} from '../../src/auth/users';
 import {hashPassword} from '../../src/auth/password';
@@ -69,6 +73,15 @@ describe('settings store', () => {
                     'anomaly_alerts_enabled',
                     'anomaly_alert_min_severity',
                     'anomaly_managers_can_override',
+                    'coaching_pillar1_enabled',
+                    'coaching_pillar2_enabled',
+                    'coaching_capture_permitted',
+                    'coaching_cloud_analysis_permitted',
+                    'showcase_enabled',
+                    'showcase_scope_permitted',
+                    'nudge_default_frequency',
+                    'nudge_dismissible_default',
+                    'coaching_managers_can_override',
                 ].sort(),
             );
         });
@@ -241,6 +254,99 @@ describe('settings store', () => {
 
         it('throws on unknown preference keys', () => {
             expect(() => setUserPreference(db, userId, 'nope', true)).toThrow();
+        });
+    });
+
+    // Task 5.10 / #131: developer-level coaching preferences, resolved against the
+    // org permission boundary. The defining behaviour is that an org policy can
+    // veto a developer's stored choice.
+    describe('developer coaching preferences', () => {
+        let userId: string;
+
+        beforeEach(async () => {
+            const hash = await hashPassword('correct-horse-battery');
+            const user = createUser(db, {
+                email: 'coach@test.com',
+                passwordHash: hash,
+                role: 'developer',
+                developerId: 'dev-1',
+            });
+            userId = user.id;
+        });
+
+        it('returns registry defaults when nothing is stored', () => {
+            const resolved = resolveDeveloperPreferences(db, userId, 'frontend');
+            expect(resolved.capture_opt_in.value).toBe(false);
+            expect(resolved.nudges_enabled.value).toBe(true);
+            // nudge_frequency seeds from the org default when unset.
+            expect(resolved.nudge_frequency.value).toBe('normal');
+        });
+
+        it('persists a developer choice per developer', () => {
+            setDeveloperPreference(db, userId, 'nudges_enabled', false);
+            setDeveloperPreference(db, userId, 'nudge_frequency', 'high');
+            const resolved = resolveDeveloperPreferences(db, userId, 'frontend');
+            expect(resolved.nudges_enabled.stored).toBe(false);
+            expect(resolved.nudge_frequency.stored).toBe('high');
+        });
+
+        it('a stored opt-in is HONORED only within org permission (cloud)', () => {
+            // Developer opts into cloud analysis, but org forbids it by default.
+            setDeveloperPreference(db, userId, 'cloud_analysis_opt_in', true);
+            let resolved = resolveDeveloperPreferences(db, userId, 'frontend');
+            // Effective value is forced false, blocked + reason surfaced…
+            expect(resolved.cloud_analysis_opt_in.value).toBe(false);
+            expect(resolved.cloud_analysis_opt_in.blocked).toBe(true);
+            expect(resolved.cloud_analysis_opt_in.reason).toMatch(/cloud/i);
+            // …yet the developer's own stored intent is preserved.
+            expect(resolved.cloud_analysis_opt_in.stored).toBe(true);
+
+            // Org permits cloud analysis → the stored opt-in now takes effect.
+            setGlobalSetting(db, 'coaching_cloud_analysis_permitted', true);
+            resolved = resolveDeveloperPreferences(db, userId, 'frontend');
+            expect(resolved.cloud_analysis_opt_in.value).toBe(true);
+            expect(resolved.cloud_analysis_opt_in.blocked).toBe(false);
+            expect(resolved.cloud_analysis_opt_in.reason).toBeUndefined();
+        });
+
+        it('capture opt-in is blocked until the org permits capture', () => {
+            setDeveloperPreference(db, userId, 'capture_opt_in', true);
+            expect(resolveDeveloperPreferences(db, userId, 'frontend').capture_opt_in.value).toBe(false);
+            setGlobalSetting(db, 'coaching_capture_permitted', true);
+            expect(resolveDeveloperPreferences(db, userId, 'frontend').capture_opt_in.value).toBe(true);
+        });
+
+        it('an org permission can be lifted per team via a governed override', () => {
+            // Globally capture is forbidden, but the org enables per-team overrides
+            // and the frontend team turns capture on for itself.
+            setGlobalSetting(db, 'coaching_managers_can_override', true);
+            setTeamSetting(db, 'frontend', 'coaching_capture_permitted', true);
+            setDeveloperPreference(db, userId, 'capture_opt_in', true);
+
+            // dev-1 is on the frontend team → capture permitted → opt-in honored.
+            expect(resolveDeveloperPreferences(db, userId, 'frontend').capture_opt_in.value).toBe(true);
+            // The same developer resolved against a team without the override stays blocked.
+            expect(resolveDeveloperPreferences(db, userId, 'backend').capture_opt_in.value).toBe(false);
+        });
+
+        it('pillar gating reflects global off-switch and per-team override', () => {
+            expect(isCoachingPillar1Enabled(db, 'frontend')).toBe(true);
+            expect(isCoachingPillar2Enabled(db, 'frontend')).toBe(true);
+
+            // Disable pillar 1 org-wide → off everywhere.
+            setGlobalSetting(db, 'coaching_pillar1_enabled', false);
+            expect(isCoachingPillar1Enabled(db, 'frontend')).toBe(false);
+            expect(isCoachingPillar1Enabled(db, 'backend')).toBe(false);
+
+            // Re-enable just for the frontend team via a governed override.
+            setGlobalSetting(db, 'coaching_managers_can_override', true);
+            setTeamSetting(db, 'frontend', 'coaching_pillar1_enabled', true);
+            expect(isCoachingPillar1Enabled(db, 'frontend')).toBe(true);
+            expect(isCoachingPillar1Enabled(db, 'backend')).toBe(false);
+        });
+
+        it('rejects an unknown coaching preference key and a bad enum value', () => {
+            expect(() => setDeveloperPreference(db, userId, 'nope', true)).toThrow();
         });
     });
 });

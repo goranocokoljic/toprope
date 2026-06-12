@@ -8,9 +8,52 @@ import {MemoryRouter} from 'react-router-dom';
 import {Preferences} from '../pages/Preferences';
 import {Settings} from '../pages/Settings';
 import {ThemeProvider} from '../theme/ThemeProvider';
-import type {AnomalyConfig, GlobalSettings, TeamSettings, UserPreferences} from '../api/types';
+import type {
+    AnomalyConfig,
+    CoachingPreferences,
+    GlobalSettings,
+    TeamSettings,
+    UserPreferences,
+} from '../api/types';
 
 const DEFAULT_PREFS: UserPreferences = {default_time_range: '30d', dark_mode: false};
+
+// Coaching prefs with capture/cloud blocked by org policy (the default org
+// posture), so the card renders its controls disabled with the org's reason.
+function defaultCoachingPrefs(): CoachingPreferences {
+    return {
+        capture_opt_in: {
+            key: 'capture_opt_in',
+            value: false,
+            stored: false,
+            blocked: true,
+            reason: 'Prompt capture is not permitted by your organization.',
+        },
+        capture_mechanism: {
+            key: 'capture_mechanism',
+            value: 'local_agent',
+            stored: 'local_agent',
+            blocked: true,
+            reason: 'Prompt capture is not permitted by your organization.',
+        },
+        capture_recovery_choice: {
+            key: 'capture_recovery_choice',
+            value: 'no_recovery',
+            stored: 'no_recovery',
+            blocked: true,
+            reason: 'Prompt capture is not permitted by your organization.',
+        },
+        cloud_analysis_opt_in: {
+            key: 'cloud_analysis_opt_in',
+            value: false,
+            stored: false,
+            blocked: true,
+            reason: 'Cloud-model analysis is not permitted by your organization.',
+        },
+        nudges_enabled: {key: 'nudges_enabled', value: true, stored: true, blocked: false},
+        nudge_frequency: {key: 'nudge_frequency', value: 'normal', stored: 'normal', blocked: false},
+    };
+}
 
 const DEFAULT_GLOBAL: GlobalSettings = {
     leaderboard_enabled: false,
@@ -26,6 +69,15 @@ const DEFAULT_GLOBAL: GlobalSettings = {
     anomaly_alerts_enabled: false,
     anomaly_alert_min_severity: 'notable',
     anomaly_managers_can_override: false,
+    coaching_pillar1_enabled: true,
+    coaching_pillar2_enabled: true,
+    coaching_capture_permitted: false,
+    coaching_cloud_analysis_permitted: false,
+    showcase_enabled: false,
+    showcase_scope_permitted: 'team_only',
+    nudge_default_frequency: 'normal',
+    nudge_dismissible_default: true,
+    coaching_managers_can_override: false,
 };
 
 // Minimal effective anomaly config for the AnomalyDetectionPanel fetch.
@@ -82,6 +134,9 @@ beforeEach(() => {
         const method = (init?.method ?? 'GET').toUpperCase();
         const bodyObj = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
 
+        if (u.includes('/api/me/coaching-preferences')) {
+            return json({data: defaultCoachingPrefs()});
+        }
         if (u.includes('/api/me/preferences')) {
             if (method === 'PATCH') {
                 prefs = {...prefs, ...(bodyObj as Partial<UserPreferences>)};
@@ -173,6 +228,19 @@ describe('Preferences page', () => {
         const select = (await screen.findByLabelText(/default time range/i)) as HTMLSelectElement;
         fireEvent.change(select, {target: {value: 'year'}});
         await waitFor(() => expect(prefs.default_time_range).toBe('year'));
+    });
+
+    it('shows coaching preferences and disables ones the org policy blocks', async () => {
+        renderPrefs();
+        // The capture opt-in switch is rendered but disabled, with the org reason.
+        const capture = (await screen.findByRole('switch', {name: /capture my prompts/i})) as HTMLInputElement;
+        expect(capture).toBeDisabled();
+        expect(
+            screen.getAllByText(/Prompt capture is not permitted by your organization/i).length,
+        ).toBeGreaterThan(0);
+        // A non-blocked preference (real-time nudges) stays enabled.
+        const nudges = (await screen.findByRole('switch', {name: /real-time nudges/i})) as HTMLInputElement;
+        expect(nudges).not.toBeDisabled();
     });
 });
 

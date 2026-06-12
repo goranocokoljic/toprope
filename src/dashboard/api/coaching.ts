@@ -15,24 +15,34 @@ import {getOrgPRReviewCoaching, getTeamPRReviewCoaching} from '../../coaching/pr
 import {getOrgCoaching, getTeamCoaching} from '../../coaching/available/coaching';
 import {parsePeriodUnit, type PeriodUnitInput} from './coaching-params';
 import {forbidden, isAdmin} from './guards';
+import {isCoachingPillar1Enabled, isCoachingPillar2Enabled} from '../../settings/store';
 
 export function registerCoachingRoutes(app: FastifyInstance, db: Database.Database): void {
     /**
      * Org-wide team aggregate — every developer pooled. Admin/manager only; each
      * period is suppressed unless enough developers contributed (k-anonymity).
+     *
+     * Pillar gating (Task 5.10): when the pillar is disabled the surface returns
+     * only {enabled:false}, so a disabled pillar is hidden on the manager
+     * aggregate too — not just the developer's /api/me view. The org aggregate
+     * pools every team, so it gates on the GLOBAL pillar value (no team).
      */
     app.get<{Querystring: PeriodUnitInput}>('/api/coaching/pr-review/org', async (request, reply) => {
         if (!isAdmin(request)) {
             return forbidden(reply);
         }
+        if (!isCoachingPillar2Enabled(db, null)) {
+            return {data: {enabled: false as const}};
+        }
         const unit = parsePeriodUnit(request.query.unit);
-        return {data: getOrgPRReviewCoaching(db, unit)};
+        return {data: {enabled: true as const, ...getOrgPRReviewCoaching(db, unit)}};
     });
 
     /**
      * One team's aggregate. 404 when the team doesn't exist so a typo can't be
      * mistaken for a real-but-empty team. The aggregate itself never exposes an
-     * individual's figures.
+     * individual's figures. Gated by Pillar 2 resolved FOR THAT TEAM, so a team
+     * override of the pillar is honored.
      */
     app.get<{Params: {team: string}; Querystring: PeriodUnitInput}>(
         '/api/coaching/pr-review/team/:team',
@@ -45,8 +55,11 @@ export function registerCoachingRoutes(app: FastifyInstance, db: Database.Databa
             if (!exists) {
                 return reply.status(404).send({error: 'Not Found', message: `Team '${team}' not found`});
             }
+            if (!isCoachingPillar2Enabled(db, team)) {
+                return {data: {enabled: false as const}};
+            }
             const unit = parsePeriodUnit(request.query.unit);
-            return {data: getTeamPRReviewCoaching(db, team, unit)};
+            return {data: {enabled: true as const, ...getTeamPRReviewCoaching(db, team, unit)}};
         },
     );
 
@@ -55,19 +68,23 @@ export function registerCoachingRoutes(app: FastifyInstance, db: Database.Databa
      * manager only; per (period, signal type) the aggregate is suppressed unless
      * enough developers contributed (k-anonymity), and it carries only contributor
      * counts and category tallies — never an individual's observation text.
+     * Gated by Pillar 1 (global) like the PR-review org aggregate above.
      */
     app.get<{Querystring: PeriodUnitInput}>('/api/coaching/available/org', async (request, reply) => {
         if (!isAdmin(request)) {
             return forbidden(reply);
         }
+        if (!isCoachingPillar1Enabled(db, null)) {
+            return {data: {enabled: false as const}};
+        }
         const unit = parsePeriodUnit(request.query.unit);
-        return {data: getOrgCoaching(db, unit)};
+        return {data: {enabled: true as const, ...getOrgCoaching(db, unit)}};
     });
 
     /**
      * One team's available-data coaching aggregate. 404 when the team doesn't
      * exist so a typo can't be mistaken for a real-but-empty team. The aggregate
-     * never exposes an individual's text or numbers.
+     * never exposes an individual's text or numbers. Gated by Pillar 1 for the team.
      */
     app.get<{Params: {team: string}; Querystring: PeriodUnitInput}>(
         '/api/coaching/available/team/:team',
@@ -80,8 +97,11 @@ export function registerCoachingRoutes(app: FastifyInstance, db: Database.Databa
             if (!exists) {
                 return reply.status(404).send({error: 'Not Found', message: `Team '${team}' not found`});
             }
+            if (!isCoachingPillar1Enabled(db, team)) {
+                return {data: {enabled: false as const}};
+            }
             const unit = parsePeriodUnit(request.query.unit);
-            return {data: getTeamCoaching(db, team, unit)};
+            return {data: {enabled: true as const, ...getTeamCoaching(db, team, unit)}};
         },
     );
 }

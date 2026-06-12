@@ -40,6 +40,9 @@ export const queryKeys = {
     leaderboardAvailability: ['leaderboard', 'availability'] as const,
     leaderboard: (team: string, metric: string) => ['leaderboard', team, metric] as const,
     preferences: ['preferences'] as const,
+    // Developer coaching preferences (Task 5.10): the developer's own opt-ins,
+    // resolved against the org boundary.
+    coachingPreferences: ['preferences', 'coaching'] as const,
     // Developer "My Dashboard" (Task 2.8). Window-keyed surfaces refetch when the
     // selected time range changes; the journey is window-independent.
     meOverview: (window: string) => ['me', 'overview', window] as const,
