@@ -19,9 +19,9 @@ import type {
 // A settings section groups related keys under a labeled subheading, so the
 // global and per-team panels render Leaderboard / ROI / Surveys / Anomaly alerts
 // as distinct blocks rather than one flat list (Task 4.12).
-type Section = 'Leaderboard' | 'ROI' | 'Surveys' | 'Anomaly alerts';
+type Section = 'Leaderboard' | 'ROI' | 'Surveys' | 'Anomaly alerts' | 'Coaching';
 
-const SECTION_ORDER: Section[] = ['Leaderboard', 'ROI', 'Surveys', 'Anomaly alerts'];
+const SECTION_ORDER: Section[] = ['Leaderboard', 'ROI', 'Surveys', 'Anomaly alerts', 'Coaching'];
 
 interface BaseField {
     key: keyof GlobalSettings;
@@ -84,6 +84,46 @@ const FIELDS: Field[] = [
         label: 'Managers may override anomaly settings',
         type: 'boolean',
         section: 'Anomaly alerts',
+        teamOverridable: false,
+    },
+    // Coaching policy (Task 5.10): the org boundary for the Phase 5 coaching
+    // features. Pillars/permissions/showcase/nudge defaults are per-team
+    // overridable (gated by coaching_managers_can_override); the gate flag itself
+    // is global-only.
+    {key: 'coaching_pillar1_enabled', label: 'Available-data coaching (Pillar 1)', type: 'boolean', section: 'Coaching', teamOverridable: true},
+    {key: 'coaching_pillar2_enabled', label: 'PR/review coaching (Pillar 2)', type: 'boolean', section: 'Coaching', teamOverridable: true},
+    {key: 'coaching_capture_permitted', label: 'Permit prompt capture (Pillar 3)', type: 'boolean', section: 'Coaching', teamOverridable: true},
+    {key: 'coaching_cloud_analysis_permitted', label: 'Permit cloud-model analysis', type: 'boolean', section: 'Coaching', teamOverridable: true},
+    {key: 'showcase_enabled', label: 'Showcase enabled', type: 'boolean', section: 'Coaching', teamOverridable: true},
+    {
+        key: 'showcase_scope_permitted',
+        label: 'Showcase sharing scope',
+        type: 'enum',
+        section: 'Coaching',
+        teamOverridable: true,
+        options: [
+            {value: 'team_only', label: 'Team only'},
+            {value: 'org_wide', label: 'Org-wide'},
+        ],
+    },
+    {
+        key: 'nudge_default_frequency',
+        label: 'Default nudge frequency',
+        type: 'enum',
+        section: 'Coaching',
+        teamOverridable: true,
+        options: [
+            {value: 'low', label: 'Low'},
+            {value: 'normal', label: 'Normal'},
+            {value: 'high', label: 'High'},
+        ],
+    },
+    {key: 'nudge_dismissible_default', label: 'Nudges dismissible by default', type: 'boolean', section: 'Coaching', teamOverridable: true},
+    {
+        key: 'coaching_managers_can_override',
+        label: 'Managers may override coaching settings',
+        type: 'boolean',
+        section: 'Coaching',
         teamOverridable: false,
     },
 ];

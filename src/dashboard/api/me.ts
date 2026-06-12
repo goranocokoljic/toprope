@@ -13,6 +13,8 @@ import {requireDeveloperId} from './guards';
 import {getDeveloperPRReviewCoaching} from '../../coaching/pr-review/coaching';
 import {getDeveloperCoaching} from '../../coaching/available/coaching';
 import {parsePeriodUnit, type PeriodUnitInput} from './coaching-params';
+import {isCoachingPillar1Enabled, isCoachingPillar2Enabled} from '../../settings/store';
+import {getDeveloperById} from '../../registry/developers';
 
 /**
  * Self-service endpoints for the logged-in developer (Task 2.4 / #39).
@@ -123,8 +125,15 @@ export function registerMeRoutes(app: FastifyInstance, db: Database.Database): v
         if (!developerId) {
             return reply;
         }
+        // Pillar 2 (PR/review coaching) can be switched off org-wide or per team
+        // (Task 5.10): when it is, this surface returns only {enabled:false} so the
+        // feature is hidden everywhere rather than serving coaching the org disabled.
+        const team = getDeveloperById(db, developerId)?.team ?? null;
+        if (!isCoachingPillar2Enabled(db, team)) {
+            return {data: {enabled: false as const}};
+        }
         const unit = parsePeriodUnit(request.query.unit);
-        return {data: getDeveloperPRReviewCoaching(db, developerId, unit)};
+        return {data: {enabled: true as const, ...getDeveloperPRReviewCoaching(db, developerId, unit)}};
     });
 
     /**
@@ -140,8 +149,13 @@ export function registerMeRoutes(app: FastifyInstance, db: Database.Database): v
         if (!developerId) {
             return reply;
         }
+        // Pillar 1 (available-data coaching) gating, mirroring pr-coaching above.
+        const team = getDeveloperById(db, developerId)?.team ?? null;
+        if (!isCoachingPillar1Enabled(db, team)) {
+            return {data: {enabled: false as const}};
+        }
         const unit = parsePeriodUnit(request.query.unit);
-        return {data: getDeveloperCoaching(db, developerId, unit)};
+        return {data: {enabled: true as const, ...getDeveloperCoaching(db, developerId, unit)}};
     });
 
     app.get<{Querystring: TimeRangeInput}>('/api/me/activity', async (request, reply) => {

@@ -1,6 +1,6 @@
 import type {FastifyInstance, FastifyReply, FastifyRequest} from 'fastify';
 import type Database from 'better-sqlite3';
-import {GLOBAL_SETTINGS, coercePreferenceValue, coerceSettingValue, getPreferenceDef, getSettingDef, type SettingValue} from '../../settings/registry';
+import {GLOBAL_SETTINGS, coerceDeveloperPreferenceValue, coercePreferenceValue, coerceSettingValue, getDeveloperPreferenceDef, getPreferenceDef, getSettingDef, type SettingValue} from '../../settings/registry';
 import {
     clearOverridesGovernedBy,
     getAllGlobalSettings,
@@ -8,10 +8,14 @@ import {
     getUserPreferences,
     isTeamOverrideAllowed,
     resolveAllForTeam,
+    resolveDeveloperPreferences,
+    setDeveloperPreference,
     setGlobalSetting,
     setTeamSetting,
     setUserPreference,
 } from '../../settings/store';
+import {getDeveloperById} from '../../registry/developers';
+import {requireDeveloperId} from './guards';
 import {
     ANOMALY_OVERRIDE_FLAG,
     clearTeamAnomalyOverrides,
@@ -415,5 +419,67 @@ export function registerSettingsRoutes(app: FastifyInstance, db: Database.Databa
         })();
 
         return {data: getUserPreferences(db, userId)};
+    });
+
+    // --- Developer coaching preferences (own row, Task 5.10 / #131) --------
+    //
+    // The developer's OWN coaching opt-ins/choices, resolved against the org
+    // permission boundary for their team. Like every /api/me route the developer
+    // id comes STRICTLY from the session (requireDeveloperId), so a developer can
+    // only ever read/write their own coaching choices. The resolved response
+    // carries `blocked`/`reason` per key so the UI can disable and explain a
+    // choice the org currently forbids.
+    //
+    // Writes validate TYPE only; org permission is enforced at resolution, never
+    // at write. A developer may record an opt-in the org currently forbids — it
+    // stays ignored until the org permits it, then takes effect automatically.
+    // The session is the source of truth for identity; the team comes from the
+    // developer record and is used only to resolve the org permission boundary.
+    function developerTeam(developerId: string): string | null {
+        return getDeveloperById(db, developerId)?.team ?? null;
+    }
+
+    app.get('/api/me/coaching-preferences', async (request, reply) => {
+        const developerId = requireDeveloperId(request, reply);
+        if (!developerId) {
+            return reply;
+        }
+        const userId = request.authUser?.userId as string;
+        const team = developerTeam(developerId);
+        return {data: resolveDeveloperPreferences(db, userId, team)};
+    });
+
+    app.patch<{Body: unknown}>('/api/me/coaching-preferences', async (request, reply) => {
+        const developerId = requireDeveloperId(request, reply);
+        if (!developerId) {
+            return reply;
+        }
+        const userId = request.authUser?.userId as string;
+        const body = asPatchBody(request.body);
+        if (!body) {
+            return badRequest(reply, 'Request body must be an object of preferences to update');
+        }
+
+        const updates: {key: string; value: boolean | string}[] = [];
+        for (const [key, raw] of Object.entries(body)) {
+            const def = getDeveloperPreferenceDef(key);
+            if (!def) {
+                return badRequest(reply, `Unknown coaching preference: ${key}`);
+            }
+            const result = coerceDeveloperPreferenceValue(def, raw);
+            if (!result.ok) {
+                return badRequest(reply, result.error);
+            }
+            updates.push({key, value: result.value});
+        }
+
+        db.transaction(() => {
+            for (const u of updates) {
+                setDeveloperPreference(db, userId, u.key, u.value);
+            }
+        })();
+
+        const team = developerTeam(developerId);
+        return {data: resolveDeveloperPreferences(db, userId, team)};
     });
 }

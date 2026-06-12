@@ -1,11 +1,15 @@
 import type Database from 'better-sqlite3';
 import {
+    DEVELOPER_PREFERENCES,
     GLOBAL_SETTINGS,
     USER_PREFERENCES,
+    coerceDeveloperPreferenceValue,
     coercePreferenceValue,
     coerceSettingValue,
+    getDeveloperPreferenceDef,
     getPreferenceDef,
     getSettingDef,
+    type DeveloperPreferenceDef,
     type PreferenceDef,
     type SettingDef,
     type SettingValue,
@@ -289,4 +293,137 @@ export function setUserPreference(
          VALUES (?, ?, ?, ?)
          ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
     ).run(userId, key, JSON.stringify(value), nowIso());
+}
+
+// ---------------------------------------------------------------------------
+// Developer-level coaching preferences (Task 5.10 / #131)
+//
+// These live in the SAME user_preferences table as the UI preferences above —
+// keyed by (user_id, key), so a developer-role user's coaching choices are
+// persisted per developer with no new table. The two registries never share a
+// key, and each read filters by its own def lookup, so they coexist cleanly.
+//
+// The defining behaviour is RESOLUTION: a stored developer choice is honored
+// only within the org's permission boundary. `resolveDeveloperPreferences`
+// resolves the gating org setting FOR THE DEVELOPER'S TEAM and, when it forbids
+// the choice, reports it as blocked and forces the effective value to the def's
+// blockedValue — the org boundary always wins over a stored opt-in.
+// ---------------------------------------------------------------------------
+
+function decodeDeveloperPreference(def: DeveloperPreferenceDef, raw: string): boolean | string {
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(raw);
+    } catch {
+        console.warn(`[settings] unparseable stored coaching preference for ${def.key}; using default`);
+        return def.default;
+    }
+    const result = coerceDeveloperPreferenceValue(def, parsed);
+    if (!result.ok) {
+        console.warn(
+            `[settings] stored coaching preference for ${def.key} failed re-coercion (${result.error}); using default`,
+        );
+        return def.default;
+    }
+    return result.value;
+}
+
+export function setDeveloperPreference(
+    db: Database.Database,
+    userId: string,
+    key: string,
+    value: boolean | string,
+): void {
+    const def = getDeveloperPreferenceDef(key);
+    if (!def) {
+        throw new Error(`Unknown coaching preference key: ${key}`);
+    }
+    db.prepare(
+        `INSERT INTO user_preferences (user_id, key, value, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+    ).run(userId, key, JSON.stringify(value), nowIso());
+}
+
+/** The developer's stored choice for a key (or its effective default), before org gating. */
+function storedDeveloperPreference(
+    db: Database.Database,
+    userId: string,
+    def: DeveloperPreferenceDef,
+    team: string | null | undefined,
+): boolean | string {
+    const row = db
+        .prepare('SELECT value FROM user_preferences WHERE user_id = ? AND key = ?')
+        .get(userId, def.key) as {value: string} | undefined;
+    if (row) {
+        return decodeDeveloperPreference(def, row.value);
+    }
+    // No stored choice: an enum preference may inherit the org default (e.g.
+    // nudge_frequency follows nudge_default_frequency) so the developer starts
+    // from the org's posture rather than a hardcoded constant.
+    if (def.defaultFromOrg) {
+        // defaultFromOrg always names an enum org setting (string-valued), so the
+        // resolved value matches a developer preference's boolean|string domain.
+        return resolveSetting(db, def.defaultFromOrg, team) as boolean | string;
+    }
+    return def.default;
+}
+
+/** One developer preference, resolved against the org permission boundary. */
+export interface ResolvedDeveloperPreference {
+    key: string;
+    /** Effective value after org gating — what the system should actually act on. */
+    value: boolean | string;
+    /** The developer's own stored choice (or its default), independent of gating. */
+    stored: boolean | string;
+    /** True when an org policy currently forbids this choice. */
+    blocked: boolean;
+    /** Human-readable reason, present only when `blocked`. */
+    reason?: string;
+}
+
+/**
+ * Resolve every developer coaching preference for `userId`, applying the org
+ * permission boundary resolved for `team`. For a gated preference whose org flag
+ * is off, `blocked` is true, `reason` explains why, and `value` is forced to the
+ * def's blockedValue (falling back to the stored value when none is declared) —
+ * so a stored opt-in the org forbids is never the effective value. `stored`
+ * always carries the developer's own choice so the UI can show what they picked
+ * and re-honor it automatically if the org later permits it.
+ */
+export function resolveDeveloperPreferences(
+    db: Database.Database,
+    userId: string,
+    team?: string | null,
+): Record<string, ResolvedDeveloperPreference> {
+    const out: Record<string, ResolvedDeveloperPreference> = {};
+    for (const def of Object.values(DEVELOPER_PREFERENCES)) {
+        const stored = storedDeveloperPreference(db, userId, def, team);
+        const blocked = def.gatedBy ? resolveSetting(db, def.gatedBy, team) !== true : false;
+        const value = blocked && def.blockedValue !== undefined ? def.blockedValue : stored;
+        out[def.key] = {
+            key: def.key,
+            value,
+            stored,
+            blocked,
+            ...(blocked && def.blockedReason ? {reason: def.blockedReason} : {}),
+        };
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Coaching pillar gating (Task 5.10 / #131)
+//
+// "Disabling a pillar org-wide hides/disables it everywhere": the developer
+// coaching surfaces resolve these for the developer's team before serving any
+// coaching, so a team override or a global off-switch suppresses the feature.
+// ---------------------------------------------------------------------------
+
+export function isCoachingPillar1Enabled(db: Database.Database, team?: string | null): boolean {
+    return resolveSetting(db, 'coaching_pillar1_enabled', team) === true;
+}
+
+export function isCoachingPillar2Enabled(db: Database.Database, team?: string | null): boolean {
+    return resolveSetting(db, 'coaching_pillar2_enabled', team) === true;
 }

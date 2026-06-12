@@ -36,6 +36,13 @@ export interface SettingDef {
     allowed?: readonly string[];
 }
 
+// Closed value sets shared between the org-level coaching settings and the
+// developer-level preferences they gate, so the two sides validate identically.
+export const SHOWCASE_SCOPE_OPTIONS = ['team_only', 'org_wide'] as const;
+export const NUDGE_FREQUENCY_OPTIONS = ['low', 'normal', 'high'] as const;
+export const CAPTURE_MECHANISM_OPTIONS = ['local_agent', 'editor_extension'] as const;
+export const CAPTURE_RECOVERY_OPTIONS = ['no_recovery', 'recovery_path'] as const;
+
 export const GLOBAL_SETTINGS: Record<string, SettingDef> = {
     leaderboard_enabled: {
         key: 'leaderboard_enabled',
@@ -144,6 +151,89 @@ export const GLOBAL_SETTINGS: Record<string, SettingDef> = {
         default: false,
         teamOverridable: false,
     },
+    // --- Phase 5 coaching policy (Task 5.10 / #131) -----------------------
+    //
+    // The ORG/ADMIN-level boundary for the coaching features. These set the
+    // outer limit of what is permitted; the developer makes their own choices
+    // (DEVELOPER_PREFERENCES, below) within it. All are global-default + per-team
+    // override, gated by the single coaching_managers_can_override flag — the
+    // same pattern as the survey/anomaly blocks above. Privacy-sensitive
+    // permissions (prompt capture, cloud analysis) default OFF; the always-safe
+    // available-data and PR/review pillars default ON so a git-only developer has
+    // useful coaching out of the box.
+    coaching_pillar1_enabled: {
+        key: 'coaching_pillar1_enabled',
+        type: 'boolean',
+        default: true,
+        teamOverridable: true,
+        overrideGovernedBy: 'coaching_managers_can_override',
+    },
+    coaching_pillar2_enabled: {
+        key: 'coaching_pillar2_enabled',
+        type: 'boolean',
+        default: true,
+        teamOverridable: true,
+        overrideGovernedBy: 'coaching_managers_can_override',
+    },
+    // Whether Pillar 3 prompt capture is permitted at all. OFF by default — a
+    // developer's capture opt-in is moot until an admin permits it.
+    coaching_capture_permitted: {
+        key: 'coaching_capture_permitted',
+        type: 'boolean',
+        default: false,
+        teamOverridable: true,
+        overrideGovernedBy: 'coaching_managers_can_override',
+    },
+    // Whether retrospective analysis may use cloud models. OFF by default — some
+    // orgs forbid prompts leaving their infrastructure outright.
+    coaching_cloud_analysis_permitted: {
+        key: 'coaching_cloud_analysis_permitted',
+        type: 'boolean',
+        default: false,
+        teamOverridable: true,
+        overrideGovernedBy: 'coaching_managers_can_override',
+    },
+    showcase_enabled: {
+        key: 'showcase_enabled',
+        type: 'boolean',
+        default: false,
+        teamOverridable: true,
+        overrideGovernedBy: 'coaching_managers_can_override',
+    },
+    // The widest sharing scope an org permits for showcased conversations.
+    // `team_only` (default) keeps published examples within the author's team;
+    // `org_wide` additionally allows org-wide publishing.
+    showcase_scope_permitted: {
+        key: 'showcase_scope_permitted',
+        type: 'enum',
+        default: 'team_only',
+        allowed: SHOWCASE_SCOPE_OPTIONS,
+        teamOverridable: true,
+        overrideGovernedBy: 'coaching_managers_can_override',
+    },
+    // Org default for how often real-time nudges fire; a developer may pick their
+    // own nudge_frequency within this (it is the fallback when they haven't).
+    nudge_default_frequency: {
+        key: 'nudge_default_frequency',
+        type: 'enum',
+        default: 'normal',
+        allowed: NUDGE_FREQUENCY_OPTIONS,
+        teamOverridable: true,
+        overrideGovernedBy: 'coaching_managers_can_override',
+    },
+    nudge_dismissible_default: {
+        key: 'nudge_dismissible_default',
+        type: 'boolean',
+        default: true,
+        teamOverridable: true,
+        overrideGovernedBy: 'coaching_managers_can_override',
+    },
+    coaching_managers_can_override: {
+        key: 'coaching_managers_can_override',
+        type: 'boolean',
+        default: false,
+        teamOverridable: false,
+    },
 };
 
 export interface PreferenceDef {
@@ -175,8 +265,101 @@ export const USER_PREFERENCES: Record<string, PreferenceDef> = {
     },
 };
 
+/**
+ * A DEVELOPER-level coaching preference (Task 5.10 / #131). These are the
+ * developer's OWN privacy/coaching choices, stored per developer and honored
+ * only within the org's permission boundary (the GLOBAL_SETTINGS above). The
+ * gating metadata here is what makes "an org policy can veto a developer choice"
+ * declarative: the store reads `gatedBy`/`blockedValue` and never lets a stored
+ * choice escape the org boundary.
+ */
+export interface DeveloperPreferenceDef {
+    key: string;
+    type: 'boolean' | 'enum';
+    /** Hardcoded fallback when the developer has stored no value AND no org default applies. */
+    default: boolean | string;
+    /** Closed set of allowed values for `enum` preferences. */
+    allowed?: readonly string[];
+    /**
+     * Org boolean setting (a *_permitted flag) that must resolve to `true` for
+     * this developer choice to take effect. When it resolves `false`, the choice
+     * is "blocked": resolution reports `blocked: true` and forces the effective
+     * value to `blockedValue` (when set) so the org boundary always wins.
+     */
+    gatedBy?: string;
+    /**
+     * The effective value when the org blocks this choice. For the consequential
+     * opt-ins (capture, cloud analysis) this is `false`, guaranteeing a blocked
+     * opt-in is never honored regardless of what the developer stored.
+     */
+    blockedValue?: boolean | string;
+    /**
+     * When the developer has stored no value, take the default from this org enum
+     * setting (resolved for their team) instead of `default`. Lets the org's
+     * nudge_default_frequency seed the developer's nudge_frequency.
+     */
+    defaultFromOrg?: string;
+    /** Human-readable reason surfaced in the UI when the choice is blocked. */
+    blockedReason?: string;
+}
+
+export const DEVELOPER_PREFERENCES: Record<string, DeveloperPreferenceDef> = {
+    // Opt-in #1: does the developer want their prompts captured at all. Forced to
+    // false (never captured) when the org has not permitted capture.
+    capture_opt_in: {
+        key: 'capture_opt_in',
+        type: 'boolean',
+        default: false,
+        gatedBy: 'coaching_capture_permitted',
+        blockedValue: false,
+        blockedReason: 'Prompt capture is not permitted by your organization.',
+    },
+    capture_mechanism: {
+        key: 'capture_mechanism',
+        type: 'enum',
+        default: 'local_agent',
+        allowed: CAPTURE_MECHANISM_OPTIONS,
+        gatedBy: 'coaching_capture_permitted',
+        blockedReason: 'Prompt capture is not permitted by your organization.',
+    },
+    capture_recovery_choice: {
+        key: 'capture_recovery_choice',
+        type: 'enum',
+        default: 'no_recovery',
+        allowed: CAPTURE_RECOVERY_OPTIONS,
+        gatedBy: 'coaching_capture_permitted',
+        blockedReason: 'Prompt capture is not permitted by your organization.',
+    },
+    // Opt-in #2: may a retrospective use cloud models. Forced to false when the
+    // org forbids cloud analysis — the developer's opt-in is then simply ignored.
+    cloud_analysis_opt_in: {
+        key: 'cloud_analysis_opt_in',
+        type: 'boolean',
+        default: false,
+        gatedBy: 'coaching_cloud_analysis_permitted',
+        blockedValue: false,
+        blockedReason: 'Cloud-model analysis is not permitted by your organization.',
+    },
+    nudges_enabled: {
+        key: 'nudges_enabled',
+        type: 'boolean',
+        default: true,
+    },
+    nudge_frequency: {
+        key: 'nudge_frequency',
+        type: 'enum',
+        default: 'normal',
+        allowed: NUDGE_FREQUENCY_OPTIONS,
+        defaultFromOrg: 'nudge_default_frequency',
+    },
+};
+
 export function getSettingDef(key: string): SettingDef | undefined {
     return GLOBAL_SETTINGS[key];
+}
+
+export function getDeveloperPreferenceDef(key: string): DeveloperPreferenceDef | undefined {
+    return DEVELOPER_PREFERENCES[key];
 }
 
 export function getPreferenceDef(key: string): PreferenceDef | undefined {
@@ -235,6 +418,33 @@ export function coercePreferenceValue(def: PreferenceDef, raw: unknown): Prefere
         return {ok: true, value: raw};
     }
     // string
+    if (typeof raw !== 'string') {
+        return {ok: false, error: `${def.key} must be a string`};
+    }
+    if (def.allowed && !def.allowed.includes(raw)) {
+        return {ok: false, error: `${def.key} must be one of: ${def.allowed.join(', ')}`};
+    }
+    return {ok: true, value: raw};
+}
+
+/**
+ * Validate/coerce an untrusted value for a developer coaching preference. Mirrors
+ * `coerceSettingValue` for the `boolean`/`enum` shapes these preferences use.
+ * Type-only: org permission is enforced later, at resolution — a developer may
+ * record an opt-in the org currently forbids without error; it simply stays
+ * ignored until (and unless) the org permits it.
+ */
+export function coerceDeveloperPreferenceValue(
+    def: DeveloperPreferenceDef,
+    raw: unknown,
+): PreferenceCoercionResult {
+    if (def.type === 'boolean') {
+        if (typeof raw !== 'boolean') {
+            return {ok: false, error: `${def.key} must be a boolean`};
+        }
+        return {ok: true, value: raw};
+    }
+    // enum
     if (typeof raw !== 'string') {
         return {ok: false, error: `${def.key} must be a string`};
     }
