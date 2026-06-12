@@ -356,7 +356,16 @@ function storedDeveloperPreference(
     // out-of-domain (or numeric) value into a boolean|string preference.
     if (def.defaultFromOrg) {
         const seeded = coercePreferenceValue(def, resolveSetting(db, def.defaultFromOrg, team));
-        return seeded.ok ? seeded.value : def.default;
+        if (seeded.ok) {
+            return seeded.value;
+        }
+        // Org value is outside this pref's domain (registry drift between the org
+        // enum and the developer enum). Surface it like the sibling decoders rather
+        // than silently reverting the developer to the hardcoded default.
+        console.warn(
+            `[settings] org default ${def.defaultFromOrg} for ${def.key} failed re-coercion (${seeded.error}); using default`,
+        );
+        return def.default;
     }
     return def.default;
 }
