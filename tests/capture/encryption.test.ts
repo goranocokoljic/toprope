@@ -63,4 +63,9 @@ describe('capture encryption (Task 5.4)', () => {
         const shortKey = Buffer.alloc(CAPTURE_KEY_BYTES - 1);
         expect(() => encryptCapture(PLAINTEXT, shortKey, KEY_ID)).toThrow();
     });
+
+    it('rejects an empty capture in the core (not just at the HTTP edge)', () => {
+        const key = generateDeveloperKey();
+        expect(() => encryptCapture('', key, KEY_ID)).toThrow(/empty/i);
+    });
 });

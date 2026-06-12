@@ -63,6 +63,11 @@ function assertKey(key: Buffer): void {
  */
 export function encryptCapture(plaintext: string, key: Buffer, keyId: string): EncryptedPayload {
     assertKey(key);
+    // Reject an empty capture in the reusable core, not just at the HTTP edge: an
+    // empty plaintext is meaningless and would otherwise produce a 0-byte ciphertext.
+    if (plaintext.length === 0) {
+        throw new Error('Cannot encrypt an empty capture');
+    }
     const iv = randomBytes(IV_BYTES);
     const cipher = createCipheriv('aes-256-gcm', key, iv);
     const ciphertext = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);

@@ -162,6 +162,18 @@ describe('Capture API (Task 5.4)', () => {
         expect(db.prepare('SELECT COUNT(*) c FROM prompt_captures').get()).toMatchObject({c: 0});
     });
 
+    it('rejects oversized encryption_meta, session_id, and tool (anti-exhaustion bounds)', async () => {
+        const base = makePayload('local_agent');
+        const bigMeta = {...base, encryption_meta: {...base.encryption_meta, key_id: 'x'.repeat(5000)}};
+        const bigSession = {...base, session_id: 's'.repeat(300)};
+        const bigTool = {...base, tool: 't'.repeat(100)};
+        for (const payload of [bigMeta, bigSession, bigTool]) {
+            const res = await app.inject({method: 'POST', url: '/api/me/captures', headers: auth(aliceToken), payload});
+            expect(res.statusCode).toBe(400);
+        }
+        expect(db.prepare('SELECT COUNT(*) c FROM prompt_captures').get()).toMatchObject({c: 0});
+    });
+
     it('normalizes a non-UTC captured_at to canonical UTC ISO before storing', async () => {
         // An offset-bearing timestamp must be stored as the equivalent UTC ISO,
         // never verbatim, to honor the all-timestamps-UTC-ISO invariant.

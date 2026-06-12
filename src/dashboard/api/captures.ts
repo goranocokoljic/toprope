@@ -52,6 +52,15 @@ const MAX_CIPHERTEXT_BYTES = 512 * 1024;
 // while a genuinely enormous body is still refused before the handler runs.
 const CAPTURE_BODY_LIMIT = 1024 * 1024;
 
+// encryption_meta holds only the public crypto descriptor (algo/iv/auth_tag/key_id);
+// a few KiB is ample. Capping the serialized size applies the same anti-exhaustion
+// reasoning as the ciphertext cap so a developer can't pad the blind store via meta.
+const MAX_META_BYTES = 4 * 1024;
+
+// Length caps on the small free-text columns, same anti-exhaustion intent.
+const MAX_SESSION_ID_LEN = 256;
+const MAX_TOOL_LEN = 64;
+
 function badRequest(reply: FastifyReply, message: string): undefined {
     reply.status(400).send({error: 'Bad Request', message});
     return undefined;
@@ -97,6 +106,10 @@ function validateBody(body: unknown, reply: FastifyReply): ValidatedCapture | nu
         badRequest(reply, 'session_id is required');
         return null;
     }
+    if (sessionId.length > MAX_SESSION_ID_LEN) {
+        badRequest(reply, `session_id exceeds the ${MAX_SESSION_ID_LEN}-character limit`);
+        return null;
+    }
 
     // captured_at must be a valid timestamp; default to now when omitted. NORMALIZE
     // to canonical UTC ISO rather than storing the client string verbatim — Date.parse
@@ -118,7 +131,7 @@ function validateBody(body: unknown, reply: FastifyReply): ValidatedCapture | nu
     }
     const mechanism = obj.mechanism;
 
-    if (typeof obj.ciphertext !== 'string' || !BASE64_RE.test(obj.ciphertext)) {
+    if (typeof obj.ciphertext !== 'string' || !BASE64_RE.test(obj.ciphertext) || obj.ciphertext.length % 4 !== 0) {
         badRequest(reply, 'ciphertext must be a non-empty base64 string');
         return null;
     }
@@ -149,11 +162,19 @@ function validateBody(body: unknown, reply: FastifyReply): ValidatedCapture | nu
             return null;
         }
     }
+    if (JSON.stringify(meta).length > MAX_META_BYTES) {
+        badRequest(reply, `encryption_meta exceeds the ${MAX_META_BYTES}-byte limit`);
+        return null;
+    }
 
     let tool: string | null = null;
     if (obj.tool !== undefined && obj.tool !== null) {
         if (typeof obj.tool !== 'string') {
             badRequest(reply, 'tool must be a string');
+            return null;
+        }
+        if (obj.tool.length > MAX_TOOL_LEN) {
+            badRequest(reply, `tool exceeds the ${MAX_TOOL_LEN}-character limit`);
             return null;
         }
         tool = obj.tool.trim() || null;
@@ -176,6 +197,13 @@ export function registerCaptureRoutes(app: FastifyInstance, db: Database.Databas
      * Ingest one already-encrypted capture. Inert (403) unless capture is enabled
      * for the developer (opted in AND org permits). The body must be ciphertext +
      * public meta; plaintext/raw-key fields are rejected (400).
+     *
+     * Delivery is deliberately at-least-once: every accepted POST inserts a fresh
+     * row (server-assigned id, no natural-key dedupe — a session_id intentionally
+     * groups MANY captures, so it is not unique). If a client retries after a lost
+     * 201 it will create a duplicate; the developer owns and can delete their own
+     * captures. A client-supplied idempotency key is a candidate for a later task
+     * if duplicates prove a problem in practice.
      */
     app.post<{Body: unknown}>('/api/me/captures', {bodyLimit: CAPTURE_BODY_LIMIT}, async (request: FastifyRequest<{Body: unknown}>, reply) => {
         const developerId = requireDeveloperId(request, reply);
