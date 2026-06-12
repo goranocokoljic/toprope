@@ -1,7 +1,15 @@
 import {useQuery, type UseQueryResult} from '@tanstack/react-query';
 import {api} from '../api/client';
 import {queryKeys} from '../api/queryKeys';
-import type {TeamDetail, TeamListItem, TeamProviders, TeamTrend, WasteAlert} from '../api/types';
+import type {
+    PRReviewPeriodUnit,
+    TeamDetail,
+    TeamListItem,
+    TeamPRReviewCoaching,
+    TeamProviders,
+    TeamTrend,
+    WasteAlert,
+} from '../api/types';
 import type {TimeRangeValue} from '../timeRange/range';
 import {trendQuery, trendWindowKey} from '../timeRange/trendQuery';
 
@@ -48,5 +56,19 @@ export function useTeamWaste(team: string): UseQueryResult<WasteAlert[], Error> 
     return useQuery({
         queryKey: queryKeys.teamWaste(team),
         queryFn: () => api.getTeamWaste(team),
+    });
+}
+
+/**
+ * Team (or org) PR/review coaching aggregate (Task 5.3). `scope` is a team name
+ * or the literal 'org'; keyed by scope + unit so each caches independently.
+ */
+export function useTeamPRReviewCoaching(
+    scope: string,
+    unit: PRReviewPeriodUnit,
+): UseQueryResult<TeamPRReviewCoaching, Error> {
+    return useQuery({
+        queryKey: queryKeys.teamPRCoaching(scope, unit),
+        queryFn: () => api.getTeamPRReviewCoaching(scope, unit),
     });
 }

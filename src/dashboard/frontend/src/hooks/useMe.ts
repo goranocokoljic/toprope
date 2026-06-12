@@ -1,7 +1,15 @@
 import {useQuery, type UseQueryResult} from '@tanstack/react-query';
 import {api, type TimeRangeQuery} from '../api/client';
 import {queryKeys} from '../api/queryKeys';
-import type {DeveloperJourney, MeActivity, MeOverview, MeTimeline, MeTools} from '../api/types';
+import type {
+    DeveloperJourney,
+    DeveloperPRReviewCoaching,
+    MeActivity,
+    MeOverview,
+    MeTimeline,
+    MeTools,
+    PRReviewPeriodUnit,
+} from '../api/types';
 import type {TimeRangeValue} from '../timeRange/range';
 import {trendQuery, trendWindowKey} from '../timeRange/trendQuery';
 
@@ -57,5 +65,15 @@ export function useMeActivity(range: TimeRangeValue): UseQueryResult<MeActivity,
     return useQuery({
         queryKey: queryKeys.meActivity(trendWindowKey(range)),
         queryFn: () => api.getMeActivity(trendQuery(range)),
+    });
+}
+
+/** The developer's own PR/review coaching trajectory (Task 5.3), keyed by unit. */
+export function useMyPRReviewCoaching(
+    unit: PRReviewPeriodUnit,
+): UseQueryResult<DeveloperPRReviewCoaching, Error> {
+    return useQuery({
+        queryKey: queryKeys.mePRCoaching(unit),
+        queryFn: () => api.getMyPRReviewCoaching(unit),
     });
 }
