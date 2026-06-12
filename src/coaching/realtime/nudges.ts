@@ -13,7 +13,7 @@
  * detected loop into that nudge.
  */
 
-import type {NudgeSuggestion, NudgeType} from './types';
+import type {NudgeType, StructuralNudge} from './types';
 
 /** Tunables for the structural checks. */
 export interface NudgeCheckConfig {
@@ -51,38 +51,43 @@ const ERROR_TOPIC_RE = /\b(error|errors|exception|crash|crashed|crashes|fails|fa
 // "file:line" marker, a stack frame, or a traceback header.
 const ERROR_PRESENT_RE = /```|`[^`]+`|\b\w+(Error|Exception)\b|\b(Error|Exception)\s*:|:\s*\d+|\bat\s+[\w.$]+\s*\(|traceback \(most recent/i;
 
+// The checks return the nudge's intrinsic part only (type + message). The
+// `dismissible` flag is NOT decided here: it comes from the developer's settings
+// and is stamped on exactly once by the coach, so the checks don't carry a
+// write-only field the coach would immediately overwrite.
+
 /** length-below-threshold check. */
-export function checkShortPrompt(prompt: string, config: NudgeCheckConfig): NudgeSuggestion | null {
+export function checkShortPrompt(prompt: string, config: NudgeCheckConfig): StructuralNudge | null {
     if (prompt.trim().length < config.minPromptLength) {
-        return {type: 'short_prompt', message: MESSAGES.short_prompt, dismissible: true};
+        return {type: 'short_prompt', message: MESSAGES.short_prompt};
     }
     return null;
 }
 
 /** asks-about-code-but-includes-none check. */
-export function checkMissingContext(prompt: string): NudgeSuggestion | null {
+export function checkMissingContext(prompt: string): StructuralNudge | null {
     if (CODE_TOPIC_RE.test(prompt) && !CODE_PRESENT_RE.test(prompt)) {
-        return {type: 'missing_context', message: MESSAGES.missing_context, dismissible: true};
+        return {type: 'missing_context', message: MESSAGES.missing_context};
     }
     return null;
 }
 
 /** describes-an-error-but-includes-no-error-text check. */
-export function checkMissingError(prompt: string): NudgeSuggestion | null {
+export function checkMissingError(prompt: string): StructuralNudge | null {
     if (ERROR_TOPIC_RE.test(prompt) && !ERROR_PRESENT_RE.test(prompt)) {
-        return {type: 'missing_error', message: MESSAGES.missing_error, dismissible: true};
+        return {type: 'missing_error', message: MESSAGES.missing_error};
     }
     return null;
 }
 
 /**
  * Run every structural check against one prompt and return the nudges that apply,
- * in a stable order (short → missing_context → missing_error). The `dismissible`
- * flag on each is overridden by the coach from settings; here it defaults to true
- * because a structural nudge is always advisory and never blocks the developer.
+ * in a stable order (short → missing_context → missing_error). A structural nudge
+ * is always advisory and never blocks; the coach adds the settings-driven
+ * `dismissible` flag when it delivers them.
  */
-export function runStructuralChecks(prompt: string, config: NudgeCheckConfig = DEFAULT_NUDGE_CONFIG): NudgeSuggestion[] {
-    const out: NudgeSuggestion[] = [];
+export function runStructuralChecks(prompt: string, config: NudgeCheckConfig = DEFAULT_NUDGE_CONFIG): StructuralNudge[] {
+    const out: StructuralNudge[] = [];
     const short = checkShortPrompt(prompt, config);
     if (short) {
         out.push(short);

@@ -20,7 +20,7 @@
 
 import {DEFAULT_LOOP_CONFIG, LoopDetector, type LoopDetectorConfig} from './loop-detector';
 import {DEFAULT_NUDGE_CONFIG, REPEATED_PROMPT_MESSAGE, runStructuralChecks, type NudgeCheckConfig} from './nudges';
-import type {LoopDetection, LoopEventMeta, NudgeEventMeta, NudgeSuggestion} from './types';
+import type {LoopEventMeta, NudgeEventMeta, NudgeSuggestion, StructuralNudge} from './types';
 
 export type NudgeFrequency = 'low' | 'normal' | 'high';
 
@@ -53,17 +53,20 @@ export interface RealtimeCoachConfig {
 
 /** What `observePrompt` returns for one prompt. */
 export interface CoachResult {
-    /** The raw loop detection (local view), or null. Present even if throttled. */
-    loop: LoopDetection | null;
     /** Nudges to show the developer right now (after enabled + throttle). */
     nudges: NudgeSuggestion[];
-    /** Loop-event metadata to optionally sync — present when a loop was detected. */
+    /**
+     * Loop-event metadata to optionally sync — present (non-null) when a loop was
+     * detected this prompt. This doubles as the "a loop happened" signal: there is
+     * no separate detection field, since `loopEvent.similarPromptCount` already
+     * carries the only datum a local view would want.
+     */
     loopEvent: LoopEventMeta | null;
     /** Nudge-event metadata to optionally sync — one per delivered nudge. */
     nudgeEvents: NudgeEventMeta[];
 }
 
-const EMPTY_RESULT: CoachResult = {loop: null, nudges: [], loopEvent: null, nudgeEvents: []};
+const EMPTY_RESULT: CoachResult = {nudges: [], loopEvent: null, nudgeEvents: []};
 
 export class RealtimeCoach {
     private readonly detector: LoopDetector;
@@ -99,9 +102,9 @@ export class RealtimeCoach {
         this.promptsSinceNudge++;
 
         const loop = this.detector.observe(prompt);
-        const candidates: NudgeSuggestion[] = runStructuralChecks(prompt, this.nudgeConfig);
+        const candidates: StructuralNudge[] = runStructuralChecks(prompt, this.nudgeConfig);
         if (loop) {
-            candidates.push({type: 'repeated_prompt', message: REPEATED_PROMPT_MESSAGE, dismissible: true});
+            candidates.push({type: 'repeated_prompt', message: REPEATED_PROMPT_MESSAGE});
         }
 
         const loopEvent: LoopEventMeta | null = loop
@@ -112,11 +115,13 @@ export class RealtimeCoach {
         // frequency has elapsed. Detection metadata (loopEvent) is unaffected.
         const cooldown = FREQUENCY_COOLDOWN[this.settings.frequency];
         if (candidates.length === 0 || this.promptsSinceNudge <= cooldown) {
-            return {loop, nudges: [], loopEvent, nudgeEvents: []};
+            return {nudges: [], loopEvent, nudgeEvents: []};
         }
 
         const deliveredAt = new Date().toISOString();
-        const nudges = candidates.map((n) => ({...n, dismissible: this.settings.dismissible}));
+        // Stamp the settings-driven dismissible flag on exactly once, here, as the
+        // checks deliberately don't carry it (see StructuralNudge).
+        const nudges: NudgeSuggestion[] = candidates.map((n) => ({...n, dismissible: this.settings.dismissible}));
         const nudgeEvents: NudgeEventMeta[] = nudges.map((n) => ({
             sessionId: this.sessionId,
             nudgeType: n.type,
@@ -124,6 +129,6 @@ export class RealtimeCoach {
         }));
         this.promptsSinceNudge = 0;
 
-        return {loop, nudges, loopEvent, nudgeEvents};
+        return {nudges, loopEvent, nudgeEvents};
     }
 }

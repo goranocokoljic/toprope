@@ -117,6 +117,19 @@ describe('Realtime coaching API (Task 5.6)', () => {
         expect(logs).not.toContain('SUPERSECRETMARKER');
     });
 
+    it('rejects ANY unexpected field via allowlist (not just known content names)', async () => {
+        const res = await app.inject({
+            method: 'POST',
+            url: '/api/me/coaching/loop-events',
+            headers: auth(aliceToken),
+            // `transcript` is not on a guessed content denylist, but the allowlist refuses it.
+            payload: {session_id: 's1', similar_prompt_count: 3, transcript: 'SUPERSECRETMARKER ...'},
+        });
+        expect(res.statusCode).toBe(400);
+        expect(db.prepare('SELECT COUNT(*) c FROM loop_events').get()).toMatchObject({c: 0});
+        expect(logs).not.toContain('SUPERSECRETMARKER');
+    });
+
     it('rejects an out-of-set nudge_type', async () => {
         const res = await app.inject({
             method: 'POST',

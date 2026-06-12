@@ -74,7 +74,11 @@ export class LoopDetector {
     private readonly config: LoopDetectorConfig;
 
     constructor(config: Partial<LoopDetectorConfig> = {}) {
-        this.config = {...DEFAULT_LOOP_CONFIG, ...config};
+        const merged = {...DEFAULT_LOOP_CONFIG, ...config};
+        // A loop is "the same request more than once", so a minimum of 2 is the
+        // floor — clamp it so a caller-supplied 0/1 (which would fire on the very
+        // first prompt, a spurious loop-of-1) can't break the documented invariant.
+        this.config = {...merged, minSimilar: Math.max(2, merged.minSimilar)};
     }
 
     /**

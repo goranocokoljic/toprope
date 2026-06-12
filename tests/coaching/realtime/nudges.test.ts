@@ -12,7 +12,8 @@ describe('structural nudges — each condition (Task 5.6)', () => {
         it('fires when the prompt is below the length threshold', () => {
             const n = checkShortPrompt('fix this', DEFAULT_NUDGE_CONFIG);
             expect(n?.type).toBe('short_prompt');
-            expect(n?.dismissible).toBe(true);
+            // The check produces only type + message; dismissibility is the coach's concern.
+            expect(n).not.toHaveProperty('dismissible');
         });
         it('does not fire for a sufficiently long prompt', () => {
             expect(checkShortPrompt('please walk me through how the retry backoff is configured', DEFAULT_NUDGE_CONFIG)).toBeNull();

@@ -53,7 +53,7 @@ describe('RealtimeCoach — settings adherence + privacy (Task 5.6)', () => {
         c.observePrompt(p);
         c.observePrompt(p);
         const r = c.observePrompt(p); // 3rd → loop
-        expect(r.loop?.similarPromptCount).toBe(3);
+        // loopEvent doubles as the "a loop happened" signal (no separate field).
         expect(r.loopEvent?.similarPromptCount).toBe(3);
         expect(r.nudges.map((n) => n.type)).toContain('repeated_prompt');
     });

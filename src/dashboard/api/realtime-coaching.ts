@@ -6,9 +6,10 @@
  * similar-prompt count, a nudge's type, timestamps) and let the developer read
  * back and dismiss their own events. Two invariants, enforced here and tested:
  *
- *  1. METADATA ONLY. The record routes REJECT any body field that could carry
- *     prompt content (plaintext/prompt/text/…), so content cannot reach the server
- *     even by accident — backing the schema's structural no-content guarantee.
+ *  1. METADATA ONLY. The record routes ALLOWLIST exactly the metadata fields they
+ *     accept and reject any other key, so prompt content cannot reach the server
+ *     even under an unanticipated field name — backing the schema's structural
+ *     no-content guarantee (the same allowlist posture as the capture routes).
  *
  *  2. PRIVATE TO THE DEVELOPER. Every route lives under /api/me and derives the
  *     developer id from the session, never from input — so a developer can only
@@ -34,23 +35,32 @@ import {
 import {isNudgeType} from '../../coaching/realtime/types';
 import {asObject, badRequest} from './body-validation';
 
-// Any field that could carry readable prompt content. The record routes refuse a
-// body containing any of these — loop/nudge events are metadata only, and content
-// must never reach the server, even transiently. Structural guard, not a scan.
-const FORBIDDEN_CONTENT_KEYS = ['plaintext', 'prompt', 'prompts', 'responses', 'text', 'content', 'message', 'messages'];
+// The exact metadata fields each record route accepts. Allowlisting (rather than
+// denylisting guessed "content" field names) is the house pattern for this
+// concern — see validateMetaAllowlist in body-validation.ts — and is strictly
+// stronger: ANY unexpected field, including a differently-named or nested attempt
+// to smuggle prompt content, is refused outright, so the body that reaches the
+// handler is always a known, flat, metadata-only shape.
+const LOOP_EVENT_KEYS = ['session_id', 'detected_at', 'similar_prompt_count'] as const;
+const NUDGE_EVENT_KEYS = ['session_id', 'nudge_type', 'delivered_at'] as const;
 
 const MAX_SESSION_ID_LEN = 256;
 // A loop is a handful of similar prompts; cap the count well above any real loop so
 // a malformed producer can't store an absurd value, while never rejecting a real one.
 const MAX_SIMILAR_PROMPT_COUNT = 10000;
 
-/** Reject a body that carries any apparent prompt-content field. Returns false (sent 400) on a hit. */
-function rejectContentKeys(obj: Record<string, unknown>, reply: FastifyReply): boolean {
-    for (const key of FORBIDDEN_CONTENT_KEYS) {
-        if (key in obj) {
+/**
+ * Reject a body carrying any key outside the route's allowlist. Returns false
+ * (sent 400) on the first unexpected field, so prompt content can't reach the
+ * server even under a field name we didn't anticipate — the structural backing
+ * for the metadata-only guarantee.
+ */
+function rejectUnknownKeys(obj: Record<string, unknown>, allowed: readonly string[], reply: FastifyReply): boolean {
+    for (const key of Object.keys(obj)) {
+        if (!allowed.includes(key)) {
             badRequest(
                 reply,
-                `Field '${key}' is not accepted: loop/nudge events are metadata only and must never carry prompt content`,
+                `Field '${key}' is not accepted: loop/nudge events are metadata only and accept exactly ${allowed.join(', ')}`,
             );
             return false;
         }
@@ -77,8 +87,11 @@ function normalizeTimestamp(raw: unknown, field: string, reply: FastifyReply): s
     if (raw === undefined || raw === null) {
         return new Date().toISOString();
     }
-    if (typeof raw === 'string' && !Number.isNaN(Date.parse(raw))) {
-        return new Date(raw).toISOString();
+    if (typeof raw === 'string') {
+        const parsed = new Date(raw);
+        if (!Number.isNaN(parsed.getTime())) {
+            return parsed.toISOString();
+        }
     }
     badRequest(reply, `${field} must be an ISO timestamp string`);
     return null;
@@ -119,7 +132,7 @@ export function registerRealtimeCoachingRoutes(app: FastifyInstance, db: Databas
             badRequest(reply, 'Request body must be an object');
             return reply;
         }
-        if (!rejectContentKeys(obj, reply)) {
+        if (!rejectUnknownKeys(obj, LOOP_EVENT_KEYS, reply)) {
             return reply;
         }
         const sessionId = validateSessionId(obj, reply);
@@ -168,7 +181,7 @@ export function registerRealtimeCoachingRoutes(app: FastifyInstance, db: Databas
             badRequest(reply, 'Request body must be an object');
             return reply;
         }
-        if (!rejectContentKeys(obj, reply)) {
+        if (!rejectUnknownKeys(obj, NUDGE_EVENT_KEYS, reply)) {
             return reply;
         }
         const sessionId = validateSessionId(obj, reply);

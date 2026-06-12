@@ -27,11 +27,20 @@ export interface LoopDetection {
     similarPromptCount: number;
 }
 
-/** A single gentle, dismissible nudge the local coach surfaces to the developer. */
-export interface NudgeSuggestion {
+/**
+ * A nudge's intrinsic part as the structural checks produce it: which check fired
+ * and the message to show. The `dismissible` flag is deliberately NOT here — it is
+ * a settings-driven delivery concern the coach stamps on (see `NudgeSuggestion`).
+ */
+export interface StructuralNudge {
     type: NudgeType;
     /** Human-readable, non-blocking guidance shown to the developer. */
     message: string;
+}
+
+/** A single gentle nudge the local coach delivers — a StructuralNudge plus the
+ * settings-resolved dismissibility. */
+export interface NudgeSuggestion extends StructuralNudge {
     /** Whether the developer can dismiss it (resolved from settings; always advisory). */
     dismissible: boolean;
 }
