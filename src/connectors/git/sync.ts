@@ -234,10 +234,36 @@ function parseRepoFilters(rawRepos: string[] | undefined): {include: string[]; e
     return {include, exclude};
 }
 
+// Per-PR normalized facts for pr_records (Task 5.2). Built in fetchProviderData
+// where the raw GitPR + its review comments/verdicts are in hand, then resolved
+// to a developer and upserted in sync().
+interface PRRecordInput {
+    provider: GitProviderType;
+    repo: string;
+    prId: string;
+    authorLogin: string | null;
+    authorEmail: string | null;
+    state: string;
+    createdAt: string;
+    mergedAt: string | null;
+    closedAt: string | null;
+    reviewCommentCount: number;
+    changesRequestedCount: number;
+    /** Normalized review verdict events (approved / changes_requested). */
+    reviewEventCount: number;
+    // Whether the comment / verdict fetches succeeded. On failure the counts
+    // above are zero BY ABSENCE, not by observation — the upsert must not let
+    // them clobber previously-observed values (a transient API failure would
+    // otherwise rewrite real review history as "clean reviews").
+    commentsOk: boolean;
+    reviewsOk: boolean;
+}
+
 interface ProviderFetchResult {
     commits: AnalysisCommit[];
     prs: AnalysisPR[];
     reviewComments: AnalysisReviewComment[];
+    prRecords: PRRecordInput[];
     errors: string[];
     stateKey: string;
 }
@@ -251,6 +277,7 @@ async function fetchProviderData(
     const allCommits: AnalysisCommit[] = [];
     const allPRs: AnalysisPR[] = [];
     const allReviewComments: AnalysisReviewComment[] = [];
+    const allPRRecords: PRRecordInput[] = [];
 
     const provider = createGitProvider(providerConfig);
     const providerType = provider.name;
@@ -274,7 +301,14 @@ async function fetchProviderData(
         errors.push(
             `[${providerType}] Failed to list repos: ${err instanceof Error ? err.message : String(err)}`,
         );
-        return {commits: allCommits, prs: allPRs, reviewComments: allReviewComments, errors, stateKey};
+        return {
+            commits: allCommits,
+            prs: allPRs,
+            reviewComments: allReviewComments,
+            prRecords: allPRRecords,
+            errors,
+            stateKey,
+        };
     }
 
     const reposToSync = applyRepoFilter(
@@ -315,20 +349,200 @@ async function fetchProviderData(
             );
         }
 
+        let commentFetchFailures = 0;
+        let reviewFetchFailures = 0;
         for (const pr of rawPRs) {
             allPRs.push(toAnalysisPR(pr));
+            let prCommentCount = 0;
+            let commentsOk = true;
             try {
                 const comments = await provider.getReviewComments(repoName, pr.id);
+                prCommentCount = comments.length;
                 for (const c of comments) {
                     allReviewComments.push(toAnalysisReviewComment(c));
                 }
             } catch {
-                // Review comment fetch failed — skip for this PR
+                // Review comment fetch failed — counted and surfaced below
+                commentsOk = false;
+                commentFetchFailures++;
+            }
+
+            // Review verdict events (Task 5.2). Best-effort like comments: a
+            // failed fetch still records the PR, flagged so the upsert
+            // preserves previously-observed verdict data.
+            let changesRequestedCount = 0;
+            let reviewEventCount = 0;
+            let reviewsOk = true;
+            try {
+                const reviews = await provider.getPRReviews(repoName, pr.id);
+                reviewEventCount = reviews.length;
+                changesRequestedCount = reviews.filter(
+                    (r) => r.state === 'changes_requested',
+                ).length;
+            } catch {
+                reviewsOk = false;
+                reviewFetchFailures++;
+            }
+
+            allPRRecords.push({
+                provider: providerType,
+                repo: repoName,
+                prId: pr.id,
+                authorLogin: pr.author.username || null,
+                authorEmail: pr.author.email || null,
+                state: pr.state,
+                createdAt: pr.createdAt,
+                mergedAt: pr.mergedAt,
+                closedAt: pr.closedAt,
+                reviewCommentCount: prCommentCount,
+                changesRequestedCount,
+                reviewEventCount,
+                commentsOk,
+                reviewsOk,
+            });
+        }
+
+        // Surface fetch failures (aggregated per repo so a rate-limited run
+        // doesn't produce one error per PR). A silent failure here would be
+        // indistinguishable from a clean review history downstream.
+        if (commentFetchFailures > 0) {
+            errors.push(
+                `[${providerType}/${repoName}] Failed to fetch review comments for ${commentFetchFailures} PR(s)`,
+            );
+        }
+        if (reviewFetchFailures > 0) {
+            errors.push(
+                `[${providerType}/${repoName}] Failed to fetch review verdicts for ${reviewFetchFailures} PR(s)`,
+            );
+        }
+    }
+
+    return {
+        commits: allCommits,
+        prs: allPRs,
+        reviewComments: allReviewComments,
+        prRecords: allPRRecords,
+        errors,
+        stateKey,
+    };
+}
+
+/**
+ * Review cycles for a PR: 0 when it never saw any review activity; otherwise
+ * one initial review round plus one more per "changes requested" send-back.
+ */
+function computeReviewRounds(
+    reviewEventCount: number,
+    reviewCommentCount: number,
+    changesRequestedCount: number,
+): number {
+    if (reviewEventCount === 0 && reviewCommentCount === 0) return 0;
+    return 1 + changesRequestedCount;
+}
+
+function timeToMergeHours(record: PRRecordInput): number | null {
+    if (!record.mergedAt) return null;
+    const ms = Date.parse(record.mergedAt) - Date.parse(record.createdAt);
+    if (Number.isNaN(ms) || ms < 0) return null;
+    return ms / 3_600_000;
+}
+
+/**
+ * Project constraint: all timestamps in UTC ISO. Bitbucket/GitLab can emit
+ * offset timestamps (+02:00-style); normalize so the day-attribution in the
+ * coaching engine (substr of the date part) is a UTC day, not a local one.
+ * Unparseable input passes through untouched rather than becoming garbage.
+ */
+function toUtcIso(timestamp: string): string;
+function toUtcIso(timestamp: string | null): string | null;
+function toUtcIso(timestamp: string | null): string | null {
+    if (timestamp === null) return null;
+    const ms = Date.parse(timestamp);
+    return Number.isNaN(ms) ? timestamp : new Date(ms).toISOString();
+}
+
+interface PRRecordExistingRow {
+    review_comment_count: number;
+    review_rounds: number;
+    changes_requested_count: number;
+}
+
+function upsertPRRecord(
+    db: Database.Database,
+    record: PRRecordInput,
+    developerId: string,
+    syncedAt: string,
+): void {
+    // A failed comment/verdict fetch yields zeros by absence, not observation.
+    // Carry forward the previously-observed values for the failed dimension so
+    // one bad sync can't rewrite real review history as "clean reviews".
+    let commentCount = record.reviewCommentCount;
+    let crCount = record.changesRequestedCount;
+    let rounds = computeReviewRounds(record.reviewEventCount, commentCount, crCount);
+    if (!record.commentsOk || !record.reviewsOk) {
+        const existing = db
+            .prepare(
+                `SELECT review_comment_count, review_rounds, changes_requested_count
+                 FROM pr_records WHERE provider = ? AND repo = ? AND pr_id = ?`,
+            )
+            .get(record.provider, record.repo, record.prId) as PRRecordExistingRow | undefined;
+        if (existing) {
+            if (!record.commentsOk) commentCount = existing.review_comment_count;
+            if (!record.reviewsOk) {
+                // Verdict events weren't observed this sync — restore the last
+                // verdict-derived round count and changes-requested count as a
+                // unit. Recomputing rounds from a fresh comment count alone
+                // (which can't raise rounds past 1) would blend stale and fresh
+                // state into a row that never matched any single observation.
+                crCount = existing.changes_requested_count;
+                rounds = existing.review_rounds;
+            } else {
+                // Verdicts observed; only comments are stale — recompute from
+                // the authoritative fresh verdict data.
+                rounds = computeReviewRounds(record.reviewEventCount, commentCount, crCount);
             }
         }
     }
 
-    return {commits: allCommits, prs: allPRs, reviewComments: allReviewComments, errors, stateKey};
+    db.prepare(
+        `INSERT INTO pr_records
+         (id, developer_id, provider, repo, pr_id, state, created_at, merged_at, closed_at,
+          review_comment_count, review_rounds, changes_requested_count, time_to_merge_hours, synced_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(provider, repo, pr_id) DO UPDATE SET
+           developer_id = excluded.developer_id,
+           state = excluded.state,
+           created_at = excluded.created_at,
+           -- Freeze the merge timestamp once observed: a PR merges exactly once,
+           -- and Bitbucket approximates it with updated_on, which post-merge
+           -- activity inflates on every re-sync. COALESCE keeps the first
+           -- non-null value so merged_at and time_to_merge_hours stay consistent.
+           merged_at = COALESCE(pr_records.merged_at, excluded.merged_at),
+           closed_at = excluded.closed_at,
+           review_comment_count = excluded.review_comment_count,
+           review_rounds = excluded.review_rounds,
+           changes_requested_count = excluded.changes_requested_count,
+           -- Keep the FIRST observed time-to-merge: it never legitimately
+           -- changes after merge, and Bitbucket's merge timestamp is
+           -- approximated by updated_on, which post-merge activity inflates.
+           time_to_merge_hours = COALESCE(pr_records.time_to_merge_hours, excluded.time_to_merge_hours),
+           synced_at = excluded.synced_at`,
+    ).run(
+        randomUUID(),
+        developerId,
+        record.provider,
+        record.repo,
+        record.prId,
+        record.state,
+        toUtcIso(record.createdAt),
+        toUtcIso(record.mergedAt),
+        toUtcIso(record.closedAt),
+        commentCount,
+        rounds,
+        crCount,
+        timeToMergeHours(record),
+        syncedAt,
+    );
 }
 
 export class GitSync implements ConnectorInterface {
@@ -396,9 +610,23 @@ export class GitSync implements ConnectorInterface {
         // Accumulate snapshots from all providers into a single map keyed by
         // "developer_id:date" so same-day multi-provider data is merged.
         const globalSnapshots = new Map<string, GitSnapshotRow>();
+        // Per-PR records (Task 5.2) resolved to developers, written after the
+        // snapshot pass. Keyed naturally by (provider, repo, pr_id), so no
+        // cross-provider merging is needed.
+        const resolvedPRRecords: Array<{record: PRRecordInput; developerId: string}> = [];
 
         for (const {result, providerType} of fetchResults) {
-            const {commits, prs, reviewComments, stateKey} = result;
+            const {commits, prs, reviewComments, prRecords, stateKey} = result;
+
+            for (const record of prRecords) {
+                const developerId = resolveDeveloperId(
+                    devLookup,
+                    providerType,
+                    record.authorLogin,
+                    record.authorEmail,
+                );
+                if (developerId) resolvedPRRecords.push({record, developerId});
+            }
 
             if (commits.length === 0 && prs.length === 0 && reviewComments.length === 0) {
                 setProviderLastSyncTime(db, stateKey, now);
@@ -449,12 +677,15 @@ export class GitSync implements ConnectorInterface {
             setProviderLastSyncTime(db, stateKey, now);
         }
 
-        // Upsert all merged snapshots in a single transaction
+        // Upsert all merged snapshots + per-PR records in a single transaction
         const insertMany = db.transaction(() => {
             for (const snap of globalSnapshots.values()) {
                 const outcome = upsertSnapshot(db, snap);
                 if (outcome === 'written') snapshotsWritten++;
                 else snapshotsSkipped++;
+            }
+            for (const {record, developerId} of resolvedPRRecords) {
+                upsertPRRecord(db, record, developerId, now);
             }
         });
 

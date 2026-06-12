@@ -95,6 +95,7 @@ function makeMockProvider(overrides: Partial<GitProvider> = {}): GitProvider {
         getCommits: vi.fn().mockResolvedValue([]),
         getPullRequests: vi.fn().mockResolvedValue([]),
         getReviewComments: vi.fn().mockResolvedValue([]),
+        getPRReviews: vi.fn().mockResolvedValue([]),
         getCommitDiff: vi.fn().mockResolvedValue([]),
         checkAccess: vi.fn().mockResolvedValue(undefined),
         ...overrides,
@@ -606,5 +607,245 @@ describe('GitSync', () => {
         const bbKey = db.prepare(`SELECT value FROM sync_state WHERE key = 'git_last_sync:bitbucket:myws'`).get();
         expect(githubKey).toBeDefined();
         expect(bbKey).toBeDefined();
+    });
+
+    describe('pr_records (Task 5.2)', () => {
+        interface PRRecordRow {
+            developer_id: string;
+            provider: string;
+            repo: string;
+            pr_id: string;
+            state: string;
+            review_comment_count: number;
+            review_rounds: number;
+            changes_requested_count: number;
+            merged_at: string | null;
+            time_to_merge_hours: number | null;
+        }
+
+        function getPRRecords(): PRRecordRow[] {
+            return db.prepare('SELECT * FROM pr_records ORDER BY pr_id').all() as PRRecordRow[];
+        }
+
+        it('persists per-PR records with normalized review outcomes', async () => {
+            const devId = seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            const provider = makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+                getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+                getReviewComments: vi.fn().mockResolvedValue([
+                    makeProviderReviewComment('bob'),
+                    makeProviderReviewComment('bob'),
+                ]),
+                getPRReviews: vi.fn().mockResolvedValue([
+                    {author: {name: '', email: '', username: 'bob'}, state: 'changes_requested', submittedAt: '2024-01-15T12:00:00Z', prId: '1'},
+                    {author: {name: '', email: '', username: 'bob'}, state: 'approved', submittedAt: '2024-01-16T09:00:00Z', prId: '1'},
+                ]),
+            });
+            createGitProvider.mockReturnValue(provider);
+
+            await new GitSync(makeGithubConfig()).sync(db);
+
+            const records = getPRRecords();
+            expect(records).toHaveLength(1);
+            expect(records[0].developer_id).toBe(devId);
+            expect(records[0].provider).toBe('github');
+            expect(records[0].repo).toBe('repo-a');
+            expect(records[0].state).toBe('merged');
+            expect(records[0].review_comment_count).toBe(2);
+            expect(records[0].changes_requested_count).toBe(1);
+            // One initial round + one send-back
+            expect(records[0].review_rounds).toBe(2);
+            // makeProviderPR: created 01-15T08:00 → merged 01-16T10:00 = 26h
+            expect(records[0].time_to_merge_hours).toBeCloseTo(26, 5);
+        });
+
+        it('records zero review rounds for a PR with no review activity', async () => {
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            const provider = makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+                getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+            });
+            createGitProvider.mockReturnValue(provider);
+
+            await new GitSync(makeGithubConfig()).sync(db);
+
+            const records = getPRRecords();
+            expect(records).toHaveLength(1);
+            expect(records[0].review_rounds).toBe(0);
+            expect(records[0].changes_requested_count).toBe(0);
+        });
+
+        it('upserts the same PR on re-sync instead of duplicating it', async () => {
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            const openPR = {...makeProviderPR('alice'), state: 'open', mergedAt: null, closedAt: null};
+            const provider = makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+                getPullRequests: vi.fn().mockResolvedValue([openPR]),
+            });
+            createGitProvider.mockReturnValue(provider);
+            await new GitSync(makeGithubConfig()).sync(db);
+            expect(getPRRecords()[0].state).toBe('open');
+
+            // Next sync: the PR has merged and gained a send-back round.
+            const mergedProvider = makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+                getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+                getPRReviews: vi.fn().mockResolvedValue([
+                    {author: {name: '', email: '', username: 'bob'}, state: 'changes_requested', submittedAt: '2024-01-15T12:00:00Z', prId: '1'},
+                ]),
+            });
+            createGitProvider.mockReturnValue(mergedProvider);
+            await new GitSync(makeGithubConfig()).sync(db);
+
+            const records = getPRRecords();
+            expect(records).toHaveLength(1); // updated in place
+            expect(records[0].state).toBe('merged');
+            expect(records[0].review_rounds).toBe(2);
+        });
+
+        it('still records the PR when the review fetch fails, and surfaces the failure as a sync error', async () => {
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            const provider = makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+                getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+                getReviewComments: vi.fn().mockResolvedValue([makeProviderReviewComment('bob')]),
+                getPRReviews: vi.fn().mockRejectedValue(new Error('boom')),
+            });
+            createGitProvider.mockReturnValue(provider);
+
+            const result = await new GitSync(makeGithubConfig()).sync(db);
+
+            const records = getPRRecords();
+            expect(records).toHaveLength(1);
+            expect(records[0].changes_requested_count).toBe(0);
+            // Comments alone still count as review activity
+            expect(records[0].review_rounds).toBe(1);
+            // The failure is not silent — a token missing the reviews scope
+            // must not masquerade as a clean review history.
+            expect(result.errors.some((e) => /review verdicts/.test(e))).toBe(true);
+        });
+
+        it('a failed review fetch on re-sync preserves previously-observed verdict data', async () => {
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            const goodProvider = makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+                getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+                getReviewComments: vi.fn().mockResolvedValue([
+                    makeProviderReviewComment('bob'),
+                    makeProviderReviewComment('bob'),
+                ]),
+                getPRReviews: vi.fn().mockResolvedValue([
+                    {author: {name: '', email: '', username: 'bob'}, state: 'changes_requested', submittedAt: '2024-01-15T12:00:00Z', prId: '1'},
+                ]),
+            });
+            createGitProvider.mockReturnValue(goodProvider);
+            await new GitSync(makeGithubConfig()).sync(db);
+            expect(getPRRecords()[0].changes_requested_count).toBe(1);
+            expect(getPRRecords()[0].review_rounds).toBe(2);
+
+            // Re-sync with both fetches failing (rate limit, revoked scope…).
+            const badProvider = makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+                getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+                getReviewComments: vi.fn().mockRejectedValue(new Error('rate limited')),
+                getPRReviews: vi.fn().mockRejectedValue(new Error('rate limited')),
+            });
+            createGitProvider.mockReturnValue(badProvider);
+            await new GitSync(makeGithubConfig()).sync(db);
+
+            // The bad sync must not rewrite real review history as "clean".
+            const records = getPRRecords();
+            expect(records).toHaveLength(1);
+            expect(records[0].review_comment_count).toBe(2);
+            expect(records[0].changes_requested_count).toBe(1);
+            expect(records[0].review_rounds).toBe(2);
+        });
+
+        it('restores the prior review_rounds verdict when only the verdict fetch fails (no stale/fresh blend)', async () => {
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            // First good sync: two send-backs → review_rounds 3, with no review
+            // comments yet.
+            const goodProvider = makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+                getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+                getPRReviews: vi.fn().mockResolvedValue([
+                    {author: {name: '', email: '', username: 'bob'}, state: 'changes_requested', submittedAt: '2024-01-15T12:00:00Z', prId: '1'},
+                    {author: {name: '', email: '', username: 'carol'}, state: 'changes_requested', submittedAt: '2024-01-15T13:00:00Z', prId: '1'},
+                    {author: {name: '', email: '', username: 'bob'}, state: 'approved', submittedAt: '2024-01-16T09:00:00Z', prId: '1'},
+                ]),
+            });
+            createGitProvider.mockReturnValue(goodProvider);
+            await new GitSync(makeGithubConfig()).sync(db);
+            expect(getPRRecords()[0].review_rounds).toBe(3);
+            expect(getPRRecords()[0].changes_requested_count).toBe(2);
+
+            // Re-sync: comments NOW arrive (fresh), but the verdict fetch fails.
+            // The rounds must be restored from the last observed verdict (3), not
+            // recomputed from the fresh comment count alone — which would collapse
+            // a 3-round PR to 1 and erase the send-back history.
+            const mixedProvider = makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+                getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+                getReviewComments: vi.fn().mockResolvedValue([makeProviderReviewComment('bob')]),
+                getPRReviews: vi.fn().mockRejectedValue(new Error('rate limited')),
+            });
+            createGitProvider.mockReturnValue(mixedProvider);
+            await new GitSync(makeGithubConfig()).sync(db);
+
+            const rec = getPRRecords()[0];
+            expect(rec.review_comment_count).toBe(1); // fresh comment count applied
+            expect(rec.changes_requested_count).toBe(2); // verdict carried forward
+            expect(rec.review_rounds).toBe(3); // verdict-derived rounds preserved
+        });
+
+        it('freezes merged_at against a provider re-reporting a later merge timestamp', async () => {
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            // First observation: merged at the real merge time.
+            const firstProvider = makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+                getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+            });
+            createGitProvider.mockReturnValue(firstProvider);
+            await new GitSync(makeGithubConfig()).sync(db);
+            const firstMerged = getPRRecords()[0].merged_at;
+            const firstTtm = getPRRecords()[0].time_to_merge_hours;
+            expect(firstMerged).not.toBeNull();
+
+            // Re-sync where the provider reports a later merge timestamp (e.g.
+            // Bitbucket's updated_on bumped by post-merge activity). The stored
+            // merged_at must stay frozen so it never disagrees with the frozen
+            // time_to_merge_hours.
+            const driftedPR = {...makeProviderPR('alice'), mergedAt: '2024-02-01T10:00:00Z'};
+            const driftProvider = makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+                getPullRequests: vi.fn().mockResolvedValue([driftedPR]),
+            });
+            createGitProvider.mockReturnValue(driftProvider);
+            await new GitSync(makeGithubConfig()).sync(db);
+
+            expect(getPRRecords()[0].merged_at).toBe(firstMerged);
+            expect(getPRRecords()[0].time_to_merge_hours).toBe(firstTtm);
+        });
+
+        it('skips PRs from authors with no developer record', async () => {
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            const provider = makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+                getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('stranger')]),
+            });
+            createGitProvider.mockReturnValue(provider);
+
+            await new GitSync(makeGithubConfig()).sync(db);
+
+            expect(getPRRecords()).toHaveLength(0);
+        });
     });
 });

@@ -241,7 +241,11 @@ describe('Manager API (Task 2.3)', () => {
         beforeEach(() => {
             seedTeam(db, 'eng');
             seedDeveloper(db, 'dev1', 'eng');
-            seedToolSnapshot(db, {developer: 'dev1', date: '2026-05-10'});
+            // active_count looks at a trailing window from the real clock, so
+            // the seed date must be recent relative to "now" — a fixed date
+            // here rots out of the window as the calendar advances.
+            const recent = new Date(Date.now() - 5 * 86_400_000).toISOString().slice(0, 10);
+            seedToolSnapshot(db, {developer: 'dev1', date: recent});
         });
 
         it('serves the teams list and team detail to admins', async () => {
