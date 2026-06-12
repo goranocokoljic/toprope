@@ -28,17 +28,13 @@ import {
     deleteCaptureForDeveloper,
 } from '../../capture/store';
 import {isCaptureMechanism} from '../../capture/types';
+import {badRequest, asObject, BASE64_RE, validateMetaAllowlist} from './body-validation';
 
 // Body keys that would indicate the client is sending readable content. The
 // server REFUSES any payload carrying these — encryption is the client's job and
 // plaintext must never reach the server, even transiently. This is a structural
 // guard backing the privacy guarantee, not a content scan.
 const FORBIDDEN_PLAINTEXT_KEYS = ['plaintext', 'prompts', 'responses', 'text', 'content', 'messages'];
-
-// Strict base64 (no interior whitespace / non-base64 chars). The reference client
-// emits canonical base64, so this rejects malformed input rather than letting
-// Buffer.from silently drop stray characters into a different stored blob.
-const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 
 // Per-capture ciphertext cap (decoded bytes). A single captured session is bounded;
 // without a cap an authenticated developer could write arbitrarily large blobs into
@@ -60,17 +56,6 @@ const MAX_META_BYTES = 4 * 1024;
 // Length caps on the small free-text columns, same anti-exhaustion intent.
 const MAX_SESSION_ID_LEN = 256;
 const MAX_TOOL_LEN = 64;
-
-function badRequest(reply: FastifyReply, message: string): undefined {
-    reply.status(400).send({error: 'Bad Request', message});
-    return undefined;
-}
-
-function asObject(value: unknown): Record<string, unknown> | null {
-    return value && typeof value === 'object' && !Array.isArray(value)
-        ? (value as Record<string, unknown>)
-        : null;
-}
 
 interface ValidatedCapture {
     sessionId: string;
@@ -154,22 +139,9 @@ function validateBody(body: unknown, reply: FastifyReply): ValidatedCapture | nu
     // non-empty string. Allowlisting (not blacklisting `key`/`secret`) means an
     // unknown field is refused outright, so a raw key can't be smuggled in under a
     // differently-named or NESTED key — and since every allowed field must be a
-    // string, the stored meta is always a known, flat, bounded shape.
-    const allowedMetaKeys = ['algo', 'iv', 'auth_tag', 'key_id'];
-    for (const k of Object.keys(meta)) {
-        if (!allowedMetaKeys.includes(k)) {
-            badRequest(reply, `encryption_meta has an unexpected field '${k}'; only algo, iv, auth_tag, key_id are allowed`);
-            return null;
-        }
-    }
-    for (const field of allowedMetaKeys) {
-        if (typeof meta[field] !== 'string' || (meta[field] as string).length === 0) {
-            badRequest(reply, `encryption_meta.${field} is required`);
-            return null;
-        }
-    }
-    if (JSON.stringify(meta).length > MAX_META_BYTES) {
-        badRequest(reply, `encryption_meta exceeds the ${MAX_META_BYTES}-byte limit`);
+    // string, the stored meta is always a known, flat, bounded shape. Shared with
+    // the capture-key route via validateMetaAllowlist.
+    if (!validateMetaAllowlist(meta, ['algo', 'iv', 'auth_tag', 'key_id'], 'encryption_meta', MAX_META_BYTES, reply)) {
         return null;
     }
 
