@@ -99,6 +99,27 @@ function cloudAllowedFor(db: Database.Database, userId: string, team: string | n
     return resolveDeveloperPreferences(db, userId, team).cloud_analysis_opt_in?.value === true;
 }
 
+/**
+ * Enforce the capture opt-in gate (opt-in #1) for the operations that TRANSIENTLY
+ * decrypt session plaintext — generation AND conversational follow-up. Both are
+ * "deep analysis" over freshly decrypted prompts, so both are inert (403) once a
+ * developer has opted out of capture: opting out must stop new plaintext handling,
+ * not just new captures. (Owner-scoped reads/deletes of already-stored output stay
+ * ungated — they touch no plaintext.) Returns false and sends the 403 when blocked.
+ */
+function ensureCaptureEnabled(db: Database.Database, userId: string, team: string | null, reply: FastifyReply): boolean {
+    const gate = captureGate(db, userId, team);
+    if (!gate.enabled) {
+        reply.status(403).send({
+            error: 'Forbidden',
+            code: 'capture_not_enabled',
+            message: gate.reason ?? 'Prompt capture is not enabled for your account.',
+        });
+        return false;
+    }
+    return true;
+}
+
 export function registerRetrospectiveRoutes(
     app: FastifyInstance,
     db: Database.Database,
@@ -112,6 +133,12 @@ export function registerRetrospectiveRoutes(
      * Generate a retrospective for one captured session. Requires capture enabled
      * (opt-in #1). Body: { session_id, key (base64 AES-256), analysis_location? }.
      * Cloud is honored only when the org permits AND the developer opted in.
+     *
+     * Generation is deliberately ADDITIVE, mirroring the issue's schema (id PK, no
+     * uniqueness on session_id): re-running for the same session inserts a fresh
+     * retrospective rather than replacing the prior one, so a developer keeps a
+     * history of analyses (and can run both a local and a later cloud pass over the
+     * same session). They own and can delete any they don't want.
      */
     app.post<{Body: unknown}>('/api/me/retrospectives', async (request, reply) => {
         const developerId = requireDeveloperId(request, reply);
@@ -121,13 +148,8 @@ export function registerRetrospectiveRoutes(
         const userId = request.authUser!.userId;
         const team = getDeveloperById(db, developerId)?.team ?? null;
 
-        const gate = captureGate(db, userId, team);
-        if (!gate.enabled) {
-            return reply.status(403).send({
-                error: 'Forbidden',
-                code: 'capture_not_enabled',
-                message: gate.reason ?? 'Prompt capture is not enabled for your account.',
-            });
+        if (!ensureCaptureEnabled(db, userId, team, reply)) {
+            return reply;
         }
 
         const obj = asObject(request.body);
@@ -219,6 +241,11 @@ export function registerRetrospectiveRoutes(
      * location the retrospective used; a cloud retrospective re-checks the live
      * cloud permission, so a revoked opt-in stops further cloud turns. The answer
      * is conversational and not persisted.
+     *
+     * Like generation, follow-up TRANSIENTLY decrypts the session, so it requires
+     * capture still enabled (opt-in #1): opting out halts all fresh plaintext
+     * handling, not just new captures. (Reading/deleting the stored retrospective
+     * stays ungated — that output holds no plaintext.)
      */
     app.post<{Params: {id: string}; Body: unknown}>('/api/me/retrospectives/:id/followup', async (request, reply) => {
         const developerId = requireDeveloperId(request, reply);
@@ -228,6 +255,12 @@ export function registerRetrospectiveRoutes(
         const retrospective = getRetrospectiveForDeveloper(db, developerId, request.params.id);
         if (!retrospective) {
             return reply.status(404).send({error: 'Not Found', message: 'Retrospective not found'});
+        }
+
+        const userId = request.authUser!.userId;
+        const team = getDeveloperById(db, developerId)?.team ?? null;
+        if (!ensureCaptureEnabled(db, userId, team, reply)) {
+            return reply;
         }
 
         const obj = asObject(request.body);
@@ -254,8 +287,6 @@ export function registerRetrospectiveRoutes(
             return reply;
         }
 
-        const userId = request.authUser!.userId;
-        const team = getDeveloperById(db, developerId)?.team ?? null;
         try {
             const answer = await answerFollowUp(db, {
                 developerId,

@@ -239,7 +239,11 @@ describe('Retrospective API (Task 5.7)', () => {
             payload: {question: 'why was this flagged?', key: key.toString('base64')},
         });
         expect(followup.statusCode).toBe(200);
-        expect(typeof followup.json().data.answer).toBe('string');
+        const answer = followup.json().data.answer as string;
+        // Grounded in the actual session signals (not an empty/canned string), and
+        // never leaking the decrypted prompt content.
+        expect(answer).toMatch(/prompt|session|loop/i);
+        expect(answer).not.toContain('SUPERSECRETMARKER');
         expect(followup.json().data.analysisLocation).toBe('local');
 
         // Another developer cannot follow up on it (404, owner-scoped).
@@ -250,6 +254,31 @@ describe('Retrospective API (Task 5.7)', () => {
             payload: {question: 'why?', key: key.toString('base64')},
         });
         expect(bobFollow.statusCode).toBe(404);
+    });
+
+    it('blocks follow-up once the developer opts out of capture (no fresh plaintext handling)', async () => {
+        await boot();
+        const gen = await app.inject({
+            method: 'POST',
+            url: '/api/me/retrospectives',
+            headers: auth(aliceToken),
+            payload: {session_id: SESSION, key: key.toString('base64')},
+        });
+        const id = gen.json().data.id;
+        // Developer opts out of capture after the retrospective already exists.
+        setDeveloperPreference(db, aliceUserId, 'capture_opt_in', false);
+        const followup = await app.inject({
+            method: 'POST',
+            url: `/api/me/retrospectives/${id}/followup`,
+            headers: auth(aliceToken),
+            payload: {question: 'why was this flagged?', key: key.toString('base64')},
+        });
+        expect(followup.statusCode).toBe(403);
+        expect(followup.json().code).toBe('capture_not_enabled');
+        // The stored retrospective (no plaintext) is still readable — only fresh
+        // decryption is halted.
+        const read = await app.inject({method: 'GET', url: `/api/me/retrospectives/${id}`, headers: auth(aliceToken)});
+        expect(read.statusCode).toBe(200);
     });
 
     it('deletes the developer’s own retrospective', async () => {

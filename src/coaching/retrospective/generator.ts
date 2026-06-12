@@ -26,7 +26,7 @@
 import type Database from 'better-sqlite3';
 import {decryptCapture, type EncryptionMeta} from '../../capture/encryption';
 import {listSessionCapturesForDeveloper} from '../../capture/store';
-import {listLoopEventsForDeveloper} from '../realtime/store';
+import {listLoopEventsForSession} from '../realtime/store';
 import type {LoopEventMeta} from '../realtime/types';
 import type {RetrospectiveAnalyzer, SessionAnalysisInput} from './analyzer';
 import {insertRetrospective} from './store';
@@ -121,11 +121,13 @@ function decryptSession(db: Database.Database, developerId: string, sessionId: s
     return parts.join('\n');
 }
 
-/** The session's loop metadata (Task 5.6), filtered to this session — counts only, no content. */
+/**
+ * The session's loop metadata (Task 5.6) — counts only, no content. A stored
+ * LoopEvent is a structural superset of the LoopEventMeta the analyser consumes,
+ * so the session-scoped rows are passed straight through (no re-mapping needed).
+ */
 function loopEventsForSession(db: Database.Database, developerId: string, sessionId: string): LoopEventMeta[] {
-    return listLoopEventsForDeveloper(db, developerId)
-        .filter((e) => e.sessionId === sessionId)
-        .map((e) => ({sessionId: e.sessionId, detectedAt: e.detectedAt, similarPromptCount: e.similarPromptCount}));
+    return listLoopEventsForSession(db, developerId, sessionId);
 }
 
 /**
