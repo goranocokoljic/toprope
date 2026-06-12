@@ -315,19 +315,27 @@ export function runScheduledJob(
             // acceptance baseline both keep converging after a period closes, so
             // re-folding recent periods is what makes the stored output track the
             // final picture rather than freezing a photograph taken at close.
+            // Built in its own guard so even the shared setup (date-key arithmetic)
+            // can never abort the aggregation job that already succeeded above — on
+            // the near-impossible failure both engines simply skip an empty window.
             const metricsPeriods: string[] = [];
-            if (period === 'weekly') {
-                // periodKey is a week_start date; convert to a YYYY-Www label
-                // once, then walk back with priorIsoWeek — structurally parallel
-                // to the monthly priorMonth fold below.
-                let wk = isoWeekLabel(periodKey);
-                metricsPeriods.push(wk);
-                for (let i = 0; i < 3; i++) {
-                    wk = priorIsoWeek(wk);
+            try {
+                if (period === 'weekly') {
+                    // periodKey is a week_start date; convert to a YYYY-Www label
+                    // once, then walk back with priorIsoWeek — structurally parallel
+                    // to the monthly priorMonth fold below.
+                    let wk = isoWeekLabel(periodKey);
                     metricsPeriods.push(wk);
+                    for (let i = 0; i < 3; i++) {
+                        wk = priorIsoWeek(wk);
+                        metricsPeriods.push(wk);
+                    }
+                } else {
+                    metricsPeriods.push(periodKey, priorMonth(periodKey));
                 }
-            } else {
-                metricsPeriods.push(periodKey, priorMonth(periodKey));
+            } catch (windowErr) {
+                const msg = windowErr instanceof Error ? windowErr.message : String(windowErr);
+                console.error(`[coaching] FAILED to build recompute window — base period ${periodKey}: ${msg}`);
             }
 
             // Each engine is wrapped independently so one failing never aborts the

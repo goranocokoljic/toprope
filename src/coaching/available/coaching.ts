@@ -18,7 +18,7 @@
  */
 
 import type Database from 'better-sqlite3';
-import {isoWeekLabel, monthOf, priorIsoWeek, priorMonth} from '../../aggregation/dates';
+import {DEFAULT_WINDOW, periodKeysEndingAt} from '../period-window';
 // The k-anonymity floor is a privacy invariant with a single home — reuse the
 // pr-review definition so the two coaching aggregates can never drift apart.
 import {MIN_TEAM_COHORT} from '../pr-review/guidance';
@@ -33,9 +33,6 @@ import type {
     TeamCoachingSeries,
 } from './types';
 
-/** Default trajectory window per unit — enough history to read a trend. */
-const DEFAULT_WINDOW: Record<CoachingPeriodUnit, number> = {weekly: 12, monthly: 6};
-
 /** Stable display order for the four signal types within a period / across series. */
 const SIGNAL_TYPE_ORDER: CoachingSignalType[] = [
     'churn_reflection',
@@ -43,27 +40,6 @@ const SIGNAL_TYPE_ORDER: CoachingSignalType[] = [
     'journey_coaching',
     'personal_insight',
 ];
-
-/**
- * The `count` period keys ending at `refDate`, oldest first — walking back with
- * the same prior-period helpers the generator uses so the key shape matches what
- * is stored (and the IN-clause lookups hit).
- */
-export function periodKeysEndingAt(
-    unit: CoachingPeriodUnit,
-    refDate: string,
-    count: number,
-): string[] {
-    const current = unit === 'weekly' ? isoWeekLabel(refDate) : monthOf(refDate);
-    const prior = unit === 'weekly' ? priorIsoWeek : priorMonth;
-    const keys: string[] = [current];
-    let key = current;
-    for (let i = 1; i < count; i++) {
-        key = prior(key);
-        keys.push(key);
-    }
-    return keys.reverse();
-}
 
 function placeholders(n: number): string {
     return new Array(n).fill('?').join(', ');
@@ -189,6 +165,10 @@ function aggregateForDeveloperIds(
             cells.set(key, cell);
         }
         cell.developers.add(row.developer_id);
+        // Only the categorical bucket crosses the manager boundary — NEVER the raw
+        // per-developer numbers (current/baseline/delta) that also live in
+        // metric_context. Keep this read to `.category`; tallying any magnitude
+        // here would leak an individual's figures past the k-anonymity floor.
         const category = parseContext(row.metric_context)?.category ?? 'unknown';
         cell.categories.set(category, (cell.categories.get(category) ?? 0) + 1);
     }
@@ -214,7 +194,15 @@ function aggregateForDeveloperIds(
     return {scope: scopeLabel, period_unit: unit, series};
 }
 
-/** Org-wide manager aggregate — every developer pooled. */
+/**
+ * Org-wide manager aggregate — every developer pooled.
+ *
+ * Loads every developer id into a single `IN (...)` clause (same pattern as the
+ * pr-review aggregate). SQLite caps bound parameters (SQLITE_MAX_VARIABLE_NUMBER,
+ * ~32k on current builds), so an org of tens of thousands of developers would need
+ * this chunked or pooled in SQL; trivial at launch scale, flagged so it isn't a
+ * surprise in prod.
+ */
 export function getOrgCoaching(
     db: Database.Database,
     unit: CoachingPeriodUnit,
@@ -228,7 +216,10 @@ export function getOrgCoaching(
 
 /**
  * One team's manager aggregate. Scopes strictly by the team's CURRENT members —
- * a team literally named 'org' is still just that team, never the whole org.
+ * a team literally named 'org' is still just that team, never the whole org. A
+ * developer who changed teams carries their signal history to the new team's
+ * aggregate (same as every team-scoped query in the app); acceptable because the
+ * k-anonymity floor still prevents any individual read.
  */
 export function getTeamCoaching(
     db: Database.Database,

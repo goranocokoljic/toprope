@@ -8,6 +8,8 @@
  * to the developer — managers see only aggregate trends derived from these.
  */
 
+import type {PeriodUnit} from '../period-window';
+
 /** The four signal kinds, exactly as the schema's signal_type column documents. */
 export type CoachingSignalType =
     | 'churn_reflection'
@@ -22,8 +24,12 @@ export type CoachingSignalType =
  */
 export type CoachingBasis = 'git_estimate' | 'measured';
 
-/** Period unit the generator runs on (period TEXT: YYYY-Www or YYYY-MM). */
-export type CoachingPeriodUnit = 'weekly' | 'monthly';
+/**
+ * Period unit the generator runs on (period TEXT: YYYY-Www or YYYY-MM). Aliases
+ * the shared {@link PeriodUnit} so it cannot drift from the pr-review coaching
+ * unit (both surfaces share the period-window helpers).
+ */
+export type CoachingPeriodUnit = PeriodUnit;
 
 /**
  * One produced signal before persistence — the pure engine's output. The

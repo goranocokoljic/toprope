@@ -30,7 +30,8 @@
 import type Database from 'better-sqlite3';
 import {randomUUID} from 'crypto';
 import {isoWeekRange, monthRange, priorIsoWeek, priorMonth, type DateRange} from '../../aggregation/dates';
-import {getDeveloperJourney} from '../../dashboard/api/journey';
+import {getDeveloperJourney, type JourneyTier} from '../../dashboard/api/journey';
+import {rankToTier} from '../../dashboard/api/coverage';
 import {resolveAvailableCoachingThresholds} from './config';
 import {
     buildAcceptanceTrend,
@@ -70,6 +71,7 @@ interface Statements {
     activeDays: Database.Statement;
     commits: Database.Statement;
     interactions: Database.Statement;
+    toolQualityRank: Database.Statement;
     deletePeriod: Database.Statement;
     insert: Database.Statement;
 }
@@ -112,6 +114,17 @@ function prepareStatements(db: Database.Database): Statements {
         ),
         interactions: db.prepare(
             `SELECT COALESCE(SUM(interaction_count), 0) AS n
+             FROM tool_snapshots WHERE developer_id = ? AND date BETWEEN ? AND ?`,
+        ),
+        // Best tool data-quality rank the developer produced IN THE PERIOD
+        // (high=3/medium=2/low=1), or 0 with no tool rows — the measured half of
+        // the period-bounded tier.
+        toolQualityRank: db.prepare(
+            `SELECT COALESCE(MAX(CASE data_quality
+                        WHEN 'high' THEN 3
+                        WHEN 'medium' THEN 2
+                        WHEN 'low' THEN 1
+                        ELSE 0 END), 0) AS rank
              FROM tool_snapshots WHERE developer_id = ? AND date BETWEEN ? AND ?`,
         ),
         deletePeriod: db.prepare('DELETE FROM coaching_signals WHERE period = ?'),
@@ -169,6 +182,26 @@ function journeyAsOf(range: DateRange, now: Date): Date {
 }
 
 /**
+ * The developer's data-quality tier from the data they produced IN THIS PERIOD —
+ * not their best-ever signal. This is what keeps the tier-aware basis honest: a
+ * period that was git-only stays `git_estimate` even after the developer later
+ * connects a tool, because the basis describes the data behind THAT period, not
+ * today's account state. Mirrors the rank model (tool quality → high/medium/low,
+ * any git commits → medium) but bounded to `range`, then mapped via the canonical
+ * {@link rankToTier} so it can never drift from the org coverage tier.
+ */
+function periodTier(
+    stmts: Statements,
+    devId: string,
+    range: DateRange,
+    hasGit: boolean,
+): JourneyTier {
+    const toolRank = (stmts.toolQualityRank.get(devId, range.start, range.end) as {rank: number})
+        .rank;
+    return rankToTier(Math.max(toolRank, hasGit ? 2 : 0));
+}
+
+/**
  * Compute and persist every developer's available-data coaching signals for one
  * period. Developers with no activity in the period get nothing. The whole
  * period is rewritten in one transaction (delete-then-insert) so the result is
@@ -216,19 +249,21 @@ export function generateCoachingSignalsForPeriod(
             const commits = scalar(stmts.commits, devId, range);
             const interactions = scalar(stmts.interactions, devId, range);
 
-            // One journey assembly per developer — its annotations drive the
-            // journey signal and its tier drives the tier-aware basis/insight.
+            // The tier-aware basis must describe THIS period's data, not the
+            // developer's best-ever signal, or a trailing recompute would relabel
+            // a historically git-only period `measured` once tools connect later.
+            const tier = periodTier(stmts, devId, range, commits > 0);
+
+            // One journey assembly per developer — only its annotations are used
+            // here (the journey's own whole-history tier is intentionally not the
+            // basis source; the period-bounded `tier` above is).
             const journey = getDeveloperJourney(db, devId, asOf);
 
             const drafts: Array<CoachingSignalDraft | null> = [
                 buildChurnReflection(currentChurn, baselineChurn, activeDays, thresholds),
                 buildAcceptanceTrend(currentAcceptance, baselineAcceptance, thresholds),
-                buildJourneyCoaching(journey.annotations, journey.tier),
-                buildPersonalInsight(
-                    journey.tier,
-                    {activeDays, commits, interactions},
-                    thresholds,
-                ),
+                buildJourneyCoaching(journey.annotations, tier),
+                buildPersonalInsight(tier, {activeDays, commits, interactions}, thresholds),
             ];
 
             for (const draft of drafts) {

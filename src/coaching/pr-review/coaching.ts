@@ -19,7 +19,7 @@
  */
 
 import type Database from 'better-sqlite3';
-import {isoWeekLabel, monthOf, priorIsoWeek, priorMonth} from '../../aggregation/dates';
+import {DEFAULT_WINDOW, periodKeysEndingAt} from '../period-window';
 import {resolvePRReviewThresholds} from './config';
 import {
     aggregateTeamPeriod,
@@ -42,30 +42,10 @@ import type {
     VariantTrajectoryOf,
 } from './types';
 
-/** Default trajectory window per unit — enough history to read a trend, not so */
-/** long it drags in ancient periods. Monthly reads as "the last half-year". */
-const DEFAULT_WINDOW: Record<PRReviewPeriodUnit, number> = {weekly: 12, monthly: 6};
-
-/**
- * The `count` period keys ending at `refDate`, oldest first. Walking back with
- * the same prior-period helpers the engine uses keeps the key shape identical to
- * what is stored, so the IN-clause lookups hit.
- */
-export function periodKeysEndingAt(
-    unit: PRReviewPeriodUnit,
-    refDate: string,
-    count: number,
-): string[] {
-    const current = unit === 'weekly' ? isoWeekLabel(refDate) : monthOf(refDate);
-    const prior = unit === 'weekly' ? priorIsoWeek : priorMonth;
-    const keys: string[] = [current];
-    let key = current;
-    for (let i = 1; i < count; i++) {
-        key = prior(key);
-        keys.push(key);
-    }
-    return keys.reverse();
-}
+// The period-window helpers (DEFAULT_WINDOW, periodKeysEndingAt) are shared with
+// the available-data coaching surface — see ../period-window. Re-exported here so
+// existing importers of this module keep resolving the same symbol.
+export {periodKeysEndingAt} from '../period-window';
 
 interface MetricRow {
     period: string;

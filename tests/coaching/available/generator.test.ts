@@ -170,6 +170,27 @@ describe('generateCoachingSignalsForPeriod', () => {
         expect(total).toBe(first.signalsWritten);
     });
 
+    it('keeps a historically git-only period git_estimate after tools connect later', () => {
+        // A developer who was git-only in May but connects a tool in June must NOT
+        // have May relabeled `measured` on the next trailing recompute — the basis
+        // describes the period's own data, not today's account state.
+        const id = seedGitOnlyDev();
+        generateCoachingSignalsForPeriod(db, 'monthly', '2026-05', NOW);
+        const before = signalsFor(id, '2026-05');
+        expect(before.get('journey_coaching')!.basis).toBe('git_estimate');
+        expect(before.get('personal_insight')!.basis).toBe('git_estimate');
+
+        // June: a high-quality tool connects.
+        seedTool({devId: id, date: '2026-06-05', acceptance: 0.7});
+        seedTool({devId: id, date: '2026-06-06', acceptance: 0.7});
+
+        // Recompute May (as the scheduler's trailing window does) with a later clock.
+        generateCoachingSignalsForPeriod(db, 'monthly', '2026-05', new Date('2026-06-20T12:00:00.000Z'));
+        const after = signalsFor(id, '2026-05');
+        expect(after.get('journey_coaching')!.basis).toBe('git_estimate');
+        expect(after.get('personal_insight')!.basis).toBe('git_estimate');
+    });
+
     it('retracts a developer\'s signals when their activity leaves the period', () => {
         const id = seedGitOnlyDev();
         generateCoachingSignalsForPeriod(db, 'monthly', '2026-05', NOW);
