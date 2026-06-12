@@ -1,7 +1,11 @@
 import {describe, it, expect, beforeEach, afterEach} from 'vitest';
 import type Database from 'better-sqlite3';
 import {makeTestDb} from '../dashboard/fixtures';
-import {captureGate, isCaptureEnabled} from '../../src/capture/gate';
+import {captureGate} from '../../src/capture/gate';
+
+/** Thin projection used throughout: the gate's boolean enablement for a user/team. */
+const isCaptureEnabled = (db: Database.Database, userId: string, team?: string | null): boolean =>
+    captureGate(db, userId, team).enabled;
 import {setGlobalSetting, setTeamSetting, setDeveloperPreference} from '../../src/settings/store';
 
 const USER = 'user-1';

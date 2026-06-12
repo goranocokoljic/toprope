@@ -21,7 +21,10 @@
 -- inserted once and owned by the developer (who may later delete their own).
 CREATE TABLE prompt_captures (
     id TEXT PRIMARY KEY,
-    developer_id TEXT NOT NULL REFERENCES developers(id),
+    -- CASCADE: a developer's private captures should die with the developer record
+    -- (no orphaned encrypted blobs), and the choice is made explicit here rather
+    -- than inheriting NO ACTION — matching how every sibling FK declares its intent.
+    developer_id TEXT NOT NULL REFERENCES developers(id) ON DELETE CASCADE,
     session_id TEXT NOT NULL,             -- groups captures from one capture session
     captured_at TEXT NOT NULL,            -- when the interaction happened (UTC ISO)
     tool TEXT,                            -- which AI tool, if known

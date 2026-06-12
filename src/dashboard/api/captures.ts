@@ -35,6 +35,23 @@ import {isCaptureMechanism} from '../../capture/types';
 // guard backing the privacy guarantee, not a content scan.
 const FORBIDDEN_PLAINTEXT_KEYS = ['plaintext', 'prompts', 'responses', 'text', 'content', 'messages'];
 
+// Strict base64 (no interior whitespace / non-base64 chars). The reference client
+// emits canonical base64, so this rejects malformed input rather than letting
+// Buffer.from silently drop stray characters into a different stored blob.
+const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+
+// Per-capture ciphertext cap (decoded bytes). A single captured session is bounded;
+// without a cap an authenticated developer could write arbitrarily large blobs into
+// the blind store (availability/storage-exhaustion). 512 KiB is generous for one
+// session of prompts+responses.
+const MAX_CIPHERTEXT_BYTES = 512 * 1024;
+
+// Whole-request body cap for the ingestion route. Set comfortably above a
+// max-ciphertext payload (512 KiB → ~683 KiB base64, plus meta/JSON overhead) so
+// an over-cap ciphertext gets validateBody's clean 400 rather than an opaque 413,
+// while a genuinely enormous body is still refused before the handler runs.
+const CAPTURE_BODY_LIMIT = 1024 * 1024;
+
 function badRequest(reply: FastifyReply, message: string): undefined {
     reply.status(400).send({error: 'Bad Request', message});
     return undefined;
@@ -81,12 +98,15 @@ function validateBody(body: unknown, reply: FastifyReply): ValidatedCapture | nu
         return null;
     }
 
-    // captured_at must be a valid timestamp; default to now when omitted.
+    // captured_at must be a valid timestamp; default to now when omitted. NORMALIZE
+    // to canonical UTC ISO rather than storing the client string verbatim — Date.parse
+    // accepts looser forms (date-only, offset-bearing) and the platform invariant is
+    // that all stored timestamps are UTC ISO, which the captured_at index relies on.
     let capturedAt: string;
     if (obj.captured_at === undefined || obj.captured_at === null) {
         capturedAt = new Date().toISOString();
     } else if (typeof obj.captured_at === 'string' && !Number.isNaN(Date.parse(obj.captured_at))) {
-        capturedAt = obj.captured_at;
+        capturedAt = new Date(obj.captured_at).toISOString();
     } else {
         badRequest(reply, 'captured_at must be an ISO timestamp string');
         return null;
@@ -98,15 +118,17 @@ function validateBody(body: unknown, reply: FastifyReply): ValidatedCapture | nu
     }
     const mechanism = obj.mechanism;
 
-    if (typeof obj.ciphertext !== 'string' || obj.ciphertext.length === 0) {
-        badRequest(reply, 'ciphertext (base64 string) is required');
+    if (typeof obj.ciphertext !== 'string' || !BASE64_RE.test(obj.ciphertext)) {
+        badRequest(reply, 'ciphertext must be a non-empty base64 string');
         return null;
     }
-    // Decode strictly: a non-base64 string yields a shorter/empty buffer, which we
-    // reject so a malformed payload can't be stored as an unreadable blob.
     const ciphertext = Buffer.from(obj.ciphertext, 'base64');
-    if (ciphertext.length === 0 || ciphertext.toString('base64').replace(/=+$/, '') !== obj.ciphertext.replace(/=+$/, '')) {
-        badRequest(reply, 'ciphertext must be valid non-empty base64');
+    if (ciphertext.length === 0) {
+        badRequest(reply, 'ciphertext must decode to non-empty bytes');
+        return null;
+    }
+    if (ciphertext.length > MAX_CIPHERTEXT_BYTES) {
+        badRequest(reply, `ciphertext exceeds the ${MAX_CIPHERTEXT_BYTES}-byte per-capture limit`);
         return null;
     }
 
@@ -155,7 +177,7 @@ export function registerCaptureRoutes(app: FastifyInstance, db: Database.Databas
      * for the developer (opted in AND org permits). The body must be ciphertext +
      * public meta; plaintext/raw-key fields are rejected (400).
      */
-    app.post<{Body: unknown}>('/api/me/captures', async (request: FastifyRequest<{Body: unknown}>, reply) => {
+    app.post<{Body: unknown}>('/api/me/captures', {bodyLimit: CAPTURE_BODY_LIMIT}, async (request: FastifyRequest<{Body: unknown}>, reply) => {
         const developerId = requireDeveloperId(request, reply);
         if (!developerId) {
             return reply;

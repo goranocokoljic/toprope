@@ -153,6 +153,25 @@ describe('Capture API (Task 5.4)', () => {
         expect(res.statusCode).toBe(400);
     });
 
+    it('rejects a ciphertext over the per-capture size cap', async () => {
+        // 512 KiB is the cap; 600 KiB of decoded bytes must be refused with a clean 400.
+        const oversized = Buffer.alloc(600 * 1024, 7).toString('base64');
+        const payload = {...makePayload('local_agent'), ciphertext: oversized};
+        const res = await app.inject({method: 'POST', url: '/api/me/captures', headers: auth(aliceToken), payload});
+        expect(res.statusCode).toBe(400);
+        expect(db.prepare('SELECT COUNT(*) c FROM prompt_captures').get()).toMatchObject({c: 0});
+    });
+
+    it('normalizes a non-UTC captured_at to canonical UTC ISO before storing', async () => {
+        // An offset-bearing timestamp must be stored as the equivalent UTC ISO,
+        // never verbatim, to honor the all-timestamps-UTC-ISO invariant.
+        const payload = {...makePayload('local_agent'), captured_at: '2026-06-15T05:00:00+05:00'};
+        const res = await app.inject({method: 'POST', url: '/api/me/captures', headers: auth(aliceToken), payload});
+        expect(res.statusCode).toBe(201);
+        const row = db.prepare('SELECT captured_at FROM prompt_captures WHERE developer_id = ?').get('alice') as {captured_at: string};
+        expect(row.captured_at).toBe('2026-06-15T00:00:00.000Z');
+    });
+
     it('rejects malformed bodies (missing ciphertext, bad mechanism)', async () => {
         const base = makePayload('local_agent');
         const noCipher = {...base, ciphertext: undefined};

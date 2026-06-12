@@ -31,9 +31,18 @@ function nowIso(): string {
     return new Date().toISOString();
 }
 
-/** Decode the mechanism column, falling back to local_agent if a row is corrupt. */
+/**
+ * Decode the mechanism column. The write path only ever stores a validated enum
+ * value, so an unrecognized value means DB corruption or a future enum migration;
+ * warn (mirroring the settings decoders) so it's discoverable rather than silently
+ * mislabeled, then fall back to local_agent.
+ */
 function decodeMechanism(raw: string): CaptureMechanism {
-    return isCaptureMechanism(raw) ? raw : 'local_agent';
+    if (isCaptureMechanism(raw)) {
+        return raw;
+    }
+    console.warn(`[capture] unrecognized mechanism '${raw}' in prompt_captures; defaulting to local_agent`);
+    return 'local_agent';
 }
 
 function parseMeta(raw: string): Record<string, unknown> {

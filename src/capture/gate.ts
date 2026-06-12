@@ -36,19 +36,13 @@ export function captureGate(
     userId: string,
     team?: string | null,
 ): CaptureGateResult {
-    const prefs = resolveDeveloperPreferences(db, userId, team);
-    const optIn = prefs.capture_opt_in;
+    const optIn = resolveDeveloperPreferences(db, userId, team).capture_opt_in;
     if (optIn?.value === true) {
         return {enabled: true};
     }
-    // Distinguish "org forbids" (blocked, with the policy reason) from "developer
-    // simply hasn't opted in" so the caller can surface an accurate message.
-    if (optIn?.blocked && optIn.reason) {
-        return {enabled: false, reason: optIn.reason};
-    }
-    return {enabled: false, reason: 'Prompt capture is not enabled for your account.'};
-}
-
-export function isCaptureEnabled(db: Database.Database, userId: string, team?: string | null): boolean {
-    return captureGate(db, userId, team).enabled;
+    // `value === true` already means "opted in AND org permits", so anything else
+    // is inert. `reason` is populated by the resolver ONLY when the org blocks the
+    // choice (its policy message), so prefer it and otherwise fall back to the
+    // plain "not opted in" message — no separate `blocked` check is needed.
+    return {enabled: false, reason: optIn?.reason ?? 'Prompt capture is not enabled for your account.'};
 }
