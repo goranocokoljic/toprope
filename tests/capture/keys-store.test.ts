@@ -8,6 +8,7 @@ import {
     getKeyRecord,
     getRecoveryMaterial,
     logRecoveryEvent,
+    hasOpenRecovery,
     listRecoveryLog,
 } from '../../src/capture/keys-store';
 
@@ -117,5 +118,17 @@ describe('Capture keys store (Task 5.5)', () => {
         logRecoveryEvent(db, 'alice', 'recovery_initiated', 'alice');
         expect(listRecoveryLog(db, 'bob')).toHaveLength(0);
         expect(listRecoveryLog(db, 'alice')).toHaveLength(1);
+    });
+
+    it('hasOpenRecovery is true only while the latest event is an unclosed initiate', () => {
+        expect(hasOpenRecovery(db, 'alice')).toBe(false); // no events
+        logRecoveryEvent(db, 'alice', 'recovery_initiated', 'alice');
+        expect(hasOpenRecovery(db, 'alice')).toBe(true); // open
+        logRecoveryEvent(db, 'alice', 'recovery_completed', 'alice');
+        expect(hasOpenRecovery(db, 'alice')).toBe(false); // closed
+        // A new initiate re-opens; it is per-developer (bob unaffected).
+        logRecoveryEvent(db, 'alice', 'recovery_initiated', 'alice');
+        expect(hasOpenRecovery(db, 'alice')).toBe(true);
+        expect(hasOpenRecovery(db, 'bob')).toBe(false);
     });
 });

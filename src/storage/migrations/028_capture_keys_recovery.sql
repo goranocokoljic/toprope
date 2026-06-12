@@ -74,5 +74,8 @@ CREATE TABLE key_recovery_log (
     visible_to_developer INTEGER NOT NULL DEFAULT 1 CHECK (visible_to_developer IN (0, 1))
 );
 
--- The developer's recovery-log view is "my recovery events, newest first".
-CREATE INDEX idx_key_recovery_log_dev_time ON key_recovery_log(developer_id, occurred_at);
+-- The developer's recovery-log view is "my recovery events, newest first",
+-- filtered to visible_to_developer = 1 — so the index leads with both columns the
+-- read predicate uses before ordering on occurred_at.
+CREATE INDEX idx_key_recovery_log_dev_visible_time
+    ON key_recovery_log(developer_id, visible_to_developer, occurred_at);

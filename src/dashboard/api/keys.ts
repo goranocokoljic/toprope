@@ -24,11 +24,14 @@ import type Database from 'better-sqlite3';
 import {requireDeveloperId} from './guards';
 import {getDeveloperById} from '../../registry/developers';
 import {resolveSetting, setDeveloperPreference} from '../../settings/store';
+import {badRequest, asObject, BASE64_RE, validateMetaAllowlist} from './body-validation';
+import {RECOVERY_WRAP_ALGO, RECOVERY_KDF} from '../../capture/key-recovery';
 import {
     registerKey,
     getKeyRecord,
     getRecoveryMaterial,
     logRecoveryEvent,
+    hasOpenRecovery,
     listRecoveryLog,
     type RecoveryChoice,
 } from '../../capture/keys-store';
@@ -49,9 +52,6 @@ const FORBIDDEN_SECRET_KEYS = [
     'password',
 ];
 
-// Strict base64 (no interior whitespace / non-base64 chars).
-const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
-
 // A wrapped AES-256 key is tiny (~48 bytes); 1 KiB is generous and bounds the
 // blind store against an authenticated developer padding it.
 const MAX_RECOVERY_BLOB_BYTES = 1024;
@@ -67,16 +67,9 @@ const KEY_BODY_LIMIT = 64 * 1024;
 
 const RECOVERY_CHOICES: readonly RecoveryChoice[] = ['no_recovery', 'recovery_path'];
 
-function badRequest(reply: FastifyReply, message: string): undefined {
-    reply.status(400).send({error: 'Bad Request', message});
-    return undefined;
-}
-
-function asObject(value: unknown): Record<string, unknown> | null {
-    return value && typeof value === 'object' && !Array.isArray(value)
-        ? (value as Record<string, unknown>)
-        : null;
-}
+// The base64 meta fields the client wraps with; validated for shape at setup so a
+// broken client can't store un-unwrappable material it only discovers at recovery.
+const RECOVERY_META_BASE64_FIELDS = ['salt', 'iv', 'auth_tag'] as const;
 
 /** True when the org currently permits prompt capture for the developer's team. */
 function capturePermitted(db: Database.Database, team: string | null): boolean {
@@ -168,23 +161,32 @@ function validateSetup(body: unknown, reply: FastifyReply): ValidatedSetup | nul
     }
     // Allowlist exactly the public KDF/cipher fields, each a non-empty string —
     // so a secret can't be smuggled in under a differently-named or nested field,
-    // and the stored meta is always a known, flat, bounded shape.
-    const allowedMetaKeys = ['algo', 'kdf', 'salt', 'iv', 'auth_tag'];
-    for (const k of Object.keys(meta)) {
-        if (!allowedMetaKeys.includes(k)) {
-            badRequest(reply, `recovery_meta has an unexpected field '${k}'; only algo, kdf, salt, iv, auth_tag are allowed`);
-            return null;
-        }
-    }
-    for (const field of allowedMetaKeys) {
-        if (typeof meta[field] !== 'string' || (meta[field] as string).length === 0) {
-            badRequest(reply, `recovery_meta.${field} is required`);
-            return null;
-        }
-    }
-    if (JSON.stringify(meta).length > MAX_META_BYTES) {
-        badRequest(reply, `recovery_meta exceeds the ${MAX_META_BYTES}-byte limit`);
+    // and the stored meta is always a known, flat, bounded shape. Shared with the
+    // capture-ingestion route via validateMetaAllowlist.
+    if (!validateMetaAllowlist(meta, ['algo', 'kdf', 'salt', 'iv', 'auth_tag'], 'recovery_meta', MAX_META_BYTES, reply)) {
         return null;
+    }
+    // Beyond shape, validate the meta DESCRIBES material this server can actually
+    // help unwrap later: the algo/kdf must be the ones the client wrapper emits,
+    // and salt/iv/auth_tag must be real base64. Without this, a broken client could
+    // store `algo: "rot13"` or `salt: "!!!"`, get a green 201, and only discover at
+    // recovery time that the key is permanently unrecoverable — defeating the whole
+    // point of choosing recovery_path. The server still never decrypts; this only
+    // protects the developer's own ability to recover their own data.
+    if (meta.algo !== RECOVERY_WRAP_ALGO) {
+        badRequest(reply, `recovery_meta.algo must be ${RECOVERY_WRAP_ALGO}`);
+        return null;
+    }
+    if (meta.kdf !== RECOVERY_KDF) {
+        badRequest(reply, `recovery_meta.kdf must be ${RECOVERY_KDF}`);
+        return null;
+    }
+    for (const field of RECOVERY_META_BASE64_FIELDS) {
+        const v = meta[field] as string;
+        if (!BASE64_RE.test(v) || v.length % 4 !== 0) {
+            badRequest(reply, `recovery_meta.${field} must be base64`);
+            return null;
+        }
     }
 
     return {keyId, recoveryChoice, recoveryBlob, recoveryMeta: meta};
@@ -196,8 +198,11 @@ export function registerKeyRoutes(app: FastifyInstance, db: Database.Database): 
      * the key_id and recovery posture. For recovery_path, store the opaque
      * client-wrapped blob; for no_recovery, store nothing recoverable but require
      * an explicit informed-consent acknowledgement. Gated on the org permitting
-     * capture at all. Keeps the developer's `capture_recovery_choice` preference
-     * in sync so the resolved-preference view matches the key record.
+     * capture at all. Writes the developer's `capture_recovery_choice` preference
+     * in sync at write time. (Note: the resolved preference is org-gated, so if the
+     * org later disables capture it reports the blockedValue 'no_recovery' while the
+     * key record keeps the developer's real posture — they only provably match at
+     * the moment of writing, which is the intended behavior.)
      */
     app.post<{Body: unknown}>('/api/me/capture-key', {bodyLimit: KEY_BODY_LIMIT}, async (request, reply) => {
         const developerId = requireDeveloperId(request, reply);
@@ -281,6 +286,11 @@ export function registerKeyRoutes(app: FastifyInstance, db: Database.Database): 
                 message: 'You chose no-recovery: there is no recovery material, and your captures cannot be recovered if the key is lost.',
             });
         }
+        // Second read of the same row is deliberate: getKeyRecord branches on the
+        // posture to produce distinct 404 / no_recovery_path / no_recovery_material
+        // codes, while getRecoveryMaterial returns the blob+meta (which getKeyRecord
+        // never carries, by the privacy boundary). For a recovery_path record this is
+        // expected to be present; the guard covers a torn/legacy row.
         const material = getRecoveryMaterial(db, developerId);
         if (!material) {
             return reply.status(409).send({
@@ -307,13 +317,14 @@ export function registerKeyRoutes(app: FastifyInstance, db: Database.Database): 
      * the unwrap succeeded (it never holds the secret), so the client reports it
      * and the result is audited — completing the visible recovery trail.
      *
-     * Gated by the SAME preconditions as `initiate`: a completed/failed outcome can
-     * only be recorded against a key whose posture is `recovery_path`. Without this
-     * a no_recovery developer (who has nothing to recover) — or one with no key at
-     * all — could inject `recovery_completed`/`recovery_failed` rows into their own
-     * audit, so the log (the feature's trust artifact) would no longer faithfully
-     * describe real recovery flows. The guard keeps every logged outcome tied to a
-     * recovery that was actually initiable.
+     * Gated by the SAME preconditions as `initiate` (recovery_path key required),
+     * AND by an OPEN recovery: an outcome can only be recorded when the developer's
+     * latest recovery event is a `recovery_initiated` not yet closed. Without these
+     * guards a developer could append `recovery_completed`/`recovery_failed` rows
+     * with no preceding initiate — or for a no_recovery/absent key — so the audit
+     * (the feature's trust artifact) would no longer faithfully describe real
+     * recovery flows. Every logged outcome stays tied to a recovery that was
+     * actually initiated.
      */
     app.post<{Body: unknown}>('/api/me/capture-key/recovery/complete', async (request, reply) => {
         const developerId = requireDeveloperId(request, reply);
@@ -329,6 +340,13 @@ export function registerKeyRoutes(app: FastifyInstance, db: Database.Database): 
                 error: 'Conflict',
                 code: 'no_recovery_path',
                 message: 'You chose no-recovery: there is no recovery flow whose outcome could be recorded.',
+            });
+        }
+        if (!hasOpenRecovery(db, developerId)) {
+            return reply.status(409).send({
+                error: 'Conflict',
+                code: 'no_recovery_in_progress',
+                message: 'No recovery is in progress; initiate a recovery before reporting its outcome.',
             });
         }
         const obj = asObject(request.body);

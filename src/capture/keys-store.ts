@@ -186,6 +186,28 @@ export function logRecoveryEvent(
 }
 
 /**
+ * True when the developer has an OPEN recovery attempt — i.e. their most recent
+ * recovery event is `recovery_initiated`, not yet followed by a terminal
+ * completed/failed. Used to gate `recovery/complete` so an outcome can only be
+ * recorded against a recovery that was actually initiated: without this a
+ * developer could append a `recovery_completed` with no preceding initiate,
+ * making their own audit no longer a faithful record of real flows. The latest
+ * event is taken by (occurred_at, rowid) — the same monotonic ordering the log
+ * view uses — so a same-millisecond initiate is still recognized as the latest.
+ */
+export function hasOpenRecovery(db: Database.Database, developerId: string): boolean {
+    const row = db
+        .prepare(
+            `SELECT event FROM key_recovery_log
+             WHERE developer_id = ?
+             ORDER BY occurred_at DESC, rowid DESC
+             LIMIT 1`,
+        )
+        .get(developerId) as {event: string} | undefined;
+    return row?.event === 'recovery_initiated';
+}
+
+/**
  * The developer's own recovery audit, newest first. Filtered to their id AND to
  * visible_to_developer = 1 — so this view structurally shows every recovery
  * event (the writer always sets it to 1) and never another developer's.

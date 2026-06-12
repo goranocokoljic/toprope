@@ -187,6 +187,8 @@ describe('Capture key API (Task 5.5)', () => {
     it('a failed unwrap is also audited (recovery_failed)', async () => {
         const {body} = recoveryPathBody();
         await app.inject({method: 'POST', url: '/api/me/capture-key', headers: auth(aliceToken), payload: body});
+        // An outcome can only be reported against an initiated recovery.
+        await app.inject({method: 'POST', url: '/api/me/capture-key/recovery/initiate', headers: auth(aliceToken)});
         await app.inject({method: 'POST', url: '/api/me/capture-key/recovery/complete', headers: auth(aliceToken), payload: {outcome: 'failed'}});
         const log = await app.inject({method: 'GET', url: '/api/me/capture-key/recovery-log', headers: auth(aliceToken)});
         expect((log.json().data as Array<{event: string}>)[0].event).toBe('recovery_failed');
@@ -241,9 +243,10 @@ describe('Capture key API (Task 5.5)', () => {
         expect(aliceLog.json().data).toHaveLength(1);
     });
 
-    it('rejects a bad recovery-complete outcome (once a recovery_path key exists)', async () => {
+    it('rejects a bad recovery-complete outcome (once a recovery is in progress)', async () => {
         const {body} = recoveryPathBody();
         await app.inject({method: 'POST', url: '/api/me/capture-key', headers: auth(aliceToken), payload: body});
+        await app.inject({method: 'POST', url: '/api/me/capture-key/recovery/initiate', headers: auth(aliceToken)});
         const res = await app.inject({method: 'POST', url: '/api/me/capture-key/recovery/complete', headers: auth(aliceToken), payload: {outcome: 'maybe'}});
         expect(res.statusCode).toBe(400);
     });
@@ -261,5 +264,37 @@ describe('Capture key API (Task 5.5)', () => {
 
         // The audit log was never polluted with a fabricated outcome.
         expect(db.prepare('SELECT COUNT(*) c FROM key_recovery_log WHERE developer_id = ?').get('alice')).toMatchObject({c: 0});
+    });
+
+    it('recovery/complete with a recovery_path key but NO open recovery is refused (no fabricated outcome)', async () => {
+        const {body} = recoveryPathBody();
+        await app.inject({method: 'POST', url: '/api/me/capture-key', headers: auth(aliceToken), payload: body});
+        // Never initiated → complete must be refused.
+        const res = await app.inject({method: 'POST', url: '/api/me/capture-key/recovery/complete', headers: auth(aliceToken), payload: {outcome: 'completed'}});
+        expect(res.statusCode).toBe(409);
+        expect(res.json().code).toBe('no_recovery_in_progress');
+        expect(db.prepare('SELECT COUNT(*) c FROM key_recovery_log WHERE developer_id = ?').get('alice')).toMatchObject({c: 0});
+
+        // After a genuine initiate, a single complete closes it; a second complete is refused again.
+        await app.inject({method: 'POST', url: '/api/me/capture-key/recovery/initiate', headers: auth(aliceToken)});
+        const first = await app.inject({method: 'POST', url: '/api/me/capture-key/recovery/complete', headers: auth(aliceToken), payload: {outcome: 'completed'}});
+        expect(first.statusCode).toBe(200);
+        const second = await app.inject({method: 'POST', url: '/api/me/capture-key/recovery/complete', headers: auth(aliceToken), payload: {outcome: 'completed'}});
+        expect(second.statusCode).toBe(409);
+        // Exactly one initiated + one completed recorded.
+        const events = (await app.inject({method: 'GET', url: '/api/me/capture-key/recovery-log', headers: auth(aliceToken)})).json().data as Array<{event: string}>;
+        expect(events.map((e) => e.event).sort()).toEqual(['recovery_completed', 'recovery_initiated']);
+    });
+
+    it('rejects recovery_meta whose algo/kdf/base64 a future recovery could not unwrap (SO-1)', async () => {
+        const make = (metaPatch: Record<string, unknown>): Record<string, unknown> => {
+            const {body} = recoveryPathBody();
+            return {...body, recovery_meta: {...(body.recovery_meta as Record<string, unknown>), ...metaPatch}};
+        };
+        for (const patch of [{algo: 'rot13'}, {kdf: 'md5'}, {salt: '!!!not-base64'}, {iv: 'x'}]) {
+            const res = await app.inject({method: 'POST', url: '/api/me/capture-key', headers: auth(aliceToken), payload: make(patch)});
+            expect(res.statusCode).toBe(400);
+        }
+        expect(db.prepare('SELECT COUNT(*) c FROM capture_keys').get()).toMatchObject({c: 0});
     });
 });
