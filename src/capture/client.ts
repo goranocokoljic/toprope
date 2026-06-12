@@ -16,6 +16,7 @@
 
 import {encryptCapture, type EncryptionMeta} from './encryption';
 import type {CaptureMechanism} from './types';
+import type {CoachResult, RealtimeCoach} from '../coaching/realtime/coach';
 
 /** The exact JSON body the ingestion route accepts. All ciphertext, no plaintext. */
 export interface CaptureWirePayload {
@@ -46,6 +47,15 @@ export interface CaptureClientConfig {
     /** Reference id for the key (stored in meta; managed in Task 5.5). */
     keyId: string;
     mechanism: CaptureMechanism;
+    /**
+     * Optional local real-time coach (Task 5.6). When present, the client can run
+     * loop detection + structural nudges on an outgoing prompt via `observe`,
+     * entirely on the machine — the prompt is consumed locally for coaching and is
+     * never placed on the (already client-side) coach's metadata output. Both
+     * capture mechanisms wrap this one client, so attaching the coach here is what
+     * makes loop detection run at the capture layer for the agent AND the extension.
+     */
+    coach?: RealtimeCoach;
 }
 
 /**
@@ -89,6 +99,17 @@ export class CaptureClient {
         const payload = buildCapturePayload(this.config, input);
         await this.transport(payload);
         return payload;
+    }
+
+    /**
+     * Run the attached local coach on one outgoing prompt (Task 5.6). Pure-local:
+     * the prompt is observed on the machine and only the returned CoachResult
+     * METADATA (counts/types/timestamps) is ever suitable to sync — the prompt
+     * text never leaves here. Returns null when no coach is attached, so a caller
+     * that didn't opt into coaching pays nothing.
+     */
+    observe(prompt: string): CoachResult | null {
+        return this.config.coach ? this.config.coach.observePrompt(prompt) : null;
     }
 }
 
