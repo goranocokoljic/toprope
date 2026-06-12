@@ -5,6 +5,7 @@ import type {
     GitCommit,
     GitPR,
     GitReviewComment,
+    GitPRReview,
     GitFileDiff,
     GitAuthor,
     BitbucketProviderConfig,
@@ -141,6 +142,17 @@ interface RawComment {
     author: RawParticipant | null;
     created_on: string;
     inline?: {from?: number | null; to?: number | null; path?: string} | null;
+}
+
+// One entry of GET /pullrequests/{id}/activity. Each entry carries exactly one
+// of these keys: `approval` (an approve event), `changes_requested` (a
+// request-changes event), `comment`, or `update`. Only the first two are
+// review verdicts; comments are already covered by getReviewComments.
+interface RawActivityEntry {
+    approval?: {date: string; user: RawParticipant | null};
+    changes_requested?: {date: string; user: RawParticipant | null};
+    comment?: unknown;
+    update?: unknown;
 }
 
 function normalizePRState(bbState: string): string {
@@ -345,6 +357,36 @@ export class BitbucketProvider implements GitProvider {
                 createdAt: c.created_on,
                 prId,
             }));
+    }
+
+    async getPRReviews(repo: string, prId: string): Promise<GitPRReview[]> {
+        const entries = await this.fetchPaged<RawActivityEntry>(
+            `${BASE_URL}/repositories/${this.workspace}/${repo}/pullrequests/${prId}/activity?pagelen=50`,
+        );
+
+        const reviews: GitPRReview[] = [];
+        for (const entry of entries) {
+            if (entry.approval) {
+                reviews.push({
+                    author: participantToAuthor(entry.approval.user),
+                    state: 'approved',
+                    submittedAt: entry.approval.date,
+                    prId,
+                });
+            } else if (entry.changes_requested) {
+                reviews.push({
+                    author: participantToAuthor(entry.changes_requested.user),
+                    state: 'changes_requested',
+                    submittedAt: entry.changes_requested.date,
+                    prId,
+                });
+            }
+            // comment/update entries are not review verdicts — skip.
+        }
+
+        // The activity feed is newest-first; return oldest-first to match the
+        // other providers' submission order.
+        return reviews.sort((a, b) => a.submittedAt.localeCompare(b.submittedAt));
     }
 
     async getCommitDiff(repo: string, commitSha: string): Promise<GitFileDiff[]> {

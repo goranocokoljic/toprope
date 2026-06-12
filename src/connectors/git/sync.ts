@@ -234,10 +234,30 @@ function parseRepoFilters(rawRepos: string[] | undefined): {include: string[]; e
     return {include, exclude};
 }
 
+// Per-PR normalized facts for pr_records (Task 5.2). Built in fetchProviderData
+// where the raw GitPR + its review comments/verdicts are in hand, then resolved
+// to a developer and upserted in sync().
+interface PRRecordInput {
+    provider: GitProviderType;
+    repo: string;
+    prId: string;
+    authorLogin: string | null;
+    authorEmail: string | null;
+    state: string;
+    createdAt: string;
+    mergedAt: string | null;
+    closedAt: string | null;
+    reviewCommentCount: number;
+    changesRequestedCount: number;
+    /** Normalized review verdict events (approve/CR/comment reviews). */
+    reviewEventCount: number;
+}
+
 interface ProviderFetchResult {
     commits: AnalysisCommit[];
     prs: AnalysisPR[];
     reviewComments: AnalysisReviewComment[];
+    prRecords: PRRecordInput[];
     errors: string[];
     stateKey: string;
 }
@@ -251,6 +271,7 @@ async function fetchProviderData(
     const allCommits: AnalysisCommit[] = [];
     const allPRs: AnalysisPR[] = [];
     const allReviewComments: AnalysisReviewComment[] = [];
+    const allPRRecords: PRRecordInput[] = [];
 
     const provider = createGitProvider(providerConfig);
     const providerType = provider.name;
@@ -274,7 +295,14 @@ async function fetchProviderData(
         errors.push(
             `[${providerType}] Failed to list repos: ${err instanceof Error ? err.message : String(err)}`,
         );
-        return {commits: allCommits, prs: allPRs, reviewComments: allReviewComments, errors, stateKey};
+        return {
+            commits: allCommits,
+            prs: allPRs,
+            reviewComments: allReviewComments,
+            prRecords: allPRRecords,
+            errors,
+            stateKey,
+        };
     }
 
     const reposToSync = applyRepoFilter(
@@ -317,18 +345,113 @@ async function fetchProviderData(
 
         for (const pr of rawPRs) {
             allPRs.push(toAnalysisPR(pr));
+            let prCommentCount = 0;
             try {
                 const comments = await provider.getReviewComments(repoName, pr.id);
+                prCommentCount = comments.length;
                 for (const c of comments) {
                     allReviewComments.push(toAnalysisReviewComment(c));
                 }
             } catch {
                 // Review comment fetch failed — skip for this PR
             }
+
+            // Review verdict events (Task 5.2). Best-effort like comments: a
+            // failed fetch leaves the PR with zero verdict events rather than
+            // dropping the record.
+            let changesRequestedCount = 0;
+            let reviewEventCount = 0;
+            try {
+                const reviews = await provider.getPRReviews(repoName, pr.id);
+                reviewEventCount = reviews.length;
+                changesRequestedCount = reviews.filter(
+                    (r) => r.state === 'changes_requested',
+                ).length;
+            } catch {
+                // Review fetch failed — record the PR without verdict data
+            }
+
+            allPRRecords.push({
+                provider: providerType,
+                repo: repoName,
+                prId: pr.id,
+                authorLogin: pr.author.username || null,
+                authorEmail: pr.author.email || null,
+                state: pr.state,
+                createdAt: pr.createdAt,
+                mergedAt: pr.mergedAt,
+                closedAt: pr.closedAt,
+                reviewCommentCount: prCommentCount,
+                changesRequestedCount,
+                reviewEventCount,
+            });
         }
     }
 
-    return {commits: allCommits, prs: allPRs, reviewComments: allReviewComments, errors, stateKey};
+    return {
+        commits: allCommits,
+        prs: allPRs,
+        reviewComments: allReviewComments,
+        prRecords: allPRRecords,
+        errors,
+        stateKey,
+    };
+}
+
+/**
+ * Review cycles for a PR: 0 when it never saw any review activity; otherwise
+ * one initial review round plus one more per "changes requested" send-back.
+ */
+function reviewRounds(record: PRRecordInput): number {
+    if (record.reviewEventCount === 0 && record.reviewCommentCount === 0) return 0;
+    return 1 + record.changesRequestedCount;
+}
+
+function timeToMergeHours(record: PRRecordInput): number | null {
+    if (!record.mergedAt) return null;
+    const ms = Date.parse(record.mergedAt) - Date.parse(record.createdAt);
+    if (Number.isNaN(ms) || ms < 0) return null;
+    return ms / 3_600_000;
+}
+
+function upsertPRRecord(
+    db: Database.Database,
+    record: PRRecordInput,
+    developerId: string,
+    syncedAt: string,
+): void {
+    db.prepare(
+        `INSERT INTO pr_records
+         (id, developer_id, provider, repo, pr_id, state, created_at, merged_at, closed_at,
+          review_comment_count, review_rounds, changes_requested_count, time_to_merge_hours, synced_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(provider, repo, pr_id) DO UPDATE SET
+           developer_id = excluded.developer_id,
+           state = excluded.state,
+           created_at = excluded.created_at,
+           merged_at = excluded.merged_at,
+           closed_at = excluded.closed_at,
+           review_comment_count = excluded.review_comment_count,
+           review_rounds = excluded.review_rounds,
+           changes_requested_count = excluded.changes_requested_count,
+           time_to_merge_hours = excluded.time_to_merge_hours,
+           synced_at = excluded.synced_at`,
+    ).run(
+        randomUUID(),
+        developerId,
+        record.provider,
+        record.repo,
+        record.prId,
+        record.state,
+        record.createdAt,
+        record.mergedAt,
+        record.closedAt,
+        record.reviewCommentCount,
+        reviewRounds(record),
+        record.changesRequestedCount,
+        timeToMergeHours(record),
+        syncedAt,
+    );
 }
 
 export class GitSync implements ConnectorInterface {
@@ -396,9 +519,23 @@ export class GitSync implements ConnectorInterface {
         // Accumulate snapshots from all providers into a single map keyed by
         // "developer_id:date" so same-day multi-provider data is merged.
         const globalSnapshots = new Map<string, GitSnapshotRow>();
+        // Per-PR records (Task 5.2) resolved to developers, written after the
+        // snapshot pass. Keyed naturally by (provider, repo, pr_id), so no
+        // cross-provider merging is needed.
+        const resolvedPRRecords: Array<{record: PRRecordInput; developerId: string}> = [];
 
         for (const {result, providerType} of fetchResults) {
-            const {commits, prs, reviewComments, stateKey} = result;
+            const {commits, prs, reviewComments, prRecords, stateKey} = result;
+
+            for (const record of prRecords) {
+                const developerId = resolveDeveloperId(
+                    devLookup,
+                    providerType,
+                    record.authorLogin,
+                    record.authorEmail,
+                );
+                if (developerId) resolvedPRRecords.push({record, developerId});
+            }
 
             if (commits.length === 0 && prs.length === 0 && reviewComments.length === 0) {
                 setProviderLastSyncTime(db, stateKey, now);
@@ -449,12 +586,15 @@ export class GitSync implements ConnectorInterface {
             setProviderLastSyncTime(db, stateKey, now);
         }
 
-        // Upsert all merged snapshots in a single transaction
+        // Upsert all merged snapshots + per-PR records in a single transaction
         const insertMany = db.transaction(() => {
             for (const snap of globalSnapshots.values()) {
                 const outcome = upsertSnapshot(db, snap);
                 if (outcome === 'written') snapshotsWritten++;
                 else snapshotsSkipped++;
+            }
+            for (const {record, developerId} of resolvedPRRecords) {
+                upsertPRRecord(db, record, developerId, now);
             }
         });
 

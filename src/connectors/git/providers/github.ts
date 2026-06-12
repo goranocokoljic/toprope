@@ -5,6 +5,8 @@ import type {
     GitCommit,
     GitPR,
     GitReviewComment,
+    GitPRReview,
+    GitReviewState,
     GitFileDiff,
     GitAuthor,
     GitHubProviderConfig,
@@ -158,6 +160,28 @@ interface RawReviewComment {
     user: {login: string} | null;
     body: string;
     created_at: string;
+}
+
+interface RawReview {
+    user: {login: string} | null;
+    state: string;
+    submitted_at: string | null;
+}
+
+/**
+ * GitHub review states → normalized verdicts. APPROVED and CHANGES_REQUESTED
+ * are explicit verdicts; COMMENTED, DISMISSED, PENDING and anything future map
+ * to 'commented' (review activity without a standing verdict).
+ */
+function normalizeReviewState(state: string): GitReviewState {
+    switch (state) {
+        case 'APPROVED':
+            return 'approved';
+        case 'CHANGES_REQUESTED':
+            return 'changes_requested';
+        default:
+            return 'commented';
+    }
 }
 
 export class GitHubProvider implements GitProvider {
@@ -365,6 +389,36 @@ export class GitHubProvider implements GitProvider {
         }
 
         return comments;
+    }
+
+    async getPRReviews(repo: string, prId: string): Promise<GitPRReview[]> {
+        const reviews: GitPRReview[] = [];
+        let nextUrl: string | null =
+            `${BASE_URL}/repos/${this.org}/${repo}/pulls/${prId}/reviews?per_page=100`;
+
+        while (nextUrl) {
+            const res = await fetchGitHub(nextUrl, this.authHeaders);
+            const page = (await res.json()) as RawReview[];
+
+            for (const r of page) {
+                // PENDING reviews have no submitted_at — not yet a review event.
+                if (!r.submitted_at) continue;
+                reviews.push({
+                    author: {
+                        name: '',
+                        email: '',
+                        username: r.user?.login ?? '',
+                    },
+                    state: normalizeReviewState(r.state),
+                    submittedAt: r.submitted_at,
+                    prId,
+                });
+            }
+
+            nextUrl = parseNextLink(res.headers.get('link'));
+        }
+
+        return reviews;
     }
 
     async getCommitDiff(repo: string, commitSha: string): Promise<GitFileDiff[]> {

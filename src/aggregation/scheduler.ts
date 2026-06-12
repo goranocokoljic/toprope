@@ -41,6 +41,7 @@ import {openDb} from '../storage/db';
 import {runMigrations} from '../storage/migrator';
 import {
     isoWeekStart,
+    isoWeekLabel,
     monthOf,
     quarterOf,
     yearOf,
@@ -55,6 +56,7 @@ import {computeAllQuarterlyAggregates} from './quarterly';
 import {computeAllYearlyAggregates} from './yearly';
 import {markStaleSummariesForRecompute} from '../summaries/staleness';
 import {runAnomalyScanForPeriod} from '../anomaly/scan';
+import {computePRReviewMetricsForPeriod} from '../coaching/pr-review/compute';
 
 export type AggregationPeriod = 'weekly' | 'monthly' | 'quarterly' | 'yearly';
 
@@ -280,6 +282,25 @@ export function runScheduledJob(
             } catch (scanErr) {
                 const msg = scanErr instanceof Error ? scanErr.message : String(scanErr);
                 console.error(`[anomaly:scan] FAILED — period ${periodKey}: ${msg}`);
+            }
+        }
+        // PR/review outcome metrics (Task 5.2) run after the weekly and monthly
+        // aggregates land, on the same period the job just computed. Best-effort
+        // with the same contract as the anomaly scan: a failure is logged but
+        // never fails the aggregation job that succeeded above. The weekly job's
+        // period key is a week_start date; the metrics are keyed by the ISO week
+        // label (YYYY-Www) per the pr_review_metrics schema.
+        if (period === 'weekly' || period === 'monthly') {
+            const metricsPeriod = period === 'weekly' ? isoWeekLabel(periodKey) : periodKey;
+            try {
+                const result = computePRReviewMetricsForPeriod(db, period, metricsPeriod, now);
+                console.log(
+                    `[pr-review:metrics] done — period ${result.period}, ` +
+                        `${result.developers} developer(s), ${result.rowsWritten} row(s)`,
+                );
+            } catch (metricsErr) {
+                const msg = metricsErr instanceof Error ? metricsErr.message : String(metricsErr);
+                console.error(`[pr-review:metrics] FAILED — period ${metricsPeriod}: ${msg}`);
             }
         }
         return {period, periodKey, rowsWritten, ok: true};

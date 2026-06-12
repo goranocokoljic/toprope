@@ -95,6 +95,7 @@ function makeMockProvider(overrides: Partial<GitProvider> = {}): GitProvider {
         getCommits: vi.fn().mockResolvedValue([]),
         getPullRequests: vi.fn().mockResolvedValue([]),
         getReviewComments: vi.fn().mockResolvedValue([]),
+        getPRReviews: vi.fn().mockResolvedValue([]),
         getCommitDiff: vi.fn().mockResolvedValue([]),
         checkAccess: vi.fn().mockResolvedValue(undefined),
         ...overrides,
@@ -606,5 +607,136 @@ describe('GitSync', () => {
         const bbKey = db.prepare(`SELECT value FROM sync_state WHERE key = 'git_last_sync:bitbucket:myws'`).get();
         expect(githubKey).toBeDefined();
         expect(bbKey).toBeDefined();
+    });
+
+    describe('pr_records (Task 5.2)', () => {
+        interface PRRecordRow {
+            developer_id: string;
+            provider: string;
+            repo: string;
+            pr_id: string;
+            state: string;
+            review_comment_count: number;
+            review_rounds: number;
+            changes_requested_count: number;
+            time_to_merge_hours: number | null;
+        }
+
+        function getPRRecords(): PRRecordRow[] {
+            return db.prepare('SELECT * FROM pr_records ORDER BY pr_id').all() as PRRecordRow[];
+        }
+
+        it('persists per-PR records with normalized review outcomes', async () => {
+            const devId = seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            const provider = makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+                getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+                getReviewComments: vi.fn().mockResolvedValue([
+                    makeProviderReviewComment('bob'),
+                    makeProviderReviewComment('bob'),
+                ]),
+                getPRReviews: vi.fn().mockResolvedValue([
+                    {author: {name: '', email: '', username: 'bob'}, state: 'changes_requested', submittedAt: '2024-01-15T12:00:00Z', prId: '1'},
+                    {author: {name: '', email: '', username: 'bob'}, state: 'approved', submittedAt: '2024-01-16T09:00:00Z', prId: '1'},
+                ]),
+            });
+            createGitProvider.mockReturnValue(provider);
+
+            await new GitSync(makeGithubConfig()).sync(db);
+
+            const records = getPRRecords();
+            expect(records).toHaveLength(1);
+            expect(records[0].developer_id).toBe(devId);
+            expect(records[0].provider).toBe('github');
+            expect(records[0].repo).toBe('repo-a');
+            expect(records[0].state).toBe('merged');
+            expect(records[0].review_comment_count).toBe(2);
+            expect(records[0].changes_requested_count).toBe(1);
+            // One initial round + one send-back
+            expect(records[0].review_rounds).toBe(2);
+            // makeProviderPR: created 01-15T08:00 → merged 01-16T10:00 = 26h
+            expect(records[0].time_to_merge_hours).toBeCloseTo(26, 5);
+        });
+
+        it('records zero review rounds for a PR with no review activity', async () => {
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            const provider = makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+                getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+            });
+            createGitProvider.mockReturnValue(provider);
+
+            await new GitSync(makeGithubConfig()).sync(db);
+
+            const records = getPRRecords();
+            expect(records).toHaveLength(1);
+            expect(records[0].review_rounds).toBe(0);
+            expect(records[0].changes_requested_count).toBe(0);
+        });
+
+        it('upserts the same PR on re-sync instead of duplicating it', async () => {
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            const openPR = {...makeProviderPR('alice'), state: 'open', mergedAt: null, closedAt: null};
+            const provider = makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+                getPullRequests: vi.fn().mockResolvedValue([openPR]),
+            });
+            createGitProvider.mockReturnValue(provider);
+            await new GitSync(makeGithubConfig()).sync(db);
+            expect(getPRRecords()[0].state).toBe('open');
+
+            // Next sync: the PR has merged and gained a send-back round.
+            const mergedProvider = makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+                getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+                getPRReviews: vi.fn().mockResolvedValue([
+                    {author: {name: '', email: '', username: 'bob'}, state: 'changes_requested', submittedAt: '2024-01-15T12:00:00Z', prId: '1'},
+                ]),
+            });
+            createGitProvider.mockReturnValue(mergedProvider);
+            await new GitSync(makeGithubConfig()).sync(db);
+
+            const records = getPRRecords();
+            expect(records).toHaveLength(1); // updated in place
+            expect(records[0].state).toBe('merged');
+            expect(records[0].review_rounds).toBe(2);
+        });
+
+        it('still records the PR when the review fetch fails (verdicts default to zero)', async () => {
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            const provider = makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+                getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+                getReviewComments: vi.fn().mockResolvedValue([makeProviderReviewComment('bob')]),
+                getPRReviews: vi.fn().mockRejectedValue(new Error('boom')),
+            });
+            createGitProvider.mockReturnValue(provider);
+
+            await new GitSync(makeGithubConfig()).sync(db);
+
+            const records = getPRRecords();
+            expect(records).toHaveLength(1);
+            expect(records[0].changes_requested_count).toBe(0);
+            // Comments alone still count as review activity
+            expect(records[0].review_rounds).toBe(1);
+        });
+
+        it('skips PRs from authors with no developer record', async () => {
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            const provider = makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+                getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('stranger')]),
+            });
+            createGitProvider.mockReturnValue(provider);
+
+            await new GitSync(makeGithubConfig()).sync(db);
+
+            expect(getPRRecords()).toHaveLength(0);
+        });
     });
 });

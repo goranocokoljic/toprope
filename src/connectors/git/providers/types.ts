@@ -44,6 +44,23 @@ export interface GitReviewComment {
     prId: string;
 }
 
+/**
+ * Normalized review verdict states across providers:
+ *   - GitHub: PR review states APPROVED / CHANGES_REQUESTED / COMMENTED
+ *   - Bitbucket: activity entries with `approval` / `changes_requested`
+ *   - GitLab: system notes "approved this merge request" / "requested changes"
+ * Anything that is review activity but not an explicit verdict maps to
+ * 'commented'.
+ */
+export type GitReviewState = 'approved' | 'changes_requested' | 'commented';
+
+export interface GitPRReview {
+    author: GitAuthor;
+    state: GitReviewState;
+    submittedAt: string;
+    prId: string;
+}
+
 export interface GitFileDiff {
     path: string;
     additions: number;
@@ -57,6 +74,10 @@ export interface GitProvider {
     getCommits(repo: string, since: string, until: string): Promise<GitCommit[]>;
     getPullRequests(repo: string, state: string, since: string): Promise<GitPR[]>;
     getReviewComments(repo: string, prId: string): Promise<GitReviewComment[]>;
+    // Normalized review verdict events (approved / changes_requested /
+    // commented) for one PR, in submission order. Task 5.2 uses these to count
+    // review rounds and send-backs identically across providers.
+    getPRReviews(repo: string, prId: string): Promise<GitPRReview[]>;
     getCommitDiff(repo: string, commitSha: string): Promise<GitFileDiff[]>;
     // Cheap reachability/auth probe — fetches a single page, resolves on success
     // and throws on auth/network failure. Used by `govproxy doctor` to validate
