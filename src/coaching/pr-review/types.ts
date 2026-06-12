@@ -8,6 +8,8 @@
  * The variants are stored as separate rows (scope_variant) and never merged.
  */
 
+import type {PeriodUnit} from '../period-window';
+
 export type ScopeVariant = 'all_pr' | 'ai_assisted_pr';
 
 /** Confidence tier per variant: all_pr is factual, ai_assisted_pr inferred. */
@@ -29,8 +31,12 @@ export type CombinedSignal =
     | 'effective'
     | 'insufficient_data';
 
-/** The two period units the engine computes (period TEXT: YYYY-Www or YYYY-MM). */
-export type PRReviewPeriodUnit = 'weekly' | 'monthly';
+/**
+ * The two period units the engine computes (period TEXT: YYYY-Www or YYYY-MM).
+ * Aliases the shared {@link PeriodUnit} so it cannot drift from the available-data
+ * coaching unit (both surfaces share the period-window helpers).
+ */
+export type PRReviewPeriodUnit = PeriodUnit;
 
 /**
  * One PR's normalized facts, as read from pr_records and (for the AI variant)

@@ -12,6 +12,7 @@
 import type {FastifyInstance} from 'fastify';
 import type Database from 'better-sqlite3';
 import {getOrgPRReviewCoaching, getTeamPRReviewCoaching} from '../../coaching/pr-review/coaching';
+import {getOrgCoaching, getTeamCoaching} from '../../coaching/available/coaching';
 import {parsePeriodUnit, type PeriodUnitInput} from './coaching-params';
 import {forbidden, isAdmin} from './guards';
 
@@ -46,6 +47,41 @@ export function registerCoachingRoutes(app: FastifyInstance, db: Database.Databa
             }
             const unit = parsePeriodUnit(request.query.unit);
             return {data: getTeamPRReviewCoaching(db, team, unit)};
+        },
+    );
+
+    /**
+     * Org-wide available-data coaching aggregate — every developer pooled. Admin/
+     * manager only; per (period, signal type) the aggregate is suppressed unless
+     * enough developers contributed (k-anonymity), and it carries only contributor
+     * counts and category tallies — never an individual's observation text.
+     */
+    app.get<{Querystring: PeriodUnitInput}>('/api/coaching/available/org', async (request, reply) => {
+        if (!isAdmin(request)) {
+            return forbidden(reply);
+        }
+        const unit = parsePeriodUnit(request.query.unit);
+        return {data: getOrgCoaching(db, unit)};
+    });
+
+    /**
+     * One team's available-data coaching aggregate. 404 when the team doesn't
+     * exist so a typo can't be mistaken for a real-but-empty team. The aggregate
+     * never exposes an individual's text or numbers.
+     */
+    app.get<{Params: {team: string}; Querystring: PeriodUnitInput}>(
+        '/api/coaching/available/team/:team',
+        async (request, reply) => {
+            if (!isAdmin(request)) {
+                return forbidden(reply);
+            }
+            const {team} = request.params;
+            const exists = db.prepare('SELECT 1 FROM teams WHERE name = ?').get(team);
+            if (!exists) {
+                return reply.status(404).send({error: 'Not Found', message: `Team '${team}' not found`});
+            }
+            const unit = parsePeriodUnit(request.query.unit);
+            return {data: getTeamCoaching(db, team, unit)};
         },
     );
 }
