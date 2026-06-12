@@ -193,10 +193,14 @@ export function logRecoveryEvent(
 export function listRecoveryLog(db: Database.Database, developerId: string): RecoveryLogEntry[] {
     const rows = db
         .prepare(
+            // Tie-break on the implicit rowid (monotonic with insertion order) rather
+            // than the random-UUID id: two events in the same millisecond — e.g. an
+            // initiate immediately followed by a fast client-reported outcome — must
+            // not sort in a misleading order in the developer's audit view.
             `SELECT id, event, initiated_by, occurred_at
              FROM key_recovery_log
              WHERE developer_id = ? AND visible_to_developer = 1
-             ORDER BY occurred_at DESC, id DESC`,
+             ORDER BY occurred_at DESC, rowid DESC`,
         )
         .all(developerId) as RecoveryLogRow[];
     return rows.map((row) => ({

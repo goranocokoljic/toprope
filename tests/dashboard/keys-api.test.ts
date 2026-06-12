@@ -13,11 +13,16 @@ import {SESSION_COOKIE} from '../../src/auth/cookies';
 import {setGlobalSetting} from '../../src/settings/store';
 import {resolveDeveloperPreferences} from '../../src/settings/store';
 import {generateDeveloperKey} from '../../src/capture/encryption';
-import {wrapCaptureKey, unwrapCaptureKey, keysEqual, type RecoveryMeta} from '../../src/capture/key-recovery';
+import {wrapCaptureKey, unwrapCaptureKey, type RecoveryMeta} from '../../src/capture/key-recovery';
 
 const PASSWORD = 'correct-horse-battery';
 const NOW = '2026-06-15T00:00:00.000Z';
 const RECOVERY_SECRET = 'my recovery phrase that the server never sees';
+
+/** Local assertion helper — the test owns both buffers in plaintext. */
+function keysEqual(a: Buffer, b: Buffer): boolean {
+    return a.equals(b);
+}
 
 function seedDeveloper(db: Database.Database, id: string, team: string): void {
     db.prepare('INSERT INTO developers (id, name, email, team, created_at) VALUES (?, ?, ?, ?, ?)')
@@ -236,8 +241,25 @@ describe('Capture key API (Task 5.5)', () => {
         expect(aliceLog.json().data).toHaveLength(1);
     });
 
-    it('rejects a bad recovery-complete outcome', async () => {
+    it('rejects a bad recovery-complete outcome (once a recovery_path key exists)', async () => {
+        const {body} = recoveryPathBody();
+        await app.inject({method: 'POST', url: '/api/me/capture-key', headers: auth(aliceToken), payload: body});
         const res = await app.inject({method: 'POST', url: '/api/me/capture-key/recovery/complete', headers: auth(aliceToken), payload: {outcome: 'maybe'}});
         expect(res.statusCode).toBe(400);
+    });
+
+    it('recovery/complete is guarded like initiate — no spurious audit rows for no_recovery / no key', async () => {
+        // No key registered yet → 404, nothing logged.
+        const noKey = await app.inject({method: 'POST', url: '/api/me/capture-key/recovery/complete', headers: auth(aliceToken), payload: {outcome: 'completed'}});
+        expect(noKey.statusCode).toBe(404);
+
+        // no_recovery posture → 409, still nothing logged (no recovery flow exists).
+        await app.inject({method: 'POST', url: '/api/me/capture-key', headers: auth(aliceToken), payload: {key_id: 'k1', recovery_choice: 'no_recovery', acknowledge_unrecoverable: true}});
+        const noRecovery = await app.inject({method: 'POST', url: '/api/me/capture-key/recovery/complete', headers: auth(aliceToken), payload: {outcome: 'completed'}});
+        expect(noRecovery.statusCode).toBe(409);
+        expect(noRecovery.json().code).toBe('no_recovery_path');
+
+        // The audit log was never polluted with a fabricated outcome.
+        expect(db.prepare('SELECT COUNT(*) c FROM key_recovery_log WHERE developer_id = ?').get('alice')).toMatchObject({c: 0});
     });
 });

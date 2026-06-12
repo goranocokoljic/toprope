@@ -25,7 +25,7 @@
  *    return a garbage "key", so a successful unwrap is also an integrity proof.
  */
 
-import {createCipheriv, createDecipheriv, randomBytes, scryptSync, timingSafeEqual} from 'crypto';
+import {createCipheriv, createDecipheriv, randomBytes, scryptSync} from 'crypto';
 import {CAPTURE_KEY_BYTES} from './encryption';
 
 /** The wrapping algorithm; recorded in meta for forward-compat. */
@@ -141,13 +141,4 @@ export function unwrapCaptureKey(recoveryBlob: Buffer, meta: RecoveryMeta, recov
         throw new Error('Recovered key is not a valid AES-256 key');
     }
     return key;
-}
-
-/**
- * Constant-time equality for two keys — a test/verification helper so a recovery
- * round-trip can prove "the unwrapped key equals the original" without leaking
- * timing on the comparison.
- */
-export function keysEqual(a: Buffer, b: Buffer): boolean {
-    return a.length === b.length && timingSafeEqual(a, b);
 }

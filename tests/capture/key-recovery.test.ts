@@ -3,12 +3,16 @@ import {generateDeveloperKey, CAPTURE_KEY_BYTES} from '../../src/capture/encrypt
 import {
     wrapCaptureKey,
     unwrapCaptureKey,
-    keysEqual,
     RECOVERY_WRAP_ALGO,
     RECOVERY_KDF,
 } from '../../src/capture/key-recovery';
 
 const SECRET = 'correct horse battery staple — my recovery phrase';
+
+/** Local assertion helper — the round-trip owns both buffers in plaintext. */
+function keysEqual(a: Buffer, b: Buffer): boolean {
+    return a.equals(b);
+}
 
 describe('Capture key recovery wrapping (Task 5.5)', () => {
     it('round-trips: a key wrapped with a recovery secret unwraps to the SAME key', () => {

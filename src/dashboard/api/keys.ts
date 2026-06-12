@@ -220,16 +220,21 @@ export function registerKeyRoutes(app: FastifyInstance, db: Database.Database): 
             return reply;
         }
 
-        const record = registerKey(db, {
-            developerId,
-            keyId: valid.keyId,
-            recoveryChoice: valid.recoveryChoice,
-            recoveryBlob: valid.recoveryBlob,
-            recoveryMeta: valid.recoveryMeta,
-        });
-        // Keep the developer preference consistent with the stored key posture so
-        // a single source of truth doesn't diverge from the resolved-preference view.
-        setDeveloperPreference(db, userId, 'capture_recovery_choice', valid.recoveryChoice);
+        // The key record and the mirrored preference must move together: write them
+        // in ONE transaction so a failure can't leave the stored posture and the
+        // resolved `capture_recovery_choice` preference diverged — the very
+        // divergence this sync exists to prevent.
+        const record = db.transaction(() => {
+            const rec = registerKey(db, {
+                developerId,
+                keyId: valid.keyId,
+                recoveryChoice: valid.recoveryChoice,
+                recoveryBlob: valid.recoveryBlob,
+                recoveryMeta: valid.recoveryMeta,
+            });
+            setDeveloperPreference(db, userId, 'capture_recovery_choice', valid.recoveryChoice);
+            return rec;
+        })();
         return reply.status(201).send({data: record});
     });
 
@@ -251,6 +256,14 @@ export function registerKeyRoutes(app: FastifyInstance, db: Database.Database): 
      * the developer — and hands back the opaque wrapped blob + meta so the client
      * can unwrap it locally with the developer's recovery secret. For no_recovery
      * (or no key) there is nothing to recover: 409, and no misleading log entry.
+     *
+     * Policy: the recovery routes (initiate/complete/recovery-log) are DELIBERATELY
+     * NOT gated on `capturePermitted`, unlike setup. Recovery only ever operates on
+     * the developer's OWN, already-captured, already-encrypted data; if the org
+     * later turns capture off, the developer must still be able to recover and audit
+     * what was captured while it was on — locking them out of their own data would
+     * be the wrong outcome. Setup is gated because it provisions NEW capture; reading
+     * back one's existing data is not new capture.
      */
     app.post('/api/me/capture-key/recovery/initiate', async (request, reply) => {
         const developerId = requireDeveloperId(request, reply);
@@ -293,11 +306,30 @@ export function registerKeyRoutes(app: FastifyInstance, db: Database.Database): 
      * Report the outcome of a client-side unwrap. The server can't observe whether
      * the unwrap succeeded (it never holds the secret), so the client reports it
      * and the result is audited — completing the visible recovery trail.
+     *
+     * Gated by the SAME preconditions as `initiate`: a completed/failed outcome can
+     * only be recorded against a key whose posture is `recovery_path`. Without this
+     * a no_recovery developer (who has nothing to recover) — or one with no key at
+     * all — could inject `recovery_completed`/`recovery_failed` rows into their own
+     * audit, so the log (the feature's trust artifact) would no longer faithfully
+     * describe real recovery flows. The guard keeps every logged outcome tied to a
+     * recovery that was actually initiable.
      */
     app.post<{Body: unknown}>('/api/me/capture-key/recovery/complete', async (request, reply) => {
         const developerId = requireDeveloperId(request, reply);
         if (!developerId) {
             return reply;
+        }
+        const record = getKeyRecord(db, developerId);
+        if (!record) {
+            return reply.status(404).send({error: 'Not Found', message: 'No capture key registered'});
+        }
+        if (record.recoveryChoice !== 'recovery_path') {
+            return reply.status(409).send({
+                error: 'Conflict',
+                code: 'no_recovery_path',
+                message: 'You chose no-recovery: there is no recovery flow whose outcome could be recorded.',
+            });
         }
         const obj = asObject(request.body);
         const outcome = obj?.outcome;
