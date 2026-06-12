@@ -58,6 +58,7 @@ import {computeAllYearlyAggregates} from './yearly';
 import {markStaleSummariesForRecompute} from '../summaries/staleness';
 import {runAnomalyScanForPeriod} from '../anomaly/scan';
 import {computePRReviewMetricsForPeriod} from '../coaching/pr-review/compute';
+import {generateCoachingSignalsForPeriod} from '../coaching/available/generator';
 
 export type AggregationPeriod = 'weekly' | 'monthly' | 'quarterly' | 'yearly';
 
@@ -309,12 +310,19 @@ export function runScheduledJob(
         // slow, precomputing a per-period density table is the remediation,
         // mirroring the note on runAnomalyScanForPeriod.
         if (period === 'weekly' || period === 'monthly') {
+            // The trailing recompute window, shared by both coaching engines: the
+            // just-closed period plus a few priors. A PR's verdict and a churn/
+            // acceptance baseline both keep converging after a period closes, so
+            // re-folding recent periods is what makes the stored output track the
+            // final picture rather than freezing a photograph taken at close.
+            // Guarded so a setup failure can't abort the just-succeeded aggregation
+            // job; on failure both engines no-op over the empty window.
+            const metricsPeriods: string[] = [];
             try {
-                const metricsPeriods: string[] = [];
                 if (period === 'weekly') {
                     // periodKey is a week_start date; convert to a YYYY-Www label
-                    // once, then walk back with priorIsoWeek — structurally
-                    // parallel to the monthly priorMonth fold below.
+                    // once, then walk back with priorIsoWeek — structurally parallel
+                    // to the monthly priorMonth fold below.
                     let wk = isoWeekLabel(periodKey);
                     metricsPeriods.push(wk);
                     for (let i = 0; i < 3; i++) {
@@ -324,6 +332,14 @@ export function runScheduledJob(
                 } else {
                     metricsPeriods.push(periodKey, priorMonth(periodKey));
                 }
+            } catch (windowErr) {
+                const msg = windowErr instanceof Error ? windowErr.message : String(windowErr);
+                console.error(`[coaching] FAILED to build recompute window — base period ${periodKey}: ${msg}`);
+            }
+
+            // Each engine is wrapped independently so one failing never aborts the
+            // other (or the aggregation job that already succeeded above).
+            try {
                 for (const metricsPeriod of metricsPeriods) {
                     const result = computePRReviewMetricsForPeriod(db, period, metricsPeriod, now);
                     console.log(
@@ -334,6 +350,19 @@ export function runScheduledJob(
             } catch (metricsErr) {
                 const msg = metricsErr instanceof Error ? metricsErr.message : String(metricsErr);
                 console.error(`[pr-review:metrics] FAILED — base period ${periodKey}: ${msg}`);
+            }
+
+            try {
+                for (const coachingPeriod of metricsPeriods) {
+                    const result = generateCoachingSignalsForPeriod(db, period, coachingPeriod, now);
+                    console.log(
+                        `[coaching:available] done — period ${result.period}, ` +
+                            `${result.developers} developer(s), ${result.signalsWritten} signal(s)`,
+                    );
+                }
+            } catch (coachingErr) {
+                const msg = coachingErr instanceof Error ? coachingErr.message : String(coachingErr);
+                console.error(`[coaching:available] FAILED — base period ${periodKey}: ${msg}`);
             }
         }
         return {period, periodKey, rowsWritten, ok: true};

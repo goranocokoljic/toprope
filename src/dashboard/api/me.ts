@@ -11,6 +11,7 @@ import {getDeveloperJourney} from './journey';
 import {parseTimeRange, TimeRangeError, type TimeRangeInput} from './range';
 import {requireDeveloperId} from './guards';
 import {getDeveloperPRReviewCoaching} from '../../coaching/pr-review/coaching';
+import {getDeveloperCoaching} from '../../coaching/available/coaching';
 import {parsePeriodUnit, type PeriodUnitInput} from './coaching-params';
 
 /**
@@ -124,6 +125,23 @@ export function registerMeRoutes(app: FastifyInstance, db: Database.Database): v
         }
         const unit = parsePeriodUnit(request.query.unit);
         return {data: getDeveloperPRReviewCoaching(db, developerId, unit)};
+    });
+
+    /**
+     * The developer's PRIVATE available-data coaching: their own churn
+     * reflection, acceptance trend (only when tool data exists), journey
+     * coaching, and tier-aware personal insight — each within-developer-over-time
+     * and including the observation text. Session-scoped like every /api/me
+     * route, so a developer can never reach anyone else's coaching. `unit` selects
+     * weekly or monthly periods (default monthly).
+     */
+    app.get<{Querystring: PeriodUnitInput}>('/api/me/coaching', async (request, reply) => {
+        const developerId = requireDeveloperId(request, reply);
+        if (!developerId) {
+            return reply;
+        }
+        const unit = parsePeriodUnit(request.query.unit);
+        return {data: getDeveloperCoaching(db, developerId, unit)};
     });
 
     app.get<{Querystring: TimeRangeInput}>('/api/me/activity', async (request, reply) => {
