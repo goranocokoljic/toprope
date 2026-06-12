@@ -3,7 +3,6 @@ import {
     DEVELOPER_PREFERENCES,
     GLOBAL_SETTINGS,
     USER_PREFERENCES,
-    coerceDeveloperPreferenceValue,
     coercePreferenceValue,
     coerceSettingValue,
     getDeveloperPreferenceDef,
@@ -278,6 +277,15 @@ export function getUserPreferences(db: Database.Database, userId: string): Recor
     return out;
 }
 
+/** Upsert one (user_id, key) preference row. Shared by the UI and coaching setters. */
+function writePreferenceRow(db: Database.Database, userId: string, key: string, value: boolean | string): void {
+    db.prepare(
+        `INSERT INTO user_preferences (user_id, key, value, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+    ).run(userId, key, JSON.stringify(value), nowIso());
+}
+
 export function setUserPreference(
     db: Database.Database,
     userId: string,
@@ -288,11 +296,7 @@ export function setUserPreference(
     if (!def) {
         throw new Error(`Unknown preference key: ${key}`);
     }
-    db.prepare(
-        `INSERT INTO user_preferences (user_id, key, value, updated_at)
-         VALUES (?, ?, ?, ?)
-         ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-    ).run(userId, key, JSON.stringify(value), nowIso());
+    writePreferenceRow(db, userId, key, value);
 }
 
 // ---------------------------------------------------------------------------
@@ -310,24 +314,6 @@ export function setUserPreference(
 // blockedValue — the org boundary always wins over a stored opt-in.
 // ---------------------------------------------------------------------------
 
-function decodeDeveloperPreference(def: DeveloperPreferenceDef, raw: string): boolean | string {
-    let parsed: unknown;
-    try {
-        parsed = JSON.parse(raw);
-    } catch {
-        console.warn(`[settings] unparseable stored coaching preference for ${def.key}; using default`);
-        return def.default;
-    }
-    const result = coerceDeveloperPreferenceValue(def, parsed);
-    if (!result.ok) {
-        console.warn(
-            `[settings] stored coaching preference for ${def.key} failed re-coercion (${result.error}); using default`,
-        );
-        return def.default;
-    }
-    return result.value;
-}
-
 export function setDeveloperPreference(
     db: Database.Database,
     userId: string,
@@ -338,11 +324,14 @@ export function setDeveloperPreference(
     if (!def) {
         throw new Error(`Unknown coaching preference key: ${key}`);
     }
-    db.prepare(
-        `INSERT INTO user_preferences (user_id, key, value, updated_at)
-         VALUES (?, ?, ?, ?)
-         ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-    ).run(userId, key, JSON.stringify(value), nowIso());
+    // Coerce before persisting (defense-in-depth): the HTTP route already
+    // validates, but this is an exported primitive, so it must not let a
+    // wrong-typed/out-of-domain value reach the table.
+    const result = coercePreferenceValue(def, value);
+    if (!result.ok) {
+        throw new Error(`Invalid coaching preference value: ${result.error}`);
+    }
+    writePreferenceRow(db, userId, key, result.value);
 }
 
 /** The developer's stored choice for a key (or its effective default), before org gating. */
@@ -356,15 +345,18 @@ function storedDeveloperPreference(
         .prepare('SELECT value FROM user_preferences WHERE user_id = ? AND key = ?')
         .get(userId, def.key) as {value: string} | undefined;
     if (row) {
-        return decodeDeveloperPreference(def, row.value);
+        // A DeveloperPreferenceDef is a PreferenceDef, so the shared decoder
+        // re-coerces and falls back to default on a malformed stored value.
+        return decodePreference(def, row.value);
     }
-    // No stored choice: an enum preference may inherit the org default (e.g.
+    // No stored choice: a preference may inherit the org default (e.g.
     // nudge_frequency follows nudge_default_frequency) so the developer starts
-    // from the org's posture rather than a hardcoded constant.
+    // from the org's posture rather than a hardcoded constant. The org value is
+    // re-coerced against this def's domain so a registry drift can't carry an
+    // out-of-domain (or numeric) value into a boolean|string preference.
     if (def.defaultFromOrg) {
-        // defaultFromOrg always names an enum org setting (string-valued), so the
-        // resolved value matches a developer preference's boolean|string domain.
-        return resolveSetting(db, def.defaultFromOrg, team) as boolean | string;
+        const seeded = coercePreferenceValue(def, resolveSetting(db, def.defaultFromOrg, team));
+        return seeded.ok ? seeded.value : def.default;
     }
     return def.default;
 }

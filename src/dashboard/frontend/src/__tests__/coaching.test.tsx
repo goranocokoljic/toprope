@@ -82,8 +82,10 @@ let fetchMock: Mock;
 function installFetch(): void {
     fetchMock = vi.fn(async (url: unknown) => {
         const path = new URL(String(url), 'http://localhost').pathname;
-        if (path === '/api/me/pr-coaching') return jsonResponse(DEV_COACHING);
-        if (path === '/api/coaching/pr-review/org') return jsonResponse(TEAM_COACHING);
+        // Pillar 2 enabled → the server wraps the trajectory in {enabled:true, …}
+        // (Task 5.10). The page narrows on `enabled` before reading the trajectory.
+        if (path === '/api/me/pr-coaching') return jsonResponse({enabled: true, ...DEV_COACHING});
+        if (path === '/api/coaching/pr-review/org') return jsonResponse({enabled: true, ...TEAM_COACHING});
         if (path === '/api/teams') {
             return jsonResponse([{name: 'eng'}]) as Response & {pagination?: unknown};
         }
@@ -96,7 +98,7 @@ function installFetch(): void {
 function installFetchWithTeams(): void {
     fetchMock = vi.fn(async (url: unknown) => {
         const path = new URL(String(url), 'http://localhost').pathname;
-        if (path === '/api/coaching/pr-review/org') return jsonResponse(TEAM_COACHING);
+        if (path === '/api/coaching/pr-review/org') return jsonResponse({enabled: true, ...TEAM_COACHING});
         if (path === '/api/teams') {
             return new Response(
                 JSON.stringify({data: [{name: 'eng'}], pagination: {page: 1, limit: 100, total: 1}}),
@@ -155,6 +157,23 @@ describe('MyCoaching — developer-private trajectory', () => {
     it('states the privacy guarantee to the developer', async () => {
         renderPage(<MyCoaching />);
         expect(await screen.findByText(/manager only ever sees team-level aggregates/i)).toBeInTheDocument();
+    });
+
+    it('shows an off-state (not a crash) when the org disables Pillar 2', async () => {
+        // The server returns only {enabled:false} when the pillar is off — no
+        // trajectory. The page must render the off-state, never dereference all_pr.
+        fetchMock = vi.fn(async (url: unknown) => {
+            const path = new URL(String(url), 'http://localhost').pathname;
+            if (path === '/api/me/pr-coaching') return jsonResponse({enabled: false});
+            return new Response(JSON.stringify({error: 'not found'}), {status: 404});
+        });
+        vi.stubGlobal('fetch', fetchMock);
+
+        renderPage(<MyCoaching />);
+        expect(await screen.findByTestId('my-coaching-disabled')).toBeInTheDocument();
+        expect(screen.getByText(/PR\/review coaching is turned off/i)).toBeInTheDocument();
+        // The trajectory sections are absent — nothing tried to read all_pr.
+        expect(screen.queryByText('All your PRs')).not.toBeInTheDocument();
     });
 });
 

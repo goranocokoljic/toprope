@@ -1,6 +1,6 @@
 import type {FastifyInstance, FastifyReply, FastifyRequest} from 'fastify';
 import type Database from 'better-sqlite3';
-import {GLOBAL_SETTINGS, coerceDeveloperPreferenceValue, coercePreferenceValue, coerceSettingValue, getDeveloperPreferenceDef, getPreferenceDef, getSettingDef, type SettingValue} from '../../settings/registry';
+import {GLOBAL_SETTINGS, coercePreferenceValue, coerceSettingValue, getDeveloperPreferenceDef, getPreferenceDef, getSettingDef, type SettingValue} from '../../settings/registry';
 import {
     clearOverridesGovernedBy,
     getAllGlobalSettings,
@@ -466,7 +466,7 @@ export function registerSettingsRoutes(app: FastifyInstance, db: Database.Databa
             if (!def) {
                 return badRequest(reply, `Unknown coaching preference: ${key}`);
             }
-            const result = coerceDeveloperPreferenceValue(def, raw);
+            const result = coercePreferenceValue(def, raw);
             if (!result.ok) {
                 return badRequest(reply, result.error);
             }

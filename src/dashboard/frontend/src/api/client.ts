@@ -16,7 +16,7 @@ import type {
     CoverageData,
     DeveloperIdentity,
     DeveloperJourney,
-    DeveloperPRReviewCoaching,
+    MyPRReviewCoaching,
     GlobalSettings,
     Leaderboard,
     LeaderboardAvailability,
@@ -39,7 +39,7 @@ import type {
     TeamComparison,
     TeamDetail,
     TeamListItem,
-    TeamPRReviewCoaching,
+    TeamPRReviewCoachingResponse,
     TeamProviders,
     TeamSettings,
     TeamTrend,
@@ -596,8 +596,8 @@ export const api = {
      * The developer's OWN PR/review coaching trajectory (session-scoped) — both
      * scope variants, framed as a trend over time. `unit` picks weekly/monthly.
      */
-    async getMyPRReviewCoaching(unit: PRReviewPeriodUnit): Promise<DeveloperPRReviewCoaching> {
-        const body = await request<ApiEnvelope<DeveloperPRReviewCoaching>>(
+    async getMyPRReviewCoaching(unit: PRReviewPeriodUnit): Promise<MyPRReviewCoaching> {
+        const body = await request<ApiEnvelope<MyPRReviewCoaching>>(
             `/api/me/pr-coaching?unit=${encodeURIComponent(unit)}`,
         );
         return body.data;
@@ -610,12 +610,12 @@ export const api = {
     async getTeamPRReviewCoaching(
         scope: string,
         unit: PRReviewPeriodUnit,
-    ): Promise<TeamPRReviewCoaching> {
+    ): Promise<TeamPRReviewCoachingResponse> {
         const path =
             scope === 'org'
                 ? `/api/coaching/pr-review/org?unit=${encodeURIComponent(unit)}`
                 : `/api/coaching/pr-review/team/${encodeURIComponent(scope)}?unit=${encodeURIComponent(unit)}`;
-        const body = await request<ApiEnvelope<TeamPRReviewCoaching>>(path);
+        const body = await request<ApiEnvelope<TeamPRReviewCoachingResponse>>(path);
         return body.data;
     },
 

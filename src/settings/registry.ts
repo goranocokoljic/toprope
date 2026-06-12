@@ -273,13 +273,10 @@ export const USER_PREFERENCES: Record<string, PreferenceDef> = {
  * declarative: the store reads `gatedBy`/`blockedValue` and never lets a stored
  * choice escape the org boundary.
  */
-export interface DeveloperPreferenceDef {
-    key: string;
-    type: 'boolean' | 'enum';
-    /** Hardcoded fallback when the developer has stored no value AND no org default applies. */
-    default: boolean | string;
-    /** Closed set of allowed values for `enum` preferences. */
-    allowed?: readonly string[];
+// Extends PreferenceDef (same key/type/default/allowed shape, so the shared
+// coerce/decode helpers accept it) with the org-gating metadata that is the only
+// thing genuinely new about developer coaching preferences.
+export interface DeveloperPreferenceDef extends PreferenceDef {
     /**
      * Org boolean setting (a *_permitted flag) that must resolve to `true` for
      * this developer choice to take effect. When it resolves `false`, the choice
@@ -316,7 +313,7 @@ export const DEVELOPER_PREFERENCES: Record<string, DeveloperPreferenceDef> = {
     },
     capture_mechanism: {
         key: 'capture_mechanism',
-        type: 'enum',
+        type: 'string',
         default: 'local_agent',
         allowed: CAPTURE_MECHANISM_OPTIONS,
         gatedBy: 'coaching_capture_permitted',
@@ -324,7 +321,7 @@ export const DEVELOPER_PREFERENCES: Record<string, DeveloperPreferenceDef> = {
     },
     capture_recovery_choice: {
         key: 'capture_recovery_choice',
-        type: 'enum',
+        type: 'string',
         default: 'no_recovery',
         allowed: CAPTURE_RECOVERY_OPTIONS,
         gatedBy: 'coaching_capture_permitted',
@@ -347,7 +344,7 @@ export const DEVELOPER_PREFERENCES: Record<string, DeveloperPreferenceDef> = {
     },
     nudge_frequency: {
         key: 'nudge_frequency',
-        type: 'enum',
+        type: 'string',
         default: 'normal',
         allowed: NUDGE_FREQUENCY_OPTIONS,
         defaultFromOrg: 'nudge_default_frequency',
@@ -427,29 +424,8 @@ export function coercePreferenceValue(def: PreferenceDef, raw: unknown): Prefere
     return {ok: true, value: raw};
 }
 
-/**
- * Validate/coerce an untrusted value for a developer coaching preference. Mirrors
- * `coerceSettingValue` for the `boolean`/`enum` shapes these preferences use.
- * Type-only: org permission is enforced later, at resolution — a developer may
- * record an opt-in the org currently forbids without error; it simply stays
- * ignored until (and unless) the org permits it.
- */
-export function coerceDeveloperPreferenceValue(
-    def: DeveloperPreferenceDef,
-    raw: unknown,
-): PreferenceCoercionResult {
-    if (def.type === 'boolean') {
-        if (typeof raw !== 'boolean') {
-            return {ok: false, error: `${def.key} must be a boolean`};
-        }
-        return {ok: true, value: raw};
-    }
-    // enum
-    if (typeof raw !== 'string') {
-        return {ok: false, error: `${def.key} must be a string`};
-    }
-    if (def.allowed && !def.allowed.includes(raw)) {
-        return {ok: false, error: `${def.key} must be one of: ${def.allowed.join(', ')}`};
-    }
-    return {ok: true, value: raw};
-}
+// Developer coaching preferences reuse `coercePreferenceValue` (a
+// DeveloperPreferenceDef is a PreferenceDef plus gating metadata, so the
+// boolean/string coercion is identical). Coercion is type-only: org permission
+// is enforced later, at resolution — a developer may record an opt-in the org
+// currently forbids without error; it simply stays ignored until the org permits.

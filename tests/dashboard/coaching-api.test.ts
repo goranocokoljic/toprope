@@ -10,6 +10,7 @@ import {registerCoachingRoutes} from '../../src/dashboard/api/coaching';
 import {createUser} from '../../src/auth/users';
 import {hashPassword} from '../../src/auth/password';
 import {SESSION_COOKIE} from '../../src/auth/cookies';
+import {setGlobalSetting, setTeamSetting} from '../../src/settings/store';
 import type {ScopeVariant} from '../../src/coaching/pr-review/types';
 
 const PASSWORD = 'correct-horse-battery';
@@ -168,5 +169,47 @@ describe('Coaching API privacy boundary (Task 5.3)', () => {
     it('404s an unknown team rather than leaking an empty aggregate path', async () => {
         const res = await app.inject({method: 'GET', url: '/api/coaching/pr-review/team/nope', headers: auth(adminToken)});
         expect(res.statusCode).toBe(404);
+    });
+
+    // Task 5.10: disabling a pillar hides it EVERYWHERE — the manager aggregate
+    // and the developer's own view, not just one surface.
+    it('disabling Pillar 2 hides the manager org + team aggregates and the developer view', async () => {
+        for (const id of ['alice', 'bob', 'carol']) {
+            seedMetric(db, {developerId: id, period: '2026-06', variant: 'all_pr', prsTotal: 4, rework: 0.25});
+        }
+        // Enabled by default → all three surfaces carry the aggregate/trajectory.
+        for (const url of ['/api/coaching/pr-review/org', '/api/coaching/pr-review/team/eng']) {
+            const res = await app.inject({method: 'GET', url, headers: auth(adminToken)});
+            expect(res.json().data.enabled, url).toBe(true);
+        }
+        const me = await app.inject({method: 'GET', url: '/api/me/pr-coaching', headers: auth(aliceToken)});
+        expect(me.json().data.enabled).toBe(true);
+
+        // Disable Pillar 2 org-wide.
+        setGlobalSetting(db, 'coaching_pillar2_enabled', false);
+
+        for (const url of ['/api/coaching/pr-review/org', '/api/coaching/pr-review/team/eng']) {
+            const res = await app.inject({method: 'GET', url, headers: auth(adminToken)});
+            expect(res.json().data.enabled, url).toBe(false);
+            expect(res.json().data.all_pr, url).toBeUndefined();
+        }
+        const meOff = await app.inject({method: 'GET', url: '/api/me/pr-coaching', headers: auth(aliceToken)});
+        expect(meOff.json().data.enabled).toBe(false);
+    });
+
+    it('a per-team Pillar 2 override re-enables just that team aggregate', async () => {
+        for (const id of ['alice', 'bob', 'carol']) {
+            seedMetric(db, {developerId: id, period: '2026-06', variant: 'all_pr', prsTotal: 4, rework: 0.25});
+        }
+        // Global off, but managers may override and the eng team turns it back on.
+        setGlobalSetting(db, 'coaching_pillar2_enabled', false);
+        setGlobalSetting(db, 'coaching_managers_can_override', true);
+        setTeamSetting(db, 'eng', 'coaching_pillar2_enabled', true);
+
+        const team = await app.inject({method: 'GET', url: '/api/coaching/pr-review/team/eng', headers: auth(adminToken)});
+        expect(team.json().data.enabled).toBe(true);
+        // The org-wide aggregate (no team) still reflects the global off-switch.
+        const org = await app.inject({method: 'GET', url: '/api/coaching/pr-review/org', headers: auth(adminToken)});
+        expect(org.json().data.enabled).toBe(false);
     });
 });

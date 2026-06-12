@@ -455,6 +455,17 @@ export interface DeveloperPRReviewCoaching {
     ai_assisted: PRReviewVariantTrajectory;
 }
 
+/**
+ * /api/me/pr-coaching response. Pillar 2 (PR/review coaching) can be disabled
+ * org-wide or per team (Task 5.10); when it is, the server returns only
+ * `{enabled:false}` with no trajectory, and the page shows an off-state instead
+ * of the coaching. The `enabled` discriminator lets the UI narrow safely before
+ * touching the trajectory fields.
+ */
+export type MyPRReviewCoaching =
+    | {enabled: false}
+    | ({enabled: true} & DeveloperPRReviewCoaching);
+
 /** One period of a team aggregate — suppressed (no numbers) or pooled team figures. */
 export interface TeamCoachingAggregatePoint {
     period: string;
@@ -486,6 +497,16 @@ export interface TeamPRReviewCoaching {
     all_pr: TeamCoachingVariantTrajectory;
     ai_assisted: TeamCoachingVariantTrajectory;
 }
+
+/**
+ * /api/coaching/pr-review/{org,team} response. Pillar 2 gating (Task 5.10)
+ * applies to the manager aggregate too: when the pillar is off the server returns
+ * `{enabled:false}` with no aggregate, so the surface is hidden everywhere, not
+ * just on the developer's own view.
+ */
+export type TeamPRReviewCoachingResponse =
+    | {enabled: false}
+    | ({enabled: true} & TeamPRReviewCoaching);
 
 /** First→last detected AI activity — the span of the journey timeline. */
 export interface JourneyBounds {
