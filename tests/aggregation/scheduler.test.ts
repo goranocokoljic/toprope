@@ -202,6 +202,79 @@ describe('runScheduledJob — manual == scheduled', () => {
     });
 });
 
+describe('PR/review metrics hookup (Task 5.2)', () => {
+    let db: Database.Database;
+
+    function seedPRRecord(developerId: string, prId: string, createdAt: string): void {
+        db.prepare(
+            `INSERT INTO pr_records
+             (id, developer_id, provider, repo, pr_id, state, created_at, merged_at, closed_at,
+              review_comment_count, review_rounds, changes_requested_count, time_to_merge_hours, synced_at)
+             VALUES (?, ?, 'github', 'repo-a', ?, 'merged', ?, ?, ?, 2, 1, 0, 24, ?)`,
+        ).run(randomUUID(), developerId, prId, createdAt, createdAt, createdAt, createdAt);
+    }
+
+    beforeEach(() => {
+        db = makeDb();
+        addDeveloper(db, 'dev-1', 'backend');
+        addSubscription(db, 'dev-1', {monthly_cost: 30, seat_assigned_at: '2026-01-01'});
+        addGitSnapshot(db, 'dev-1', '2026-06-02', {commits: 5, code_churn_rate: 0.3});
+    });
+
+    afterEach(() => db.close());
+
+    it('the weekly job computes pr_review_metrics for the just-closed ISO week', () => {
+        // Week 2026-06-01 … 06-07 = ISO week 2026-W23.
+        seedPRRecord('dev-1', '1', '2026-06-02T08:00:00.000Z');
+
+        const result = runScheduledJob(db, 'weekly', WEEKLY_NOW, recordingLogger());
+
+        expect(result.ok).toBe(true);
+        const rows = db
+            .prepare("SELECT scope_variant FROM pr_review_metrics WHERE period = '2026-W23'")
+            .all() as Array<{scope_variant: string}>;
+        expect(rows.map((r) => r.scope_variant).sort()).toEqual(['ai_assisted_pr', 'all_pr']);
+    });
+
+    it('the weekly job also recomputes trailing weeks so late-arriving verdicts land', () => {
+        // 2026-05-27 falls in ISO week 2026-W22 — one week before the
+        // just-closed W23. The trailing recompute must re-fold it.
+        seedPRRecord('dev-1', '1', '2026-05-27T08:00:00.000Z');
+
+        const result = runScheduledJob(db, 'weekly', WEEKLY_NOW, recordingLogger());
+
+        expect(result.ok).toBe(true);
+        expect(
+            count(db, "SELECT COUNT(*) AS n FROM pr_review_metrics WHERE period = '2026-W22'"),
+        ).toBe(2);
+    });
+
+    it('the monthly job computes pr_review_metrics for the just-closed month', () => {
+        seedPRRecord('dev-1', '2', '2026-05-15T08:00:00.000Z');
+
+        const result = runScheduledJob(
+            db,
+            'monthly',
+            new Date('2026-06-01T04:30:00.000Z'),
+            recordingLogger(),
+        );
+
+        expect(result.ok).toBe(true);
+        expect(
+            count(db, "SELECT COUNT(*) AS n FROM pr_review_metrics WHERE period = '2026-05'"),
+        ).toBe(2);
+    });
+
+    it('quarterly and yearly jobs do not compute PR/review metrics', () => {
+        seedPRRecord('dev-1', '3', '2026-05-15T08:00:00.000Z');
+
+        runScheduledJob(db, 'quarterly', new Date('2026-07-01T05:00:00.000Z'), recordingLogger());
+        runScheduledJob(db, 'yearly', new Date('2027-01-01T05:00:00.000Z'), recordingLogger());
+
+        expect(count(db, 'SELECT COUNT(*) AS n FROM pr_review_metrics')).toBe(0);
+    });
+});
+
 describe('error isolation', () => {
     let db: Database.Database;
 

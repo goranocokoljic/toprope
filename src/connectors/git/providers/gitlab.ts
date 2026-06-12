@@ -5,6 +5,8 @@ import type {
     GitCommit,
     GitPR,
     GitReviewComment,
+    GitPRReview,
+    GitReviewState,
     GitFileDiff,
     GitAuthor,
     GitLabProviderConfig,
@@ -385,6 +387,56 @@ export class GitLabProvider implements GitProvider {
                 createdAt: n.created_at,
                 prId,
             }));
+    }
+
+    async getPRReviews(repo: string, prId: string): Promise<GitPRReview[]> {
+        const notes: RawNote[] = [];
+        let page = 1;
+
+        let hasNextPage = true;
+        while (hasNextPage) {
+            const url = `${this.baseUrl}/projects/${this.projectPath(repo)}/merge_requests/${prId}/notes?per_page=${PER_PAGE}&page=${page}&sort=asc&order_by=created_at`;
+            const res = await fetchGitLab(url, this.authHeaders);
+            const data = (await res.json()) as RawNote[];
+            notes.push(...data);
+
+            const nextPage = res.headers.get('x-next-page');
+            hasNextPage = !!nextPage && nextPage !== '';
+            if (hasNextPage) page = parseInt(nextPage!, 10);
+        }
+
+        // GitLab exposes review verdicts as system notes on the MR — there is
+        // no structured verdict field in the notes API, so this matches the
+        // system-note wording (verified against GitLab 16.x/17.x SaaS).
+        // startsWith, not equality: GitLab occasionally appends detail to
+        // system notes, and a wording extension must degrade to "still
+        // matches", not to a silent zero-verdict undercount. Everything else
+        // (comments are covered by getReviewComments, unapprovals don't add a
+        // round) is skipped.
+        const reviews: GitPRReview[] = [];
+        for (const n of notes) {
+            if (!n.system) continue;
+            let state: GitReviewState;
+            if (n.body.startsWith('approved this merge request')) {
+                state = 'approved';
+            } else if (n.body.startsWith('requested changes')) {
+                state = 'changes_requested';
+            } else {
+                continue;
+            }
+            reviews.push({
+                author: {
+                    name: n.author?.name ?? '',
+                    email: n.author?.email ?? '',
+                    username: n.author?.username ?? '',
+                },
+                state,
+                submittedAt: n.created_at,
+                prId,
+            });
+        }
+
+        return reviews;
     }
 
     async getCommitDiff(repo: string, commitSha: string): Promise<GitFileDiff[]> {
