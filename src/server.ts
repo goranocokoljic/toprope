@@ -27,6 +27,7 @@ import {registerCompareRoutes} from './dashboard/api/compare';
 import {registerCompareTableRoutes} from './dashboard/api/compare-table';
 import {registerSummaryRoutes} from './dashboard/api/summaries';
 import {registerAnomalyRoutes} from './dashboard/api/anomalies';
+import {registerCoachingRoutes} from './dashboard/api/coaching';
 import {registerDashboardStatic} from './dashboard/static';
 import {createSlackClient} from './slack/client';
 import {notifyNewAnomalies} from './anomaly/notify';
@@ -114,6 +115,9 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
     registerSummaryRoutes(app, db, config.summaries);
     // Anomaly surfacing (Task 4.8): manager panel + acknowledge/resolve.
     registerAnomalyRoutes(app, db);
+    // PR/review coaching (Task 5.3): manager-facing TEAM aggregates only. The
+    // developer-private trajectory lives on /api/me (registered above).
+    registerCoachingRoutes(app, db);
 
     // Data-prompted surveys (Task 4.3): manager queue + developer self-service.
     // Survey delivery prefers the Slack bot when configured, with an email

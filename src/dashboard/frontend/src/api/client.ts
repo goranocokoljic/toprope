@@ -16,6 +16,7 @@ import type {
     CoverageData,
     DeveloperIdentity,
     DeveloperJourney,
+    DeveloperPRReviewCoaching,
     GlobalSettings,
     Leaderboard,
     LeaderboardAvailability,
@@ -28,6 +29,7 @@ import type {
     OverviewData,
     OverviewTrend,
     PaginatedResponse,
+    PRReviewPeriodUnit,
     ReconciliationResult,
     ReconciliationRunSummary,
     ReconciliationStatus,
@@ -37,6 +39,7 @@ import type {
     TeamComparison,
     TeamDetail,
     TeamListItem,
+    TeamPRReviewCoaching,
     TeamProviders,
     TeamSettings,
     TeamTrend,
@@ -583,6 +586,34 @@ export const api = {
     /** Personal git activity totals + per-provider breakdown (My Activity, Task 2.9). */
     async getMeActivity(params: TimeRangeQuery): Promise<MeActivity> {
         const body = await request<ApiEnvelope<MeActivity>>(`/api/me/activity${timeRangeQueryString(params)}`);
+        return body.data;
+    },
+
+    // --- PR/review coaching (Task 5.3) ---
+    /**
+     * The developer's OWN PR/review coaching trajectory (session-scoped) — both
+     * scope variants, framed as a trend over time. `unit` picks weekly/monthly.
+     */
+    async getMyPRReviewCoaching(unit: PRReviewPeriodUnit): Promise<DeveloperPRReviewCoaching> {
+        const body = await request<ApiEnvelope<DeveloperPRReviewCoaching>>(
+            `/api/me/pr-coaching?unit=${encodeURIComponent(unit)}`,
+        );
+        return body.data;
+    },
+
+    /**
+     * Manager team-aggregate PR/review coaching (NO individual numbers). `scope`
+     * is a team name or the literal 'org' for the org-wide roll-up.
+     */
+    async getTeamPRReviewCoaching(
+        scope: string,
+        unit: PRReviewPeriodUnit,
+    ): Promise<TeamPRReviewCoaching> {
+        const path =
+            scope === 'org'
+                ? `/api/coaching/pr-review/org?unit=${encodeURIComponent(unit)}`
+                : `/api/coaching/pr-review/team/${encodeURIComponent(scope)}?unit=${encodeURIComponent(unit)}`;
+        const body = await request<ApiEnvelope<TeamPRReviewCoaching>>(path);
         return body.data;
     },
 

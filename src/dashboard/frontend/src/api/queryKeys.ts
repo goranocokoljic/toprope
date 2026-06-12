@@ -53,6 +53,11 @@ export const queryKeys = {
     // the time range refetches.
     meTools: (window: string) => ['me', 'tools', window] as const,
     meActivity: (window: string) => ['me', 'activity', window] as const,
+    // PR/review coaching (Task 5.3). Keyed by period unit so weekly/monthly cache
+    // independently; the team aggregate adds the scope (team name or 'org').
+    mePRCoaching: (unit: string) => ['me', 'pr-coaching', unit] as const,
+    teamPRCoaching: (scope: string, unit: string) =>
+        ['coaching', 'pr-review', scope, unit] as const,
     // Phase 3 (Task 3.12): maturity trend + AI summaries.
     // Maturity trend is keyed by scope ('org' or a team) + resolved window.
     maturityTrend: (scope: string, window: string) => ['maturity', 'trend', scope, window] as const,

@@ -71,6 +71,120 @@ export interface VariantMetrics {
     combinedSignal: CombinedSignal;
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Coaching surface (Task 5.3 / #124)
+//
+// Read-side shapes that turn the stored per-period metrics into a *trajectory*
+// (the developer-private view) and a *team aggregate* (the manager view). The
+// engine math stays in engine.ts / guidance.ts; these are the transport shapes
+// the API returns. The two views never blur: an individual's numbers reach only
+// the developer's own /api/me surface; the manager only ever sees an aggregate
+// with a k-anonymity floor (see guidance.ts MIN_TEAM_COHORT).
+// ───────────────────────────────────────────────────────────────────────────
+
+// The shapes below cross the wire to the dashboard, so they follow the API's
+// snake_case convention (matching every sibling endpoint and the stored
+// columns), even though the pure engine internals above are camelCase.
+
+/** Direction of a metric's movement across the trajectory window. */
+export type TrendDirection = 'rising' | 'falling' | 'steady' | 'insufficient_data';
+
+/**
+ * A metric's movement over the window, as the from→to pair the UI needs to phrase
+ * a trajectory ("rose from 15% to 30%") rather than a bare snapshot verdict. The
+ * endpoints (period keys) and values are null when there isn't enough data to
+ * establish a trend (fewer than two periods clearing the min-PR bar).
+ */
+export interface MetricTrend {
+    /** Which stored metric this trend describes (rework_rate in V1). */
+    metric: 'rework_rate';
+    direction: TrendDirection;
+    from_period: string | null;
+    to_period: string | null;
+    from_value: number | null;
+    to_value: number | null;
+}
+
+/** One period's stored metrics, shaped for the trajectory series the UI plots. */
+export interface PRReviewTrajectoryPoint {
+    period: string;
+    prs_total: number;
+    prs_merged: number;
+    rework_rate: number | null;
+    review_rejection_rate: number | null;
+    avg_review_rounds: number | null;
+    avg_comment_density: number | null;
+    comment_density_vs_baseline: number | null;
+    avg_time_to_merge_hours: number | null;
+    avg_churn: number | null;
+    combined_signal: CombinedSignal;
+}
+
+/**
+ * One scope variant's full trajectory plus the derived framing the UI turns into
+ * coaching copy. `basis` carries the factual/inferred label so the AI-assisted
+ * variant is always presentable as lower-confidence.
+ *
+ * Generic over the point shape so the developer and team surfaces share one
+ * envelope (and the read-layer builder shares one return type) — the derived
+ * trend/signal/count fields are identical; only the per-period points differ.
+ */
+export interface VariantTrajectoryOf<P> {
+    scope_variant: ScopeVariant;
+    basis: MetricsBasis;
+    points: P[];
+    /** Movement of the headline rework signal across the window. */
+    rework_trend: MetricTrend;
+    /** Combined signal of the latest period that cleared the min-PR bar. */
+    latest_signal: CombinedSignal;
+    /** Periods in the window that had enough PRs to coach on (>= min_prs). */
+    sufficient_periods: number;
+}
+
+/** A developer's own per-period trajectory for one variant. */
+export type VariantTrajectory = VariantTrajectoryOf<PRReviewTrajectoryPoint>;
+
+/** The developer-private PR/review coaching payload (their own data only). */
+export interface DeveloperPRReviewCoaching {
+    period_unit: PRReviewPeriodUnit;
+    all_pr: VariantTrajectory;
+    ai_assisted: VariantTrajectory;
+}
+
+/**
+ * One period's team aggregate for a variant. Either suppressed (too few
+ * contributing developers to be safe to surface — k-anonymity) or the weighted
+ * team-level numbers. Suppressed periods carry NO numbers at all, only the
+ * marker, so a thin period can never leak an individual's figures.
+ */
+export interface TeamAggregatePoint {
+    period: string;
+    /** True when fewer than MIN_TEAM_COHORT developers contributed this period. */
+    suppressed: boolean;
+    /** Developers contributing PRs this period — present only when not suppressed. */
+    developers: number | null;
+    prs_total: number | null;
+    rework_rate: number | null;
+    review_rejection_rate: number | null;
+    avg_review_rounds: number | null;
+    avg_comment_density: number | null;
+    avg_time_to_merge_hours: number | null;
+    avg_churn: number | null;
+    combined_signal: CombinedSignal;
+}
+
+/** One scope variant's team-level trajectory for the manager view. */
+export type TeamVariantTrajectory = VariantTrajectoryOf<TeamAggregatePoint>;
+
+/** The manager-facing team aggregate payload (NO individual numbers). */
+export interface TeamPRReviewCoaching {
+    /** Team name, or the literal 'org' for the org-wide roll-up. */
+    scope: string;
+    period_unit: PRReviewPeriodUnit;
+    all_pr: TeamVariantTrajectory;
+    ai_assisted: TeamVariantTrajectory;
+}
+
 /** Configurable thresholds (issue: churn_high, reject, ai_signature, min_prs). */
 export interface PRReviewThresholds {
     /** avg_churn at or above this is "high churn". */

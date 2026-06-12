@@ -19,6 +19,7 @@ const MANAGER_ITEMS: NavItem[] = [
     {to: '/manager/rank-teams', label: 'Rank teams'},
     {to: '/manager/waste', label: 'Waste'},
     {to: '/manager/anomalies', label: 'Anomalies'},
+    {to: '/manager/coaching', label: 'Coaching'},
 ];
 // Appended to the manager section ONLY when the leaderboard is available
 // (Task 2.17). The leaderboard ships off by default; when off it must leave no
@@ -30,6 +31,7 @@ const DEVELOPER_SECTION: NavSection = {
         {to: '/developer', label: 'My Dashboard'},
         {to: '/developer/tools', label: 'My Tools'},
         {to: '/developer/activity', label: 'My Activity'},
+        {to: '/developer/coaching', label: 'My PR Coaching'},
     ],
 };
 const ACCOUNT_SECTION: NavSection = {title: 'Account', items: [{to: '/preferences', label: 'Preferences'}]};

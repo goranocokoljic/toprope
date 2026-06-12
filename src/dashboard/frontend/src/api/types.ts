@@ -399,6 +399,94 @@ export interface MeJourney {
     events: MeJourneyEvent[];
 }
 
+// ── PR/review coaching (Task 5.3) ───────────────────────────────────────────
+// Developer-private trajectory (/api/me/pr-coaching) and manager team aggregate
+// (/api/coaching/pr-review/*). The two scope variants stay separate: all_pr is
+// factual, ai_assisted_pr is inferred (lower confidence).
+
+export type PRReviewPeriodUnit = 'weekly' | 'monthly';
+export type PRReviewScopeVariant = 'all_pr' | 'ai_assisted_pr';
+export type PRReviewBasis = 'factual' | 'inferred';
+export type PRReviewCombinedSignal =
+    | 'struggling'
+    | 'healthy_iteration'
+    | 'effective'
+    | 'insufficient_data';
+export type PRReviewTrendDirection = 'rising' | 'falling' | 'steady' | 'insufficient_data';
+
+/** Movement of a metric across the window — the from→to pair for trajectory copy. */
+export interface PRReviewMetricTrend {
+    metric: 'rework_rate';
+    direction: PRReviewTrendDirection;
+    from_period: string | null;
+    to_period: string | null;
+    from_value: number | null;
+    to_value: number | null;
+}
+
+/** One period of a developer's own trajectory. */
+export interface PRReviewTrajectoryPoint {
+    period: string;
+    prs_total: number;
+    prs_merged: number;
+    rework_rate: number | null;
+    review_rejection_rate: number | null;
+    avg_review_rounds: number | null;
+    avg_comment_density: number | null;
+    comment_density_vs_baseline: number | null;
+    avg_time_to_merge_hours: number | null;
+    avg_churn: number | null;
+    combined_signal: PRReviewCombinedSignal;
+}
+
+export interface PRReviewVariantTrajectory {
+    scope_variant: PRReviewScopeVariant;
+    basis: PRReviewBasis;
+    points: PRReviewTrajectoryPoint[];
+    rework_trend: PRReviewMetricTrend;
+    latest_signal: PRReviewCombinedSignal;
+    sufficient_periods: number;
+}
+
+/** Developer's private PR/review coaching. From /api/me/pr-coaching. */
+export interface DeveloperPRReviewCoaching {
+    period_unit: PRReviewPeriodUnit;
+    all_pr: PRReviewVariantTrajectory;
+    ai_assisted: PRReviewVariantTrajectory;
+}
+
+/** One period of a team aggregate — suppressed (no numbers) or pooled team figures. */
+export interface TeamCoachingAggregatePoint {
+    period: string;
+    suppressed: boolean;
+    developers: number | null;
+    prs_total: number | null;
+    rework_rate: number | null;
+    review_rejection_rate: number | null;
+    avg_review_rounds: number | null;
+    avg_comment_density: number | null;
+    avg_time_to_merge_hours: number | null;
+    avg_churn: number | null;
+    combined_signal: PRReviewCombinedSignal;
+}
+
+export interface TeamCoachingVariantTrajectory {
+    scope_variant: PRReviewScopeVariant;
+    basis: PRReviewBasis;
+    points: TeamCoachingAggregatePoint[];
+    rework_trend: PRReviewMetricTrend;
+    latest_signal: PRReviewCombinedSignal;
+    sufficient_periods: number;
+}
+
+/** Manager team aggregate (NO individual numbers). From /api/coaching/pr-review/*. */
+export interface TeamPRReviewCoaching {
+    scope: string;
+    period_unit: PRReviewPeriodUnit;
+    all_pr: TeamCoachingVariantTrajectory;
+    ai_assisted: TeamCoachingVariantTrajectory;
+}
+
 /** First→last detected AI activity — the span of the journey timeline. */
 export interface JourneyBounds {
     first_activity: string | null;
