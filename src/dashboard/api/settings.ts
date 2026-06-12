@@ -444,7 +444,10 @@ export function registerSettingsRoutes(app: FastifyInstance, db: Database.Databa
         if (!developerId) {
             return reply;
         }
-        const userId = request.authUser?.userId as string;
+        // requireDeveloperId already proved request.authUser is set (it 401s
+        // otherwise), so this is an honest non-null assertion, not a cast that
+        // papers over a possible undefined.
+        const userId = request.authUser!.userId;
         const team = developerTeam(developerId);
         return {data: resolveDeveloperPreferences(db, userId, team)};
     });
@@ -454,7 +457,10 @@ export function registerSettingsRoutes(app: FastifyInstance, db: Database.Databa
         if (!developerId) {
             return reply;
         }
-        const userId = request.authUser?.userId as string;
+        // requireDeveloperId already proved request.authUser is set (it 401s
+        // otherwise), so this is an honest non-null assertion, not a cast that
+        // papers over a possible undefined.
+        const userId = request.authUser!.userId;
         const body = asPatchBody(request.body);
         if (!body) {
             return badRequest(reply, 'Request body must be an object of preferences to update');

@@ -581,6 +581,81 @@ describe('settings API', () => {
             expect(reread.json().data.cloud_analysis_opt_in.blocked).toBe(false);
         });
 
+        it('honors a developer opt-in via the PER-TEAM org boundary, not just the global one', async () => {
+            // dev-1 (alice) is seeded on team `frontend` (fixtures). This exercises the
+            // full HTTP join developer → team → resolution: the developer's opt-in is
+            // forbidden globally but PERMITTED for their team via a per-team override, so
+            // resolution must honor the team boundary — proving the route resolves against
+            // the developer's actual team, not the global default.
+            const dev = await app.inject({
+                method: 'PATCH',
+                url: '/api/me/coaching-preferences',
+                headers: authHeaders(devToken),
+                payload: {cloud_analysis_opt_in: true},
+            });
+            expect(dev.statusCode).toBe(200);
+            // Global forbids cloud analysis → blocked while only the global default applies.
+            expect(dev.json().data.cloud_analysis_opt_in.value).toBe(false);
+            expect(dev.json().data.cloud_analysis_opt_in.blocked).toBe(true);
+
+            // Admin enables per-team overrides, then permits cloud analysis for `frontend`
+            // ONLY — the global default stays false.
+            await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/global',
+                headers: authHeaders(adminToken),
+                payload: {coaching_managers_can_override: true},
+            });
+            const teamPatch = await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/team/frontend',
+                headers: authHeaders(adminToken),
+                payload: {coaching_cloud_analysis_permitted: true},
+            });
+            expect(teamPatch.statusCode).toBe(200);
+
+            // The developer (on frontend) now resolves to honored — proving resolution
+            // used the TEAM boundary, since the global permission is still false.
+            const reread = await app.inject({
+                method: 'GET',
+                url: '/api/me/coaching-preferences',
+                headers: authHeaders(devToken),
+            });
+            expect(reread.json().data.cloud_analysis_opt_in.value).toBe(true);
+            expect(reread.json().data.cloud_analysis_opt_in.blocked).toBe(false);
+
+            // Confirm the global default genuinely remained false (not silently flipped),
+            // so the honored value above can only have come from the team override.
+            const global = await app.inject({
+                method: 'GET',
+                url: '/api/settings/global',
+                headers: authHeaders(adminToken),
+            });
+            expect(global.json().data.coaching_cloud_analysis_permitted).toBe(false);
+        });
+
+        it('a blocked capture enum resolves to its neutral value, never the developer\'s stored choice', async () => {
+            // With capture forbidden org-wide (default), a stored mechanism/recovery choice
+            // must not leak through as the effective value — it collapses to the neutral
+            // default so no consumer acts on a real capture mechanism while capture is off.
+            const patch = await app.inject({
+                method: 'PATCH',
+                url: '/api/me/coaching-preferences',
+                headers: authHeaders(devToken),
+                payload: {capture_mechanism: 'editor_extension', capture_recovery_choice: 'recovery_path'},
+            });
+            expect(patch.statusCode).toBe(200);
+            const mech = patch.json().data.capture_mechanism;
+            const rec = patch.json().data.capture_recovery_choice;
+            // Stored carries the developer's choice; the effective value is the safe default.
+            expect(mech.stored).toBe('editor_extension');
+            expect(mech.blocked).toBe(true);
+            expect(mech.value).toBe('local_agent');
+            expect(rec.stored).toBe('recovery_path');
+            expect(rec.blocked).toBe(true);
+            expect(rec.value).toBe('no_recovery');
+        });
+
         it('rejects an unknown coaching preference key', async () => {
             const res = await app.inject({
                 method: 'PATCH',

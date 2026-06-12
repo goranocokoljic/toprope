@@ -317,6 +317,12 @@ export const DEVELOPER_PREFERENCES: Record<string, DeveloperPreferenceDef> = {
         default: 'local_agent',
         allowed: CAPTURE_MECHANISM_OPTIONS,
         gatedBy: 'coaching_capture_permitted',
+        // When capture is forbidden the effective value collapses to the neutral
+        // default rather than leaking the developer's stored mechanism — so a
+        // consumer that reads the resolved value never acts on a real capture
+        // mechanism while the org forbids capture. (`capture_opt_in` is the true
+        // gate; this keeps the enum honest regardless of read order.)
+        blockedValue: 'local_agent',
         blockedReason: 'Prompt capture is not permitted by your organization.',
     },
     capture_recovery_choice: {
@@ -325,6 +331,9 @@ export const DEVELOPER_PREFERENCES: Record<string, DeveloperPreferenceDef> = {
         default: 'no_recovery',
         allowed: CAPTURE_RECOVERY_OPTIONS,
         gatedBy: 'coaching_capture_permitted',
+        // Same as capture_mechanism: a blocked recovery choice resolves to the
+        // safe 'no_recovery', never the developer's stored 'recovery_path'.
+        blockedValue: 'no_recovery',
         blockedReason: 'Prompt capture is not permitted by your organization.',
     },
     // Opt-in #2: may a retrospective use cloud models. Forced to false when the

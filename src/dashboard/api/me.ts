@@ -150,6 +150,11 @@ export function registerMeRoutes(app: FastifyInstance, db: Database.Database): v
             return reply;
         }
         // Pillar 1 (available-data coaching) gating, mirroring pr-coaching above.
+        // The response is the same {enabled} discriminated union: {enabled:false}
+        // with no trajectory when the pillar is off, else {enabled:true, ...}. Any
+        // future consumer MUST narrow on `enabled` before touching trajectory
+        // fields — exactly as MyPRReviewCoaching does for pr-coaching. (No client
+        // wiring exists for this surface yet, so the contract lives here.)
         const team = getDeveloperById(db, developerId)?.team ?? null;
         if (!isCoachingPillar1Enabled(db, team)) {
             return {data: {enabled: false as const}};
