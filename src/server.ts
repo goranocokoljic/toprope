@@ -31,6 +31,7 @@ import {registerCoachingRoutes} from './dashboard/api/coaching';
 import {registerCaptureRoutes} from './dashboard/api/captures';
 import {registerKeyRoutes} from './dashboard/api/keys';
 import {registerRealtimeCoachingRoutes} from './dashboard/api/realtime-coaching';
+import {registerRetrospectiveRoutes} from './dashboard/api/retrospectives';
 import {registerDashboardStatic} from './dashboard/static';
 import {createSlackClient} from './slack/client';
 import {notifyNewAnomalies} from './anomaly/notify';
@@ -132,6 +133,12 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
     // capture layer; these /api/me routes only record/read the developer's own
     // non-sensitive event METADATA (counts, types, timestamps) and dismissals.
     registerRealtimeCoachingRoutes(app, db);
+    // Session retrospectives (Task 5.7): the deep async coaching layer. Generation
+    // TRANSIENTLY decrypts a captured session in memory with a key the developer
+    // supplies for that one call, runs a LOCAL-default analyser (cloud only via
+    // opt-in #2), and persists ONLY the narrative output — never the key/plaintext.
+    // All /api/me, developer-private; no manager path.
+    registerRetrospectiveRoutes(app, db);
 
     // Data-prompted surveys (Task 4.3): manager queue + developer self-service.
     // Survey delivery prefers the Slack bot when configured, with an email
