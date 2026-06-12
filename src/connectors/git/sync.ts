@@ -463,7 +463,7 @@ function toUtcIso(timestamp: string | null): string | null {
 
 interface PRRecordExistingRow {
     review_comment_count: number;
-    review_rounds: number;
+    review_event_count: number;
     changes_requested_count: number;
 }
 
@@ -482,7 +482,7 @@ function upsertPRRecord(
     if (!record.commentsOk || !record.reviewsOk) {
         const existing = db
             .prepare(
-                `SELECT review_comment_count, review_rounds, changes_requested_count
+                `SELECT review_comment_count, review_event_count, changes_requested_count
                  FROM pr_records WHERE provider = ? AND repo = ? AND pr_id = ?`,
             )
             .get(record.provider, record.repo, record.prId) as PRRecordExistingRow | undefined;
@@ -490,8 +490,8 @@ function upsertPRRecord(
             if (!record.commentsOk) commentCount = existing.review_comment_count;
             if (!record.reviewsOk) {
                 crCount = existing.changes_requested_count;
-                // The prior rounds imply whether verdict events existed.
-                eventCount = existing.review_rounds > 0 ? 1 : 0;
+                // Restore the OBSERVED event count, not an inference from rounds.
+                eventCount = existing.review_event_count;
             }
         }
     }
@@ -499,17 +499,23 @@ function upsertPRRecord(
     db.prepare(
         `INSERT INTO pr_records
          (id, developer_id, provider, repo, pr_id, state, created_at, merged_at, closed_at,
-          review_comment_count, review_rounds, changes_requested_count, time_to_merge_hours, synced_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          review_comment_count, review_rounds, changes_requested_count, review_event_count,
+          time_to_merge_hours, synced_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(provider, repo, pr_id) DO UPDATE SET
            developer_id = excluded.developer_id,
            state = excluded.state,
            created_at = excluded.created_at,
-           merged_at = excluded.merged_at,
+           -- Freeze the merge timestamp once observed: a PR merges exactly once,
+           -- and Bitbucket approximates it with updated_on, which post-merge
+           -- activity inflates on every re-sync. COALESCE keeps the first
+           -- non-null value so merged_at and time_to_merge_hours stay consistent.
+           merged_at = COALESCE(pr_records.merged_at, excluded.merged_at),
            closed_at = excluded.closed_at,
            review_comment_count = excluded.review_comment_count,
            review_rounds = excluded.review_rounds,
            changes_requested_count = excluded.changes_requested_count,
+           review_event_count = excluded.review_event_count,
            -- Keep the FIRST observed time-to-merge: it never legitimately
            -- changes after merge, and Bitbucket's merge timestamp is
            -- approximated by updated_on, which post-merge activity inflates.
@@ -528,6 +534,7 @@ function upsertPRRecord(
         commentCount,
         computeReviewRounds(eventCount, commentCount, crCount),
         crCount,
+        eventCount,
         timeToMergeHours(record),
         syncedAt,
     );

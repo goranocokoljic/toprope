@@ -619,6 +619,8 @@ describe('GitSync', () => {
             review_comment_count: number;
             review_rounds: number;
             changes_requested_count: number;
+            review_event_count: number;
+            merged_at: string | null;
             time_to_merge_hours: number | null;
         }
 
@@ -763,6 +765,68 @@ describe('GitSync', () => {
             expect(records[0].review_comment_count).toBe(2);
             expect(records[0].changes_requested_count).toBe(1);
             expect(records[0].review_rounds).toBe(2);
+        });
+
+        it('persists the observed review_event_count and carries it forward on a failed re-sync', async () => {
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            // Two verdict events, neither a send-back (e.g. two approvals): the
+            // observed event count is 2, but changes_requested_count is 0 and
+            // review_rounds is 1. Reverse-engineering the event count from
+            // review_rounds would wrongly recover 1, not 2 — so persist it.
+            const goodProvider = makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+                getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+                getPRReviews: vi.fn().mockResolvedValue([
+                    {author: {name: '', email: '', username: 'bob'}, state: 'approved', submittedAt: '2024-01-15T12:00:00Z', prId: '1'},
+                    {author: {name: '', email: '', username: 'carol'}, state: 'approved', submittedAt: '2024-01-16T09:00:00Z', prId: '1'},
+                ]),
+            });
+            createGitProvider.mockReturnValue(goodProvider);
+            await new GitSync(makeGithubConfig()).sync(db);
+            expect(getPRRecords()[0].review_event_count).toBe(2);
+            expect(getPRRecords()[0].changes_requested_count).toBe(0);
+
+            // Re-sync with the verdict fetch failing: the observed count must be
+            // preserved, not reset to zero or inferred from review_rounds.
+            const badProvider = makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+                getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+                getPRReviews: vi.fn().mockRejectedValue(new Error('rate limited')),
+            });
+            createGitProvider.mockReturnValue(badProvider);
+            await new GitSync(makeGithubConfig()).sync(db);
+            expect(getPRRecords()[0].review_event_count).toBe(2);
+        });
+
+        it('freezes merged_at against a provider re-reporting a later merge timestamp', async () => {
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            // First observation: merged at the real merge time.
+            const firstProvider = makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+                getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+            });
+            createGitProvider.mockReturnValue(firstProvider);
+            await new GitSync(makeGithubConfig()).sync(db);
+            const firstMerged = getPRRecords()[0].merged_at;
+            const firstTtm = getPRRecords()[0].time_to_merge_hours;
+            expect(firstMerged).not.toBeNull();
+
+            // Re-sync where the provider reports a later merge timestamp (e.g.
+            // Bitbucket's updated_on bumped by post-merge activity). The stored
+            // merged_at must stay frozen so it never disagrees with the frozen
+            // time_to_merge_hours.
+            const driftedPR = {...makeProviderPR('alice'), mergedAt: '2024-02-01T10:00:00Z'};
+            const driftProvider = makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+                getPullRequests: vi.fn().mockResolvedValue([driftedPR]),
+            });
+            createGitProvider.mockReturnValue(driftProvider);
+            await new GitSync(makeGithubConfig()).sync(db);
+
+            expect(getPRRecords()[0].merged_at).toBe(firstMerged);
+            expect(getPRRecords()[0].time_to_merge_hours).toBe(firstTtm);
         });
 
         it('skips PRs from authors with no developer record', async () => {

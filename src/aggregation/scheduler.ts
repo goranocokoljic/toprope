@@ -299,10 +299,23 @@ export function runScheduledJob(
         // the stored metrics track the PRs' final outcomes instead of freezing
         // a photograph taken hours after period close. The engine's UPSERT +
         // stale-row retraction make every recompute safe.
+        //
+        // Cost note: each recompute re-derives every developer's trailing
+        // comment-density baseline (default 8 prior periods), and each baseline
+        // period runs a per-PR AI-signature subquery — so the work here is
+        // roughly O(recomputed_periods × developers × baselinePeriods × PRs).
+        // Deterministic and trivial at launch scale, but it stacks on the same
+        // weekly critical path as the anomaly scan; if an org's weekly job gets
+        // slow, precomputing a per-period density table is the remediation,
+        // mirroring the note on runAnomalyScanForPeriod.
         if (period === 'weekly' || period === 'monthly') {
             try {
                 const metricsPeriods: string[] = [];
                 if (period === 'weekly') {
+                    // Weekly periodKey is a week_start *date*, not a YYYY-Www
+                    // label, so we step back by whole weeks and re-label rather
+                    // than folding priorIsoWeek (which operates on labels). This
+                    // mirrors priorIsoWeek's intent on a date-keyed input.
                     for (let weeksBack = 0; weeksBack < 4; weeksBack++) {
                         metricsPeriods.push(
                             isoWeekLabel(addDays(periodKey, -7 * weeksBack)),
