@@ -124,11 +124,15 @@ export interface PRReviewTrajectoryPoint {
  * One scope variant's full trajectory plus the derived framing the UI turns into
  * coaching copy. `basis` carries the factual/inferred label so the AI-assisted
  * variant is always presentable as lower-confidence.
+ *
+ * Generic over the point shape so the developer and team surfaces share one
+ * envelope (and the read-layer builder shares one return type) — the derived
+ * trend/signal/count fields are identical; only the per-period points differ.
  */
-export interface VariantTrajectory {
+export interface VariantTrajectoryOf<P> {
     scope_variant: ScopeVariant;
     basis: MetricsBasis;
-    points: PRReviewTrajectoryPoint[];
+    points: P[];
     /** Movement of the headline rework signal across the window. */
     rework_trend: MetricTrend;
     /** Combined signal of the latest period that cleared the min-PR bar. */
@@ -136,6 +140,9 @@ export interface VariantTrajectory {
     /** Periods in the window that had enough PRs to coach on (>= min_prs). */
     sufficient_periods: number;
 }
+
+/** A developer's own per-period trajectory for one variant. */
+export type VariantTrajectory = VariantTrajectoryOf<PRReviewTrajectoryPoint>;
 
 /** The developer-private PR/review coaching payload (their own data only). */
 export interface DeveloperPRReviewCoaching {
@@ -167,15 +174,7 @@ export interface TeamAggregatePoint {
 }
 
 /** One scope variant's team-level trajectory for the manager view. */
-export interface TeamVariantTrajectory {
-    scope_variant: ScopeVariant;
-    basis: MetricsBasis;
-    points: TeamAggregatePoint[];
-    rework_trend: MetricTrend;
-    latest_signal: CombinedSignal;
-    /** Non-suppressed periods that also cleared the min-PR bar. */
-    sufficient_periods: number;
-}
+export type TeamVariantTrajectory = VariantTrajectoryOf<TeamAggregatePoint>;
 
 /** The manager-facing team aggregate payload (NO individual numbers). */
 export interface TeamPRReviewCoaching {

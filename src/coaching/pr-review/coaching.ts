@@ -33,14 +33,13 @@ import {BASIS_FOR_VARIANT} from './types';
 import type {
     CombinedSignal,
     DeveloperPRReviewCoaching,
-    MetricsBasis,
-    MetricTrend,
     PRReviewPeriodUnit,
     PRReviewThresholds,
     PRReviewTrajectoryPoint,
     ScopeVariant,
     TeamAggregatePoint,
     TeamPRReviewCoaching,
+    VariantTrajectoryOf,
 } from './types';
 
 /** Default trajectory window per unit — enough history to read a trend, not so */
@@ -69,7 +68,6 @@ export function periodKeysEndingAt(
 }
 
 interface MetricRow {
-    developer_id: string;
     period: string;
     scope_variant: ScopeVariant;
     prs_total: number;
@@ -132,14 +130,7 @@ function buildTrajectory<P extends TrajectoryLike>(
     variant: ScopeVariant,
     points: P[],
     thresholds: PRReviewThresholds,
-): {
-    scope_variant: ScopeVariant;
-    basis: MetricsBasis;
-    points: P[];
-    rework_trend: MetricTrend;
-    latest_signal: CombinedSignal;
-    sufficient_periods: number;
-} {
+): VariantTrajectoryOf<P> {
     return {
         scope_variant: variant,
         basis: BASIS_FOR_VARIANT[variant],
@@ -167,7 +158,7 @@ export function getDeveloperPRReviewCoaching(
 
     const rows = db
         .prepare(
-            `SELECT developer_id, period, scope_variant, prs_total, prs_merged, rework_rate,
+            `SELECT period, scope_variant, prs_total, prs_merged, rework_rate,
                     avg_review_rounds, review_rejection_rate, avg_comment_density,
                     comment_density_vs_baseline, avg_time_to_merge_hours, avg_churn, combined_signal
              FROM pr_review_metrics
@@ -175,6 +166,9 @@ export function getDeveloperPRReviewCoaching(
         )
         .all(developerId, ...keys) as MetricRow[];
 
+    // Keyed by the two known variant literals; any unexpected scope_variant value
+    // stored by a future writer is simply never looked up (fail-closed) — the
+    // column is plain TEXT, so the read deliberately doesn't trust it blindly.
     const byVariantPeriod = new Map<string, MetricRow>();
     for (const row of rows) byVariantPeriod.set(`${row.scope_variant}|${row.period}`, row);
 
@@ -232,6 +226,11 @@ function rowToDevMetric(row: TeamMetricRow): DevPeriodMetric {
  * the app): a developer who changed teams carries their metric history to the
  * new team's aggregate. Acceptable here because the floor still prevents any
  * individual read; noted so a future reader doesn't mistake it for a bug.
+ *
+ * Org pooling deliberately overrides team-level suppression: a developer whose
+ * period is suppressed in their thin team is still pooled into the org roll-up,
+ * which is fine because the org cohort must itself clear the floor (>= 3
+ * contributors) before any number is shown, so no individual is isolable.
  */
 function aggregateForDeveloperIds(
     db: Database.Database,
@@ -281,7 +280,15 @@ function aggregateForDeveloperIds(
     };
 }
 
-/** Org-wide manager aggregate — every developer pooled. */
+/**
+ * Org-wide manager aggregate — every developer pooled.
+ *
+ * Loads every developer id into a single `IN (...)` clause (same pattern as
+ * leaderboard.ts / compare.ts). SQLite caps bound parameters
+ * (SQLITE_MAX_VARIABLE_NUMBER, ~32k on current builds), so an org of tens of
+ * thousands of developers would need this chunked or pooled in SQL; trivial at
+ * launch scale, flagged so it isn't a surprise in prod.
+ */
 export function getOrgPRReviewCoaching(
     db: Database.Database,
     unit: PRReviewPeriodUnit,

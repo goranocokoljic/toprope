@@ -11,6 +11,7 @@ import {
     getTeamPRReviewCoaching,
     periodKeysEndingAt,
 } from '../../../src/coaching/pr-review/coaching';
+import {parsePeriodUnit} from '../../../src/dashboard/api/coaching-params';
 import type {CombinedSignal, ScopeVariant} from '../../../src/coaching/pr-review/types';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../../src/storage/migrations');
@@ -215,5 +216,22 @@ describe('getTeamPRReviewCoaching — aggregate only, k-anonymity (Task 5.3)', (
         expect(result.all_pr.points.every((p) => p.suppressed)).toBe(true);
         expect(result.all_pr.sufficient_periods).toBe(0);
         expect(result.ai_assisted.points.every((p) => p.suppressed)).toBe(true);
+    });
+
+    it('handles an org with zero developers (fresh install) without erroring', () => {
+        const result = getOrgPRReviewCoaching(db, 'monthly', NOW);
+        expect(result.scope).toBe('org');
+        expect(result.all_pr.points.every((p) => p.suppressed)).toBe(true);
+        expect(result.all_pr.sufficient_periods).toBe(0);
+    });
+});
+
+describe('parsePeriodUnit (Task 5.3)', () => {
+    it('accepts the two valid units and fail-softs everything else to monthly', () => {
+        expect(parsePeriodUnit('weekly')).toBe('weekly');
+        expect(parsePeriodUnit('monthly')).toBe('monthly');
+        expect(parsePeriodUnit(undefined)).toBe('monthly'); // absent → default
+        expect(parsePeriodUnit('garbage')).toBe('monthly'); // unrecognized → default
+        expect(parsePeriodUnit('WEEKLY')).toBe('monthly'); // case-sensitive by design
     });
 });
