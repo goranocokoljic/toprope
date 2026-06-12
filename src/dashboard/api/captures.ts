@@ -150,13 +150,19 @@ function validateBody(body: unknown, reply: FastifyReply): ValidatedCapture | nu
         badRequest(reply, 'encryption_meta must be an object');
         return null;
     }
-    // The meta carries a key REFERENCE (key_id), never key material. Refuse a raw
-    // key outright so a misbehaving client can't smuggle the key into the store.
-    if ('key' in meta || 'secret' in meta) {
-        badRequest(reply, 'encryption_meta must not contain a key; it stores a key_id reference only');
-        return null;
+    // Allowlist the meta shape: exactly the four public crypto fields, each a
+    // non-empty string. Allowlisting (not blacklisting `key`/`secret`) means an
+    // unknown field is refused outright, so a raw key can't be smuggled in under a
+    // differently-named or NESTED key — and since every allowed field must be a
+    // string, the stored meta is always a known, flat, bounded shape.
+    const allowedMetaKeys = ['algo', 'iv', 'auth_tag', 'key_id'];
+    for (const k of Object.keys(meta)) {
+        if (!allowedMetaKeys.includes(k)) {
+            badRequest(reply, `encryption_meta has an unexpected field '${k}'; only algo, iv, auth_tag, key_id are allowed`);
+            return null;
+        }
     }
-    for (const field of ['algo', 'iv', 'auth_tag', 'key_id']) {
+    for (const field of allowedMetaKeys) {
         if (typeof meta[field] !== 'string' || (meta[field] as string).length === 0) {
             badRequest(reply, `encryption_meta.${field} is required`);
             return null;

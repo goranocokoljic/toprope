@@ -146,11 +146,15 @@ describe('Capture API (Task 5.4)', () => {
         expect(db.prepare('SELECT COUNT(*) c FROM prompt_captures').get()).toMatchObject({c: 0});
     });
 
-    it('rejects encryption_meta that smuggles a raw key', async () => {
+    it('rejects encryption_meta that smuggles a raw key — top-level or nested (allowlist)', async () => {
         const payload = makePayload('local_agent');
-        const withKey = {...payload, encryption_meta: {...payload.encryption_meta, key: 'deadbeef'}};
-        const res = await app.inject({method: 'POST', url: '/api/me/captures', headers: auth(aliceToken), payload: withKey});
-        expect(res.statusCode).toBe(400);
+        const topLevel = {...payload, encryption_meta: {...payload.encryption_meta, key: 'deadbeef'}};
+        const nested = {...payload, encryption_meta: {...payload.encryption_meta, extra: {key: 'deadbeef'}}};
+        for (const withKey of [topLevel, nested]) {
+            const res = await app.inject({method: 'POST', url: '/api/me/captures', headers: auth(aliceToken), payload: withKey});
+            expect(res.statusCode).toBe(400);
+        }
+        expect(db.prepare('SELECT COUNT(*) c FROM prompt_captures').get()).toMatchObject({c: 0});
     });
 
     it('rejects a ciphertext over the per-capture size cap', async () => {
