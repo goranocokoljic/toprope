@@ -27,19 +27,20 @@ import {
     countSufficientPeriods,
     latestSufficientSignal,
     type DevPeriodMetric,
+    type TrajectoryLike,
 } from './guidance';
 import {BASIS_FOR_VARIANT} from './types';
 import type {
     CombinedSignal,
     DeveloperPRReviewCoaching,
+    MetricsBasis,
+    MetricTrend,
     PRReviewPeriodUnit,
     PRReviewThresholds,
     PRReviewTrajectoryPoint,
     ScopeVariant,
     TeamAggregatePoint,
     TeamPRReviewCoaching,
-    TeamVariantTrajectory,
-    VariantTrajectory,
 } from './types';
 
 /** Default trajectory window per unit — enough history to read a trend, not so */
@@ -120,11 +121,25 @@ function rowToPoint(row: MetricRow): PRReviewTrajectoryPoint {
     };
 }
 
-function buildVariantTrajectory(
+/**
+ * Build one scope variant's trajectory (the derived trend + latest signal + the
+ * sufficient-period count) over its point series. Generic over the point shape
+ * so the developer (PRReviewTrajectoryPoint) and team (TeamAggregatePoint)
+ * surfaces share one builder — both point types satisfy TrajectoryLike, which is
+ * all the derivation helpers read.
+ */
+function buildTrajectory<P extends TrajectoryLike>(
     variant: ScopeVariant,
-    points: PRReviewTrajectoryPoint[],
+    points: P[],
     thresholds: PRReviewThresholds,
-): VariantTrajectory {
+): {
+    scope_variant: ScopeVariant;
+    basis: MetricsBasis;
+    points: P[];
+    rework_trend: MetricTrend;
+    latest_signal: CombinedSignal;
+    sufficient_periods: number;
+} {
     return {
         scope_variant: variant,
         basis: BASIS_FOR_VARIANT[variant],
@@ -146,11 +161,9 @@ export function getDeveloperPRReviewCoaching(
     developerId: string,
     unit: PRReviewPeriodUnit,
     now: Date = new Date(),
-    windowPeriods?: number,
 ): DeveloperPRReviewCoaching {
     const thresholds = resolvePRReviewThresholds(db);
-    const count = windowPeriods ?? DEFAULT_WINDOW[unit];
-    const keys = periodKeysEndingAt(unit, now.toISOString().slice(0, 10), count);
+    const keys = periodKeysEndingAt(unit, now.toISOString().slice(0, 10), DEFAULT_WINDOW[unit]);
 
     const rows = db
         .prepare(
@@ -173,27 +186,27 @@ export function getDeveloperPRReviewCoaching(
 
     return {
         period_unit: unit,
-        all_pr: buildVariantTrajectory('all_pr', variantPoints('all_pr'), thresholds),
-        ai_assisted: buildVariantTrajectory('ai_assisted_pr', variantPoints('ai_assisted_pr'), thresholds),
+        all_pr: buildTrajectory('all_pr', variantPoints('all_pr'), thresholds),
+        ai_assisted: buildTrajectory('ai_assisted_pr', variantPoints('ai_assisted_pr'), thresholds),
     };
 }
 
-function buildTeamVariantTrajectory(
-    variant: ScopeVariant,
-    points: TeamAggregatePoint[],
-    thresholds: PRReviewThresholds,
-): TeamVariantTrajectory {
-    return {
-        scope_variant: variant,
-        basis: BASIS_FOR_VARIANT[variant],
-        points,
-        rework_trend: computeReworkTrend(points, thresholds.minPrs),
-        latest_signal: latestSufficientSignal(points, thresholds.minPrs),
-        sufficient_periods: countSufficientPeriods(points, thresholds.minPrs),
-    };
+/** Only the columns the team aggregate consumes — the per-developer signal and */
+/** comment-density-vs-baseline are deliberately NOT read on the manager path. */
+interface TeamMetricRow {
+    period: string;
+    scope_variant: ScopeVariant;
+    prs_total: number;
+    prs_merged: number;
+    rework_rate: number | null;
+    avg_review_rounds: number | null;
+    review_rejection_rate: number | null;
+    avg_comment_density: number | null;
+    avg_time_to_merge_hours: number | null;
+    avg_churn: number | null;
 }
 
-function rowToDevMetric(row: MetricRow): DevPeriodMetric {
+function rowToDevMetric(row: TeamMetricRow): DevPeriodMetric {
     return {
         prsTotal: row.prs_total,
         prsMerged: row.prs_merged,
@@ -207,39 +220,28 @@ function rowToDevMetric(row: MetricRow): DevPeriodMetric {
 }
 
 /**
- * The developer ids in scope: every developer for the org roll-up, or the named
- * team's members. Returned ids are the only rows the aggregate will ever read,
- * so team scoping is enforced here, once.
- */
-function scopeDeveloperIds(db: Database.Database, scope: string): string[] {
-    const rows =
-        scope === 'org'
-            ? (db.prepare('SELECT id FROM developers').all() as Array<{id: string}>)
-            : (db.prepare('SELECT id FROM developers WHERE team = ?').all(scope) as Array<{id: string}>);
-    return rows.map((r) => r.id);
-}
-
-/**
- * A team (or org) PR/review coaching aggregate for the manager view. Every
- * period is pooled across the scope's developers and suppressed when too few
- * contributed (k-anonymity) — no individual's numbers are ever returned, and no
- * developer id appears in the output. Both scope variants are aggregated
- * separately and stay labeled factual/inferred.
+ * Aggregate a manager-facing coaching view over an already-resolved set of
+ * developer ids. The caller owns scoping (org = all developers, team = the
+ * team's members), so there is no scope sentinel to collide with a real team
+ * name. Every period is pooled across these developers and suppressed when too
+ * few contributed (k-anonymity) — no individual's numbers are ever returned, and
+ * no developer id appears in the output. Both variants stay labeled
+ * factual/inferred.
  *
- * `scope` is a team name or the literal 'org'. The route layer validates that a
- * named team exists before calling.
+ * Membership is the developers' CURRENT team (same as every team-scoped query in
+ * the app): a developer who changed teams carries their metric history to the
+ * new team's aggregate. Acceptable here because the floor still prevents any
+ * individual read; noted so a future reader doesn't mistake it for a bug.
  */
-export function getTeamPRReviewCoaching(
+function aggregateForDeveloperIds(
     db: Database.Database,
-    scope: string,
+    scopeLabel: string,
+    devIds: string[],
     unit: PRReviewPeriodUnit,
-    now: Date = new Date(),
-    windowPeriods?: number,
+    now: Date,
 ): TeamPRReviewCoaching {
     const thresholds = resolvePRReviewThresholds(db);
-    const count = windowPeriods ?? DEFAULT_WINDOW[unit];
-    const keys = periodKeysEndingAt(unit, now.toISOString().slice(0, 10), count);
-    const devIds = scopeDeveloperIds(db, scope);
+    const keys = periodKeysEndingAt(unit, now.toISOString().slice(0, 10), DEFAULT_WINDOW[unit]);
 
     // No developers in scope → every period suppressed, but the variant pair and
     // window stay complete so the UI renders an honest "not enough data" state.
@@ -248,14 +250,14 @@ export function getTeamPRReviewCoaching(
             ? []
             : (db
                   .prepare(
-                      `SELECT developer_id, period, scope_variant, prs_total, prs_merged, rework_rate,
+                      `SELECT period, scope_variant, prs_total, prs_merged, rework_rate,
                               avg_review_rounds, review_rejection_rate, avg_comment_density,
-                              comment_density_vs_baseline, avg_time_to_merge_hours, avg_churn, combined_signal
+                              avg_time_to_merge_hours, avg_churn
                        FROM pr_review_metrics
                        WHERE developer_id IN (${placeholders(devIds.length)})
                          AND period IN (${placeholders(keys.length)})`,
                   )
-                  .all(...devIds, ...keys) as MetricRow[]);
+                  .all(...devIds, ...keys) as TeamMetricRow[]);
 
     // (variant, period) -> the contributing developers' metrics for that cell.
     const grouped = new Map<string, DevPeriodMetric[]>();
@@ -272,9 +274,35 @@ export function getTeamPRReviewCoaching(
         );
 
     return {
-        scope,
+        scope: scopeLabel,
         period_unit: unit,
-        all_pr: buildTeamVariantTrajectory('all_pr', variantPoints('all_pr'), thresholds),
-        ai_assisted: buildTeamVariantTrajectory('ai_assisted_pr', variantPoints('ai_assisted_pr'), thresholds),
+        all_pr: buildTrajectory('all_pr', variantPoints('all_pr'), thresholds),
+        ai_assisted: buildTrajectory('ai_assisted_pr', variantPoints('ai_assisted_pr'), thresholds),
     };
+}
+
+/** Org-wide manager aggregate — every developer pooled. */
+export function getOrgPRReviewCoaching(
+    db: Database.Database,
+    unit: PRReviewPeriodUnit,
+    now: Date = new Date(),
+): TeamPRReviewCoaching {
+    const devIds = (db.prepare('SELECT id FROM developers').all() as Array<{id: string}>).map((r) => r.id);
+    return aggregateForDeveloperIds(db, 'org', devIds, unit, now);
+}
+
+/**
+ * One team's manager aggregate. Scopes strictly by the team's CURRENT members —
+ * a team literally named 'org' is still just that team, never the whole org.
+ */
+export function getTeamPRReviewCoaching(
+    db: Database.Database,
+    team: string,
+    unit: PRReviewPeriodUnit,
+    now: Date = new Date(),
+): TeamPRReviewCoaching {
+    const devIds = (
+        db.prepare('SELECT id FROM developers WHERE team = ?').all(team) as Array<{id: string}>
+    ).map((r) => r.id);
+    return aggregateForDeveloperIds(db, team, devIds, unit, now);
 }

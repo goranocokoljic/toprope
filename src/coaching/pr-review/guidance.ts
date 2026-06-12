@@ -41,7 +41,7 @@ export const MIN_TEAM_COHORT = 3;
 const REWORK_TREND_DEADBAND = 0.02;
 
 /** The minimal point shape the trajectory helpers read (snake_case = the wire shape). */
-interface TrajectoryLike {
+export interface TrajectoryLike {
     period: string;
     prs_total: number | null;
     rework_rate: number | null;

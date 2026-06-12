@@ -29,12 +29,11 @@ import type {
  * not a bare snapshot verdict.
  */
 
-/** Rework-rate + review-rounds trajectory, plotted per period. */
+/** Rework-rate trajectory, plotted per period (a ratio, rendered as a percent). */
 function trajectoryData(variant: PRReviewVariantTrajectory): ChartDatum[] {
     return variant.points.map((p) => ({
         period: p.period,
         rework: p.rework_rate,
-        rounds: p.avg_review_rounds,
     }));
 }
 
@@ -86,10 +85,7 @@ function VariantSection({variant}: {variant: PRReviewVariantTrajectory}): JSX.El
                 <TrendChart
                     data={trajectoryData(variant)}
                     xKey="period"
-                    series={[
-                        {key: 'rework', label: 'Rework rate', axis: 'left'},
-                        {key: 'rounds', label: 'Avg review rounds', axis: 'right'},
-                    ]}
+                    series={[{key: 'rework', label: 'Rework rate'}]}
                     variant="line"
                     height={220}
                     xTickFormatter={formatPeriodTick}

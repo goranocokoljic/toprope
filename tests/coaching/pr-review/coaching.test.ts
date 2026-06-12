@@ -7,6 +7,7 @@ import {addTeam} from '../../../src/registry/teams';
 import {addDeveloper} from '../../../src/registry/developers';
 import {
     getDeveloperPRReviewCoaching,
+    getOrgPRReviewCoaching,
     getTeamPRReviewCoaching,
     periodKeysEndingAt,
 } from '../../../src/coaching/pr-review/coaching';
@@ -176,18 +177,36 @@ describe('getTeamPRReviewCoaching — aggregate only, k-anonymity (Task 5.3)', (
         expect(june?.rework_rate).toBeCloseTo(0.275, 4);
     });
 
-    it('aggregates the whole org under the org scope', () => {
+    it('aggregates the whole org under getOrgPRReviewCoaching', () => {
         const a = dev(db, 'eng', 'a');
         const b = dev(db, 'design', 'b');
         const c = dev(db, 'ops', 'c');
         for (const id of [a, b, c]) {
             seedMetric(db, {developerId: id, period: '2026-06', variant: 'all_pr', prsTotal: 4, rework: 0.2, rejection: 0.2});
         }
-        const result = getTeamPRReviewCoaching(db, 'org', 'monthly', NOW);
+        const result = getOrgPRReviewCoaching(db, 'monthly', NOW);
+        expect(result.scope).toBe('org');
         const june = result.all_pr.points.find((p) => p.period === '2026-06');
         expect(june?.suppressed).toBe(false);
         expect(june?.developers).toBe(3);
         expect(june?.prs_total).toBe(12);
+    });
+
+    it('scopes a team literally named "org" to that team only, never the whole org', () => {
+        // SEC-1 regression: the org sentinel must not collide with a real team name.
+        const a = dev(db, 'org', 'a'); // team called "org" with one member
+        const b = dev(db, 'eng', 'b');
+        const c = dev(db, 'eng', 'c');
+        const d = dev(db, 'eng', 'd');
+        seedMetric(db, {developerId: a, period: '2026-06', variant: 'all_pr', prsTotal: 4, rework: 0.2});
+        for (const id of [b, c, d]) {
+            seedMetric(db, {developerId: id, period: '2026-06', variant: 'all_pr', prsTotal: 4, rework: 0.2});
+        }
+        const result = getTeamPRReviewCoaching(db, 'org', 'monthly', NOW);
+        const june = result.all_pr.points.find((p) => p.period === '2026-06');
+        // The "org" TEAM has a single contributor → suppressed; it did NOT fold in
+        // the 3 eng developers (which would have made it look like the whole org).
+        expect(june?.suppressed).toBe(true);
     });
 
     it('returns an all-suppressed window for a team with no metrics', () => {

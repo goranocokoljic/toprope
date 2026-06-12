@@ -11,7 +11,7 @@
 
 import type {FastifyInstance} from 'fastify';
 import type Database from 'better-sqlite3';
-import {getTeamPRReviewCoaching} from '../../coaching/pr-review/coaching';
+import {getOrgPRReviewCoaching, getTeamPRReviewCoaching} from '../../coaching/pr-review/coaching';
 import {parsePeriodUnit, type PeriodUnitInput} from './coaching-params';
 import {forbidden, isAdmin} from './guards';
 
@@ -25,7 +25,7 @@ export function registerCoachingRoutes(app: FastifyInstance, db: Database.Databa
             return forbidden(reply);
         }
         const unit = parsePeriodUnit(request.query.unit);
-        return {data: getTeamPRReviewCoaching(db, 'org', unit)};
+        return {data: getOrgPRReviewCoaching(db, unit)};
     });
 
     /**
