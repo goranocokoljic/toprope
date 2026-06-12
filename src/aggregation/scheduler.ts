@@ -315,9 +315,8 @@ export function runScheduledJob(
             // acceptance baseline both keep converging after a period closes, so
             // re-folding recent periods is what makes the stored output track the
             // final picture rather than freezing a photograph taken at close.
-            // Built in its own guard so even the shared setup (date-key arithmetic)
-            // can never abort the aggregation job that already succeeded above — on
-            // the near-impossible failure both engines simply skip an empty window.
+            // Guarded so a setup failure can't abort the just-succeeded aggregation
+            // job; on failure both engines no-op over the empty window.
             const metricsPeriods: string[] = [];
             try {
                 if (period === 'weekly') {

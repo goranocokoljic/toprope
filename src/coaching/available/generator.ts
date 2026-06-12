@@ -189,6 +189,11 @@ function journeyAsOf(range: DateRange, now: Date): Date {
  * today's account state. Mirrors the rank model (tool quality → high/medium/low,
  * any git commits → medium) but bounded to `range`, then mapped via the canonical
  * {@link rankToTier} so it can never drift from the org coverage tier.
+ *
+ * The expense-only (rank 1 / `low`) term is intentionally omitted: a period-scoped
+ * subscription lookup is out of scope here, and the generator only processes
+ * developers with git or tool activity in the period, so a pure expense-only seat
+ * is never reached on this path.
  */
 function periodTier(
     stmts: Statements,
