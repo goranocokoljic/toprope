@@ -30,6 +30,7 @@ import {registerAnomalyRoutes} from './dashboard/api/anomalies';
 import {registerCoachingRoutes} from './dashboard/api/coaching';
 import {registerCaptureRoutes} from './dashboard/api/captures';
 import {registerKeyRoutes} from './dashboard/api/keys';
+import {registerRealtimeCoachingRoutes} from './dashboard/api/realtime-coaching';
 import {registerDashboardStatic} from './dashboard/static';
 import {createSlackClient} from './slack/client';
 import {notifyNewAnomalies} from './anomaly/notify';
@@ -127,6 +128,10 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
     // recovery posture (no_recovery | recovery_path), client-wrapped recovery
     // blob, and a developer-visible recovery audit. No server-side key material.
     registerKeyRoutes(app, db);
+    // Real-time loop detection + nudges (Task 5.6): detection runs locally at the
+    // capture layer; these /api/me routes only record/read the developer's own
+    // non-sensitive event METADATA (counts, types, timestamps) and dismissals.
+    registerRealtimeCoachingRoutes(app, db);
 
     // Data-prompted surveys (Task 4.3): manager queue + developer self-service.
     // Survey delivery prefers the Slack bot when configured, with an email
