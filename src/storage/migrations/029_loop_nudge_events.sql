@@ -26,8 +26,9 @@ CREATE TABLE loop_events (
     session_id TEXT NOT NULL,             -- groups events from one local session
     detected_at TEXT NOT NULL,            -- when the loop was detected (UTC ISO)
     -- How many similar prompts formed the loop. METADATA ONLY — a count, never the
-    -- prompts themselves. NULL only if a producer omits it.
-    similar_prompt_count INTEGER,
+    -- prompts themselves. NOT NULL: a loop event without its count is meaningless,
+    -- and the record route requires it (>= 2), so there is no path that stores null.
+    similar_prompt_count INTEGER NOT NULL,
     created_at TEXT NOT NULL              -- when the server stored the row (UTC ISO)
 );
 

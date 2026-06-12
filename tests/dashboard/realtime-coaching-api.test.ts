@@ -130,6 +130,19 @@ describe('Realtime coaching API (Task 5.6)', () => {
         expect(logs).not.toContain('SUPERSECRETMARKER');
     });
 
+    it('rejects a similar_prompt_count below the loop floor (< 2), matching the detector', async () => {
+        for (const count of [0, 1]) {
+            const res = await app.inject({
+                method: 'POST',
+                url: '/api/me/coaching/loop-events',
+                headers: auth(aliceToken),
+                payload: {session_id: 's1', similar_prompt_count: count},
+            });
+            expect(res.statusCode).toBe(400);
+        }
+        expect(db.prepare('SELECT COUNT(*) c FROM loop_events').get()).toMatchObject({c: 0});
+    });
+
     it('rejects an out-of-set nudge_type', async () => {
         const res = await app.inject({
             method: 'POST',

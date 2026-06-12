@@ -89,6 +89,13 @@ export class RealtimeCoach {
      * inert (returns nothing and does no detection), so an opted-out developer
      * never sees a nudge and nothing is ever produced to sync.
      *
+     * Because "disabled" skips detection entirely, the rolling window does NOT
+     * advance while off: prompts sent during a disabled stretch are not recorded,
+     * so re-enabling mid-session starts loop detection from a cold window rather
+     * than counting prompts the developer never had coached. This is intentional —
+     * off means off, no background work — and the only consequence is that the
+     * first loop after re-enabling needs a fresh run of similar prompts.
+     *
      * Loop DETECTION fires whenever the similarity condition holds (the underlying
      * signal), so a `loopEvent` is produced on every detection; the corresponding
      * `repeated_prompt` NUDGE, like the structural ones, is subject to the

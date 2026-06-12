@@ -45,8 +45,13 @@ const LOOP_EVENT_KEYS = ['session_id', 'detected_at', 'similar_prompt_count'] as
 const NUDGE_EVENT_KEYS = ['session_id', 'nudge_type', 'delivered_at'] as const;
 
 const MAX_SESSION_ID_LEN = 256;
-// A loop is a handful of similar prompts; cap the count well above any real loop so
-// a malformed producer can't store an absurd value, while never rejecting a real one.
+// A loop is "the same request >= 2 times" — the local detector is clamped to that
+// floor and can only ever emit a count >= 2. Mirror that invariant at the trust
+// boundary so the sync endpoint can't be looser than the producer it serves: a
+// client-supplied 0/1 is not a loop and is rejected.
+const MIN_SIMILAR_PROMPT_COUNT = 2;
+// Cap the count well above any real loop so a malformed producer can't store an
+// absurd value, while never rejecting a real one.
 const MAX_SIMILAR_PROMPT_COUNT = 10000;
 
 /**
@@ -146,10 +151,13 @@ export function registerRealtimeCoachingRoutes(app: FastifyInstance, db: Databas
         if (
             typeof obj.similar_prompt_count !== 'number' ||
             !Number.isInteger(obj.similar_prompt_count) ||
-            obj.similar_prompt_count < 0 ||
+            obj.similar_prompt_count < MIN_SIMILAR_PROMPT_COUNT ||
             obj.similar_prompt_count > MAX_SIMILAR_PROMPT_COUNT
         ) {
-            badRequest(reply, 'similar_prompt_count must be a non-negative integer');
+            badRequest(
+                reply,
+                `similar_prompt_count must be an integer between ${MIN_SIMILAR_PROMPT_COUNT} and ${MAX_SIMILAR_PROMPT_COUNT}`,
+            );
             return reply;
         }
 
@@ -200,6 +208,12 @@ export function registerRealtimeCoachingRoutes(app: FastifyInstance, db: Databas
         const event = insertNudgeEvent(db, developerId, {sessionId, nudgeType: obj.nudge_type, deliveredAt});
         return reply.status(201).send({data: event});
     });
+
+    // The read/dismiss routes below are owner-scoped but deliberately NOT gated by
+    // nudgeGate: a developer may always read and dismiss their OWN already-stored
+    // history even after opting out of nudges. The 403 gate is on RECORDING new
+    // events, not on managing past ones — opting out stops new metadata, it doesn't
+    // lock the developer out of what they already have.
 
     /** List the developer's own loop events (metadata only), newest first. */
     app.get('/api/me/coaching/loop-events', async (request, reply) => {

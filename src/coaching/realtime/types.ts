@@ -71,7 +71,7 @@ export interface LoopEvent {
     developerId: string;
     sessionId: string;
     detectedAt: string;
-    similarPromptCount: number | null;
+    similarPromptCount: number;
     createdAt: string;
 }
 

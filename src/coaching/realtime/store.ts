@@ -17,7 +17,7 @@ interface LoopRow {
     developer_id: string;
     session_id: string;
     detected_at: string;
-    similar_prompt_count: number | null;
+    similar_prompt_count: number;
     created_at: string;
 }
 
