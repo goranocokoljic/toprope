@@ -18,7 +18,9 @@ export const LOCAL_AGENT_MECHANISM = 'local_agent' as const;
 /**
  * Build a local-agent capture client. Callers supply the developer's key + key
  * id and a transport (typically `httpCaptureTransport` to /api/me/captures); the
- * mechanism is set for them so an agent can never mislabel its captures.
+ * mechanism is set for them so an agent can never mislabel its captures. An
+ * optional `coach` (Task 5.6) attaches the local real-time loop detector + nudges
+ * so the agent can run them on the machine via `client.observe(prompt)`.
  */
 export function createLocalAgent(
     config: Omit<CaptureClientConfig, 'mechanism'>,

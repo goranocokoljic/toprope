@@ -20,6 +20,8 @@ export const EDITOR_EXTENSION_MECHANISM = 'editor_extension' as const;
  * Build an editor-extension capture client. Identical surface to the local
  * agent's factory — only the recorded mechanism differs — so a developer can
  * switch mechanisms without any change to how captures are encrypted or stored.
+ * Like the agent it accepts an optional `coach` (Task 5.6): the same local
+ * real-time loop detector + nudges run for the extension via `client.observe`.
  */
 export function createEditorExtension(
     config: Omit<CaptureClientConfig, 'mechanism'>,
