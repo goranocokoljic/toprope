@@ -57,13 +57,13 @@ export interface LoopNudgeAggregate {
     /**
      * Developers in scope who have effectively opted into capture (org-permission
      * gated) — an ELIGIBILITY count, not a coaching signal. Floored like every
-     * other count on this surface: the EXACT value is reported only when it is 0
-     * (nobody opted in) or at least the min-group-size floor; a value between 1
-     * and the floor is reported as `null` (suppressed), because in a small team a
-     * manager who knows the roster could otherwise read off WHICH individual
-     * enabled capture — an opt-in choice is itself private. `null` therefore means
-     * "some, but too few to show without identifying them"; the UI distinguishes
-     * it from the explicit 0.
+     * other count on this surface: the EXACT value is reported only when it is at
+     * least the min-group-size floor; anything below (including 0) is `null`.
+     * Collapsing 0 into null is deliberate — the org count sums over teams, so an
+     * explicit 0 would let a manager who knows the roster difference the org and
+     * team panels to isolate a single opted-in developer (an opt-in choice is
+     * itself private). `null` therefore means "too few opted in to show safely",
+     * indistinguishable from none.
      */
     opted_in_developers: number | null;
     /** Distinct opted-in developers who hit a detection loop in the window (floored). */

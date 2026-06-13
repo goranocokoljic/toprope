@@ -4,7 +4,7 @@ import path from 'path';
 import {runMigrations} from '../../../src/storage/migrator';
 import {addTeam} from '../../../src/registry/teams';
 import {addDeveloper} from '../../../src/registry/developers';
-import {createUser} from '../../../src/auth/users';
+import {createUser, deactivateUser, getUserByDeveloperId} from '../../../src/auth/users';
 import {setGlobalSetting, setDeveloperPreference} from '../../../src/settings/store';
 import {insertLoopEvent, insertNudgeEvent} from '../../../src/coaching/realtime/store';
 import {
@@ -116,11 +116,10 @@ describe('aggregateLoopNudge — pure flooring math', () => {
         expect(agg.opted_in_developers).toBe(7);
     });
 
-    it('floors the opted-in eligibility count: exact at 0 or >= floor, null in between', () => {
-        // 0 → exact (distinguishes "nobody opted in").
-        expect(aggregateLoopNudge('eng', 'monthly', 0, [], []).opted_in_developers).toBe(0);
-        // 1 and 2 (below floor of 3) → suppressed to null, so a manager can't read
-        // off which single individual enabled capture in a tiny scope.
+    it('floors the opted-in eligibility count: exact at >= floor, null below (incl. 0)', () => {
+        // 0, 1, 2 (below floor of 3) all → null, so an explicit zero can't anchor a
+        // differencing attack across the org/team panels to isolate one opt-in.
+        expect(aggregateLoopNudge('eng', 'monthly', 0, [], []).opted_in_developers).toBeNull();
         expect(aggregateLoopNudge('eng', 'monthly', 1, [], []).opted_in_developers).toBeNull();
         expect(aggregateLoopNudge('eng', 'monthly', 2, [], []).opted_in_developers).toBeNull();
         // 3 (the floor) → exact.
@@ -202,13 +201,28 @@ describe('getTeamLoopNudgeAggregate / getOrgLoopNudgeAggregate — opted-in only
         expect(agg.loops.suppressed).toBe(true);
     });
 
-    it('returns a fully-suppressed, zero-eligibility aggregate when nobody opted in', () => {
+    it('returns a fully-suppressed aggregate (null eligibility) when nobody opted in', () => {
         devWithOptIn(db, 'eng', 'aaa', false);
         devWithOptIn(db, 'eng', 'bbb', false);
         const agg = getTeamLoopNudgeAggregate(db, 'eng', 'monthly', NOW);
-        expect(agg.opted_in_developers).toBe(0);
+        // Below-floor (here zero) collapses to null — indistinguishable from "a few".
+        expect(agg.opted_in_developers).toBeNull();
         expect(agg.loops.suppressed).toBe(true);
         expect(agg.nudges.every((n) => n.suppressed)).toBe(true);
+    });
+
+    it('excludes a deactivated developer even if they had opted in', () => {
+        const a = devWithOptIn(db, 'eng', 'aaa', true);
+        const b = devWithOptIn(db, 'eng', 'bbb', true);
+        const c = devWithOptIn(db, 'eng', 'ccc', true);
+        for (const id of [a, b, c]) {
+            insertLoopEvent(db, id, {sessionId: 's', detectedAt: IN_WINDOW, similarPromptCount: 3});
+        }
+        // Revoke c's access — their patterns must stop contributing → 2 left → suppressed.
+        deactivateUser(db, getUserByDeveloperId(db, c)!.id);
+
+        const agg = getTeamLoopNudgeAggregate(db, 'eng', 'monthly', NOW);
+        expect(agg.loops.suppressed).toBe(true);
     });
 
     it('aggregates nudge types across opted-in developers org-wide', () => {

@@ -11,6 +11,7 @@ import {formatPercent} from '../components/format';
 import {combinedSignalCopy, formatPeriodTick, reworkTrendSentence, teamVariantTitle} from '../components/coaching';
 import type {
     LoopNudgeAggregate,
+    LoopNudgeCell,
     ManagerCoachingPanel,
     PRReviewPeriodUnit,
     TeamAvailableCoaching,
@@ -267,19 +268,17 @@ const NUDGE_LABEL: Record<string, string> = {
 };
 
 function LoopNudgeSection({loopNudge}: {loopNudge: LoopNudgeAggregate}): JSX.Element {
-    const cells: Array<{label: string; cell: {suppressed: boolean; developers: number | null}}> = [
+    const cells: Array<{label: string; cell: LoopNudgeCell}> = [
         {label: 'Detection loops', cell: loopNudge.loops},
         ...loopNudge.nudges.map((n) => ({label: NUDGE_LABEL[n.nudge_type] ?? n.nudge_type, cell: n})),
     ];
     const anyShown = cells.some((c) => !c.cell.suppressed);
-    // The eligibility count is floored: null = "some, but too few to name safely";
-    // 0 = nobody opted in; a number = the exact (>= floor) count.
+    // The eligibility count is floored: null = too few (or none) to show the exact
+    // count without risking identifying who opted in; a number = the exact >= floor count.
     const optInBasis =
         loopNudge.opted_in_developers === null
-            ? 'Based on the opted-in developers in this scope (too few to show the exact count without identifying them).'
-            : loopNudge.opted_in_developers === 0
-              ? 'No developers in this scope have opted into prompt capture yet.'
-              : `Based on ${loopNudge.opted_in_developers} opted-in developers in this scope.`;
+            ? 'Too few developers in this scope have opted into prompt capture to show the exact count without identifying them.'
+            : `Based on ${loopNudge.opted_in_developers} opted-in developers in this scope.`;
 
     return (
         <Section

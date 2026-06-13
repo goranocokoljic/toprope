@@ -34,10 +34,12 @@ interface OptInRow {
  * Order is preserved. The caller owns scope (org = all developers, team = the
  * team's members); this only enforces the opt-in boundary on top of that scope.
  *
- * One query resolves every (developer → linked user, current team) in the set;
- * the per-developer work is then just the capture gate's single-preference
+ * One query resolves every (developer → linked ACTIVE user, current team) in the
+ * set; the per-developer work is then just the capture gate's single-preference
  * resolution, gated for the developer's OWN team so a per-team capture override
- * is honored exactly as on the developer's own surfaces.
+ * is honored exactly as on the developer's own surfaces. Deactivated accounts are
+ * excluded — revoking a developer's access should also stop their patterns
+ * contributing to a manager aggregate, not just lock them out of their own view.
  */
 export function resolveOptedInDeveloperIds(db: Database.Database, devIds: string[]): string[] {
     if (devIds.length === 0) {
@@ -49,7 +51,7 @@ export function resolveOptedInDeveloperIds(db: Database.Database, devIds: string
             `SELECT u.developer_id AS developer_id, u.id AS user_id, d.team AS team
              FROM users u
              JOIN developers d ON d.id = u.developer_id
-             WHERE u.developer_id IN (${placeholders})`,
+             WHERE u.developer_id IN (${placeholders}) AND u.deactivated_at IS NULL`,
         )
         .all(...devIds) as OptInRow[];
 

@@ -66,15 +66,18 @@ function buildCell(developerIds: string[], minCohort: number): LoopNudgeCell {
 }
 
 /**
- * Floor the opted-in eligibility count: report the exact value only when it is 0
- * (nobody opted in) or at least the cohort floor; a value in between is suppressed
- * to null so a small opted-in cohort can't reveal which individual enabled capture.
+ * Floor the opted-in eligibility count: report the exact value ONLY when it is at
+ * least the cohort floor; anything below (including 0) is suppressed to null.
+ *
+ * Collapsing 0 into null — rather than reporting an explicit zero — is deliberate:
+ * the org count is the sum over teams, so an explicit 0 on one team plus null (1–2)
+ * on others lets a manager who knows the roster difference the org panel against the
+ * team panels to isolate a team with a single opted-in developer (an opt-in choice
+ * is itself private). Without the explicit-0 anchor, a below-floor scope is
+ * indistinguishable from an empty one, so no individual's opt-in can be read off.
  */
 function flooredOptInCount(optedInCount: number, minCohort: number): number | null {
-    if (optedInCount === 0 || optedInCount >= minCohort) {
-        return optedInCount;
-    }
-    return null;
+    return optedInCount >= minCohort ? optedInCount : null;
 }
 
 /**
@@ -169,9 +172,15 @@ function aggregateForDeveloperIds(
         // A nudge_type outside the closed set means corruption / a future enum;
         // drop it rather than crash the manager view (the CHECK constraint makes
         // this practically unreachable, but the manager surface must never throw).
-        .filter((r): r is {developer_id: string; nudge_type: NudgeType} =>
-            (NUDGE_TYPES as readonly string[]).includes(r.nudge_type),
-        )
+        // Warn on the way out, mirroring the realtime store's decodeNudgeType, so a
+        // genuinely corrupt row is discoverable rather than silently vanishing.
+        .filter((r): r is {developer_id: string; nudge_type: NudgeType} => {
+            if ((NUDGE_TYPES as readonly string[]).includes(r.nudge_type)) {
+                return true;
+            }
+            console.warn(`[manager-aggregate] unrecognized nudge_type '${r.nudge_type}' in nudge_events; excluding from aggregate`);
+            return false;
+        })
         .map((r) => ({developerId: r.developer_id, nudgeType: r.nudge_type}));
 
     return aggregateLoopNudge(scopeLabel, unit, optedIn.length, loops, nudges);

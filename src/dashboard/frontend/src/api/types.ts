@@ -498,16 +498,6 @@ export interface TeamPRReviewCoaching {
     ai_assisted: TeamCoachingVariantTrajectory;
 }
 
-/**
- * /api/coaching/pr-review/{org,team} response. Pillar 2 gating (Task 5.10)
- * applies to the manager aggregate too: when the pillar is off the server returns
- * `{enabled:false}` with no aggregate, so the surface is hidden everywhere, not
- * just on the developer's own view.
- */
-export type TeamPRReviewCoachingResponse =
-    | {enabled: false}
-    | ({enabled: true} & TeamPRReviewCoaching);
-
 // ── Manager aggregate coaching panel (Task 5.11) ────────────────────────────
 // The unified manager surface over all three pillars: PR/review trends, churn/
 // effectiveness trends, anonymized loop/nudge patterns (opted-in developers
@@ -563,8 +553,8 @@ export interface LoopNudgeAggregate {
     period_unit: PRReviewPeriodUnit;
     /**
      * Developers in scope who effectively opted into capture (eligibility count),
-     * floored: exact when 0 or at least the min-group-size, `null` when between 1
-     * and the floor (too few to show without identifying who opted in).
+     * floored: exact only at or above the min-group-size, else `null` (too few —
+     * including none — to show without risking identifying who opted in).
      */
     opted_in_developers: number | null;
     loops: LoopNudgeCell;
