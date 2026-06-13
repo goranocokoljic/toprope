@@ -2,7 +2,7 @@
 
 **The canonical reference for what GovProxy is, what's built, and what's next.**
 
-Version 1.1 — June 2026 | Living document — update as phases complete
+Version 1.2 — June 2026 | Living document — update as phases complete
 
 > This document supersedes the phase definitions and roadmaps in all earlier
 > documents (see Section 7, Superseded Documents). When any other document
@@ -52,8 +52,8 @@ API connectors come online progressively. Primary git provider is Bitbucket.
 | Phase 2 | Dashboard: manager + developer views | ✅ DONE |
 | Phase 3 | Aggregation engine + AI-generated summaries | ✅ DONE |
 | Phase 4 | Complete the data picture + close analytics gaps | ✅ DONE |
-| Phase 5 | Developer coaching | ▶ NEXT |
-| Phase 6 | Production hardening & scale | ⬜ PLANNED |
+| Phase 5 | Developer coaching | ✅ DONE |
+| Phase 6 | Production hardening & scale | ▶ NEXT |
 | Backlog | Benchmarks, mobile, future connectors | ⬜ UNSCHEDULED |
 
 ---
@@ -275,6 +275,57 @@ API connectors come online progressively. Primary git provider is Bitbucket.
 
 ---
 
+### Phase 5 — Developer Coaching ✅
+
+The product's differentiator: a private mirror that helps developers improve,
+while managers see only team-level patterns. Tier-aware — the first two pillars
+work on existing data, so a git-only WMG developer gets useful coaching with no
+opt-in. The non-negotiable rule across the phase: **individual coaching signals
+are private to the developer; managers see floored team aggregates only**, framed
+within-developer-over-time, never as a cross-developer ranking.
+
+**Pillar 1 — Available-data coaching** (works at launch, git-only)
+- Churn self-reflection, acceptance-rate trends (only where tool data exists —
+  honestly null for git-only), adoption-journey interpretation, and tier-aware
+  personal insights, all on the developer's own data (`/api/me/coaching`)
+- Manager aggregate carries contributor counts + category tallies only — never the
+  observation sentence, with a k-anonymity floor (≥3 contributors)
+
+**Pillar 2 — PR/review outcome coaching** (works at launch, the no-opt-in
+highest-value signal)
+- From GitHub/Bitbucket/GitLab PR + review data: rework/review-rejection rate,
+  review rounds, comment density, time-to-merge, and the churn + review combination
+  that disambiguates struggling vs healthy iteration vs effective adoption
+- **All-PR (factual)** and **AI-assisted (inferred)** views kept rigorously separate
+  and labelled; private developer trajectory (`/api/me/pr-coaching`) vs floored
+  manager team aggregate (`/api/coaching/pr-review/...`) with no individual reachable
+
+**Pillar 3 — Opt-in prompt capture** (off until an admin permits; developer's choice)
+- Double opt-in: capture at all (opt-in #1) and, separately, cloud retrospective
+  analysis (opt-in #2); both mechanisms — local agent + editor extension — feed one
+  client-side-encrypted blind store that rejects any plaintext/key material
+- Real-time loop detection + prompt-quality nudges run locally at the capture layer
+  and sync metadata only; session retrospective defaults to a **local model**
+  (prompts never leave org infra), cloud only on the double opt-in + org permission
+- Developer-chosen key recovery (no-recovery vs recovery-path); every recovery
+  action is logged in a developer-visible feed — no silent use, no admin backdoor
+
+**Showcase — exemplary conversations**
+- Deliberate owner act: promote (transient decrypt) → mandatory redact → publish to
+  a **separate shared store** at team/org scope; private captures untouched, nothing
+  auto-harvested; browse within access scope; owner unpublish; team-lead remove
+  (with author notice) but never publish/edit on a developer's behalf
+
+**Cross-cutting**
+- Coaching settings & permissions (org policy gates developer choices; pillars
+  team-overridable); unified manager coaching panel (`/api/coaching/manager/...`)
+  that is structurally aggregate-only
+- Privacy verified end to end by `tests/integration/phase5-pipeline.test.ts`: the
+  no-plaintext, no-individual-leak, min-group-size, double-opt-in, and
+  owner-only-publish guarantees each have a dedicated assertion (Task 5.12)
+
+---
+
 ## 4. Definitive Forward Roadmap
 
 > This numbering is authoritative and supersedes all earlier phase definitions.
@@ -291,26 +342,19 @@ reconciliation) or honestly surfaced as gaps, and the three orphaned analytics
 items (anomaly detection, team comparison, adoption-journey visualization) are
 built and tier-aware.
 
-### Phase 5 — Developer Coaching ▶ NEXT
+### Phase 5 — Developer Coaching ✅ DONE
 
-**Theme:** make the product something developers *want*, not just tolerate.
+Built and verified end to end — see the full feature inventory in Section 3 and the
+integration/privacy/dogfood suite `tests/integration/phase5-pipeline.test.ts`. Three
+coaching pillars (available-data, PR/review outcomes, opt-in prompt capture) plus the
+exemplary-conversation showcase, delivered under a strict privacy floor: individual
+coaching is private to the developer, managers see only floored team aggregates,
+prompt capture is client-side-encrypted with no server-side plaintext or key, the
+retrospective defaults to a local model, and the showcase is owner-initiated only.
+The product is now something developers *want*, not just tolerate. The dedicated
+privacy-verification pass (Task 5.12) is the gate, and it passes.
 
-Scope:
-- Loop detection (repeated similar prompts / unproductive cycles)
-- Prompt-quality signals and gentle nudges
-- Session retrospective: AI-powered coding coach reviewing a developer's session,
-  fully private to the developer
-- Rule-based or AI-generated personal insights (deferred from Phase 2)
-- Strict privacy: prompt content never visible to managers; individual coaching
-  private; team-level aggregates only
-
-Rationale: this is the product's true differentiator and drives developer
-adoption. It comes after the data picture is complete so coaching is grounded in
-good data. Note: parts of coaching may require data sources (e.g., prompt-level
-data) only available for certain tools or via an optional mechanism — scope to be
-defined in the Phase 5 design.
-
-### Phase 6 — Production Hardening & Scale ⬜
+### Phase 6 — Production Hardening & Scale ▶ NEXT
 
 **Theme:** ready to leave WMG and sell to external customers.
 
@@ -384,13 +428,23 @@ Active documents going forward:
 - **THIS document** (roadmap / source of truth)
 - Phase4_Design_Document.md + Phase4_Task_Tracker.md — the build record for the
   now-complete Phase 4 (historical implementation detail)
-- Phase 5 design document + task tracker (to be created next)
+- Phase5_Design_Document.md + Phase5_Task_Tracker.md — the build record for the
+  now-complete Phase 5 (historical implementation detail)
+- Phase 6 design document + task tracker (to be created next)
 - Product_Vision_v2 (product vision reference)
 
 ---
 
 ## 8. Change Log
 
+- v1.2 (June 2026) — Phase 5 (Developer Coaching) marked DONE. Added the Phase 5
+  feature inventory (Pillar 1 available-data coaching, Pillar 2 PR/review outcome
+  coaching, Pillar 3 opt-in client-side-encrypted prompt capture with local-default
+  retrospective + double opt-in + developer-chosen logged key recovery, the
+  deliberate promote/redact/publish showcase, coaching settings, and the unified
+  aggregate-only manager panel) and the integration + privacy-verification + dogfood
+  pass (Task 5.12, `tests/integration/phase5-pipeline.test.ts`). Phase 6 (Production
+  Hardening & Scale) is now NEXT.
 - v1.1 (June 2026) — Phase 4 marked DONE. Added the Phase 4 feature inventory
   (self-reporting CLI + Slack, data-prompted surveys, richer expense import +
   reconciliation, Cursor connector, tier-aware anomaly detection + surfacing, team

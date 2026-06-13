@@ -361,6 +361,99 @@ under the manager's Surveys panel.
 
 ---
 
+## 10. Developer coaching (Phase 5) (15 min)
+
+Phase 5 turns the platform from a *measurement* tool into a *capability-building*
+one: a private mirror that helps developers improve, while the manager sees only
+team-level patterns. The first two pillars work on data you already have — a
+git-only WMG developer gets genuinely useful coaching with **no opt-in required**.
+The cross-cutting privacy rule holds everywhere: **individual coaching signals are
+private to the developer; managers see floored team aggregates only**, and a
+coaching signal becoming manager-visible is treated as a bug, not a feature.
+
+Org-level coaching policy lives in **Settings** (admin). Pillars 1–2 default ON;
+prompt capture, cloud analysis, and the showcase default OFF until an admin
+permits them. Each is team-overridable when `coaching_managers_can_override` is on.
+
+### 10a. Pillar 2 — PR/review outcome coaching (the highest-value, no-opt-in signal)
+
+This is the one to dogfood first on real WMG git-only data. From the PR/MR +
+review data the Phase 1 git connectors already pull (GitHub, Bitbucket, GitLab),
+it reads the *verdict* on AI-assisted work — rework/review-rejection rate, review
+rounds, comment density, time-to-merge, and the powerful **churn + review**
+combination (high churn + high rejection = struggling with AI output; high churn +
+clean reviews = healthy iteration; low churn + clean reviews = effective adopter).
+
+- A developer opens **`GET /api/me/pr-coaching`** and sees their own trajectory,
+  with the **all-PR (factual)** and **AI-assisted (inferred)** views kept rigorously
+  separate and labelled — the inferred view is never presented as fact.
+- A manager opens **`GET /api/coaching/pr-review/team/<team>`** (or `/org`) and sees
+  a pooled team trajectory only. Every period below the cohort floor (3
+  contributors) is suppressed; no individual's numbers and no developer id ever
+  appear. There is deliberately no route that returns one developer's coaching to a
+  manager.
+- Sanity-check the signals against developers whose work you know: a developer you
+  know was wrestling with AI output should read as elevated churn + rework, not a
+  clean trajectory.
+
+### 10b. Pillar 1 — available-data coaching
+
+Churn self-reflection, acceptance-rate trends (only where tool data exists —
+honestly absent for git-only), adoption-journey interpretation, and tier-aware
+personal insights, all on the developer's **own** data via **`GET /api/me/coaching`**.
+Inferred (git-estimate) signals are separated from measured ones. The manager
+aggregate (`/api/coaching/available/...`) carries contributor counts and category
+tallies only — never the observation sentence.
+
+### 10c. Pillar 3 — opt-in prompt capture (double opt-in, private by default)
+
+Off until an admin permits it (`coaching_capture_permitted`). Then it is the
+**developer's** choice, in two separate steps:
+
+- **Opt-in #1 — capture at all.** The developer turns capture on and picks a
+  mechanism (local agent **or** editor extension — both feed the same store).
+  Prompts are encrypted **client-side**; the server is a blind store that holds
+  only ciphertext + public crypto metadata and **rejects any body carrying
+  plaintext or key material**. Loop detection and prompt-quality nudges run
+  **locally** at the capture layer and sync only metadata (counts, types,
+  timestamps) — never prompt text.
+- **Key recovery — the developer's informed choice.** At opt-in they pick
+  *no-recovery* (maximum privacy; a lost key is unrecoverable by design) or a
+  *recovery path* (the key is wrapped client-side; the server stores only the
+  opaque blob). **Every recovery action is logged in a feed the developer can
+  read** (`GET /api/me/capture-key/recovery-log`) — recovery can never be used
+  silently, and there is no admin backdoor.
+- **Opt-in #2 — cloud retrospective.** The session retrospective defaults to a
+  **local model** (raw prompts never leave org infrastructure). Cloud analysis runs
+  only when the org permits cloud analysis **and** the developer separately opts in.
+
+### 10d. Showcase — deliberately-shared exemplary conversations
+
+Off until `showcase_enabled`. The bridge from private self-coaching to
+organizational learning, and the conflict ("your prompts are private" vs "share
+your best prompt") dissolves because **sharing is always a deliberate owner act**:
+
+- From their **own** retrospective the developer **promotes** a conversation
+  (transiently decrypted for them to edit), **redacts** it (a mandatory step the
+  flow refuses to skip), and **publishes** the redacted content at team or org
+  scope (within the org's `showcase_scope_permitted`).
+- Published examples live in a **separate shared store**; the private capture is
+  never read or modified by publishing, and nothing is auto-harvested. Others
+  **browse** within their access scope.
+- The owner can **unpublish** anytime; a team lead can **remove** an example from
+  their team's showcase (and the author is notified) — but a lead can **never**
+  publish or edit on a developer's behalf.
+
+### 10e. Manager coaching panel
+
+`GET /api/coaching/manager/team/<team>` (or `/org`) composes the three pillar
+aggregates plus synthesized team opportunities into one admin-only payload. Every
+section is floored, the loop/nudge section counts only opted-in developers, and no
+code path here accepts a developer id — the whole surface is structurally
+aggregate-only.
+
+---
+
 ## Health check
 
 `GET http://localhost:8080/health` must always return `{"status":"ok"}`. Use it
