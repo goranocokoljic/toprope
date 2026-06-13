@@ -26,8 +26,7 @@
  */
 
 import type Database from 'better-sqlite3';
-import {decryptCapture, type EncryptionMeta} from '../capture/encryption';
-import {listSessionCapturesForDeveloper} from '../capture/store';
+import {decryptSessionToText, SessionDecryptError} from '../capture/session-decrypt';
 import {insertShowcaseExample} from './store';
 import {isShowcaseEnabledForTeam, isScopePermittedForTeam} from './gate';
 import type {ShowcaseExample, ShowcaseScope} from './types';
@@ -51,20 +50,6 @@ export class ShowcaseError extends Error {
     }
 }
 
-/** Coerce a stored public meta object into the EncryptionMeta decryptCapture needs. */
-function toEncryptionMeta(meta: Record<string, unknown>): EncryptionMeta {
-    const {algo, iv, auth_tag, key_id} = meta;
-    if (
-        typeof algo !== 'string' ||
-        typeof iv !== 'string' ||
-        typeof auth_tag !== 'string' ||
-        typeof key_id !== 'string'
-    ) {
-        throw new ShowcaseError('decrypt_failed', 'Capture encryption metadata is malformed');
-    }
-    return {algo, iv, auth_tag, key_id};
-}
-
 /** The transient result of decrypting a session for promotion: the joined plaintext draft. */
 export interface ShowcaseDraft {
     sessionId: string;
@@ -83,34 +68,22 @@ export interface DraftFromSessionInput {
 
 /**
  * Transiently decrypt one of the owner's OWN captured sessions into an editable
- * draft. Mirrors the retrospective generator's transient-decrypt posture: captures
- * are the server's blind ciphertext; decryption happens HERE, in memory, and the
- * returned plaintext is the owner's to redact — it is never persisted or logged. A
- * wrong key (or any tampering) makes GCM verification throw, surfaced as a typed
- * `decrypt_failed`; an empty session is a typed `no_captures`.
- *
- * Ordering note: `captured_at` is client-supplied (see the capture store), so the
- * chronological join is best-effort with `created_at` as the tiebreak — good enough
- * for a human reviewing a draft to redact.
+ * draft. Delegates the crypto handling to the shared `decryptSessionToText` (the
+ * one home for "captures are blind ciphertext, decrypt in memory, never persist or
+ * log"), then re-types its failures as `ShowcaseError` so this route maps them to
+ * HTTP the same way the rest of the showcase surface does. The returned plaintext
+ * is the owner's to redact — it is never persisted or logged here.
  */
 export function draftFromSession(db: Database.Database, input: DraftFromSessionInput): ShowcaseDraft {
-    const captures = listSessionCapturesForDeveloper(db, input.developerId, input.sessionId);
-    if (captures.length === 0) {
-        throw new ShowcaseError('no_captures', 'No captured session found to promote');
-    }
-    const parts: string[] = [];
-    for (const capture of captures) {
-        const meta = toEncryptionMeta(capture.encryptionMeta);
-        const ciphertext = Buffer.from(capture.ciphertext, 'base64');
-        try {
-            parts.push(decryptCapture(ciphertext, meta, input.key));
-        } catch {
-            // Never include the underlying crypto error or any bytes — a bad key and a
-            // tampered blob are intentionally indistinguishable.
-            throw new ShowcaseError('decrypt_failed', 'Could not decrypt the session with the provided key');
+    try {
+        const {plaintext, captureCount} = decryptSessionToText(db, input.developerId, input.sessionId, input.key);
+        return {sessionId: input.sessionId, plaintext, captureCount};
+    } catch (err) {
+        if (err instanceof SessionDecryptError) {
+            throw new ShowcaseError(err.code, err.message);
         }
+        throw err;
     }
-    return {sessionId: input.sessionId, plaintext: parts.join('\n'), captureCount: captures.length};
 }
 
 export interface PublishExampleInput {

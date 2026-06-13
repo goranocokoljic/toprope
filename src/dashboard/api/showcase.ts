@@ -199,6 +199,22 @@ export function registerShowcaseRoutes(app: FastifyInstance, db: Database.Databa
      * persists exactly the content the owner submits. Owner-scoped on the
      * retrospective (no other path); mandatory redaction acknowledgement; scope
      * within org policy — all enforced before any write.
+     *
+     * Two deliberate design notes:
+     *
+     *  - `retrospective_id` gates WHO MAY PUBLISH, not WHAT IS PUBLISHED. It proves
+     *    the caller owns a retrospective (the promote entry point), but the stored
+     *    `content` is the owner's own submitted redaction and is never re-derived or
+     *    cross-checked against that session — by design, `showcase_examples` keeps no
+     *    pointer back to the private capture. Do not infer that published content is
+     *    provenance-linked to this retrospective; it is not.
+     *
+     *  - Publish is gated by showcase enablement, NOT by the capture opt-in. The
+     *    capture gate guards FRESH plaintext handling (decryption) and so guards the
+     *    draft route; publish performs no decryption and handles only the owner's
+     *    already-redacted, deliberately-org-visible text, so a developer who has
+     *    opted out of capture may still publish a draft they previously prepared.
+     *    `showcase_enabled` (resolved live in the service) is publish's feature gate.
      */
     app.post<{Body: unknown}>('/api/me/showcase', async (request, reply) => {
         const developerId = requireDeveloperId(request, reply);

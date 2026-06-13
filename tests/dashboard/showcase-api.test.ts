@@ -169,6 +169,22 @@ describe('Showcase API (Task 5.8)', () => {
         expect(res.statusCode).toBe(404);
     });
 
+    it('returns no_captures (404) when the owned retrospective’s captures were since deleted', async () => {
+        await boot();
+        // The retrospective is real and owned, but its underlying session captures are gone
+        // (e.g. the developer deleted the capture). Ownership passes; the decrypt finds nothing.
+        db.prepare('DELETE FROM prompt_captures WHERE developer_id = ?').run('alice');
+        const res = await app.inject({
+            method: 'POST',
+            url: '/api/me/showcase/draft',
+            headers: auth(aliceToken),
+            payload: {retrospective_id: aliceRetroId, key: key.toString('base64')},
+        });
+        expect(res.statusCode).toBe(404);
+        // Distinguishable from the "retrospective not found" 404 by its stable code.
+        expect(res.json().code).toBe('no_captures');
+    });
+
     it('promote requires capture enabled (handles fresh plaintext)', async () => {
         setDeveloperPreference(db, aliceUserId, 'capture_opt_in', false);
         await boot();
@@ -287,6 +303,29 @@ describe('Showcase API (Task 5.8)', () => {
         expect(allowed.statusCode).toBe(201);
         expect(allowed.json().data.scope).toBe('org');
         expect(allowed.json().data.scopeTarget).toBeNull();
+    });
+
+    it('publishes owner-redacted content even after the developer opts out of capture (publish is not capture-gated)', async () => {
+        await boot();
+        // Opting out halts FRESH plaintext handling (the draft route), but publishing the
+        // owner's already-redacted, deliberately-org-visible text performs no decryption.
+        setDeveloperPreference(db, aliceUserId, 'capture_opt_in', false);
+        const res = await app.inject({
+            method: 'POST',
+            url: '/api/me/showcase',
+            headers: auth(aliceToken),
+            payload: {retrospective_id: aliceRetroId, scope: 'team', title: 'Still mine', content: REDACTED, redaction_acknowledged: true},
+        });
+        expect(res.statusCode).toBe(201);
+        // But the draft route (which decrypts) is now blocked.
+        const draft = await app.inject({
+            method: 'POST',
+            url: '/api/me/showcase/draft',
+            headers: auth(aliceToken),
+            payload: {retrospective_id: aliceRetroId, key: key.toString('base64')},
+        });
+        expect(draft.statusCode).toBe(403);
+        expect(draft.json().code).toBe('capture_not_enabled');
     });
 
     it('refuses to publish when showcasing is disabled for the team', async () => {
