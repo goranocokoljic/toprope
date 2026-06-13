@@ -182,7 +182,7 @@ export function registerShowcaseRoutes(app: FastifyInstance, db: Database.Databa
             return {
                 data: {
                     retrospectiveId,
-                    sessionId: draft.sessionId,
+                    sessionId: retrospective.sessionId,
                     draft: draft.plaintext,
                     captureCount: draft.captureCount,
                 },

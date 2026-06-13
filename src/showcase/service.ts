@@ -26,7 +26,7 @@
  */
 
 import type Database from 'better-sqlite3';
-import {decryptSessionToText, SessionDecryptError} from '../capture/session-decrypt';
+import {decryptSessionToText, SessionDecryptError, type DecryptedSession} from '../capture/session-decrypt';
 import {insertShowcaseExample} from './store';
 import {isShowcaseEnabledForTeam, isScopePermittedForTeam} from './gate';
 import type {ShowcaseExample, ShowcaseScope} from './types';
@@ -50,15 +50,6 @@ export class ShowcaseError extends Error {
     }
 }
 
-/** The transient result of decrypting a session for promotion: the joined plaintext draft. */
-export interface ShowcaseDraft {
-    sessionId: string;
-    /** The decrypted conversation, concatenated chronologically. Transient: never persisted/logged. */
-    plaintext: string;
-    /** How many capture rows the draft was built from (provenance for the owner). */
-    captureCount: number;
-}
-
 export interface DraftFromSessionInput {
     developerId: string;
     sessionId: string;
@@ -70,14 +61,14 @@ export interface DraftFromSessionInput {
  * Transiently decrypt one of the owner's OWN captured sessions into an editable
  * draft. Delegates the crypto handling to the shared `decryptSessionToText` (the
  * one home for "captures are blind ciphertext, decrypt in memory, never persist or
- * log"), then re-types its failures as `ShowcaseError` so this route maps them to
- * HTTP the same way the rest of the showcase surface does. The returned plaintext
- * is the owner's to redact — it is never persisted or logged here.
+ * log") and returns its `DecryptedSession` directly — the caller already holds the
+ * session id, so there's nothing to add. Failures are re-typed as `ShowcaseError`
+ * so this route maps them to HTTP the same way the rest of the showcase surface
+ * does. The returned plaintext is the owner's to redact — never persisted/logged here.
  */
-export function draftFromSession(db: Database.Database, input: DraftFromSessionInput): ShowcaseDraft {
+export function draftFromSession(db: Database.Database, input: DraftFromSessionInput): DecryptedSession {
     try {
-        const {plaintext, captureCount} = decryptSessionToText(db, input.developerId, input.sessionId, input.key);
-        return {sessionId: input.sessionId, plaintext, captureCount};
+        return decryptSessionToText(db, input.developerId, input.sessionId, input.key);
     } catch (err) {
         if (err instanceof SessionDecryptError) {
             throw new ShowcaseError(err.code, err.message);
