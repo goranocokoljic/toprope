@@ -268,7 +268,8 @@ function aggregateForDeveloperIds(
  * excluded from the org roll-up (issue #145), so a team that opted the pillar out
  * is not silently represented in the org aggregate even though its own panel hides
  * it. The caller still gates the whole roll-up on the GLOBAL flag; this only drops
- * the opted-out teams' developers from the pool.
+ * the opted-out teams' developers from the pool — see org-pool.ts for how this
+ * relates to (but does not duplicate) Pillar 3's per-developer opt-in cohort.
  *
  * Loads the eligible developer ids into a single `IN (...)` clause (same pattern as
  * leaderboard.ts / compare.ts). SQLite caps bound parameters
