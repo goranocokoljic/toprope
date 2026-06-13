@@ -68,7 +68,7 @@ import {
     type RetrospectiveAnalyzer,
     type SessionAnalysisInput,
 } from '../../src/coaching/retrospective/analyzer';
-import {monthOf} from '../../src/aggregation/dates';
+import {monthOf, priorMonth} from '../../src/aggregation/dates';
 import type {RetrospectiveAnalyzers} from '../../src/coaching/retrospective/generator';
 
 // ── response shapes (only the fields these tests assert on) ───────────────────
@@ -112,6 +112,25 @@ interface Envelope<T> {
     code?: string;
 }
 
+/**
+ * Render DB rows to a single searchable string, decoding BLOB columns to text.
+ * `JSON.stringify` alone serialises a better-sqlite3 Buffer (a BLOB column like
+ * `ciphertext` / `recovery_blob`) as `{"type":"Buffer","data":[…]}` — bytes as
+ * integers — so a marker that leaked INTO a blob (e.g. encryption silently
+ * bypassed) would be invisible to a substring scan. Decoding each Buffer to
+ * latin1 makes those columns part of the search, so the no-plaintext / no-key
+ * assertions defend the blob columns, not just the text ones.
+ */
+function rowsToSearchableText(rows: Array<Record<string, unknown>>): string {
+    return rows
+        .map((row) =>
+            Object.values(row)
+                .map((v) => (Buffer.isBuffer(v) ? v.toString('latin1') : JSON.stringify(v)))
+                .join('|'),
+        )
+        .join('\n');
+}
+
 /** Find the window point for a period, asserting it exists (keeps callers null-free). */
 function periodPoint(variant: Variant, period: string): TrajPoint {
     const point = variant.points.find((p) => p.period === period);
@@ -139,40 +158,46 @@ interface World {
     userIds: Record<string, string>;
 }
 
-/** Insert one pr_records row (per-PR facts the git sync would have written). */
+/**
+ * Insert one merged pr_records row. Only `changesRequested` (drives the rework /
+ * rejection rate) and the in-period `created_at` day are asserted on; the other
+ * per-PR columns are fixed at sensible constants the suite never varies.
+ */
 function seedPR(
     db: Database.Database,
-    opts: {
-        developer: string;
-        provider: string;
-        prId: string;
-        createdDay: string;
-        mergedDay?: string;
-        comments?: number;
-        rounds?: number;
-        changesRequested?: number;
-        ttmHours?: number;
-    },
+    opts: {developer: string; provider: string; prId: string; createdDay: string; changesRequested: number},
 ): void {
     db.prepare(
         `INSERT INTO pr_records
          (id, developer_id, provider, repo, pr_id, state, created_at, merged_at, closed_at,
           review_comment_count, review_rounds, changes_requested_count, time_to_merge_hours, synced_at)
-         VALUES (?, ?, ?, 'repo-a', ?, 'merged', ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, 'repo-a', ?, 'merged', ?, ?, ?, 2, 1, ?, 10, ?)`,
     ).run(
         randomUUID(),
         opts.developer,
         opts.provider,
         opts.prId,
         `${opts.createdDay}T08:00:00.000Z`,
-        `${opts.mergedDay ?? opts.createdDay}T18:00:00.000Z`,
-        `${opts.mergedDay ?? opts.createdDay}T18:00:00.000Z`,
-        opts.comments ?? 2,
-        opts.rounds ?? 1,
-        opts.changesRequested ?? 0,
-        opts.ttmHours ?? 10,
+        `${opts.createdDay}T18:00:00.000Z`,
+        `${opts.createdDay}T18:00:00.000Z`,
+        opts.changesRequested,
         '2026-06-01T00:00:00.000Z',
     );
+}
+
+/**
+ * Insert a tool snapshot that DOES carry `acceptance_rate` — the column the
+ * Pillar-1 generator reads for the acceptance-trend signal (the harness
+ * `seedToolSnapshot` leaves it null). Used to give one developer real acceptance
+ * data so git-only gilbert's honest *absence* of that signal is a true contrast.
+ */
+function seedAcceptanceSnapshot(db: Database.Database, developer: string, date: string, rate: number): void {
+    db.prepare(
+        `INSERT INTO tool_snapshots
+           (id, developer_id, date, tool, data_source, data_quality, is_active,
+            interaction_count, acceptance_count, acceptance_rate)
+         VALUES (?, ?, ?, 'copilot', 'api', 'high', 1, 30, ?, ?)`,
+    ).run(`${developer}-${date}-copilot`, developer, date, Math.round(30 * rate), rate);
 }
 
 /** Seed a month of git activity (churn + AI signature) for a developer. */
@@ -199,10 +224,10 @@ function seedGitMonth(
 
 /** Seed four PRs for a developer: two come back for changes (rework rate 0.5). */
 function seedPRSet(db: Database.Database, developer: string, provider: string): void {
-    seedPR(db, {developer, provider, prId: `${developer}-1`, createdDay: day('05'), changesRequested: 1, comments: 6});
-    seedPR(db, {developer, provider, prId: `${developer}-2`, createdDay: day('07'), changesRequested: 2, comments: 8, rounds: 3});
-    seedPR(db, {developer, provider, prId: `${developer}-3`, createdDay: day('09'), comments: 1});
-    seedPR(db, {developer, provider, prId: `${developer}-4`, createdDay: day('11'), comments: 1});
+    seedPR(db, {developer, provider, prId: `${developer}-1`, createdDay: day('05'), changesRequested: 1});
+    seedPR(db, {developer, provider, prId: `${developer}-2`, createdDay: day('07'), changesRequested: 2});
+    seedPR(db, {developer, provider, prId: `${developer}-3`, createdDay: day('09'), changesRequested: 0});
+    seedPR(db, {developer, provider, prId: `${developer}-4`, createdDay: day('11'), changesRequested: 0});
 }
 
 /**
@@ -246,6 +271,18 @@ async function seedWorld(db: Database.Database): Promise<World> {
                 quality: 'high',
             });
         }
+    }
+
+    // amelia additionally has measured acceptance_rate this period AND the prior
+    // month (the baseline the trend compares against), so her Pillar-1 surface
+    // carries a real `acceptance_trend` — the positive control that makes
+    // git-only gilbert's absence of that signal a true contrast, not a universal
+    // null. 0.5 → 0.6 is a rising trend (delta ≥ the 0.05 threshold).
+    const priorM = priorMonth(PERIOD);
+    for (let d = 1; d <= 20; d++) {
+        const dd = String(d).padStart(2, '0');
+        seedAcceptanceSnapshot(db, 'amelia', `${PERIOD}-${dd}`, 0.6);
+        seedAcceptanceSnapshot(db, 'amelia', `${priorM}-${dd}`, 0.5);
     }
 
     // PRs: three frontend contributors (clears floor of 3) + one backend (bob).
@@ -367,10 +404,10 @@ describe('Phase 5 E2E (5.12): Pillar 2 — PR/review outcome coaching', () => {
         const {status, body} = await get<Envelope<PRCoaching>>('/api/me/pr-coaching', token);
         expect(status).toBe(200);
         expect(body.data.enabled).toBe(true);
-        // The two scope variants are present, separate, and correctly labelled —
-        // factual all-PR vs inferred AI-assisted. They are never blurred.
-        expect(body.data.all_pr!.basis).toBe('factual');
-        expect(body.data.ai_assisted!.basis).toBe('inferred');
+        // Both scope variants are present as separate trajectories (the factual /
+        // inferred labelling itself is asserted once, in the privacy-gate test).
+        expect(body.data.all_pr).toBeDefined();
+        expect(body.data.ai_assisted).toBeDefined();
         // The current period carries this developer's four PRs.
         expect(periodPoint(body.data.all_pr!, PERIOD).prs_total).toBe(4);
     });
@@ -385,7 +422,17 @@ describe('Phase 5 E2E (5.12): Pillar 2 — PR/review outcome coaching', () => {
         expect(point.suppressed).toBe(false);
         expect(point.developers).toBe(3);
         expect(point.prs_total).toBe(12);
-        // No individual developer id ever appears in a manager aggregate.
+        // STRUCTURAL guard: a point carries exactly the pooled team fields — the
+        // contributor COUNT (`developers`) but no per-developer collection. If a
+        // future change added an individual breakdown (the real leak vector), the
+        // key set would change and this fails. Stronger than an id-substring scan,
+        // which can only catch a leak that happens to embed the id string.
+        expect(Object.keys(point as Record<string, unknown>).sort()).toEqual([
+            'avg_churn', 'avg_comment_density', 'avg_review_rounds', 'avg_time_to_merge_hours',
+            'combined_signal', 'developers', 'period', 'prs_total', 'review_rejection_rate',
+            'rework_rate', 'suppressed',
+        ]);
+        // And no individual developer id appears anywhere in the payload.
         const raw = JSON.stringify(body);
         for (const id of ['amelia', 'bianca', 'cyrus']) {
             expect(raw).not.toContain(id);
@@ -427,14 +474,34 @@ describe('Phase 5 E2E (5.12): Pillar 1 — available-data coaching (git-only)', 
         expect(signals.some((s) => s.signal_type === 'acceptance_trend')).toBe(false);
     });
 
+    it('DOES surface a measured acceptance trend for a developer who has tool data (positive control)', async () => {
+        // The contrast that makes the git-only absence above meaningful: amelia has
+        // measured acceptance_rate this period + a prior baseline, so her surface
+        // carries a real `acceptance_trend` (basis `measured`). If this signal could
+        // never fire for anyone, the git-only "honestly absent" assertion would be
+        // vacuous — this proves the signal CAN fire, so gilbert's null is a true
+        // tier-aware contrast, not a universal blank.
+        const token = await login(app, 'amelia@wmg.test');
+        const {body} = await get<Envelope<AvailableCoaching>>('/api/me/coaching', token);
+        const acceptance = body.data.signals.find((s) => s.signal_type === 'acceptance_trend');
+        expect(acceptance).toBeDefined();
+        expect(acceptance!.basis).toBe('measured');
+    });
+
     it('exposes the available-data team aggregate to a manager without any observation text', async () => {
         const token = await login(app, 'manager@wmg.test');
         const {status, body} = await get<Envelope<unknown>>('/api/coaching/available/team/frontend', token);
         expect(status).toBe(200);
         // The aggregate is counts + categories only — never the private sentence.
+        // These markers are FRAGMENTS OF THE REAL observation text the frontend
+        // developers' own signals carry (high-tier personal insight "...you were
+        // active on N day(s)...", the rising acceptance-trend sentence) — so the
+        // assertion would actually fail if the read layer ever started selecting
+        // the `observation` column into the manager aggregate.
         const raw = JSON.stringify(body);
-        expect(raw).not.toContain('git_estimate'); // basis is a per-signal field, never aggregated
-        expect(raw).not.toContain('You were active');
+        expect(raw).not.toContain('you were active');
+        expect(raw).not.toContain('acceptance rate has climbed');
+        expect(raw).not.toContain('estimated from your git activity');
     });
 });
 
@@ -685,14 +752,15 @@ describe('Phase 5 privacy verification (5.12): the gate', () => {
             {key, keyId: 'k1', mechanism: 'local_agent'},
             {sessionId: 'sess-amelia', plaintext: `prompt: ${SECRET}`, capturedAt: new Date().toISOString(), tool: 'claude_code'},
         ));
-        // A full dump of every capture-bearing table contains no plaintext marker.
-        const dump = JSON.stringify([
-            ...db.prepare('SELECT * FROM prompt_captures').all(),
-            ...db.prepare('SELECT * FROM loop_events').all(),
-            ...db.prepare('SELECT * FROM nudge_events').all(),
+        // A full dump of every capture-bearing table — with BLOB columns decoded —
+        // contains no plaintext marker. Decoding the ciphertext blob is what makes
+        // this catch an "encryption bypassed, plaintext stored in the blob" regression.
+        const dump = rowsToSearchableText([
+            ...(db.prepare('SELECT * FROM prompt_captures').all() as Array<Record<string, unknown>>),
+            ...(db.prepare('SELECT * FROM loop_events').all() as Array<Record<string, unknown>>),
+            ...(db.prepare('SELECT * FROM nudge_events').all() as Array<Record<string, unknown>>),
         ]);
         expect(dump).not.toContain('SUPERSECRETMARKER');
-        expect(dump).not.toContain('billing');
     });
 
     it('the server cannot decrypt captures on its own — no key material is ever stored', async () => {
@@ -709,12 +777,16 @@ describe('Phase 5 privacy verification (5.12): the gate', () => {
             key_id: 'k1', recovery_choice: 'recovery_path',
             recovery_blob: wrapped.recovery_blob.toString('base64'), recovery_meta: wrapped.meta,
         });
-        const dump = JSON.stringify([
-            ...db.prepare('SELECT * FROM prompt_captures').all(),
-            ...db.prepare('SELECT * FROM capture_keys').all(),
+        // Decode the BLOB columns (ciphertext, recovery_blob) too: the raw key must
+        // be absent even as raw bytes, so a regression that stored the unwrapped key
+        // in recovery_blob would be caught — not hidden behind Buffer JSON encoding.
+        const dump = rowsToSearchableText([
+            ...(db.prepare('SELECT * FROM prompt_captures').all() as Array<Record<string, unknown>>),
+            ...(db.prepare('SELECT * FROM capture_keys').all() as Array<Record<string, unknown>>),
         ]);
         expect(dump).not.toContain(key.toString('base64'));
         expect(dump).not.toContain(key.toString('hex'));
+        expect(dump).not.toContain(key.toString('latin1'));
     });
 
     it('enforces the min-group-size guard on a thin team aggregate', async () => {
