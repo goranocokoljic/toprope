@@ -27,7 +27,6 @@ import {requireDeveloperId} from './guards';
 import {getDeveloperById} from '../../registry/developers';
 import {captureGate} from '../../capture/gate';
 import {resolveDeveloperPreferences} from '../../settings/store';
-import {CAPTURE_KEY_BYTES} from '../../capture/encryption';
 import {
     answerFollowUp,
     generateRetrospective,
@@ -42,7 +41,7 @@ import {
     listRetrospectivesForDeveloper,
 } from '../../coaching/retrospective/store';
 import {isAnalysisLocation, type AnalysisLocation} from '../../coaching/retrospective/types';
-import {asObject, badRequest, BASE64_RE} from './body-validation';
+import {asObject, badRequest, decodeCaptureKey} from './body-validation';
 
 // Allowlist exactly the fields each route accepts. The generate/follow-up bodies
 // legitimately carry the developer's key (the one transient secret), so unlike the
@@ -70,20 +69,6 @@ function rejectUnknownKeys(obj: Record<string, unknown>, allowed: readonly strin
         }
     }
     return true;
-}
-
-/** Validate the base64 key and decode it to exactly the AES-256 key length, or 400. */
-function decodeKey(raw: unknown, reply: FastifyReply): Buffer | null {
-    if (typeof raw !== 'string' || raw.length === 0 || !BASE64_RE.test(raw) || raw.length % 4 !== 0) {
-        badRequest(reply, 'key must be a non-empty base64 string');
-        return null;
-    }
-    const key = Buffer.from(raw, 'base64');
-    if (key.length !== CAPTURE_KEY_BYTES) {
-        badRequest(reply, `key must decode to exactly ${CAPTURE_KEY_BYTES} bytes (AES-256)`);
-        return null;
-    }
-    return key;
 }
 
 /** Send the typed generator error as its mapped HTTP status; rethrow anything else. */
@@ -180,7 +165,7 @@ export function registerRetrospectiveRoutes(
             requestedLocation = obj.analysis_location;
         }
 
-        const key = decodeKey(obj.key, reply);
+        const key = decodeCaptureKey(obj.key, reply);
         if (!key) {
             return reply;
         }
@@ -282,7 +267,7 @@ export function registerRetrospectiveRoutes(
             return reply;
         }
 
-        const key = decodeKey(obj.key, reply);
+        const key = decodeCaptureKey(obj.key, reply);
         if (!key) {
             return reply;
         }

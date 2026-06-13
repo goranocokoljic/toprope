@@ -32,6 +32,7 @@ import {registerCaptureRoutes} from './dashboard/api/captures';
 import {registerKeyRoutes} from './dashboard/api/keys';
 import {registerRealtimeCoachingRoutes} from './dashboard/api/realtime-coaching';
 import {registerRetrospectiveRoutes} from './dashboard/api/retrospectives';
+import {registerShowcaseRoutes} from './dashboard/api/showcase';
 import {registerDashboardStatic} from './dashboard/static';
 import {createSlackClient} from './slack/client';
 import {notifyNewAnomalies} from './anomaly/notify';
@@ -139,6 +140,14 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
     // opt-in #2), and persists ONLY the narrative output — never the key/plaintext.
     // All /api/me, developer-private; no manager path.
     registerRetrospectiveRoutes(app, db);
+    // Exemplary-conversation showcase (Task 5.8): the deliberate, OWNER-ONLY bridge
+    // from a private encrypted capture to an org-visible example. Promote transiently
+    // decrypts one of the developer's OWN sessions into an editable draft; publish
+    // writes only the owner's REDACTED content to the SEPARATE shared store
+    // (showcase_examples) after a mandatory redaction acknowledgement and a live
+    // scope/enablement check. The private capture is never touched; nothing is ever
+    // auto-harvested. All /api/me, developer-owned; no manager path.
+    registerShowcaseRoutes(app, db);
 
     // Data-prompted surveys (Task 4.3): manager queue + developer self-service.
     // Survey delivery prefers the Slack bot when configured, with an email
