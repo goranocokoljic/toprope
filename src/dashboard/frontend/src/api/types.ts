@@ -498,15 +498,91 @@ export interface TeamPRReviewCoaching {
     ai_assisted: TeamCoachingVariantTrajectory;
 }
 
-/**
- * /api/coaching/pr-review/{org,team} response. Pillar 2 gating (Task 5.10)
- * applies to the manager aggregate too: when the pillar is off the server returns
- * `{enabled:false}` with no aggregate, so the surface is hidden everywhere, not
- * just on the developer's own view.
- */
-export type TeamPRReviewCoachingResponse =
-    | {enabled: false}
-    | ({enabled: true} & TeamPRReviewCoaching);
+// ── Manager aggregate coaching panel (Task 5.11) ────────────────────────────
+// The unified manager surface over all three pillars: PR/review trends, churn/
+// effectiveness trends, anonymized loop/nudge patterns (opted-in developers
+// only), and synthesized team coaching opportunities. TEAM-LEVEL ONLY — no shape
+// here carries a developer id or an individual's number, and there is no
+// drill-down endpoint to one developer's coaching.
+
+/** The four available-data signal kinds, mirroring the backend signal_type. */
+export type AvailableSignalType =
+    | 'churn_reflection'
+    | 'acceptance_trend'
+    | 'journey_coaching'
+    | 'personal_insight';
+
+/** One period's available-data team aggregate — suppressed, or a count + tally. */
+export interface TeamAvailablePoint {
+    period: string;
+    suppressed: boolean;
+    developers: number | null;
+    /** category → count (e.g. {elevated: 2, lower: 1}); null when suppressed. */
+    categories: Record<string, number> | null;
+}
+
+export interface TeamAvailableSeries {
+    signal_type: AvailableSignalType;
+    points: TeamAvailablePoint[];
+}
+
+/** Manager available-data (churn/effectiveness) aggregate — trends only, no text. */
+export interface TeamAvailableCoaching {
+    scope: string;
+    period_unit: PRReviewPeriodUnit;
+    series: TeamAvailableSeries[];
+}
+
+/** The structural nudge types, mirroring the backend closed set. */
+export type NudgeType = 'short_prompt' | 'missing_context' | 'missing_error' | 'repeated_prompt';
+
+/** One floored count cell (loops, or one nudge type) — suppressed carries no numbers. */
+export interface LoopNudgeCell {
+    suppressed: boolean;
+    developers: number | null;
+    total: number | null;
+}
+
+export interface LoopNudgeTypeCell extends LoopNudgeCell {
+    nudge_type: NudgeType;
+}
+
+/** Pillar 3 loop/nudge pattern aggregate — built from opted-in developers only. */
+export interface LoopNudgeAggregate {
+    scope: string;
+    period_unit: PRReviewPeriodUnit;
+    /**
+     * Developers in scope who effectively opted into capture (eligibility count),
+     * floored: exact only at or above the min-group-size, else `null` (too few —
+     * including none — to show without risking identifying who opted in).
+     */
+    opted_in_developers: number | null;
+    loops: LoopNudgeCell;
+    nudges: LoopNudgeTypeCell[];
+}
+
+export type OpportunityPillar = 'pr_review' | 'available' | 'loop_nudge';
+
+/** A team coaching opportunity — a suggestion framed as an opportunity, never a judgment. */
+export interface TeamCoachingOpportunity {
+    id: string;
+    pillar: OpportunityPillar;
+    title: string;
+    suggestion: string;
+}
+
+/** A pillar section discriminated by `enabled` (disabled → hidden by the UI). */
+export type PillarSection<T> = {enabled: false} | ({enabled: true} & T);
+
+/** The unified manager coaching panel. From /api/coaching/manager/{org,team}. */
+export interface ManagerCoachingPanel {
+    scope: string;
+    period_unit: PRReviewPeriodUnit;
+    pr_review: PillarSection<TeamPRReviewCoaching>;
+    available: PillarSection<TeamAvailableCoaching>;
+    loop_nudge: PillarSection<LoopNudgeAggregate>;
+    opportunities: TeamCoachingOpportunity[];
+}
 
 /** First→last detected AI activity — the span of the journey timeline. */
 export interface JourneyBounds {

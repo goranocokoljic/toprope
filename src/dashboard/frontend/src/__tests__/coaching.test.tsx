@@ -16,6 +16,7 @@ import {
 } from '../components/coaching';
 import type {
     DeveloperPRReviewCoaching,
+    ManagerCoachingPanel,
     PRReviewMetricTrend,
     TeamPRReviewCoaching,
 } from '../api/types';
@@ -73,6 +74,50 @@ const TEAM_COACHING: TeamPRReviewCoaching = {
     },
 };
 
+// The unified manager panel (Task 5.11) wraps the PR/review aggregate alongside
+// the churn/effectiveness aggregate, the opted-in loop/nudge patterns, and the
+// synthesized opportunities. Reuses the PR fixture above for the pr_review pillar.
+const TEAM_PANEL: ManagerCoachingPanel = {
+    scope: 'org',
+    period_unit: 'monthly',
+    pr_review: {enabled: true, ...TEAM_COACHING},
+    available: {
+        enabled: true,
+        scope: 'org',
+        period_unit: 'monthly',
+        series: [
+            {
+                signal_type: 'churn_reflection',
+                points: [
+                    {period: '2026-05', suppressed: true, developers: null, categories: null},
+                    {period: '2026-06', suppressed: false, developers: 4, categories: {elevated: 3, lower: 1}},
+                ],
+            },
+        ],
+    },
+    loop_nudge: {
+        enabled: true,
+        scope: 'org',
+        period_unit: 'monthly',
+        opted_in_developers: 4,
+        loops: {suppressed: false, developers: 3, total: 5},
+        nudges: [
+            {nudge_type: 'short_prompt', suppressed: true, developers: null, total: null},
+            {nudge_type: 'missing_context', suppressed: false, developers: 3, total: 4},
+            {nudge_type: 'missing_error', suppressed: true, developers: null, total: null},
+            {nudge_type: 'repeated_prompt', suppressed: true, developers: null, total: null},
+        ],
+    },
+    opportunities: [
+        {
+            id: 'loops_common',
+            pillar: 'loop_nudge',
+            title: 'Several developers hit detection loops',
+            suggestion: 'A shared debugging template may help.',
+        },
+    ],
+};
+
 function jsonResponse(body: unknown): Response {
     return new Response(JSON.stringify({data: body}), {status: 200, headers: {'Content-Type': 'application/json'}});
 }
@@ -98,7 +143,7 @@ function installFetch(): void {
 function installFetchWithTeams(): void {
     fetchMock = vi.fn(async (url: unknown) => {
         const path = new URL(String(url), 'http://localhost').pathname;
-        if (path === '/api/coaching/pr-review/org') return jsonResponse({enabled: true, ...TEAM_COACHING});
+        if (path === '/api/coaching/manager/org') return jsonResponse(TEAM_PANEL);
         if (path === '/api/teams') {
             return new Response(
                 JSON.stringify({data: [{name: 'eng'}], pagination: {page: 1, limit: 100, total: 1}}),
@@ -182,7 +227,7 @@ describe('MyCoaching — developer-private trajectory', () => {
 describe('TeamCoaching — manager aggregate only', () => {
     beforeEach(() => installFetchWithTeams());
 
-    it('renders team-level variants and the k-anonymity suppression note', async () => {
+    it('renders team-level PR variants and the k-anonymity suppression note', async () => {
         renderPage(<TeamCoaching />);
         expect(await screen.findByText('All PRs')).toBeInTheDocument();
         expect(screen.getByText('AI-assisted PRs')).toBeInTheDocument();
@@ -195,6 +240,30 @@ describe('TeamCoaching — manager aggregate only', () => {
         expect(
             await screen.findByText(/never shows or links to any one person's figures/i),
         ).toBeInTheDocument();
+    });
+
+    it('surfaces the churn/effectiveness aggregate (counts only)', async () => {
+        renderPage(<TeamCoaching />);
+        const summary = await screen.findByTestId('available-summary');
+        expect(summary).toHaveTextContent('Code churn');
+        // The latest sufficient point's count + category tally, never an individual figure.
+        expect(summary).toHaveTextContent(/4 developers/);
+    });
+
+    it('surfaces opted-in-only loop/nudge patterns with the opt-in basis stated', async () => {
+        renderPage(<TeamCoaching />);
+        expect(await screen.findByTestId('loop-nudge-optin')).toHaveTextContent(/opted-in developer/i);
+        const summary = screen.getByTestId('loop-nudge-summary');
+        // Loops + the one non-suppressed nudge type are shown; suppressed types are not.
+        expect(summary).toHaveTextContent('Detection loops');
+        expect(summary).toHaveTextContent('Missing context');
+        expect(summary).not.toHaveTextContent('Missing error text');
+    });
+
+    it('lists team coaching opportunities framed as suggestions', async () => {
+        renderPage(<TeamCoaching />);
+        const ops = await screen.findByTestId('coaching-opportunities');
+        expect(ops).toHaveTextContent('Several developers hit detection loops');
     });
 });
 
