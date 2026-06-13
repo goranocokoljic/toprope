@@ -10,6 +10,7 @@ import {
     getOrgCoaching,
     getTeamCoaching,
 } from '../../../src/coaching/available/coaching';
+import {setGlobalSetting, setTeamSetting} from '../../../src/settings/store';
 import type {CoachingSignalType} from '../../../src/coaching/available/types';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../../src/storage/migrations');
@@ -132,6 +133,43 @@ describe('getTeamCoaching (manager aggregate)', () => {
             .find((s) => s.signal_type === 'personal_insight')!
             .points.find((p) => p.period === '2026-05')!;
         expect(may.suppressed).toBe(false);
+        expect(may.developers).toBe(3);
+    });
+
+    it('excludes a team that overrode Pillar 1 off from the org roll-up (#145)', () => {
+        // A team that opted Pillar 1 OUT must not feed the ORG aggregate, even
+        // though the org roll-up still gates on the global flag.
+        setGlobalSetting(db, 'coaching_managers_can_override', true);
+        setTeamSetting(db, 'optout', 'coaching_pillar1_enabled', false);
+
+        const inIds = ['i1', 'i2', 'i3'].map((n) => seedDev(n, 'eng'));
+        const outIds = ['x1', 'x2', 'x3'].map((n) => seedDev(n, 'optout'));
+        for (const id of [...inIds, ...outIds]) {
+            insertSignal(id, '2026-05', 'personal_insight', 'measured', 't', 'high');
+        }
+
+        const org = getOrgCoaching(db, 'monthly', NOW);
+        const may = org.series
+            .find((s) => s.signal_type === 'personal_insight')!
+            .points.find((p) => p.period === '2026-05')!;
+        // Only the 3 eng developers — the opted-out team's 3 are excluded.
+        expect(may.suppressed).toBe(false);
+        expect(may.developers).toBe(3);
+    });
+
+    it('keeps a team whose override is inert because the governing flag is off (#145)', () => {
+        // Override row exists but coaching_managers_can_override defaults OFF, so
+        // resolveSetting ignores it → the pillar is still enabled for the team and
+        // it stays in the org pool.
+        setTeamSetting(db, 'eng', 'coaching_pillar1_enabled', false);
+
+        const ids = ['o1', 'o2', 'o3'].map((n) => seedDev(n, 'eng'));
+        for (const id of ids) insertSignal(id, '2026-05', 'personal_insight', 'measured', 't', 'high');
+
+        const org = getOrgCoaching(db, 'monthly', NOW);
+        const may = org.series
+            .find((s) => s.signal_type === 'personal_insight')!
+            .points.find((p) => p.period === '2026-05')!;
         expect(may.developers).toBe(3);
     });
 });

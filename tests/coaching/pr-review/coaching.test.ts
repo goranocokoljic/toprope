@@ -12,6 +12,7 @@ import {
     periodKeysEndingAt,
 } from '../../../src/coaching/pr-review/coaching';
 import {parsePeriodUnit} from '../../../src/dashboard/api/coaching-params';
+import {setGlobalSetting, setTeamSetting} from '../../../src/settings/store';
 import type {CombinedSignal, ScopeVariant} from '../../../src/coaching/pr-review/types';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../../src/storage/migrations');
@@ -189,6 +190,45 @@ describe('getTeamPRReviewCoaching — aggregate only, k-anonymity (Task 5.3)', (
         expect(result.scope).toBe('org');
         const june = result.all_pr.points.find((p) => p.period === '2026-06');
         expect(june?.suppressed).toBe(false);
+        expect(june?.developers).toBe(3);
+        expect(june?.prs_total).toBe(12);
+    });
+
+    it('excludes a team that overrode Pillar 2 off from the org roll-up (#145)', () => {
+        // A team that opted Pillar 2 OUT must not feed the ORG aggregate, even
+        // though the org roll-up still gates on the global flag. Its own panel
+        // already hides the pillar; the org view must agree.
+        setGlobalSetting(db, 'coaching_managers_can_override', true);
+        setTeamSetting(db, 'optout', 'coaching_pillar2_enabled', false);
+
+        const inIds = ['e1', 'e2', 'e3'].map((n) => dev(db, 'eng', n));
+        const outIds = ['o1', 'o2', 'o3'].map((n) => dev(db, 'optout', n));
+        for (const id of [...inIds, ...outIds]) {
+            seedMetric(db, {developerId: id, period: '2026-06', variant: 'all_pr', prsTotal: 4, rework: 0.2, rejection: 0.2});
+        }
+
+        const result = getOrgPRReviewCoaching(db, 'monthly', NOW);
+        const june = result.all_pr.points.find((p) => p.period === '2026-06');
+        // Only the 3 eng developers are pooled — the opted-out team's 3 are gone.
+        expect(june?.suppressed).toBe(false);
+        expect(june?.developers).toBe(3);
+        expect(june?.prs_total).toBe(12);
+    });
+
+    it('still pools a team whose override was set while the governing flag is off (#145)', () => {
+        // An override row that resolveSetting refuses to honor (governing flag off)
+        // must NOT exclude the team — the pillar stays enabled for them, so they
+        // remain in the org pool. Guards against keying exclusion off the raw row.
+        setTeamSetting(db, 'eng', 'coaching_pillar2_enabled', false);
+        // coaching_managers_can_override defaults OFF → the override is inert.
+
+        const ids = ['a', 'b', 'c'].map((n) => dev(db, 'eng', n));
+        for (const id of ids) {
+            seedMetric(db, {developerId: id, period: '2026-06', variant: 'all_pr', prsTotal: 4, rework: 0.2, rejection: 0.2});
+        }
+
+        const result = getOrgPRReviewCoaching(db, 'monthly', NOW);
+        const june = result.all_pr.points.find((p) => p.period === '2026-06');
         expect(june?.developers).toBe(3);
         expect(june?.prs_total).toBe(12);
     });
