@@ -3,18 +3,23 @@
  *
  * This module is the one home for the governance privacy contract:
  *
- *   * A team lead can REMOVE an example from THEIR team's showcase, but the verbs
- *     stop there. There is no promote, no publish, no edit here and no caller that
+ *   * Moderation can REMOVE an example from a team's showcase, but the verbs stop
+ *     there. There is no promote, no publish, no edit here and no caller that
  *     reaches into prompt_captures — removal only flips a published example to
- *     `removed` and records that it happened. The "a lead can never publish on a
- *     developer's behalf" guarantee is structural: publishing lives solely under
+ *     `removed` and records that it happened. The "moderation can never publish on
+ *     a developer's behalf" guarantee is structural: publishing lives solely under
  *     /api/me keyed off the developer's OWN session + retrospective, and nothing in
  *     this manager-facing path can create or alter a showcase example's content.
  *
- *   * "Their team's showcase" is enforced, not assumed. An example belongs to team
- *     T's showcase when it is team-scoped to T, OR its author is currently on team
- *     T (T's contribution to the org-wide showcase). A lead acting for T cannot
- *     remove another team's team-scoped example.
+ *   * The action is SCOPED to a named team, not gated by a per-team-lead identity.
+ *     GovProxy's role model is binary (admin | developer) with no team-lead role,
+ *     so `team` is the team whose showcase the removal is scoped to — it bounds
+ *     WHICH examples may be touched, not WHO may moderate. An example belongs to
+ *     team T's showcase when it is team-scoped to T, OR its author is currently on
+ *     team T (T's contribution to the org-wide showcase); a removal scoped to T is
+ *     refused for any other team's team-scoped example. (A future scoped team-lead
+ *     role would add an actor-membership check on top; the recorded team is a scope
+ *     label, not an authorization fact.)
  *
  *   * Every removal is LOGGED and the author NOTIFIED, atomically with the status
  *     flip — the transition and its audit/notification row commit together, so a
@@ -41,11 +46,12 @@ export class ShowcaseGovernanceError extends Error {
 }
 
 /**
- * Whether an example belongs to team `team`'s showcase — the boundary of a lead's
- * removal authority. True when the example is team-scoped to that team, or when
- * its author is currently on that team (so the team owns its org-wide
- * contribution too). Exported so the moderation LIST can show a lead exactly the
- * examples they could act on, using the same rule the removal enforces.
+ * Whether an example belongs to team `team`'s showcase — the boundary a removal
+ * scoped to that team may touch. True when the example is team-scoped to that
+ * team, or when its author is currently on that team (so the team owns its
+ * org-wide contribution too). The moderation LIST scopes by the same rule, but in
+ * SQL (see listPublishedExamples) to avoid a per-row lookup; this single-example
+ * form is what the removal path checks.
  */
 export function isExampleInTeamShowcase(db: Database.Database, example: ShowcaseExample, team: string): boolean {
     if (example.scope === 'team' && example.scopeTarget === team) {
@@ -98,8 +104,10 @@ export function removeExampleAsTeamLead(db: Database.Database, input: RemoveExam
 
     const occurredAt = new Date().toISOString();
     const removalId = db.transaction(() => {
-        // Re-check the transition inside the txn: markExampleRemoved only changes a
-        // still-published row, so a concurrent unpublish/remove can't double-log.
+        // The status flip and its audit/notification row commit together, so a
+        // removal is never recorded without the transition (or vice versa).
+        // markExampleRemoved only changes a still-published row, so the guard also
+        // means the (re-read) status check above can't lead to a double-log.
         if (!markExampleRemoved(db, input.exampleId)) {
             throw new ShowcaseGovernanceError('not_published', 'Example is no longer published; nothing to remove.');
         }

@@ -169,6 +169,43 @@ function accessScopeClause(viewerTeam: string | null): {sql: string; params: unk
 }
 
 /**
+ * Append the shared content filters (task_type / tool / scope) to a WHERE
+ * clause/param list, in place. The one home for these three filters so the
+ * access-scoped browse and the moderation list can't drift in how they apply
+ * them. Each is bound via `?` — only the values are user-supplied, never columns.
+ */
+function appendContentFilters(
+    clauses: string[],
+    params: unknown[],
+    filters: Pick<ShowcaseBrowseFilters, 'taskType' | 'tool' | 'scope'>,
+): void {
+    if (filters.taskType !== undefined) {
+        clauses.push('task_type = ?');
+        params.push(filters.taskType);
+    }
+    if (filters.tool !== undefined) {
+        clauses.push('tool = ?');
+        params.push(filters.tool);
+    }
+    if (filters.scope !== undefined) {
+        clauses.push('scope = ?');
+        params.push(filters.scope);
+    }
+}
+
+/** Run a showcase SELECT with the given AND-combined clauses + bound params, newest first. */
+function selectShowcase(db: Database.Database, clauses: string[], params: unknown[]): ShowcaseExample[] {
+    const rows = db
+        .prepare(
+            `SELECT * FROM showcase_examples
+             WHERE ${clauses.join(' AND ')}
+             ORDER BY published_at DESC, created_at DESC`,
+        )
+        .all(...params) as ShowcaseRow[];
+    return rows.map(rowToExample);
+}
+
+/**
  * Browse PUBLISHED examples a viewer may see, newest first, with optional
  * filters. Access scope is applied FIRST (see accessScopeClause) and the filters
  * only narrow within it — a `team` filter can never reveal another team's
@@ -184,19 +221,7 @@ export function browseShowcaseExamples(
     const access = accessScopeClause(viewerTeam);
     const clauses = ["status = 'published'", access.sql];
     const params: unknown[] = [...access.params];
-
-    if (filters.taskType !== undefined) {
-        clauses.push('task_type = ?');
-        params.push(filters.taskType);
-    }
-    if (filters.tool !== undefined) {
-        clauses.push('tool = ?');
-        params.push(filters.tool);
-    }
-    if (filters.scope !== undefined) {
-        clauses.push('scope = ?');
-        params.push(filters.scope);
-    }
+    appendContentFilters(clauses, params, filters);
     // A team filter narrows to that team's scope_target. Combined with the access
     // clause it is a no-op widening: org-scoped rows have a null scope_target and
     // so are excluded by it, leaving only that team's team-scoped examples — which
@@ -205,15 +230,7 @@ export function browseShowcaseExamples(
         clauses.push('scope_target = ?');
         params.push(filters.team);
     }
-
-    const rows = db
-        .prepare(
-            `SELECT * FROM showcase_examples
-             WHERE ${clauses.join(' AND ')}
-             ORDER BY published_at DESC, created_at DESC`,
-        )
-        .all(...params) as ShowcaseRow[];
-    return rows.map(rowToExample);
+    return selectShowcase(db, clauses, params);
 }
 
 /**
@@ -243,39 +260,32 @@ export function getShowcaseExampleById(db: Database.Database, exampleId: string)
     return row ? rowToExample(row) : undefined;
 }
 
+/** Filters for the moderation list: the shared content filters plus a `team` that scopes to one team's showcase. */
+export type ShowcaseModerationFilters = Pick<ShowcaseBrowseFilters, 'taskType' | 'tool' | 'scope'> & {team?: string};
+
 /**
  * All PUBLISHED examples (UNSCOPED by viewer/author), newest first, with optional
  * content filters — the moderation surface for team leads/admins. Deliberately
- * NOT access-scoped: a lead moderates by team membership (applied by the
- * governance layer), not by their own browse visibility. `status='published'`
- * still holds, so already-removed/unpublished examples never resurface here.
+ * NOT access-scoped: a lead moderates by team membership, not by their own browse
+ * visibility. `status='published'` still holds, so already-removed/unpublished
+ * examples never resurface here.
+ *
+ * A `team` filter narrows to that team's showcase IN SQL — team-scoped to the
+ * team, OR authored by a current member of the team — the same membership rule
+ * `isExampleInTeamShowcase` applies to a single example, kept here as one query
+ * rather than a per-row developer lookup.
  */
-export function listPublishedExamples(
-    db: Database.Database,
-    filters: Pick<ShowcaseBrowseFilters, 'taskType' | 'tool' | 'scope'> = {},
-): ShowcaseExample[] {
+export function listPublishedExamples(db: Database.Database, filters: ShowcaseModerationFilters = {}): ShowcaseExample[] {
     const clauses = ["status = 'published'"];
     const params: unknown[] = [];
-    if (filters.taskType !== undefined) {
-        clauses.push('task_type = ?');
-        params.push(filters.taskType);
+    appendContentFilters(clauses, params, filters);
+    if (filters.team !== undefined) {
+        clauses.push(
+            "((scope = 'team' AND scope_target = ?) OR author_developer_id IN (SELECT id FROM developers WHERE team = ?))",
+        );
+        params.push(filters.team, filters.team);
     }
-    if (filters.tool !== undefined) {
-        clauses.push('tool = ?');
-        params.push(filters.tool);
-    }
-    if (filters.scope !== undefined) {
-        clauses.push('scope = ?');
-        params.push(filters.scope);
-    }
-    const rows = db
-        .prepare(
-            `SELECT * FROM showcase_examples
-             WHERE ${clauses.join(' AND ')}
-             ORDER BY published_at DESC, created_at DESC`,
-        )
-        .all(...params) as ShowcaseRow[];
-    return rows.map(rowToExample);
+    return selectShowcase(db, clauses, params);
 }
 
 /**

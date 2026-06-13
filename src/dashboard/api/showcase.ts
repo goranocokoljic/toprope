@@ -47,7 +47,7 @@ import {
     unpublishOwnExample,
 } from '../../showcase/store';
 import {isShowcaseScope, type ShowcaseBrowseFilters, type ShowcaseScope} from '../../showcase/types';
-import {asObject, badRequest, decodeCaptureKey} from './body-validation';
+import {asObject, badRequest, decodeCaptureKey, optionalQueryString, rejectUnknownKeys} from './body-validation';
 
 // Allowlist exactly the fields each route accepts. The draft body legitimately
 // carries the developer's key (the one transient secret); publish never does — it
@@ -79,16 +79,6 @@ const ERROR_STATUS: Record<ShowcaseErrorCode, number> = {
     scope_not_permitted: 403,
     redaction_required: 400,
 };
-
-function rejectUnknownKeys(obj: Record<string, unknown>, allowed: readonly string[], reply: FastifyReply): boolean {
-    for (const key of Object.keys(obj)) {
-        if (!allowed.includes(key)) {
-            badRequest(reply, `Field '${key}' is not accepted; this route accepts exactly ${allowed.join(', ')}`);
-            return false;
-        }
-    }
-    return true;
-}
 
 /** Send the typed service error as its mapped HTTP status; rethrow anything else. */
 function sendShowcaseError(err: unknown, reply: FastifyReply): FastifyReply {
@@ -454,13 +444,4 @@ export function registerShowcaseRoutes(app: FastifyInstance, db: Database.Databa
         }
         return {data: {acknowledged: true}};
     });
-}
-
-/** Read an optional querystring filter: a non-empty trimmed string, or undefined when absent/blank. */
-function optionalQueryString(value: unknown): string | undefined {
-    if (typeof value !== 'string') {
-        return undefined;
-    }
-    const trimmed = value.trim();
-    return trimmed.length === 0 ? undefined : trimmed;
 }

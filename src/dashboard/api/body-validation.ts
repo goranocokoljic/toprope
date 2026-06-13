@@ -50,6 +50,35 @@ export function decodeCaptureKey(raw: unknown, reply: FastifyReply): Buffer | nu
 }
 
 /**
+ * Reject any body key outside `allowed`: sends a 400 and returns false on the
+ * first unknown key, true when every key is allowlisted. The one home for the
+ * allowlist sweep shared by the showcase routes (publish, governance remove) so
+ * they reject unexpected fields with one identical message.
+ */
+export function rejectUnknownKeys(
+    obj: Record<string, unknown>,
+    allowed: readonly string[],
+    reply: FastifyReply,
+): boolean {
+    for (const key of Object.keys(obj)) {
+        if (!allowed.includes(key)) {
+            badRequest(reply, `Field '${key}' is not accepted; this route accepts exactly ${allowed.join(', ')}`);
+            return false;
+        }
+    }
+    return true;
+}
+
+/** Read an optional querystring filter: a non-empty trimmed string, or undefined when absent/blank. */
+export function optionalQueryString(value: unknown): string | undefined {
+    if (typeof value !== 'string') {
+        return undefined;
+    }
+    const trimmed = value.trim();
+    return trimmed.length === 0 ? undefined : trimmed;
+}
+
+/**
  * Validate a public "meta" object: exactly the allowed keys (no unknown/nested
  * field can smuggle in a secret), each a non-empty string, and the serialized
  * size bounded. Sends a 400 and returns false on any failure; returns true when
