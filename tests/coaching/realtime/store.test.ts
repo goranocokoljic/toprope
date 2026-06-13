@@ -6,6 +6,7 @@ import {
     insertLoopEvent,
     insertNudgeEvent,
     listLoopEventsForDeveloper,
+    listLoopEventsForSession,
     listNudgeEventsForDeveloper,
 } from '../../../src/coaching/realtime/store';
 
@@ -33,6 +34,18 @@ describe('realtime coaching store (Task 5.6)', () => {
         const events = listLoopEventsForDeveloper(db, 'alice');
         expect(events).toHaveLength(1);
         expect(events[0]).toMatchObject({developerId: 'alice', sessionId: 's1', similarPromptCount: 3});
+    });
+
+    it('lists loop events for one session, scoped to the owner', () => {
+        insertLoopEvent(db, 'alice', {sessionId: 's1', detectedAt: NOW, similarPromptCount: 3});
+        insertLoopEvent(db, 'alice', {sessionId: 's2', detectedAt: NOW, similarPromptCount: 4});
+        insertLoopEvent(db, 'bob', {sessionId: 's1', detectedAt: NOW, similarPromptCount: 9});
+        const s1 = listLoopEventsForSession(db, 'alice', 's1');
+        expect(s1).toHaveLength(1);
+        expect(s1[0]).toMatchObject({developerId: 'alice', sessionId: 's1', similarPromptCount: 3});
+        // Another developer's same-named session is never returned.
+        expect(listLoopEventsForSession(db, 'alice', 's1').some((e) => e.developerId === 'bob')).toBe(false);
+        expect(listLoopEventsForSession(db, 'alice', 'unknown')).toHaveLength(0);
     });
 
     it('persists nudge events (un-dismissed) and supports dismissal', () => {
