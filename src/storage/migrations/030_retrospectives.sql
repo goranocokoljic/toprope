@@ -38,6 +38,11 @@ CREATE TABLE retrospectives (
     analysis_location TEXT NOT NULL CHECK (analysis_location IN ('local', 'cloud')),
     retrospective_text TEXT NOT NULL,      -- the coaching narrative (private to dev)
     highlights TEXT,                       -- JSON: { worked: string[], improve: string[] }
+    -- Provenance: how many capture rows the narrative was derived from. A retrospective
+    -- is a DERIVED artifact over capture rows; recording the analyzed count lets a later
+    -- reader tell what the narrative was built on (e.g. a partial/short session) instead
+    -- of having to guess. Counts only — never the prompts themselves.
+    analyzed_capture_count INTEGER NOT NULL,
     created_at TEXT NOT NULL               -- when the server stored the row (UTC ISO)
 );
 

@@ -91,6 +91,22 @@ describe('Retrospective generator (Task 5.7)', () => {
         expect(retro.analysisLocation).toBe('local');
         expect(retro.analysisModel).toBe('local-default');
         expect(retro.retrospectiveText.length).toBeGreaterThan(0);
+        // Provenance: the single seeded capture is recorded as what was analyzed.
+        expect(retro.analyzedCaptureCount).toBe(1);
+    });
+
+    it('records how many captures the retrospective was derived from (provenance)', async () => {
+        seedCapture(db, 'alice', key, 'prompt: first');
+        seedCapture(db, 'alice', key, 'prompt: second');
+        const retro = await generateRetrospective(db, {
+            developerId: 'alice',
+            sessionId: SESSION,
+            key,
+            requestedLocation: 'local',
+            cloudAllowed: false,
+            analyzers: localOnly(),
+        });
+        expect(retro.analyzedCaptureCount).toBe(2);
     });
 
     it('NEVER persists or exposes the decrypted plaintext (verified)', async () => {

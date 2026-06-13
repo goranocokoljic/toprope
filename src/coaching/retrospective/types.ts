@@ -39,6 +39,8 @@ export interface Retrospective {
     retrospectiveText: string;
     /** Structured highlights, or null if none were produced. */
     highlights: RetrospectiveHighlights | null;
+    /** Provenance: how many capture rows the narrative was built from. */
+    analyzedCaptureCount: number;
     createdAt: string;
 }
 
@@ -51,4 +53,6 @@ export interface RetrospectiveOutput {
     analysisLocation: AnalysisLocation;
     retrospectiveText: string;
     highlights: RetrospectiveHighlights | null;
+    /** Provenance: how many capture rows the narrative was built from. */
+    analyzedCaptureCount: number;
 }

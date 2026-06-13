@@ -27,7 +27,6 @@ import type Database from 'better-sqlite3';
 import {decryptCapture, type EncryptionMeta} from '../../capture/encryption';
 import {listSessionCapturesForDeveloper} from '../../capture/store';
 import {listLoopEventsForSession} from '../realtime/store';
-import type {LoopEventMeta} from '../realtime/types';
 import type {RetrospectiveAnalyzer, SessionAnalysisInput} from './analyzer';
 import {insertRetrospective} from './store';
 import type {AnalysisLocation, Retrospective} from './types';
@@ -95,13 +94,28 @@ function toEncryptionMeta(meta: Record<string, unknown>): EncryptionMeta {
     return {algo, iv, auth_tag, key_id};
 }
 
+/** The transient result of decrypting a session: the joined plaintext plus the
+ * number of capture rows it was built from (recorded as provenance — see below). */
+interface DecryptedSession {
+    /** The decrypted prompts/responses, concatenated. Transient: never persisted/logged. */
+    plaintext: string;
+    /** How many capture rows were decrypted and analyzed — stored on the retrospective. */
+    captureCount: number;
+}
+
 /**
  * Decrypt every capture in a session and concatenate the plaintext in chronological
- * order. The returned string is transient — the caller uses it for analysis and
+ * order. The returned `plaintext` is transient — the caller uses it for analysis and
  * lets it fall out of scope; it is never persisted or logged. A wrong key (or any
  * tampering) makes GCM verification throw, surfaced as a typed `decrypt_failed`.
+ *
+ * Ordering note: `captured_at` is CLIENT-supplied (it rides the capture payload and
+ * is never server-stamped), so the chronological reconstruction is best-effort —
+ * clock skew or ties fall back to `created_at` (server insert order). The analyser
+ * counts signals rather than depending on strict order, so a mis-ordered narrative
+ * reads oddly at worst; it does not corrupt the counts.
  */
-function decryptSession(db: Database.Database, developerId: string, sessionId: string, key: Buffer): string {
+function decryptSession(db: Database.Database, developerId: string, sessionId: string, key: Buffer): DecryptedSession {
     const captures = listSessionCapturesForDeveloper(db, developerId, sessionId);
     if (captures.length === 0) {
         throw new RetrospectiveError('no_captures', 'No captured session found to analyze');
@@ -118,16 +132,7 @@ function decryptSession(db: Database.Database, developerId: string, sessionId: s
             throw new RetrospectiveError('decrypt_failed', 'Could not decrypt the session with the provided key');
         }
     }
-    return parts.join('\n');
-}
-
-/**
- * The session's loop metadata (Task 5.6) — counts only, no content. A stored
- * LoopEvent is a structural superset of the LoopEventMeta the analyser consumes,
- * so the session-scoped rows are passed straight through (no re-mapping needed).
- */
-function loopEventsForSession(db: Database.Database, developerId: string, sessionId: string): LoopEventMeta[] {
-    return listLoopEventsForSession(db, developerId, sessionId);
+    return {plaintext: parts.join('\n'), captureCount: captures.length};
 }
 
 /**
@@ -169,11 +174,13 @@ export async function generateRetrospective(
     const analyzer = selectAnalyzer(input.requestedLocation, input.cloudAllowed, input.analyzers);
     // Decrypt only AFTER the gate passes, so a forbidden cloud request never even
     // produces plaintext in memory.
-    const plaintext = decryptSession(db, input.developerId, input.sessionId, input.key);
+    const {plaintext, captureCount} = decryptSession(db, input.developerId, input.sessionId, input.key);
     const analysisInput: SessionAnalysisInput = {
         sessionId: input.sessionId,
         plaintext,
-        loopEvents: loopEventsForSession(db, input.developerId, input.sessionId),
+        // A stored LoopEvent is a structural superset of the LoopEventMeta the analyser
+        // consumes, so the session-scoped rows are passed straight through.
+        loopEvents: listLoopEventsForSession(db, input.developerId, input.sessionId),
     };
     const result = await analyzer.analyze(analysisInput);
     return insertRetrospective(db, {
@@ -184,6 +191,7 @@ export async function generateRetrospective(
         analysisLocation: analyzer.location,
         retrospectiveText: result.retrospectiveText,
         highlights: result.highlights,
+        analyzedCaptureCount: captureCount,
     });
 }
 
@@ -197,11 +205,11 @@ export async function generateRetrospective(
  */
 export async function answerFollowUp(db: Database.Database, input: FollowUpInput): Promise<string> {
     const analyzer = selectAnalyzer(input.retrospective.analysisLocation, input.cloudAllowed, input.analyzers);
-    const plaintext = decryptSession(db, input.developerId, input.retrospective.sessionId, input.key);
+    const {plaintext} = decryptSession(db, input.developerId, input.retrospective.sessionId, input.key);
     const analysisInput: SessionAnalysisInput = {
         sessionId: input.retrospective.sessionId,
         plaintext,
-        loopEvents: loopEventsForSession(db, input.developerId, input.retrospective.sessionId),
+        loopEvents: listLoopEventsForSession(db, input.developerId, input.retrospective.sessionId),
     };
     return analyzer.followUp(analysisInput, input.retrospective.retrospectiveText, input.question);
 }

@@ -22,6 +22,7 @@ interface RetrospectiveRow {
     analysis_location: string;
     retrospective_text: string;
     highlights: string | null;
+    analyzed_capture_count: number;
     created_at: string;
 }
 
@@ -72,6 +73,7 @@ function rowToRetrospective(row: RetrospectiveRow): Retrospective {
         analysisLocation: decodeLocation(row.analysis_location),
         retrospectiveText: row.retrospective_text,
         highlights: parseHighlights(row.highlights),
+        analyzedCaptureCount: row.analyzed_capture_count,
         createdAt: row.created_at,
     };
 }
@@ -83,8 +85,8 @@ export function insertRetrospective(db: Database.Database, output: Retrospective
     const highlightsJson = output.highlights ? JSON.stringify(output.highlights) : null;
     db.prepare(
         `INSERT INTO retrospectives
-         (id, developer_id, session_id, generated_at, analysis_model, analysis_location, retrospective_text, highlights, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, developer_id, session_id, generated_at, analysis_model, analysis_location, retrospective_text, highlights, analyzed_capture_count, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
         id,
         output.developerId,
@@ -94,6 +96,7 @@ export function insertRetrospective(db: Database.Database, output: Retrospective
         output.analysisLocation,
         output.retrospectiveText,
         highlightsJson,
+        output.analyzedCaptureCount,
         createdAt,
     );
     return {
@@ -105,6 +108,7 @@ export function insertRetrospective(db: Database.Database, output: Retrospective
         analysisLocation: output.analysisLocation,
         retrospectiveText: output.retrospectiveText,
         highlights: output.highlights,
+        analyzedCaptureCount: output.analyzedCaptureCount,
         createdAt,
     };
 }

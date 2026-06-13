@@ -25,6 +25,7 @@ function output(developerId: string, overrides: Partial<RetrospectiveOutput> = {
         analysisLocation: 'local',
         retrospectiveText: 'Here is your session retrospective.',
         highlights: {worked: ['good context'], improve: ['be more specific']},
+        analyzedCaptureCount: 3,
         ...overrides,
     };
 }
@@ -52,6 +53,7 @@ describe('Retrospective store (Task 5.7)', () => {
         expect(fetched!.retrospectiveText).toBe('Here is your session retrospective.');
         expect(fetched!.analysisLocation).toBe('local');
         expect(fetched!.highlights).toEqual({worked: ['good context'], improve: ['be more specific']});
+        expect(fetched!.analyzedCaptureCount).toBe(3);
     });
 
     it('persists analysis_location for both local and cloud', () => {
@@ -65,8 +67,8 @@ describe('Retrospective store (Task 5.7)', () => {
         expect(() =>
             db
                 .prepare(
-                    `INSERT INTO retrospectives (id, developer_id, session_id, generated_at, analysis_model, analysis_location, retrospective_text, highlights, created_at)
-                     VALUES ('r1','alice','s','${NOW}','m','elsewhere','t',NULL,'${NOW}')`,
+                    `INSERT INTO retrospectives (id, developer_id, session_id, generated_at, analysis_model, analysis_location, retrospective_text, highlights, analyzed_capture_count, created_at)
+                     VALUES ('r1','alice','s','${NOW}','m','elsewhere','t',NULL,1,'${NOW}')`,
                 )
                 .run(),
         ).toThrow();
