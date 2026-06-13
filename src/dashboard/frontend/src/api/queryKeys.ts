@@ -61,6 +61,10 @@ export const queryKeys = {
     mePRCoaching: (unit: string) => ['me', 'pr-coaching', unit] as const,
     teamPRCoaching: (scope: string, unit: string) =>
         ['coaching', 'pr-review', scope, unit] as const,
+    // Manager aggregate coaching panel (Task 5.11): the unified all-pillar surface,
+    // keyed by scope (team name or 'org') + period unit.
+    managerCoachingPanel: (scope: string, unit: string) =>
+        ['coaching', 'manager', scope, unit] as const,
     // Phase 3 (Task 3.12): maturity trend + AI summaries.
     // Maturity trend is keyed by scope ('org' or a team) + resolved window.
     maturityTrend: (scope: string, window: string) => ['maturity', 'trend', scope, window] as const,

@@ -2,6 +2,7 @@ import {useQuery, type UseQueryResult} from '@tanstack/react-query';
 import {api} from '../api/client';
 import {queryKeys} from '../api/queryKeys';
 import type {
+    ManagerCoachingPanel,
     PRReviewPeriodUnit,
     TeamDetail,
     TeamListItem,
@@ -70,5 +71,20 @@ export function useTeamPRReviewCoaching(
     return useQuery({
         queryKey: queryKeys.teamPRCoaching(scope, unit),
         queryFn: () => api.getTeamPRReviewCoaching(scope, unit),
+    });
+}
+
+/**
+ * The unified manager coaching panel (Task 5.11) — all three pillar aggregates
+ * plus team coaching opportunities, for `scope` (a team name or 'org'). Keyed by
+ * scope + unit so each caches independently.
+ */
+export function useManagerCoachingPanel(
+    scope: string,
+    unit: PRReviewPeriodUnit,
+): UseQueryResult<ManagerCoachingPanel, Error> {
+    return useQuery({
+        queryKey: queryKeys.managerCoachingPanel(scope, unit),
+        queryFn: () => api.getManagerCoachingPanel(scope, unit),
     });
 }
