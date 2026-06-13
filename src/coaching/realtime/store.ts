@@ -121,6 +121,28 @@ export function listLoopEventsForDeveloper(db: Database.Database, developerId: s
     return rows.map(rowToLoopEvent);
 }
 
+/**
+ * Every loop event for ONE session owned by a developer, newest first. Scoped on
+ * developer_id AND session_id at the SQL boundary (the table is indexed on
+ * developer_id) so a session-level consumer — e.g. the retrospective generator
+ * (Task 5.7) — reads only that session's events instead of loading all of a
+ * developer's and filtering in memory.
+ */
+export function listLoopEventsForSession(
+    db: Database.Database,
+    developerId: string,
+    sessionId: string,
+): LoopEvent[] {
+    const rows = db
+        .prepare(
+            `SELECT id, developer_id, session_id, detected_at, similar_prompt_count, created_at
+             FROM loop_events WHERE developer_id = ? AND session_id = ?
+             ORDER BY detected_at DESC, created_at DESC`,
+        )
+        .all(developerId, sessionId) as LoopRow[];
+    return rows.map(rowToLoopEvent);
+}
+
 /** Every nudge event owned by a developer, newest first. */
 export function listNudgeEventsForDeveloper(db: Database.Database, developerId: string): NudgeEvent[] {
     const rows = db

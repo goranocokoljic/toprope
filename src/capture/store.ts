@@ -146,6 +146,28 @@ export function getCaptureForDeveloper(
 }
 
 /**
+ * Every capture for one session, scoped to the owner, WITH ciphertext, oldest
+ * first. Ordered chronologically (captured_at ASC) so a consumer that decrypts and
+ * concatenates them — e.g. the retrospective generator (Task 5.7) — reconstructs
+ * the session in the order it happened. Scoped on developer_id so one developer
+ * can never read another's session, even with a guessed session_id.
+ */
+export function listSessionCapturesForDeveloper(
+    db: Database.Database,
+    developerId: string,
+    sessionId: string,
+): PromptCapture[] {
+    const rows = db
+        .prepare(
+            `SELECT * FROM prompt_captures
+             WHERE developer_id = ? AND session_id = ?
+             ORDER BY captured_at ASC, created_at ASC`,
+        )
+        .all(developerId, sessionId) as CaptureRow[];
+    return rows.map(rowToCapture);
+}
+
+/**
  * Delete one capture, scoped to the owner. Returns true when a row was removed.
  * Scoping the DELETE on developer_id means one developer can never delete
  * another's capture even with a valid id.
