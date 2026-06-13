@@ -46,8 +46,9 @@ import {
     listShowcaseRemovalsForAuthor,
     unpublishOwnExample,
 } from '../../showcase/store';
-import {isShowcaseScope, type ShowcaseBrowseFilters, type ShowcaseScope} from '../../showcase/types';
-import {asObject, badRequest, decodeCaptureKey, optionalQueryString, rejectUnknownKeys} from './body-validation';
+import {isShowcaseScope, type ShowcaseScope} from '../../showcase/types';
+import {asObject, badRequest, decodeCaptureKey, rejectUnknownKeys} from './body-validation';
+import {parseShowcaseFilters, type ShowcaseFilterQuery} from './showcase-filters';
 
 // Allowlist exactly the fields each route accepts. The draft body legitimately
 // carries the developer's key (the one transient secret); publish never does — it
@@ -345,7 +346,7 @@ export function registerShowcaseRoutes(app: FastifyInstance, db: Database.Databa
      * store and returns the owner's already-redacted content. There is no path
      * from here back into prompt_captures — browse never reads a private capture.
      */
-    app.get<{Querystring: {task_type?: string; tool?: string; team?: string; scope?: string}}>(
+    app.get<{Querystring: ShowcaseFilterQuery}>(
         '/api/me/showcase/browse',
         async (request, reply) => {
             const developerId = requireDeveloperId(request, reply);
@@ -354,28 +355,10 @@ export function registerShowcaseRoutes(app: FastifyInstance, db: Database.Databa
             }
             const viewerTeam = getDeveloperById(db, developerId)?.team ?? null;
 
-            const filters: ShowcaseBrowseFilters = {};
-            const taskType = optionalQueryString(request.query.task_type);
-            if (taskType !== undefined) {
-                filters.taskType = taskType;
+            const filters = parseShowcaseFilters(request.query, reply);
+            if (!filters) {
+                return reply;
             }
-            const tool = optionalQueryString(request.query.tool);
-            if (tool !== undefined) {
-                filters.tool = tool;
-            }
-            const team = optionalQueryString(request.query.team);
-            if (team !== undefined) {
-                filters.team = team;
-            }
-            const scope = optionalQueryString(request.query.scope);
-            if (scope !== undefined) {
-                if (!isShowcaseScope(scope)) {
-                    badRequest(reply, 'scope filter must be one of: team, org');
-                    return reply;
-                }
-                filters.scope = scope;
-            }
-
             return {data: browseShowcaseExamples(db, viewerTeam, filters)};
         },
     );

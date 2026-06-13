@@ -26,14 +26,14 @@
 import type {FastifyInstance, FastifyReply} from 'fastify';
 import type Database from 'better-sqlite3';
 import {forbidden, isAdmin} from './guards';
-import {asObject, badRequest, optionalQueryString, rejectUnknownKeys} from './body-validation';
-import {listPublishedExamples, type ShowcaseModerationFilters} from '../../showcase/store';
+import {asObject, badRequest, rejectUnknownKeys} from './body-validation';
+import {listPublishedExamples} from '../../showcase/store';
 import {
     removeExampleAsTeamLead,
     ShowcaseGovernanceError,
     type ShowcaseGovernanceErrorCode,
 } from '../../showcase/governance';
-import {isShowcaseScope} from '../../showcase/types';
+import {parseShowcaseFilters, type ShowcaseFilterQuery} from './showcase-filters';
 
 const MAX_REASON_LEN = 1000;
 const REMOVE_KEYS = ['team', 'reason'] as const;
@@ -60,38 +60,19 @@ export function registerShowcaseAdminRoutes(app: FastifyInstance, db: Database.D
      * every published example across the org. Optional content filters: task_type,
      * tool, scope. Admin/manager only.
      */
-    app.get<{Querystring: {team?: string; task_type?: string; tool?: string; scope?: string}}>(
-        '/api/admin/showcase',
-        async (request, reply) => {
-            if (!isAdmin(request)) {
-                return forbidden(reply);
-            }
-
-            const filters: ShowcaseModerationFilters = {};
-            const taskType = optionalQueryString(request.query.task_type);
-            if (taskType !== undefined) {
-                filters.taskType = taskType;
-            }
-            const tool = optionalQueryString(request.query.tool);
-            if (tool !== undefined) {
-                filters.tool = tool;
-            }
-            const scope = optionalQueryString(request.query.scope);
-            if (scope !== undefined) {
-                if (!isShowcaseScope(scope)) {
-                    badRequest(reply, 'scope filter must be one of: team, org');
-                    return reply;
-                }
-                filters.scope = scope;
-            }
-            const team = optionalQueryString(request.query.team);
-            if (team !== undefined) {
-                filters.team = team;
-            }
-
-            return {data: listPublishedExamples(db, filters)};
-        },
-    );
+    app.get<{Querystring: ShowcaseFilterQuery}>('/api/admin/showcase', async (request, reply) => {
+        if (!isAdmin(request)) {
+            return forbidden(reply);
+        }
+        // Same validated shape as the /api/me browse filters; the moderation list
+        // consumes task_type/tool/scope/team identically (team scopes to that
+        // team's showcase in SQL).
+        const filters = parseShowcaseFilters(request.query, reply);
+        if (!filters) {
+            return reply;
+        }
+        return {data: listPublishedExamples(db, filters)};
+    });
 
     /**
      * Remove an example from a team's showcase. Body: { team, reason? }. `team` is
