@@ -488,16 +488,17 @@ describe('Phase 5 E2E (5.12): Pillar 1 — available-data coaching (git-only)', 
         expect(acceptance!.basis).toBe('measured');
     });
 
-    it('exposes the available-data team aggregate to a manager without any observation text', async () => {
+    it('exposes the available-data aggregate to a manager without any observation text', async () => {
         const token = await login(app, 'manager@wmg.test');
-        const {status, body} = await get<Envelope<unknown>>('/api/coaching/available/team/frontend', token);
+        // The ORG aggregate so the scanned scope pools BOTH tiers of contributor:
+        // the high-tier devs (amelia/bianca/cyrus → "...you were active...", and
+        // amelia's rising acceptance trend) AND git-only gilbert (the medium-tier
+        // "...estimated from your git activity..." insight). Every marker below is
+        // therefore a fragment of an observation a pooled developer actually
+        // produced, so the assertion would genuinely FAIL if the read layer ever
+        // started selecting the private `observation` column into the aggregate.
+        const {status, body} = await get<Envelope<unknown>>('/api/coaching/available/org', token);
         expect(status).toBe(200);
-        // The aggregate is counts + categories only — never the private sentence.
-        // These markers are FRAGMENTS OF THE REAL observation text the frontend
-        // developers' own signals carry (high-tier personal insight "...you were
-        // active on N day(s)...", the rising acceptance-trend sentence) — so the
-        // assertion would actually fail if the read layer ever started selecting
-        // the `observation` column into the manager aggregate.
         const raw = JSON.stringify(body);
         expect(raw).not.toContain('you were active');
         expect(raw).not.toContain('acceptance rate has climbed');
