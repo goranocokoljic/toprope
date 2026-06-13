@@ -20,6 +20,8 @@
 
 import type Database from 'better-sqlite3';
 import {DEFAULT_WINDOW, periodKeysEndingAt} from '../period-window';
+import {orgDeveloperIdsWhereTeamEnabled} from '../org-pool';
+import {isCoachingPillar2Enabled} from '../../settings/store';
 import {resolvePRReviewThresholds} from './config';
 import {
     aggregateTeamPeriod,
@@ -261,9 +263,15 @@ function aggregateForDeveloperIds(
 }
 
 /**
- * Org-wide manager aggregate — every developer pooled.
+ * Org-wide manager aggregate — every developer whose OWN team still has Pillar 2
+ * enabled is pooled. A team that overrode `coaching_pillar2_enabled` OFF is
+ * excluded from the org roll-up (issue #145), so a team that opted the pillar out
+ * is not silently represented in the org aggregate even though its own panel hides
+ * it. The caller still gates the whole roll-up on the GLOBAL flag; this only drops
+ * the opted-out teams' developers from the pool — see org-pool.ts for how this
+ * relates to (but does not duplicate) Pillar 3's per-developer opt-in cohort.
  *
- * Loads every developer id into a single `IN (...)` clause (same pattern as
+ * Loads the eligible developer ids into a single `IN (...)` clause (same pattern as
  * leaderboard.ts / compare.ts). SQLite caps bound parameters
  * (SQLITE_MAX_VARIABLE_NUMBER, ~32k on current builds), so an org of tens of
  * thousands of developers would need this chunked or pooled in SQL; trivial at
@@ -274,7 +282,9 @@ export function getOrgPRReviewCoaching(
     unit: PRReviewPeriodUnit,
     now: Date = new Date(),
 ): TeamPRReviewCoaching {
-    const devIds = (db.prepare('SELECT id FROM developers').all() as Array<{id: string}>).map((r) => r.id);
+    const devIds = orgDeveloperIdsWhereTeamEnabled(db, (team) =>
+        isCoachingPillar2Enabled(db, team),
+    );
     return aggregateForDeveloperIds(db, 'org', devIds, unit, now);
 }
 
