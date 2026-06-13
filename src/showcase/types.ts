@@ -60,3 +60,49 @@ export interface ShowcasePublishRecord {
     content: string;
     authorNote: string | null;
 }
+
+/**
+ * Optional browse filters (Task 5.9). All are AND-combined and applied ON TOP of
+ * the viewer's access scope — they can only narrow what the viewer may already
+ * see, never widen it. A `team` filter narrows to that team's scope_target; it
+ * does NOT grant visibility into a team the viewer isn't in (the access scope is
+ * applied first).
+ */
+export interface ShowcaseBrowseFilters {
+    taskType?: string;
+    tool?: string;
+    team?: string;
+    scope?: ShowcaseScope;
+}
+
+/**
+ * One team-lead removal as the author sees it in their notification feed (Task
+ * 5.9). Joined with the example title so the author knows WHICH example went,
+ * without the feed having to re-fetch each example separately.
+ */
+export interface ShowcaseRemovalNotice {
+    id: string;
+    exampleId: string;
+    /** The removed example's title, for the author's feed. */
+    exampleTitle: string;
+    /** Email of the team lead who removed it — the actor is never anonymous. */
+    removedByEmail: string;
+    /** The team whose showcase the lead acted for. */
+    team: string | null;
+    /** Optional reason the lead supplied. */
+    reason: string | null;
+    occurredAt: string;
+    /** Null while unread; set when the author dismisses the notice. */
+    acknowledgedAt: string | null;
+}
+
+/** The fields a team-lead removal persists (everything but the server-assigned id). */
+export interface ShowcaseRemovalRecord {
+    exampleId: string;
+    authorDeveloperId: string;
+    removedByUserId: string;
+    removedByEmail: string;
+    team: string | null;
+    reason: string | null;
+    occurredAt: string;
+}

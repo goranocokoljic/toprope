@@ -37,8 +37,16 @@ import {
     ShowcaseError,
     type ShowcaseErrorCode,
 } from '../../showcase/service';
-import {getShowcaseExampleForAuthor, listShowcaseExamplesByAuthor} from '../../showcase/store';
-import {isShowcaseScope, type ShowcaseScope} from '../../showcase/types';
+import {
+    acknowledgeShowcaseRemoval,
+    browseShowcaseExamples,
+    getShowcaseExampleForAuthor,
+    getShowcaseExampleForViewer,
+    listShowcaseExamplesByAuthor,
+    listShowcaseRemovalsForAuthor,
+    unpublishOwnExample,
+} from '../../showcase/store';
+import {isShowcaseScope, type ShowcaseBrowseFilters, type ShowcaseScope} from '../../showcase/types';
 import {asObject, badRequest, decodeCaptureKey} from './body-validation';
 
 // Allowlist exactly the fields each route accepts. The draft body legitimately
@@ -332,4 +340,127 @@ export function registerShowcaseRoutes(app: FastifyInstance, db: Database.Databa
         }
         return {data: example};
     });
+
+    // --- Task 5.9: access-scoped browse/discovery + owner unpublish + notices ---
+
+    /**
+     * Browse PUBLISHED examples within the viewer's access scope — org-scoped to
+     * everyone, team-scoped only to that team — newest first. Optional filters:
+     * task_type, tool, team, scope. The filters only narrow within the viewer's
+     * scope, so a `team` filter can never reveal another team's team-scoped
+     * examples. The viewer's team is resolved from their OWN developer record,
+     * never request input, so the access boundary can't be widened by the client.
+     *
+     * This is a consumption surface only: it reads the shared showcase_examples
+     * store and returns the owner's already-redacted content. There is no path
+     * from here back into prompt_captures — browse never reads a private capture.
+     */
+    app.get<{Querystring: {task_type?: string; tool?: string; team?: string; scope?: string}}>(
+        '/api/me/showcase/browse',
+        async (request, reply) => {
+            const developerId = requireDeveloperId(request, reply);
+            if (!developerId) {
+                return reply;
+            }
+            const viewerTeam = getDeveloperById(db, developerId)?.team ?? null;
+
+            const filters: ShowcaseBrowseFilters = {};
+            const taskType = optionalQueryString(request.query.task_type);
+            if (taskType !== undefined) {
+                filters.taskType = taskType;
+            }
+            const tool = optionalQueryString(request.query.tool);
+            if (tool !== undefined) {
+                filters.tool = tool;
+            }
+            const team = optionalQueryString(request.query.team);
+            if (team !== undefined) {
+                filters.team = team;
+            }
+            const scope = optionalQueryString(request.query.scope);
+            if (scope !== undefined) {
+                if (!isShowcaseScope(scope)) {
+                    badRequest(reply, 'scope filter must be one of: team, org');
+                    return reply;
+                }
+                filters.scope = scope;
+            }
+
+            return {data: browseShowcaseExamples(db, viewerTeam, filters)};
+        },
+    );
+
+    /**
+     * Example detail within the viewer's access scope: the redacted conversation +
+     * author note + metadata. 404 when the example is outside the viewer's scope or
+     * isn't published — a team-scoped example in another team is indistinguishable
+     * from a missing one, so the detail view leaks nothing the browse list wouldn't.
+     */
+    app.get<{Params: {id: string}}>('/api/me/showcase/browse/:id', async (request, reply) => {
+        const developerId = requireDeveloperId(request, reply);
+        if (!developerId) {
+            return reply;
+        }
+        const viewerTeam = getDeveloperById(db, developerId)?.team ?? null;
+        const example = getShowcaseExampleForViewer(db, viewerTeam, request.params.id);
+        if (!example) {
+            return reply.status(404).send({error: 'Not Found', message: 'Showcase example not found'});
+        }
+        return {data: example};
+    });
+
+    /**
+     * Owner unpublish: the author removes their OWN example from the showcase
+     * (status -> unpublished; gone from browse). Author-scoped and guarded on the
+     * example currently being published, so it 404s for a non-owner, a missing id,
+     * or one a team lead already removed — an owner can never resurrect a removed
+     * example by unpublishing it.
+     */
+    app.post<{Params: {id: string}}>('/api/me/showcase/:id/unpublish', async (request, reply) => {
+        const developerId = requireDeveloperId(request, reply);
+        if (!developerId) {
+            return reply;
+        }
+        const updated = unpublishOwnExample(db, developerId, request.params.id);
+        if (!updated) {
+            return reply.status(404).send({error: 'Not Found', message: 'No published example of yours with that id'});
+        }
+        return {data: updated};
+    });
+
+    /**
+     * The author's removal-notification feed: every team-lead removal of one of
+     * their examples, newest first. This is how "the author is notified" is
+     * delivered — the same logged row the audit keeps, read back by its author, so
+     * a removal can never be silent. Author-scoped; never another developer's.
+     */
+    app.get('/api/me/showcase/removals', async (request, reply) => {
+        const developerId = requireDeveloperId(request, reply);
+        if (!developerId) {
+            return reply;
+        }
+        return {data: listShowcaseRemovalsForAuthor(db, developerId)};
+    });
+
+    /** Dismiss one removal notice from the author's feed. Author-scoped; 404 if not theirs or already dismissed. */
+    app.post<{Params: {id: string}}>('/api/me/showcase/removals/:id/acknowledge', async (request, reply) => {
+        const developerId = requireDeveloperId(request, reply);
+        if (!developerId) {
+            return reply;
+        }
+        const ok = acknowledgeShowcaseRemoval(db, developerId, request.params.id, new Date().toISOString());
+        if (!ok) {
+            return reply.status(404).send({error: 'Not Found', message: 'No unacknowledged removal notice with that id'});
+        }
+        return {data: {acknowledged: true}};
+    });
+}
+
+/** Read an optional querystring filter: a non-empty trimmed string, or undefined when absent/blank. */
+function optionalQueryString(value: unknown): string | undefined {
+    if (typeof value !== 'string') {
+        return undefined;
+    }
+    const trimmed = value.trim();
+    return trimmed.length === 0 ? undefined : trimmed;
 }

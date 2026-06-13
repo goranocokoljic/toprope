@@ -33,6 +33,7 @@ import {registerKeyRoutes} from './dashboard/api/keys';
 import {registerRealtimeCoachingRoutes} from './dashboard/api/realtime-coaching';
 import {registerRetrospectiveRoutes} from './dashboard/api/retrospectives';
 import {registerShowcaseRoutes} from './dashboard/api/showcase';
+import {registerShowcaseAdminRoutes} from './dashboard/api/showcase-admin';
 import {registerDashboardStatic} from './dashboard/static';
 import {createSlackClient} from './slack/client';
 import {notifyNewAnomalies} from './anomaly/notify';
@@ -148,6 +149,14 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
     // scope/enablement check. The private capture is never touched; nothing is ever
     // auto-harvested. All /api/me, developer-owned; no manager path.
     registerShowcaseRoutes(app, db);
+    // Showcase browse/discovery + governance (Task 5.9): the /api/me browse routes
+    // (access-scoped list/detail, owner unpublish, author removal-notice feed) are
+    // registered above with the rest of the showcase surface. These /api/admin
+    // routes are the team-lead MODERATION surface — list + REMOVE only. There is
+    // deliberately NO admin route that publishes or edits an example's content, so
+    // a team lead can remove from their team's showcase but never publish for a
+    // developer; every removal is team-bounded, logged, and notifies the author.
+    registerShowcaseAdminRoutes(app, db);
 
     // Data-prompted surveys (Task 4.3): manager queue + developer self-service.
     // Survey delivery prefers the Slack bot when configured, with an email
