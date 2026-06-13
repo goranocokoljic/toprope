@@ -39,7 +39,6 @@ import type {
     TeamComparison,
     TeamDetail,
     TeamListItem,
-    TeamPRReviewCoachingResponse,
     ManagerCoachingPanel,
     TeamProviders,
     TeamSettings,
@@ -604,23 +603,11 @@ export const api = {
         return body.data;
     },
 
-    /**
-     * Manager team-aggregate PR/review coaching (NO individual numbers). `scope`
-     * is a team name or the literal 'org' for the org-wide roll-up.
-     */
-    async getTeamPRReviewCoaching(
-        scope: string,
-        unit: PRReviewPeriodUnit,
-    ): Promise<TeamPRReviewCoachingResponse> {
-        const path =
-            scope === 'org'
-                ? `/api/coaching/pr-review/org?unit=${encodeURIComponent(unit)}`
-                : `/api/coaching/pr-review/team/${encodeURIComponent(scope)}?unit=${encodeURIComponent(unit)}`;
-        const body = await request<ApiEnvelope<TeamPRReviewCoachingResponse>>(path);
-        return body.data;
-    },
-
     // --- Manager aggregate coaching panel (Task 5.11) ---
+    // The manager team-aggregate PR/review surface is now folded into the unified
+    // panel below (getManagerCoachingPanel), which the Team Coaching page consumes;
+    // the per-pillar /api/coaching/pr-review/* routes remain on the server as a
+    // finer-grained API but have no dedicated client method.
     /**
      * The unified manager coaching panel for a scope (`org` or a team name): all
      * three pillar aggregates plus team coaching opportunities. TEAM-LEVEL ONLY —

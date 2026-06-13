@@ -20,22 +20,37 @@ import type {PeriodUnit} from '../period-window';
 import {getOrgPRReviewCoaching, getTeamPRReviewCoaching} from '../pr-review/coaching';
 import {getOrgCoaching, getTeamCoaching} from '../available/coaching';
 import {
+    isCoachingCapturePermitted,
     isCoachingPillar1Enabled,
     isCoachingPillar2Enabled,
-    resolveSetting,
 } from '../../settings/store';
 import {getOrgLoopNudgeAggregate, getTeamLoopNudgeAggregate} from './loop-nudge';
 import {deriveTeamOpportunities} from './opportunities';
 import type {ManagerCoachingPanel} from './types';
 
 /**
- * Whether Pillar 3 (capture-derived loop/nudge) signals may be aggregated for a
- * scope. Gated on `coaching_capture_permitted`: when the org/team does not permit
- * capture there is, by construction, no opted-in cohort, so the section is hidden
- * rather than shown empty. Resolved for the team so a per-team override is honored.
+ * Whether the Pillar 3 (capture-derived loop/nudge) section should be shown for a
+ * scope. When capture isn't permitted there is, by construction, no opted-in
+ * cohort, so the section is hidden rather than shown empty.
+ *
+ * For a TEAM this is just the team-resolved `coaching_capture_permitted`. For the
+ * ORG roll-up it is global-OR-any-team: `coaching_capture_permitted` is
+ * team-overridable, and the opted-in cohort is resolved per the developer's OWN
+ * team (capture/gate.ts), so a team that turns capture on while the global flag is
+ * off still has valid opted-in contributors. Gating the org section on the global
+ * flag alone would hide those developers from the org view even though they show
+ * on their team's panel — a silent gap. Checking any-team keeps the org roll-up
+ * consistent with where the data actually lives.
  */
 function isLoopNudgeEnabled(db: Database.Database, team: string | null): boolean {
-    return resolveSetting(db, 'coaching_capture_permitted', team) === true;
+    if (team !== null) {
+        return isCoachingCapturePermitted(db, team);
+    }
+    if (isCoachingCapturePermitted(db, null)) {
+        return true;
+    }
+    const teams = db.prepare('SELECT name FROM teams').all() as Array<{name: string}>;
+    return teams.some((t) => isCoachingCapturePermitted(db, t.name));
 }
 
 /**

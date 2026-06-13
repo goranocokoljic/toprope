@@ -6,7 +6,6 @@ import type {
     PRReviewPeriodUnit,
     TeamDetail,
     TeamListItem,
-    TeamPRReviewCoachingResponse,
     TeamProviders,
     TeamTrend,
     WasteAlert,
@@ -57,20 +56,6 @@ export function useTeamWaste(team: string): UseQueryResult<WasteAlert[], Error> 
     return useQuery({
         queryKey: queryKeys.teamWaste(team),
         queryFn: () => api.getTeamWaste(team),
-    });
-}
-
-/**
- * Team (or org) PR/review coaching aggregate (Task 5.3). `scope` is a team name
- * or the literal 'org'; keyed by scope + unit so each caches independently.
- */
-export function useTeamPRReviewCoaching(
-    scope: string,
-    unit: PRReviewPeriodUnit,
-): UseQueryResult<TeamPRReviewCoachingResponse, Error> {
-    return useQuery({
-        queryKey: queryKeys.teamPRCoaching(scope, unit),
-        queryFn: () => api.getTeamPRReviewCoaching(scope, unit),
     });
 }
 

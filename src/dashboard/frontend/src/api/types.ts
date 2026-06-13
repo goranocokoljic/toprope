@@ -561,8 +561,12 @@ export interface LoopNudgeTypeCell extends LoopNudgeCell {
 export interface LoopNudgeAggregate {
     scope: string;
     period_unit: PRReviewPeriodUnit;
-    /** Developers in scope who effectively opted into capture (eligibility count). */
-    opted_in_developers: number;
+    /**
+     * Developers in scope who effectively opted into capture (eligibility count),
+     * floored: exact when 0 or at least the min-group-size, `null` when between 1
+     * and the floor (too few to show without identifying who opted in).
+     */
+    opted_in_developers: number | null;
     loops: LoopNudgeCell;
     nudges: LoopNudgeTypeCell[];
 }

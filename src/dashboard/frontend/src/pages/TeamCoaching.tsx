@@ -272,6 +272,14 @@ function LoopNudgeSection({loopNudge}: {loopNudge: LoopNudgeAggregate}): JSX.Ele
         ...loopNudge.nudges.map((n) => ({label: NUDGE_LABEL[n.nudge_type] ?? n.nudge_type, cell: n})),
     ];
     const anyShown = cells.some((c) => !c.cell.suppressed);
+    // The eligibility count is floored: null = "some, but too few to name safely";
+    // 0 = nobody opted in; a number = the exact (>= floor) count.
+    const optInBasis =
+        loopNudge.opted_in_developers === null
+            ? 'Based on the opted-in developers in this scope (too few to show the exact count without identifying them).'
+            : loopNudge.opted_in_developers === 0
+              ? 'No developers in this scope have opted into prompt capture yet.'
+              : `Based on ${loopNudge.opted_in_developers} opted-in developers in this scope.`;
 
     return (
         <Section
@@ -280,9 +288,7 @@ function LoopNudgeSection({loopNudge}: {loopNudge: LoopNudgeAggregate}): JSX.Ele
         >
             <Card>
                 <p className="text-xs text-muted" data-testid="loop-nudge-optin">
-                    Based on {loopNudge.opted_in_developers} opted-in developer
-                    {loopNudge.opted_in_developers === 1 ? '' : 's'} in this scope. Only opted-in
-                    developers' patterns are ever included.
+                    {optInBasis} Only opted-in developers' patterns are ever included.
                 </p>
                 {anyShown ? (
                     <ul className="mt-3 space-y-2" data-testid="loop-nudge-summary">

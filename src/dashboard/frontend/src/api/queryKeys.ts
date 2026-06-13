@@ -59,8 +59,6 @@ export const queryKeys = {
     // PR/review coaching (Task 5.3). Keyed by period unit so weekly/monthly cache
     // independently; the team aggregate adds the scope (team name or 'org').
     mePRCoaching: (unit: string) => ['me', 'pr-coaching', unit] as const,
-    teamPRCoaching: (scope: string, unit: string) =>
-        ['coaching', 'pr-review', scope, unit] as const,
     // Manager aggregate coaching panel (Task 5.11): the unified all-pillar surface,
     // keyed by scope (team name or 'org') + period unit.
     managerCoachingPanel: (scope: string, unit: string) =>

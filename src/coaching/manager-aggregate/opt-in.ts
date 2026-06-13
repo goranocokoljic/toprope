@@ -10,39 +10,55 @@
  * cannot accidentally pool a developer who never chose in (or whose org forbids
  * capture).
  *
- * The chain is deliberate: a developer_id → its linked user account → that user's
- * resolved coaching preferences for the developer's CURRENT team. A developer with
- * no linked user account, or a stored opt-in the org currently forbids, resolves
- * to NOT opted in — the safe direction.
+ * Resolution delegates to the one capture gate (capture/gate.ts) — the single
+ * home for "opted in AND org permits" — so the manager aggregate's opted-in
+ * cohort can never diverge from the gate the developer's own capture surfaces
+ * use. The developer→user→team lookups are resolved in ONE batched query rather
+ * than per developer, so an org-wide panel doesn't fan out into N×(user + team)
+ * round-trips; only the gate's single-preference resolution then runs per
+ * opted-in candidate. A developer with no linked user account simply has no row
+ * in the join and is excluded — the safe direction.
  */
 
 import type Database from 'better-sqlite3';
-import {getUserByDeveloperId} from '../../auth/users';
-import {getDeveloperById} from '../../registry/developers';
 import {captureGate} from '../../capture/gate';
 
-/**
- * Whether ONE developer has effectively opted into capture. Delegates to the
- * single capture gate (capture/gate.ts) — the one home for "opted in AND org
- * permits" — so the manager aggregate's opted-in cohort can never diverge from
- * the gate the developer's own capture surfaces use. True only when a linked user
- * account exists and the gate resolves enabled for the developer's current team.
- */
-export function isDeveloperOptedIn(db: Database.Database, developerId: string): boolean {
-    const user = getUserByDeveloperId(db, developerId);
-    if (!user) {
-        // No account → no opt-in could ever have been recorded; exclude.
-        return false;
-    }
-    const team = getDeveloperById(db, developerId)?.team ?? null;
-    return captureGate(db, user.id, team).enabled;
+interface OptInRow {
+    developer_id: string;
+    user_id: string;
+    team: string;
 }
 
 /**
  * Filter a set of developer ids down to those effectively opted into capture.
  * Order is preserved. The caller owns scope (org = all developers, team = the
  * team's members); this only enforces the opt-in boundary on top of that scope.
+ *
+ * One query resolves every (developer → linked user, current team) in the set;
+ * the per-developer work is then just the capture gate's single-preference
+ * resolution, gated for the developer's OWN team so a per-team capture override
+ * is honored exactly as on the developer's own surfaces.
  */
 export function resolveOptedInDeveloperIds(db: Database.Database, devIds: string[]): string[] {
-    return devIds.filter((id) => isDeveloperOptedIn(db, id));
+    if (devIds.length === 0) {
+        return [];
+    }
+    const placeholders = new Array(devIds.length).fill('?').join(', ');
+    const rows = db
+        .prepare(
+            `SELECT u.developer_id AS developer_id, u.id AS user_id, d.team AS team
+             FROM users u
+             JOIN developers d ON d.id = u.developer_id
+             WHERE u.developer_id IN (${placeholders})`,
+        )
+        .all(...devIds) as OptInRow[];
+
+    const optedIn = new Set<string>();
+    for (const row of rows) {
+        if (captureGate(db, row.user_id, row.team).enabled) {
+            optedIn.add(row.developer_id);
+        }
+    }
+    // Preserve the caller's order; only developers that cleared the gate survive.
+    return devIds.filter((id) => optedIn.has(id));
 }

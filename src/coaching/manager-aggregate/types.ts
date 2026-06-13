@@ -56,12 +56,16 @@ export interface LoopNudgeAggregate {
     period_unit: PeriodUnit;
     /**
      * Developers in scope who have effectively opted into capture (org-permission
-     * gated). This is an ELIGIBILITY count, not a coaching signal — it tells the
-     * UI how much of the team's pattern data is even available, and lets it
-     * explain a fully-suppressed view ("only N developers opted in"). It is NOT
-     * floored: it names no pattern and no individual, just how many chose in.
+     * gated) — an ELIGIBILITY count, not a coaching signal. Floored like every
+     * other count on this surface: the EXACT value is reported only when it is 0
+     * (nobody opted in) or at least the min-group-size floor; a value between 1
+     * and the floor is reported as `null` (suppressed), because in a small team a
+     * manager who knows the roster could otherwise read off WHICH individual
+     * enabled capture — an opt-in choice is itself private. `null` therefore means
+     * "some, but too few to show without identifying them"; the UI distinguishes
+     * it from the explicit 0.
      */
-    opted_in_developers: number;
+    opted_in_developers: number | null;
     /** Distinct opted-in developers who hit a detection loop in the window (floored). */
     loops: LoopNudgeCell;
     /** One floored cell per nudge type, stable order, suppressed cells included. */

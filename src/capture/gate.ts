@@ -16,7 +16,7 @@
  */
 
 import type Database from 'better-sqlite3';
-import {resolveDeveloperPreferences} from '../settings/store';
+import {resolveDeveloperPreference} from '../settings/store';
 
 export interface CaptureGateResult {
     /** True only when the developer opted in AND the org currently permits capture. */
@@ -36,7 +36,7 @@ export function captureGate(
     userId: string,
     team?: string | null,
 ): CaptureGateResult {
-    const optIn = resolveDeveloperPreferences(db, userId, team).capture_opt_in;
+    const optIn = resolveDeveloperPreference(db, userId, 'capture_opt_in', team);
     if (optIn?.value === true) {
         return {enabled: true};
     }

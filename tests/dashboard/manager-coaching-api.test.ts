@@ -146,8 +146,10 @@ describe('Manager coaching panel API (Task 5.11)', () => {
         expect(res.statusCode).toBe(200);
         const data = res.json().data;
         expect(data.loop_nudge.enabled).toBe(true);
-        // Only bob + carol opted in → 2 eligible → below the floor of 3 → suppressed.
-        expect(data.loop_nudge.opted_in_developers).toBe(2);
+        // Only bob + carol opted in → 2 eligible → below the floor of 3 → the cells
+        // AND the exact eligibility count are suppressed (null), so a manager can't
+        // read off which individual opted in within this small scope.
+        expect(data.loop_nudge.opted_in_developers).toBeNull();
         expect(data.loop_nudge.loops.suppressed).toBe(true);
         // The privacy regression guard: no developer id anywhere in the payload.
         for (const id of ['alice', 'bob', 'carol']) {

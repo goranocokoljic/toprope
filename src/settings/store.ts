@@ -383,6 +383,47 @@ export interface ResolvedDeveloperPreference {
     reason?: string;
 }
 
+/** Resolve ONE developer preference def against the org boundary (see the plural). */
+function resolveDeveloperPreferenceDef(
+    db: Database.Database,
+    userId: string,
+    def: DeveloperPreferenceDef,
+    team: string | null | undefined,
+): ResolvedDeveloperPreference {
+    const stored = storedDeveloperPreference(db, userId, def, team);
+    const blocked = def.gatedBy ? resolveSetting(db, def.gatedBy, team) !== true : false;
+    const value = blocked && def.blockedValue !== undefined ? def.blockedValue : stored;
+    return {
+        key: def.key,
+        value,
+        stored,
+        blocked,
+        ...(blocked && def.blockedReason ? {reason: def.blockedReason} : {}),
+    };
+}
+
+/**
+ * Resolve a SINGLE developer coaching preference for `userId` against the org
+ * permission boundary for `team`. The targeted counterpart to
+ * {@link resolveDeveloperPreferences}: a consumer that needs only one preference
+ * (e.g. the capture gate reading `capture_opt_in`, or the manager aggregate
+ * resolving the opted-in cohort over many developers) resolves just that key
+ * instead of every preference, which matters when it runs once per developer in
+ * a loop. Throws on an unknown key (a programming error, like the setters).
+ */
+export function resolveDeveloperPreference(
+    db: Database.Database,
+    userId: string,
+    key: string,
+    team?: string | null,
+): ResolvedDeveloperPreference {
+    const def = getDeveloperPreferenceDef(key);
+    if (!def) {
+        throw new Error(`Unknown coaching preference key: ${key}`);
+    }
+    return resolveDeveloperPreferenceDef(db, userId, def, team);
+}
+
 /**
  * Resolve every developer coaching preference for `userId`, applying the org
  * permission boundary resolved for `team`. For a gated preference whose org flag
@@ -399,16 +440,7 @@ export function resolveDeveloperPreferences(
 ): Record<string, ResolvedDeveloperPreference> {
     const out: Record<string, ResolvedDeveloperPreference> = {};
     for (const def of Object.values(DEVELOPER_PREFERENCES)) {
-        const stored = storedDeveloperPreference(db, userId, def, team);
-        const blocked = def.gatedBy ? resolveSetting(db, def.gatedBy, team) !== true : false;
-        const value = blocked && def.blockedValue !== undefined ? def.blockedValue : stored;
-        out[def.key] = {
-            key: def.key,
-            value,
-            stored,
-            blocked,
-            ...(blocked && def.blockedReason ? {reason: def.blockedReason} : {}),
-        };
+        out[def.key] = resolveDeveloperPreferenceDef(db, userId, def, team);
     }
     return out;
 }
@@ -427,4 +459,15 @@ export function isCoachingPillar1Enabled(db: Database.Database, team?: string | 
 
 export function isCoachingPillar2Enabled(db: Database.Database, team?: string | null): boolean {
     return resolveSetting(db, 'coaching_pillar2_enabled', team) === true;
+}
+
+/**
+ * Whether Pillar 3 prompt capture is permitted for a scope. Capture-derived
+ * surfaces (e.g. the manager loop/nudge aggregate) gate on this the same way
+ * pillars 1 and 2 gate on their flags — keeping every "is pillar N enabled for
+ * scope" check in one module rather than re-deriving the `=== true` comparison
+ * at each call site.
+ */
+export function isCoachingCapturePermitted(db: Database.Database, team?: string | null): boolean {
+    return resolveSetting(db, 'coaching_capture_permitted', team) === true;
 }

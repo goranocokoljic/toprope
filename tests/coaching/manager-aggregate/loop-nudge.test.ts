@@ -111,9 +111,20 @@ describe('aggregateLoopNudge — pure flooring math', () => {
         }
     });
 
-    it('carries the opted-in eligibility count through verbatim', () => {
+    it('carries the opted-in eligibility count through when it clears the floor', () => {
         const agg = aggregateLoopNudge('eng', 'monthly', 7, [], []);
         expect(agg.opted_in_developers).toBe(7);
+    });
+
+    it('floors the opted-in eligibility count: exact at 0 or >= floor, null in between', () => {
+        // 0 → exact (distinguishes "nobody opted in").
+        expect(aggregateLoopNudge('eng', 'monthly', 0, [], []).opted_in_developers).toBe(0);
+        // 1 and 2 (below floor of 3) → suppressed to null, so a manager can't read
+        // off which single individual enabled capture in a tiny scope.
+        expect(aggregateLoopNudge('eng', 'monthly', 1, [], []).opted_in_developers).toBeNull();
+        expect(aggregateLoopNudge('eng', 'monthly', 2, [], []).opted_in_developers).toBeNull();
+        // 3 (the floor) → exact.
+        expect(aggregateLoopNudge('eng', 'monthly', 3, [], []).opted_in_developers).toBe(3);
     });
 });
 
@@ -158,10 +169,24 @@ describe('getTeamLoopNudgeAggregate / getOrgLoopNudgeAggregate — opted-in only
         }
 
         const agg = getTeamLoopNudgeAggregate(db, 'eng', 'monthly', NOW);
-        // Only 2 opted-in contributors → below the floor → suppressed.
-        expect(agg.opted_in_developers).toBe(2);
+        // Only 2 opted-in (below the floor) → eligibility count suppressed to null too.
+        expect(agg.opted_in_developers).toBeNull();
         expect(agg.loops.suppressed).toBe(true);
         expect(agg.loops.developers).toBeNull();
+    });
+
+    it('excludes events before the window start AND after the window end (future-dated)', () => {
+        const a = devWithOptIn(db, 'eng', 'aaa', true);
+        const b = devWithOptIn(db, 'eng', 'bbb', true);
+        const c = devWithOptIn(db, 'eng', 'ccc', true);
+        // a & b in window; c's event is FUTURE-dated (clock skew on a local agent) →
+        // it must NOT count, so only 2 in-window contributors → suppressed.
+        insertLoopEvent(db, a, {sessionId: 's', detectedAt: IN_WINDOW, similarPromptCount: 3});
+        insertLoopEvent(db, b, {sessionId: 's', detectedAt: IN_WINDOW, similarPromptCount: 3});
+        insertLoopEvent(db, c, {sessionId: 's', detectedAt: '2026-12-31T00:00:00.000Z', similarPromptCount: 3});
+
+        const agg = getTeamLoopNudgeAggregate(db, 'eng', 'monthly', NOW);
+        expect(agg.loops.suppressed).toBe(true);
     });
 
     it('excludes events outside the trajectory window', () => {

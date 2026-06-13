@@ -5,7 +5,7 @@ import {runMigrations} from '../../../src/storage/migrator';
 import {addTeam} from '../../../src/registry/teams';
 import {addDeveloper} from '../../../src/registry/developers';
 import {createUser} from '../../../src/auth/users';
-import {setGlobalSetting, setDeveloperPreference} from '../../../src/settings/store';
+import {setGlobalSetting, setTeamSetting, setDeveloperPreference} from '../../../src/settings/store';
 import {insertLoopEvent} from '../../../src/coaching/realtime/store';
 import {
     getOrgManagerCoachingPanel,
@@ -80,6 +80,28 @@ describe('manager coaching panel — pillar gating + composition', () => {
         }
         // A loop opportunity is synthesized from the floored cell.
         expect(panel.opportunities.map((o) => o.id)).toContain('loops_common');
+    });
+
+    it('shows the org loop/nudge section when capture is permitted only via a team override', () => {
+        // Global capture stays OFF, but managers may override and one team turns it
+        // ON. Opted-in developers on that team are valid contributors, so the ORG
+        // roll-up must surface the section rather than hiding them (SO-1).
+        setGlobalSetting(db, 'coaching_managers_can_override', true);
+        setTeamSetting(db, 'eng', 'coaching_capture_permitted', true);
+        const a = optedInDev(db, 'eng', 'aaa');
+        const b = optedInDev(db, 'eng', 'bbb');
+        const c = optedInDev(db, 'eng', 'ccc');
+        for (const id of [a, b, c]) {
+            insertLoopEvent(db, id, {sessionId: 's', detectedAt: IN_WINDOW, similarPromptCount: 4});
+        }
+
+        const org = getOrgManagerCoachingPanel(db, 'monthly', NOW);
+        expect(org.loop_nudge.enabled).toBe(true);
+        if (org.loop_nudge.enabled) {
+            // The team's opted-in developers are pooled into the org roll-up.
+            expect(org.loop_nudge.opted_in_developers).toBe(3);
+            expect(org.loop_nudge.loops.suppressed).toBe(false);
+        }
     });
 
     it('disabling Pillar 2 hides the PR/review section', () => {

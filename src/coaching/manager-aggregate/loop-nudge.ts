@@ -66,10 +66,22 @@ function buildCell(developerIds: string[], minCohort: number): LoopNudgeCell {
 }
 
 /**
+ * Floor the opted-in eligibility count: report the exact value only when it is 0
+ * (nobody opted in) or at least the cohort floor; a value in between is suppressed
+ * to null so a small opted-in cohort can't reveal which individual enabled capture.
+ */
+function flooredOptInCount(optedInCount: number, minCohort: number): number | null {
+    if (optedInCount === 0 || optedInCount >= minCohort) {
+        return optedInCount;
+    }
+    return null;
+}
+
+/**
  * Pure aggregation of opted-in loop/nudge contributions into the manager
- * aggregate. `optedInCount` is the eligibility figure carried through verbatim
- * (it names no pattern, only how many developers opted in). Every count cell is
- * independently floored at `minCohort`.
+ * aggregate. `optedInCount` is the eligibility figure, floored the same way as
+ * every count cell (see {@link flooredOptInCount}). Every count cell is
+ * independently floored at `minCohort` on DISTINCT contributing developers.
  */
 export function aggregateLoopNudge(
     scope: string,
@@ -92,23 +104,27 @@ export function aggregateLoopNudge(
     return {
         scope,
         period_unit: unit,
-        opted_in_developers: optedInCount,
+        opted_in_developers: flooredOptInCount(optedInCount, minCohort),
         loops: loopCell,
         nudges: nudgeCells,
     };
 }
 
 /**
- * The inclusive start date of the trajectory window — the first day of the oldest
- * period in the window. loop/nudge events are stored as ISO timestamps, not per
- * period, so the read layer filters them by this date cutoff. ISO timestamps sort
- * lexicographically against a 'YYYY-MM-DD' string, so `detected_at >= cutoff` is a
- * correct inclusive bound.
+ * The trajectory window as a `[start, end)` pair of ISO bounds. loop/nudge events
+ * are stored as ISO timestamps, not per period, so the read layer filters them by
+ * this range. `start` is the first day of the oldest period in the window (a
+ * 'YYYY-MM-DD' date). `end` is `now` as a full ISO timestamp — the UPPER bound
+ * matters: without it a clock-skewed local agent could sync a future-dated event
+ * that would inflate a contributor count and push a thin cell over the floor.
+ * ISO-8601 timestamps sort lexicographically against both bounds, so
+ * `detected_at >= start AND detected_at <= end` is a correct inclusive window.
  */
-function windowStartDate(unit: PeriodUnit, now: Date): string {
+function windowBounds(unit: PeriodUnit, now: Date): {start: string; end: string} {
     const keys = periodKeysEndingAt(unit, now.toISOString().slice(0, 10), DEFAULT_WINDOW[unit]);
     const oldest = keys[0];
-    return unit === 'weekly' ? isoWeekRange(oldest).start : monthRange(oldest).start;
+    const start = unit === 'weekly' ? isoWeekRange(oldest).start : monthRange(oldest).start;
+    return {start, end: now.toISOString()};
 }
 
 /**
@@ -131,22 +147,22 @@ function aggregateForDeveloperIds(
         return aggregateLoopNudge(scopeLabel, unit, 0, [], []);
     }
 
-    const cutoff = windowStartDate(unit, now);
+    const {start, end} = windowBounds(unit, now);
     const inClause = placeholders(optedIn.length);
 
     const loopRows = db
         .prepare(
             `SELECT developer_id FROM loop_events
-             WHERE developer_id IN (${inClause}) AND detected_at >= ?`,
+             WHERE developer_id IN (${inClause}) AND detected_at >= ? AND detected_at <= ?`,
         )
-        .all(...optedIn, cutoff) as Array<{developer_id: string}>;
+        .all(...optedIn, start, end) as Array<{developer_id: string}>;
 
     const nudgeRows = db
         .prepare(
             `SELECT developer_id, nudge_type FROM nudge_events
-             WHERE developer_id IN (${inClause}) AND delivered_at >= ?`,
+             WHERE developer_id IN (${inClause}) AND delivered_at >= ? AND delivered_at <= ?`,
         )
-        .all(...optedIn, cutoff) as Array<{developer_id: string; nudge_type: string}>;
+        .all(...optedIn, start, end) as Array<{developer_id: string; nudge_type: string}>;
 
     const loops: LoopContribution[] = loopRows.map((r) => ({developerId: r.developer_id}));
     const nudges: NudgeContribution[] = nudgeRows
