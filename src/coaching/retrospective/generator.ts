@@ -24,8 +24,7 @@
  */
 
 import type Database from 'better-sqlite3';
-import {decryptCapture, type EncryptionMeta} from '../../capture/encryption';
-import {listSessionCapturesForDeveloper} from '../../capture/store';
+import {decryptSessionToText, SessionDecryptError, type DecryptedSession} from '../../capture/session-decrypt';
 import {listLoopEventsForSession} from '../realtime/store';
 import type {RetrospectiveAnalyzer, SessionAnalysisInput} from './analyzer';
 import {insertRetrospective} from './store';
@@ -80,59 +79,23 @@ export interface FollowUpInput {
     analyzers: RetrospectiveAnalyzers;
 }
 
-/** Coerce a stored public meta object into the EncryptionMeta decryptCapture needs. */
-function toEncryptionMeta(meta: Record<string, unknown>): EncryptionMeta {
-    const {algo, iv, auth_tag, key_id} = meta;
-    if (
-        typeof algo !== 'string' ||
-        typeof iv !== 'string' ||
-        typeof auth_tag !== 'string' ||
-        typeof key_id !== 'string'
-    ) {
-        throw new RetrospectiveError('decrypt_failed', 'Capture encryption metadata is malformed');
-    }
-    return {algo, iv, auth_tag, key_id};
-}
-
-/** The transient result of decrypting a session: the joined plaintext plus the
- * number of capture rows it was built from (recorded as provenance — see below). */
-interface DecryptedSession {
-    /** The decrypted prompts/responses, concatenated. Transient: never persisted/logged. */
-    plaintext: string;
-    /** How many capture rows were decrypted and analyzed — stored on the retrospective. */
-    captureCount: number;
-}
-
 /**
  * Decrypt every capture in a session and concatenate the plaintext in chronological
- * order. The returned `plaintext` is transient — the caller uses it for analysis and
- * lets it fall out of scope; it is never persisted or logged. A wrong key (or any
- * tampering) makes GCM verification throw, surfaced as a typed `decrypt_failed`.
- *
- * Ordering note: `captured_at` is CLIENT-supplied (it rides the capture payload and
- * is never server-stamped), so the chronological reconstruction is best-effort —
- * clock skew or ties fall back to `created_at` (server insert order). The analyser
- * counts signals rather than depending on strict order, so a mis-ordered narrative
- * reads oddly at worst; it does not corrupt the counts.
+ * order. Delegates to the shared `decryptSessionToText` (the single home for the
+ * "blind ciphertext → in-memory plaintext, never persist or log" operation) and
+ * re-types its failures as `RetrospectiveError` so the route keeps mapping them to
+ * HTTP via its existing `RetrospectiveError` switch. The returned `plaintext` is
+ * transient — the caller uses it for analysis and lets it fall out of scope.
  */
 function decryptSession(db: Database.Database, developerId: string, sessionId: string, key: Buffer): DecryptedSession {
-    const captures = listSessionCapturesForDeveloper(db, developerId, sessionId);
-    if (captures.length === 0) {
-        throw new RetrospectiveError('no_captures', 'No captured session found to analyze');
-    }
-    const parts: string[] = [];
-    for (const capture of captures) {
-        const meta = toEncryptionMeta(capture.encryptionMeta);
-        const ciphertext = Buffer.from(capture.ciphertext, 'base64');
-        try {
-            parts.push(decryptCapture(ciphertext, meta, key));
-        } catch {
-            // Never include the underlying crypto error detail or any bytes — just the
-            // typed code. A bad key and a tampered blob are intentionally indistinguishable.
-            throw new RetrospectiveError('decrypt_failed', 'Could not decrypt the session with the provided key');
+    try {
+        return decryptSessionToText(db, developerId, sessionId, key);
+    } catch (err) {
+        if (err instanceof SessionDecryptError) {
+            throw new RetrospectiveError(err.code, err.message);
         }
+        throw err;
     }
-    return {plaintext: parts.join('\n'), captureCount: captures.length};
 }
 
 /**
