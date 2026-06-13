@@ -26,17 +26,18 @@ export function isShowcaseEnabledForTeam(db: Database.Database, team?: string | 
 }
 
 /**
- * The scopes a developer's team may publish at, derived from
- * `showcase_scope_permitted`: `team_only` → only team scope; `org_wide` → team
- * AND org. Team scope is always available once showcasing is enabled — narrowing
- * to team-only never removes the ability to share within one's own team.
+ * Whether a specific scope is currently permitted for a developer's team, per
+ * `showcase_scope_permitted`. Team scope is ALWAYS available once showcasing is
+ * enabled — narrowing to `team_only` never removes the ability to share within
+ * one's own team; org scope additionally requires the org to permit `org_wide`.
+ *
+ * (A "list every permitted scope" helper for a scope-selection UI is deliberately
+ * NOT exported yet — there is no caller until the Task 5.9 browse/selection surface,
+ * which can add it when it has a concrete use.)
  */
-export function permittedScopesForTeam(db: Database.Database, team?: string | null): ShowcaseScope[] {
-    const permitted = resolveSetting(db, 'showcase_scope_permitted', team);
-    return permitted === 'org_wide' ? ['team', 'org'] : ['team'];
-}
-
-/** Whether a specific scope is currently permitted for a developer's team. */
 export function isScopePermittedForTeam(db: Database.Database, team: string | null | undefined, scope: ShowcaseScope): boolean {
-    return permittedScopesForTeam(db, team).includes(scope);
+    if (scope === 'team') {
+        return true;
+    }
+    return resolveSetting(db, 'showcase_scope_permitted', team) === 'org_wide';
 }

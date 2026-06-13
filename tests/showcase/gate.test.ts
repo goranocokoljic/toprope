@@ -2,11 +2,7 @@ import {describe, it, expect, beforeEach, afterEach} from 'vitest';
 import type Database from 'better-sqlite3';
 import {makeTestDb} from '../dashboard/fixtures';
 import {setGlobalSetting, setTeamSetting} from '../../src/settings/store';
-import {
-    isShowcaseEnabledForTeam,
-    permittedScopesForTeam,
-    isScopePermittedForTeam,
-} from '../../src/showcase/gate';
+import {isShowcaseEnabledForTeam, isScopePermittedForTeam} from '../../src/showcase/gate';
 
 const NOW = '2026-06-13T00:00:00.000Z';
 
@@ -29,14 +25,14 @@ describe('showcase gate (Task 5.8)', () => {
     });
 
     it('defaults to team_only — only team scope is permitted', () => {
-        expect(permittedScopesForTeam(db, 'eng')).toEqual(['team']);
         expect(isScopePermittedForTeam(db, 'eng', 'team')).toBe(true);
         expect(isScopePermittedForTeam(db, 'eng', 'org')).toBe(false);
     });
 
     it('permits org scope when showcase_scope_permitted is org_wide', () => {
         setGlobalSetting(db, 'showcase_scope_permitted', 'org_wide');
-        expect(permittedScopesForTeam(db, 'eng')).toEqual(['team', 'org']);
+        // Team scope stays available, and org scope is now permitted too.
+        expect(isScopePermittedForTeam(db, 'eng', 'team')).toBe(true);
         expect(isScopePermittedForTeam(db, 'eng', 'org')).toBe(true);
     });
 
