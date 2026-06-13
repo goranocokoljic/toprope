@@ -39,7 +39,7 @@ import type {
     TeamComparison,
     TeamDetail,
     TeamListItem,
-    TeamPRReviewCoachingResponse,
+    ManagerCoachingPanel,
     TeamProviders,
     TeamSettings,
     TeamTrend,
@@ -603,19 +603,22 @@ export const api = {
         return body.data;
     },
 
+    // --- Manager aggregate coaching panel (Task 5.11) ---
+    // The manager team-aggregate PR/review surface is now folded into the unified
+    // panel below (getManagerCoachingPanel), which the Team Coaching page consumes;
+    // the per-pillar /api/coaching/pr-review/* routes remain on the server as a
+    // finer-grained API but have no dedicated client method.
     /**
-     * Manager team-aggregate PR/review coaching (NO individual numbers). `scope`
-     * is a team name or the literal 'org' for the org-wide roll-up.
+     * The unified manager coaching panel for a scope (`org` or a team name): all
+     * three pillar aggregates plus team coaching opportunities. TEAM-LEVEL ONLY —
+     * never an individual's coaching, and there is no drill-down counterpart.
      */
-    async getTeamPRReviewCoaching(
-        scope: string,
-        unit: PRReviewPeriodUnit,
-    ): Promise<TeamPRReviewCoachingResponse> {
+    async getManagerCoachingPanel(scope: string, unit: PRReviewPeriodUnit): Promise<ManagerCoachingPanel> {
         const path =
             scope === 'org'
-                ? `/api/coaching/pr-review/org?unit=${encodeURIComponent(unit)}`
-                : `/api/coaching/pr-review/team/${encodeURIComponent(scope)}?unit=${encodeURIComponent(unit)}`;
-        const body = await request<ApiEnvelope<TeamPRReviewCoachingResponse>>(path);
+                ? `/api/coaching/manager/org?unit=${encodeURIComponent(unit)}`
+                : `/api/coaching/manager/team/${encodeURIComponent(scope)}?unit=${encodeURIComponent(unit)}`;
+        const body = await request<ApiEnvelope<ManagerCoachingPanel>>(path);
         return body.data;
     },
 

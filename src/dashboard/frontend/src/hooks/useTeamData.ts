@@ -2,10 +2,10 @@ import {useQuery, type UseQueryResult} from '@tanstack/react-query';
 import {api} from '../api/client';
 import {queryKeys} from '../api/queryKeys';
 import type {
+    ManagerCoachingPanel,
     PRReviewPeriodUnit,
     TeamDetail,
     TeamListItem,
-    TeamPRReviewCoachingResponse,
     TeamProviders,
     TeamTrend,
     WasteAlert,
@@ -60,15 +60,16 @@ export function useTeamWaste(team: string): UseQueryResult<WasteAlert[], Error> 
 }
 
 /**
- * Team (or org) PR/review coaching aggregate (Task 5.3). `scope` is a team name
- * or the literal 'org'; keyed by scope + unit so each caches independently.
+ * The unified manager coaching panel (Task 5.11) — all three pillar aggregates
+ * plus team coaching opportunities, for `scope` (a team name or 'org'). Keyed by
+ * scope + unit so each caches independently.
  */
-export function useTeamPRReviewCoaching(
+export function useManagerCoachingPanel(
     scope: string,
     unit: PRReviewPeriodUnit,
-): UseQueryResult<TeamPRReviewCoachingResponse, Error> {
+): UseQueryResult<ManagerCoachingPanel, Error> {
     return useQuery({
-        queryKey: queryKeys.teamPRCoaching(scope, unit),
-        queryFn: () => api.getTeamPRReviewCoaching(scope, unit),
+        queryKey: queryKeys.managerCoachingPanel(scope, unit),
+        queryFn: () => api.getManagerCoachingPanel(scope, unit),
     });
 }

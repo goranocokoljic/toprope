@@ -28,6 +28,7 @@ import {registerCompareTableRoutes} from './dashboard/api/compare-table';
 import {registerSummaryRoutes} from './dashboard/api/summaries';
 import {registerAnomalyRoutes} from './dashboard/api/anomalies';
 import {registerCoachingRoutes} from './dashboard/api/coaching';
+import {registerManagerCoachingRoutes} from './dashboard/api/manager-coaching';
 import {registerCaptureRoutes} from './dashboard/api/captures';
 import {registerKeyRoutes} from './dashboard/api/keys';
 import {registerRealtimeCoachingRoutes} from './dashboard/api/realtime-coaching';
@@ -124,6 +125,12 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
     // PR/review coaching (Task 5.3): manager-facing TEAM aggregates only. The
     // developer-private trajectory lives on /api/me (registered above).
     registerCoachingRoutes(app, db);
+    // Manager aggregate coaching panel (Task 5.11): the unified TEAM-LEVEL surface
+    // over all three pillars — PR/review + churn trends, anonymized loop/nudge
+    // patterns from OPTED-IN developers only, and synthesized team coaching
+    // opportunities. Admin-only; every aggregate is min-group-size floored and no
+    // route here accepts a developer id, so no individual coaching is reachable.
+    registerManagerCoachingRoutes(app, db);
     // Prompt capture (Task 5.4): developer-private, opt-in, client-encrypted
     // capture ingestion + read under /api/me. The server is a blind store.
     registerCaptureRoutes(app, db);
