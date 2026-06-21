@@ -15,6 +15,9 @@ dist/
 reviews/
 .review-diff.patch
 
+# Per-task dev-cycle reports (human-readable; remove this line to commit them as project history)
+reports/
+
 # Logs
 *.log
 
