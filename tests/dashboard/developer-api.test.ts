@@ -1,4 +1,4 @@
-import {describe, it, expect, beforeEach, afterEach} from 'vitest';
+import {describe, it, expect, beforeEach, afterEach, vi} from 'vitest';
 import Fastify, {type FastifyInstance} from 'fastify';
 import type Database from 'better-sqlite3';
 import {makeTestDb} from './fixtures';
@@ -179,6 +179,13 @@ describe('Developer API (Task 2.4)', () => {
     let bobToken: string;
 
     beforeEach(async () => {
+        // Freeze the clock to NOW so endpoints that default to a trailing window
+        // (e.g. /api/me/overview → last 30 days) resolve against a fixed "today"
+        // that contains the seeded May activity, instead of drifting with the
+        // real wall clock. Fake only Date — leave real timers for Fastify's async.
+        vi.useFakeTimers({toFake: ['Date']});
+        vi.setSystemTime(new Date(NOW));
+
         db = makeTestDb();
         const hash = await hashPassword(PASSWORD);
 
@@ -198,6 +205,7 @@ describe('Developer API (Task 2.4)', () => {
     afterEach(async () => {
         await app.close();
         db.close();
+        vi.useRealTimers();
     });
 
     // ── authentication / scoping ─────────────────────────────────────────────
