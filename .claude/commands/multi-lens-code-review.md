@@ -1,10 +1,10 @@
 ---
 description: >-
   Multi-lens code review of the current branch's changes for GovProxy.
-  The parent captures the diff once and dispatches three independent
+  The parent captures the diff once and dispatches four independent
   reviewer subagents in parallel — Senior Overlord, Security/Correctness,
-  Occam's Razor — each with an isolated, diff-only context, then
-  concatenates their sections into a single file in /reviews. With
+  Occam's Razor, Test Adequacy — each with an isolated, diff-only context,
+  then concatenates their sections into a single file in /reviews. With
   --post, it also publishes a summary + inline findings to the branch's
   GitHub PR. Diff scope is merge-base against a configurable base branch.
 argument-hint: "[anchor: what this change does and why — the bug/issue/feature being addressed] [--base <branch> (default: develop)] [--post (publish to the GitHub PR)]"
@@ -15,7 +15,7 @@ argument-hint: "[anchor: what this change does and why — the bug/issue/feature
 ## How this command works
 
 Parallel, isolated review. The parent orchestrator captures the diff
-once, dispatches three independent subagents — one per lens — and
+once, dispatches four independent subagents — one per lens — and
 concatenates their returned sections into a single file. GovProxy is a
 single Node/TypeScript repo on GitHub, so there is one diff to review
 and (optionally) one PR to post to.
@@ -26,11 +26,11 @@ Phases:
    the branch, resolve merge-base, capture the diff once to a gitignored
    temp file, decide the output filename. The parent does **not** read
    the diff into its own context.
-2. **Three lens subagents (parallel)** — dispatch SO, SEC, OR as three
+2. **Four lens subagents (parallel)** — dispatch SO, SEC, OR, TST as four
    independent subagents in one message. Each gets only the diff file
    path and its lens prompt, reads the diff itself, and returns its
    composed markdown section.
-3. **Single Write** — concatenate the three returned sections and write
+3. **Single Write** — concatenate the four returned sections and write
    the entire review file in one tool call.
 4. **Post (only if `--post`)** — publish one GitHub review: a summary
    body plus one inline comment per finding that maps to a diff line.
@@ -39,10 +39,10 @@ Phases:
 
 **Cross-lens isolation is real, not approximated.** Each lens runs in
 its own subagent with a fresh context containing only the diff and its
-disposition — no subagent can see another's findings. Three genuinely
-independent reads converging on the same line is real triangulation
-signal. The parent never holds the diff text; it only assembles the
-sections the subagents return.
+disposition — no subagent can see another's findings. Independent reads
+converging on the same line is real triangulation signal. The parent
+never holds the diff text; it only assembles the sections the subagents
+return.
 
 ## Operational rules (apply throughout)
 
@@ -55,14 +55,14 @@ These keep cost predictable. They are operational, not editorial.
    protocol when a diff exceeds the Read cap.
 2. **The parent never reads the diff into its own context.** It captures
    to disk via a Bash redirect and hands subagents the path only. The
-   parent context holds only the three returned sections.
-3. **One Write at the end.** Concatenate the three returned sections and
+   parent context holds only the four returned sections.
+3. **One Write at the end.** Concatenate the four returned sections and
    write in one tool call in Phase 3. No header-first pattern, no `Edit`
    ceremony per lens.
 4. **No task-list plumbing.** A short pipeline does not need
    `TaskCreate`/`TaskUpdate`. Track progress in your reasoning.
 5. **Batch independent tool calls.** In Phase 1 the git commands are
-   independent — fire them in a single message. In Phase 2 the three
+   independent — fire them in a single message. In Phase 2 the four
    subagents are independent — dispatch them in a single message.
 6. **Use the Bash tool for git/gh.** The snippets below are bash (the
    Bash tool runs git-bash on this Windows host, so `$(...)` and standard
@@ -157,9 +157,9 @@ path); the diff content stays on disk until the subagents read it.
 **Do not write the review file yet, and do not read the diff.** Phase 2
 subagents read the diff and return sections; Phase 3 writes once.
 
-## Phase 2 — Three lens subagents (parallel, isolated)
+## Phase 2 — Four lens subagents (parallel, isolated)
 
-Dispatch three independent subagents — one per lens — in a **single
+Dispatch four independent subagents — one per lens — in a **single
 message** (one `Agent` call each, `subagent_type: general-purpose` so
 each has Read + Bash + Grep for the investigation policy). They run in
 parallel with fully isolated contexts; no subagent can see another's
@@ -182,7 +182,7 @@ verbatim:
   working tree).
 - **The lens prompt** for that subagent's lens, copied verbatim from the
   lens definitions below — Lens 1 → SO subagent, Lens 2 → SEC subagent,
-  Lens 3 → OR subagent.
+  Lens 3 → OR subagent, Lens 4 → TST subagent.
 - **The investigation policy** (the *Investigation policy* section
   above), copied in so the subagent reads surrounding files when a
   finding genuinely depends on them, verifies the anchor holistically,
@@ -224,8 +224,9 @@ Anchor: <one-line restatement of $ARGUMENTS or "no anchor provided">
 ---
 ```
 
-Stable IDs (`SO-1`, `SEC-1`, `OR-1`, …) are required so the reader can
-cross-reference and so Phase 4 can attach each finding to a PR line.
+Stable IDs (`SO-1`, `SEC-1`, `OR-1`, `TST-1`, …) are required so the
+reader can cross-reference and so Phase 4 can attach each finding to a
+PR line.
 
 ### Lens 1: [SO] Senior Overlord
 
@@ -311,13 +312,59 @@ well-targeted, say so.
 Anchor on `$ARGUMENTS`: does the diff fix the reported scenario, or does
 it fix more than was asked?
 
+### Lens 4: [TST] Test Adequacy
+
+You are reviewing whether the tests in this change actually *prove* the
+code is correct — not whether tests exist, but whether they would catch
+the regressions that matter. Assume the implementation ships; your job is
+to find where a future bug slips through a green test suite.
+
+Work through these axes against the diff (read the test files **and** the
+source they cover — a test's adequacy is only judgeable against the code
+it claims to exercise):
+
+- **Per-criterion coverage.** Treat the anchor as the list of behaviors
+  this change promises. Does each one have at least one test that would
+  **fail if that behavior regressed**? A promised behavior with no
+  failing-on-regression test is a gap, not a nitpick.
+- **Untested branches & paths.** Error paths, `catch` blocks, early
+  returns, and discriminated-union arms the diff adds that no test
+  exercises. New source with zero covering test is the strongest finding.
+- **GovProxy edge cases.** When the changed code touches them, these must
+  be tested: a zero-activity day, a missing/unknown developer, a
+  malformed CSV amount or date, an empty or paginated connector API
+  response, a duplicate-day write (append-only must hold), and UTC date
+  boundaries.
+- **Assertion strength.** Tests that call the code but assert only
+  truthiness, a snapshot, or the mock itself are false confidence — worse
+  than no test. Flag any test that cannot fail for the right reason.
+- **Coupling & determinism.** Tests coupled to implementation detail that
+  will break on a harmless refactor; shared mutable state across tests;
+  real network/clock/filesystem where it should be faked; time/random/
+  order dependence that makes a test flaky.
+
+Severity rubric (calibrate deliberately — this lens feeds an auto-fix
+loop, so over-ranking burns cycles):
+- **Critical/High** — an acceptance criterion has no test that proves it;
+  an error path or an invariant-critical branch (append-only, the privacy
+  model, snapshot integrity) is entirely untested; new logic's only
+  coverage is a test that asserts nothing.
+- **Medium** — a meaningful edge case is untested while the happy path is
+  solid; present-but-weak assertions on secondary logic.
+- **Low / Style** — test naming, structure, minor duplication.
+
+Cite concrete `file:line` for both the test and the source line it should
+cover. Don't demand tests for trivial glue, pure type declarations, or
+generated code. If the tests are genuinely thorough, say so plainly — a
+clean TST pass is real signal, not a reason to manufacture findings.
+
 ## Phase 3 — Single Write
 
-Concatenate the three sections returned by the subagents — **SO, then
-SEC, then OR** — under the header below. Assembly is mechanical: do not
-edit, dedup, re-rank, or merge findings across sections. If a subagent
-failed to return a usable section, note that inline under that lens's
-heading rather than dropping the lens silently. Full file content:
+Concatenate the four sections returned by the subagents — **SO, then
+SEC, then OR, then TST** — under the header below. Assembly is mechanical:
+do not edit, dedup, re-rank, or merge findings across sections. If a
+subagent failed to return a usable section, note that inline under that
+lens's heading rather than dropping the lens silently. Full file content:
 
 ```markdown
 # Review (multi-lens) — issue #<ISSUE or "uncommitted"> — iteration <N>
@@ -335,6 +382,8 @@ heading rather than dropping the lens silently. Full file content:
 <SEC section>
 
 <OR section>
+
+<TST section>
 ```
 
 Then call `Write` **once** with that content to `$OUTPUT`.
