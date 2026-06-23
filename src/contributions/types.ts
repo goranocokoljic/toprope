@@ -63,6 +63,9 @@ export const KNOWN_REVIEW_EVENTS = [
     'unpublished',
     'removed',
     'redacted',
+    // 6.1.4 scope-resolution governance: a team hiding / un-hiding an org item for itself.
+    'hidden',
+    'unhidden',
 ] as const;
 
 /** A stored contribution — the spine row as callers see it (camelCase). */
