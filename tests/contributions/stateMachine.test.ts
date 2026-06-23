@@ -456,6 +456,68 @@ describe('contribution state machine (Task 6.1.2)', () => {
         });
     });
 
+    describe('actor validation', () => {
+        it('rejects a blank actorId on every transition (invalid_actor)', () => {
+            const id = makeDraft(db);
+            // submit
+            expect(() => submit(db, {contributionId: id, gate: 'auto-publish', actorId: '  ', timestamp: T2})).toThrow(
+                ContributionStateError,
+            );
+            try {
+                submit(db, {contributionId: id, gate: 'auto-publish', actorId: '', timestamp: T2});
+            } catch (e) {
+                expect((e as ContributionStateError).code).toBe('invalid_actor');
+            }
+            // Nothing was written by the rejected submit.
+            expect(getContribution(db, id)?.state).toBe('draft');
+            expect(listReviewEvents(db, id)).toHaveLength(0);
+
+            // Drive to published with a real actor, then check the other ops reject blanks.
+            submit(db, {contributionId: id, gate: 'auto-publish', actorId: 'alice', timestamp: T2});
+            for (const op of [
+                () => approve(db, {contributionId: id, actorId: ''}),
+                () => publish(db, {contributionId: id, gate: 'auto-publish', actorId: ''}),
+                () => unpublish(db, {contributionId: id, actorId: ''}),
+                () => remove(db, {contributionId: id, actorId: ''}),
+            ]) {
+                try {
+                    op();
+                    throw new Error('expected throw');
+                } catch (e) {
+                    expect((e as ContributionStateError).code).toBe('invalid_actor');
+                }
+            }
+        });
+    });
+
+    describe('approval gate timestamp boundary', () => {
+        it('an approval stamped at the SAME instant as the submission satisfies the gate (TST-5)', () => {
+            const id = makeDraft(db);
+            submit(db, {contributionId: id, gate: 'required-approval', actorId: 'alice', timestamp: T2});
+            // Approval shares the submission's exact timestamp — the inclusive `>=` arm.
+            approve(db, {contributionId: id, actorId: 'lead', timestamp: T2});
+            const result = publish(db, {contributionId: id, gate: 'required-approval', actorId: 'lead', timestamp: T2});
+            expect(result.state).toBe('published');
+            expect(eventTypes(db, id)).toEqual(['submitted', 'approved', 'published']);
+        });
+    });
+
+    describe('not_found across operations', () => {
+        it('unpublish and remove throw not_found for a missing contribution', () => {
+            for (const op of [
+                () => unpublish(db, {contributionId: 'nope', actorId: 'lead', timestamp: T2}),
+                () => remove(db, {contributionId: 'nope', actorId: 'lead', timestamp: T2}),
+            ]) {
+                try {
+                    op();
+                    throw new Error('expected throw');
+                } catch (e) {
+                    expect((e as ContributionStateError).code).toBe('not_found');
+                }
+            }
+        });
+    });
+
     describe('default timestamp', () => {
         it('stamps a valid UTC ISO occurredAt when no timestamp is supplied (TST-3)', () => {
             const id = makeDraft(db);

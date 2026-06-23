@@ -21,6 +21,14 @@
  * be recorded without its audit row (or vice versa). Pre-publish hooks run inside
  * that same transaction — a throwing hook rolls the whole publish back, so a
  * failed scrub leaves the contribution unpublished rather than half-published.
+ *
+ * Concurrency: the legality and gate checks read the current state/audit log just
+ * BEFORE opening the write transaction. better-sqlite3 is synchronous and
+ * single-threaded, so within one process nothing can interleave between the read
+ * and the write. This engine assumes a single writer; cross-process concurrent
+ * transitions are out of scope (a guarded `UPDATE ... WHERE state = ?` would be the
+ * fix if that ever changes), mirroring the single-process posture documented on the
+ * store's version writer.
  */
 
 import type Database from 'better-sqlite3';
@@ -71,7 +79,12 @@ export function isLegalTransition(from: ContributionState, to: ContributionState
 }
 
 /** Stable error codes the caller (route/service) can switch on without matching message text. */
-export type ContributionStateErrorCode = 'not_found' | 'illegal_transition' | 'gate_not_satisfied' | 'invalid_gate';
+export type ContributionStateErrorCode =
+    | 'not_found'
+    | 'illegal_transition'
+    | 'gate_not_satisfied'
+    | 'invalid_gate'
+    | 'invalid_actor';
 
 /** A typed failure from the state machine, carrying a code the caller can map to an HTTP status. */
 export class ContributionStateError extends Error {
@@ -150,6 +163,18 @@ function nowIso(): string {
 }
 
 /**
+ * Reject a missing or blank actor. The audit trail's "every transition names an
+ * actor" guarantee is only as real as the actorId handed in: an empty string would
+ * satisfy the `NOT NULL` column yet leave an effectively anonymous row, so the
+ * engine enforces a non-blank actor here rather than trusting the caller.
+ */
+function requireActor(actorId: string): void {
+    if (actorId.trim() === '') {
+        throw new ContributionStateError('invalid_actor', 'A non-empty actorId is required for every transition.');
+    }
+}
+
+/**
  * Load the contribution and assert that `from → to` is a legal move, throwing a
  * typed error otherwise. Returns the current contribution so callers don't re-read.
  */
@@ -217,12 +242,17 @@ function doPublish(
  * at `submitted` and waits for {@link approve} + {@link publish}.
  *
  * Returns the contribution in its resulting state. Throws `illegal_transition`
- * when the contribution is not a draft, or `not_found` when it does not exist.
+ * when the contribution is not a draft, `not_found` when it does not exist,
+ * `invalid_gate` for an unrecognized gate, or `invalid_actor` for a blank actor.
+ *
+ * Transaction: this opens its own transaction. better-sqlite3 has no nested
+ * transactions, so do NOT call it from inside another `db.transaction(...)`.
  */
 export function submit(db: Database.Database, input: SubmitInput): Contribution {
     if (!isReviewGate(input.gate)) {
         throw new ContributionStateError('invalid_gate', `Unrecognized review gate '${String(input.gate)}'.`);
     }
+    requireActor(input.actorId);
     const ts = input.timestamp ?? nowIso();
     const note = input.note ?? null;
     const hooks = input.prePublishHooks ?? [];
@@ -253,6 +283,7 @@ export function submit(db: Database.Database, input: SubmitInput): Contribution 
  * a distinct approver (four-eyes) must enforce that before calling `approve`.
  */
 export function approve(db: Database.Database, input: ApproveInput): Contribution {
+    requireActor(input.actorId);
     const ts = input.timestamp ?? nowIso();
     const note = input.note ?? null;
     const contribution = getContribution(db, input.contributionId);
@@ -279,11 +310,15 @@ export function approve(db: Database.Database, input: ApproveInput): Contributio
  * `approved` event was recorded for the current submission — this is the
  * gate-cannot-be-bypassed guarantee. Pre-publish hooks run, atomically, before the
  * flip. Throws `illegal_transition` unless the contribution is `submitted`.
+ *
+ * Transaction: this opens its own transaction. better-sqlite3 has no nested
+ * transactions, so do NOT call it from inside another `db.transaction(...)`.
  */
 export function publish(db: Database.Database, input: PublishInput): Contribution {
     if (!isReviewGate(input.gate)) {
         throw new ContributionStateError('invalid_gate', `Unrecognized review gate '${String(input.gate)}'.`);
     }
+    requireActor(input.actorId);
     const ts = input.timestamp ?? nowIso();
     const note = input.note ?? null;
     const hooks = input.prePublishHooks ?? [];
@@ -312,6 +347,7 @@ export function publish(db: Database.Database, input: PublishInput): Contributio
  * the contribution is `published`.
  */
 export function unpublish(db: Database.Database, input: UnpublishInput): Contribution {
+    requireActor(input.actorId);
     const ts = input.timestamp ?? nowIso();
     const note = input.note ?? null;
     const contribution = requireTransition(db, input.contributionId, 'unpublished');
@@ -331,6 +367,7 @@ export function unpublish(db: Database.Database, input: UnpublishInput): Contrib
  * `illegal_transition` unless the contribution is `published` or `unpublished`.
  */
 export function remove(db: Database.Database, input: RemoveInput): Contribution {
+    requireActor(input.actorId);
     const ts = input.timestamp ?? nowIso();
     const note = input.note ?? null;
     const contribution = requireTransition(db, input.contributionId, 'removed');
