@@ -35,6 +35,7 @@ import {registerRealtimeCoachingRoutes} from './dashboard/api/realtime-coaching'
 import {registerRetrospectiveRoutes} from './dashboard/api/retrospectives';
 import {registerShowcaseRoutes} from './dashboard/api/showcase';
 import {registerShowcaseAdminRoutes} from './dashboard/api/showcase-admin';
+import {registerPracticeAuthoringRoutes} from './dashboard/api/practices';
 import {registerDashboardStatic} from './dashboard/static';
 import {createSlackClient} from './slack/client';
 import {notifyNewAnomalies} from './anomaly/notify';
@@ -164,6 +165,12 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
     // a team lead can remove from their team's showcase but never publish for a
     // developer; every removal is team-bounded, logged, and notifies the author.
     registerShowcaseAdminRoutes(app, db);
+
+    // Best-practice rich authoring editor (Task 6.2.3): /api/me, developer-owned —
+    // markdown + code blocks + embedded {{metric}} references rendered to a safe
+    // (sanitized) preview, metric refs producing auto-surfacing tags, every save
+    // routed through the 6.1.3 versioning primitive. No manager path.
+    registerPracticeAuthoringRoutes(app, db);
 
     // Data-prompted surveys (Task 4.3): manager queue + developer self-service.
     // Survey delivery prefers the Slack bot when configured, with an email
