@@ -37,6 +37,20 @@ import type {Contribution, ContributionState} from './types';
  */
 export type ReviewGate = 'required-approval' | 'auto-publish';
 
+/** The known review gates. Informational + the basis for {@link isReviewGate}. */
+export const REVIEW_GATES = ['required-approval', 'auto-publish'] as const;
+
+/**
+ * Runtime validator for a review gate. The gate guards a governance invariant, so
+ * it must NOT be trusted into the core on a compile-time type alone: a caller that
+ * derives the gate from a settings string / route param could hand in an
+ * unrecognized value, and the gate logic must reject it rather than silently
+ * fall through. Both {@link submit} and {@link publish} validate with this first.
+ */
+export function isReviewGate(value: unknown): value is ReviewGate {
+    return value === 'required-approval' || value === 'auto-publish';
+}
+
 /**
  * The legal transitions, as a single source of truth. A move is legal only if its
  * target appears in the current state's list; everything else is rejected. This is
@@ -57,7 +71,7 @@ export function isLegalTransition(from: ContributionState, to: ContributionState
 }
 
 /** Stable error codes the caller (route/service) can switch on without matching message text. */
-export type ContributionStateErrorCode = 'not_found' | 'illegal_transition' | 'gate_not_satisfied';
+export type ContributionStateErrorCode = 'not_found' | 'illegal_transition' | 'gate_not_satisfied' | 'invalid_gate';
 
 /** A typed failure from the state machine, carrying a code the caller can map to an HTTP status. */
 export class ContributionStateError extends Error {
@@ -99,7 +113,15 @@ interface BaseInput {
 }
 
 export interface SubmitInput extends BaseInput {
-    /** The review gate for this contribution model. `auto-publish` carries straight to published. */
+    /**
+     * The review gate for this contribution model. `auto-publish` carries straight
+     * to published; `required-approval` stops at submitted until approved.
+     *
+     * SECURITY: a feature MUST derive this server-side from the contribution's
+     * resolved model/settings — never echo it from client request input. A
+     * client-supplied gate of `auto-publish` would let an author self-publish past
+     * a required-approval model. Unrecognized values are rejected (`invalid_gate`).
+     */
     gate: ReviewGate;
     /** Pre-publish hooks, used only when `auto-publish` advances this submission to published. */
     prePublishHooks?: PrePublishHook[];
@@ -108,7 +130,12 @@ export interface SubmitInput extends BaseInput {
 export type ApproveInput = BaseInput;
 
 export interface PublishInput extends BaseInput {
-    /** The review gate; `required-approval` requires a recorded approval for this submission. */
+    /**
+     * The review gate. Publishing is fail-CLOSED: anything other than the explicit
+     * `auto-publish` requires a recorded approval for the current submission, so an
+     * unrecognized value can never bypass the gate (it is also rejected outright as
+     * `invalid_gate`). As with submit, derive this server-side, never from the client.
+     */
     gate: ReviewGate;
     /** Feature-specific steps (e.g. redaction) run, atomically, before the publish. */
     prePublishHooks?: PrePublishHook[];
@@ -193,6 +220,9 @@ function doPublish(
  * when the contribution is not a draft, or `not_found` when it does not exist.
  */
 export function submit(db: Database.Database, input: SubmitInput): Contribution {
+    if (!isReviewGate(input.gate)) {
+        throw new ContributionStateError('invalid_gate', `Unrecognized review gate '${String(input.gate)}'.`);
+    }
     const ts = input.timestamp ?? nowIso();
     const note = input.note ?? null;
     const hooks = input.prePublishHooks ?? [];
@@ -216,6 +246,11 @@ export function submit(db: Database.Database, input: SubmitInput): Contribution 
  * approval is a gate fact, not a lifecycle state — so the contribution stays
  * `submitted` until {@link publish}. Throws `illegal_transition` unless the
  * contribution is currently `submitted`.
+ *
+ * Actor/author separation is NOT enforced here: this primitive records whoever the
+ * feature names as `actorId`, so an author may self-approve when the model allows
+ * it (e.g. the showcase "developer approves" case). A feature whose model demands
+ * a distinct approver (four-eyes) must enforce that before calling `approve`.
  */
 export function approve(db: Database.Database, input: ApproveInput): Contribution {
     const ts = input.timestamp ?? nowIso();
@@ -246,12 +281,18 @@ export function approve(db: Database.Database, input: ApproveInput): Contributio
  * flip. Throws `illegal_transition` unless the contribution is `submitted`.
  */
 export function publish(db: Database.Database, input: PublishInput): Contribution {
+    if (!isReviewGate(input.gate)) {
+        throw new ContributionStateError('invalid_gate', `Unrecognized review gate '${String(input.gate)}'.`);
+    }
     const ts = input.timestamp ?? nowIso();
     const note = input.note ?? null;
     const hooks = input.prePublishHooks ?? [];
     const contribution = requireTransition(db, input.contributionId, 'published');
 
-    if (input.gate === 'required-approval' && !hasApprovalForCurrentSubmission(db, input.contributionId)) {
+    // Fail-closed: only an explicit `auto-publish` skips the approval check, so any
+    // other gate (including a future one) requires a recorded approval to reach
+    // published — the gate cannot be bypassed by an unexpected value.
+    if (input.gate !== 'auto-publish' && !hasApprovalForCurrentSubmission(db, input.contributionId)) {
         throw new ContributionStateError(
             'gate_not_satisfied',
             `Contribution '${input.contributionId}' requires approval before it can be published.`,

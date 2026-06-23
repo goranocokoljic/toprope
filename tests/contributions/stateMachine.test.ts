@@ -1,7 +1,7 @@
 import {describe, it, expect, beforeEach, afterEach} from 'vitest';
 import type Database from 'better-sqlite3';
 import {makeTestDb} from '../dashboard/fixtures';
-import {createContribution, getContribution, listReviewEvents, updateContributionState} from '../../src/contributions/store';
+import {addReviewEvent, createContribution, getContribution, listReviewEvents, updateContributionState} from '../../src/contributions/store';
 import {
     approve,
     ContributionStateError,
@@ -12,6 +12,7 @@ import {
     submit,
     unpublish,
     type PrePublishHook,
+    type ReviewGate,
 } from '../../src/contributions/stateMachine';
 import type {ContributionState, NewContribution} from '../../src/contributions/types';
 
@@ -109,6 +110,11 @@ describe('contribution state machine (Task 6.1.2)', () => {
             expect(getContribution(db, id)?.state).toBe('published');
             // Both transitions are audited: submitted then published. No approval needed.
             expect(eventTypes(db, id)).toEqual(['submitted', 'published']);
+            // The published event must carry the acting user and the single shared
+            // timestamp — not a fresh clock or a dropped actor (TST-2).
+            const events = listReviewEvents(db, id);
+            expect(events[0]).toMatchObject({event: 'submitted', actorId: 'alice', occurredAt: T2});
+            expect(events[1]).toMatchObject({event: 'published', actorId: 'alice', occurredAt: T2});
         });
 
         it('runs pre-publish hooks when auto-publishing', () => {
@@ -360,6 +366,107 @@ describe('contribution state machine (Task 6.1.2)', () => {
             } catch (e) {
                 expect((e as ContributionStateError).code).toBe('gate_not_satisfied');
             }
+        });
+    });
+
+    describe('atomic rollback', () => {
+        it('a throwing hook during auto-publish rolls submit all the way back to draft (TST-1)', () => {
+            const id = makeDraft(db);
+            const failing: PrePublishHook = () => {
+                throw new Error('scrub failed');
+            };
+            expect(() =>
+                submit(db, {contributionId: id, gate: 'auto-publish', actorId: 'alice', timestamp: T2, prePublishHooks: [failing]}),
+            ).toThrow('scrub failed');
+
+            // The submitted write, its audit event, and the publish all share one
+            // transaction — a failing hook must leave NOTHING: state back at draft,
+            // zero audit events (no stranded `submitted`).
+            expect(getContribution(db, id)?.state).toBe('draft');
+            expect(listReviewEvents(db, id)).toHaveLength(0);
+        });
+
+        it('a hook writes through ctx.db, and that write rolls back with the publish if a later hook throws (TST-4)', () => {
+            // First: a hook writes a review event via ctx.db and the publish commits —
+            // proving the handle participates in the same transaction.
+            const ok = makeDraft(db);
+            submit(db, {contributionId: ok, gate: 'required-approval', actorId: 'alice', timestamp: T2});
+            approve(db, {contributionId: ok, actorId: 'lead', timestamp: T3});
+            const writing: PrePublishHook = (ctx) => {
+                // Write through ctx.db so the row joins the publish transaction.
+                addReviewEvent(ctx.db, {
+                    contributionId: ctx.contribution.id,
+                    event: 'redacted',
+                    actorId: ctx.actorId,
+                    note: 'scrubbed',
+                    occurredAt: ctx.timestamp,
+                });
+            };
+            publish(db, {contributionId: ok, gate: 'required-approval', actorId: 'lead', timestamp: T4, prePublishHooks: [writing]});
+            expect(eventTypes(db, ok)).toEqual(['submitted', 'approved', 'redacted', 'published']);
+
+            // Second: the hook write is followed by a throwing hook — the ctx.db write
+            // must roll back together with the aborted publish.
+            const rolled = makeDraft(db, {title: 'Rolled'});
+            submit(db, {contributionId: rolled, gate: 'required-approval', actorId: 'alice', timestamp: T2});
+            approve(db, {contributionId: rolled, actorId: 'lead', timestamp: T3});
+            const thenFail: PrePublishHook = () => {
+                throw new Error('boom');
+            };
+            expect(() =>
+                publish(db, {
+                    contributionId: rolled,
+                    gate: 'required-approval',
+                    actorId: 'lead',
+                    timestamp: T4,
+                    prePublishHooks: [writing, thenFail],
+                }),
+            ).toThrow('boom');
+            // The 'redacted' row the first hook wrote via ctx.db is gone.
+            expect(eventTypes(db, rolled)).toEqual(['submitted', 'approved']);
+            expect(getContribution(db, rolled)?.state).toBe('submitted');
+        });
+    });
+
+    describe('gate validation (fail-closed)', () => {
+        it('submit rejects an unrecognized gate value (invalid_gate)', () => {
+            const id = makeDraft(db);
+            try {
+                submit(db, {contributionId: id, gate: 'requires-approval' as unknown as ReviewGate, actorId: 'alice', timestamp: T2});
+                throw new Error('expected throw');
+            } catch (e) {
+                expect((e as ContributionStateError).code).toBe('invalid_gate');
+            }
+            // Nothing written — validation happens before any state change.
+            expect(getContribution(db, id)?.state).toBe('draft');
+            expect(listReviewEvents(db, id)).toHaveLength(0);
+        });
+
+        it('publish refuses an unrecognized gate rather than failing open to published', () => {
+            const id = makeDraft(db);
+            submit(db, {contributionId: id, gate: 'required-approval', actorId: 'alice', timestamp: T2});
+            // An unrecognized gate must NOT slip past the approval check.
+            try {
+                publish(db, {contributionId: id, gate: 'auto_publish' as unknown as ReviewGate, actorId: 'lead', timestamp: T3});
+                throw new Error('expected throw');
+            } catch (e) {
+                expect((e as ContributionStateError).code).toBe('invalid_gate');
+            }
+            expect(getContribution(db, id)?.state).toBe('submitted');
+        });
+    });
+
+    describe('default timestamp', () => {
+        it('stamps a valid UTC ISO occurredAt when no timestamp is supplied (TST-3)', () => {
+            const id = makeDraft(db);
+            // Omit timestamp -> the `?? nowIso()` default path is exercised on a real write.
+            submit(db, {contributionId: id, gate: 'required-approval', actorId: 'alice'});
+            const events = listReviewEvents(db, id);
+            expect(events).toHaveLength(1);
+            const occurredAt = events[0].occurredAt;
+            // Round-trips as a UTC ISO instant.
+            expect(occurredAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+            expect(new Date(occurredAt).toISOString()).toBe(occurredAt);
         });
     });
 
