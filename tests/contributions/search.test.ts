@@ -13,7 +13,7 @@ import {
     removeContributionTag,
     updateContributionState,
 } from '../../src/contributions/store';
-import {editContribution} from '../../src/contributions/versioning';
+import {editContribution, revertToVersion} from '../../src/contributions/versioning';
 import {hideOrgItemForTeam} from '../../src/contributions/scope';
 import type {NewContribution} from '../../src/contributions/types';
 
@@ -147,13 +147,20 @@ describe('contribution search', () => {
             expect(ids(res)).toEqual([both]);
         });
 
-        it('ranks a title match above a body-only match', () => {
-            const bodyOnly = make(db, 'Generic', {bodyText: 'a passing mention of churn somewhere'});
+        it('ranks title above body above tags (all three bm25 weights exercised)', () => {
+            // One hit per column so each bm25 weight (title=10, body=4, tags=2) is
+            // isolated. This asserts the FULL three-way ordering — not just title>body
+            // — so it would fail if the weights were misaligned (e.g. the leading
+            // UNINDEXED column shifting them) and tags slipped to the default weight.
+            const tagOnly = make(db, 'Generic A', {bodyText: 'unrelated prose', tags: ['churn']});
+            const bodyOnly = make(db, 'Generic B', {bodyText: 'a passing mention of churn somewhere'});
             const titleHit = make(db, 'Churn reduction guide', {bodyText: 'unrelated prose'});
             const res = searchContributions(db, {text: 'churn'});
-            expect(ids(res)).toEqual([titleHit, bodyOnly]);
-            // Lower bm25 score == more relevant; the title hit must score lower.
+            expect(ids(res)).toEqual([titleHit, bodyOnly, tagOnly]);
+            // Lower bm25 score == more relevant; scores must be strictly increasing
+            // title → body → tags.
             expect(res[0].score).toBeLessThan(res[1].score);
+            expect(res[1].score).toBeLessThan(res[2].score);
         });
 
         it('returns empty for a term that matches nothing', () => {
@@ -237,12 +244,17 @@ describe('contribution search', () => {
             expect(ids(res)).toEqual([target]);
         });
 
-        it('applies limit after ranking', () => {
-            make(db, 'churn one', {bodyText: 'churn churn churn'});
-            make(db, 'churn two', {bodyText: 'churn'});
-            make(db, 'churn three', {bodyText: 'churn'});
+        it('applies limit after ranking — keeps the most relevant, not just the first N', () => {
+            // The title hit is most relevant; the two body hits are seeded so the
+            // title hit is NOT created first, so a limit applied before ranking would
+            // drop it. Asserting the identities (not just the length) proves the cap
+            // keeps the top-ranked results.
+            make(db, 'body one', {bodyText: 'churn mention'});
+            const titleHit = make(db, 'Churn guide', {bodyText: 'unrelated'});
+            make(db, 'body two', {bodyText: 'churn mention'});
             const res = searchContributions(db, {text: 'churn', limit: 2});
             expect(res).toHaveLength(2);
+            expect(res[0].contribution.id).toBe(titleHit);
         });
     });
 
@@ -313,6 +325,20 @@ describe('contribution search', () => {
 
             expect(searchContributions(db, {text: 'churn'})).toEqual([]);
             expect(ids(searchContributions(db, {text: 'caching'}))).toEqual([id]);
+        });
+
+        it('reverting re-indexes the body of the version it restores', () => {
+            // Revert bumps current_version to point at an OLDER body — a distinct
+            // trigger path from edit. The index must follow it back.
+            const id = make(db, 'Evolving', {bodyText: 'discusses churn'});
+            editContribution(db, id, {actorId: 'alice', body: body('now about caching'), timestamp: T2});
+            expect(searchContributions(db, {text: 'churn'})).toEqual([]);
+
+            revertToVersion(db, id, 1, {actorId: 'alice', timestamp: T3});
+
+            // v1's "churn" body is current again; the edited "caching" body is not.
+            expect(ids(searchContributions(db, {text: 'churn'}))).toEqual([id]);
+            expect(searchContributions(db, {text: 'caching'})).toEqual([]);
         });
 
         it('adding then removing a tag updates what tag text matches', () => {

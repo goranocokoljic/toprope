@@ -25,6 +25,13 @@
  * title hit outranks a passing mention. With no text query it is a pure filtered
  * browse, ordered newest-first to match the store's default. Feature-specific
  * ranking (e.g. blending in usage/feedback signals) is layered on later by 6.2/6.3.
+ *
+ * KNOWN LIMITATION — the body is the spine's opaque JSON payload, indexed VERBATIM
+ * (the spine must not parse it). So the JSON's own structural KEYS are tokenized and
+ * indexed alongside the prose: a free-text query for a word that happens to be an
+ * envelope key (e.g. `markdown`) will match every contribution that uses that key.
+ * This is the documented tradeoff of keeping the spine feature-agnostic; the fix is
+ * for a feature to later supply EXTRACTED text to index instead of the raw envelope.
  */
 
 import type Database from 'better-sqlite3';
@@ -193,12 +200,18 @@ export function searchContributions(
 
     const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
     // Weight title above body above tags so a title hit outranks a passing mention.
-    // bm25 returns lower-is-better, so ascending order is most-relevant-first.
+    // bm25's weights are POSITIONAL over ALL declared columns, including the leading
+    // UNINDEXED `contribution_id` — so the first weight (0.0) is the inert id column
+    // and the real weights are title=10, body=4, tags=2. (Omitting the id weight
+    // would silently shift every weight one column left, leaving tags at the default
+    // 1.0 — the off-by-one this 0.0 prefix prevents.) bm25 is lower-is-better, so
+    // ascending order is most-relevant-first.
+    const BM25 = 'bm25(contribution_search, 0.0, 10.0, 4.0, 2.0)';
     const orderBy =
         match !== null
-            ? 'ORDER BY bm25(contribution_search, 10.0, 4.0, 2.0) ASC, c.created_at DESC, c.id DESC'
+            ? `ORDER BY ${BM25} ASC, c.created_at DESC, c.id DESC`
             : 'ORDER BY c.created_at DESC, c.id DESC';
-    const scoreSelect = match !== null ? 'bm25(contribution_search, 10.0, 4.0, 2.0) AS __score' : '0 AS __score';
+    const scoreSelect = match !== null ? `${BM25} AS __score` : '0 AS __score';
 
     const sql = `SELECT c.*, ${scoreSelect} FROM contributions c ${joins.join(' ')} ${where} ${orderBy}`;
     const rows = db.prepare(sql).all(...params) as (ContributionRow & {__score: number})[];
