@@ -208,6 +208,41 @@ describe('contribution-model engine (Task 6.2.2 / #157)', () => {
             expect(ranked.map((r) => r.score)).toEqual([2, 1, -1]);
         });
 
+        it('ranks by helpful-RATIO, not raw net score (6.2.4)', () => {
+            // `broad` has the higher NET score (+4) but a worse ratio; `pure` has a
+            // lower net (+3) but a perfect ratio with enough votes to be credible.
+            // Helpful-ratio ranking must put `pure` first — proving the sort key is the
+            // confidence-adjusted ratio, not net (helpful − notHelpful).
+            const broad = makeDraft(db, {title: 'broad', timestamp: T1});
+            const pure = makeDraft(db, {title: 'pure', timestamp: T2});
+            for (const id of [broad, pure]) {
+                submitPractice(db, {contributionId: id, actorId: 'alice', actorIsLead: false, team: TEAM});
+            }
+            // broad: 8 helpful / 4 not-helpful (net +4, ratio 0.667)
+            // pure:  3 helpful / 0 not-helpful (net +3, ratio 1.0)
+            let dev = 0;
+            const vote = (id: string, signal: 'helpful' | 'not_helpful'): void => {
+                const developerId = `voter-${dev++}`;
+                seedDeveloper(db, developerId);
+                recordFeedback(db, {contributionId: id, developerId, signal});
+            };
+            for (let i = 0; i < 8; i++) vote(broad, 'helpful');
+            for (let i = 0; i < 4; i++) vote(broad, 'not_helpful');
+            for (let i = 0; i < 3; i++) vote(pure, 'helpful');
+
+            const ranked = orderPracticePool(db, 'bottom_up', [broad, pure]);
+            expect(ranked.map((r) => r.contributionId)).toEqual([pure, broad]);
+            // Net would have ordered them the OTHER way: broad's net (4) beats pure's (3).
+            const broadRow = ranked.find((r) => r.contributionId === broad);
+            const pureRow = ranked.find((r) => r.contributionId === pure);
+            expect(broadRow?.score).toBe(4);
+            expect(pureRow?.score).toBe(3);
+            // The ratio-based rank score is what flips the order.
+            expect(pureRow?.rankScore).toBeGreaterThan(broadRow?.rankScore ?? 0);
+            expect(pureRow?.helpfulRatio).toBe(1);
+            expect(broadRow?.helpfulRatio).toBeCloseTo(8 / 12, 10);
+        });
+
         it('runs a supplied pre-publish hook on the auto-publish path', () => {
             const id = makeDraft(db);
             let ran = 0;
