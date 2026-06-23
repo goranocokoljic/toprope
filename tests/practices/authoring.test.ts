@@ -79,9 +79,19 @@ describe('best-practice rich authoring (Task 6.2.3)', () => {
             expect(html).toContain('World');
         });
 
-        it('drops a javascript: link href', () => {
+        it('drops a javascript: link href but keeps the link text harmless', () => {
             const {html} = renderPractice('[click](javascript:alert(1))');
             expect(html).not.toContain('javascript:');
+            expect(html).not.toContain('alert(1)');
+            // the anchor survives WITHOUT a dangerous href — not merely the substring gone
+            expect(html).toContain('click');
+            expect(html).not.toMatch(/href="javascript/i);
+        });
+
+        it('drops a data: URL scheme on a link', () => {
+            const {html} = renderPractice('[x](data:text/html;base64,PHNjcmlwdD4=)');
+            expect(html).not.toContain('data:text/html');
+            expect(html).not.toMatch(/href="data:/i);
         });
 
         it('strips inline event-handler attributes from raw HTML', () => {
@@ -127,6 +137,14 @@ describe('best-practice rich authoring (Task 6.2.3)', () => {
         it('does NOT treat a reference inside an inline code span as a metric', () => {
             const {metrics} = renderPractice('the token `{{churn}}` is literal');
             expect(metrics).toEqual([]);
+        });
+
+        it('does NOT mint a tag from a hand-written raw-HTML data-metric outside the vocabulary', () => {
+            // marked passes raw HTML through; the tag path must stay gated by the
+            // vocabulary so a forged attribute cannot create an arbitrary tag.
+            const {metrics} = renderPractice('Legit {{churn}} plus <span data-metric="totally_made_up">x</span>');
+            expect(metrics).toEqual(['churn']); // only the real, vocabulary metric
+            expect(metrics).not.toContain('totally_made_up');
         });
     });
 
@@ -219,6 +237,14 @@ describe('best-practice rich authoring (Task 6.2.3)', () => {
             expect(getContributionTags(db, id)).toEqual(['churn', 'cost_per_pr']);
             savePractice(db, id, {actorId: 'alice', markdown: 'now only {{acceptance_rate}}', timestamp: T2});
             expect(getContributionTags(db, id)).toEqual(['acceptance_rate']);
+        });
+
+        it('does not persist a tag forged via raw-HTML data-metric', () => {
+            const id = makePractice('Real {{churn}} and forged <span data-metric="evil_tag">x</span>');
+            expect(getContributionTags(db, id)).toEqual(['churn']);
+            // and a later save can still cleanly drop the real metric (no stuck junk)
+            savePractice(db, id, {actorId: 'alice', markdown: 'no metrics now', timestamp: T2});
+            expect(getContributionTags(db, id)).toEqual([]);
         });
 
         it('preserves a non-metric (free-form) tag while reconciling metric tags', () => {
@@ -328,6 +354,10 @@ describe('best-practice rich authoring (Task 6.2.3)', () => {
 
         it('treats a non-JSON body as raw markdown rather than throwing', () => {
             expect(decodeContent('just text')).toEqual({markdown: 'just text'});
+        });
+
+        it('treats a JSON object without a string markdown field as raw markdown', () => {
+            expect(decodeContent('{"x":1}')).toEqual({markdown: '{"x":1}'});
         });
     });
 

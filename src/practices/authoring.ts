@@ -170,10 +170,19 @@ const SANITIZE_OPTIONS: sanitizeHtml.IOptions = {
 /**
  * Render markdown to a sanitized preview and extract the metric tags its prose
  * references imply. The metric set is read off the rendered (pre-sanitize) HTML's
- * `data-metric` attributes, so it is exactly what the chips show — code-block and
+ * `data-metric` attributes AND filtered back through the vocabulary — code-block and
  * inline-code references contribute neither a chip nor a tag, and unrecognised
  * references contribute neither either. The returned `metrics` are distinct and
  * sorted for a deterministic tag set.
+ *
+ * Why the vocabulary filter, given the renderer only ever emits `data-metric` for a
+ * recognised metric: `marked` passes RAW HTML in the markdown through verbatim, so a
+ * developer could hand-write `<span data-metric="anything">…` directly in their body.
+ * Without the filter that raw attribute would be scraped into the tag set, minting a
+ * tag outside `PRACTICE_METRICS` that `syncMetricTags` could never reconcile away
+ * (it only removes recognised metrics). Re-checking `isPracticeMetric` here keeps the
+ * tag path gated by exactly the same vocabulary the chip path is, so no raw-HTML
+ * escape hatch can forge an auto-surfacing tag.
  *
  * Pure and side-effect free: this is the engine behind both the live-preview
  * endpoint and the tag reconciliation a save performs.
@@ -182,7 +191,9 @@ export function renderPractice(md: string): RenderedPractice {
     const rendered = markdown.parse(md) as string;
     const metrics = new Set<string>();
     for (const match of rendered.matchAll(/data-metric="([a-zA-Z0-9_]+)"/g)) {
-        metrics.add(match[1]);
+        if (isPracticeMetric(match[1])) {
+            metrics.add(match[1]);
+        }
     }
     const html = sanitizeHtml(rendered, SANITIZE_OPTIONS);
     return {html, metrics: [...metrics].sort()};
