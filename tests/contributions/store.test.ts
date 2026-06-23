@@ -64,7 +64,7 @@ describe('contribution spine store (Task 6.1.1)', () => {
     describe('createContribution', () => {
         it('creates the spine row at version 1 with a server id and defaults', () => {
             const c = createContribution(db, newContribution());
-            expect(c.id).toMatch(/[0-9a-f-]{36}/);
+            expect(c.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
             expect(c.currentVersion).toBe(1);
             expect(c.state).toBe('draft');
             expect(c.contentType).toBe('best_practice');
@@ -129,6 +129,16 @@ describe('contribution spine store (Task 6.1.1)', () => {
             expect(listContributions(db, {scope: 'team', scopeTarget: 'eng'}).length).toBe(1);
             expect(listContributions(db, {scope: 'team', scopeTarget: 'design'}).length).toBe(0);
             expect(listContributions(db, {scope: 'org'}).length).toBe(1);
+        });
+
+        it('selects org-wide rows with scopeTarget: null (IS NULL, not = NULL)', () => {
+            const team = createContribution(db, newContribution({scope: 'team', scopeTarget: 'eng'}));
+            const org = createContribution(db, newContribution({scope: 'org', scopeTarget: undefined}));
+            // Explicit null must match the org rows (scope_target IS NULL) — and
+            // must NOT silently match nothing the way `scope_target = NULL` would.
+            expect(listContributions(db, {scopeTarget: null}).map((c) => c.id)).toEqual([org.id]);
+            // A team-target filter still excludes the org row.
+            expect(listContributions(db, {scopeTarget: 'eng'}).map((c) => c.id)).toEqual([team.id]);
         });
     });
 
@@ -234,6 +244,12 @@ describe('contribution spine store (Task 6.1.1)', () => {
         it('returns an empty trail for a contribution with no events', () => {
             const c = createContribution(db, newContribution());
             expect(listReviewEvents(db, c.id)).toEqual([]);
+        });
+
+        it('rejects an event for a non-existent contribution (FK keeps the trail un-orphaned)', () => {
+            expect(() =>
+                addReviewEvent(db, {contributionId: 'ghost', event: 'submitted', actorId: 'alice', occurredAt: T1}),
+            ).toThrow();
         });
     });
 

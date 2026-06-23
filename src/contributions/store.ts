@@ -187,7 +187,11 @@ export function listContributions(db: Database.Database, filters: ContributionFi
         clauses.push('scope = ?');
         params.push(filters.scope);
     }
-    if (filters.scopeTarget !== undefined) {
+    if (filters.scopeTarget === null) {
+        // `= NULL` is never true in SQL, so an explicit null filter (select the
+        // org-wide rows) must use IS NULL rather than a bound parameter.
+        clauses.push('scope_target IS NULL');
+    } else if (filters.scopeTarget !== undefined) {
         clauses.push('scope_target = ?');
         params.push(filters.scopeTarget);
     }
@@ -245,9 +249,17 @@ export function deleteContribution(db: Database.Database, id: string): boolean {
 /**
  * Append a new version to an existing contribution and point `current_version`
  * at it, atomically. The new version number is `max(version) + 1` for that
- * contribution, computed inside the transaction so concurrent writers can't
- * collide (the UNIQUE(contribution_id, version) constraint is the backstop).
- * Returns the new version, or undefined when the contribution does not exist.
+ * contribution, computed inside the transaction. Returns the new version, or
+ * undefined when the contribution does not exist.
+ *
+ * Concurrency: better-sqlite3 is synchronous and single-threaded, so within one
+ * process the read-compute-write sequence cannot interleave. Across separate
+ * connections/processes the `MAX(version)+1` read is not serialized, so two
+ * writers could pick the same number — but the UNIQUE(contribution_id, version)
+ * constraint then makes the loser fail fast with SQLITE_CONSTRAINT rather than
+ * storing a duplicate (and `current_version` never drifts, because its UPDATE is
+ * in the same aborted transaction). It converts a race into a retryable error,
+ * not silent corruption; callers expecting cross-process concurrency should retry.
  */
 export function addContributionVersion(
     db: Database.Database,
@@ -303,8 +315,12 @@ export function getContributionVersion(
 
 /**
  * The live version of a contribution — the row its `current_version` points at.
- * Undefined when the contribution doesn't exist. Reads `current_version` and the
- * matching version together so the two can't drift in the result.
+ * Reads `current_version` and the matching version together so the two can't
+ * drift in the result. Returns undefined in TWO distinct cases the caller may
+ * need to tell apart: the contribution does not exist, OR it exists but its
+ * `current_version` points at an absent version row (only reachable if a
+ * contribution was written outside this store's invariant-preserving paths).
+ * Pair with `getContribution` if you need to distinguish them.
  */
 export function getCurrentContributionVersion(
     db: Database.Database,

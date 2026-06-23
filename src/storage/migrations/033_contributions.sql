@@ -45,7 +45,15 @@ CREATE TABLE IF NOT EXISTS contribution_versions (
     -- The versioned payload, an opaque JSON string. The spine never interprets
     -- it — feature code owns the shape — keeping the spine feature-agnostic.
     body TEXT NOT NULL,
-    author_id TEXT NOT NULL,                   -- who authored this version
+    -- Who authored this version. INTENTIONALLY a plain id with NO FK to
+    -- developers (unlike contributions.author_id): this is an audit/history
+    -- column, and an audit record must survive the deletion of the actor it
+    -- names rather than cascade-vanishing or blocking the delete. The authoring
+    -- developer is set server-side by the contribution flow (6.1.2), never from
+    -- request input, so the id's validity is guaranteed at the write boundary,
+    -- not by a referential constraint here. Rows of a deleted developer's own
+    -- contributions are still removed via the contribution_id CASCADE above.
+    author_id TEXT NOT NULL,
     change_note TEXT,
     created_at TEXT NOT NULL,                  -- UTC ISO
     UNIQUE (contribution_id, version)
@@ -64,7 +72,12 @@ CREATE TABLE IF NOT EXISTS contribution_review_events (
     -- audit trail must be able to record any action a feature's governance flow
     -- performs (submitted|approved|published|unpublished|removed|redacted today).
     event TEXT NOT NULL,
-    actor_id TEXT NOT NULL,                     -- who performed the action
+    -- Who performed the action. Like contribution_versions.author_id, this is an
+    -- audit column with NO FK to developers on purpose: the trail must outlive
+    -- the actor it names, and the id is set server-side by the governance flow
+    -- (never from request input). The contribution_id CASCADE below still clears
+    -- a deleted developer's own contributions' trails.
+    actor_id TEXT NOT NULL,
     note TEXT,
     occurred_at TEXT NOT NULL                   -- UTC ISO, when the action happened
 );

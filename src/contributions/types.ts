@@ -148,7 +148,14 @@ export interface NewReviewEvent {
 export interface ContributionFilters {
     contentType?: ContributionContentType;
     scope?: ContributionScope;
-    scopeTarget?: string;
+    /**
+     * Narrow by `scope_target`. A string matches that team's rows; explicit
+     * `null` matches the org-wide rows (whose `scope_target` is NULL). Omitting
+     * the field (undefined) does not filter on target at all. Because SQL `= NULL`
+     * is never true, the null case is handled with `IS NULL` in the store — so
+     * passing `null` correctly selects org rows rather than silently matching none.
+     */
+    scopeTarget?: string | null;
     state?: ContributionState;
     authorId?: string;
 }
