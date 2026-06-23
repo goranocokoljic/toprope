@@ -141,9 +141,21 @@ function requireVersionable(db: Database.Database, contributionId: string): void
  * authored; a published item is versioned when edited) — it is refused only on a
  * `removed` contribution.
  *
+ * GOVERNANCE BOUNDARY — an edit is a content change, NOT a lifecycle transition: it
+ * appends a version and bumps `current_version`, but it does not change `state` and
+ * writes no review event. So editing a `submitted` or `published` contribution does
+ * NOT re-open or re-trigger the review gate. The state machine's gate
+ * (`hasApprovalForCurrentSubmission`) is satisfied by an `approved` event after the
+ * last `submitted` event, which an edit neither adds nor invalidates — meaning
+ * submit → approve → edit → publish would publish a body the approver never saw.
+ * This primitive is deliberately feature-agnostic and does not own that policy: a
+ * consuming feature (6.2/6.3) that edits content after submission/approval MUST
+ * re-submit (or otherwise re-gate) the contribution itself so the new body is
+ * re-reviewed. Enforcing it here would leak governance rules into the spine.
+ *
  * Returns the newly created version. Throws `invalid_actor` for a blank actor,
- * `empty_body` for an empty body, `not_found` when the contribution does not exist,
- * or `contribution_removed` when it has been removed.
+ * `empty_body` for an empty (or whitespace-only) body, `not_found` when the
+ * contribution does not exist, or `contribution_removed` when it has been removed.
  */
 export function editContribution(db: Database.Database, contributionId: string, input: EditInput): ContributionVersion {
     requireActor(input.actorId);

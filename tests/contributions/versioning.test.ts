@@ -1,7 +1,7 @@
 import {describe, it, expect, beforeEach, afterEach} from 'vitest';
 import type Database from 'better-sqlite3';
 import {makeTestDb} from '../dashboard/fixtures';
-import {createContribution, getContribution, updateContributionState} from '../../src/contributions/store';
+import {createContribution, getContribution, listReviewEvents, updateContributionState} from '../../src/contributions/store';
 import {
     editContribution,
     getCurrentVersion,
@@ -86,6 +86,20 @@ describe('contribution versioning (Task 6.1.3)', () => {
             const id = makePublished(db);
             editContribution(db, id, {actorId: 'bob', body: body('v2'), timestamp: T2});
             expect(getContribution(db, id)!.state).toBe('published');
+        });
+
+        it('does not move a submitted contribution or write a review event (governance boundary)', () => {
+            // An edit is a content change, not a lifecycle transition: it must leave the
+            // state at 'submitted' and add no review event, so it neither advances nor
+            // disturbs the review gate. The duty to re-gate after an edit belongs to the
+            // consuming feature, not this primitive.
+            const id = createContribution(db, newContribution()).id;
+            updateContributionState(db, id, 'submitted', T1);
+            editContribution(db, id, {actorId: 'bob', body: body('v2: edited after submit'), timestamp: T2});
+            expect(getContribution(db, id)!.state).toBe('submitted');
+            expect(listReviewEvents(db, id)).toHaveLength(0);
+            // the edit did land as a new version
+            expect(getCurrentVersion(db, id)!.body).toBe(body('v2: edited after submit'));
         });
 
         it('works on a draft too — each edit advances the head through the chain', () => {
@@ -253,9 +267,13 @@ describe('contribution versioning (Task 6.1.3)', () => {
             } catch (e) {
                 expect((e as VersioningError).code).toBe('version_not_found');
             }
-            // no new version was created — prove the chain is untouched, not just the head
+            // no new version was created — prove the chain is untouched in length AND
+            // content, not just the head pointer (a revert that mutated before validating
+            // the target would slip past a length-only check)
             expect(getContribution(db, id)!.currentVersion).toBe(1);
-            expect(getVersionHistory(db, id)).toHaveLength(1);
+            const history = getVersionHistory(db, id);
+            expect(history).toHaveLength(1);
+            expect(history[0].body).toBe(body('v1: parameterize queries'));
         });
 
         it('refuses to revert to a store-created empty version (empty_body, both paths agree)', () => {
