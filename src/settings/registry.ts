@@ -39,6 +39,9 @@ export interface SettingDef {
 // Closed value sets shared between the org-level coaching settings and the
 // developer-level preferences they gate, so the two sides validate identically.
 export const SHOWCASE_SCOPE_OPTIONS = ['team_only', 'org_wide'] as const;
+// The three Best-Practice contribution models (Task 6.2.2 / #157). Shared with the
+// engine so the registry enum and the engine's model union validate identically.
+export const CONTRIBUTION_MODEL_OPTIONS = ['top_down', 'bottom_up', 'hybrid'] as const;
 export const NUDGE_FREQUENCY_OPTIONS = ['low', 'normal', 'high'] as const;
 export const CAPTURE_MECHANISM_OPTIONS = ['local_agent', 'editor_extension'] as const;
 export const CAPTURE_RECOVERY_OPTIONS = ['no_recovery', 'recovery_path'] as const;
@@ -233,6 +236,24 @@ export const GLOBAL_SETTINGS: Record<string, SettingDef> = {
         type: 'boolean',
         default: false,
         teamOverridable: false,
+    },
+    // The active Best-Practice contribution model for a team (Task 6.2.2 / #157):
+    // `top_down` (default — only leads publish), `bottom_up` (anyone publishes, a
+    // feedback-ranked pool), or `hybrid` (anyone publishes, lead endorsement
+    // elevates). Switching it changes which mechanics are active, never the schema,
+    // so a team can change model at runtime with no migration.
+    //
+    // Intentionally team-overridable WITHOUT a managers_can_* governing flag: the
+    // 6.2.2 acceptance criterion is that the model is per-team switchable at
+    // runtime, so a team override is honored directly. The 6.4 Settings Extensions
+    // task may layer a governing flag on top (one-line `overrideGovernedBy` add)
+    // if an admin gate is later wanted; nothing here depends on its absence.
+    best_practice_contribution_model: {
+        key: 'best_practice_contribution_model',
+        type: 'enum',
+        default: 'top_down',
+        allowed: CONTRIBUTION_MODEL_OPTIONS,
+        teamOverridable: true,
     },
 };
 
