@@ -88,6 +88,15 @@ describe('practices store (#156)', () => {
             expect(updated).toEqual({contributionId: 'c1', modelUsed: 'claude', endorsed: true});
         });
 
+        it('preserves an omitted endorsed flag on update (endorsed kept when only model changes)', () => {
+            // Symmetric to the case above — guards the endorsed-preservation branch:
+            // changing only model_used must not silently reset endorsed to its default.
+            setPracticeDetails(db, 'c1', {modelUsed: 'claude', endorsed: true});
+            const updated = setPracticeDetails(db, 'c1', {modelUsed: 'gpt'});
+            expect(updated).toEqual({contributionId: 'c1', modelUsed: 'gpt', endorsed: true});
+            expect(getPracticeDetails(db, 'c1')?.endorsed).toBe(true);
+        });
+
         it('setPracticeEndorsed creates the row when absent and toggles the flag', () => {
             const created = setPracticeEndorsed(db, 'c1', true);
             expect(created).toEqual({contributionId: 'c1', modelUsed: null, endorsed: true});
@@ -263,6 +272,10 @@ describe('practices store (#156)', () => {
             expect(ev.metricContext).toBeNull();
         });
 
+        // Asserts events accumulate in time order (the read contract). It does NOT
+        // assert immutability of history — like the spine's review-event log, the
+        // append-only posture is a convention (no update/delete path exists),
+        // not a DB constraint.
         it('is append-only — multiple events for the same dev accumulate in time order', () => {
             recordUsageEvent(db, {contributionId: 'c1', developerId: 'alice', event: 'viewed', occurredAt: T1});
             recordUsageEvent(db, {contributionId: 'c1', developerId: 'alice', event: 'applied', occurredAt: T3});

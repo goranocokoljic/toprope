@@ -142,25 +142,32 @@ function rowToUsageEvent(row: UsageEventRow): UsageEvent {
  * fields present in `input` are written — an omitted field keeps its existing
  * value on update, or takes the column default (model_used NULL, endorsed false)
  * on insert. Returns the resulting details row.
+ *
+ * The read-of-existing and the write run in one transaction so the "omitted field
+ * is preserved" merge can't lose an update to a writer that lands between the read
+ * and the UPSERT — matching the spine store's transaction posture for its
+ * multi-statement writes (createContribution / addContributionVersion).
  */
 export function setPracticeDetails(
     db: Database.Database,
     contributionId: string,
     input: PracticeDetailsInput = {},
 ): PracticeDetails {
-    const existing = getPracticeDetails(db, contributionId);
-    const modelUsed = input.modelUsed !== undefined ? input.modelUsed : (existing?.modelUsed ?? null);
-    const endorsed = input.endorsed !== undefined ? input.endorsed : (existing?.endorsed ?? false);
+    return db.transaction((): PracticeDetails => {
+        const existing = getPracticeDetails(db, contributionId);
+        const modelUsed = input.modelUsed !== undefined ? input.modelUsed : (existing?.modelUsed ?? null);
+        const endorsed = input.endorsed !== undefined ? input.endorsed : (existing?.endorsed ?? false);
 
-    db.prepare(
-        `INSERT INTO practice_details (contribution_id, model_used, endorsed)
-         VALUES (?, ?, ?)
-         ON CONFLICT(contribution_id) DO UPDATE SET
-            model_used = excluded.model_used,
-            endorsed = excluded.endorsed`,
-    ).run(contributionId, modelUsed, endorsed ? 1 : 0);
+        db.prepare(
+            `INSERT INTO practice_details (contribution_id, model_used, endorsed)
+             VALUES (?, ?, ?)
+             ON CONFLICT(contribution_id) DO UPDATE SET
+                model_used = excluded.model_used,
+                endorsed = excluded.endorsed`,
+        ).run(contributionId, modelUsed, endorsed ? 1 : 0);
 
-    return {contributionId, modelUsed, endorsed};
+        return {contributionId, modelUsed, endorsed};
+    })();
 }
 
 /** The practice details for a contribution, or undefined when none has been set. */
@@ -260,8 +267,17 @@ export function recordFeedback(db: Database.Database, input: NewFeedback): Pract
     ).run(randomUUID(), input.contributionId, input.developerId, input.signal, createdAt);
 
     // Read back so the returned id is the canonical stored one (an UPSERT update
-    // keeps the original row's id, not the one this call generated).
-    return getFeedback(db, input.contributionId, input.developerId) as PracticeFeedback;
+    // keeps the original row's id, not the one this call generated). The row was
+    // just written on this synchronous connection, so it is always present; guard
+    // explicitly rather than casting the uncertainty away, so a future change that
+    // makes the write conditional fails loudly instead of returning a bad object.
+    const stored = getFeedback(db, input.contributionId, input.developerId);
+    if (stored === undefined) {
+        throw new Error(
+            `[practices] feedback row vanished immediately after UPSERT (contribution=${input.contributionId}, developer=${input.developerId})`,
+        );
+    }
+    return stored;
 }
 
 /** One developer's current feedback on a practice, or undefined when none exists. */
@@ -276,7 +292,12 @@ export function getFeedback(
     return row ? rowToFeedback(row) : undefined;
 }
 
-/** All feedback rows for a practice, newest first. */
+/**
+ * All feedback rows for a practice, newest first — a RAW PER-DEVELOPER read: each
+ * row exposes an individual developer's signal. Per the privacy model, individual
+ * data is visible only to that developer; this must NOT be surfaced in a manager
+ * or team/aggregate response — use `getFeedbackCounts` for the aggregate path.
+ */
 export function listFeedback(db: Database.Database, contributionId: string): PracticeFeedback[] {
     const rows = db
         .prepare('SELECT * FROM practice_feedback WHERE contribution_id = ? ORDER BY created_at DESC, id DESC')
@@ -332,6 +353,10 @@ export function recordUsageEvent(db: Database.Database, input: NewUsageEvent): U
  * A practice's usage events in chronological order (oldest first). Ties on
  * `occurred_at` fall back to insertion order (rowid) so events recorded in the
  * same instant still read back in the order they were appended.
+ *
+ * RAW PER-DEVELOPER read: each row names the developer who engaged. Per the
+ * privacy model this must NOT be surfaced in a manager or team/aggregate response;
+ * the later correlation (6.2.4) consumes it server-side to produce aggregates.
  */
 export function listUsageEvents(db: Database.Database, contributionId: string): UsageEvent[] {
     const rows = db
