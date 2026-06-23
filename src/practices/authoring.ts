@@ -34,7 +34,7 @@
  */
 
 import type Database from 'better-sqlite3';
-import {Marked, type Tokens} from 'marked';
+import {Marked, type Token, type Tokens} from 'marked';
 import sanitizeHtml from 'sanitize-html';
 import {
     addContributionTag,
@@ -168,45 +168,56 @@ const SANITIZE_OPTIONS: sanitizeHtml.IOptions = {
 };
 
 /**
+ * Collect the recognised metric references from a lexed token tree. Walking the
+ * tokens — rather than scraping the rendered HTML — is what makes "a reference
+ * produces a tag, and ONLY outside code" true by construction: `marked` never emits a
+ * `metricRef` token inside a fenced block or inline code span (those are code/codespan
+ * tokens), and it never emits one for hand-written raw HTML (that is an `html` token,
+ * passed through verbatim). So the tag set comes from exactly the same tokenization
+ * the chips do — the preview and the tags can never disagree, and no raw-HTML
+ * `data-metric` attribute can forge a tag. The vocabulary filter then drops an
+ * unrecognised `{{foo}}` (whose token still exists but renders as literal text), so
+ * only `PRACTICE_METRICS` names become tags. Distinct + sorted for a deterministic set.
+ */
+function collectMetricRefs(tokens: Token[]): string[] {
+    const metrics = new Set<string>();
+    markdown.walkTokens(tokens, (token: Token): void => {
+        if (token.type === 'metricRef') {
+            const metric = (token as unknown as MetricRefToken).metric;
+            if (isPracticeMetric(metric)) {
+                metrics.add(metric);
+            }
+        }
+    });
+    return [...metrics].sort();
+}
+
+/**
  * Render markdown to a sanitized preview and extract the metric tags its prose
- * references imply. The metric set is read off the rendered (pre-sanitize) HTML's
- * `data-metric` attributes AND filtered back through the vocabulary — code-block and
- * inline-code references contribute neither a chip nor a tag, and unrecognised
- * references contribute neither either. The returned `metrics` are distinct and
- * sorted for a deterministic tag set.
- *
- * Why the vocabulary filter, given the renderer only ever emits `data-metric` for a
- * recognised metric: `marked` passes RAW HTML in the markdown through verbatim, so a
- * developer could hand-write `<span data-metric="anything">…` directly in their body.
- * Without the filter that raw attribute would be scraped into the tag set, minting a
- * tag outside `PRACTICE_METRICS` that `syncMetricTags` could never reconcile away
- * (it only removes recognised metrics). Re-checking `isPracticeMetric` here keeps the
- * tag path gated by exactly the same vocabulary the chip path is, so no raw-HTML
- * escape hatch can forge an auto-surfacing tag.
+ * references imply. Lexes once, derives the metric set from the `metricRef` tokens
+ * (see {@link collectMetricRefs} — tags follow prose references only, never code, never
+ * raw HTML), renders the same tokens to HTML, then sanitizes. The HTML is safe to
+ * inject into a viewer's page; the metrics are the auto-surfacing tags a save persists.
  *
  * Pure and side-effect free: this is the engine behind both the live-preview
  * endpoint and the tag reconciliation a save performs.
  */
 export function renderPractice(md: string): RenderedPractice {
-    const rendered = markdown.parse(md) as string;
-    const metrics = new Set<string>();
-    for (const match of rendered.matchAll(/data-metric="([a-zA-Z0-9_]+)"/g)) {
-        if (isPracticeMetric(match[1])) {
-            metrics.add(match[1]);
-        }
-    }
-    const html = sanitizeHtml(rendered, SANITIZE_OPTIONS);
-    return {html, metrics: [...metrics].sort()};
+    const tokens = markdown.lexer(md);
+    const metrics = collectMetricRefs(tokens);
+    const html = sanitizeHtml(markdown.parser(tokens), SANITIZE_OPTIONS);
+    return {html, metrics};
 }
 
 /**
  * The metric identifiers a body references in prose (recognised, distinct, sorted) —
- * the auto-surfacing tags a save will reconcile. A thin projection of
- * {@link renderPractice} so the two can never disagree about what counts as a
- * reference.
+ * the auto-surfacing tags a save will reconcile. Lexes and walks the tokens only,
+ * skipping the render+sanitize pass {@link renderPractice} does, since the tag set
+ * does not depend on the HTML. Shares {@link collectMetricRefs} with `renderPractice`,
+ * so the two can never disagree about what counts as a reference.
  */
 export function extractMetricRefs(md: string): string[] {
-    return renderPractice(md).metrics;
+    return collectMetricRefs(markdown.lexer(md));
 }
 
 // --- Body encode / decode ---------------------------------------------------

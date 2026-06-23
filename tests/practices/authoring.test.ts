@@ -140,11 +140,18 @@ describe('best-practice rich authoring (Task 6.2.3)', () => {
         });
 
         it('does NOT mint a tag from a hand-written raw-HTML data-metric outside the vocabulary', () => {
-            // marked passes raw HTML through; the tag path must stay gated by the
-            // vocabulary so a forged attribute cannot create an arbitrary tag.
+            // marked passes raw HTML through; tags come from the token stream, not the
+            // HTML, so a forged attribute cannot create an arbitrary tag.
             const {metrics} = renderPractice('Legit {{churn}} plus <span data-metric="totally_made_up">x</span>');
-            expect(metrics).toEqual(['churn']); // only the real, vocabulary metric
+            expect(metrics).toEqual(['churn']); // only the real, prose-referenced metric
             expect(metrics).not.toContain('totally_made_up');
+        });
+
+        it('does NOT mint a tag from a raw-HTML data-metric even for a VALID metric with no prose reference', () => {
+            // A valid-vocabulary name written only as raw HTML (never as {{churn}}) must
+            // not become a tag — tags follow the metricRef token, not any data-metric.
+            const {metrics} = renderPractice('No reference here, only raw <span data-metric="churn">x</span> and <code data-metric="acceptance_rate">y</code>.');
+            expect(metrics).toEqual([]);
         });
     });
 
@@ -323,6 +330,16 @@ describe('best-practice rich authoring (Task 6.2.3)', () => {
             expect(view!.html).toContain('<h1>Heading</h1>');
             expect(view!.html).toContain('data-metric="churn"');
             expect(view!.metrics).toEqual(['churn']);
+        });
+
+        it('round-trips markdown with quotes and backslashes through the version body', () => {
+            const tricky = 'He said "x" and used a \\ backslash and a `{{churn}}` literal';
+            const id = createPractice(db, {title: 'T', authorId: 'alice', scope: 'org', markdown: tricky, timestamp: T1})
+                .contribution.id;
+            expect(getPracticeView(db, id)!.markdown).toBe(tricky);
+            // and after a save the new body round-trips too
+            savePractice(db, id, {actorId: 'alice', markdown: tricky + ' edited', timestamp: T2});
+            expect(getPracticeView(db, id)!.markdown).toBe(tricky + ' edited');
         });
 
         it('reflects the latest version after a save', () => {

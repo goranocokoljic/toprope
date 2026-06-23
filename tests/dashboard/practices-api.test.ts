@@ -171,6 +171,11 @@ describe('Best-practice authoring API (Task 6.2.3)', () => {
         });
         const read = await app.inject({method: 'GET', url: `/api/me/practices/${showcase.id}`, headers: auth(aliceToken)});
         expect(read.statusCode).toBe(404);
+        // save and revert against a non-practice id are also 404 (owner/content guard)
+        const save = await app.inject({method: 'POST', url: `/api/me/practices/${showcase.id}/save`, headers: auth(aliceToken), payload: {markdown: 'x'}});
+        expect(save.statusCode).toBe(404);
+        const revert = await app.inject({method: 'POST', url: `/api/me/practices/${showcase.id}/revert`, headers: auth(aliceToken), payload: {version: 1}});
+        expect(revert.statusCode).toBe(404);
     });
 
     it('lists only the developer’s own practices', async () => {
