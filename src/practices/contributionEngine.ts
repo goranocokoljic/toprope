@@ -21,6 +21,7 @@
 import type Database from 'better-sqlite3';
 import {
     approve as smApprove,
+    ContributionStateError,
     publish as smPublish,
     submit as smSubmit,
     type PrePublishHook,
@@ -40,7 +41,8 @@ import {
 /** Stable error codes the caller can map to an HTTP status without matching message text. */
 export type ContributionModelErrorCode =
     | 'not_authorized' // the actor's capability is insufficient for this action under the active model
-    | 'not_applicable'; // the action is meaningless under the active model (e.g. endorse when not hybrid)
+    | 'not_applicable' // the action is meaningless under the active model (e.g. endorse when not hybrid)
+    | 'not_published'; // the action requires a published contribution (e.g. endorsing a draft/removed practice)
 
 /** A typed failure from the engine's model/permission layer (distinct from state-machine errors). */
 export class ContributionModelError extends Error {
@@ -172,7 +174,8 @@ export function approvePractice(db: Database.Database, input: ApprovePracticeInp
  * `not_authorized` BEFORE the state machine runs, and even a lead must have a
  * recorded approval (the state machine enforces the gate). Under bottom_up / hybrid
  * publishing is open — anyone may publish, and the `auto-publish` gate needs no
- * approval (this path also covers re-publishing flows that don't go through submit).
+ * approval. The only legal entry is `submitted → published`; a contribution that
+ * never reached `submitted` (or is already published) gets `illegal_transition`.
  *
  * Returns the resulting contribution with its model + gate. Propagates
  * `ContributionStateError` (e.g. `gate_not_satisfied` when a top_down publish has
@@ -203,8 +206,16 @@ export function publishPractice(db: Database.Database, input: PublishPracticeInp
  * elevation lever. Endorsing is a LEAD action (`not_authorized` for a non-lead) and
  * is `not_applicable` unless the active model is `hybrid`: under top_down and
  * bottom_up endorsement carries no meaning, so the engine refuses it rather than
- * writing a flag nothing reads. Persists `practice_details.endorsed` via the 6.2.1
- * store and returns the active model + gate.
+ * writing a flag nothing reads.
+ *
+ * Endorsement also requires a PUBLISHED contribution: it elevates a practice within
+ * the published pool, so endorsing a draft/submitted/unpublished/removed practice is
+ * meaningless and is refused (`not_published`) rather than writing a flag that drifts
+ * out of sync with the lifecycle. A non-existent contribution throws the spine's
+ * `not_found` (a `ContributionStateError`) instead of letting the raw FK surface an
+ * un-coded SQLite error. Both checks run before the store write so the guard order
+ * is: model → authority → existence → state. Persists `practice_details.endorsed`
+ * via the 6.2.1 store and returns the active model + gate.
  *
  * `endorsed` defaults to true; pass `false` to withdraw a prior endorsement.
  */
@@ -222,6 +233,16 @@ export function endorsePractice(
     }
     if (!input.actorIsLead) {
         throw new ContributionModelError('not_authorized', 'Only a lead/curator may endorse a practice.');
+    }
+    const contribution = getContribution(db, input.contributionId);
+    if (!contribution) {
+        throw new ContributionStateError('not_found', `Contribution '${input.contributionId}' not found.`);
+    }
+    if (contribution.state !== 'published') {
+        throw new ContributionModelError(
+            'not_published',
+            `Only a published practice can be endorsed; '${input.contributionId}' is '${contribution.state}'.`,
+        );
     }
     setPracticeEndorsed(db, input.contributionId, input.endorsed ?? true);
     return {model, gate};
@@ -253,9 +274,12 @@ export interface RankedPractice {
  *   * top_down → leads curate what is published, so there is no algorithmic
  *     surfacing to apply: ordered most-recent-first as a stable default.
  *
- * Unknown ids (no contribution row) are dropped — the result is a subset of the
- * input, never a list with holes. The ordering is total and deterministic (id is
- * the final tiebreak), so the same input always yields the same order.
+ * Only PUBLISHED practices are ranked: the pool is what a viewer sees, so a
+ * draft/submitted/unpublished/removed practice (or an unknown id with no
+ * contribution row) is dropped rather than surfaced. The result is therefore a
+ * subset of the input, never a list with holes. The ordering is total and
+ * deterministic (id is the final tiebreak), so the same input always yields the
+ * same order.
  */
 export function orderPracticePool(
     db: Database.Database,
@@ -265,7 +289,7 @@ export function orderPracticePool(
     const ranked: RankedPractice[] = [];
     for (const id of contributionIds) {
         const contribution = getContribution(db, id);
-        if (!contribution) {
+        if (!contribution || contribution.state !== 'published') {
             continue;
         }
         const counts = getFeedbackCounts(db, id);

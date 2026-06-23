@@ -51,6 +51,11 @@ function makeDraft(db: Database.Database, overrides: Partial<NewContribution> = 
     return createContribution(db, newContribution(overrides)).id;
 }
 
+/** Create a contribution already in the published state (for pool-ordering tests). */
+function makePublished(db: Database.Database, overrides: Partial<NewContribution> = {}): string {
+    return makeDraft(db, {state: 'published', ...overrides});
+}
+
 /** Point team `eng` at a specific model (top_down is the default, so omit for it). */
 function useModel(db: Database.Database, model: ContributionModel): void {
     setTeamSetting(db, TEAM, CONTRIBUTION_MODEL_SETTING_KEY, model);
@@ -240,9 +245,33 @@ describe('contribution-model engine (Task 6.2.2 / #157)', () => {
 
         it('an endorsement can be withdrawn (endorsed: false)', () => {
             const id = makeDraft(db);
+            submitPractice(db, {contributionId: id, actorId: 'alice', actorIsLead: false, team: TEAM}); // auto-publishes
             endorsePractice(db, {contributionId: id, actorId: 'lead', actorIsLead: true, team: TEAM});
             endorsePractice(db, {contributionId: id, actorId: 'lead', actorIsLead: true, team: TEAM, endorsed: false});
             expect(getPracticeDetails(db, id)?.endorsed).toBe(false);
+        });
+
+        it('cannot endorse a practice that is not yet published', () => {
+            const id = makeDraft(db); // still a draft — never submitted/published
+            try {
+                endorsePractice(db, {contributionId: id, actorId: 'lead', actorIsLead: true, team: TEAM});
+                throw new Error('expected throw');
+            } catch (err) {
+                expect(err).toBeInstanceOf(ContributionModelError);
+                expect((err as ContributionModelError).code).toBe('not_published');
+            }
+            // No details row written for the rejected endorsement.
+            expect(getPracticeDetails(db, id)).toBeUndefined();
+        });
+
+        it('endorsing an unknown contribution throws the spine not_found (not a raw FK error)', () => {
+            try {
+                endorsePractice(db, {contributionId: 'ghost', actorId: 'lead', actorIsLead: true, team: TEAM});
+                throw new Error('expected throw');
+            } catch (err) {
+                expect(err).toBeInstanceOf(ContributionStateError);
+                expect((err as ContributionStateError).code).toBe('not_found');
+            }
         });
 
         it('endorsement ELEVATES a practice above un-endorsed ones, with feedback ordering within each group', () => {
@@ -306,14 +335,24 @@ describe('contribution-model engine (Task 6.2.2 / #157)', () => {
 
     describe('orderPracticePool', () => {
         it('drops unknown ids rather than returning holes', () => {
-            const real = makeDraft(db);
+            const real = makePublished(db);
             const ranked = orderPracticePool(db, 'bottom_up', ['ghost', real, 'phantom']);
             expect(ranked.map((r) => r.contributionId)).toEqual([real]);
         });
 
+        it('drops practices that are not published (only the live pool is surfaced)', () => {
+            const published = makePublished(db, {title: 'live', timestamp: T2});
+            const draft = makeDraft(db, {title: 'draft', timestamp: T1});
+            const removed = makePublished(db, {title: 'removed', timestamp: T3});
+            // soft-remove the published one via a direct state write (governance remove)
+            db.prepare("UPDATE contributions SET state = 'removed' WHERE id = ?").run(removed);
+            const ranked = orderPracticePool(db, 'bottom_up', [published, draft, removed]);
+            expect(ranked.map((r) => r.contributionId)).toEqual([published]);
+        });
+
         it('top_down orders most-recent-first (curated default)', () => {
-            const oldId = makeDraft(db, {title: 'old', timestamp: T1});
-            const newId = makeDraft(db, {title: 'new', timestamp: T3});
+            const oldId = makePublished(db, {title: 'old', timestamp: T1});
+            const newId = makePublished(db, {title: 'new', timestamp: T3});
             const ranked = orderPracticePool(db, 'top_down', [oldId, newId]);
             expect(ranked.map((r) => r.contributionId)).toEqual([newId, oldId]);
         });
@@ -323,12 +362,9 @@ describe('contribution-model engine (Task 6.2.2 / #157)', () => {
         });
 
         it('breaks ties on equal score by total feedback, then recency', () => {
-            const oldQuiet = makeDraft(db, {title: 'old-quiet', timestamp: T1}); // 0/0, score 0
-            const newQuiet = makeDraft(db, {title: 'new-quiet', timestamp: T3}); // 0/0, score 0
-            const mixed = makeDraft(db, {title: 'mixed', timestamp: T2}); // 1/1, score 0 but total 2
-            for (const id of [oldQuiet, newQuiet, mixed]) {
-                submitPractice(db, {contributionId: id, actorId: 'alice', actorIsLead: false, team: TEAM});
-            }
+            const oldQuiet = makePublished(db, {title: 'old-quiet', timestamp: T1}); // 0/0, score 0
+            const newQuiet = makePublished(db, {title: 'new-quiet', timestamp: T3}); // 0/0, score 0
+            const mixed = makePublished(db, {title: 'mixed', timestamp: T2}); // 1/1, score 0 but total 2
             recordFeedback(db, {contributionId: mixed, developerId: 'alice', signal: 'helpful'});
             recordFeedback(db, {contributionId: mixed, developerId: 'bob', signal: 'not_helpful'});
 
@@ -338,8 +374,8 @@ describe('contribution-model engine (Task 6.2.2 / #157)', () => {
         });
 
         it('falls back to id as a stable final tiebreak when score, total, and recency are equal', () => {
-            const a = makeDraft(db, {title: 'a', authorId: 'alice', timestamp: T1});
-            const b = makeDraft(db, {title: 'b', authorId: 'alice', timestamp: T1});
+            const a = makePublished(db, {title: 'a', authorId: 'alice', timestamp: T1});
+            const b = makePublished(db, {title: 'b', authorId: 'alice', timestamp: T1});
             const ranked = orderPracticePool(db, 'bottom_up', [a, b]);
             const sortedIds = [a, b].sort();
             expect(ranked.map((r) => r.contributionId)).toEqual(sortedIds);
