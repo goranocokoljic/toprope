@@ -110,8 +110,9 @@ describe('contribution versioning (Task 6.1.3)', () => {
             } catch (e) {
                 expect((e as VersioningError).code).toBe('invalid_actor');
             }
-            // nothing was appended
+            // nothing was appended — assert the chain itself, not just the head pointer
             expect(getContribution(db, id)!.currentVersion).toBe(1);
+            expect(getVersionHistory(db, id)).toHaveLength(1);
         });
 
         it('rejects an empty body', () => {
@@ -123,6 +124,21 @@ describe('contribution versioning (Task 6.1.3)', () => {
                 expect((e as VersioningError).code).toBe('empty_body');
             }
             expect(getContribution(db, id)!.currentVersion).toBe(1);
+            expect(getVersionHistory(db, id)).toHaveLength(1);
+        });
+
+        it('rejects a whitespace-only body (not just the literal empty string)', () => {
+            const id = makePublished(db);
+            for (const blank of ['   ', '\n', '\t']) {
+                try {
+                    editContribution(db, id, {actorId: 'bob', body: blank});
+                    expect.unreachable(`whitespace-only body ${JSON.stringify(blank)} must throw`);
+                } catch (e) {
+                    expect((e as VersioningError).code).toBe('empty_body');
+                }
+            }
+            // no blank version laundered into the append-only lineage
+            expect(getVersionHistory(db, id)).toHaveLength(1);
         });
 
         it('throws not_found for an unknown contribution', () => {
@@ -237,8 +253,38 @@ describe('contribution versioning (Task 6.1.3)', () => {
             } catch (e) {
                 expect((e as VersioningError).code).toBe('version_not_found');
             }
-            // no new version was created
+            // no new version was created — prove the chain is untouched, not just the head
             expect(getContribution(db, id)!.currentVersion).toBe(1);
+            expect(getVersionHistory(db, id)).toHaveLength(1);
+        });
+
+        it('refuses to revert to a store-created empty version (empty_body, both paths agree)', () => {
+            // The store permits an empty v1; reverting to it must not re-promote a blank
+            // body to current, mirroring editContribution's empty-body guard.
+            const id = createContribution(db, newContribution({body: ''})).id;
+            editContribution(db, id, {actorId: 'bob', body: body('v2'), timestamp: T2});
+            try {
+                revertToVersion(db, id, 1, {actorId: 'alice', timestamp: T3});
+                expect.unreachable('reverting to an empty body must throw');
+            } catch (e) {
+                expect((e as VersioningError).code).toBe('empty_body');
+            }
+            // current stays at the non-empty v2; nothing appended
+            expect(getContribution(db, id)!.currentVersion).toBe(2);
+            expect(getVersionHistory(db, id)).toHaveLength(2);
+        });
+
+        it('reports contribution_removed (not version_not_found) when a removed item also has a bad target', () => {
+            // Guard ordering: the removed-tombstone check runs before the target lookup,
+            // so a removed contribution fails closed regardless of the target version.
+            const id = makePublished(db);
+            updateContributionState(db, id, 'removed', T2);
+            try {
+                revertToVersion(db, id, 99, {actorId: 'alice', timestamp: T3});
+                expect.unreachable('removed contribution must throw');
+            } catch (e) {
+                expect((e as VersioningError).code).toBe('contribution_removed');
+            }
         });
 
         it('throws not_found for an unknown contribution', () => {

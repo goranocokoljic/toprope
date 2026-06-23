@@ -39,7 +39,7 @@
  */
 
 import type Database from 'better-sqlite3';
-import {addContributionVersion, getContribution, getContributionVersion, getCurrentContributionVersion, listContributionVersions} from './store';
+import {addContributionVersion, getContribution, getContributionVersion} from './store';
 import type {ContributionVersion} from './types';
 
 /** Stable error codes the caller (route/service) can switch on without matching message text. */
@@ -94,11 +94,32 @@ function requireActor(actorId: string): void {
 }
 
 /**
+ * Reject a blank version body. Like `requireActor`, this uses `.trim()` rather than a
+ * strict `=== ''` so a whitespace-only body (`'   '`, `'\n'`) — which is never valid
+ * JSON and would only ever be a meaningless edit — cannot launder past the NOT NULL
+ * column into the append-only lineage. Both write paths (edit and revert) gate on
+ * this, so the two can never disagree about whether an empty body may become current.
+ */
+function requireNonEmptyBody(body: string): void {
+    if (body.trim() === '') {
+        throw new VersioningError('empty_body', 'A version body cannot be empty.');
+    }
+}
+
+/**
  * Load the contribution and refuse versioning when it is missing or `removed`.
  * `removed` is the terminal tombstone (the state machine's soft delete) — appending
  * a version to it would grow a misleading history on something that has been taken
  * down, so versioning is fail-closed there. Returns nothing; throws a typed error
  * otherwise. Callers use this before any append so the guard is consistent.
+ *
+ * Scope of the guard: it is enforced by THIS engine, not at the store's insert
+ * boundary, and is read-then-append rather than a single guarded UPDATE. Under the
+ * documented single-writer model that is airtight (better-sqlite3 is synchronous and
+ * there is no `await` between this check and the append, so nothing interleaves). The
+ * store's UNIQUE(contribution_id, version) only serializes version NUMBERS across
+ * processes — it does NOT extend to this `removed` check, so cross-process robustness
+ * (out of scope here) would need a `WHERE state != 'removed'` predicate in the store.
  */
 function requireVersionable(db: Database.Database, contributionId: string): void {
     const contribution = getContribution(db, contributionId);
@@ -126,9 +147,7 @@ function requireVersionable(db: Database.Database, contributionId: string): void
  */
 export function editContribution(db: Database.Database, contributionId: string, input: EditInput): ContributionVersion {
     requireActor(input.actorId);
-    if (input.body === '') {
-        throw new VersioningError('empty_body', 'A version body cannot be empty.');
-    }
+    requireNonEmptyBody(input.body);
     requireVersionable(db, contributionId);
 
     const version = addContributionVersion(db, contributionId, {
@@ -137,11 +156,13 @@ export function editContribution(db: Database.Database, contributionId: string, 
         changeNote: input.changeNote ?? null,
         timestamp: input.timestamp,
     });
-    // requireVersionable already proved the contribution exists and is single-writer
-    // safe, so a missing return here would be a genuine invariant break, not a normal
-    // not-found — surface it loudly rather than handing back undefined.
+    // requireVersionable just proved the contribution exists and this is single-writer,
+    // so addContributionVersion (which only returns undefined for a missing contribution)
+    // cannot return undefined here. A non-version is a genuine invariant break, not the
+    // ordinary not-found the typed errors model — throw a plain Error so it reads as the
+    // "this cannot happen" signal it is rather than a 404-shaped domain error.
     if (!version) {
-        throw new VersioningError('not_found', `Contribution '${contributionId}' not found.`);
+        throw new Error(`Invariant: addContributionVersion returned undefined for existing contribution '${contributionId}'.`);
     }
     return version;
 }
@@ -158,9 +179,11 @@ export function editContribution(db: Database.Database, contributionId: string, 
  * does not special-case it.
  *
  * Returns the newly created version (its `version` is the new head, not `target`).
- * Throws `invalid_actor` for a blank actor, `contribution_removed` when the
- * contribution is removed, or `version_not_found` when the target version (or the
- * contribution) does not exist.
+ * Throws `invalid_actor` for a blank actor, `not_found` when the contribution does
+ * not exist, `contribution_removed` when it is removed, `version_not_found` when the
+ * target version does not exist, or `empty_body` if the target body is blank (only
+ * reachable for a store-created empty version — the same guard edit applies, so a
+ * blank body can never be re-promoted to current through either path).
  */
 export function revertToVersion(
     db: Database.Database,
@@ -178,6 +201,7 @@ export function revertToVersion(
             `Version ${target} of contribution '${contributionId}' does not exist.`,
         );
     }
+    requireNonEmptyBody(source.body);
 
     const version = addContributionVersion(db, contributionId, {
         body: source.body,
@@ -185,30 +209,33 @@ export function revertToVersion(
         changeNote: input.changeNote ?? `Reverted to version ${target}`,
         timestamp: input.timestamp,
     });
-    // The contribution existed a moment ago (requireVersionable) and this is a single
-    // writer, so a missing append is an invariant break, not an ordinary not-found.
+    // requireVersionable proved the contribution exists and this is single-writer, so
+    // addContributionVersion cannot return undefined here. Treat a non-version as the
+    // invariant break it is (a plain Error), not an ordinary not-found.
     if (!version) {
-        throw new VersioningError('not_found', `Contribution '${contributionId}' not found.`);
+        throw new Error(`Invariant: addContributionVersion returned undefined for existing contribution '${contributionId}'.`);
     }
     return version;
 }
 
 /**
- * The full version history of a contribution, oldest first (version ascending).
- * Returns an empty array for an unknown contribution — a history read is a safe,
- * non-mutating query, so it does not throw on not-found (callers that need to
- * distinguish "no such contribution" from "no versions" can pair it with a
- * contribution lookup; in practice every contribution has at least version 1).
+ * The versioning surface's READ side. These are the store's version readers, exposed
+ * under the versioning vocabulary so a feature (6.2/6.3) imports its whole versioning
+ * API from one module. They are renamed re-exports rather than wrapper functions
+ * because they add nothing over the store — matching the sibling state machine, which
+ * likewise imports store readers directly instead of re-wrapping them. The store owns
+ * their authoritative contracts:
+ *   * `getVersionHistory` — every version oldest-first; an unknown contribution yields
+ *     an empty array (a read does not throw on not-found).
+ *   * `getCurrentVersion` — the version `current_version` points at; undefined for an
+ *     unknown contribution.
+ *
+ * Note: neither read filters on lifecycle state — a `removed` (tombstoned)
+ * contribution still returns its history and current version (correct for an
+ * audit/history primitive). A default-read CALLER that serves content to a browse
+ * surface must itself exclude `removed` so taken-down material is not shown.
  */
-export function getVersionHistory(db: Database.Database, contributionId: string): ContributionVersion[] {
-    return listContributionVersions(db, contributionId);
-}
-
-/**
- * The current (live) version a default read should serve — the one
- * `current_version` points at. Returns undefined when the contribution does not
- * exist (or, only under externally-corrupted data, points at an absent version).
- */
-export function getCurrentVersion(db: Database.Database, contributionId: string): ContributionVersion | undefined {
-    return getCurrentContributionVersion(db, contributionId);
-}
+export {
+    listContributionVersions as getVersionHistory,
+    getCurrentContributionVersion as getCurrentVersion,
+} from './store';
