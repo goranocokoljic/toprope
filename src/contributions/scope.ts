@@ -158,10 +158,23 @@ function rowToHide(row: HideRow): TeamHide {
  * of whether hiding is currently permitted — the permission gate is applied by the
  * caller (or by {@link listVisibleForViewer}), exactly as the settings store reads
  * a raw override separately from deciding whether to honor it.
+ *
+ * Self-defending: the query joins back to `contributions.scope = 'org'` so the set
+ * only ever contains ORG contribution ids — the same invariant the write path
+ * enforces (only org items can be hidden, see {@link requireHidableOrgItem}). The
+ * pure resolver re-checks org-scope before subtracting a hide too, but constraining
+ * it here means a direct consumer of this accessor cannot mistakenly treat a stray
+ * team-row hide as meaningful: the privacy-relevant rule does not hinge on a single
+ * downstream `&&`.
  */
 export function getHiddenContributionIdsForTeam(db: Database.Database, team: string): Set<string> {
     const rows = db
-        .prepare('SELECT contribution_id FROM contribution_team_hides WHERE team = ?')
+        .prepare(
+            `SELECT h.contribution_id
+             FROM contribution_team_hides h
+             JOIN contributions c ON c.id = h.contribution_id AND c.scope = 'org'
+             WHERE h.team = ?`,
+        )
         .all(team) as {contribution_id: string}[];
     return new Set(rows.map((r) => r.contribution_id));
 }
@@ -279,7 +292,6 @@ export function hideOrgItemForTeam(db: Database.Database, input: HideInput & {pe
     }
     requireHidableOrgItem(db, input.contributionId);
     const ts = input.timestamp ?? nowIso();
-    const note = input.note ?? null;
 
     return db.transaction((): boolean => {
         const res = db
@@ -296,7 +308,7 @@ export function hideOrgItemForTeam(db: Database.Database, input: HideInput & {pe
             contributionId: input.contributionId,
             event: 'hidden',
             actorId: input.actorId,
-            note: note ?? `Hidden for team ${input.team}`,
+            note: input.note ?? `Hidden for team ${input.team}`,
             occurredAt: ts,
         });
         return true;
@@ -323,7 +335,6 @@ export function unhideOrgItemForTeam(db: Database.Database, input: HideInput): b
     requireActor(input.actorId);
     requireTeam(input.team);
     const ts = input.timestamp ?? nowIso();
-    const note = input.note ?? null;
 
     return db.transaction((): boolean => {
         const res = db
@@ -336,7 +347,7 @@ export function unhideOrgItemForTeam(db: Database.Database, input: HideInput): b
             contributionId: input.contributionId,
             event: 'unhidden',
             actorId: input.actorId,
-            note: note ?? `Un-hidden for team ${input.team}`,
+            note: input.note ?? `Un-hidden for team ${input.team}`,
             occurredAt: ts,
         });
         return true;

@@ -283,6 +283,22 @@ describe('scope resolution — hide/unhide governance (Task 6.1.4)', () => {
             hideOrgItemForTeam(db, {contributionId: orgId, team: 'eng', actorId: 'alice', permitted: true});
             expect(getHiddenContributionIdsForTeam(db, 'eng').has(orgId)).toBe(true);
             expect(getHiddenContributionIdsForTeam(db, 'design').has(orgId)).toBe(false);
+            // isHiddenForTeam discriminates by team too: hidden for eng, not for design.
+            expect(isHiddenForTeam(db, orgId, 'eng')).toBe(true);
+            expect(isHiddenForTeam(db, orgId, 'design')).toBe(false);
+        });
+
+        it('getHiddenContributionIdsForTeam is self-defending: a stray team-scoped hide row is excluded', () => {
+            // The mutation path forbids hiding a team item, so force the only way a
+            // non-org hide could exist — a raw insert — and assert the accessor's
+            // JOIN to scope = 'org' keeps it out of the hidden set (so a direct
+            // consumer can never treat it as a meaningful hide).
+            const teamId = makeTeam(db, 'Eng-only practice', 'eng');
+            db.prepare(
+                `INSERT INTO contribution_team_hides (contribution_id, team, hidden_by, hidden_at)
+                 VALUES (?, ?, ?, ?)`,
+            ).run(teamId, 'eng', 'alice', T1);
+            expect(getHiddenContributionIdsForTeam(db, 'eng').has(teamId)).toBe(false);
         });
     });
 
@@ -318,6 +334,8 @@ describe('scope resolution — hide/unhide governance (Task 6.1.4)', () => {
             const hides = listHidesForContribution(db, orgId);
             expect(hides.map((h) => h.team).sort()).toEqual(['design', 'eng']);
             expect(hides.every((h) => h.contributionId === orgId)).toBe(true);
+            // Ordering is newest-first (hidden_at DESC): design (T2) before eng (T1).
+            expect(hides.map((h) => h.team)).toEqual(['design', 'eng']);
         });
     });
 });

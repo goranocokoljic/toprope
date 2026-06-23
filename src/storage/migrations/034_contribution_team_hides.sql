@@ -24,7 +24,13 @@ CREATE TABLE IF NOT EXISTS contribution_team_hides (
     -- deleted, its per-team hide rows go with it (mirrors the spine's cascades).
     contribution_id TEXT NOT NULL REFERENCES contributions(id) ON DELETE CASCADE,
     -- The team that hid it for itself. The override is scoped to this one team;
-    -- every other team still sees the org item.
+    -- every other team still sees the org item. NOTE: unlike `hidden_by` this is a
+    -- FUNCTIONAL key the resolver matches a viewer's team against — not an audit
+    -- attribution — so it must be the team's CANONICAL name (the same value carried
+    -- on developers.team / teams.name). A mis-cased or typo'd team here records a
+    -- hide that silently affects nothing; the governance flow resolves the team
+    -- server-side, so the value's validity is guaranteed at the write boundary
+    -- rather than by an FK (kept off for the same reason as the audit columns).
     team TEXT NOT NULL,
     -- Who performed the hide. Audit column, like the spine's actor columns — a
     -- plain id with NO FK to developers so the record outlives the actor it names
