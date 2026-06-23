@@ -82,6 +82,7 @@ describe('settings store', () => {
                     'nudge_default_frequency',
                     'nudge_dismissible_default',
                     'coaching_managers_can_override',
+                    'best_practice_contribution_model',
                 ].sort(),
             );
         });
