@@ -207,6 +207,47 @@ describe('contribution-model engine (Task 6.2.2 / #157)', () => {
             expect(ranked.map((r) => r.contributionId)).toEqual([high, mid, low]);
             expect(ranked.map((r) => r.score)).toEqual([2, 1, -1]);
         });
+
+        it('runs a supplied pre-publish hook on the auto-publish path', () => {
+            const id = makeDraft(db);
+            let ran = 0;
+            let sawId = '';
+            submitPractice(db, {
+                contributionId: id,
+                actorId: 'alice',
+                actorIsLead: false,
+                team: TEAM,
+                prePublishHooks: [
+                    (ctx) => {
+                        ran += 1;
+                        sawId = ctx.contribution.id;
+                    },
+                ],
+            });
+            expect(ran).toBe(1);
+            expect(sawId).toBe(id);
+            expect(getContribution(db, id)?.state).toBe('published');
+        });
+
+        it('a throwing pre-publish hook rolls the whole auto-publish back to draft', () => {
+            const id = makeDraft(db);
+            expect(() =>
+                submitPractice(db, {
+                    contributionId: id,
+                    actorId: 'alice',
+                    actorIsLead: false,
+                    team: TEAM,
+                    prePublishHooks: [
+                        () => {
+                            throw new Error('scrub failed');
+                        },
+                    ],
+                }),
+            ).toThrow('scrub failed');
+            // The transaction wrapping submit+auto-publish rolled back entirely.
+            expect(getContribution(db, id)?.state).toBe('draft');
+            expect(eventTypes(db, id)).toEqual([]);
+        });
     });
 
     // --- hybrid ------------------------------------------------------------
@@ -291,6 +332,22 @@ describe('contribution-model engine (Task 6.2.2 / #157)', () => {
             // endorsed first (despite weaker feedback), then the rest by feedback.
             expect(ranked.map((r) => r.contributionId)).toEqual([endorsedWeak, popularPlain, plain]);
             expect(ranked[0].endorsed).toBe(true);
+        });
+
+        it('orders by feedback WITHIN the endorsed group (two endorsed practices)', () => {
+            const endorsedStrong = makeDraft(db, {title: 'endorsed-strong', timestamp: T1});
+            const endorsedWeak = makeDraft(db, {title: 'endorsed-weak', timestamp: T2});
+            for (const id of [endorsedStrong, endorsedWeak]) {
+                submitPractice(db, {contributionId: id, actorId: 'alice', actorIsLead: false, team: TEAM});
+                endorsePractice(db, {contributionId: id, actorId: 'lead', actorIsLead: true, team: TEAM});
+            }
+            // both endorsed; endorsedStrong has the better feedback so it sorts first.
+            recordFeedback(db, {contributionId: endorsedStrong, developerId: 'alice', signal: 'helpful'});
+            recordFeedback(db, {contributionId: endorsedStrong, developerId: 'bob', signal: 'helpful'});
+
+            const ranked = orderPracticePool(db, 'hybrid', [endorsedWeak, endorsedStrong]);
+            expect(ranked.map((r) => r.contributionId)).toEqual([endorsedStrong, endorsedWeak]);
+            expect(ranked.every((r) => r.endorsed)).toBe(true);
         });
     });
 
