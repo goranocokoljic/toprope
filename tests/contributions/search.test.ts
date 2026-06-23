@@ -107,6 +107,23 @@ describe('contribution search', () => {
         it('keeps unicode letters and digits', () => {
             expect(buildMatchExpression('café 42')).toBe('"café"* "42"*');
         });
+
+        it('the sanitized expression actually executes against MATCH without error', () => {
+            // The unit cases above assert the STRING; this proves that string is
+            // genuinely MATCH-safe by driving an operator/quote/paren-laden query
+            // through the real FTS query (search.ts: `contribution_search MATCH ?`).
+            // A regression that leaked a bare *, ", OR or ( would throw SQLITE_ERROR.
+            const hit = make(db, 'Operators', {bodyText: 'foo or bar baz together'});
+            make(db, 'Other', {bodyText: 'completely unrelated prose'});
+
+            let res: ContributionSearchResult[] = [];
+            expect(() => {
+                res = searchContributions(db, {text: 'foo* OR "bar" (baz)'});
+            }).not.toThrow();
+            // The four surviving tokens (foo, OR, bar, baz) AND-match only the doc
+            // that contains all of them.
+            expect(ids(res)).toEqual([hit]);
+        });
     });
 
     // --- Free-text search returns relevant content (AC1) ------------------------
@@ -307,6 +324,23 @@ describe('contribution search', () => {
             const fe = searchContributions(db, {text: 'shared', viewerTeam: 'frontend', hidesPermitted: false});
             expect(fe.map((r) => r.contribution.title).sort()).toEqual(['Frontend only', 'Org wide']);
         });
+
+        it('limit is applied AFTER scope so out-of-scope rows that sort first cannot steal the cap', () => {
+            // The design hinges on scope-then-limit. Seed backend (out-of-scope) rows
+            // NEWEST so they sort ahead of the in-scope rows on the recency tiebreak;
+            // a limit pushed into SQL (before scope) would spend the cap on backend
+            // rows and silently drop the frontend viewer's real results.
+            make(db, 'Org leak', {scope: 'org', bodyText: 'leaktest', ts: T1});
+            make(db, 'Frontend leak', {scope: 'team', scopeTarget: 'frontend', bodyText: 'leaktest', ts: T2});
+            make(db, 'Backend leak A', {scope: 'team', scopeTarget: 'backend', bodyText: 'leaktest', ts: T3});
+            make(db, 'Backend leak B', {scope: 'team', scopeTarget: 'backend', bodyText: 'leaktest', ts: T3});
+
+            const res = searchContributions(db, {text: 'leaktest', viewerTeam: 'frontend', limit: 2});
+            const titles = res.map((r) => r.contribution.title).sort();
+            // Both in-scope rows survive (not crowded out by the newer backend rows)
+            // and no backend row leaks through despite sorting ahead.
+            expect(titles).toEqual(['Frontend leak', 'Org leak']);
+        });
     });
 
     // --- Index freshness (AC4) --------------------------------------------------
@@ -381,6 +415,20 @@ describe('contribution search', () => {
             expect(ids(res)).toEqual([c, b, a]);
             // No text query → score is 0 for every hit.
             expect(res.every((r) => r.score === 0)).toBe(true);
+        });
+
+        it('returns EVERY lifecycle state by default — state is opt-in, not implied', () => {
+            // The primitive is deliberately state-agnostic: it returns drafts and
+            // removed/unpublished rows unless the caller narrows with a state filter
+            // (a consumer surface forces e.g. {state:'published'}). Pin this so a
+            // regression that started silently hiding non-published rows is caught.
+            const draft = make(db, 'A draft', {state: 'draft', ts: T1});
+            const removed = make(db, 'A tombstone', {state: 'removed', ts: T2});
+            const published = make(db, 'A published', {state: 'published', ts: T3});
+
+            expect(ids(searchContributions(db, {})).sort()).toEqual([draft, removed, published].sort());
+            // The state filter narrows to exactly the published row.
+            expect(ids(searchContributions(db, {filters: {state: 'published'}}))).toEqual([published]);
         });
     });
 });

@@ -3,7 +3,7 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 import {runMigrations} from '../../src/storage/migrator';
-import {createContribution} from '../../src/contributions/store';
+import {createContribution, deleteContribution} from '../../src/contributions/store';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../src/storage/migrations');
 const SQL_035 = fs.readFileSync(path.join(MIGRATIONS_DIR, '035_contribution_search.sql'), 'utf-8');
@@ -95,5 +95,32 @@ describe('migration 035 — contribution search index (#155)', () => {
             .prepare('SELECT contribution_id FROM contribution_search WHERE contribution_search MATCH ?')
             .get('churn') as {contribution_id: string} | undefined;
         expect(hit?.contribution_id).toBe(id);
+    });
+
+    it('the delete trigger physically removes the FTS row (not just masked by the live JOIN)', () => {
+        // searchContributions JOINs FTS to the live contributions table, so a deleted
+        // row vanishes from results even if its FTS row were orphaned. Assert against
+        // the index DIRECTLY so this proves the contribution_search_ad trigger fired.
+        const id = createContribution(db, {
+            contentType: 'best_practice',
+            title: 'Doomed',
+            authorId: 'a',
+            scope: 'org',
+            scopeTarget: null,
+            body: JSON.stringify({markdown: 'transient churn note'}),
+            timestamp: '2026-06-20T00:00:00.000Z',
+        }).id;
+
+        const before = db
+            .prepare('SELECT count(*) AS n FROM contribution_search WHERE contribution_id = ?')
+            .get(id) as {n: number};
+        expect(before.n).toBe(1);
+
+        deleteContribution(db, id);
+
+        const after = db
+            .prepare('SELECT count(*) AS n FROM contribution_search WHERE contribution_id = ?')
+            .get(id) as {n: number};
+        expect(after.n).toBe(0);
     });
 });

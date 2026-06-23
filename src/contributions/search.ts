@@ -35,7 +35,7 @@
  */
 
 import type Database from 'better-sqlite3';
-import {getHiddenContributionIdsForTeam, resolveVisible} from './scope';
+import {resolveVisibleForViewer} from './scope';
 import type {Contribution, ContributionFilters} from './types';
 import {isContributionScope, isContributionState} from './types';
 
@@ -216,17 +216,14 @@ export function searchContributions(
     const sql = `SELECT c.*, ${scoreSelect} FROM contributions c ${joins.join(' ')} ${where} ${orderBy}`;
     const rows = db.prepare(sql).all(...params) as (ContributionRow & {__score: number})[];
 
-    // Enforce viewer scope with the SAME 6.1.4 resolver the browse surfaces use.
-    const honorHides = query.hidesPermitted ?? true;
-    const hiddenIds =
-        honorHides && query.viewerTeam != null
-            ? getHiddenContributionIdsForTeam(db, query.viewerTeam)
-            : new Set<string>();
-
-    const results: ContributionSearchResult[] = resolveVisible(
+    // Enforce viewer scope with the SAME 6.1.4 tail the browse surfaces use, so the
+    // visibility rule lives in exactly one place (resolveVisibleForViewer) and can
+    // never diverge between search and browse.
+    const results: ContributionSearchResult[] = resolveVisibleForViewer(
+        db,
         rows.map((row) => ({...rowToContribution(row), __score: row.__score})),
         query.viewerTeam,
-        hiddenIds,
+        query.hidesPermitted ?? true,
     ).map((row) => {
         const {__score, ...contribution} = row;
         return {contribution, score: __score};

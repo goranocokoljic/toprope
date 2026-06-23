@@ -375,14 +375,39 @@ export interface VisibleForViewerOptions {
 }
 
 /**
- * The DB-backed resolution helper a feature calls to get a viewer's visible set in
- * one step: it lists candidate contributions from the spine (narrowed by any
- * `filters`), resolves the viewer's per-team hides (when `hidesPermitted`), and
- * returns only what the viewer may see, newest-first as the store orders them.
+ * The single, authoritative "enforce viewer scope" step every surface shares: given
+ * a set of candidate rows (however they were produced — a plain list, an FTS-ranked
+ * search, …), resolve the viewer's per-team hides (when `hidesPermitted`) and return
+ * only what the viewer may see, in the candidates' original order.
+ *
+ * This is the privacy-critical tail and MUST live in exactly one place — both the
+ * browse surface ({@link listVisibleForViewer}) and search call it, so a change to
+ * the visibility rule can never apply to one surface and not the other.
  *
  * A teamless viewer (`viewerTeam` null/undefined) gets only org items — there are
  * no team rows they can match and no hides keyed to a team. When `hidesPermitted`
  * is false the hidden set is empty, so hides are not subtracted.
+ */
+export function resolveVisibleForViewer<T extends ScopedContribution>(
+    db: Database.Database,
+    candidates: readonly T[],
+    viewerTeam: string | null | undefined,
+    hidesPermitted = true,
+): T[] {
+    // Only build the hidden set when hides are honored AND the viewer has a team —
+    // a teamless viewer has no per-team hides to apply.
+    const hiddenIds =
+        hidesPermitted && viewerTeam != null
+            ? getHiddenContributionIdsForTeam(db, viewerTeam)
+            : new Set<string>();
+    return resolveVisible(candidates, viewerTeam, hiddenIds);
+}
+
+/**
+ * The DB-backed resolution helper a feature calls to get a viewer's visible set in
+ * one step: it lists candidate contributions from the spine (narrowed by any
+ * `filters`), then enforces viewer scope via {@link resolveVisibleForViewer},
+ * returning only what the viewer may see, newest-first as the store orders them.
  */
 export function listVisibleForViewer(
     db: Database.Database,
@@ -390,10 +415,5 @@ export function listVisibleForViewer(
     options: VisibleForViewerOptions = {},
 ): Contribution[] {
     const candidates = listContributions(db, options.filters ?? {});
-    const honorHides = options.hidesPermitted ?? true;
-    // Only build the hidden set when hides are honored AND the viewer has a team —
-    // a teamless viewer has no per-team hides to apply.
-    const hiddenIds =
-        honorHides && viewerTeam != null ? getHiddenContributionIdsForTeam(db, viewerTeam) : new Set<string>();
-    return resolveVisible(candidates, viewerTeam, hiddenIds);
+    return resolveVisibleForViewer(db, candidates, viewerTeam, options.hidesPermitted ?? true);
 }
