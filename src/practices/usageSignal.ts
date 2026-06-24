@@ -231,8 +231,12 @@ export function analyzeUsageSignal(
     }
     const windowDays = options.windowDays ?? DEFAULT_WINDOW_DAYS;
     const minSample = options.minSample ?? DEFAULT_MIN_SAMPLE;
-    if (windowDays < 1) {
-        throw new Error(`[practices] windowDays must be >= 1 for usage-signal correlation (got ${windowDays})`);
+    if (!Number.isInteger(windowDays) || windowDays < 1) {
+        // Reject NaN / fractional / sub-1 here with a clear message, rather than letting
+        // a NaN slip past `< 1` into addDays and surface as an opaque RangeError.
+        throw new Error(
+            `[practices] windowDays must be a positive integer for usage-signal correlation (got ${windowDays})`,
+        );
     }
 
     // Earliest matching engagement DAY per developer. listUsageEvents is oldest-first,

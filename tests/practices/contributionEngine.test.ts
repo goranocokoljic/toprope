@@ -492,6 +492,33 @@ describe('contribution-model engine (Task 6.2.2 / #157)', () => {
             expect(ranked.map((r) => r.contributionId)).toEqual([mixed, newQuiet, oldQuiet]);
         });
 
+        it('breaks an equal-rankScore tie (two all-not-helpful practices) by total feedback', () => {
+            // Wilson lower bound is 0 for any all-negative tally, so 0/2 and 0/4 tie on
+            // rankScore — the secondary tier (more total feedback first) must separate them.
+            const fewer = makePublished(db, {title: 'fewer', timestamp: T2}); // 0/2
+            const more = makePublished(db, {title: 'more', timestamp: T2}); // 0/4
+            const vote = (id: string, n: number): void => {
+                for (let i = 0; i < n; i++) {
+                    const developerId = `nh-${id}-${i}`;
+                    seedDeveloper(db, developerId);
+                    recordFeedback(db, {contributionId: id, developerId, signal: 'not_helpful'});
+                }
+            };
+            vote(fewer, 2);
+            vote(more, 4);
+            const ranked = orderPracticePool(db, 'bottom_up', [fewer, more]);
+            expect(ranked.map((r) => r.rankScore)).toEqual([0, 0]); // equal primary key
+            expect(ranked.map((r) => r.contributionId)).toEqual([more, fewer]); // more total first
+        });
+
+        it('ranks a no-feedback practice below one with positive feedback', () => {
+            const quiet = makePublished(db, {title: 'quiet', timestamp: T3}); // 0/0 → rankScore 0
+            const liked = makePublished(db, {title: 'liked', timestamp: T1}); // 1/0 → rankScore > 0
+            recordFeedback(db, {contributionId: liked, developerId: 'alice', signal: 'helpful'});
+            const ranked = orderPracticePool(db, 'bottom_up', [quiet, liked]);
+            expect(ranked.map((r) => r.contributionId)).toEqual([liked, quiet]);
+        });
+
         it('falls back to id as a stable final tiebreak when score, total, and recency are equal', () => {
             const a = makePublished(db, {title: 'a', authorId: 'alice', timestamp: T1});
             const b = makePublished(db, {title: 'b', authorId: 'alice', timestamp: T1});
