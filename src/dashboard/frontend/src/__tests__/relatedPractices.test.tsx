@@ -15,6 +15,7 @@ function practice(over: Partial<RelatedPractice> = {}): RelatedPractice {
 
 let surfaced: RelatedPractice[];
 let viewPosts: {id: string; metric: string}[];
+let viewStatus: number;
 let fetchMock: Mock;
 
 function json(body: unknown, status = 200): Response {
@@ -28,6 +29,7 @@ function makeClient(): QueryClient {
 beforeEach(() => {
     surfaced = [practice()];
     viewPosts = [];
+    viewStatus = 201;
     fetchMock = vi.fn(async (url: unknown, init?: RequestInit) => {
         const u = String(url);
         const method = (init?.method ?? 'GET').toUpperCase();
@@ -36,6 +38,9 @@ beforeEach(() => {
         if (viewMatch && method === 'POST') {
             const body = JSON.parse(String(init?.body ?? '{}')) as {metric: string};
             viewPosts.push({id: decodeURIComponent(viewMatch[1]), metric: body.metric});
+            if (viewStatus >= 400) {
+                return json({error: 'Not Found'}, viewStatus);
+            }
             return json({data: {id: 'e1', event: 'viewed'}}, 201);
         }
         if (u.includes('/api/me/practices/related') && method === 'GET') {
@@ -119,5 +124,34 @@ describe('RelatedPractices affordance (Task 6.2.7)', () => {
         expect(await screen.findByText('Pinned')).toBeInTheDocument();
         expect(screen.getByText('Endorsed')).toBeInTheDocument();
         expect(screen.getByText(/found this helpful/i)).toBeInTheDocument();
+    });
+
+    it('suppresses the helpful-ratio hint at 0% (stays encouraging, never a quiet negative)', async () => {
+        surfaced = [practice({helpfulRatio: 0})];
+        renderAffordance();
+        fireEvent.click(await screen.findByRole('button', {name: /related practice/i}));
+        expect(await screen.findByText(INTRO)).toBeInTheDocument();
+        expect(screen.queryByText(/found this helpful/i)).not.toBeInTheDocument();
+    });
+
+    it('survives a failed view-log — the read surface still renders (fire-and-forget)', async () => {
+        viewStatus = 404; // the view POST fails
+        renderAffordance();
+        fireEvent.click(await screen.findByRole('button', {name: /related practice/i}));
+        // The practices still render even though recording the view failed.
+        expect(await screen.findByText(INTRO)).toBeInTheDocument();
+        expect(screen.getByText('Review AI suggestions before accepting')).toBeInTheDocument();
+        await waitFor(() => expect(viewPosts).toHaveLength(1)); // the POST was attempted
+    });
+
+    it('uses semantic theme tokens only (dark-mode safe — no raw colors)', async () => {
+        renderAffordance();
+        fireEvent.click(await screen.findByRole('button', {name: /related practice/i}));
+        const panel = await screen.findByTestId('related-practices');
+        const html = panel.outerHTML;
+        // Leans on the semantic palette that dark mode swaps via the <html> class…
+        expect(panel.className).toMatch(/border-border|bg-surface-raised/);
+        // …and never hardcodes a raw color that would break in dark mode.
+        expect(html).not.toMatch(/text-white|text-black|bg-gray|bg-white|#[0-9a-fA-F]{3,6}/);
     });
 });

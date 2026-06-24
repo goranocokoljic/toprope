@@ -188,13 +188,20 @@ export function registerPracticeSurfaceRoutes(app: FastifyInstance, db: Database
                     .send({error: 'Not Found', message: 'No such surfaced practice for this metric'});
             }
 
+            // Append-only: each view is a fresh row (no per-developer/metric dedup
+            // here, matching GovProxy's append-only posture). The 6.2.4 correlation
+            // tolerates repeat rows by anchoring on each developer's FIRST engagement,
+            // so a developer re-viewing a practice cannot skew the sample beyond their
+            // single first-engagement contribution.
             const event = recordUsageEvent(db, {
                 contributionId: request.params.id,
                 developerId,
                 event: 'viewed',
                 metricContext: metric,
             });
-            return reply.status(201).send({data: event});
+            // Return a lean projection — the client only needs to know the view was
+            // recorded; don't echo the internal row (developerId/occurredAt) verbatim.
+            return reply.status(201).send({data: {id: event.id, event: event.event}});
         },
     );
 }

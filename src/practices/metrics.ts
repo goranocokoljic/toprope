@@ -64,8 +64,3 @@ export const PRACTICE_METRIC_LABELS: Record<PracticeMetric, string> = {
     acceptance_rate: 'acceptance rate',
     ai_signature_score: 'AI-signature score',
 };
-
-/** The plain-language label for a known practice metric. */
-export function practiceMetricLabel(metric: PracticeMetric): string {
-    return PRACTICE_METRIC_LABELS[metric];
-}

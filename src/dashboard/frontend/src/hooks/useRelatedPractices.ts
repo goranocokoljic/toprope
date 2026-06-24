@@ -12,19 +12,11 @@ import type {RelatedPractices} from '../api/types';
  * `RelatedPractices` component owns layout and the unobtrusive empty state.
  */
 
-/**
- * The practices to surface next to `metric` for the logged-in developer. `enabled`
- * lets a caller mount the affordance but skip the fetch (e.g. before the metric is
- * known); defaults to on.
- */
-export function useRelatedPractices(
-    metric: string,
-    enabled = true,
-): UseQueryResult<RelatedPractices, Error> {
+/** The practices to surface next to `metric` for the logged-in developer. */
+export function useRelatedPractices(metric: string): UseQueryResult<RelatedPractices, Error> {
     return useQuery({
         queryKey: queryKeys.relatedPractices(metric),
         queryFn: () => api.getRelatedPractices(metric),
-        enabled,
     });
 }
 

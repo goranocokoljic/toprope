@@ -27,7 +27,10 @@ export function RelatedPractices({metric}: {metric: string}): JSX.Element | null
     const recordView = useRecordPracticeView();
     const [expanded, setExpanded] = useState(false);
     // Practices whose view we've already recorded this mount — re-expanding the panel
-    // must not log a second view for the same surfaced practice.
+    // must not log a second view for the same surfaced practice. Dedup is per-mount
+    // (the ref resets on remount); the append-only usage log can therefore hold a
+    // repeat "viewed" row across visits, which the 6.2.4 correlation tolerates by
+    // anchoring on each developer's FIRST engagement rather than counting rows.
     const recorded = useRef<Set<string>>(new Set());
 
     const practices = data?.practices ?? [];
@@ -93,7 +96,10 @@ export function RelatedPractices({metric}: {metric: string}): JSX.Element | null
                                 Endorsed
                             </span>
                         ) : null}
-                        {practice.helpfulRatio !== null ? (
+                        {practice.helpfulRatio !== null && practice.helpfulRatio > 0 ? (
+                            // Only a positive ratio is shown — a "0% found this helpful" hint next
+                            // to a developer's own metric reads as a quiet negative, against the
+                            // encouraging register this surface is meant to keep.
                             <span className="text-xs text-muted">
                                 {formatPercent(practice.helpfulRatio)} found this helpful
                             </span>

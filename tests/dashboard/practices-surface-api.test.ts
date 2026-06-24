@@ -9,7 +9,7 @@ import {createUser} from '../../src/auth/users';
 import {hashPassword} from '../../src/auth/password';
 import {SESSION_COOKIE} from '../../src/auth/cookies';
 import {addContributionTag, createContribution} from '../../src/contributions/store';
-import {addMetricPin, listUsageEvents} from '../../src/practices/store';
+import {addMetricPin, listUsageEvents, recordFeedback, setPracticeEndorsed} from '../../src/practices/store';
 import type {NewContribution} from '../../src/contributions/types';
 
 const PASSWORD = 'correct-horse-battery';
@@ -155,6 +155,46 @@ describe('Contextual best-practice display API (Task 6.2.7 / #162)', () => {
         for (let i = 0; i < 4; i++) make(db, `Tip ${i}`, {tags: ['churn']});
         const res = await app.inject({method: 'GET', url: '/api/me/practices/related?metric=churn&limit=2', headers: auth(aliceToken)});
         expect(res.json().data.practices).toHaveLength(2);
+    });
+
+    it('a repeated limit param uses the last value (array branch)', async () => {
+        for (let i = 0; i < 4; i++) make(db, `Tip ${i}`, {tags: ['churn']});
+        const res = await app.inject({method: 'GET', url: '/api/me/practices/related?metric=churn&limit=1&limit=3', headers: auth(aliceToken)});
+        expect(res.statusCode).toBe(200);
+        expect(res.json().data.practices).toHaveLength(3);
+    });
+
+    it('projects the pin / endorsement / helpful-ratio / scope fields onto the DTO (AC1)', async () => {
+        // A team-scoped, lead-pinned, lead-endorsed practice with 3 helpful / 1 not_helpful.
+        const id = make(db, 'Pinned, endorsed, voted', {tags: ['churn'], scope: 'team', scopeTarget: 'eng'});
+        addMetricPin(db, {contributionId: id, metric: 'churn', action: 'pin', actorId: 'lead', createdAt: NOW});
+        setPracticeEndorsed(db, id, true);
+        for (let i = 0; i < 3; i++) {
+            seedDeveloper(db, `voter_h_${i}`, 'eng');
+            recordFeedback(db, {contributionId: id, developerId: `voter_h_${i}`, signal: 'helpful'});
+        }
+        seedDeveloper(db, 'voter_n', 'eng');
+        recordFeedback(db, {contributionId: id, developerId: 'voter_n', signal: 'not_helpful'});
+
+        const res = await app.inject({method: 'GET', url: '/api/me/practices/related?metric=churn', headers: auth(aliceToken)});
+        expect(res.statusCode).toBe(200);
+        const p = res.json().data.practices[0];
+        expect(p.id).toBe(id);
+        expect(p.pinned).toBe(true);
+        expect(p.endorsed).toBe(true);
+        expect(p.scope).toBe('team');
+        expect(p.helpfulRatio).toBeCloseTo(0.75, 5);
+    });
+
+    it('an un-pinned, un-endorsed, feedback-less practice projects the neutral DTO defaults', async () => {
+        const id = make(db, 'Plain', {tags: ['churn']});
+        const res = await app.inject({method: 'GET', url: '/api/me/practices/related?metric=churn', headers: auth(aliceToken)});
+        const p = res.json().data.practices[0];
+        expect(p.id).toBe(id);
+        expect(p.pinned).toBe(false);
+        expect(p.endorsed).toBe(false);
+        expect(p.scope).toBe('org');
+        expect(p.helpfulRatio).toBeNull();
     });
 
     // --- request validation -------------------------------------------------

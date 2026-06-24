@@ -8,37 +8,14 @@
  * would read as a reprimand and is exactly what this feature must avoid.
  *
  * Centralizing the copy here (rather than inlining strings in the route or the React
- * component) gives the tone ONE reviewable home and lets a test assert the invariant
- * directly: every metric's intro is framed as optional help and contains none of the
- * judgemental words ({@link SCOLDING_WORDS}) that would turn a suggestion into a
- * verdict. The component renders whatever this module returns, so the surface can
- * never drift to a harsher register without this test failing.
+ * component) gives the tone ONE reviewable home, and lets the tone test assert the
+ * invariant directly against the very string production emits: every metric's intro is
+ * framed as optional help and contains none of the judgemental words that would turn a
+ * suggestion into a verdict. The component renders whatever this returns, so the
+ * surface can never drift to a harsher register without that test failing.
  */
 
-import {practiceMetricLabel, type PracticeMetric} from './metrics';
-
-/**
- * Words/phrases that would make the copy scold rather than encourage — a judgement on
- * the developer's number instead of an offer of help. The tone test asserts no intro
- * contains any of these (case-insensitively), and they double as the documented
- * definition of "scolding" for anyone editing the copy. Lowercase; matched as
- * substrings, so "problem" also catches "problems".
- */
-export const SCOLDING_WORDS: readonly string[] = [
-    'bad',
-    'poor',
-    'worst',
-    'terrible',
-    'wrong',
-    'fail',
-    'problem',
-    'fault',
-    'blame',
-    'should have',
-    'too high',
-    'too low',
-    'your fault',
-];
+import {PRACTICE_METRIC_LABELS, type PracticeMetric} from './metrics';
 
 /**
  * The encouraging intro shown above the practices surfaced for a metric. Framed as
@@ -48,15 +25,5 @@ export const SCOLDING_WORDS: readonly string[] = [
  * developer's figure is strong or weak.
  */
 export function relatedPracticesIntro(metric: PracticeMetric): string {
-    return `Here are a few practices that may help with ${practiceMetricLabel(metric)}.`;
-}
-
-/**
- * Whether a line of copy stays encouraging — i.e. contains none of the
- * {@link SCOLDING_WORDS}. Exported so the route/UI (and the test) can assert the
- * invariant on any copy, not just the canned intro.
- */
-export function isEncouraging(copy: string): boolean {
-    const lower = copy.toLowerCase();
-    return !SCOLDING_WORDS.some((word) => lower.includes(word));
+    return `Here are a few practices that may help with ${PRACTICE_METRIC_LABELS[metric]}.`;
 }
