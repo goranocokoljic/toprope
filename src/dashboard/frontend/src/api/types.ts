@@ -1145,3 +1145,117 @@ export interface RelatedPractices {
     intro: string;
     practices: RelatedPractice[];
 }
+
+// --- Best-practice browse UI (Task 6.2.8) ----------------------------------
+
+/** A team's active best-practice contribution model (6.2.2). */
+export type ContributionModel = 'top_down' | 'bottom_up' | 'hybrid';
+
+/** A developer's feedback signal on a practice (6.2.4). */
+export type PracticeFeedbackSignal = 'helpful' | 'not_helpful';
+
+/** A practice's aggregate feedback, summarised for display. */
+export interface PracticeFeedbackSummary {
+    helpful: number;
+    notHelpful: number;
+    /** Raw helpful-ratio in [0,1], or null when there is no feedback yet. */
+    helpfulRatio: number | null;
+}
+
+/** One row in the browse list. From GET /api/me/practices/browse. */
+export interface BrowsePracticeSummary {
+    id: string;
+    title: string;
+    scope: string;
+    scopeTarget: string | null;
+    authorId: string;
+    authorName: string | null;
+    currentVersion: number;
+    createdAt: string;
+    updatedAt: string;
+    /** Metric tags (auto-surfacing metrics) attached to the practice, sorted. */
+    metrics: string[];
+    /** Lead-endorsement flag (hybrid model). */
+    endorsed: boolean;
+    feedback: PracticeFeedbackSummary;
+}
+
+/** The browse list plus the viewer-team's active model. From GET /api/me/practices/browse. */
+export interface PracticeBrowseList {
+    model: ContributionModel;
+    /** Whether the viewer may author a draft practice (any authenticated developer). */
+    canContribute: boolean;
+    practices: BrowsePracticeSummary[];
+}
+
+/** A showcase cross-linked to a practice ("see it in action"). Populated by 6.3.8. */
+export interface ShowcaseCrossLink {
+    id: string;
+    title: string;
+}
+
+/** Full detail of one practice. From GET /api/me/practices/browse/:id. */
+export interface BrowsePracticeDetail {
+    id: string;
+    title: string;
+    scope: string;
+    scopeTarget: string | null;
+    state: string;
+    authorId: string;
+    authorName: string | null;
+    currentVersion: number;
+    createdAt: string;
+    updatedAt: string;
+    /** Sanitized HTML of the current version, safe to inject. */
+    html: string;
+    metrics: string[];
+    feedback: PracticeFeedbackSummary & {viewerSignal: PracticeFeedbackSignal | null};
+    endorsed: boolean;
+    /** The viewer-team's active contribution model — drives the model-aware copy. */
+    model: ContributionModel;
+    /** True only when the viewer authored this practice — gates the edit affordance. */
+    canEdit: boolean;
+    /** Showcases that demonstrate this practice (6.3.8). Empty until that task is built. */
+    showcases: ShowcaseCrossLink[];
+}
+
+/** One version in a practice's history. From GET /api/me/practices/browse/:id/history. */
+export interface PracticeHistoryEntry {
+    version: number;
+    authorId: string;
+    authorName: string | null;
+    changeNote: string | null;
+    createdAt: string;
+}
+
+/** The result of toggling feedback. From POST /api/me/practices/browse/:id/feedback. */
+export interface PracticeFeedbackResult {
+    /** The viewer's resulting current signal, or null when the toggle cleared it. */
+    signal: PracticeFeedbackSignal | null;
+    /** True when this press removed an existing signal. */
+    removed: boolean;
+    feedback: PracticeFeedbackSummary;
+}
+
+/** A rendered markdown preview: sanitized HTML + the metric tags it implies (6.2.3). */
+export interface PracticePreview {
+    html: string;
+    metrics: string[];
+}
+
+/** The author-facing view of one of the viewer's OWN practices (6.2.3 editor). */
+export interface OwnedPracticeView {
+    contributionId: string;
+    title: string;
+    state: string;
+    currentVersion: number;
+    markdown: string;
+    html: string;
+    metrics: string[];
+}
+
+/** The new contribution returned when a draft practice is created (6.2.3). */
+export interface CreatedPractice {
+    contribution: {id: string; title: string; scope: string; scopeTarget: string | null; state: string};
+    metrics: string[];
+}

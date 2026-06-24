@@ -32,6 +32,7 @@ const DEVELOPER_SECTION: NavSection = {
         {to: '/developer/tools', label: 'My Tools'},
         {to: '/developer/activity', label: 'My Activity'},
         {to: '/developer/coaching', label: 'My PR Coaching'},
+        {to: '/developer/practices', label: 'Best Practices'},
     ],
 };
 const ACCOUNT_SECTION: NavSection = {title: 'Account', items: [{to: '/preferences', label: 'Preferences'}]};

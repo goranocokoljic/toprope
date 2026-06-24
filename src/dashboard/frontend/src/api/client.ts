@@ -48,6 +48,14 @@ import type {
     CoachingPreferences,
     CoachingPreferencesPatch,
     RelatedPractices,
+    PracticeBrowseList,
+    BrowsePracticeDetail,
+    PracticeHistoryEntry,
+    PracticeFeedbackSignal,
+    PracticeFeedbackResult,
+    PracticePreview,
+    OwnedPracticeView,
+    CreatedPractice,
     WasteAlert,
     WasteResolutionReason,
     WasteTeamSummary,
@@ -748,4 +756,92 @@ export const api = {
             {metric},
         );
     },
+
+    // --- Best-practice browse UI (Task 6.2.8) ---
+    /**
+     * Browse / search the published practices the viewer may see. Free text plus
+     * tag/team/scope filters all flow through 6.1.5 search server-side; the response
+     * carries the viewer-team's active contribution model for the contribute entry point.
+     */
+    async browsePractices(filters: PracticeBrowseFilters = {}): Promise<PracticeBrowseList> {
+        const search = new URLSearchParams();
+        if (filters.q) search.set('q', filters.q);
+        if (filters.tag) search.set('tag', filters.tag);
+        if (filters.team) search.set('team', filters.team);
+        if (filters.scope) search.set('scope', filters.scope);
+        const qs = search.toString();
+        const body = await request<ApiEnvelope<PracticeBrowseList>>(
+            `/api/me/practices/browse${qs ? `?${qs}` : ''}`,
+        );
+        return body.data;
+    },
+
+    /** Full detail of one practice the viewer may see (rendered content, feedback, history access). */
+    async getPracticeDetail(id: string): Promise<BrowsePracticeDetail> {
+        const body = await request<ApiEnvelope<BrowsePracticeDetail>>(
+            `/api/me/practices/browse/${encodeURIComponent(id)}`,
+        );
+        return body.data;
+    },
+
+    /** Version history of a practice the viewer may see, oldest-first. */
+    async getPracticeHistory(id: string): Promise<PracticeHistoryEntry[]> {
+        const body = await request<ApiEnvelope<PracticeHistoryEntry[]>>(
+            `/api/me/practices/browse/${encodeURIComponent(id)}/history`,
+        );
+        return body.data;
+    },
+
+    /** Toggle the viewer's helpful / not-helpful feedback on a practice (6.2.4). */
+    async togglePracticeFeedback(
+        id: string,
+        signal: PracticeFeedbackSignal,
+    ): Promise<PracticeFeedbackResult> {
+        const body = await postJson<ApiEnvelope<PracticeFeedbackResult>>(
+            `/api/me/practices/browse/${encodeURIComponent(id)}/feedback`,
+            {signal},
+        );
+        return body.data;
+    },
+
+    // --- Best-practice authoring editor (Task 6.2.3, used by the 6.2.8 entry points) ---
+    /** Live markdown preview: sanitized HTML + the metric tags it implies. Persists nothing. */
+    async previewPractice(markdown: string): Promise<PracticePreview> {
+        const body = await postJson<ApiEnvelope<PracticePreview>>('/api/me/practices/preview', {markdown});
+        return body.data;
+    },
+
+    /** Create a draft practice from markdown. Team scope pins to the author's own team. */
+    async createPractice(input: {
+        title: string;
+        scope: 'org' | 'team';
+        markdown: string;
+    }): Promise<CreatedPractice> {
+        const body = await postJson<ApiEnvelope<CreatedPractice>>('/api/me/practices', input);
+        return body.data;
+    },
+
+    /** Load one of the viewer's OWN practices for editing (owner-scoped; 404 otherwise). */
+    async getOwnedPractice(id: string): Promise<OwnedPracticeView> {
+        const body = await request<ApiEnvelope<OwnedPracticeView>>(
+            `/api/me/practices/${encodeURIComponent(id)}`,
+        );
+        return body.data;
+    },
+
+    /** Save an edit to one of the viewer's OWN practices (appends a new version). */
+    async savePractice(id: string, markdown: string): Promise<void> {
+        await postJson<ApiEnvelope<unknown>>(
+            `/api/me/practices/${encodeURIComponent(id)}/save`,
+            {markdown},
+        );
+    },
 };
+
+/** Query filters for {@link api.browsePractices}. */
+export interface PracticeBrowseFilters {
+    q?: string;
+    tag?: string;
+    team?: string;
+    scope?: 'org' | 'team';
+}
