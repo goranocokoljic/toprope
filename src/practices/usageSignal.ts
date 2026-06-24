@@ -27,7 +27,7 @@
  */
 
 import type Database from 'better-sqlite3';
-import {computePeriodMetrics, type PeriodMetrics} from '../aggregation/compute';
+import {computePeriodMetrics, type DataQuality, type PeriodMetrics} from '../aggregation/compute';
 import {addDays} from '../aggregation/dates';
 import {listUsageEvents} from './store';
 import {isPracticeMetric, type PracticeMetric} from './metrics';
@@ -50,9 +50,10 @@ export const DEFAULT_WINDOW_DAYS = 14;
 /**
  * The event kinds that count as ENGAGEMENT for the correlation. Viewing or applying
  * a surfaced practice is engagement; other log kinds (e.g. a future `dismissed`) are
- * not, so they never anchor a before/after comparison. Overridable per call.
+ * not, so they never anchor a before/after comparison. This is the policy, not a
+ * per-call knob — a future caller that needs a different set changes it here.
  */
-export const ENGAGEMENT_EVENTS: readonly UsageEventType[] = ['viewed', 'applied'];
+export const ENGAGEMENT_EVENTS: ReadonlySet<UsageEventType> = new Set(['viewed', 'applied']);
 
 /**
  * The mandatory directional / non-causal disclaimer shown with every usage signal.
@@ -97,11 +98,28 @@ function metricValue(metrics: PeriodMetrics, metric: PracticeMetric): number | n
         case 'estimated_cost':
             return metrics.estimated_total_cost;
         default: {
-            // Exhaustive over PracticeMetric; a new metric without a case fails to compile.
+            // Exhaustive over PracticeMetric: the assignment fails to compile if a
+            // metric is added without a case. At runtime fail CLOSED — throw rather
+            // than return the un-narrowed input as a number — though `analyzeUsageSignal`
+            // guards the entry with `isPracticeMetric`, so this is unreachable in practice.
             const _never: never = metric;
-            return _never;
+            throw new Error(`[practices] unhandled metric '${String(_never)}' in usage-signal correlation`);
         }
     }
+}
+
+/** Data-quality tiers ordered weakest → strongest, for {@link weakestQuality}. */
+const QUALITY_RANK: Record<DataQuality, number> = {low: 0, medium: 1, high: 2};
+
+/** The weakest (lowest-confidence) tier among the inputs, or null when there are none. */
+function weakestQuality(qualities: readonly DataQuality[]): DataQuality | null {
+    let weakest: DataQuality | null = null;
+    for (const q of qualities) {
+        if (weakest === null || QUALITY_RANK[q] < QUALITY_RANK[weakest]) {
+            weakest = q;
+        }
+    }
+    return weakest;
 }
 
 /** How a single developer's metric moved across their engagement. */
@@ -123,8 +141,6 @@ export interface UsageSignalOptions {
     windowDays?: number;
     /** Minimum measurable developers before the signal is shown. Default {@link DEFAULT_MIN_SAMPLE}. */
     minSample?: number;
-    /** Which event kinds count as engagement. Default {@link ENGAGEMENT_EVENTS}. */
-    engagementEvents?: readonly UsageEventType[];
 }
 
 /** The correlation result — either withheld (below sample) or a shown directional signal. */
@@ -145,6 +161,15 @@ export interface UsageSignalResult {
     flat: number | null;
     /** improved / sampleSize in [0, 1] (null when withheld). */
     improvedShare: number | null;
+    /**
+     * The WEAKEST data-quality tier across every measurable developer's before/after
+     * windows (null when there is no sample). A correlation that compares a low-tier
+     * git-estimate window against a high-tier measured one is only as trustworthy as
+     * its weakest input, so the surfacing layer (6.2.7) must label the signal with
+     * this basis rather than implying it is all measured — GovProxy tags every data
+     * point high/medium/low and this signal is no exception.
+     */
+    basis: DataQuality | null;
     /** Encouraging, plain-language directional headline (null when withheld). */
     headline: string | null;
     /** The mandatory non-causal disclaimer — present whether shown or withheld. */
@@ -168,6 +193,7 @@ function withheld(
         worsened: null,
         flat: null,
         improvedShare: null,
+        basis: null,
         headline: null,
         disclaimer: DIRECTIONAL_DISCLAIMER,
     };
@@ -205,7 +231,6 @@ export function analyzeUsageSignal(
     }
     const windowDays = options.windowDays ?? DEFAULT_WINDOW_DAYS;
     const minSample = options.minSample ?? DEFAULT_MIN_SAMPLE;
-    const engagementEvents = new Set(options.engagementEvents ?? ENGAGEMENT_EVENTS);
     if (windowDays < 1) {
         throw new Error(`[practices] windowDays must be >= 1 for usage-signal correlation (got ${windowDays})`);
     }
@@ -216,7 +241,7 @@ export function analyzeUsageSignal(
     // metric under study, and whose kind counts as engagement, anchor a comparison.
     const firstEngagementDay = new Map<string, string>();
     for (const ev of listUsageEvents(db, contributionId)) {
-        if (ev.metricContext !== metric || !engagementEvents.has(ev.event)) {
+        if (ev.metricContext !== metric || !ENGAGEMENT_EVENTS.has(ev.event)) {
             continue;
         }
         if (firstEngagementDay.has(ev.developerId)) {
@@ -237,18 +262,19 @@ export function analyzeUsageSignal(
     let improved = 0;
     let worsened = 0;
     let flat = 0;
+    // Every measurable developer's before/after window tiers — the basis is only as
+    // strong as the weakest window that fed the comparison (SO-1: don't imply a
+    // mixed-tier correlation is fully measured).
+    const windowTiers: DataQuality[] = [];
     for (const [developerId, day] of firstEngagementDay) {
-        const before = metricValue(
-            computePeriodMetrics(db, developerId, addDays(day, -windowDays), addDays(day, -1)),
-            metric,
-        );
-        const after = metricValue(
-            computePeriodMetrics(db, developerId, addDays(day, 1), addDays(day, windowDays)),
-            metric,
-        );
+        const beforeMetrics = computePeriodMetrics(db, developerId, addDays(day, -windowDays), addDays(day, -1));
+        const afterMetrics = computePeriodMetrics(db, developerId, addDays(day, 1), addDays(day, windowDays));
+        const before = metricValue(beforeMetrics, metric);
+        const after = metricValue(afterMetrics, metric);
         if (before === null || after === null) {
             continue; // not measurable — excluded from the sample, not counted as flat
         }
+        windowTiers.push(beforeMetrics.data_quality, afterMetrics.data_quality);
         const movement = classifyMovement(before, after, metric);
         if (movement === 'improved') {
             improved += 1;
@@ -277,6 +303,7 @@ export function analyzeUsageSignal(
         worsened,
         flat,
         improvedShare,
+        basis: weakestQuality(windowTiers),
         headline,
         disclaimer: DIRECTIONAL_DISCLAIMER,
     };

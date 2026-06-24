@@ -44,6 +44,28 @@ function seedChurn(db: Database.Database, dev: string, date: string, churn: numb
     ).run(`git-${dev}-${date}`, dev, date, churn);
 }
 
+/** Insert a git_snapshot carrying an ai_signature_score on `date`. */
+function seedAiSignature(db: Database.Database, dev: string, date: string, score: number): void {
+    db.prepare(
+        `INSERT INTO git_snapshots (id, developer_id, date, ai_signature_score) VALUES (?, ?, ?, ?)`,
+    ).run(`gs-${dev}-${date}`, dev, date, score);
+}
+
+/** Insert a git_snapshot carrying merged-PR counts on `date` (drives cost_per_pr). */
+function seedPrs(db: Database.Database, dev: string, date: string, prsMerged: number): void {
+    db.prepare(
+        `INSERT INTO git_snapshots (id, developer_id, date, prs_merged) VALUES (?, ?, ?, ?)`,
+    ).run(`gp-${dev}-${date}`, dev, date, prsMerged);
+}
+
+/** Give a developer a company-managed subscription assigned well before the windows. */
+function seedSubscription(db: Database.Database, dev: string, monthlyCost: number): void {
+    db.prepare(
+        `INSERT INTO subscriptions (id, developer_id, tool, plan, billing_model, monthly_cost, seat_assigned_at, data_source)
+         VALUES (?, ?, 'copilot', 'business', 'company_managed', ?, '2026-01-01', 'csv')`,
+    ).run(`sub-${dev}`, dev, monthlyCost);
+}
+
 /** Insert a tool_snapshot whose acceptance_rate is acceptances/interactions on `date`. */
 function seedAcceptance(
     db: Database.Database,
@@ -131,6 +153,8 @@ describe('usage-signal correlation (Task 6.2.4 / #159)', () => {
         expect(res.flat).toBe(0);
         expect(res.improvedShare).toBe(1);
         expect(res.headline).toContain('3 developers');
+        // git-only windows → the weakest contributing tier is 'medium'.
+        expect(res.basis).toBe('medium');
     });
 
     // --- directional / non-causal labeling -----------------------------------
@@ -198,6 +222,86 @@ describe('usage-signal correlation (Task 6.2.4 / #159)', () => {
         expect(res.shown).toBe(true);
         expect(res.improved).toBe(3);
         expect(res.worsened).toBe(0);
+    });
+
+    it('respects metric polarity: ai_signature_score improves when it goes UP', () => {
+        for (const dev of ['d1', 'd2', 'd3']) {
+            seedDeveloper(db, dev);
+            seedAiSignature(db, dev, BEFORE_DAY, 0.3);
+            seedAiSignature(db, dev, AFTER_DAY, 0.7); // up → improved
+            recordUsageEvent(db, {
+                contributionId: 'c1',
+                developerId: dev,
+                event: 'viewed',
+                metricContext: 'ai_signature_score',
+                occurredAt: ENGAGE_AT,
+            });
+        }
+        const res = analyze(db, 'ai_signature_score');
+        expect(res.shown).toBe(true);
+        expect(res.improved).toBe(3);
+        expect(res.worsened).toBe(0);
+    });
+
+    it('correlates cost_per_pr (subscription ÷ merged PRs), improving when it falls', () => {
+        // Same subscription each window; more merged PRs after → lower cost per PR → improved.
+        for (const dev of ['d1', 'd2', 'd3']) {
+            seedDeveloper(db, dev);
+            seedSubscription(db, dev, 30);
+            seedPrs(db, dev, BEFORE_DAY, 1); // ~13.5 / 1 ≈ 13.5
+            seedPrs(db, dev, AFTER_DAY, 5); // ~13.5 / 5 ≈ 2.7 → cost per PR fell
+            recordUsageEvent(db, {
+                contributionId: 'c1',
+                developerId: dev,
+                event: 'applied',
+                metricContext: 'cost_per_pr',
+                occurredAt: ENGAGE_AT,
+            });
+        }
+        const res = analyze(db, 'cost_per_pr');
+        expect(res.shown).toBe(true);
+        expect(res.improved).toBe(3);
+        expect(res.worsened).toBe(0);
+    });
+
+    // --- before/after window boundaries --------------------------------------
+
+    it('excludes a snapshot ON the engagement day from BOTH windows, and includes the far edges', () => {
+        // d1: churn data ONLY on the engagement day — neither window sees it, so d1 is
+        // non-measurable and excluded. d2/d3: data on the inclusive far edges (day-14,
+        // day+14) — both windows see them, so they ARE measurable and improve.
+        seedDeveloper(db, 'd1');
+        seedChurn(db, 'd1', ENGAGE_DAY, 0.5); // on the engagement day → in neither window
+        recordUsageEvent(db, {contributionId: 'c1', developerId: 'd1', event: 'viewed', metricContext: 'churn', occurredAt: ENGAGE_AT});
+        for (const dev of ['d2', 'd3', 'd4']) {
+            seedDeveloper(db, dev);
+            seedChurn(db, dev, '2026-03-01', 0.6); // day-14 (engagement 03-15) → far edge of before window
+            seedChurn(db, dev, '2026-03-29', 0.2); // day+14 → far edge of after window
+            recordUsageEvent(db, {contributionId: 'c1', developerId: dev, event: 'viewed', metricContext: 'churn', occurredAt: ENGAGE_AT});
+        }
+        const res = analyze(db, 'churn');
+        expect(res.sampleSize).toBe(3); // d1 excluded (only an engagement-day point)
+        expect(res.improved).toBe(3); // d2/d3/d4 measured across the far edges
+    });
+
+    // --- data-quality basis (SO-1) -------------------------------------------
+
+    it('reports the WEAKEST data-quality tier across measurable windows as the basis', () => {
+        // Two git-only developers (medium tier) and one with tool activity (high tier).
+        seedChurnDev(db, 'd1', 0.5, 0.2);
+        seedChurnDev(db, 'd2', 0.6, 0.3);
+        seedDeveloper(db, 'd3');
+        seedChurn(db, 'd3', BEFORE_DAY, 0.4);
+        seedChurn(db, 'd3', AFTER_DAY, 0.1);
+        // d3 also has tool usage in both windows → its windows compute as 'high' tier.
+        seedAcceptance(db, 'd3', BEFORE_DAY, 10, 8);
+        seedAcceptance(db, 'd3', AFTER_DAY, 10, 9);
+        recordUsageEvent(db, {contributionId: 'c1', developerId: 'd3', event: 'viewed', metricContext: 'churn', occurredAt: ENGAGE_AT});
+        const res = analyze(db, 'churn');
+        expect(res.shown).toBe(true);
+        expect(res.sampleSize).toBe(3);
+        // d1/d2 windows are 'medium'; the weakest tier wins even though d3 is 'high'.
+        expect(res.basis).toBe('medium');
     });
 
     // --- the "measurable" rule -----------------------------------------------

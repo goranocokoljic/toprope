@@ -384,6 +384,33 @@ describe('contribution-model engine (Task 6.2.2 / #157)', () => {
             expect(ranked.map((r) => r.contributionId)).toEqual([endorsedStrong, endorsedWeak]);
             expect(ranked.every((r) => r.endorsed)).toBe(true);
         });
+
+        it('within the endorsed group, ranks by helpful-RATIO not raw net score (6.2.4)', () => {
+            // Both endorsed, so endorsement can't separate them — the feedback order
+            // within the group must use the ratio. `broad` has the higher net (+4) but a
+            // worse ratio; `pure` has a lower net (+3) but a perfect ratio. Net would put
+            // broad first; ratio must put `pure` first.
+            const broad = makeDraft(db, {title: 'endorsed-broad', timestamp: T1});
+            const pure = makeDraft(db, {title: 'endorsed-pure', timestamp: T2});
+            for (const id of [broad, pure]) {
+                submitPractice(db, {contributionId: id, actorId: 'alice', actorIsLead: false, team: TEAM});
+                endorsePractice(db, {contributionId: id, actorId: 'lead', actorIsLead: true, team: TEAM});
+            }
+            let dev = 0;
+            const vote = (id: string, signal: 'helpful' | 'not_helpful'): void => {
+                const developerId = `hv-${dev++}`;
+                seedDeveloper(db, developerId);
+                recordFeedback(db, {contributionId: id, developerId, signal});
+            };
+            for (let i = 0; i < 8; i++) vote(broad, 'helpful');
+            for (let i = 0; i < 4; i++) vote(broad, 'not_helpful'); // 8/4, net +4, ratio 0.667
+            for (let i = 0; i < 3; i++) vote(pure, 'helpful'); // 3/0, net +3, ratio 1.0
+
+            const ranked = orderPracticePool(db, 'hybrid', [broad, pure]);
+            expect(ranked.map((r) => r.contributionId)).toEqual([pure, broad]);
+            expect(ranked.find((r) => r.contributionId === broad)?.score).toBe(4); // net would order the other way
+            expect(ranked.find((r) => r.contributionId === pure)?.score).toBe(3);
+        });
     });
 
     // --- switching the model at runtime ------------------------------------
