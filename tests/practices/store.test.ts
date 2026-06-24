@@ -11,6 +11,7 @@ import {
     listUsageEvents,
     recordFeedback,
     recordUsageEvent,
+    removeFeedback,
     removeMetricPin,
     setPracticeDetails,
     setPracticeEndorsed,
@@ -243,6 +244,25 @@ describe('practices store (#156)', () => {
             expect(() =>
                 recordFeedback(db, {contributionId: 'ghost', developerId: 'alice', signal: 'helpful'}),
             ).toThrow();
+        });
+
+        it('removeFeedback clears a developer’s current signal and reports the change', () => {
+            recordFeedback(db, {contributionId: 'c1', developerId: 'alice', signal: 'helpful', createdAt: T1});
+            expect(removeFeedback(db, 'c1', 'alice')).toBe(true);
+            expect(getFeedback(db, 'c1', 'alice')).toBeUndefined();
+            expect(getFeedbackCounts(db, 'c1')).toEqual({helpful: 0, notHelpful: 0});
+        });
+
+        it('removeFeedback is a no-op (returns false) when there is no current signal', () => {
+            expect(removeFeedback(db, 'c1', 'bob')).toBe(false);
+        });
+
+        it('removeFeedback only clears the named developer, leaving others intact', () => {
+            recordFeedback(db, {contributionId: 'c1', developerId: 'alice', signal: 'helpful', createdAt: T1});
+            recordFeedback(db, {contributionId: 'c1', developerId: 'bob', signal: 'helpful', createdAt: T1});
+            expect(removeFeedback(db, 'c1', 'alice')).toBe(true);
+            expect(getFeedback(db, 'c1', 'bob')?.signal).toBe('helpful');
+            expect(getFeedbackCounts(db, 'c1')).toEqual({helpful: 1, notHelpful: 0});
         });
     });
 

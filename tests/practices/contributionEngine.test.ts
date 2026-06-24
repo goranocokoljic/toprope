@@ -208,6 +208,41 @@ describe('contribution-model engine (Task 6.2.2 / #157)', () => {
             expect(ranked.map((r) => r.score)).toEqual([2, 1, -1]);
         });
 
+        it('ranks by helpful-RATIO, not raw net score (6.2.4)', () => {
+            // `broad` has the higher NET score (+4) but a worse ratio; `pure` has a
+            // lower net (+3) but a perfect ratio with enough votes to be credible.
+            // Helpful-ratio ranking must put `pure` first — proving the sort key is the
+            // confidence-adjusted ratio, not net (helpful − notHelpful).
+            const broad = makeDraft(db, {title: 'broad', timestamp: T1});
+            const pure = makeDraft(db, {title: 'pure', timestamp: T2});
+            for (const id of [broad, pure]) {
+                submitPractice(db, {contributionId: id, actorId: 'alice', actorIsLead: false, team: TEAM});
+            }
+            // broad: 8 helpful / 4 not-helpful (net +4, ratio 0.667)
+            // pure:  3 helpful / 0 not-helpful (net +3, ratio 1.0)
+            let dev = 0;
+            const vote = (id: string, signal: 'helpful' | 'not_helpful'): void => {
+                const developerId = `voter-${dev++}`;
+                seedDeveloper(db, developerId);
+                recordFeedback(db, {contributionId: id, developerId, signal});
+            };
+            for (let i = 0; i < 8; i++) vote(broad, 'helpful');
+            for (let i = 0; i < 4; i++) vote(broad, 'not_helpful');
+            for (let i = 0; i < 3; i++) vote(pure, 'helpful');
+
+            const ranked = orderPracticePool(db, 'bottom_up', [broad, pure]);
+            expect(ranked.map((r) => r.contributionId)).toEqual([pure, broad]);
+            // Net would have ordered them the OTHER way: broad's net (4) beats pure's (3).
+            const broadRow = ranked.find((r) => r.contributionId === broad);
+            const pureRow = ranked.find((r) => r.contributionId === pure);
+            expect(broadRow?.score).toBe(4);
+            expect(pureRow?.score).toBe(3);
+            // The ratio-based rank score is what flips the order.
+            expect(pureRow?.rankScore).toBeGreaterThan(broadRow?.rankScore ?? 0);
+            expect(pureRow?.helpfulRatio).toBe(1);
+            expect(broadRow?.helpfulRatio).toBeCloseTo(8 / 12, 10);
+        });
+
         it('runs a supplied pre-publish hook on the auto-publish path', () => {
             const id = makeDraft(db);
             let ran = 0;
@@ -349,6 +384,33 @@ describe('contribution-model engine (Task 6.2.2 / #157)', () => {
             expect(ranked.map((r) => r.contributionId)).toEqual([endorsedStrong, endorsedWeak]);
             expect(ranked.every((r) => r.endorsed)).toBe(true);
         });
+
+        it('within the endorsed group, ranks by helpful-RATIO not raw net score (6.2.4)', () => {
+            // Both endorsed, so endorsement can't separate them — the feedback order
+            // within the group must use the ratio. `broad` has the higher net (+4) but a
+            // worse ratio; `pure` has a lower net (+3) but a perfect ratio. Net would put
+            // broad first; ratio must put `pure` first.
+            const broad = makeDraft(db, {title: 'endorsed-broad', timestamp: T1});
+            const pure = makeDraft(db, {title: 'endorsed-pure', timestamp: T2});
+            for (const id of [broad, pure]) {
+                submitPractice(db, {contributionId: id, actorId: 'alice', actorIsLead: false, team: TEAM});
+                endorsePractice(db, {contributionId: id, actorId: 'lead', actorIsLead: true, team: TEAM});
+            }
+            let dev = 0;
+            const vote = (id: string, signal: 'helpful' | 'not_helpful'): void => {
+                const developerId = `hv-${dev++}`;
+                seedDeveloper(db, developerId);
+                recordFeedback(db, {contributionId: id, developerId, signal});
+            };
+            for (let i = 0; i < 8; i++) vote(broad, 'helpful');
+            for (let i = 0; i < 4; i++) vote(broad, 'not_helpful'); // 8/4, net +4, ratio 0.667
+            for (let i = 0; i < 3; i++) vote(pure, 'helpful'); // 3/0, net +3, ratio 1.0
+
+            const ranked = orderPracticePool(db, 'hybrid', [broad, pure]);
+            expect(ranked.map((r) => r.contributionId)).toEqual([pure, broad]);
+            expect(ranked.find((r) => r.contributionId === broad)?.score).toBe(4); // net would order the other way
+            expect(ranked.find((r) => r.contributionId === pure)?.score).toBe(3);
+        });
     });
 
     // --- switching the model at runtime ------------------------------------
@@ -428,6 +490,33 @@ describe('contribution-model engine (Task 6.2.2 / #157)', () => {
             const ranked = orderPracticePool(db, 'bottom_up', [oldQuiet, newQuiet, mixed]);
             // all score 0: most total feedback first, then newer-first among the quiet two.
             expect(ranked.map((r) => r.contributionId)).toEqual([mixed, newQuiet, oldQuiet]);
+        });
+
+        it('breaks an equal-rankScore tie (two all-not-helpful practices) by total feedback', () => {
+            // Wilson lower bound is 0 for any all-negative tally, so 0/2 and 0/4 tie on
+            // rankScore — the secondary tier (more total feedback first) must separate them.
+            const fewer = makePublished(db, {title: 'fewer', timestamp: T2}); // 0/2
+            const more = makePublished(db, {title: 'more', timestamp: T2}); // 0/4
+            const vote = (id: string, n: number): void => {
+                for (let i = 0; i < n; i++) {
+                    const developerId = `nh-${id}-${i}`;
+                    seedDeveloper(db, developerId);
+                    recordFeedback(db, {contributionId: id, developerId, signal: 'not_helpful'});
+                }
+            };
+            vote(fewer, 2);
+            vote(more, 4);
+            const ranked = orderPracticePool(db, 'bottom_up', [fewer, more]);
+            expect(ranked.map((r) => r.rankScore)).toEqual([0, 0]); // equal primary key
+            expect(ranked.map((r) => r.contributionId)).toEqual([more, fewer]); // more total first
+        });
+
+        it('ranks a no-feedback practice below one with positive feedback', () => {
+            const quiet = makePublished(db, {title: 'quiet', timestamp: T3}); // 0/0 → rankScore 0
+            const liked = makePublished(db, {title: 'liked', timestamp: T1}); // 1/0 → rankScore > 0
+            recordFeedback(db, {contributionId: liked, developerId: 'alice', signal: 'helpful'});
+            const ranked = orderPracticePool(db, 'bottom_up', [quiet, liked]);
+            expect(ranked.map((r) => r.contributionId)).toEqual([liked, quiet]);
         });
 
         it('falls back to id as a stable final tiebreak when score, total, and recency are equal', () => {
