@@ -154,10 +154,12 @@ export function registerPracticeSurfaceRoutes(app: FastifyInstance, db: Database
      * raw material the usage-signal correlation (6.2.4) joins against metric movement.
      * Body: { metric }. The developer id is the session's, never request input.
      *
-     * Gated on the practice being in the viewer's CURRENT surfacing set for the metric:
+     * Gated on the practice being SURFACING-ELIGIBLE for the viewer at this metric:
      * a practice the viewer cannot see (out of scope, unpublished, or suppressed) is a
-     * 404 and records nothing, so a developer can only ever log a view of a practice the
-     * surface actually showed them.
+     * 404 and records nothing. The gate runs against the UNCAPPED surfacing set (no
+     * display `limit`), so it is deliberately "could-be-surfaced," not "was in the
+     * top-N the GET rendered" — the display cap is an affordance, not a security
+     * boundary, and a practice ranked below the cap is still a legitimate view target.
      */
     app.post<{Params: {id: string}; Body: unknown}>(
         '/api/me/practices/:id/view',
