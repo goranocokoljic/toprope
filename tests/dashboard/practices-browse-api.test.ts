@@ -183,6 +183,33 @@ describe('Best-practice browse API (Task 6.2.8 / #163)', () => {
         expect(bad.statusCode).toBe(400);
     });
 
+    it('rejects a limit over the ceiling, at/below zero, and honors the last of a repeated param', async () => {
+        make(db, 'Tip A', {});
+        make(db, 'Tip B', {});
+        // The 200 ceiling is the unbounded-page guard — exceeding it must 400.
+        const over = await app.inject({
+            method: 'GET',
+            url: '/api/me/practices/browse?limit=300',
+            headers: auth(aliceToken),
+        });
+        expect(over.statusCode).toBe(400);
+        // Lower bound: zero / negative are not valid page sizes.
+        const zero = await app.inject({
+            method: 'GET',
+            url: '/api/me/practices/browse?limit=0',
+            headers: auth(aliceToken),
+        });
+        expect(zero.statusCode).toBe(400);
+        // A repeated ?limit= takes the last value (last-wins).
+        const repeated = await app.inject({
+            method: 'GET',
+            url: '/api/me/practices/browse?limit=300&limit=1',
+            headers: auth(aliceToken),
+        });
+        expect(repeated.statusCode).toBe(200);
+        expect(repeated.json().data.practices).toHaveLength(1);
+    });
+
     it('rejects an unknown scope filter with 400', async () => {
         const res = await app.inject({
             method: 'GET',
