@@ -36,6 +36,7 @@ import {registerRetrospectiveRoutes} from './dashboard/api/retrospectives';
 import {registerShowcaseRoutes} from './dashboard/api/showcase';
 import {registerShowcaseAdminRoutes} from './dashboard/api/showcase-admin';
 import {registerPracticeAuthoringRoutes} from './dashboard/api/practices';
+import {registerPracticeSurfaceRoutes} from './dashboard/api/practices-surface';
 import {registerDashboardStatic} from './dashboard/static';
 import {createSlackClient} from './slack/client';
 import {notifyNewAnomalies} from './anomaly/notify';
@@ -171,6 +172,12 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
     // (sanitized) preview, metric refs producing auto-surfacing tags, every save
     // routed through the 6.1.3 versioning primitive. No manager path.
     registerPracticeAuthoringRoutes(app, db);
+
+    // Contextual best-practice display (Task 6.2.7): /api/me, developer-scoped —
+    // GET the practices to surface next to a metric (viewer-scoped surfacing from
+    // 6.2.5/6.2.6, wrapped in encouraging copy) and POST a "viewed" usage event for
+    // a surfaced practice (feeds the 6.2.4 usage signal). Records only what was shown.
+    registerPracticeSurfaceRoutes(app, db);
 
     // Data-prompted surveys (Task 4.3): manager queue + developer self-service.
     // Survey delivery prefers the Slack bot when configured, with an email
