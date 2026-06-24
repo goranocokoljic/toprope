@@ -12,6 +12,9 @@ import {DeveloperDashboard} from './pages/DeveloperDashboard';
 import {MyTools} from './pages/MyTools';
 import {MyActivity} from './pages/MyActivity';
 import {MyCoaching} from './pages/MyCoaching';
+import {BestPractices} from './pages/BestPractices';
+import {BestPracticeDetail} from './pages/BestPracticeDetail';
+import {BestPracticeEditor} from './pages/BestPracticeEditor';
 import {TeamCoaching} from './pages/TeamCoaching';
 import {Preferences} from './pages/Preferences';
 import {Settings} from './pages/Settings';
@@ -58,6 +61,10 @@ export function App(): JSX.Element {
                 <Route path="developer/tools" element={<MyTools />} />
                 <Route path="developer/activity" element={<MyActivity />} />
                 <Route path="developer/coaching" element={<MyCoaching />} />
+                <Route path="developer/practices" element={<BestPractices />} />
+                <Route path="developer/practices/new" element={<BestPracticeEditor />} />
+                <Route path="developer/practices/:id" element={<BestPracticeDetail />} />
+                <Route path="developer/practices/:id/edit" element={<BestPracticeEditor />} />
                 <Route path="preferences" element={<Preferences />} />
                 <Route
                     path="settings"
