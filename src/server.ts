@@ -37,6 +37,7 @@ import {registerShowcaseRoutes} from './dashboard/api/showcase';
 import {registerShowcaseAdminRoutes} from './dashboard/api/showcase-admin';
 import {registerPracticeAuthoringRoutes} from './dashboard/api/practices';
 import {registerPracticeSurfaceRoutes} from './dashboard/api/practices-surface';
+import {registerPracticeBrowseRoutes} from './dashboard/api/practices-browse';
 import {registerDashboardStatic} from './dashboard/static';
 import {createSlackClient} from './slack/client';
 import {notifyNewAnomalies} from './anomaly/notify';
@@ -178,6 +179,13 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
     // 6.2.5/6.2.6, wrapped in encouraging copy) and POST a "viewed" usage event for
     // a surfaced practice (feeds the 6.2.4 usage signal). Records only what was shown.
     registerPracticeSurfaceRoutes(app, db);
+
+    // Best-practice browse UI (Task 6.2.8): /api/me, developer-scoped — the
+    // non-contextual discovery path. List/search published practices the viewer may
+    // see (6.1.5 search + 6.1.4 scope), read one in full (rendered content + feedback +
+    // history access + model-aware create/edit gates + showcase cross-links), and
+    // toggle helpful/not-helpful feedback (6.2.4). Every read/write is viewer-scoped.
+    registerPracticeBrowseRoutes(app, db);
 
     // Data-prompted surveys (Task 4.3): manager queue + developer self-service.
     // Survey delivery prefers the Slack bot when configured, with an email

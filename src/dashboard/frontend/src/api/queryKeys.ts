@@ -82,4 +82,10 @@ export const queryKeys = {
     // Contextual best-practice display (Task 6.2.7): the practices surfaced next to
     // one metric, keyed by metric so each metric's affordance caches independently.
     relatedPractices: (metric: string) => ['practices', 'related', metric] as const,
+    // Best-practice browse UI (Task 6.2.8): the searchable library. The list is keyed
+    // by a serialized filter signature so each query/tag/team/scope combination caches
+    // independently; detail and history are keyed by practice id.
+    practicesBrowse: (filterKey: string) => ['practices', 'browse', filterKey] as const,
+    practiceDetail: (id: string) => ['practices', 'detail', id] as const,
+    practiceHistory: (id: string) => ['practices', 'history', id] as const,
 };
