@@ -30,6 +30,7 @@ import {
 import type {Contribution} from '../contributions/types';
 import {getContribution} from '../contributions/store';
 import {getFeedbackCounts, getPracticeDetails, setPracticeEndorsed} from './store';
+import {feedbackRankScore, helpfulRatio} from './feedback';
 import {
     gateForModel,
     modelRequiresLeadToPublish,
@@ -256,19 +257,32 @@ export interface RankedPractice {
     helpful: number;
     notHelpful: number;
     /**
-     * Net feedback score (`helpful - notHelpful`) — a deliberately lightweight,
-     * directional signal for Phase 6. The richer helpful-ratio + usage-signal blend
-     * is 6.2.4's job; this is enough to demonstrate feedback ordering.
+     * Net feedback tally (`helpful - notHelpful`). Retained as a human-readable
+     * figure; it is NO LONGER the sort key — the pool ranks on {@link rankScore}
+     * (the confidence-adjusted helpful-ratio) so a small loud minority can't outrank
+     * a broadly-helpful practice on raw net alone.
      */
     score: number;
+    /**
+     * The RAW helpful-ratio (`helpful / total`) in [0, 1] for display, or null when
+     * the practice has no feedback yet. Not the sort key — see {@link rankScore}.
+     */
+    helpfulRatio: number | null;
+    /**
+     * The value the pool sorts on for bottom-up / hybrid (6.2.4): the confidence-
+     * adjusted helpful-ratio (Wilson lower bound over helpful / total). Higher ranks
+     * earlier; a no-feedback practice scores 0.
+     */
+    rankScore: number;
     createdAt: string;
 }
 
 /**
  * Order a set of practices into the pool the active model presents.
  *
- *   * bottom_up → ranked purely by feedback: higher net score first, then more
- *     total feedback, then most recent.
+ *   * bottom_up → ranked purely by feedback: higher helpful-ratio first (the
+ *     confidence-adjusted {@link RankedPractice.rankScore}), then more total
+ *     feedback, then most recent.
  *   * hybrid → endorsed practices ELEVATED above un-endorsed ones, and within each
  *     group the same feedback ordering as bottom_up.
  *   * top_down → leads curate what is published, so there is no algorithmic
@@ -300,13 +314,15 @@ export function orderPracticePool(
             helpful: counts.helpful,
             notHelpful: counts.notHelpful,
             score: counts.helpful - counts.notHelpful,
+            helpfulRatio: helpfulRatio(counts),
+            rankScore: feedbackRankScore(counts),
             createdAt: contribution.createdAt,
         });
     }
 
     const byFeedback = (a: RankedPractice, b: RankedPractice): number => {
-        if (a.score !== b.score) {
-            return b.score - a.score;
+        if (a.rankScore !== b.rankScore) {
+            return b.rankScore - a.rankScore; // higher helpful-ratio first
         }
         const aTotal = a.helpful + a.notHelpful;
         const bTotal = b.helpful + b.notHelpful;

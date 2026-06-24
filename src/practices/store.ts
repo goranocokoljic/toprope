@@ -280,6 +280,20 @@ export function recordFeedback(db: Database.Database, input: NewFeedback): Pract
     return stored;
 }
 
+/**
+ * Clear a developer's current feedback on a practice — the "toggle off" half of the
+ * togglable signal (6.2.4). Deletes the at-most-one current row for
+ * (contribution_id, developer_id); returns true when a row was actually removed,
+ * false when the developer had no current signal. Idempotent: clearing a signal
+ * that isn't there is a no-op, not an error.
+ */
+export function removeFeedback(db: Database.Database, contributionId: string, developerId: string): boolean {
+    const res = db
+        .prepare('DELETE FROM practice_feedback WHERE contribution_id = ? AND developer_id = ?')
+        .run(contributionId, developerId);
+    return res.changes > 0;
+}
+
 /** One developer's current feedback on a practice, or undefined when none exists. */
 export function getFeedback(
     db: Database.Database,
