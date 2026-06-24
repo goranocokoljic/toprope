@@ -231,11 +231,90 @@ describe('tag-based auto-surfacing (Task 6.2.5 / #160)', () => {
             expect(ids(surfacePractices(db, {metric: 'churn', viewerTeam: TEAM}))).toEqual([p]);
         });
 
-        // TST-2: 6.2.5 RESPECTS suppressions but does not yet force-surface pins —
-        // a pin on an UNTAGGED practice must not pull it in (that merge is 6.2.6).
-        it('does not force-surface a pinned-but-untagged practice (pin force-surface is 6.2.6)', () => {
+    });
+
+    // --- Pin force-surface + merge (6.2.6 / #161) --------------------------
+
+    describe('pin force-surface (6.2.6)', () => {
+        it('force-surfaces a pinned-but-untagged practice at the metric', () => {
             const untagged = make(db, 'Pinned but untagged', {tags: []});
             addMetricPin(db, {contributionId: untagged, metric: 'churn', action: 'pin', actorId: 'lead', createdAt: T1});
+            const surfaced = surfacePractices(db, {metric: 'churn', viewerTeam: TEAM});
+            expect(ids(surfaced)).toEqual([untagged]);
+            expect(surfaced[0].pinned).toBe(true);
+        });
+
+        it('a pin is metric-specific — it does not force the practice onto a different metric', () => {
+            const untagged = make(db, 'Pinned to churn only', {tags: []});
+            addMetricPin(db, {contributionId: untagged, metric: 'churn', action: 'pin', actorId: 'lead', createdAt: T1});
+            expect(ids(surfacePractices(db, {metric: 'churn', viewerTeam: TEAM}))).toEqual([untagged]);
+            expect(surfacePractices(db, {metric: 'acceptance_rate', viewerTeam: TEAM})).toEqual([]);
+        });
+
+        it('elevates a pinned practice above an auto-surfaced (tag-matched) one', () => {
+            // bottom_up so feedback would otherwise place the tag-matched one first.
+            useModel(db, TEAM, 'bottom_up');
+            const tagged = make(db, 'Auto-surfaced popular', {tags: ['churn'], ts: T2});
+            const pinned = make(db, 'Pinned untagged', {tags: [], ts: T1});
+            vote(db, tagged, 20, 0); // strong feedback — would top the pool on merit
+            addMetricPin(db, {contributionId: pinned, metric: 'churn', action: 'pin', actorId: 'lead', createdAt: T1});
+            const surfaced = surfacePractices(db, {metric: 'churn', viewerTeam: TEAM});
+            expect(ids(surfaced)).toEqual([pinned, tagged]); // pinned elevated despite weaker signals
+            expect(surfaced[0].pinned).toBe(true);
+            expect(surfaced[1].pinned).toBe(false);
+        });
+
+        it('a tag-matched practice that is also pinned is flagged pinned and elevated', () => {
+            useModel(db, TEAM, 'bottom_up');
+            const plainTagged = make(db, 'Just tagged', {tags: ['churn'], ts: T2});
+            const taggedAndPinned = make(db, 'Tagged and pinned', {tags: ['churn'], ts: T1});
+            vote(db, plainTagged, 20, 0); // stronger feedback
+            addMetricPin(db, {
+                contributionId: taggedAndPinned,
+                metric: 'churn',
+                action: 'pin',
+                actorId: 'lead',
+                createdAt: T1,
+            });
+            const surfaced = surfacePractices(db, {metric: 'churn', viewerTeam: TEAM});
+            expect(ids(surfaced)).toEqual([taggedAndPinned, plainTagged]);
+            expect(surfaced[0].pinned).toBe(true);
+            expect(surfaced[1].pinned).toBe(false);
+        });
+
+        it('does NOT force-surface a pinned practice that is not published', () => {
+            const draft = make(db, 'Pinned draft', {tags: [], state: 'draft'});
+            addMetricPin(db, {contributionId: draft, metric: 'churn', action: 'pin', actorId: 'lead', createdAt: T1});
+            expect(surfacePractices(db, {metric: 'churn', viewerTeam: TEAM})).toEqual([]);
+        });
+
+        it('a pin cannot leak a practice past the viewer scope — a team-pinned practice stays hidden from another team', () => {
+            const teamOnly = make(db, 'Eng-only pinned', {tags: [], scope: 'team', scopeTarget: TEAM});
+            addMetricPin(db, {contributionId: teamOnly, metric: 'churn', action: 'pin', actorId: 'lead', createdAt: T1});
+            // The owning team sees the forced practice; another team never does.
+            expect(ids(surfacePractices(db, {metric: 'churn', viewerTeam: TEAM}))).toEqual([teamOnly]);
+            expect(surfacePractices(db, {metric: 'churn', viewerTeam: OTHER_TEAM})).toEqual([]);
+        });
+
+        it('a pin does not override a per-team hide of an org practice (hides honored)', () => {
+            const org = make(db, 'Org pinned', {tags: [], scope: 'org'});
+            addMetricPin(db, {contributionId: org, metric: 'churn', action: 'pin', actorId: 'lead', createdAt: T1});
+            hideOrgItemForTeam(db, {contributionId: org, team: TEAM, actorId: 'alice', permitted: true});
+            expect(surfacePractices(db, {metric: 'churn', viewerTeam: TEAM})).toEqual([]);
+            // Another team that did not hide it still gets the forced practice.
+            expect(ids(surfacePractices(db, {metric: 'churn', viewerTeam: OTHER_TEAM}))).toEqual([org]);
+        });
+
+        it('a suppress recorded after a pin wins — the practice is neither force-surfaced nor flagged', () => {
+            const untagged = make(db, 'Pinned then suppressed', {tags: []});
+            addMetricPin(db, {contributionId: untagged, metric: 'churn', action: 'pin', actorId: 'lead', createdAt: T1});
+            addMetricPin(db, {
+                contributionId: untagged,
+                metric: 'churn',
+                action: 'suppress',
+                actorId: 'lead',
+                createdAt: T2,
+            });
             expect(surfacePractices(db, {metric: 'churn', viewerTeam: TEAM})).toEqual([]);
         });
     });
