@@ -35,7 +35,8 @@
 
 import type Database from 'better-sqlite3';
 import {searchContributions} from '../contributions/search';
-import {getContributionTags} from '../contributions/store';
+import {resolveVisibleForViewer} from '../contributions/scope';
+import {getContribution, getContributionTags} from '../contributions/store';
 import {getVersionHistory} from '../contributions/versioning';
 import type {Contribution, ContributionScope, ContributionState} from '../contributions/types';
 import {getDeveloperById} from '../registry/developers';
@@ -55,11 +56,14 @@ export interface PracticeBrowseFilters {
     /**
      * The "team" filter: a team name narrows to that team's team-scoped practices.
      * Maps to the spine's `scope_target`; it can only NARROW within the viewer's scope,
-     * never widen it (the scope tail still runs).
+     * never widen it (the scope tail still runs, so a foreign team resolves to an empty
+     * set rather than a leak).
      */
-    team?: string | null;
+    team?: string;
     /** The "scope" filter: `org` or `team`. */
     scope?: ContributionScope;
+    /** Cap the number of results (applied after scope resolution). Omit for no cap. */
+    limit?: number;
 }
 
 /** A practice's feedback signals, summarised for display. */
@@ -183,9 +187,13 @@ export function browsePractices(
             state: 'published',
             scope: filters.scope,
             // `team` selects team-scoped rows for that team; left undefined it does not filter.
-            scopeTarget: filters.team ?? undefined,
+            scopeTarget: filters.team,
         },
         viewerTeam,
+        // Bound the unbounded discovery surface: the cap is applied AFTER scope
+        // resolution by the search primitive, so a capped page is never silently
+        // shrunk by out-of-scope rows that were going to be dropped anyway.
+        limit: filters.limit,
     });
 
     const authorName = makeAuthorNameResolver(db);
@@ -210,19 +218,29 @@ export function browsePractices(
  * this surface's visibility rule: it returns undefined (→ 404) for a missing id, a
  * non-practice, a non-published practice, AND a practice outside the viewer's scope —
  * the same uniform "you cannot see this" the owner-scoped editor gives, so the response
- * never reveals which of those it was. Reuses {@link searchContributions} so the scope
- * tail is identical to the list and to surfacing.
+ * never reveals which of those it was.
+ *
+ * A point read: fetch the one contribution, reject it on content-type/lifecycle, then
+ * run THAT single row through {@link resolveVisibleForViewer} — the exact 6.1.4 scope
+ * tail the list and surfacing use (incl. per-team hides), mirroring how
+ * `surfacePractices` scope-checks a force-surfaced pin. So the visibility guarantee is
+ * identical to the list while the cost is O(1), not a scan of every visible practice.
  */
 function loadVisiblePractice(
     db: Database.Database,
     viewerTeam: string | null | undefined,
     id: string,
 ): Contribution | undefined {
-    const [hit] = searchContributions(db, {
-        filters: {contentType: PRACTICE_CONTENT_TYPE, state: 'published'},
-        viewerTeam,
-    }).filter((h) => h.contribution.id === id);
-    return hit?.contribution;
+    const contribution = getContribution(db, id);
+    if (
+        !contribution ||
+        contribution.contentType !== PRACTICE_CONTENT_TYPE ||
+        contribution.state !== 'published'
+    ) {
+        return undefined;
+    }
+    const [visible] = resolveVisibleForViewer(db, [contribution], viewerTeam);
+    return visible;
 }
 
 /**

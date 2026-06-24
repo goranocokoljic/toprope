@@ -65,6 +65,9 @@ let historyData: PracticeHistoryEntry[];
 let browseUrls: string[];
 let feedbackPosts: {id: string; signal: string}[];
 let createPosts: {title: string; scope: string; markdown: string}[];
+let savePosts: {id: string; markdown: string}[];
+let ownedData: {contributionId: string; title: string; state: string; currentVersion: number; markdown: string; html: string; metrics: string[]};
+let ownedStatus: number;
 let fetchMock: Mock;
 
 function json(body: unknown, status = 200): Response {
@@ -86,6 +89,17 @@ beforeEach(() => {
     browseUrls = [];
     feedbackPosts = [];
     createPosts = [];
+    savePosts = [];
+    ownedData = {
+        contributionId: 'p1',
+        title: 'Review AI suggestions',
+        state: 'published',
+        currentVersion: 1,
+        markdown: 'Original markdown content',
+        html: '<p>Original markdown content</p>',
+        metrics: ['churn'],
+    };
+    ownedStatus = 200;
 
     fetchMock = vi.fn(async (url: unknown, init?: RequestInit) => {
         const u = String(url);
@@ -116,6 +130,21 @@ beforeEach(() => {
             const body = JSON.parse(String(init?.body ?? '{}')) as {title: string; scope: string; markdown: string};
             createPosts.push(body);
             return json({data: {contribution: {id: 'new1', title: body.title, scope: body.scope, scopeTarget: null, state: 'draft'}, metrics: []}}, 201);
+        }
+        const saveMatch = u.match(/\/api\/me\/practices\/([^/]+)\/save$/);
+        if (saveMatch && method === 'POST') {
+            const body = JSON.parse(String(init?.body ?? '{}')) as {markdown: string};
+            savePosts.push({id: decodeURIComponent(saveMatch[1]), markdown: body.markdown});
+            return json({data: {version: {version: 2}, metrics: []}});
+        }
+        // Owner-scoped GET of one of the developer's OWN practices (the editor's edit load).
+        // Reached only after the /browse handlers above, so it never catches a browse URL.
+        const ownedMatch = u.match(/\/api\/me\/practices\/([^/?]+)$/);
+        if (ownedMatch && method === 'GET') {
+            if (ownedStatus >= 400) {
+                return json({error: 'Not Found'}, ownedStatus);
+            }
+            return json({data: ownedData});
         }
         return json({error: 'unexpected', url: u}, 500);
     });
@@ -174,6 +203,12 @@ describe('Best-practice browse list (Task 6.2.8 / #163)', () => {
         listPractices = [];
         renderAt('/developer/practices');
         expect(await screen.findByText('No best practices yet')).toBeInTheDocument();
+    });
+
+    it('falls back to “Unknown author” when the author record is gone (edge case)', async () => {
+        listPractices = [summary({authorName: null})];
+        renderAt('/developer/practices');
+        expect(await screen.findByText('Unknown author')).toBeInTheDocument();
     });
 });
 
@@ -252,5 +287,23 @@ describe('Best-practice editor (Task 6.2.8 / #163)', () => {
         );
         // The confirmation keeps the model framing honest (saved as a draft).
         expect(await screen.findByTestId('create-confirmation')).toHaveTextContent(/draft/i);
+    });
+
+    it('loads the author’s own practice and saves an edit (AC3, edit path)', async () => {
+        renderAt('/developer/practices/p1/edit');
+        // Seeded from the owner-scoped load; the title field is not editable on edit.
+        const textarea = (await screen.findByPlaceholderText('Write the practice in Markdown…')) as HTMLTextAreaElement;
+        expect(textarea.value).toBe('Original markdown content');
+
+        fireEvent.change(textarea, {target: {value: 'Updated content'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Save changes'}));
+
+        await waitFor(() => expect(savePosts).toEqual([{id: 'p1', markdown: 'Updated content'}]));
+    });
+
+    it('shows an owner-only error when the practice cannot be opened for editing (AC3, permissions)', async () => {
+        ownedStatus = 404; // not the author's own practice
+        renderAt('/developer/practices/p1/edit');
+        expect(await screen.findByText(/only edit practices you authored/i)).toBeInTheDocument();
     });
 });

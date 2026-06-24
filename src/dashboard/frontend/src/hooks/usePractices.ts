@@ -81,7 +81,9 @@ export function useTogglePracticeFeedback(
         mutationFn: (signal: PracticeFeedbackSignal) => api.togglePracticeFeedback(id, signal),
         onSuccess: (result) => {
             queryClient.setQueryData<BrowsePracticeDetail>(queryKeys.practiceDetail(id), (prev) =>
-                prev
+                // Guard the id: only patch counts onto the detail this mutation is for,
+                // so a stale/foreign cached entry can never receive another practice's tally.
+                prev && prev.id === id
                     ? {...prev, feedback: {...result.feedback, viewerSignal: result.signal}}
                     : prev,
             );

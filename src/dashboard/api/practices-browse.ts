@@ -44,6 +44,12 @@ import {
 
 const FEEDBACK_KEYS = ['signal'] as const;
 
+/** Default page size for the browse list — bounds the discovery surface so it never ships the whole library. */
+const DEFAULT_BROWSE_LIMIT = 50;
+
+/** Hard ceiling on the browse page size, so a caller can't request an unbounded list. */
+const MAX_BROWSE_LIMIT = 200;
+
 /** The viewer's team, resolved server-side from their developer record. Null when teamless. */
 function viewerTeamOf(db: Database.Database, developerId: string): string | null {
     return getDeveloperById(db, developerId)?.team ?? null;
@@ -66,6 +72,24 @@ function parseScopeFilter(value: unknown, reply: FastifyReply): ContributionScop
     return raw;
 }
 
+/**
+ * Parse the optional `limit` query param: absent → the default; a positive integer
+ * within the ceiling → itself; anything else → 400 (returns false). Keeps the browse
+ * page bounded so a caller can't request an unbounded or nonsensical size.
+ */
+function parseLimit(value: unknown, reply: FastifyReply): number | false {
+    if (value === undefined) {
+        return DEFAULT_BROWSE_LIMIT;
+    }
+    const raw = Array.isArray(value) ? value[value.length - 1] : value;
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 1 || n > MAX_BROWSE_LIMIT) {
+        badRequest(reply, `limit must be an integer between 1 and ${MAX_BROWSE_LIMIT}`);
+        return false;
+    }
+    return n;
+}
+
 export function registerPracticeBrowseRoutes(app: FastifyInstance, db: Database.Database): void {
     /**
      * Browse / search the published best practices the viewer may see. Query:
@@ -73,7 +97,7 @@ export function registerPracticeBrowseRoutes(app: FastifyInstance, db: Database.
      * viewer-team's active contribution model (so the contribute entry point can
      * explain what publishing means for the team). An empty list is a normal result.
      */
-    app.get<{Querystring: {q?: string; tag?: string; team?: string; scope?: string}}>(
+    app.get<{Querystring: {q?: string; tag?: string; team?: string; scope?: string; limit?: string}}>(
         '/api/me/practices/browse',
         async (request, reply) => {
             const developerId = requireDeveloperId(request, reply);
@@ -84,12 +108,17 @@ export function registerPracticeBrowseRoutes(app: FastifyInstance, db: Database.
             if (scope === false) {
                 return reply;
             }
+            const limit = parseLimit(request.query.limit, reply);
+            if (limit === false) {
+                return reply;
+            }
             const viewerTeam = viewerTeamOf(db, developerId);
             const filters: PracticeBrowseFilters = {
                 text: optionalQueryString(request.query.q),
                 tag: optionalQueryString(request.query.tag),
                 team: optionalQueryString(request.query.team),
                 scope,
+                limit,
             };
             return {
                 data: {

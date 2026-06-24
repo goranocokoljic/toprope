@@ -147,6 +147,42 @@ describe('Best-practice browse API (Task 6.2.8 / #163)', () => {
         expect(res.json().data.practices.map((p: {title: string}) => p.title)).toEqual(['Review AI suggestions']);
     });
 
+    it('the team filter narrows the list and cannot widen past the viewer scope', async () => {
+        make(db, 'Eng tip', {scope: 'team', scopeTarget: 'eng'});
+        make(db, 'Data tip', {scope: 'team', scopeTarget: 'data', authorId: 'bob'});
+        const own = await app.inject({
+            method: 'GET',
+            url: '/api/me/practices/browse?team=eng',
+            headers: auth(aliceToken),
+        });
+        expect(own.json().data.practices.map((p: {title: string}) => p.title)).toEqual(['Eng tip']);
+        // Alice (eng) filtering by data's team cannot surface data's practice.
+        const foreign = await app.inject({
+            method: 'GET',
+            url: '/api/me/practices/browse?team=data',
+            headers: auth(aliceToken),
+        });
+        expect(foreign.json().data.practices).toEqual([]);
+    });
+
+    it('caps the result set with the limit param and rejects a bad limit', async () => {
+        make(db, 'Tip A', {});
+        make(db, 'Tip B', {});
+        make(db, 'Tip C', {});
+        const capped = await app.inject({
+            method: 'GET',
+            url: '/api/me/practices/browse?limit=2',
+            headers: auth(aliceToken),
+        });
+        expect(capped.json().data.practices).toHaveLength(2);
+        const bad = await app.inject({
+            method: 'GET',
+            url: '/api/me/practices/browse?limit=abc',
+            headers: auth(aliceToken),
+        });
+        expect(bad.statusCode).toBe(400);
+    });
+
     it('rejects an unknown scope filter with 400', async () => {
         const res = await app.inject({
             method: 'GET',

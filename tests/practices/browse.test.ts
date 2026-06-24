@@ -134,6 +134,24 @@ describe('Best-practice browse service (Task 6.2.8 / #163)', () => {
         expect(rows.map((r) => r.title)).toEqual(['Org churn']);
     });
 
+    it('the team filter narrows within scope and can never widen past it', () => {
+        make(db, 'Eng tip', {scope: 'team', scopeTarget: 'eng'});
+        make(db, 'Data tip', {scope: 'team', scopeTarget: 'data'});
+        // An eng viewer filtering by their own team sees only the eng practice.
+        expect(browsePractices(db, 'eng', {team: 'eng'}).map((r) => r.title)).toEqual(['Eng tip']);
+        // Filtering by a team the viewer is not on cannot surface that team's practice —
+        // the scope tail removes it, so the filter narrows to an empty set, never a leak.
+        expect(browsePractices(db, 'eng', {team: 'data'})).toEqual([]);
+    });
+
+    it('caps the result set when a limit is given', () => {
+        make(db, 'Tip A', {});
+        make(db, 'Tip B', {});
+        make(db, 'Tip C', {});
+        expect(browsePractices(db, 'eng', {limit: 2})).toHaveLength(2);
+        expect(browsePractices(db, 'eng')).toHaveLength(3);
+    });
+
     it('never surfaces a team-scoped practice to another team (scope enforcement)', () => {
         make(db, 'Eng-only tip', {scope: 'team', scopeTarget: 'eng'});
         expect(browsePractices(db, 'eng').map((r) => r.title)).toEqual(['Eng-only tip']);
