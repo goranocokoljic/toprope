@@ -159,6 +159,17 @@ describe('practices store (#156)', () => {
             expect(listMetricPins(db)).toHaveLength(2);
         });
 
+        it('breaks created_at ties by insertion order (rowid), so the last write is listed first', () => {
+            // Two overrides written in the SAME instant (a lead double-clicking). The
+            // current decision is the one inserted LAST — the surfacing reduction (6.2.5)
+            // takes the first-listed row, so this must be the later insert, deterministically.
+            // The id is a random UUID; only the rowid tiebreak makes this reliable.
+            const first = addMetricPin(db, {contributionId: 'c1', metric: 'churn', action: 'pin', actorId: 'a', createdAt: T1});
+            const second = addMetricPin(db, {contributionId: 'c1', metric: 'churn', action: 'suppress', actorId: 'a', createdAt: T1});
+            const listed = listMetricPins(db, {contributionId: 'c1', metric: 'churn'});
+            expect(listed.map((p) => p.id)).toEqual([second.id, first.id]);
+        });
+
         it('removes a pin by id', () => {
             const pin = addMetricPin(db, {contributionId: 'c1', metric: 'churn', action: 'pin', actorId: 'a'});
             expect(removeMetricPin(db, pin.id)).toBe(true);

@@ -219,6 +219,13 @@ export function addMetricPin(db: Database.Database, input: NewMetricPin): Metric
  * List metric pins, newest first, narrowed by any combination of the optional
  * filters. Every filter binds via `?` (values only), and an omitted filter isn't
  * applied — passing `{}` lists everything.
+ *
+ * Ties on `created_at` break by `rowid DESC` — insertion order — NOT by `id`, which
+ * is a random UUID and would order same-instant rows arbitrarily. The surfacing
+ * reduction (6.2.5) reads these newest-first to take the CURRENT decision per
+ * (contribution, metric), so two overrides written in the same millisecond (a lead
+ * double-clicking, a reset-then-set flow) must resolve to the one actually written
+ * last. Mirrors `listUsageEvents`'s `rowid` tiebreak on this same table family.
  */
 export function listMetricPins(db: Database.Database, filters: MetricPinFilters = {}): MetricPin[] {
     const clauses: string[] = [];
@@ -237,7 +244,7 @@ export function listMetricPins(db: Database.Database, filters: MetricPinFilters 
     }
     const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
     const rows = db
-        .prepare(`SELECT * FROM practice_metric_pins ${where} ORDER BY created_at DESC, id DESC`)
+        .prepare(`SELECT * FROM practice_metric_pins ${where} ORDER BY created_at DESC, rowid DESC`)
         .all(...params) as MetricPinRow[];
     return rows.map(rowToPin);
 }
