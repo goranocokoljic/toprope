@@ -50,3 +50,22 @@ const PRACTICE_METRIC_SET: ReadonlySet<string> = new Set(PRACTICE_METRICS);
 export function isPracticeMetric(value: string): value is PracticeMetric {
     return PRACTICE_METRIC_SET.has(value);
 }
+
+/**
+ * Human-readable, plain-language label for each metric — the single home for how a
+ * metric is named to a person. Both the usage-signal headline (6.2.4) and the
+ * contextual-display affordance (6.2.7) render a metric to the viewer, so the names
+ * live here once rather than drifting between two surfaces.
+ */
+export const PRACTICE_METRIC_LABELS: Record<PracticeMetric, string> = {
+    churn: 'code churn',
+    cost_per_pr: 'cost per PR',
+    estimated_cost: 'estimated cost',
+    acceptance_rate: 'acceptance rate',
+    ai_signature_score: 'AI-signature score',
+};
+
+/** The plain-language label for a known practice metric. */
+export function practiceMetricLabel(metric: PracticeMetric): string {
+    return PRACTICE_METRIC_LABELS[metric];
+}

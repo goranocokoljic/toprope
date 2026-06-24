@@ -79,4 +79,7 @@ export const queryKeys = {
     // Expense reconciliation (Task 4.4): keyed by status so switching the filter
     // refetches the right slice of the queue.
     adminReconciliation: (status: string) => ['admin', 'reconciliation', status] as const,
+    // Contextual best-practice display (Task 6.2.7): the practices surfaced next to
+    // one metric, keyed by metric so each metric's affordance caches independently.
+    relatedPractices: (metric: string) => ['practices', 'related', metric] as const,
 };

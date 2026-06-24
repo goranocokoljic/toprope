@@ -30,7 +30,7 @@ import type Database from 'better-sqlite3';
 import {computePeriodMetrics, type DataQuality, type PeriodMetrics} from '../aggregation/compute';
 import {addDays} from '../aggregation/dates';
 import {listUsageEvents} from './store';
-import {isPracticeMetric, type PracticeMetric} from './metrics';
+import {isPracticeMetric, PRACTICE_METRIC_LABELS, type PracticeMetric} from './metrics';
 import type {UsageEventType} from './types';
 
 /** YYYY-MM-DD — the day form the snapshot windows are keyed on. */
@@ -73,15 +73,6 @@ const METRIC_IMPROVES_DOWNWARD: Record<PracticeMetric, boolean> = {
     estimated_cost: true, // lower spend is better
     acceptance_rate: false, // higher acceptance is better
     ai_signature_score: false, // more AI-signature (adoption) reads as better here
-};
-
-/** Human-readable metric labels for the directional headline. */
-const METRIC_LABELS: Record<PracticeMetric, string> = {
-    churn: 'code churn',
-    cost_per_pr: 'cost per PR',
-    estimated_cost: 'estimated cost',
-    acceptance_rate: 'acceptance rate',
-    ai_signature_score: 'AI-signature score',
 };
 
 /** Pull the comparable value for a metric out of a computed period's metrics. */
@@ -295,7 +286,7 @@ export function analyzeUsageSignal(
     }
 
     const improvedShare = improved / sampleSize;
-    const label = METRIC_LABELS[metric];
+    const label = PRACTICE_METRIC_LABELS[metric];
     const headline = `Among ${sampleSize} developers who engaged with this practice, ${improved} saw their ${label} improve afterward.`;
     return {
         contributionId,

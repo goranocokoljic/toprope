@@ -47,6 +47,7 @@ import type {
     UserPreferences,
     CoachingPreferences,
     CoachingPreferencesPatch,
+    RelatedPractices,
     WasteAlert,
     WasteResolutionReason,
     WasteTeamSummary,
@@ -717,5 +718,34 @@ export const api = {
             patch,
         );
         return body.data;
+    },
+
+    // --- Contextual best-practice display (Task 6.2.7) ---
+    /**
+     * Best practices to surface next to a metric for the logged-in developer.
+     * Viewer-scoped server-side (the developer's own team); returns the ranked set
+     * plus the encouraging intro copy. An empty list is a normal result.
+     */
+    async getRelatedPractices(metric: string, limit?: number): Promise<RelatedPractices> {
+        const search = new URLSearchParams({metric});
+        if (limit !== undefined) {
+            search.set('limit', String(limit));
+        }
+        const body = await request<ApiEnvelope<RelatedPractices>>(
+            `/api/me/practices/related?${search.toString()}`,
+        );
+        return body.data;
+    },
+
+    /**
+     * Record that the developer viewed a surfaced practice next to a metric (feeds
+     * the 6.2.4 usage signal). Server gates this on the practice actually being
+     * surfaced to the viewer for that metric.
+     */
+    async recordPracticeView(id: string, metric: string): Promise<void> {
+        await postJson<ApiEnvelope<unknown>>(
+            `/api/me/practices/${encodeURIComponent(id)}/view`,
+            {metric},
+        );
     },
 };

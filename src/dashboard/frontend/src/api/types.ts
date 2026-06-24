@@ -1115,3 +1115,33 @@ export interface SummaryDetail extends SummaryListItem {
     summary_text: string;
     input_hash: string | null;
 }
+
+// --- Contextual best-practice display (Task 6.2.7 / #162) ------------------
+
+/**
+ * One best practice surfaced next to a metric. The viewer-safe projection the
+ * `/api/me/practices/related` endpoint returns — no author or raw feedback rows,
+ * just what the unobtrusive affordance needs to render and link.
+ */
+export interface RelatedPractice {
+    id: string;
+    title: string;
+    scope: string;
+    /** True when a lead pinned this practice to the metric (6.2.6). */
+    pinned: boolean;
+    /** Lead-endorsement flag (hybrid model). */
+    endorsed: boolean;
+    /** Raw helpful-ratio in [0,1] for a "found helpful" hint, or null when no feedback yet. */
+    helpfulRatio: number | null;
+}
+
+/**
+ * The practices to surface next to one metric, with the encouraging intro copy.
+ * From GET /api/me/practices/related?metric=<m>.
+ */
+export interface RelatedPractices {
+    metric: string;
+    /** Encouraging, reviewed framing ("here are a few practices that may help with…"). */
+    intro: string;
+    practices: RelatedPractice[];
+}
