@@ -7,6 +7,7 @@ import {TrendChart, type ChartDatum} from '../charts/TrendChart';
 import {SkeletonChart, SkeletonStatCard} from '../components/Skeleton';
 import {ErrorState} from '../components/ErrorState';
 import {StatePanel} from '../components/StatePanel';
+import {RelatedPractices} from '../components/RelatedPractices';
 import {providerLabel} from '../components/toolLabels';
 import {formatCount, formatPercent, formatDateTick} from '../components/format';
 import {earliestJourneyStart} from '../components/meHelpers';
@@ -55,6 +56,8 @@ function ChurnExplainer({churn}: {churn: number | null}): JSX.Element {
                 be a hint to review changes a little more before committing. This is a rough indicator,
                 not a precise figure.
             </p>
+            {/* Contextual best practices surfaced right next to the churn metric (6.2.7). */}
+            <RelatedPractices metric="churn" />
         </Card>
     );
 }
