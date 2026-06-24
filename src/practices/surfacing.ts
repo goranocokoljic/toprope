@@ -26,10 +26,14 @@
  *      recency under top_down. "Endorsed/helpful first" falls straight out of reusing
  *      that one ranking, so surfacing order and pool order can never drift apart.
  *
- * Scope boundary with 6.2.6 (#161): this task RESPECTS suppressions but does not yet
- * force-surface PINNED-but-untagged practices — that "pin forces surfacing" merge is
- * 6.2.6's deliverable. The reduction here already returns the `pinned` set so 6.2.6
- * can plug it in without re-deriving the current-decision logic.
+ * Manual override merge (6.2.6 / #161): a lead's PIN force-surfaces a practice at a
+ * metric even when it is not tagged with it, and a SUPPRESS removes an auto-surfaced
+ * one. Both decisions come from {@link resolveCurrentMetricOverrides}. The merge
+ * stays inside the same scope/published guarantees as auto-surfacing — a pinned
+ * practice is force-surfaced ONLY if it is published and the viewer could already see
+ * it, so a pin can never leak a practice past the viewer's scope — and pinned
+ * practices are elevated above the auto-surfaced ones (lead precision wins placement),
+ * model-ordered within each group.
  *
  * Pure composition over a single writer: every DB read goes through the existing
  * stores, so this module holds no SQL of its own and inherits their concurrency
@@ -38,6 +42,8 @@
 
 import type Database from 'better-sqlite3';
 import {searchContributions} from '../contributions/search';
+import {resolveVisibleForViewer} from '../contributions/scope';
+import {getContribution} from '../contributions/store';
 import type {Contribution} from '../contributions/types';
 import {PRACTICE_CONTENT_TYPE} from './authoring';
 import {resolveContributionModel} from './contributionModel';
@@ -96,6 +102,12 @@ export interface SurfacedPractice {
     contribution: Contribution;
     /** Its place + signals in the model-ordered pool (endorsed flag, feedback counts, rank score). */
     ranking: RankedPractice;
+    /**
+     * Whether a lead PINNED this practice to the metric (6.2.6). Pinned practices are
+     * force-surfaced (even when untagged) and listed above the auto-surfaced ones; the
+     * flag rides along so the display (6.2.7) can mark a lead's deliberate choice.
+     */
+    pinned: boolean;
 }
 
 /** What to surface, and for whom. */
@@ -126,8 +138,14 @@ export interface SurfacePracticesInput {
  *   1. Candidates = published `best_practice` contributions tagged with the metric,
  *      already scope-resolved by {@link searchContributions} (6.1.5 → 6.1.4).
  *   2. Drop any whose CURRENT override decision for the metric is `suppress`.
- *   3. Order with {@link orderPracticePool} under the resolved model (endorsed/helpful
- *      first where the model uses them; recency under top_down).
+ *   3. Force-surface PINNED practices (6.2.6) not already in the candidate set —
+ *      including untagged ones — after putting them through the SAME published +
+ *      viewer-scope guarantees as the tag-matched candidates, so a pin can never widen
+ *      what the viewer may see.
+ *   4. Order with {@link orderPracticePool} under the resolved model (endorsed/helpful
+ *      first where the model uses them; recency under top_down), then ELEVATE the
+ *      pinned practices above the auto-surfaced ones (model order kept within each
+ *      group).
  *
  * A blank metric short-circuits to an empty list — there is no "tag" to match and a
  * blank tag would spuriously collide with empty free-form tags. Returns at most
@@ -149,8 +167,9 @@ export function surfacePractices(db: Database.Database, input: SurfacePracticesI
         hidesPermitted: input.hidesPermitted,
     });
 
-    // 2. Respect suppressions (current decision per contribution for this metric).
-    const {suppressed} = resolveCurrentMetricOverrides(db, metric);
+    // 2. Resolve the current override decision per contribution for this metric, then
+    //    drop the suppressed ones from the tag-matched set.
+    const {pinned, suppressed} = resolveCurrentMetricOverrides(db, metric);
     const byId = new Map<string, Contribution>();
     for (const hit of hits) {
         if (!suppressed.has(hit.contribution.id)) {
@@ -158,19 +177,51 @@ export function surfacePractices(db: Database.Database, input: SurfacePracticesI
         }
     }
 
-    // 3. Rank by the viewer-team's active contribution model. orderPracticePool only
-    //    returns published ids from the input set, all of which are in `byId`.
+    // 3. Force-surface pinned practices that the tag match did not already include
+    //    (e.g. a pinned-but-untagged practice). Each must clear the SAME gates the
+    //    auto-surfaced ones did: it must be published (the non-published filter below
+    //    via orderPracticePool would drop it regardless, but skipping it here avoids
+    //    even loading it into the pool) and visible to the viewer. resolveVisibleForViewer
+    //    is the exact scope tail searchContributions uses, so a pin honours per-team
+    //    scope and hides identically — a lead cannot pin a practice into a viewer's
+    //    view that the viewer could not otherwise see.
+    for (const id of pinned) {
+        if (byId.has(id)) {
+            continue; // already a tag match; it will simply be flagged pinned below.
+        }
+        const contribution = getContribution(db, id);
+        if (!contribution || contribution.state !== 'published') {
+            continue; // a pin only force-surfaces a real, published practice.
+        }
+        const [visible] = resolveVisibleForViewer(
+            db,
+            [contribution],
+            input.viewerTeam,
+            input.hidesPermitted ?? true,
+        );
+        if (visible !== undefined) {
+            byId.set(id, contribution);
+        }
+    }
+
+    // 4. Rank by the viewer-team's active contribution model, then elevate the pinned
+    //    practices above the auto-surfaced ones. orderPracticePool only returns
+    //    published ids from the input set, all of which are in `byId`.
     const model = resolveContributionModel(db, input.viewerTeam);
     const ranked = orderPracticePool(db, model, [...byId.keys()]);
 
-    const surfaced: SurfacedPractice[] = [];
+    const pinnedSurfaced: SurfacedPractice[] = [];
+    const autoSurfaced: SurfacedPractice[] = [];
     for (const ranking of ranked) {
         const contribution = byId.get(ranking.contributionId);
         if (contribution === undefined) {
             continue; // unreachable: every ranked id came from byId. Defensive, not a real branch.
         }
-        surfaced.push({contribution, ranking});
+        const isPinned = pinned.has(ranking.contributionId);
+        (isPinned ? pinnedSurfaced : autoSurfaced).push({contribution, ranking, pinned: isPinned});
     }
+    // Pinned first (lead precision wins placement), model order preserved within each group.
+    const surfaced = [...pinnedSurfaced, ...autoSurfaced];
 
     return input.limit !== undefined ? surfaced.slice(0, input.limit) : surfaced;
 }
