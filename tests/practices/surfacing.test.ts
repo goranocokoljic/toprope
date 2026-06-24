@@ -212,6 +212,32 @@ describe('tag-based auto-surfacing (Task 6.2.5 / #160)', () => {
             addMetricPin(db, {contributionId: p, metric: 'churn', action: 'suppress', actorId: 'lead', createdAt: T2});
             expect(surfacePractices(db, {metric: 'churn', viewerTeam: TEAM})).toEqual([]);
         });
+
+        // SO-1: when two overrides share a created_at (a lead double-clicking, a
+        // reset-then-set flow writing both in the same millisecond), the current
+        // decision must be the one written LAST — resolved by the rowid insertion
+        // tiebreak, not the random-UUID id. Both directions are asserted.
+        it('same-timestamp pin then suppress resolves to the later write (suppress wins)', () => {
+            const p = make(db, 'Same instant', {tags: ['churn']});
+            addMetricPin(db, {contributionId: p, metric: 'churn', action: 'pin', actorId: 'lead', createdAt: T1});
+            addMetricPin(db, {contributionId: p, metric: 'churn', action: 'suppress', actorId: 'lead', createdAt: T1});
+            expect(surfacePractices(db, {metric: 'churn', viewerTeam: TEAM})).toEqual([]);
+        });
+
+        it('same-timestamp suppress then pin resolves to the later write (pin wins, practice surfaces)', () => {
+            const p = make(db, 'Same instant', {tags: ['churn']});
+            addMetricPin(db, {contributionId: p, metric: 'churn', action: 'suppress', actorId: 'lead', createdAt: T1});
+            addMetricPin(db, {contributionId: p, metric: 'churn', action: 'pin', actorId: 'lead', createdAt: T1});
+            expect(ids(surfacePractices(db, {metric: 'churn', viewerTeam: TEAM}))).toEqual([p]);
+        });
+
+        // TST-2: 6.2.5 RESPECTS suppressions but does not yet force-surface pins —
+        // a pin on an UNTAGGED practice must not pull it in (that merge is 6.2.6).
+        it('does not force-surface a pinned-but-untagged practice (pin force-surface is 6.2.6)', () => {
+            const untagged = make(db, 'Pinned but untagged', {tags: []});
+            addMetricPin(db, {contributionId: untagged, metric: 'churn', action: 'pin', actorId: 'lead', createdAt: T1});
+            expect(surfacePractices(db, {metric: 'churn', viewerTeam: TEAM})).toEqual([]);
+        });
     });
 
     // --- resolveCurrentMetricOverrides (the reduction) ---------------------
@@ -280,6 +306,26 @@ describe('tag-based auto-surfacing (Task 6.2.5 / #160)', () => {
             vote(db, older, 50, 0); // feedback must NOT reorder under top_down
             const surfaced = surfacePractices(db, {metric: 'churn', viewerTeam: TEAM});
             expect(ids(surfaced)).toEqual([newer, older]);
+        });
+
+        // TST-1: suppression must be applied BEFORE ranking, so a suppressed practice
+        // is gone even when its feedback would otherwise rank it first. This couples
+        // suppression to the ranked output — a regression that ranked the raw hits or
+        // filtered suppressions afterwards would still surface the strongest-feedback one.
+        it('bottom_up: a suppressed practice does not surface even with the strongest feedback', () => {
+            useModel(db, TEAM, 'bottom_up');
+            const strongSuppressed = make(db, 'Strong but suppressed', {tags: ['churn'], ts: T1});
+            const weakVisible = make(db, 'Weak but visible', {tags: ['churn'], ts: T2});
+            vote(db, strongSuppressed, 20, 0); // would rank first on feedback
+            vote(db, weakVisible, 1, 3);
+            addMetricPin(db, {
+                contributionId: strongSuppressed,
+                metric: 'churn',
+                action: 'suppress',
+                actorId: 'lead',
+                createdAt: T1,
+            });
+            expect(ids(surfacePractices(db, {metric: 'churn', viewerTeam: TEAM}))).toEqual([weakVisible]);
         });
 
         it('the active model follows the viewer team (different teams can rank differently)', () => {
