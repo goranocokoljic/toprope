@@ -78,6 +78,7 @@ describe('settings store', () => {
                     'coaching_capture_permitted',
                     'coaching_cloud_analysis_permitted',
                     'showcase_enabled',
+                    'showcase_ai_annotation_enabled',
                     'showcase_scope_permitted',
                     'nudge_default_frequency',
                     'nudge_dismissible_default',
