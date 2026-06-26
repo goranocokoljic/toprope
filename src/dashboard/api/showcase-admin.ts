@@ -33,6 +33,11 @@ import {
     ShowcaseGovernanceError,
     type ShowcaseGovernanceErrorCode,
 } from '../../showcase/governance';
+import {
+    removeShowcaseAsLead,
+    UnitGovernanceError,
+    type UnitGovernanceErrorCode,
+} from '../../showcase/unitGovernance';
 import {parseShowcaseFilters, type ShowcaseFilterQuery} from './showcase-filters';
 
 const MAX_REASON_LEN = 1000;
@@ -48,6 +53,30 @@ const ERROR_STATUS: Record<ShowcaseGovernanceErrorCode, number> = {
 function sendGovernanceError(err: unknown, reply: FastifyReply): FastifyReply {
     if (err instanceof ShowcaseGovernanceError) {
         return reply.status(ERROR_STATUS[err.code]).send({error: 'Governance error', code: err.code, message: err.message});
+    }
+    throw err;
+}
+
+/**
+ * Map a 6.3.x unit-governance error code to its HTTP status. `not_found` /
+ * `not_a_showcase` are 404 (no such moderatable showcase), `not_team_showcase` is 403
+ * (outside this team's gallery), `not_removable` is 409 (wrong lifecycle state). The
+ * owner-only codes never reach this admin route, but are mapped for completeness.
+ */
+const UNIT_ERROR_STATUS: Record<UnitGovernanceErrorCode, number> = {
+    not_found: 404,
+    not_a_showcase: 404,
+    not_author: 403,
+    not_published: 409,
+    not_removable: 409,
+    not_team_showcase: 403,
+};
+
+function sendUnitGovernanceError(err: unknown, reply: FastifyReply): FastifyReply {
+    if (err instanceof UnitGovernanceError) {
+        return reply
+            .status(UNIT_ERROR_STATUS[err.code])
+            .send({error: 'Governance error', code: err.code, message: err.message});
     }
     throw err;
 }
@@ -127,6 +156,63 @@ export function registerShowcaseAdminRoutes(app: FastifyInstance, db: Database.D
             return {data: {removalId: result.removalId, example: result.example}};
         } catch (err) {
             return sendGovernanceError(err, reply);
+        }
+    });
+
+    /**
+     * Remove a 6.3.x showcase UNIT from a team's gallery (the contribution-spine
+     * model). Body: { team, reason? }. `team` is REQUIRED — it scopes the action to
+     * that team's gallery and bounds which showcases may be touched (the service
+     * refuses, 403, a showcase outside it). On success the showcase flips to `removed`,
+     * the action is logged in the audit trail, and the author is notified via their
+     * removal feed — atomically. As with the Phase 5 route there is NO body field that
+     * could create or alter content: removal is the only verb. A lead can never publish
+     * on a developer's behalf — that path lives solely in the consent-gated 6.3.2 flow.
+     */
+    app.post<{Params: {id: string}; Body: unknown}>('/api/admin/showcase-units/:id/remove', async (request, reply) => {
+        if (!isAdmin(request)) {
+            return forbidden(reply);
+        }
+
+        const obj = asObject(request.body);
+        if (!obj) {
+            badRequest(reply, 'Request body must be an object');
+            return reply;
+        }
+        if (!rejectUnknownKeys(obj, REMOVE_KEYS, reply)) {
+            return reply;
+        }
+
+        const team = typeof obj.team === 'string' ? obj.team.trim() : '';
+        if (!team) {
+            badRequest(reply, 'team is required (the team whose gallery you are moderating)');
+            return reply;
+        }
+
+        let reason: string | null = null;
+        if (obj.reason !== undefined && obj.reason !== null) {
+            if (typeof obj.reason !== 'string') {
+                badRequest(reply, 'reason must be a string');
+                return reply;
+            }
+            const trimmed = obj.reason.trim();
+            if (trimmed.length > MAX_REASON_LEN) {
+                badRequest(reply, `reason exceeds the ${MAX_REASON_LEN}-character limit`);
+                return reply;
+            }
+            reason = trimmed.length === 0 ? null : trimmed;
+        }
+
+        try {
+            const removed = removeShowcaseAsLead(db, {
+                showcaseId: request.params.id,
+                team,
+                removedByUserId: request.authUser!.userId,
+                reason,
+            });
+            return {data: {showcase: removed}};
+        } catch (err) {
+            return sendUnitGovernanceError(err, reply);
         }
     });
 }

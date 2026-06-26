@@ -1259,3 +1259,101 @@ export interface CreatedPractice {
     contribution: {id: string; title: string; scope: string; scopeTarget: string | null; state: string};
     metrics: string[];
 }
+
+// --- Showcase browse/governance (Task 6.3.9 / #172) ------------------------
+
+/** Which path published a showcase: developer self-publish or joint manager+dev curation. */
+export type ShowcasePublishPath = 'self_publish' | 'joint_curation';
+
+/** One card in the showcase gallery. From GET /api/me/showcase-units/browse. */
+export interface BrowseShowcaseSummary {
+    id: string;
+    title: string;
+    scope: string;
+    scopeTarget: string | null;
+    authorId: string;
+    authorName: string | null;
+    /** Which path published it — a provenance marker; null on a divergent row. */
+    publishPath: ShowcasePublishPath | null;
+    /** Whether the unit carries an outcome link (PR/commit/goal). */
+    hasOutcomeLink: boolean;
+    /** How many inline developer annotations the unit carries (the teaching layer's heft). */
+    annotationCount: number;
+    createdAt: string;
+    updatedAt: string;
+}
+
+/** The gallery list. From GET /api/me/showcase-units/browse. */
+export interface ShowcaseGalleryList {
+    showcases: BrowseShowcaseSummary[];
+}
+
+/** One inline developer annotation anchored to a conversation turn (6.3.3). */
+export interface ShowcaseAnnotation {
+    id: string;
+    contributionId: string;
+    turnRef: string;
+    authorId: string;
+    body: string;
+    createdAt: string;
+}
+
+/** A conversation turn with the annotations anchored to it, for inline display. */
+export interface ShowcaseAnnotatedTurn {
+    turnRef: string;
+    /** The raw turn payload as the conversation carried it (opaque). */
+    turn: unknown;
+    annotations: ShowcaseAnnotation[];
+}
+
+/** The inline display of a showcase: each turn beside the annotations that explain it. */
+export interface ShowcaseInlineDisplay {
+    turns: ShowcaseAnnotatedTurn[];
+    /** Annotations whose anchor no longer matches a turn (normally empty). */
+    orphaned: ShowcaseAnnotation[];
+}
+
+/** The optional, clearly-AI, SECONDARY prompt-technique annotation (6.3.7). */
+export interface RenderedAiAnnotation {
+    present: boolean;
+    source: 'ai_generated';
+    prominence: 'secondary';
+    label: string;
+    text: string | null;
+}
+
+/** Full detail of one showcase unit. From GET /api/me/showcase-units/:id. */
+export interface BrowseShowcaseDetail {
+    id: string;
+    title: string;
+    scope: string;
+    scopeTarget: string | null;
+    state: string;
+    authorId: string;
+    authorName: string | null;
+    publishPath: ShowcasePublishPath | null;
+    createdAt: string;
+    updatedAt: string;
+    /** The MANDATORY curators' note ("what to take away"), shown prominently. */
+    curatorsNote: string;
+    outcomeLink: string | null;
+    hasOutcomeLink: boolean;
+    /** The annotated conversation body (turns + inline annotations). */
+    display: ShowcaseInlineDisplay;
+    /** The clearly-AI, secondary prompt-technique annotation slot. */
+    aiAnnotation: RenderedAiAnnotation;
+    /** Best practices this showcase demonstrates (6.3.8). Empty when none. */
+    practices: ShowcaseCrossLink[];
+    /** True only when the viewer authored this showcase — gates the unpublish affordance. */
+    canUnpublish: boolean;
+}
+
+/** One removal notice in the author's feed. From GET /api/me/showcase-units/removals. */
+export interface ShowcaseRemovalNotice {
+    showcaseId: string;
+    title: string;
+    /** The acting lead's user id. */
+    removedBy: string;
+    reason: string | null;
+    occurredAt: string;
+}
