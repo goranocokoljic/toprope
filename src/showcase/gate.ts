@@ -41,3 +41,14 @@ export function isScopePermittedForTeam(db: Database.Database, team: string | nu
     }
     return resolveSetting(db, 'showcase_scope_permitted', team) === 'org_wide';
 }
+
+/**
+ * Whether the optional AI prompt-technique annotation (Task 6.3.7 / #170) is enabled
+ * for a developer's team, per `showcase_ai_annotation_enabled`. OFF by default —
+ * resolved live so an org turning it off takes effect immediately. The annotation
+ * generator consults this before ever calling the model, so a disabled team neither
+ * generates nor stores an annotation.
+ */
+export function isAiAnnotationEnabledForTeam(db: Database.Database, team?: string | null): boolean {
+    return resolveSetting(db, 'showcase_ai_annotation_enabled', team) === true;
+}

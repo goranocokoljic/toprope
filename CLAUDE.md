@@ -2,6 +2,11 @@
 
 # GovProxy
 
+## Review knowledge base (graduated rules)
+Recurring code-review findings that graduated into always-on project rules. Honor them
+when writing code. Auto-generated — do not hand-edit (see `dev-cycle-analytics/REVIEW_KB.md`).
+@dev-docs/review-rules.md
+
 ## Overview
 AI adoption intelligence platform for engineering teams.
 Aggregates data from AI tool APIs, git repos, and expense data

@@ -63,6 +63,11 @@ export const KNOWN_REVIEW_EVENTS = [
     'unpublished',
     'removed',
     'redacted',
+    // 6.3.6 mandatory manual review: the curator's explicit "review complete"
+    // confirmation. Deliberately DISTINCT from 'approved' (which is the developer's
+    // consent the publish gate checks) so a curator's review can never be mistaken
+    // for the developer's consent.
+    'reviewed',
     // 6.1.4 scope-resolution governance: a team hiding / un-hiding an org item for itself.
     'hidden',
     'unhidden',

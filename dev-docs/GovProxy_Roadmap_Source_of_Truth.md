@@ -2,7 +2,7 @@
 
 **The canonical reference for what GovProxy is, what's built, and what's next.**
 
-Version 1.2 — June 2026 | Living document — update as phases complete
+Version 1.1 — May 2026 | Living document — update as phases complete
 
 > This document supersedes the phase definitions and roadmaps in all earlier
 > documents (see Section 7, Superseded Documents). When any other document
@@ -53,8 +53,9 @@ API connectors come online progressively. Primary git provider is Bitbucket.
 | Phase 3 | Aggregation engine + AI-generated summaries | ✅ DONE |
 | Phase 4 | Complete the data picture + close analytics gaps | ✅ DONE |
 | Phase 5 | Developer coaching | ✅ DONE |
-| Phase 6 | Production hardening & scale | ▶ NEXT |
-| Backlog | Benchmarks, mobile, future connectors | ⬜ UNSCHEDULED |
+| Phase 6 | Improvement layer: knowledge sharing + showcase | ▶ NEXT |
+| Phase 7 | Production hardening & scale | ⬜ PLANNED |
+| Backlog | Benchmarks, mobile, future connectors, artifact repository | ⬜ UNSCHEDULED |
 
 ---
 
@@ -211,150 +212,115 @@ API connectors come online progressively. Primary git provider is Bitbucket.
 
 ### Phase 4 — Complete the Data Picture + Close Analytics Gaps ✅
 
-**Self-reporting (Tier 4 data)**
-- Self-report core: developer logs AI-tool usage (tool, optional minutes, optional
-  private task descriptor) → a `self_report`/MEDIUM `tool_snapshot`; never
-  fabricates measured interaction counts; private task descriptor never enters the
-  aggregated snapshot
-- CLI `govproxy log` and an interactive Slack bot (slash command + modal),
-  authenticated by Slack request signature
-- **API-wins rule:** a self-report never overrides a measured API snapshot for the
-  same developer/day/tool, and a later API sync replaces an earlier self-report
-  placeholder (the raw self-report is always kept on record)
+**Data completeness**
+- Self-reporting: CLI (`govproxy log`) + Slack bot (interactive logging);
+  data_source="self_report", medium tier; API-wins rule (never overrides measured)
+- Data-prompted surveys: triggers (usage drop, unused new seat, plan change,
+  anomaly, manual); manager-configurable auto vs manual per trigger; Slack/email
+  delivery; responses surfaced as context next to the triggering data
+- Expense reconciliation: match expenses vs subscription registry; flag
+  expense-no-sub / sub-no-expense / cost-discrepancy; billing-model-aware;
+  resolve/ignore workflow
+- Richer expense import: multiple format profiles, dedup, multi-email matching,
+  recurring vs one-time, billing-model inference
+- Cursor connector: full parity (Analytics API, service-key auth, feature
+  breakdown autocomplete/Composer/chat)
 
-**Data-prompted surveys**
-- Triggers (usage drop, unused new seat, plan change, anomaly) detected from
-  aggregates; templated questions with optional choices
-- Auto-send vs manager-approval per trigger (global default + per-team override
-  under the manager-permission toggle); Slack delivery with email fallback;
-  stranded-auto-survey retry on the next sweep
-- Responses captured and surfaced to the manager as context next to the triggering
-  data; developer answers only their own surveys (strict scoping)
-
-**Expense / gap-filling depth (Tier 3)**
-- Richer import: multiple expense-export profiles (standard/expensify/concur/…),
-  annual→monthly normalization, dedup, billing-model inference
-- Reconciliation: expense charges vs subscription registry per period →
-  `expense_no_subscription` / `subscription_no_expense` / `cost_discrepancy`
-  mismatches (tolerance-aware, company-managed exempt, annual-coverage aware);
-  resolve/ignore workflow so total spend is trustworthy; idempotent re-runs
-
-**Cursor connector** (full ConnectorInterface parity)
-- Analytics API → `tool_snapshots` (api/HIGH); identity mapping by cursor
-  external_id with email fallback; pagination, 429 retry, idempotent daily writes;
-  obeys the API-wins rule against prior self-reports
-
-**Anomaly detection** (tier-aware)
-- Both methods — statistical (z-score) and percentage-change — configurable
-  per metric (global default + override)
-- Minimum-baseline guard suppresses early-weeks false positives until enough prior
-  periods exist; idempotent re-scan preserves acknowledged/resolved status
-- Carries an honest basis (`git_estimate` at launch); developer-scope anomalies
-  stay private, team-scope surface to managers
-- Surfacing: dashboard panel (acknowledge/resolve) + Slack alerts (notable/high,
-  settings-gated) + folded into AI summaries in plain, honest language
-
-**Team comparison**
-- Rich side-by-side for 2–4 teams: every metric, tool mix, overlaid trend,
-  per-team data-quality tier (weakest-link rule), maturity with git_estimate basis
-- Sortable all-teams table for a selected quarter, every overseen team listed
-
-**Developer adoption-journey visualization**
-- Timeline from first to latest AI activity; continuous weekly trajectory (gaps
-  zero-filled, AI signature averaged); tool/plan transitions plotted from lifecycle
-  data; annotated key moments (first active week, sustained ramp, plateau)
-- Tier-labeled; private `/api/me/journey` for the developer, manager-aggregate
-  `/api/developers/:id/journey` (developer role confined to their own)
-
-**Cross-cutting**
-- Settings extensions for survey triggers, anomaly config, and alert channels,
-  following the established global-default + per-team-override + permission model
-- Tier-awareness held end to end: every new feature labels its basis and never
-  invents direct-usage language — verified by `tests/integration/phase4-pipeline.test.ts`
-  (which reuses the Phase 3 forbidden-terms catalogue against anomaly summaries)
-
----
+**Analytics gaps closed**
+- Anomaly detection: both statistical (mean+std-dev) and percentage-change,
+  configurable per metric; minimum-baseline guard (no early-weeks false positives);
+  tier-aware (git metrics now, tool metrics when connected); severity bands
+- Anomaly surfacing: dashboard panel + inline flags, Slack notifications, folded
+  into AI summaries (tier-aware phrasing)
+- Team comparison: rich side-by-side (≤4 teams) + sortable all-teams table
+- Developer adoption-journey visualization: timeline with tool/plan transitions,
+  trajectory overlay, key-moment annotations (developer-private + manager-aggregate)
+- Settings extensions: survey, anomaly, alert-channel config (global + per-team)
 
 ### Phase 5 — Developer Coaching ✅
 
-The product's differentiator: a private mirror that helps developers improve,
-while managers see only team-level patterns. Tier-aware — the first two pillars
-work on existing data, so a git-only WMG developer gets useful coaching with no
-opt-in. The non-negotiable rule across the phase: **individual coaching signals
-are private to the developer; managers see floored team aggregates only**, framed
-within-developer-over-time, never as a cross-developer ranking.
+**Pillar 1 — Available-data coaching**
+- Churn-based self-reflection, acceptance-rate trends (where tool data exists),
+  adoption-journey coaching, personal insights (deferred from Phase 2); tier-aware,
+  within-developer framing, private to developer
 
-**Pillar 1 — Available-data coaching** (works at launch, git-only)
-- Churn self-reflection, acceptance-rate trends (only where tool data exists —
-  honestly null for git-only), adoption-journey interpretation, and tier-aware
-  personal insights, all on the developer's own data (`/api/me/coaching`)
-- Manager aggregate carries contributor counts + category tallies only — never the
-  observation sentence, with a k-anonymity floor (≥3 contributors)
+**Pillar 2 — PR/review outcome analysis**
+- Signals from git-provider PR/review data: rework rate, review-rejection rate,
+  review rounds, comment density vs own baseline, time-to-merge, review reciprocity
+- Churn+review combined signal (struggling / healthy_iteration / effective /
+  insufficient_data)
+- Two clearly-separated views: all-PR (factual) and AI-assisted-PR (inferred,
+  lower confidence); within-developer-over-time; private + manager-aggregate-only
 
-**Pillar 2 — PR/review outcome coaching** (works at launch, the no-opt-in
-highest-value signal)
-- From GitHub/Bitbucket/GitLab PR + review data: rework/review-rejection rate,
-  review rounds, comment density, time-to-merge, and the churn + review combination
-  that disambiguates struggling vs healthy iteration vs effective adoption
-- **All-PR (factual)** and **AI-assisted (inferred)** views kept rigorously separate
-  and labelled; private developer trajectory (`/api/me/pr-coaching`) vs floored
-  manager team aggregate (`/api/coaching/pr-review/...`) with no individual reachable
+**Pillar 3 — Opt-in prompt capture**
+- Double opt-in; capture via local agent OR editor extension (dev picks)
+- Client-side encryption; server holds only ciphertext, never the key/plaintext
+- Developer-chosen recovery (no-recovery or recovery-path); recovery use logged
+  and visible to the developer
+- Real-time loop detection + prompt-quality nudges (local at capture layer,
+  metadata only)
+- Session retrospective: local-model default, cloud as conscious second opt-in;
+  plaintext only transient, never persisted
 
-**Pillar 3 — Opt-in prompt capture** (off until an admin permits; developer's choice)
-- Double opt-in: capture at all (opt-in #1) and, separately, cloud retrospective
-  analysis (opt-in #2); both mechanisms — local agent + editor extension — feed one
-  client-side-encrypted blind store that rejects any plaintext/key material
-- Real-time loop detection + prompt-quality nudges run locally at the capture layer
-  and sync metadata only; session retrospective defaults to a **local model**
-  (prompts never leave org infra), cloud only on the double opt-in + org permission
-- Developer-chosen key recovery (no-recovery vs recovery-path); every recovery
-  action is logged in a developer-visible feed — no silent use, no admin backdoor
-
-**Showcase — exemplary conversations**
-- Deliberate owner act: promote (transient decrypt) → mandatory redact → publish to
-  a **separate shared store** at team/org scope; private captures untouched, nothing
-  auto-harvested; browse within access scope; owner unpublish; team-lead remove
-  (with author notice) but never publish/edit on a developer's behalf
+**Showcase (Phase 5 version)**
+- Owner-only promote → mandatory redact → publish; separate shared store from
+  private captures; browse with access scoping; owner unpublish; lead-remove
+  (never publish on a dev's behalf)
+  (Note: Phase 6 extends this with joint curation, annotations, and best-practices.)
 
 **Cross-cutting**
-- Coaching settings & permissions (org policy gates developer choices; pillars
-  team-overridable); unified manager coaching panel (`/api/coaching/manager/...`)
-  that is structurally aggregate-only
-- Privacy verified end to end by `tests/integration/phase5-pipeline.test.ts`: the
-  no-plaintext, no-individual-leak, min-group-size, double-opt-in, and
-  owner-only-publish guarantees each have a dedicated assertion (Task 5.12)
+- Coaching settings (org policy + developer-level choices; org gates developer
+  options); manager aggregate coaching signals with minimum-group-size guard
+  (no individual coaching data ever reachable by managers)
 
 ---
 
 ## 4. Definitive Forward Roadmap
 
 > This numbering is authoritative and supersedes all earlier phase definitions.
-> The original V1 build-spec phase list (which planned expense import as "Phase 4"
-> and trends/analytics as "Phase 5") is OBSOLETE — those items were built earlier,
-> across Phases 1–3. See Section 6 for the reconciliation.
+> Phases 4 and 5 are now DONE — their full feature inventories are in Section 3.
+> The improvement layer (knowledge sharing + showcase) is the new Phase 6;
+> production hardening moved to Phase 7. See Section 6 for the reconciliation.
 
-### Phase 4 — Complete the Data Picture + Close Analytics Gaps ✅ DONE
+### Phase 6 — Improvement Layer: Knowledge Sharing + Showcase ▶ NEXT
 
-Built and verified end to end — see the full feature inventory in Section 3 and
-the integration/dogfood suite `tests/integration/phase4-pipeline.test.ts`. The
-launch blind spots are now either closed (self-reporting, Cursor, richer expense +
-reconciliation) or honestly surfaced as gaps, and the three orphaned analytics
-items (anomaly detection, team comparison, adoption-journey visualization) are
-built and tier-aware.
+**Theme:** add an *improvement layer* on top of the measurement layer — the
+existing product answers "how are we doing?"; this answers "how do we get
+better?" — shifting GovProxy from intelligence toward intelligence + enablement.
 
-### Phase 5 — Developer Coaching ✅ DONE
+Built on a foundation of **shared primitives first** (contribution flow,
+versioning, org/team inheritance, search), then two features on top:
 
-Built and verified end to end — see the full feature inventory in Section 3 and the
-integration/privacy/dogfood suite `tests/integration/phase5-pipeline.test.ts`. Three
-coaching pillars (available-data, PR/review outcomes, opt-in prompt capture) plus the
-exemplary-conversation showcase, delivered under a strict privacy floor: individual
-coaching is private to the developer, managers see only floored team aggregates,
-prompt capture is client-side-encrypted with no server-side plaintext or key, the
-retrospective defaults to a local model, and the showcase is owner-initiated only.
-The product is now something developers *want*, not just tolerate. The dedicated
-privacy-verification pass (Task 5.12) is the gate, and it passes.
+- **Knowledge sharing / best practices** — a space to share best practices for
+  working with AI tools, surfaced *contextually* next to the metric they relate to
+  (a high-churn figure links to a practice on reviewing AI suggestions) rather than
+  in a docs graveyard. Configurable contribution model: top-down (default),
+  bottom-up (post + vote), or hybrid (post + lead endorsement), switchable per team.
+  Practices attach to metrics via tag-based auto-surfacing with manual override.
 
-### Phase 6 — Production Hardening & Scale ▶ NEXT
+- **Showcase — curated exemplar conversations** — standout conversations shared as
+  teaching examples, org-internal only. Two publish paths: developer self-publish
+  (from their Phase 5 retrospective) OR joint manager+developer curation — developer
+  approval ALWAYS required either way. A showcase unit includes: the conversation,
+  inline developer annotations anchored to specific turns (the highest-value layer),
+  the outcome (PR/code), a mandatory curators' note, optional specific-or-silent AI
+  annotation on prompt technique, and a link to any reusable artifact. Content
+  scrubbing before publish: auto-flag (a NEW focused secret/PII/credential detector
+  — the old proxy-era scanning was removed, so this is new work, not a reuse) PLUS
+  mandatory manual review. "How it could be better" is deliberately EXCLUDED from
+  the public showcase and offered instead as a private, self-directed tool — public
+  stays celebratory, critique stays private.
+
+Deliberately NOT in Phase 6: the internal artifact repository (Feature 2 of the
+improvement-layer draft) — it's the strongest standalone candidate and is parked
+in the backlog as a possible separate product.
+
+Rationale: the improvement layer is feature work worth dogfooding at WMG while
+iterating, and it builds naturally on the Phase 5 coaching/showcase foundation.
+The shared-primitives-first sequencing keeps the two features coherent rather than
+bolted-on.
+
+### Phase 7 — Production Hardening & Scale ⬜
 
 **Theme:** ready to leave WMG and sell to external customers.
 
@@ -366,7 +332,7 @@ Scope:
   path, multi-node considerations)
 
 Rationale: this is the "ready to sell" phase; do it once the feature set is
-proven at WMG.
+proven at WMG. (Was Phase 6; renumbered when the improvement layer was inserted.)
 
 ---
 
@@ -374,6 +340,10 @@ proven at WMG.
 
 Recorded so they're not lost; not yet assigned to a phase:
 
+- **Internal artifact repository** (Feature 2 of the improvement-layer draft) —
+  installable skills/scripts/MCPs/instructions with org-creates/team-modifies
+  inheritance, versioning, and provenance/security review. The strongest STANDALONE
+  candidate; parked as a possible separate product rather than folded into GovProxy.
 - **Cross-company anonymized benchmarks** — needs an installed base first; the
   maturity-score benchmark is internal org-average until then
 - **Mobile interface** — dedicated effort once desktop is proven
@@ -426,33 +396,20 @@ truth; consult the originals only for detailed built-feature reference:
 
 Active documents going forward:
 - **THIS document** (roadmap / source of truth)
-- Phase4_Design_Document.md + Phase4_Task_Tracker.md — the build record for the
-  now-complete Phase 4 (historical implementation detail)
-- Phase5_Design_Document.md + Phase5_Task_Tracker.md — the build record for the
-  now-complete Phase 5 (historical implementation detail)
-- Phase 6 design document + task tracker (to be created next)
+- Phase 4 design document + task tracker (to be created next)
 - Product_Vision_v2 (product vision reference)
 
 ---
 
 ## 8. Change Log
 
-- v1.2 (June 2026) — Phase 5 (Developer Coaching) marked DONE. Added the Phase 5
-  feature inventory (Pillar 1 available-data coaching, Pillar 2 PR/review outcome
-  coaching, Pillar 3 opt-in client-side-encrypted prompt capture with local-default
-  retrospective + double opt-in + developer-chosen logged key recovery, the
-  deliberate promote/redact/publish showcase, coaching settings, and the unified
-  aggregate-only manager panel) and the integration + privacy-verification + dogfood
-  pass (Task 5.12, `tests/integration/phase5-pipeline.test.ts`). Phase 6 (Production
-  Hardening & Scale) is now NEXT.
-- v1.1 (June 2026) — Phase 4 marked DONE. Added the Phase 4 feature inventory
-  (self-reporting CLI + Slack, data-prompted surveys, richer expense import +
-  reconciliation, Cursor connector, tier-aware anomaly detection + surfacing, team
-  comparison rich + sortable-table, developer adoption-journey, settings
-  extensions) and the integration/dogfood verification (Task 4.13). Phase 5
-  (Developer Coaching) is now NEXT.
 - v1.0 (May 2026) — initial consolidation. Phases 1–3 recorded as done; Phases
   4–6 defined; old numbering reconciled; superseded documents listed.
+- v1.1 (May 2026) — Phases 4 and 5 marked DONE with full feature inventories.
+  Improvement layer (knowledge sharing + showcase) inserted as the new Phase 6;
+  production hardening renumbered to Phase 7. Internal artifact repository added to
+  backlog as a standalone candidate. Note: the Phase 5 showcase is extended by the
+  Phase 6 improvement layer (joint curation, annotations, best-practices linkage).
 
 ---
 
