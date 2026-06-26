@@ -1,0 +1,6 @@
+developer_email,tool,plan,monthly_cost,billing_model
+ada@acme.com,copilot,business,,company_managed
+ada@acme.com,claude_code,max,,company_managed
+grace@acme.com,copilot,business,19,company_managed
+grace@acme.com,windsurf,pro,,reimbursed
+alan@acme.com,cursor,pro,20,personal

@@ -56,6 +56,9 @@ import type {
     PracticePreview,
     OwnedPracticeView,
     CreatedPractice,
+    ShowcaseGalleryList,
+    BrowseShowcaseDetail,
+    ShowcaseRemovalNotice,
     WasteAlert,
     WasteResolutionReason,
     WasteTeamSummary,
@@ -836,10 +839,60 @@ export const api = {
             {markdown},
         );
     },
+
+    // --- Showcase browse/governance (Task 6.3.9) ---
+    /**
+     * Browse / search the published showcases the viewer may see. Free text plus
+     * tag/team/scope filters all flow through 6.1.5 search server-side; results are
+     * scope-enforced so a showcase outside the viewer's scope never appears.
+     */
+    async browseShowcases(filters: ShowcaseBrowseFilters = {}): Promise<ShowcaseGalleryList> {
+        const search = new URLSearchParams();
+        if (filters.q) search.set('q', filters.q);
+        if (filters.tag) search.set('tag', filters.tag);
+        if (filters.team) search.set('team', filters.team);
+        if (filters.scope) search.set('scope', filters.scope);
+        const qs = search.toString();
+        const body = await request<ApiEnvelope<ShowcaseGalleryList>>(
+            `/api/me/showcase-units/browse${qs ? `?${qs}` : ''}`,
+        );
+        return body.data;
+    },
+
+    /** Full detail of one showcase the viewer may see (note + outcome + annotated turns + AI + cross-links). */
+    async getShowcaseDetail(id: string): Promise<BrowseShowcaseDetail> {
+        const body = await request<ApiEnvelope<BrowseShowcaseDetail>>(
+            `/api/me/showcase-units/${encodeURIComponent(id)}`,
+        );
+        return body.data;
+    },
+
+    /** Owner unpublish: remove one's OWN showcase from the gallery (author-scoped). */
+    async unpublishShowcase(id: string): Promise<BrowseShowcaseDetail['state']> {
+        const body = await postJson<ApiEnvelope<{state: string}>>(
+            `/api/me/showcase-units/${encodeURIComponent(id)}/unpublish`,
+            {},
+        );
+        return body.data.state;
+    },
+
+    /** The author's removal-notification feed — lead removals of their own showcases, newest first. */
+    async getShowcaseRemovals(): Promise<ShowcaseRemovalNotice[]> {
+        const body = await request<ApiEnvelope<ShowcaseRemovalNotice[]>>('/api/me/showcase-units/removals');
+        return body.data;
+    },
 };
 
 /** Query filters for {@link api.browsePractices}. */
 export interface PracticeBrowseFilters {
+    q?: string;
+    tag?: string;
+    team?: string;
+    scope?: 'org' | 'team';
+}
+
+/** Query filters for {@link api.browseShowcases}. */
+export interface ShowcaseBrowseFilters {
     q?: string;
     tag?: string;
     team?: string;

@@ -15,6 +15,8 @@ import {MyCoaching} from './pages/MyCoaching';
 import {BestPractices} from './pages/BestPractices';
 import {BestPracticeDetail} from './pages/BestPracticeDetail';
 import {BestPracticeEditor} from './pages/BestPracticeEditor';
+import {Showcase} from './pages/Showcase';
+import {ShowcaseDetail} from './pages/ShowcaseDetail';
 import {TeamCoaching} from './pages/TeamCoaching';
 import {Preferences} from './pages/Preferences';
 import {Settings} from './pages/Settings';
@@ -65,6 +67,8 @@ export function App(): JSX.Element {
                 <Route path="developer/practices/new" element={<BestPracticeEditor />} />
                 <Route path="developer/practices/:id" element={<BestPracticeDetail />} />
                 <Route path="developer/practices/:id/edit" element={<BestPracticeEditor />} />
+                <Route path="developer/showcase" element={<Showcase />} />
+                <Route path="developer/showcase/:id" element={<ShowcaseDetail />} />
                 <Route path="preferences" element={<Preferences />} />
                 <Route
                     path="settings"
