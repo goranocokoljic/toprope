@@ -27,19 +27,13 @@ import type {FastifyInstance, FastifyReply} from 'fastify';
 import type Database from 'better-sqlite3';
 import {requireDeveloperId} from './guards';
 import {optionalQueryString} from './body-validation';
-import {DEFAULT_BROWSE_LIMIT, parseLimit, parseScopeFilter} from './practices-browse';
-import {getDeveloperById} from '../../registry/developers';
+import {DEFAULT_BROWSE_LIMIT, parseLimit, parseScopeFilter, viewerTeamOf} from './practices-browse';
 import {
     browseShowcases,
     getShowcaseDetail,
     type ShowcaseBrowseFilters,
 } from '../../showcase/browse';
 import {UnitGovernanceError, unpublishOwnShowcase, listShowcaseRemovalsForAuthor} from '../../showcase/unitGovernance';
-
-/** The viewer's team, resolved server-side from their developer record. Null when teamless. */
-function viewerTeamOf(db: Database.Database, developerId: string): string | null {
-    return getDeveloperById(db, developerId)?.team ?? null;
-}
 
 export function registerShowcaseBrowseRoutes(app: FastifyInstance, db: Database.Database): void {
     /**

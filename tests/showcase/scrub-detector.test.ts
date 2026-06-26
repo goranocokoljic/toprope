@@ -51,6 +51,17 @@ describe('scrubDetector — detectSensitiveContent (#168)', () => {
         expect(finding.finding).toContain('line 1');
     });
 
+    it('masks a SHORT secret to only its first char — never copies the bulk of a short value', () => {
+        // A real (non-placeholder) credential whose value is <= 8 chars exercises the
+        // short-value branch of mask(): it reveals only the first char, not the 3-char
+        // head a longer value would expose, so a short secret is not largely re-stored.
+        const [finding] = detectSensitiveContent('password = "h0rs3z"');
+        expect(finding.tier).toBe('secret_high');
+        expect(finding.finding).not.toContain('h0rs3z'); // raw value never stored verbatim
+        expect(finding.finding).not.toContain('h0r'); // the long-branch 3-char head must NOT appear
+        expect(finding.finding).toContain('h…'); // only the first char is revealed
+    });
+
     it('does not raise a high flag on an obvious placeholder credential', () => {
         for (const placeholder of [
             'password = "your_password_here"',

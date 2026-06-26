@@ -51,7 +51,7 @@ export const DEFAULT_BROWSE_LIMIT = 50;
 export const MAX_BROWSE_LIMIT = 200;
 
 /** The viewer's team, resolved server-side from their developer record. Null when teamless. */
-function viewerTeamOf(db: Database.Database, developerId: string): string | null {
+export function viewerTeamOf(db: Database.Database, developerId: string): string | null {
     return getDeveloperById(db, developerId)?.team ?? null;
 }
 
