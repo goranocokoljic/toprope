@@ -33,7 +33,7 @@
 
 import type Database from 'better-sqlite3';
 import {addReviewEvent, getContribution, listReviewEvents, updateContributionState} from './store';
-import type {Contribution, ContributionState} from './types';
+import type {Contribution, ContributionState, ReviewEventType} from './types';
 
 /**
  * The review gate a feature configures for a contribution model:
@@ -197,12 +197,21 @@ function requireTransition(
 }
 
 /**
- * Whether the current submission has a recorded approval. True when an `approved`
- * event exists no earlier than the most recent `submitted` event — scoping to the
- * latest submission keeps the check correct if a future lifecycle ever re-enters
- * `submitted`, rather than honouring a stale approval from a prior cycle.
+ * Whether an audit event of `eventType` was recorded for the CURRENT submission —
+ * i.e. no earlier than the most recent `submitted` event. Scoping to the latest
+ * submission keeps the check correct if a future lifecycle ever re-enters
+ * `submitted`, rather than honouring a stale event from a prior cycle.
+ *
+ * This is the canonical "did action X happen for this submission" predicate. The
+ * `required-approval` gate uses it for `approved`; a feature's own pre-publish gate
+ * (e.g. the showcase mandatory-manual-review gate, 6.3.6) reuses it for its own
+ * event type rather than re-deriving the same submission-window walk.
  */
-function hasApprovalForCurrentSubmission(db: Database.Database, contributionId: string): boolean {
+export function hasEventForCurrentSubmission(
+    db: Database.Database,
+    contributionId: string,
+    eventType: ReviewEventType,
+): boolean {
     const events = listReviewEvents(db, contributionId);
     let lastSubmittedAt = '';
     for (const e of events) {
@@ -210,7 +219,16 @@ function hasApprovalForCurrentSubmission(db: Database.Database, contributionId: 
             lastSubmittedAt = e.occurredAt;
         }
     }
-    return events.some((e) => e.event === 'approved' && e.occurredAt >= lastSubmittedAt);
+    return events.some((e) => e.event === eventType && e.occurredAt >= lastSubmittedAt);
+}
+
+/**
+ * Whether the current submission has a recorded approval — the `required-approval`
+ * gate's satisfaction check. A thin alias over {@link hasEventForCurrentSubmission}
+ * for the `approved` event so the gate reads at its intent.
+ */
+function hasApprovalForCurrentSubmission(db: Database.Database, contributionId: string): boolean {
+    return hasEventForCurrentSubmission(db, contributionId, 'approved');
 }
 
 /**

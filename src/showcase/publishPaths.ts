@@ -44,6 +44,7 @@ import {
 } from '../contributions/stateMachine';
 import type {Contribution} from '../contributions/types';
 import {curatorsNoteGate} from './curation';
+import {manualReviewGate} from './manualReview';
 import {getShowcaseUnit, recordConsent, upsertShowcaseUnit} from './unitsStore';
 import {isPublishPath, isVisibilityScope, type PublishPath, type ShowcaseUnit, type VisibilityScope} from './unitsTypes';
 
@@ -307,11 +308,14 @@ export function publishShowcase(db: Database.Database, input: PublishInput): Con
         note: input.note ?? null,
         timestamp: input.timestamp,
         gate: SHOWCASE_GATE,
-        // The MANDATORY curators'-note gate (6.3.4) ALWAYS runs first — before any
-        // caller-supplied scrub/review hooks — so publish is hard-blocked when the note
-        // is missing/blank, regardless of how the unit was created (fail-closed). It
-        // runs inside the publish transaction; a throw rolls the publish back.
-        prePublishHooks: [curatorsNoteGate, ...(input.prePublishHooks ?? [])],
+        // The two MANDATORY gates ALWAYS run first — before any caller-supplied hooks —
+        // so publish is hard-blocked regardless of how the unit was created (fail-closed),
+        // both inside the publish transaction (a throw rolls the publish back):
+        //   1. curators'-note gate (6.3.4): the mandatory note must be present, then
+        //   2. manual-review gate (6.3.6): the curator must have explicitly confirmed
+        //      review — required even when the auto-flag scrubber found nothing, and
+        //      not bypassable (the epic's cross-cutting criterion).
+        prePublishHooks: [curatorsNoteGate, manualReviewGate, ...(input.prePublishHooks ?? [])],
     });
 }
 
