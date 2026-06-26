@@ -46,10 +46,14 @@ import type {Contribution} from '../contributions/types';
 import {curatorsNoteGate} from './curation';
 import {manualReviewGate} from './manualReview';
 import {getShowcaseUnit, recordConsent, upsertShowcaseUnit} from './unitsStore';
-import {isPublishPath, isVisibilityScope, type PublishPath, type ShowcaseUnit, type VisibilityScope} from './unitsTypes';
-
-/** The content_type every showcase contribution carries on the spine. */
-const SHOWCASE_CONTENT_TYPE = 'showcase_example';
+import {
+    isPublishPath,
+    isVisibilityScope,
+    SHOWCASE_CONTENT_TYPE,
+    type PublishPath,
+    type ShowcaseUnit,
+    type VisibilityScope,
+} from './unitsTypes';
 
 /**
  * A showcase always runs through the `required-approval` gate — developer approval

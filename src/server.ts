@@ -35,6 +35,7 @@ import {registerRealtimeCoachingRoutes} from './dashboard/api/realtime-coaching'
 import {registerRetrospectiveRoutes} from './dashboard/api/retrospectives';
 import {registerShowcaseRoutes} from './dashboard/api/showcase';
 import {registerShowcaseAdminRoutes} from './dashboard/api/showcase-admin';
+import {registerShowcaseBrowseRoutes} from './dashboard/api/showcase-browse';
 import {registerPracticeAuthoringRoutes} from './dashboard/api/practices';
 import {registerPracticeSurfaceRoutes} from './dashboard/api/practices-surface';
 import {registerPracticeBrowseRoutes} from './dashboard/api/practices-browse';
@@ -167,6 +168,17 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
     // a team lead can remove from their team's showcase but never publish for a
     // developer; every removal is team-bounded, logged, and notifies the author.
     registerShowcaseAdminRoutes(app, db);
+
+    // Showcase browse/governance for the Epic 6.3 unit model (Task 6.3.9): /api/me,
+    // developer-scoped — the gallery (list/search published showcases the viewer may
+    // see via 6.1.5 search + 6.1.4 scope), the unit detail (curators' note + outcome +
+    // inline-annotated conversation + clearly-AI secondary annotation + cross-linked
+    // practices), the author's OWN unpublish, and their removal-notice feed. Reads only
+    // the published, redacted unit — never a private capture. The team-lead REMOVE for
+    // this model is an /api/admin route (above); this self-service surface has no
+    // publish path, so the Phase 5 rule carries: a lead removes, but never publishes
+    // for a developer.
+    registerShowcaseBrowseRoutes(app, db);
 
     // Best-practice rich authoring editor (Task 6.2.3): /api/me, developer-owned —
     // markdown + code blocks + embedded {{metric}} references rendered to a safe

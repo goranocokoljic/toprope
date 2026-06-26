@@ -12,6 +12,15 @@
  * reuses the shared contribution spine (no duplicate store).
  */
 
+/**
+ * The spine `content_type` a showcase carries. A showcase IS a `contributions`
+ * row distinguished by this value (see migration 037); the companion tables hang
+ * off it by reference. Exported as the ONE canonical literal so the browse,
+ * governance, cross-link, and publish surfaces all key off a single source of
+ * truth rather than re-hardcoding the string (which would silently drift).
+ */
+export const SHOWCASE_CONTENT_TYPE = 'showcase_example';
+
 /** Which publish path produced a showcase unit. Closed set. */
 export type PublishPath = 'self_publish' | 'joint_curation';
 

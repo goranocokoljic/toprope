@@ -88,4 +88,10 @@ export const queryKeys = {
     practicesBrowse: (filterKey: string) => ['practices', 'browse', filterKey] as const,
     practiceDetail: (id: string) => ['practices', 'detail', id] as const,
     practiceHistory: (id: string) => ['practices', 'history', id] as const,
+    // Showcase browse/governance (Task 6.3.9): the gallery is keyed by a serialized
+    // filter signature so each query/tag/team/scope combination caches independently;
+    // the detail is keyed by showcase id; the removal feed is a single author-scoped list.
+    showcaseBrowse: (filterKey: string) => ['showcases', 'browse', filterKey] as const,
+    showcaseDetail: (id: string) => ['showcases', 'detail', id] as const,
+    showcaseRemovals: ['showcases', 'removals'] as const,
 };

@@ -35,9 +35,9 @@ import {getContribution} from '../contributions/store';
 import {resolveVisibleForViewer} from '../contributions/scope';
 import type {Contribution} from '../contributions/types';
 import {linkPractice, listLinkedPractices, listLinkingShowcases, unlinkPractice} from './unitsStore';
+import {SHOWCASE_CONTENT_TYPE} from './unitsTypes';
 
-/** The spine `content_type` each end of a cross-link must carry. */
-const SHOWCASE_CONTENT_TYPE = 'showcase_example';
+/** The practice end's spine `content_type` (the showcase end reuses the canonical {@link SHOWCASE_CONTENT_TYPE}). */
 const PRACTICE_CONTENT_TYPE = 'best_practice';
 
 /** Stable error codes the route/service maps to HTTP statuses without matching message text. */

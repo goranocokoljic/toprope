@@ -45,10 +45,10 @@ import {
 const FEEDBACK_KEYS = ['signal'] as const;
 
 /** Default page size for the browse list — bounds the discovery surface so it never ships the whole library. */
-const DEFAULT_BROWSE_LIMIT = 50;
+export const DEFAULT_BROWSE_LIMIT = 50;
 
 /** Hard ceiling on the browse page size, so a caller can't request an unbounded list. */
-const MAX_BROWSE_LIMIT = 200;
+export const MAX_BROWSE_LIMIT = 200;
 
 /** The viewer's team, resolved server-side from their developer record. Null when teamless. */
 function viewerTeamOf(db: Database.Database, developerId: string): string | null {
@@ -60,7 +60,7 @@ function viewerTeamOf(db: Database.Database, developerId: string): string | null
  * scope → itself; anything else → 400 (returns false). The browse list only knows the
  * fixed scope vocabulary, so a typo fails loudly rather than silently matching nothing.
  */
-function parseScopeFilter(value: unknown, reply: FastifyReply): ContributionScope | undefined | false {
+export function parseScopeFilter(value: unknown, reply: FastifyReply): ContributionScope | undefined | false {
     const raw = optionalQueryString(value);
     if (raw === undefined) {
         return undefined;
@@ -77,7 +77,7 @@ function parseScopeFilter(value: unknown, reply: FastifyReply): ContributionScop
  * within the ceiling → itself; anything else → 400 (returns false). Keeps the browse
  * page bounded so a caller can't request an unbounded or nonsensical size.
  */
-function parseLimit(value: unknown, reply: FastifyReply): number | false {
+export function parseLimit(value: unknown, reply: FastifyReply): number | false {
     if (value === undefined) {
         return DEFAULT_BROWSE_LIMIT;
     }
