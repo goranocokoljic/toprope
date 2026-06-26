@@ -52,8 +52,27 @@ describe('scrubDetector — detectSensitiveContent (#168)', () => {
     });
 
     it('does not raise a high flag on an obvious placeholder credential', () => {
-        const findings = detectSensitiveContent('password = "your_password_here"');
-        expect(findings.filter((f) => f.tier === 'secret_high')).toHaveLength(0);
+        for (const placeholder of [
+            'password = "your_password_here"',
+            'api_key = "<your-key>"',
+            'secret = "CHANGEME"',
+            'token = "xxxxxxxx"',
+        ]) {
+            const findings = detectSensitiveContent(placeholder);
+            expect(findings.filter((f) => f.tier === 'secret_high')).toHaveLength(0);
+        }
+    });
+
+    it('still flags a real credential whose value merely CONTAINS a stand-in word', () => {
+        // Substring suppression would wrongly drop these — they are real secrets.
+        for (const real of [
+            'api_key = "secretSauce4242XX"', // contains "secret"
+            'password = "mytoken99887766"', // contains "token"
+            'client_secret = "examplePr0dPass99"', // contains "example"
+        ]) {
+            const findings = detectSensitiveContent(real);
+            expect(findings.filter((f) => f.tier === 'secret_high')).toHaveLength(1);
+        }
     });
 
     // --- pii_hint_low corpus: softer PII, surfaced as fallible hints --------------

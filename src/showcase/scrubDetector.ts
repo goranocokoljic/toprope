@@ -63,31 +63,43 @@ interface DetectorRule {
 }
 
 // Obvious non-secret stand-ins, so a credential-assignment rule doesn't fire on
-// `password = "your_password_here"`. Kept lowercase; compared case-insensitively.
-const PLACEHOLDER_VALUES = [
+// `password = "your_password_here"`. Matched as the WHOLE value (lowercased) — NOT
+// by substring containment, which would suppress real credentials that merely
+// contain one of these words (e.g. `api_key = "secretSauce4242"`), a false negative
+// in the very tier whose contract is reliability.
+const PLACEHOLDER_EXACT = new Set([
     'password',
+    'passwd',
+    'pwd',
+    'secret',
+    'token',
+    'apikey',
     'changeme',
     'change_me',
     'example',
     'placeholder',
     'redacted',
-    'xxxxxx',
-    'your_',
-    'my_',
-    'secret',
-    'token',
     'todo',
-    '<',
-    '****',
-    '...',
-];
+    'null',
+    'none',
+    'undefined',
+]);
 
 function looksLikePlaceholder(value: string): boolean {
     const v = value.trim().toLowerCase();
     if (v.length === 0) {
         return true;
     }
-    return PLACEHOLDER_VALUES.some((p) => v.includes(p));
+    // The whole value is a stand-in word (`secret`, `changeme`, …).
+    if (PLACEHOLDER_EXACT.has(v)) {
+        return true;
+    }
+    // Templating stand-ins: `your_password`, `my-secret`, `<your-key>`, `{{TOKEN}}`,
+    // `xxxxxx`, `******`. These are shapes, not real credential values.
+    if (/^(?:your|my|the|some|a)[_-]/.test(v) || /[<>{}]/.test(v) || /^[x*•.\-_]+$/.test(v)) {
+        return true;
+    }
+    return false;
 }
 
 /**
@@ -143,7 +155,7 @@ const SECRET_RULES: DetectorRule[] = [
         tier: 'secret_high',
         // key (password / secret / api_key / access_token / client_secret / …) then
         // = or : then a quoted-or-bare value of length >= 6. Group 1 is the value.
-        regex: /(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret)\s*[=:]\s*["']?([^\s"']{6,})["']?/gi,
+        regex: /(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret)\s*[=:]\s*["']?([^\s"',;]{6,})["']?/gi,
         valueGroup: 1,
         accept: (m) => !looksLikePlaceholder(m[1] ?? ''),
     },
@@ -180,7 +192,7 @@ const PII_RULES: DetectorRule[] = [
     {
         label: 'possible customer/account id',
         tier: 'pii_hint_low',
-        regex: /\b(?:customer|account|client|user)[_\s-]?id\s*[=:]\s*["']?([^\s"']{2,})["']?/gi,
+        regex: /\b(?:customer|account|client|user)[_\s-]?id\s*[=:]\s*["']?([^\s"',;]{2,})["']?/gi,
         valueGroup: 1,
     },
 ];
@@ -210,10 +222,12 @@ function lineOf(content: string, index: number): number {
  * to recognize; collapses the middle.
  */
 function mask(value: string): string {
-    if (value.length <= 6) {
+    // Reveal at most a 3-char head + 2-char tail, and for short values only the head,
+    // so the masked finding never copies the bulk of a short secret into storage.
+    if (value.length <= 8) {
         return `${value.slice(0, 1)}…`;
     }
-    return `${value.slice(0, 4)}…${value.slice(-2)}`;
+    return `${value.slice(0, 3)}…${value.slice(-2)}`;
 }
 
 /**
@@ -230,7 +244,10 @@ export function detectSensitiveContent(content: string): ScrubFinding[] {
 
     const findings: ScrubFinding[] = [];
     for (const rule of ALL_RULES) {
-        for (const match of content.matchAll(rule.regex)) {
+        // Build a fresh regex per scan so a stray `lastIndex` on the shared module-level
+        // literal can never cause matchAll to skip matches at the start of content.
+        const regex = new RegExp(rule.regex.source, rule.regex.flags);
+        for (const match of content.matchAll(regex)) {
             if (rule.accept && !rule.accept(match)) {
                 continue;
             }
