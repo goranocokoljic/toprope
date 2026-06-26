@@ -12,6 +12,7 @@ import {
 } from '../../src/showcase/publishPaths';
 import {addShowcaseAnnotation} from '../../src/showcase/annotations';
 import {assembleCuratedUnit, curatorsNoteGate, CurationError} from '../../src/showcase/curation';
+import {confirmManualReview} from '../../src/showcase/manualReview';
 import type {PrePublishContext} from '../../src/contributions/stateMachine';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../src/storage/migrations');
@@ -32,10 +33,15 @@ function eventTypes(db: Database.Database, contributionId: string): string[] {
     return listReviewEvents(db, contributionId).map((e) => e.event);
 }
 
-/** Drive a freshly drafted showcase to the `submitted` + developer-approved state. */
+/**
+ * Drive a freshly drafted showcase to the `submitted` + developer-approved +
+ * manual-review-confirmed state — i.e. everything the publish gates (note, consent,
+ * manual review) require, so a valid publish goes through.
+ */
 function submitAndApprove(db: Database.Database, contributionId: string): void {
     submitForReview(db, {contributionId, actorId: DEV});
     approveAsDeveloper(db, {contributionId, developerId: DEV, visibilityScope: 'org'});
+    confirmManualReview(db, {contributionId, actorId: DEV});
 }
 
 /** Blank the curators' note directly, sidestepping the store's draft-time gate. */

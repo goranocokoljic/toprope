@@ -14,6 +14,7 @@ import {
     ShowcasePublishError,
     submitForReview,
 } from '../../src/showcase/publishPaths';
+import {confirmManualReview} from '../../src/showcase/manualReview';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../src/storage/migrations');
 
@@ -66,12 +67,14 @@ describe('showcase publishPaths (#165)', () => {
         expect(getContribution(db, contribution.id)?.state).toBe('submitted');
 
         approveAsDeveloper(db, {contributionId: contribution.id, developerId: DEV, visibilityScope: 'org'});
+        // The mandatory manual review (6.3.6) must be confirmed before publish.
+        confirmManualReview(db, {contributionId: contribution.id, actorId: DEV});
         const published = publishShowcase(db, {contributionId: contribution.id, actorId: DEV});
 
         expect(published.state).toBe('published');
         expect(getContribution(db, contribution.id)?.state).toBe('published');
-        // Audit trail records the full lifecycle.
-        expect(eventTypes(db, contribution.id)).toEqual(['submitted', 'approved', 'published']);
+        // Audit trail records the full lifecycle, including the manual-review confirmation.
+        expect(eventTypes(db, contribution.id)).toEqual(['submitted', 'approved', 'reviewed', 'published']);
         // Consent recorded with the explicit scope the developer chose.
         const consent = getConsent(db, contribution.id, DEV);
         expect(consent?.approved).toBe(true);
@@ -97,7 +100,9 @@ describe('showcase publishPaths (#165)', () => {
 
         submitForReview(db, {contributionId: contribution.id, actorId: MANAGER});
         approveAsDeveloper(db, {contributionId: contribution.id, developerId: DEV, visibilityScope: 'team'});
-        // The manager may publish AFTER the developer approved.
+        // The manager (curator) confirms the mandatory manual review, then may publish
+        // AFTER the developer approved.
+        confirmManualReview(db, {contributionId: contribution.id, actorId: MANAGER});
         const published = publishShowcase(db, {contributionId: contribution.id, actorId: MANAGER});
 
         expect(published.state).toBe('published');
@@ -221,6 +226,7 @@ describe('showcase publishPaths (#165)', () => {
         });
         submitForReview(db, {contributionId: contribution.id, actorId: DEV});
         approveAsDeveloper(db, {contributionId: contribution.id, developerId: DEV, visibilityScope: 'org'});
+        confirmManualReview(db, {contributionId: contribution.id, actorId: DEV});
 
         const calls: string[] = [];
         publishShowcase(db, {
@@ -242,6 +248,7 @@ describe('showcase publishPaths (#165)', () => {
         });
         submitForReview(db, {contributionId: contribution.id, actorId: DEV});
         approveAsDeveloper(db, {contributionId: contribution.id, developerId: DEV, visibilityScope: 'org'});
+        confirmManualReview(db, {contributionId: contribution.id, actorId: DEV});
 
         expect(() =>
             publishShowcase(db, {
