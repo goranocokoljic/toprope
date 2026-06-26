@@ -118,6 +118,28 @@ describe('showcase AI annotation — specific-or-silent filter (#170)', () => {
         }
     });
 
+    it('SUPPRESSES praise built from adjectives outside any fixed allowlist', () => {
+        // The universal substantive-token floor must catch these even though they use
+        // praise words a hand-written allowlist would likely miss (SEC-1).
+        for (const praise of [
+            'Perfect prompt.',
+            'Smart approach.',
+            'Brilliant prompting.',
+            'Beautiful question.',
+            'Elegant and clever.',
+            'Superb, outstanding work!',
+        ]) {
+            expect(filterSpecificOrSilent(praise)).toBeNull();
+        }
+    });
+
+    it('keeps a specific note that merely opens with the word "None"', () => {
+        // Only the exact NONE sentinel is silent — a specific sentence that happens to
+        // start with "None of..." is kept (SEC-3).
+        const specific = 'None of the usual tricks — pastes the failing assertion first to anchor the model.';
+        expect(filterSpecificOrSilent(specific)).toBe(specific);
+    });
+
     it('keeps SPECIFIC content even when it opens with a praise word', () => {
         const specific =
             'Great use of pasting the failing test first, anchoring the model to the exact expected behavior before any code.';

@@ -101,20 +101,37 @@ export function buildAnnotationPrompt(conversation: string): string {
 }
 
 /**
- * Generic-praise patterns. A match alone does NOT suppress — "great use of providing
- * the type signature up front" matches yet is specific. Suppression is decided by
- * {@link filterSpecificOrSilent}: a praise match PLUS too little substantive residual
- * means the praise WAS the whole message. Whole-word / phrase matched, case-insensitive.
+ * Multi-word praise phrases stripped before the substantive-token count, so the praise
+ * words themselves never count as "specific content". Linear-time alternations (no
+ * nested quantifiers — no ReDoS). Case-insensitive, whole-phrase matched.
  */
-const GENERIC_PRAISE_PATTERNS: readonly RegExp[] = [
-    /\b(great|good|nice|excellent|wonderful|fantastic|impressive|solid|strong|amazing|awesome)\s+(job|work|prompt|prompting|use|usage|example|conversation|approach|question)\b/i,
+const GENERIC_PRAISE_PHRASES: readonly RegExp[] = [
     /\bwell[\s-]+(done|crafted|written|structured|phrased|thought[\s-]*out)\b/i,
-    /\b(clear|concise|effective|efficient|thoughtful)\b/i,
     /\bnicely\s+done\b/i,
     /\bkeep\s+(it\s+)?up\b/i,
     /\bgood\s+(prompt\s+engineering|job)\b/i,
+    /\bprompt\s+engineering\b/i,
 ];
 
+/**
+ * Standalone praise ADJECTIVES — the vacuous-compliment vocabulary. These are stripped
+ * (not just matched) before counting substantive tokens, so "Smart, elegant approach"
+ * collapses to "approach" rather than counting smart+elegant as real content. The list
+ * is deliberately broad: the filter must not depend on the model picking one specific
+ * adjective to suppress generic praise (the acceptance criterion is "generic praise is
+ * never stored", not "these particular adjectives are caught"). The real backstop is
+ * the universal substantive-token FLOOR below, which suppresses ANY content-free output
+ * regardless of which adjective it used.
+ */
+const PRAISE_ADJECTIVES =
+    /\b(great|good|nice|excellent|wonderful|fantastic|impressive|solid|strong|amazing|awesome|perfect|smart|brilliant|beautiful|clever|elegant|exceptional|outstanding|terrific|superb|clear|concise|effective|efficient|thoughtful|neat|tidy|clean|cool|sharp)\b/gi;
+
+/**
+ * The minimum number of substantive (technique-bearing) tokens an annotation must carry
+ * to be worth storing. Below this it teaches nothing — a bare compliment or a fragment —
+ * so it is silenced. A genuinely specific technique note ("anchors with the explicit
+ * type signature") clears this comfortably.
+ */
 const MIN_SUBSTANTIVE_TOKENS = 3;
 
 /** Filler/stopwords that don't make an annotation "specific" on their own. */
@@ -123,29 +140,30 @@ const STOPWORDS = new Set([
     'is', 'was', 'were', 'it', 'its', 'as', 'at', 'by', 'be', 'are', 'you', 'your', 'they',
     'very', 'really', 'so', 'too', 'here', 'used', 'use', 'uses', 'using', 'made', 'make',
     'makes', 'did', 'does', 'done', 'their', 'them', 'into', 'just', 'also', 'which', 'who',
-    'what', 'when', 'where', 'how', 'why', 'overall', 'work', 'prompt', 'good', 'great',
+    'what', 'when', 'where', 'how', 'why', 'overall', 'work', 'prompt', 'job', 'example',
+    'approach', 'question', 'usage', 'one', 'none', 'nothing', 'anything', 'something',
 ]);
 
-/** Pull the first word (alphabetic run) out of a string, or '' when there is none. */
-function firstWord(text: string): string {
-    const match = text.match(/[a-z]+/i);
-    return match ? match[0] : '';
-}
-
 /**
- * Count substantive tokens left once generic-praise phrases are stripped: lowercase,
- * remove praise matches, split on non-letters, keep tokens of length >= 3 that aren't
- * stopwords. This is what distinguishes "great prompt, very clear" (residual: nothing)
- * from "great use of an explicit type signature anchor" (residual: explicit, type,
- * signature, anchor).
+ * Count substantive tokens once generic praise is stripped: lowercase, remove praise
+ * phrases and standalone praise adjectives, split on non-letters, keep tokens of length
+ * >= 3 that aren't stopwords. This is what distinguishes "great prompt, very clear"
+ * (residual: nothing) from "great use of an explicit type signature anchor" (residual:
+ * explicit, type, signature, anchor).
  */
 function substantiveTokenCount(text: string): number {
     let stripped = text.toLowerCase();
-    for (const pattern of GENERIC_PRAISE_PATTERNS) {
+    for (const pattern of GENERIC_PRAISE_PHRASES) {
         stripped = stripped.replace(new RegExp(pattern.source, 'gi'), ' ');
     }
+    stripped = stripped.replace(PRAISE_ADJECTIVES, ' ');
     const tokens = stripped.split(/[^a-z]+/i).filter((t) => t.length >= 3 && !STOPWORDS.has(t));
     return tokens.length;
+}
+
+/** Whether the output is the exact `NONE` sentinel (allowing trailing punctuation). */
+function isSilentSentinel(trimmed: string): boolean {
+    return trimmed.replace(/[^a-z]/gi, '').toUpperCase() === SILENT_SENTINEL;
 }
 
 /**
@@ -153,9 +171,10 @@ function substantiveTokenCount(text: string): number {
  * annotation when it is a specific technique, or `null` (silent) when it must be
  * suppressed. Suppressed when:
  *   - the output is empty/whitespace, or
- *   - the first word is the `NONE` sentinel (the model's own "I can't be specific"), or
- *   - the output trips a generic-praise pattern AND has too little substantive content
- *     left once that praise is removed (i.e. it is ONLY praise).
+ *   - it is exactly the `NONE` sentinel (the model's own "I can't be specific"), or
+ *   - it carries too few substantive tokens once generic praise is stripped — the
+ *     UNIVERSAL floor that catches a content-free compliment regardless of which praise
+ *     adjective it used (so the filter never depends on an exhaustive praise allowlist).
  * A specific note is trimmed and capped to one secondary sentence's worth of text.
  */
 export function filterSpecificOrSilent(raw: string): string | null {
@@ -166,11 +185,10 @@ export function filterSpecificOrSilent(raw: string): string | null {
     if (trimmed.length === 0) {
         return null;
     }
-    if (firstWord(trimmed).toUpperCase() === SILENT_SENTINEL) {
+    if (isSilentSentinel(trimmed)) {
         return null;
     }
-    const matchesPraise = GENERIC_PRAISE_PATTERNS.some((p) => p.test(trimmed));
-    if (matchesPraise && substantiveTokenCount(trimmed) < MIN_SUBSTANTIVE_TOKENS) {
+    if (substantiveTokenCount(trimmed) < MIN_SUBSTANTIVE_TOKENS) {
         return null;
     }
     return trimmed.length > MAX_ANNOTATION_CHARS ? `${trimmed.slice(0, MAX_ANNOTATION_CHARS).trimEnd()}…` : trimmed;
