@@ -262,6 +262,27 @@ export function listAnnotations(db: Database.Database, contributionId: string): 
     return rows.map(rowToAnnotation);
 }
 
+/** A single annotation by its id, or undefined when none exists. */
+export function getAnnotation(db: Database.Database, id: string): ShowcaseAnnotation | undefined {
+    const row = db.prepare('SELECT * FROM showcase_annotations WHERE id = ?').get(id) as AnnotationRow | undefined;
+    return row ? rowToAnnotation(row) : undefined;
+}
+
+/**
+ * Replace an annotation's body in place (the live working copy). Returns the updated
+ * annotation, or undefined when no row with that id exists. History of the prior body
+ * is NOT kept in this table — the annotation layer's edit history lives in the unit's
+ * 6.1.3 version lineage (the annotation service snapshots it on every mutation); this
+ * table only ever holds the current annotation set.
+ */
+export function updateAnnotationBody(db: Database.Database, id: string, body: string): ShowcaseAnnotation | undefined {
+    const res = db.prepare('UPDATE showcase_annotations SET body = ? WHERE id = ?').run(body, id);
+    if (res.changes === 0) {
+        return undefined;
+    }
+    return getAnnotation(db, id);
+}
+
 // --- Consent (developer approval + explicit visibility scope) ---------------
 
 /**
