@@ -34,6 +34,7 @@
 import type Database from 'better-sqlite3';
 import type {PrePublishContext, PrePublishHook} from '../contributions/stateMachine';
 import {assembleInlineDisplay, type InlineDisplay} from './annotations';
+import {renderAiAnnotation, type RenderedAiAnnotation} from './aiAnnotation';
 import {getShowcaseUnit} from './unitsStore';
 
 /** Stable error codes a route/service can switch on without matching message text. */
@@ -103,6 +104,13 @@ export interface CuratedUnitView {
     hasOutcomeLink: boolean;
     /** The annotated conversation body, assembled by the canonical 6.3.3 helper. */
     display: InlineDisplay;
+    /**
+     * The optional AI prompt-technique annotation (6.3.7), rendered as a clearly-AI,
+     * SECONDARY footnote. Always present in the view shape (with `present: false` when
+     * none was generated) so a renderer can style it distinctly from — and below —
+     * the human voice (the curators' note + inline developer annotations).
+     */
+    aiAnnotation: RenderedAiAnnotation;
 }
 
 /**
@@ -128,5 +136,8 @@ export function assembleCuratedUnit(db: Database.Database, contributionId: strin
         outcomeLink: unit.outcomeLink,
         hasOutcomeLink: isFilledIn(unit.outcomeLink),
         display,
+        // The AI annotation is the lowest layer: rendered clearly-AI and secondary, it
+        // sits below the human note/outcome/turns rather than among them.
+        aiAnnotation: renderAiAnnotation(unit.aiAnnotation),
     };
 }

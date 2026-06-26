@@ -203,6 +203,19 @@ export const GLOBAL_SETTINGS: Record<string, SettingDef> = {
         teamOverridable: true,
         overrideGovernedBy: 'coaching_managers_can_override',
     },
+    // Whether the optional AI prompt-technique annotation (Task 6.3.7 / #170) may be
+    // generated for showcases. OFF by default — the annotation is an optional,
+    // clearly-AI secondary note, never on without an explicit opt-in. Resolved per
+    // team (a per-team override is honored) and gated by the same
+    // coaching_managers_can_override flag as the other showcase settings, so it
+    // turns on/off in lockstep with the rest of the showcase policy surface.
+    showcase_ai_annotation_enabled: {
+        key: 'showcase_ai_annotation_enabled',
+        type: 'boolean',
+        default: false,
+        teamOverridable: true,
+        overrideGovernedBy: 'coaching_managers_can_override',
+    },
     // The widest sharing scope an org permits for showcased conversations.
     // `team_only` (default) keeps published examples within the author's team;
     // `org_wide` additionally allows org-wide publishing.
