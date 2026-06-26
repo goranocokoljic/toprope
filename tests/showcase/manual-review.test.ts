@@ -170,6 +170,47 @@ describe('showcase mandatory manual-review flow (#169)', () => {
         expect(listScrubFlags(db, other).find((f) => f.id === otherFlag.id)?.resolved).toBe(false);
     });
 
+    it('a redaction AFTER confirmation invalidates the review — publish blocked until re-review (SEC-1)', () => {
+        const id = draftSubmitApprove(db);
+        const secret = addScrubFlag(db, {contributionId: id, tier: 'secret_high', finding: 's'});
+
+        // Curator confirms review of the original content...
+        confirmManualReview(db, {contributionId: id, actorId: CURATOR});
+        expect(assembleReviewPanel(db, id)?.reviewConfirmed).toBe(true);
+
+        // ...then redacts. The redaction mutates the content the curator attested to,
+        // so the prior confirmation no longer applies.
+        redactForReview(db, {
+            contributionId: id,
+            actorId: CURATOR,
+            redactedConversation: '[{"id":"t0","role":"user","text":"my key is [REDACTED]"}]',
+            resolvedFlagIds: [secret.id],
+        });
+        expect(assembleReviewPanel(db, id)?.reviewConfirmed).toBe(false);
+
+        // Publishing the redacted-but-unreviewed content is blocked.
+        expect(() => publishShowcase(db, {contributionId: id, actorId: DEV})).toThrow(ManualReviewError);
+        expect(getContribution(db, id)?.state).toBe('submitted');
+
+        // Re-confirming against the redacted content restores the gate.
+        confirmManualReview(db, {contributionId: id, actorId: CURATOR});
+        expect(assembleReviewPanel(db, id)?.reviewConfirmed).toBe(true);
+        expect(publishShowcase(db, {contributionId: id, actorId: DEV}).state).toBe('published');
+    });
+
+    it('a redaction BEFORE confirmation is the normal flow — confirm then publish works', () => {
+        const id = draftSubmitApprove(db);
+        const secret = addScrubFlag(db, {contributionId: id, tier: 'secret_high', finding: 's'});
+        redactForReview(db, {
+            contributionId: id,
+            actorId: CURATOR,
+            redactedConversation: '[{"id":"t0","role":"user","text":"clean"}]',
+            resolvedFlagIds: [secret.id],
+        });
+        confirmManualReview(db, {contributionId: id, actorId: CURATOR});
+        expect(publishShowcase(db, {contributionId: id, actorId: DEV}).state).toBe('published');
+    });
+
     it('rejects a blank redaction and a redaction on a published unit (fail-closed)', () => {
         const id = draftSubmitApprove(db);
         expect(() =>

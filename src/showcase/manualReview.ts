@@ -37,8 +37,8 @@
  */
 
 import type Database from 'better-sqlite3';
-import {addContributionVersion, addReviewEvent, getContribution} from '../contributions/store';
-import {hasEventForCurrentSubmission, type PrePublishContext, type PrePublishHook} from '../contributions/stateMachine';
+import {addContributionVersion, addReviewEvent, getContribution, listReviewEvents} from '../contributions/store';
+import type {PrePublishContext, PrePublishHook} from '../contributions/stateMachine';
 import type {Contribution, ContributionReviewEvent} from '../contributions/types';
 import {getShowcaseUnit, listScrubFlags, resolveScrubFlag, upsertShowcaseUnit} from './unitsStore';
 import type {ScrubFlag} from './unitsTypes';
@@ -48,6 +48,41 @@ const MANUAL_REVIEW_EVENT = 'reviewed';
 
 /** The audit event recorded when a curator redacts content to resolve flags. */
 const REDACTION_EVENT = 'redacted';
+
+/**
+ * Whether the manual review is confirmed FOR THE CURRENT CONTENT. True only when a
+ * `reviewed` event is the most recent review-relevant checkpoint since the latest
+ * `submitted` — i.e. it comes AFTER any `redacted` event. A redaction mutates the
+ * conversation, so it INVALIDATES an earlier confirmation: the curator attested to
+ * content that no longer ships, and must re-review the redacted version before
+ * publish. Without this, confirm → redact → publish would ship unreviewed content
+ * (the confirmation alone, scoped only to the submission, would still be found).
+ *
+ * Events are walked in the store's total (occurred_at ASC, rowid ASC) order, and the
+ * decision is "whichever of `reviewed`/`redacted` came LAST wins" — so the result is
+ * deterministic even when a redaction and a confirmation share a millisecond (the
+ * rowid tiebreak in the ordering settles it), and stale events from a prior
+ * `submitted` cycle are excluded by starting after the latest `submitted`.
+ */
+function isReviewConfirmedForCurrentContent(db: Database.Database, contributionId: string): boolean {
+    const events = listReviewEvents(db, contributionId);
+    let lastSubmittedIdx = -1;
+    for (let i = 0; i < events.length; i++) {
+        if (events[i].event === 'submitted') {
+            lastSubmittedIdx = i;
+        }
+    }
+    let confirmed = false;
+    for (let i = lastSubmittedIdx + 1; i < events.length; i++) {
+        const ev = events[i].event;
+        if (ev === REDACTION_EVENT) {
+            confirmed = false;
+        } else if (ev === MANUAL_REVIEW_EVENT) {
+            confirmed = true;
+        }
+    }
+    return confirmed;
+}
 
 /** Stable error codes a route/service can switch on without matching message text. */
 export type ManualReviewErrorCode =
@@ -120,7 +155,7 @@ export function assembleReviewPanel(db: Database.Database, contributionId: strin
         piiHintCount: piiHintFlags.length,
         unresolvedSecretCount: secretFlags.filter((f) => !f.resolved).length,
         unresolvedPiiHintCount: piiHintFlags.filter((f) => !f.resolved).length,
-        reviewConfirmed: hasEventForCurrentSubmission(db, contributionId, MANUAL_REVIEW_EVENT),
+        reviewConfirmed: isReviewConfirmedForCurrentContent(db, contributionId),
     };
 }
 
@@ -303,10 +338,12 @@ export function confirmManualReview(db: Database.Database, input: ConfirmReviewI
  *
  * It checks ONLY for the confirmation — never for the scrub flags — so the mandatory
  * review is required even when the auto-flag scrubber found nothing (auto-flag never
- * substitutes for the human review). Fail-closed: no confirmation → no publish.
+ * substitutes for the human review). The confirmation must also be CURRENT: a
+ * redaction after confirmation invalidates it, so the curator re-reviews the redacted
+ * content. Fail-closed: no current confirmation → no publish.
  */
 export const manualReviewGate: PrePublishHook = (ctx: PrePublishContext): void => {
-    if (!hasEventForCurrentSubmission(ctx.db, ctx.contribution.id, MANUAL_REVIEW_EVENT)) {
+    if (!isReviewConfirmedForCurrentContent(ctx.db, ctx.contribution.id)) {
         throw new ManualReviewError(
             'review_not_confirmed',
             `Publish blocked: mandatory manual review is not confirmed for showcase '${ctx.contribution.id}'.`,
