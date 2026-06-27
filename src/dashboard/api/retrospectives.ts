@@ -25,8 +25,6 @@ import type {FastifyInstance, FastifyReply} from 'fastify';
 import type Database from 'better-sqlite3';
 import {requireDeveloperId} from './guards';
 import {getDeveloperById} from '../../registry/developers';
-import {captureGate} from '../../capture/gate';
-import {resolveDeveloperPreferences} from '../../settings/store';
 import {
     answerFollowUp,
     generateRetrospective,
@@ -41,7 +39,8 @@ import {
     listRetrospectivesForDeveloper,
 } from '../../coaching/retrospective/store';
 import {isAnalysisLocation, type AnalysisLocation} from '../../coaching/retrospective/types';
-import {asObject, badRequest, decodeCaptureKey} from './body-validation';
+import {asObject, badRequest, decodeCaptureKey, rejectUnknownKeys} from './body-validation';
+import {cloudAllowedFor, ensureCaptureEnabled} from './coaching-gates';
 
 // Allowlist exactly the fields each route accepts. The generate/follow-up bodies
 // legitimately carry the developer's key (the one transient secret), so unlike the
@@ -61,48 +60,12 @@ const ERROR_STATUS: Record<RetrospectiveErrorCode, number> = {
     decrypt_failed: 422,
 };
 
-function rejectUnknownKeys(obj: Record<string, unknown>, allowed: readonly string[], reply: FastifyReply): boolean {
-    for (const key of Object.keys(obj)) {
-        if (!allowed.includes(key)) {
-            badRequest(reply, `Field '${key}' is not accepted; this route accepts exactly ${allowed.join(', ')}`);
-            return false;
-        }
-    }
-    return true;
-}
-
 /** Send the typed generator error as its mapped HTTP status; rethrow anything else. */
 function sendGeneratorError(err: unknown, reply: FastifyReply): FastifyReply {
     if (err instanceof RetrospectiveError) {
         return reply.status(ERROR_STATUS[err.code]).send({error: 'Retrospective error', code: err.code, message: err.message});
     }
     throw err;
-}
-
-/** Resolve whether cloud analysis is currently permitted for this developer (org permits AND opted in). */
-function cloudAllowedFor(db: Database.Database, userId: string, team: string | null): boolean {
-    return resolveDeveloperPreferences(db, userId, team).cloud_analysis_opt_in?.value === true;
-}
-
-/**
- * Enforce the capture opt-in gate (opt-in #1) for the operations that TRANSIENTLY
- * decrypt session plaintext — generation AND conversational follow-up. Both are
- * "deep analysis" over freshly decrypted prompts, so both are inert (403) once a
- * developer has opted out of capture: opting out must stop new plaintext handling,
- * not just new captures. (Owner-scoped reads/deletes of already-stored output stay
- * ungated — they touch no plaintext.) Returns false and sends the 403 when blocked.
- */
-function ensureCaptureEnabled(db: Database.Database, userId: string, team: string | null, reply: FastifyReply): boolean {
-    const gate = captureGate(db, userId, team);
-    if (!gate.enabled) {
-        reply.status(403).send({
-            error: 'Forbidden',
-            code: 'capture_not_enabled',
-            message: gate.reason ?? 'Prompt capture is not enabled for your account.',
-        });
-        return false;
-    }
-    return true;
 }
 
 export function registerRetrospectiveRoutes(

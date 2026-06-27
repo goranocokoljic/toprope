@@ -11,7 +11,7 @@
 
 import type Database from 'better-sqlite3';
 import {randomUUID} from 'crypto';
-import {isAnalysisLocation, type AnalysisLocation, type Retrospective, type RetrospectiveHighlights, type RetrospectiveOutput} from './types';
+import {decodeAnalysisLocation, type Retrospective, type RetrospectiveHighlights, type RetrospectiveOutput} from './types';
 
 interface RetrospectiveRow {
     id: string;
@@ -28,20 +28,6 @@ interface RetrospectiveRow {
 
 function nowIso(): string {
     return new Date().toISOString();
-}
-
-/**
- * Decode the analysis_location column. The write path only stores a validated
- * value and the DB CHECK enforces it, so an unrecognized value means corruption
- * or a future enum migration; warn (mirroring the capture/realtime decoders) and
- * fall back to the safe 'local' rather than mislabel a cloud run.
- */
-function decodeLocation(raw: string): AnalysisLocation {
-    if (isAnalysisLocation(raw)) {
-        return raw;
-    }
-    console.warn(`[retrospective] unrecognized analysis_location '${raw}'; defaulting to local`);
-    return 'local';
 }
 
 /** Parse the highlights JSON back into the structured shape, or null on absence/corruption. */
@@ -70,7 +56,7 @@ function rowToRetrospective(row: RetrospectiveRow): Retrospective {
         sessionId: row.session_id,
         generatedAt: row.generated_at,
         analysisModel: row.analysis_model,
-        analysisLocation: decodeLocation(row.analysis_location),
+        analysisLocation: decodeAnalysisLocation(row.analysis_location, 'retrospective'),
         retrospectiveText: row.retrospective_text,
         highlights: parseHighlights(row.highlights),
         analyzedCaptureCount: row.analyzed_capture_count,
