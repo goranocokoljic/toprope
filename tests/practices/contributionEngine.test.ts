@@ -5,7 +5,7 @@ import {createContribution, getContribution, listReviewEvents} from '../../src/c
 import {ContributionStateError} from '../../src/contributions/stateMachine';
 import type {NewContribution} from '../../src/contributions/types';
 import {getPracticeDetails, recordFeedback} from '../../src/practices/store';
-import {setTeamSetting} from '../../src/settings/store';
+import {resolveCuratorCapability, setGlobalSetting, setTeamSetting} from '../../src/settings/store';
 import {CONTRIBUTION_MODEL_SETTING_KEY, type ContributionModel} from '../../src/practices/contributionModel';
 import {
     approvePractice,
@@ -525,6 +525,90 @@ describe('contribution-model engine (Task 6.2.2 / #157)', () => {
             const ranked = orderPracticePool(db, 'bottom_up', [a, b]);
             const sortedIds = [a, b].sort();
             expect(ranked.map((r) => r.contributionId)).toEqual(sortedIds);
+        });
+    });
+
+    // --- Task 6.4 / #173: the bestpractices_enabled master switch gates every -----
+    // lifecycle action, and the curator_permission capability drives the lead gate.
+    describe('bestpractices_enabled master switch (Task 6.4)', () => {
+        it('blocks submit/approve/publish/endorse when disabled for the team', () => {
+            setGlobalSetting(db, 'bestpractices_enabled', false);
+            const id = makeDraft(db);
+
+            for (const act of [
+                () => submitPractice(db, {contributionId: id, actorId: 'alice', actorIsLead: false, team: TEAM}),
+                () => approvePractice(db, {contributionId: id, actorId: 'lead', actorIsLead: true, team: TEAM}),
+                () => publishPractice(db, {contributionId: id, actorId: 'lead', actorIsLead: true, team: TEAM}),
+                () => endorsePractice(db, {contributionId: id, actorId: 'lead', actorIsLead: true, team: TEAM}),
+            ]) {
+                try {
+                    act();
+                    throw new Error('expected throw');
+                } catch (err) {
+                    expect(err).toBeInstanceOf(ContributionModelError);
+                    expect((err as ContributionModelError).code).toBe('not_enabled');
+                }
+            }
+            // The draft never advanced — a disabled feature mutated no state.
+            expect(getContribution(db, id)?.state).toBe('draft');
+        });
+
+        it('is gated PER TEAM: a governed override re-enables just one team', () => {
+            setGlobalSetting(db, 'bestpractices_enabled', false);
+            setGlobalSetting(db, 'coaching_managers_can_override', true);
+            setTeamSetting(db, TEAM, 'bestpractices_enabled', true);
+
+            // The enabled team submits fine…
+            const ok = makeDraft(db);
+            expect(submitPractice(db, {contributionId: ok, actorId: 'alice', actorIsLead: false, team: TEAM}).contribution.state).toBe(
+                'submitted',
+            );
+            // …while a team still off is refused.
+            const blocked = makeDraft(db);
+            expect(() =>
+                submitPractice(db, {contributionId: blocked, actorId: 'alice', actorIsLead: false, team: 'other-team'}),
+            ).toThrow(ContributionModelError);
+        });
+
+        it('does NOT gate the read/order path (viewing a pool never errors when off)', () => {
+            const pub = makePublished(db, {title: 'p', timestamp: T1});
+            setGlobalSetting(db, 'bestpractices_enabled', false);
+            // orderPracticePool is a pure read — a toggled-off team still sees its pool.
+            expect(orderPracticePool(db, 'bottom_up', [pub]).map((r) => r.contributionId)).toEqual([pub]);
+        });
+    });
+
+    describe('curator_permission drives the lead/curator capability (Task 6.4)', () => {
+        // The engine takes actorIsLead server-derived; resolveCuratorCapability is the
+        // canonical derivation from the session role + the team's curator_permission.
+        // This composes the two (as the publish route is expected to) and proves the
+        // setting value changes who may publish under top_down — the engine consumes
+        // the resolver's result, not curator_permission directly.
+        it('a developer cannot publish under managers_admins, but can once set to any_member', () => {
+            const id = makeDraft(db);
+            submitPractice(db, {contributionId: id, actorId: 'alice', actorIsLead: false, team: TEAM, timestamp: T1});
+
+            // Default managers_admins: a developer is not a curator → publish refused.
+            const devIsLeadDefault = resolveCuratorCapability(db, 'developer', TEAM);
+            expect(devIsLeadDefault).toBe(false);
+            // Need an approval on record first so the ONLY thing blocking is authority.
+            approvePractice(db, {contributionId: id, actorId: 'lead', actorIsLead: true, team: TEAM, timestamp: T2});
+            expect(() =>
+                publishPractice(db, {contributionId: id, actorId: 'alice', actorIsLead: devIsLeadDefault, team: TEAM}),
+            ).toThrow(ContributionModelError);
+
+            // Widen the policy: now a developer IS a curator and the same publish lands.
+            setGlobalSetting(db, 'curator_permission', 'any_member');
+            const devIsLeadWide = resolveCuratorCapability(db, 'developer', TEAM);
+            expect(devIsLeadWide).toBe(true);
+            const res = publishPractice(db, {
+                contributionId: id,
+                actorId: 'alice',
+                actorIsLead: devIsLeadWide,
+                team: TEAM,
+                timestamp: T3,
+            });
+            expect(res.contribution.state).toBe('published');
         });
     });
 });

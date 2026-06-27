@@ -148,6 +148,83 @@ describe('settings API', () => {
         });
     });
 
+    // Task 6.4 / #173: the two new Phase 6 policy switches flow through the same
+    // admin-gated global/team routes; assert they persist, validate, and stay
+    // admin-only (non-admins cannot change org policy).
+    describe('Phase 6 settings extensions (Task 6.4)', () => {
+        it('exposes the new keys with their defaults (opt-out master switch, managers_admins)', async () => {
+            const res = await app.inject({method: 'GET', url: '/api/settings/global', headers: authHeaders(adminToken)});
+            expect(res.statusCode).toBe(200);
+            expect(res.json().data).toMatchObject({
+                bestpractices_enabled: true,
+                curator_permission: 'managers_admins',
+            });
+        });
+
+        it('admin can patch both new keys and they persist', async () => {
+            const res = await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/global',
+                headers: authHeaders(adminToken),
+                payload: {bestpractices_enabled: false, curator_permission: 'any_member'},
+            });
+            expect(res.statusCode).toBe(200);
+            const reread = await app.inject({method: 'GET', url: '/api/settings/global', headers: authHeaders(adminToken)});
+            expect(reread.json().data.bestpractices_enabled).toBe(false);
+            expect(reread.json().data.curator_permission).toBe('any_member');
+        });
+
+        it('rejects a curator_permission value outside the allowed enum set', async () => {
+            const res = await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/global',
+                headers: authHeaders(adminToken),
+                payload: {curator_permission: 'everyone'},
+            });
+            expect(res.statusCode).toBe(400);
+        });
+
+        it('a non-admin developer cannot change either org-policy key', async () => {
+            const res = await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/global',
+                headers: authHeaders(devToken),
+                payload: {bestpractices_enabled: false},
+            });
+            expect(res.statusCode).toBe(403);
+            // …and the policy is untouched.
+            const reread = await app.inject({method: 'GET', url: '/api/settings/global', headers: authHeaders(adminToken)});
+            expect(reread.json().data.bestpractices_enabled).toBe(true);
+        });
+
+        it('a per-team override of bestpractices_enabled is gated by coaching_managers_can_override', async () => {
+            // Flag off → the team PATCH is rejected as a governed override.
+            const blocked = await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/team/frontend',
+                headers: authHeaders(adminToken),
+                payload: {bestpractices_enabled: false},
+            });
+            expect(blocked.statusCode).toBe(403);
+
+            // Enable the governing flag, then the same override is accepted and resolves.
+            await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/global',
+                headers: authHeaders(adminToken),
+                payload: {coaching_managers_can_override: true},
+            });
+            const ok = await app.inject({
+                method: 'PATCH',
+                url: '/api/settings/team/frontend',
+                headers: authHeaders(adminToken),
+                payload: {bestpractices_enabled: false},
+            });
+            expect(ok.statusCode).toBe(200);
+            expect(ok.json().data.effective.bestpractices_enabled).toBe(false);
+        });
+    });
+
     describe('team settings', () => {
         it('rejects a team override when the governing flag is off', async () => {
             const res = await app.inject({
