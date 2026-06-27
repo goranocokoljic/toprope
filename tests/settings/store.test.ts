@@ -19,6 +19,8 @@ import {
     setDeveloperPreference,
     isCoachingPillar1Enabled,
     isCoachingPillar2Enabled,
+    isBestPracticesEnabledForTeam,
+    resolveCuratorCapability,
 } from '../../src/settings/store';
 import {createUser} from '../../src/auth/users';
 import {hashPassword} from '../../src/auth/password';
@@ -84,6 +86,8 @@ describe('settings store', () => {
                     'nudge_dismissible_default',
                     'coaching_managers_can_override',
                     'best_practice_contribution_model',
+                    'bestpractices_enabled',
+                    'curator_permission',
                 ].sort(),
             );
         });
@@ -232,6 +236,88 @@ describe('settings store', () => {
                 "INSERT INTO settings (scope, scope_name, key, value, updated_at) VALUES ('global','','anomaly_alert_min_severity',?, ?)",
             ).run(JSON.stringify('catastrophic'), '2026-01-01T00:00:00.000Z');
             expect(getGlobalSetting(db, 'anomaly_alert_min_severity')).toBe('notable');
+        });
+    });
+
+    // Task 6.4 / #173: the two new Phase 6 policy switches, resolved through the same
+    // global-default + governed per-team-override machinery as everything above.
+    describe('Phase 6 settings extensions (Task 6.4)', () => {
+        describe('bestpractices_enabled (master switch)', () => {
+            it('defaults ON (opt-out), unlike the privacy-opt-in showcase switch', () => {
+                expect(getGlobalSetting(db, 'bestpractices_enabled')).toBe(true);
+                expect(isBestPracticesEnabledForTeam(db, 'frontend')).toBe(true);
+                // No team / global resolution agrees with the per-team resolver.
+                expect(isBestPracticesEnabledForTeam(db)).toBe(true);
+            });
+
+            it('a global off-switch disables it everywhere', () => {
+                setGlobalSetting(db, 'bestpractices_enabled', false);
+                expect(isBestPracticesEnabledForTeam(db, 'frontend')).toBe(false);
+                expect(isBestPracticesEnabledForTeam(db, 'backend')).toBe(false);
+            });
+
+            it('a per-team override is honored ONLY when coaching_managers_can_override is on', () => {
+                setGlobalSetting(db, 'bestpractices_enabled', false);
+                setTeamSetting(db, 'frontend', 'bestpractices_enabled', true);
+
+                // Flag off → the stored override is inert, global (off) wins.
+                expect(isBestPracticesEnabledForTeam(db, 'frontend')).toBe(false);
+
+                // Flag on → the team override re-enables just this team.
+                setGlobalSetting(db, 'coaching_managers_can_override', true);
+                expect(isBestPracticesEnabledForTeam(db, 'frontend')).toBe(true);
+                // A team without an override still follows the global off value.
+                expect(isBestPracticesEnabledForTeam(db, 'backend')).toBe(false);
+            });
+
+            it('disabling the governing flag discards the override (no resurrection)', () => {
+                setGlobalSetting(db, 'coaching_managers_can_override', true);
+                setGlobalSetting(db, 'bestpractices_enabled', false);
+                setTeamSetting(db, 'frontend', 'bestpractices_enabled', true);
+                expect(isBestPracticesEnabledForTeam(db, 'frontend')).toBe(true);
+
+                clearOverridesGovernedBy(db, 'coaching_managers_can_override');
+                setGlobalSetting(db, 'coaching_managers_can_override', false);
+                // Re-enabling the flag falls back to the global (off), not the old override.
+                setGlobalSetting(db, 'coaching_managers_can_override', true);
+                expect(isBestPracticesEnabledForTeam(db, 'frontend')).toBe(false);
+            });
+        });
+
+        describe('curator_permission (who may curate)', () => {
+            it('defaults to managers_admins: only admins curate, not developers', () => {
+                expect(getGlobalSetting(db, 'curator_permission')).toBe('managers_admins');
+                expect(resolveCuratorCapability(db, 'admin', 'frontend')).toBe(true);
+                expect(resolveCuratorCapability(db, 'developer', 'frontend')).toBe(false);
+            });
+
+            it('any_member widens the capability to every authenticated role', () => {
+                setGlobalSetting(db, 'curator_permission', 'any_member');
+                expect(resolveCuratorCapability(db, 'admin', 'frontend')).toBe(true);
+                expect(resolveCuratorCapability(db, 'developer', 'frontend')).toBe(true);
+            });
+
+            it('is FAIL-CLOSED: an unrecognized stored value falls back to managers_admins', () => {
+                // Hand-write a value outside the allowed set (bypassing coercion); the
+                // resolver must NOT treat it as permissive — only admins curate.
+                db.prepare(
+                    "INSERT INTO settings (scope, scope_name, key, value, updated_at) VALUES ('global','','curator_permission',?, ?)",
+                ).run(JSON.stringify('everyone'), '2026-01-01T00:00:00.000Z');
+                expect(resolveCuratorCapability(db, 'developer', 'frontend')).toBe(false);
+                expect(resolveCuratorCapability(db, 'admin', 'frontend')).toBe(true);
+            });
+
+            it('honors a per-team override only when the governing flag is on', () => {
+                setTeamSetting(db, 'frontend', 'curator_permission', 'any_member');
+                // Flag off → override inert, org default (managers_admins) wins for a developer.
+                expect(resolveCuratorCapability(db, 'developer', 'frontend')).toBe(false);
+
+                setGlobalSetting(db, 'coaching_managers_can_override', true);
+                // Flag on → the frontend team's flatter model lets a developer curate…
+                expect(resolveCuratorCapability(db, 'developer', 'frontend')).toBe(true);
+                // …while a team without the override keeps the stricter org default.
+                expect(resolveCuratorCapability(db, 'developer', 'backend')).toBe(false);
+            });
         });
     });
 

@@ -471,3 +471,44 @@ export function isCoachingPillar2Enabled(db: Database.Database, team?: string | 
 export function isCoachingCapturePermitted(db: Database.Database, team?: string | null): boolean {
     return resolveSetting(db, 'coaching_capture_permitted', team) === true;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 6 settings extensions (Task 6.4 / #173)
+//
+// Convenience resolvers for the two new Phase 6 policy switches, alongside the
+// leaderboard/ROI/coaching resolvers above. These give the best-practice engine
+// and showcase curation a typed seam onto `bestpractices_enabled` and
+// `curator_permission` instead of stringly-typed resolveSetting calls, so the
+// gate/capability rule lives here once rather than being re-derived per caller.
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether the best-practices feature is enabled for a team (the master switch).
+ * Resolved live so an org/team turning it off takes effect immediately; the
+ * contribution engine consults this before any submit/approve/publish/endorse, so
+ * a disabled team's best-practice lifecycle is inert. Defaults ON (see the
+ * registry) — best practices has shipped always-on, so this is an opt-out.
+ */
+export function isBestPracticesEnabledForTeam(db: Database.Database, team?: string | null): boolean {
+    return resolveSetting(db, 'bestpractices_enabled', team) === true;
+}
+
+/**
+ * Whether a user with the given authenticated `role` may act as a lead/curator for
+ * a team, per `curator_permission`. This is the canonical, server-side derivation
+ * of the `actorIsLead` capability the contribution engine and showcase curation
+ * gate on — a caller resolves it from the SESSION role, never from client input.
+ *
+ * FAIL-CLOSED: only the explicitly-permissive `any_member` value grants the
+ * capability to a non-admin. Any other resolved value — the `managers_admins`
+ * default, or an unrecognized string from registry drift / a hand-edited row —
+ * falls through to the restrictive branch, where only the `admin` role qualifies.
+ * So a typo can never accidentally widen who may curate.
+ */
+export function resolveCuratorCapability(db: Database.Database, role: string, team?: string | null): boolean {
+    if (resolveSetting(db, 'curator_permission', team) === 'any_member') {
+        return true;
+    }
+    // managers_admins (default) and any unrecognized value: admin/manager role only.
+    return role === 'admin';
+}

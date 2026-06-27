@@ -675,13 +675,22 @@ export interface GlobalSettings {
     coaching_cloud_analysis_permitted: boolean;
     showcase_enabled: boolean;
     showcase_scope_permitted: ShowcaseScope;
+    showcase_ai_annotation_enabled: boolean;
     nudge_default_frequency: NudgeFrequency;
     nudge_dismissible_default: boolean;
     coaching_managers_can_override: boolean;
+    // Phase 6 settings extensions (Task 6.4 / #173).
+    best_practice_contribution_model: ContributionModel;
+    bestpractices_enabled: boolean;
+    curator_permission: CuratorPermission;
 }
 
 /** Closed value sets for the coaching enum settings/preferences (Task 5.10). */
 export type ShowcaseScope = 'team_only' | 'org_wide';
+// `ContributionModel` (the three best-practice models) is declared with the
+// best-practice browse types below and reused here for best_practice_contribution_model.
+/** Who may act as a lead/curator (Task 6.4 / #173). */
+export type CuratorPermission = 'managers_admins' | 'any_member';
 export type NudgeFrequency = 'low' | 'normal' | 'high';
 export type CaptureMechanism = 'local_agent' | 'editor_extension';
 export type CaptureRecoveryChoice = 'no_recovery' | 'recovery_path';
