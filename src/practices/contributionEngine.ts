@@ -29,6 +29,7 @@ import {
 } from '../contributions/stateMachine';
 import type {Contribution} from '../contributions/types';
 import {getContribution} from '../contributions/store';
+import {isBestPracticesEnabledForTeam} from '../settings/store';
 import {getFeedbackCounts, getPracticeDetails, setPracticeEndorsed} from './store';
 import {feedbackRankScore, helpfulRatio} from './feedback';
 import {
@@ -41,6 +42,7 @@ import {
 
 /** Stable error codes the caller can map to an HTTP status without matching message text. */
 export type ContributionModelErrorCode =
+    | 'not_enabled' // the best-practices feature is disabled for this team (master switch, Task 6.4)
     | 'not_authorized' // the actor's capability is insufficient for this action under the active model
     | 'not_applicable' // the action is meaningless under the active model (e.g. endorse when not hybrid)
     | 'not_published'; // the action requires a published contribution (e.g. endorsing a draft/removed practice)
@@ -91,6 +93,24 @@ export interface PublishPracticeInput extends BaseEngineInput {
 
 export type EndorsePracticeInput = BaseEngineInput;
 
+/**
+ * Assert the best-practices feature is enabled for `team` before any lifecycle
+ * action (the Task 6.4 master switch). Resolved live from `bestpractices_enabled`,
+ * so a team for which an admin has turned best practices off cannot submit, approve,
+ * publish, or endorse — the whole contribution lifecycle is inert. Throws the typed
+ * `not_enabled` error (fail-closed) rather than letting a disabled team silently
+ * mutate state. Read paths (e.g. {@link orderPracticePool}) are NOT gated here — a
+ * team toggled off should not error when merely viewing an already-published pool.
+ */
+function assertBestPracticesEnabled(db: Database.Database, team?: string | null): void {
+    if (!isBestPracticesEnabledForTeam(db, team)) {
+        throw new ContributionModelError(
+            'not_enabled',
+            'The best-practices feature is disabled for this team.',
+        );
+    }
+}
+
 /** The active model + gate that governed an engine action, returned alongside its result. */
 export interface ModelOutcome {
     model: ContributionModel;
@@ -119,6 +139,7 @@ export interface PublishPracticeResult extends ModelOutcome {
  * it. Propagates `ContributionStateError` (e.g. the contribution is not a draft).
  */
 export function submitPractice(db: Database.Database, input: SubmitPracticeInput): SubmitPracticeResult {
+    assertBestPracticesEnabled(db, input.team);
     const model = resolveContributionModel(db, input.team);
     const gate = gateForModel(model);
     const contribution = smSubmit(db, {
@@ -144,6 +165,7 @@ export function submitPractice(db: Database.Database, input: SubmitPracticeInput
  * contribution is not in `submitted`).
  */
 export function approvePractice(db: Database.Database, input: ApprovePracticeInput): ModelOutcome {
+    assertBestPracticesEnabled(db, input.team);
     const model = resolveContributionModel(db, input.team);
     const gate = gateForModel(model);
     if (gate !== 'required-approval') {
@@ -183,6 +205,7 @@ export function approvePractice(db: Database.Database, input: ApprovePracticeInp
  * no approval, or `illegal_transition` when the contribution is not `submitted`).
  */
 export function publishPractice(db: Database.Database, input: PublishPracticeInput): PublishPracticeResult {
+    assertBestPracticesEnabled(db, input.team);
     const model = resolveContributionModel(db, input.team);
     const gate = gateForModel(model);
     if (modelRequiresLeadToPublish(model) && !input.actorIsLead) {
@@ -224,6 +247,7 @@ export function endorsePractice(
     db: Database.Database,
     input: EndorsePracticeInput & {endorsed?: boolean},
 ): ModelOutcome {
+    assertBestPracticesEnabled(db, input.team);
     const model = resolveContributionModel(db, input.team);
     const gate = gateForModel(model);
     if (!modelUsesEndorsement(model)) {

@@ -43,6 +43,12 @@ export const SHOWCASE_SCOPE_OPTIONS = ['team_only', 'org_wide'] as const;
 // engine so the registry enum and the engine's model union validate identically.
 export const CONTRIBUTION_MODEL_OPTIONS = ['top_down', 'bottom_up', 'hybrid'] as const;
 export const NUDGE_FREQUENCY_OPTIONS = ['low', 'normal', 'high'] as const;
+// Who may act as a best-practice/showcase lead/curator (Task 6.4 / #173).
+// `managers_admins` (default) restricts the lead/curator capability to the
+// admin/manager role; `any_member` widens it to any authenticated member. Shared
+// with the capability resolver so the registry enum and the resolver validate the
+// same closed set.
+export const CURATOR_PERMISSION_OPTIONS = ['managers_admins', 'any_member'] as const;
 export const CAPTURE_MECHANISM_OPTIONS = ['local_agent', 'editor_extension'] as const;
 export const CAPTURE_RECOVERY_OPTIONS = ['no_recovery', 'recovery_path'] as const;
 
@@ -267,6 +273,44 @@ export const GLOBAL_SETTINGS: Record<string, SettingDef> = {
         default: 'top_down',
         allowed: CONTRIBUTION_MODEL_OPTIONS,
         teamOverridable: true,
+    },
+    // --- Phase 6 settings extensions (Task 6.4 / #173) --------------------
+    //
+    // The two new Phase 6 policy switches that did not already exist on the
+    // settings system. The contribution model (above) and the showcase_*
+    // settings were landed by their own 6.2/6.3 tasks; 6.4 consolidates the
+    // remaining two here so every Phase 6 setting lives on the one global-default
+    // + per-team-override + permission-toggle system. Both are gated by the same
+    // coaching_managers_can_override umbrella flag as the other Phase 6 settings,
+    // so per-team overrides turn on/off in lockstep with the rest of the surface.
+
+    // Master switch for the best-practices feature. Unlike showcase_enabled (a
+    // privacy-sensitive opt-IN that defaults off), best practices has shipped as
+    // always-on since 6.2, so this is an opt-OUT: it defaults `true` to preserve
+    // that behavior, and turning it off makes the contribution lifecycle inert for
+    // a team (submit/approve/publish/endorse are refused) — the master gate the
+    // contribution engine resolves before acting.
+    bestpractices_enabled: {
+        key: 'bestpractices_enabled',
+        type: 'boolean',
+        default: true,
+        teamOverridable: true,
+        overrideGovernedBy: 'coaching_managers_can_override',
+    },
+    // Who may act as a lead/curator. The policy a caller resolves (via
+    // resolveCuratorCapability) into the server-derived `actorIsLead` capability the
+    // contribution engine takes — not yet consumed by an HTTP route in this phase
+    // (the engine functions have no route caller yet). `managers_admins` (default —
+    // the "manager/admin role" the task calls for) restricts the capability to the
+    // admin role; `any_member` widens it to any authenticated member. Resolved per
+    // team so a team can be permitted a flatter curation model than the org default.
+    curator_permission: {
+        key: 'curator_permission',
+        type: 'enum',
+        default: 'managers_admins',
+        allowed: CURATOR_PERMISSION_OPTIONS,
+        teamOverridable: true,
+        overrideGovernedBy: 'coaching_managers_can_override',
     },
 };
 

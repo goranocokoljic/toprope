@@ -75,9 +75,13 @@ const DEFAULT_GLOBAL: GlobalSettings = {
     coaching_cloud_analysis_permitted: false,
     showcase_enabled: false,
     showcase_scope_permitted: 'team_only',
+    showcase_ai_annotation_enabled: false,
     nudge_default_frequency: 'normal',
     nudge_dismissible_default: true,
     coaching_managers_can_override: false,
+    best_practice_contribution_model: 'top_down',
+    bestpractices_enabled: true,
+    curator_permission: 'managers_admins',
 };
 
 // Minimal effective anomaly config for the AnomalyDetectionPanel fetch.
@@ -122,6 +126,12 @@ function teamSettings(): TeamSettings {
             survey_anomaly_auto: global.survey_managers_can_override,
             anomaly_alerts_enabled: global.anomaly_managers_can_override,
             anomaly_alert_min_severity: global.anomaly_managers_can_override,
+            // Phase 6 (Task 6.4): the master switch and curator permission are gated
+            // by coaching_managers_can_override; the contribution model is always
+            // team-switchable (no governing flag), mirroring the backend registry.
+            bestpractices_enabled: global.coaching_managers_can_override,
+            best_practice_contribution_model: true,
+            curator_permission: global.coaching_managers_can_override,
         },
     };
 }
@@ -250,6 +260,35 @@ describe('Settings page', () => {
         // Wait for the loaded form (the loading card shares the panel title).
         expect(await screen.findByText('ROI threshold')).toBeInTheDocument();
         expect(screen.getByText('Global settings')).toBeInTheDocument();
+    });
+
+    it('renders the Phase 6 Best Practices section and its settings (Task 6.4)', async () => {
+        renderSettings();
+        // The new section heading and its three controls are present in the global panel.
+        expect(await screen.findByText('Best Practices')).toBeInTheDocument();
+        expect(screen.getByText('Best practices enabled')).toBeInTheDocument();
+        expect(screen.getByText('Contribution model')).toBeInTheDocument();
+        expect(screen.getByText('Who may act as lead/curator')).toBeInTheDocument();
+        // The showcase AI-annotation toggle is now surfaced too.
+        expect(screen.getByText('Showcase AI annotation enabled')).toBeInTheDocument();
+    });
+
+    it('saves a Best Practices global change via the standard panel PATCH (Task 6.4)', async () => {
+        renderSettings();
+        // The contribution-model select is the Best Practices enum; switch it and save.
+        const select = (await screen.findByLabelText('Contribution model')) as HTMLSelectElement;
+        fireEvent.change(select, {target: {value: 'hybrid'}});
+        fireEvent.click(screen.getByRole('button', {name: /save global settings/i}));
+        await waitFor(() => {
+            const patch = fetchMock.mock.calls.find(
+                (c) =>
+                    String(c[0]).includes('/api/settings/global') &&
+                    (c[1]?.method ?? 'GET').toUpperCase() === 'PATCH',
+            );
+            expect(patch).toBeTruthy();
+            const sent = JSON.parse(String(patch?.[1]?.body)) as Record<string, unknown>;
+            expect(sent.best_practice_contribution_model).toBe('hybrid');
+        });
     });
 
     it('clearing a global number field saves cleanly (no error, finite value sent)', async () => {
