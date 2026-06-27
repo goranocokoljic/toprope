@@ -297,6 +297,17 @@ describe('settings store', () => {
                 expect(resolveCuratorCapability(db, 'developer', 'frontend')).toBe(true);
             });
 
+            it('the normal coercion path folds an out-of-enum stored value back to the default on read', () => {
+                // Independently of the resolver, the registry re-coercion (decodeStored)
+                // must return the managers_admins default for a drifted/hand-edited value,
+                // so the fail-closed guarantee does not rely solely on the resolver's
+                // `=== any_member` check (guards against a later positive-equality rewrite).
+                db.prepare(
+                    "INSERT INTO settings (scope, scope_name, key, value, updated_at) VALUES ('global','','curator_permission',?, ?)",
+                ).run(JSON.stringify('everyone'), '2026-01-01T00:00:00.000Z');
+                expect(getGlobalSetting(db, 'curator_permission')).toBe('managers_admins');
+            });
+
             it('is FAIL-CLOSED: an unrecognized stored value falls back to managers_admins', () => {
                 // Hand-write a value outside the allowed set (bypassing coercion); the
                 // resolver must NOT treat it as permissive — only admins curate.

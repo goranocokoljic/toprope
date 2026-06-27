@@ -581,7 +581,9 @@ describe('contribution-model engine (Task 6.2.2 / #157)', () => {
     describe('curator_permission drives the lead/curator capability (Task 6.4)', () => {
         // The engine takes actorIsLead server-derived; resolveCuratorCapability is the
         // canonical derivation from the session role + the team's curator_permission.
-        // This proves the setting VALUE actually changes who may publish under top_down.
+        // This composes the two (as the publish route is expected to) and proves the
+        // setting value changes who may publish under top_down — the engine consumes
+        // the resolver's result, not curator_permission directly.
         it('a developer cannot publish under managers_admins, but can once set to any_member', () => {
             const id = makeDraft(db);
             submitPractice(db, {contributionId: id, actorId: 'alice', actorIsLead: false, team: TEAM, timestamp: T1});

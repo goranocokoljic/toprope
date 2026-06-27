@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3';
+import type {UserRole} from '../auth/types';
 import {
     DEVELOPER_PREFERENCES,
     GLOBAL_SETTINGS,
@@ -476,10 +477,13 @@ export function isCoachingCapturePermitted(db: Database.Database, team?: string 
 // Phase 6 settings extensions (Task 6.4 / #173)
 //
 // Convenience resolvers for the two new Phase 6 policy switches, alongside the
-// leaderboard/ROI/coaching resolvers above. These give the best-practice engine
-// and showcase curation a typed seam onto `bestpractices_enabled` and
-// `curator_permission` instead of stringly-typed resolveSetting calls, so the
-// gate/capability rule lives here once rather than being re-derived per caller.
+// leaderboard/ROI/coaching resolvers above. These give downstream consumers a
+// typed seam onto `bestpractices_enabled` and `curator_permission` instead of
+// stringly-typed resolveSetting calls, so the gate/capability rule lives here once
+// rather than being re-derived per caller. `isBestPracticesEnabledForTeam` already
+// has its production consumer (the contribution engine); `resolveCuratorCapability`
+// is the policy primitive that ships with its setting, ready for the publish/endorse
+// HTTP route to consume (see its own note).
 // ---------------------------------------------------------------------------
 
 /**
@@ -495,17 +499,27 @@ export function isBestPracticesEnabledForTeam(db: Database.Database, team?: stri
 
 /**
  * Whether a user with the given authenticated `role` may act as a lead/curator for
- * a team, per `curator_permission`. This is the canonical, server-side derivation
- * of the `actorIsLead` capability the contribution engine and showcase curation
- * gate on — a caller resolves it from the SESSION role, never from client input.
+ * a team, per `curator_permission`. This is the canonical, server-side derivation a
+ * caller should use to compute the `actorIsLead` capability the contribution engine
+ * takes — resolved from the SESSION role, never from client input.
+ *
+ * No production route consumes it yet: the engine lifecycle functions
+ * (`publishPractice`/`endorsePractice`/…) take `actorIsLead` as a server-derived
+ * input and have no HTTP route caller in this phase. This resolver is the policy
+ * primitive landed alongside the `curator_permission` setting so that whoever wires
+ * the publish/endorse route derives `actorIsLead` from HERE rather than re-deriving
+ * a role check at the call site (the engine itself does NOT enforce it). A test
+ * composes this resolver with `publishPractice` to prove the setting value changes
+ * who may publish.
  *
  * FAIL-CLOSED: only the explicitly-permissive `any_member` value grants the
  * capability to a non-admin. Any other resolved value — the `managers_admins`
  * default, or an unrecognized string from registry drift / a hand-edited row —
  * falls through to the restrictive branch, where only the `admin` role qualifies.
- * So a typo can never accidentally widen who may curate.
+ * So a typo can never accidentally widen who may curate. (`admin` is the entire
+ * privileged set today; a future `manager` role would be added to this branch.)
  */
-export function resolveCuratorCapability(db: Database.Database, role: string, team?: string | null): boolean {
+export function resolveCuratorCapability(db: Database.Database, role: UserRole, team?: string | null): boolean {
     if (resolveSetting(db, 'curator_permission', team) === 'any_member') {
         return true;
     }

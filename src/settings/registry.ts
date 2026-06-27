@@ -297,9 +297,11 @@ export const GLOBAL_SETTINGS: Record<string, SettingDef> = {
         teamOverridable: true,
         overrideGovernedBy: 'coaching_managers_can_override',
     },
-    // Who may act as a lead/curator (the server-derived `actorIsLead` capability
-    // the contribution engine and showcase curation gate on). `managers_admins`
-    // (default — the "manager/admin role" the task calls for) restricts it to the
+    // Who may act as a lead/curator. The policy a caller resolves (via
+    // resolveCuratorCapability) into the server-derived `actorIsLead` capability the
+    // contribution engine takes — not yet consumed by an HTTP route in this phase
+    // (the engine functions have no route caller yet). `managers_admins` (default —
+    // the "manager/admin role" the task calls for) restricts the capability to the
     // admin role; `any_member` widens it to any authenticated member. Resolved per
     // team so a team can be permitted a flatter curation model than the org default.
     curator_permission: {
