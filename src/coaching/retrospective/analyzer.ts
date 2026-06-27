@@ -22,20 +22,13 @@
  * developer's data and emits no comparative language by construction.
  */
 
-import type {LoopEventMeta} from '../realtime/types';
+import {BRIEF_PROMPT_WORDS, computeSignals, type SessionAnalysisInput, type SessionSignals} from '../sessionSignals';
 import type {AnalysisLocation, RetrospectiveHighlights} from './types';
 
-/** The input one analysis run receives. Plaintext is transient — callers never persist/log it. */
-export interface SessionAnalysisInput {
-    sessionId: string;
-    /**
-     * The decrypted prompts/responses for the session, concatenated. Present only
-     * in memory for the duration of the call; an analyser must not log or echo it.
-     */
-    plaintext: string;
-    /** Non-sensitive loop metadata (Task 5.6) for this session — counts/timestamps only. */
-    loopEvents: LoopEventMeta[];
-}
+// The transient-session input is shared with the improvement tool (Task 6.5); it
+// lives in ../sessionSignals as the single home. Re-export it here so existing
+// importers (generator, tests) keep their `./analyzer` import path.
+export type {SessionAnalysisInput} from '../sessionSignals';
 
 /** The narrative + highlights an analysis run produces. */
 export interface AnalysisResult {
@@ -59,48 +52,6 @@ export interface RetrospectiveAnalyzer {
 
 /** Default model name for the bundled heuristic analyser. */
 export const LOCAL_DEFAULT_MODEL = 'local-default';
-
-/** A prompt is "brief" below this many words — a soft signal it may be underspecified. */
-const BRIEF_PROMPT_WORDS = 5;
-
-/** Derived, NON-sensitive signals about a session — counts only, never prompt text. */
-interface SessionSignals {
-    promptCount: number;
-    briefPromptCount: number;
-    loopCount: number;
-    /** Total similar-prompt repetitions across detected loops (rough "wasted turns" proxy). */
-    loopRepetitions: number;
-    /** Whether at least one prompt carried context an analyser values (errors, code, paths). */
-    hasContext: boolean;
-}
-
-/** Split the plaintext into individual prompts. Matches `prompt:`/`user:` turn
- * markers when present, else falls back to non-empty lines. */
-function extractPrompts(plaintext: string): string[] {
-    const lines = plaintext.split(/\r?\n/);
-    const marked = lines
-        .map((line) => /^\s*(prompt|user)\s*:(.*)$/i.exec(line))
-        .filter((m): m is RegExpExecArray => m !== null)
-        .map((m) => m[2].trim())
-        .filter((s) => s.length > 0);
-    if (marked.length > 0) {
-        return marked;
-    }
-    return lines.map((l) => l.trim()).filter((l) => l.length > 0);
-}
-
-/** Compute the within-developer signals the heuristic narrative is built from. */
-function computeSignals(input: SessionAnalysisInput): SessionSignals {
-    const prompts = extractPrompts(input.plaintext);
-    const briefPromptCount = prompts.filter((p) => p.split(/\s+/).filter(Boolean).length < BRIEF_PROMPT_WORDS).length;
-    // Context markers an analyser would reward: an error/stack trace, a fenced code
-    // block, or a file path — all signals the developer gave the model something to
-    // work with. Checked over the whole plaintext, case-insensitively.
-    const hasContext = /```|error|exception|stack trace|\.\w{1,5}:\d+|\/[\w./-]+\.\w+/i.test(input.plaintext);
-    const loopCount = input.loopEvents.length;
-    const loopRepetitions = input.loopEvents.reduce((sum, e) => sum + Math.max(0, e.similarPromptCount), 0);
-    return {promptCount: prompts.length, briefPromptCount, loopCount, loopRepetitions, hasContext};
-}
 
 /**
  * The bundled, self-contained LOCAL analyser. Deterministic and network-free: it

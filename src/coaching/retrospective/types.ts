@@ -14,6 +14,22 @@ export function isAnalysisLocation(value: unknown): value is AnalysisLocation {
 }
 
 /**
+ * Decode a stored analysis_location string back to the enum. The write path only
+ * stores a validated value and the DB CHECK enforces it, so an unrecognized value
+ * means corruption or a future enum migration; warn (tagged with the calling
+ * feature) and fall back to the safe 'local' rather than mislabel a cloud run.
+ * Shared by every deep-coaching store so the two features can't fork the decoder
+ * (a recurring review finding) — the only difference, the log tag, is a parameter.
+ */
+export function decodeAnalysisLocation(raw: string, tag: string): AnalysisLocation {
+    if (isAnalysisLocation(raw)) {
+        return raw;
+    }
+    console.warn(`[${tag}] unrecognized analysis_location '${raw}'; defaulting to local`);
+    return 'local';
+}
+
+/**
  * Structured "what worked / what to improve" highlights produced alongside the
  * narrative. Both lists are within-developer observations — never a comparison to
  * peers — so the shape carries no other developer's identity or metrics.

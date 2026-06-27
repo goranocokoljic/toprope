@@ -33,6 +33,7 @@ import {registerCaptureRoutes} from './dashboard/api/captures';
 import {registerKeyRoutes} from './dashboard/api/keys';
 import {registerRealtimeCoachingRoutes} from './dashboard/api/realtime-coaching';
 import {registerRetrospectiveRoutes} from './dashboard/api/retrospectives';
+import {registerImprovementReviewRoutes} from './dashboard/api/improvement-reviews';
 import {registerShowcaseRoutes} from './dashboard/api/showcase';
 import {registerShowcaseAdminRoutes} from './dashboard/api/showcase-admin';
 import {registerShowcaseBrowseRoutes} from './dashboard/api/showcase-browse';
@@ -152,6 +153,14 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
     // opt-in #2), and persists ONLY the narrative output — never the key/plaintext.
     // All /api/me, developer-private; no manager path.
     registerRetrospectiveRoutes(app, db);
+    // Private "How Could This Be Better" tool (Task 6.5 / #174): the SEPARATE,
+    // purpose-built counterpart to the deliberately-excluded showcase critique. A
+    // developer runs it on their OWN captured conversations for self-directed
+    // improvement — its own entry point, the same transient-decrypt + LOCAL-default
+    // (cloud only via the Phase 5 double-opt-in) privacy posture, persisting only
+    // the constructive narrative + specific suggestions. Fully private: no publish
+    // path, no manager path — this is where the sharp feedback lives.
+    registerImprovementReviewRoutes(app, db);
     // Exemplary-conversation showcase (Task 5.8): the deliberate, OWNER-ONLY bridge
     // from a private encrypted capture to an org-visible example. Promote transiently
     // decrypts one of the developer's OWN sessions into an editable draft; publish

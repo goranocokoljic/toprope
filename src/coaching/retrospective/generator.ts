@@ -25,6 +25,7 @@
 
 import type Database from 'better-sqlite3';
 import {decryptSessionToText, SessionDecryptError, type DecryptedSession} from '../../capture/session-decrypt';
+import {selectGatedAnalyzer} from '../analysisGate';
 import {listLoopEventsForSession} from '../realtime/store';
 import type {RetrospectiveAnalyzer, SessionAnalysisInput} from './analyzer';
 import {insertRetrospective} from './store';
@@ -99,29 +100,21 @@ function decryptSession(db: Database.Database, developerId: string, sessionId: s
 }
 
 /**
- * Select the analyser for a desired location, enforcing the cloud gate. Local is
- * always available. Cloud requires BOTH the resolved permission (`cloudAllowed`)
- * AND a configured cloud analyser; either missing is a distinct, typed failure so
- * the route can tell "you may not" apart from "this deployment has no cloud model".
+ * Select the analyser for a desired location via the shared cloud gate
+ * (`selectGatedAnalyzer`), re-typing its refusal as a `RetrospectiveError` so this
+ * feature keeps its route→HTTP mapping. The gate is fail-closed: anything that
+ * isn't a permitted, configured cloud request resolves to the local default.
  */
 function selectAnalyzer(
     location: AnalysisLocation,
     cloudAllowed: boolean,
     analyzers: RetrospectiveAnalyzers,
 ): RetrospectiveAnalyzer {
-    if (location === 'cloud') {
-        if (!cloudAllowed) {
-            throw new RetrospectiveError(
-                'cloud_not_allowed',
-                'Cloud analysis requires both organization permission and your opt-in (opt-in #2).',
-            );
-        }
-        if (!analyzers.cloud) {
-            throw new RetrospectiveError('cloud_not_configured', 'No cloud analysis model is configured for this deployment.');
-        }
-        return analyzers.cloud;
+    const result = selectGatedAnalyzer(location, cloudAllowed, analyzers);
+    if ('error' in result) {
+        throw new RetrospectiveError(result.error.code, result.error.message);
     }
-    return analyzers.local;
+    return result.analyzer;
 }
 
 /**
