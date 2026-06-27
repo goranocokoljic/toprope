@@ -111,11 +111,18 @@ export class LocalHeuristicImprovementAnalyzer implements ImprovementAnalyzer {
             });
         }
         if (s.loopRepetitions >= 3 || s.briefPromptCount >= 2) {
+            // Name only the costs this conversation actually incurred, so the
+            // suggestion never reads "the 0 repeated tries" — it stays specific.
+            const costs: string[] = [];
+            if (s.briefPromptCount > 0) {
+                costs.push(`${s.briefPromptCount} brief prompt${s.briefPromptCount === 1 ? '' : 's'}`);
+            }
+            if (s.loopRepetitions > 0) {
+                costs.push(`${s.loopRepetitions} repeated tr${s.loopRepetitions === 1 ? 'y' : 'ies'}`);
+            }
             suggestions.push({
                 category: 'efficiency',
-                suggestion:
-                    `Tightening the ${s.briefPromptCount} brief prompt(s) and the ${s.loopRepetitions} repeated tr${s.loopRepetitions === 1 ? 'y' : 'ies'} ` +
-                    'up front could have cut several round-trips out of this conversation.',
+                suggestion: `Tightening the ${costs.join(' and the ')} up front could have cut several round-trips out of this conversation.`,
             });
         }
 

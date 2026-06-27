@@ -38,6 +38,17 @@ describe('LocalHeuristicImprovementAnalyzer (Task 6.5)', () => {
         }
     });
 
+    it('emits an efficiency suggestion for >=2 brief prompts, naming only real costs (no "0 repeated tries")', () => {
+        // 2 brief prompts, zero loops → efficiency fires on briefPromptCount>=2.
+        const res = analyzer.analyze(input('prompt: fix\nprompt: now\nprompt: please refactor the whole module entirely'));
+        const efficiency = res.suggestions.find((s) => s.category === 'efficiency');
+        expect(efficiency).toBeDefined();
+        expect(efficiency!.suggestion).toContain('2 brief prompts');
+        // With zero loops the text must NOT name a zero-count "repeated tries" term.
+        expect(efficiency!.suggestion).not.toMatch(/\b0 repeated/);
+        expect(efficiency!.suggestion).not.toContain('repeated tr');
+    });
+
     it('flags missing context with the prompt count when no error/code/path is present', () => {
         const res = analyzer.analyze(input('prompt: how do I make this faster and more correct overall'));
         const context = res.suggestions.find((s) => s.category === 'context');
