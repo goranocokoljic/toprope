@@ -17,9 +17,9 @@
  * for `local | cloud`) rather than re-declared, so the two features cannot drift.
  */
 
-import {isAnalysisLocation, type AnalysisLocation} from '../retrospective/types';
+import {decodeAnalysisLocation, isAnalysisLocation, type AnalysisLocation} from '../retrospective/types';
 
-export {isAnalysisLocation};
+export {decodeAnalysisLocation, isAnalysisLocation};
 export type {AnalysisLocation};
 
 /**

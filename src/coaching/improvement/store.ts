@@ -17,9 +17,8 @@
 import type Database from 'better-sqlite3';
 import {randomUUID} from 'crypto';
 import {
-    isAnalysisLocation,
+    decodeAnalysisLocation,
     isImprovementCategory,
-    type AnalysisLocation,
     type ImprovementReview,
     type ImprovementReviewOutput,
     type ImprovementSuggestion,
@@ -40,20 +39,6 @@ interface ImprovementReviewRow {
 
 function nowIso(): string {
     return new Date().toISOString();
-}
-
-/**
- * Decode the analysis_location column. The write path only stores a validated
- * value and the DB CHECK enforces it, so an unrecognized value means corruption
- * or a future enum migration; warn (mirroring the retrospective/capture decoders)
- * and fall back to the safe 'local' rather than mislabel a cloud run.
- */
-function decodeLocation(raw: string): AnalysisLocation {
-    if (isAnalysisLocation(raw)) {
-        return raw;
-    }
-    console.warn(`[improvement] unrecognized analysis_location '${raw}'; defaulting to local`);
-    return 'local';
 }
 
 /**
@@ -93,7 +78,7 @@ function rowToReview(row: ImprovementReviewRow): ImprovementReview {
         sessionId: row.session_id,
         generatedAt: row.generated_at,
         analysisModel: row.analysis_model,
-        analysisLocation: decodeLocation(row.analysis_location),
+        analysisLocation: decodeAnalysisLocation(row.analysis_location, 'improvement'),
         reviewText: row.review_text,
         suggestions: parseSuggestions(row.suggestions),
         analyzedCaptureCount: row.analyzed_capture_count,

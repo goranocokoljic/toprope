@@ -104,10 +104,44 @@ describe('Improvement review store (Task 6.5)', () => {
         expect(getImprovementReviewForDeveloper(db, 'alice', saved.id)!.analysisLocation).toBe('local');
     });
 
-    it('returns an empty suggestion list when the stored JSON is malformed', () => {
+    it('returns an empty suggestion list when the stored JSON is unparseable', () => {
         const saved = insertImprovementReview(db, output('alice'));
         db.prepare('UPDATE improvement_reviews SET suggestions = ? WHERE id = ?').run('not json', saved.id);
         const read = getImprovementReviewForDeveloper(db, 'alice', saved.id);
         expect(read!.suggestions).toEqual([]);
+    });
+
+    it('returns an empty suggestion list when the stored JSON parses but is not an array', () => {
+        const saved = insertImprovementReview(db, output('alice'));
+        db.prepare('UPDATE improvement_reviews SET suggestions = ? WHERE id = ?').run('{}', saved.id);
+        expect(getImprovementReviewForDeveloper(db, 'alice', saved.id)!.suggestions).toEqual([]);
+    });
+
+    it('drops malformed/unknown-category entries on READ, keeping only well-formed ones', () => {
+        const saved = insertImprovementReview(db, output('alice'));
+        // A directly-written array mixing one valid entry with a bad-category entry, a
+        // non-string suggestion, and a non-object — only the valid one must survive.
+        const corrupt = JSON.stringify([
+            {category: 'iteration', suggestion: 'keep me'},
+            {category: 'sneaky', suggestion: 'drop me'},
+            {category: 'context', suggestion: 42},
+            'not an object',
+        ]);
+        db.prepare('UPDATE improvement_reviews SET suggestions = ? WHERE id = ?').run(corrupt, saved.id);
+        expect(getImprovementReviewForDeveloper(db, 'alice', saved.id)!.suggestions).toEqual([
+            {category: 'iteration', suggestion: 'keep me'},
+        ]);
+    });
+
+    it('breaks a same-generated_at ordering tie deterministically on created_at (newest first)', () => {
+        // Two reviews for the same conversation at the same generated_at instant — the
+        // local-then-cloud same-instant case. The created_at secondary key must order them.
+        const a = insertImprovementReview(db, output('alice', {generatedAt: NOW}));
+        const b = insertImprovementReview(db, output('alice', {generatedAt: NOW}));
+        // Force distinct, known created_at values (server-assigned timestamps can collide).
+        db.prepare('UPDATE improvement_reviews SET created_at = ? WHERE id = ?').run('2026-06-15T00:00:00.001Z', a.id);
+        db.prepare('UPDATE improvement_reviews SET created_at = ? WHERE id = ?').run('2026-06-15T00:00:00.002Z', b.id);
+        const list = listImprovementReviewsForDeveloper(db, 'alice');
+        expect(list.map((r) => r.id)).toEqual([b.id, a.id]); // newest created_at first
     });
 });
