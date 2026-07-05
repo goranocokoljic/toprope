@@ -21,7 +21,7 @@
  *     immutable daily snapshots, so re-running any job for any period recomputes
  *     and overwrites rather than duplicating. A missed or retried fire is safe.
  *
- *   - Manual == scheduled. The scheduled job and the `govproxy aggregate
+ *   - Manual == scheduled. The scheduled job and the `toprope aggregate
  *     --period <p>` CLI both funnel through runAggregationForPeriod with the same
  *     period key, so a manual trigger reproduces a scheduled run exactly (a bare
  *     manual run targets the same just-completed period; `--date` targets any

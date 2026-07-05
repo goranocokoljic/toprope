@@ -1,4 +1,4 @@
-# GovProxy — Phase 6 Design Document
+# Toprope — Phase 6 Design Document
 
 **Phase 6: Improvement Layer — Knowledge Sharing + Showcase**
 
@@ -443,4 +443,4 @@ By the end of Phase 6:
 
 ---
 
-*End of Document — GovProxy Phase 6 Design (in discussion)*
+*End of Document — Toprope Phase 6 Design (in discussion)*

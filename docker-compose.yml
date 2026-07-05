@@ -1,13 +1,13 @@
 version: '3.8'
 
 services:
-  govproxy:
+  toprope:
     build: .
     ports:
       - "8080:8080"
     volumes:
       - ./data:/app/data
-      - ./govproxy.config.yaml:/app/govproxy.config.yaml:ro
+      - ./toprope.config.yaml:/app/toprope.config.yaml:ro
     environment:
       - GITHUB_API_TOKEN=${GITHUB_API_TOKEN}
       - ANTHROPIC_ADMIN_API_KEY=${ANTHROPIC_ADMIN_API_KEY}

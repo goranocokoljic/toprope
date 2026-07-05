@@ -1,4 +1,4 @@
-# GovProxy — Phase 5 Task Tracker
+# Toprope — Phase 5 Task Tracker
 
 **Phase 5: Developer Coaching**
 
@@ -893,4 +893,4 @@ Next: Phase 6 — Production Hardening & Scale (PostgreSQL, SSO/SAML, RBAC).
 
 ---
 
-*End of Document — GovProxy Phase 5 Task Tracker*
+*End of Document — Toprope Phase 5 Task Tracker*

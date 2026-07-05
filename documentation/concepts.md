@@ -1,6 +1,6 @@
 # Core concepts
 
-This chapter explains how GovProxy is put together: the data flow, the unit of
+This chapter explains how Toprope is put together: the data flow, the unit of
 storage, the data-quality tiers, and the privacy model. Understanding these makes
 every other chapter easier.
 
@@ -33,7 +33,7 @@ Developer self-reports (CLI / Slack)                                          �
 
 ## The daily snapshot — the atomic unit
 
-Everything in GovProxy is built on the **daily snapshot**: one row per developer,
+Everything in Toprope is built on the **daily snapshot**: one row per developer,
 per day, per tool. There are two snapshot families:
 
 - **`tool_snapshots`** — activity from a tool API or a self-report (interactions,
@@ -65,13 +65,13 @@ daily snapshots
 ```
 
 Each aggregate carries totals, averages, and **period-over-period deltas** (the
-first period of any series has null deltas — GovProxy never fabricates a fake
+first period of any series has null deltas — Toprope never fabricates a fake
 0%). Raw daily data is retained for drill-down (90 days by default); aggregates
 are kept indefinitely. See [Aggregation & AI summaries](./aggregation-and-summaries.md).
 
 ## Data-quality tiers
 
-The single most important concept in GovProxy. Because data comes from sources of
+The single most important concept in Toprope. Because data comes from sources of
 very different reliability, **every insight is labeled with a confidence tier**,
 and the UI never implies more certainty than the data supports.
 
@@ -127,7 +127,7 @@ requires an admin session. See [Dashboard](./dashboard.md) for accounts and auth
 | Term | Meaning |
 |---|---|
 | **Connector** | A client that pulls data from a tool API (Copilot, Claude Code, Windsurf, Cursor) into snapshots |
-| **Provider** | A git host GovProxy can analyze: GitHub, GitLab, or Bitbucket |
+| **Provider** | A git host Toprope can analyze: GitHub, GitLab, or Bitbucket |
 | **Snapshot** | One immutable daily record of activity for a developer |
 | **Aggregate** | A pre-computed weekly/monthly/quarterly/yearly rollup of snapshots |
 | **AI signature score** | A 0–100 heuristic estimate of AI assistance in commits; conservative and always labeled "estimated" |

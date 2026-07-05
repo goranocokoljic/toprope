@@ -4,7 +4,7 @@ server:
 
 storage:
   type: "sqlite"
-  sqlite_path: "./data/govproxy.db"
+  sqlite_path: "./data/toprope.db"
 
 connectors:
   copilot:
@@ -100,9 +100,9 @@ alerts:
   waste_threshold: 14
 
 # Slack self-reporting bot (Task 4.2). Distinct from alerts.slack (a one-way
-# webhook for waste alerts): this is a full bot with the /govproxy-log slash
+# webhook for waste alerts): this is a full bot with the /toprope-log slash
 # command and an interactive logging form. Developers must be linked to their
-# Slack user id (`govproxy dev link --id <dev-id> --slack <U…>`) before they can
+# Slack user id (`toprope dev link --id <dev-id> --slack <U…>`) before they can
 # log. See docs/slack-bot.md for the Slack app setup.
 slack:
   enabled: false

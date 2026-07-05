@@ -15,7 +15,7 @@ production) and open **http://localhost:8080/dashboard**.
   managed via login sessions. The legacy Phase-1 `admin_password` is retained for
   config compatibility but no longer enforced.
 - **Bootstrap an admin** from the CLI:
-  `govproxy user create-admin --email you@acme.com`. A generated temporary
+  `toprope user create-admin --email you@acme.com`. A generated temporary
   password forces a change on first login.
 - Admins provision further accounts (admin or developer) from **Admin →
   Management** or `POST /api/admin/users`.

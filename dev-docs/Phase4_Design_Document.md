@@ -1,4 +1,4 @@
-# GovProxy — Phase 4 Design Document
+# Toprope — Phase 4 Design Document
 
 **Phase 4: Complete the Data Picture + Close Analytics Gaps**
 
@@ -61,7 +61,7 @@ adoption.
 
 **How it works:**
 - A developer logs usage in seconds: which tool, rough time/effort, optional task
-  descriptor. Example CLI: `govproxy log --tool cursor --minutes 90 --task "refactor auth"`
+  descriptor. Example CLI: `toprope log --tool cursor --minutes 90 --task "refactor auth"`
 - Slack bot: a slash command or a quick interactive message ("Used AI today?
   Which tool? Roughly how long?") with tap-to-answer buttons
 - Self-reported data lands as `tool_snapshots` with `data_source = "self_report"`
@@ -154,7 +154,7 @@ product beyond WMG.
   acceptance rates, team breakdowns
 - Transforms to `tool_snapshots` with `data_source = "api"`, `data_quality = "high"`
 - Scheduled sync slotted into the existing pipeline
-- `govproxy sync cursor` + folded into `govproxy sync all` + `doctor` check
+- `toprope sync cursor` + folded into `toprope sync all` + `doctor` check
 - Feature breakdown distinguishes autocomplete vs Composer vs chat (the
   under-utilization insight: "paying for it but only using autocomplete")
 
@@ -296,7 +296,7 @@ sources and analytics on top of the existing foundation.
 
 ## 12. Proposed Task Breakdown (Draft — for the tracker)
 
-- **4.1** Self-reporting core (data model + CLI `govproxy log`)
+- **4.1** Self-reporting core (data model + CLI `toprope log`)
 - **4.2** Slack bot for self-reporting (interactive logging)
 - **4.3** Data-prompted surveys (triggers, templates, auto/manual config, responses)
 - **4.4** Expense reconciliation (match, flag mismatches, resolution UI)
@@ -347,4 +347,4 @@ By the end of Phase 4:
 
 ---
 
-*End of Document — GovProxy Phase 4 Design (decisions resolved)*
+*End of Document — Toprope Phase 4 Design (decisions resolved)*

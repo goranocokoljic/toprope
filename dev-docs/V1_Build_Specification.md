@@ -1,4 +1,4 @@
-# GovProxy — V1 Build Specification
+# Toprope — V1 Build Specification
 
 **AI Adoption Intelligence Platform for Engineering Teams**
 
@@ -57,7 +57,7 @@ Everything else — Cursor connector, developer coaching, session retrospectives
 ## 3. Project Structure
 
 ```
-govproxy/
+toprope/
 ├── CLAUDE.md                         # Claude Code instructions
 ├── package.json
 ├── tsconfig.json
@@ -382,7 +382,7 @@ CREATE INDEX idx_waste_alerts_team ON waste_alerts(team);
 ## 5. Configuration
 
 ```yaml
-# govproxy.config.yaml
+# toprope.config.yaml
 
 server:
   port: 8080
@@ -390,7 +390,7 @@ server:
 
 storage:
   type: "sqlite"
-  sqlite_path: "./data/govproxy.db"
+  sqlite_path: "./data/toprope.db"
 
 connectors:
   copilot:
@@ -597,7 +597,7 @@ Duration: Weeks 1–4
 - CLAUDE.md in project root
 - Working `npm run dev`, `npm run build`, `npm test`, `npm run lint`
 - Docker and docker-compose files (basic, for future use)
-- govproxy.config.yaml with defaults
+- toprope.config.yaml with defaults
 - Config loader with JSON Schema validation
 
 **Acceptance:**
@@ -620,13 +620,13 @@ Duration: Weeks 1–4
 - Migration 003: weekly_aggregates, monthly_aggregates, quarterly_aggregates tables
 - Migration 004: summaries, waste_alerts tables
 - Migration 005: all indexes
-- CLI command: `govproxy db migrate` — applies pending migrations
-- CLI command: `govproxy db status` — shows migration state
+- CLI command: `toprope db migrate` — applies pending migrations
+- CLI command: `toprope db status` — shows migration state
 
 **Acceptance:**
-- `govproxy db migrate` creates all tables and indexes
+- `toprope db migrate` creates all tables and indexes
 - Running it again is idempotent (no errors)
-- `govproxy db status` shows all migrations applied
+- `toprope db status` shows all migrations applied
 - Unit tests verify table creation and basic CRUD for each table
 
 ---
@@ -636,18 +636,18 @@ Duration: Weeks 1–4
 **What:** Manage the mapping of developers to teams and external tool identities.
 
 **Deliverables:**
-- CLI: `govproxy team add --name frontend --department engineering --manager goran`
-- CLI: `govproxy team list`
-- CLI: `govproxy dev add --name "John Doe" --email john@wmg.rs --team frontend --github johndoe`
-- CLI: `govproxy dev list [--team frontend]`
-- CLI: `govproxy dev link --id <dev-id> --copilot <copilot-username> --cursor <cursor-email>`
+- CLI: `toprope team add --name frontend --department engineering --manager goran`
+- CLI: `toprope team list`
+- CLI: `toprope dev add --name "John Doe" --email john@wmg.rs --team frontend --github johndoe`
+- CLI: `toprope dev list [--team frontend]`
+- CLI: `toprope dev link --id <dev-id> --copilot <copilot-username> --cursor <cursor-email>`
 - Auto-discovery: option to pull developer list from GitHub org members API
-- Config-based team definitions (from govproxy.config.yaml teams section)
+- Config-based team definitions (from toprope.config.yaml teams section)
 
 **Acceptance:**
 - Teams and developers can be created via CLI and appear in database
 - Developer external_ids JSON correctly stores mappings for multiple tools
-- `govproxy dev list --team frontend` filters correctly
+- `toprope dev list --team frontend` filters correctly
 - Auto-discovery from GitHub org pulls member list and creates developer records
 - Duplicate detection: adding same GitHub username twice shows warning
 
@@ -665,13 +665,13 @@ Duration: Weeks 1–4
 - Data transformer: convert Copilot API response → tool_snapshots records
 - Map Copilot usernames to developer_id via external_ids
 - Store daily snapshots with data_quality: "high", data_source: "api"
-- Sync command: `govproxy sync copilot` — pulls latest data
+- Sync command: `toprope sync copilot` — pulls latest data
 - Scheduled sync: configurable cron (default: daily at 2am UTC)
 - Handle API pagination, rate limits, and errors gracefully
 - Store raw API response in raw_data field (optional, configurable)
 
 **Acceptance:**
-- `govproxy sync copilot` successfully pulls data from the API (or test fixtures)
+- `toprope sync copilot` successfully pulls data from the API (or test fixtures)
 - tool_snapshots table populated with one row per developer per day
 - Interaction count, acceptance count, and acceptance rate calculated correctly
 - Features_used JSON populated with breakdown by feature (completions, chat, etc.)
@@ -693,12 +693,12 @@ Duration: Weeks 1–4
 - Data transformer: convert Anthropic API response → tool_snapshots records
 - Map Anthropic user identifiers to developer_id via external_ids
 - Store daily snapshots with data_quality: "high", data_source: "api"
-- Sync command: `govproxy sync claude-code` — pulls latest data
+- Sync command: `toprope sync claude-code` — pulls latest data
 - Scheduled sync: configurable cron (default: daily at 2:30am UTC)
 - Handle API pagination, rate limits, and errors gracefully
 
 **Acceptance:**
-- `govproxy sync claude-code` successfully pulls data from the API (or test fixtures)
+- `toprope sync claude-code` successfully pulls data from the API (or test fixtures)
 - tool_snapshots populated with correct per-developer daily records
 - Session count, commit count, PR count, and cost correctly extracted
 - Features_used JSON populated (e.g., {"chat": 12, "code_generation": 30, "agent_sessions": 5})
@@ -719,12 +719,12 @@ Duration: Weeks 1–4
 - Data transformer: convert Windsurf API response → tool_snapshots records
 - Map Windsurf user identifiers to developer_id via external_ids
 - Store daily snapshots with data_quality: "high", data_source: "api"
-- Sync command: `govproxy sync windsurf` — pulls latest data
+- Sync command: `toprope sync windsurf` — pulls latest data
 - Scheduled sync: configurable cron (default: daily at 3am UTC)
 - Handle API errors and permission issues (different endpoints require different permissions)
 
 **Acceptance:**
-- `govproxy sync windsurf` successfully pulls data from the API (or test fixtures)
+- `toprope sync windsurf` successfully pulls data from the API (or test fixtures)
 - tool_snapshots populated with correct per-developer daily records
 - AI-generated code percentage correctly captured
 - Features_used JSON populated (e.g., {"autocomplete": 50, "cascade": 8, "chat": 15})
@@ -753,12 +753,12 @@ Duration: Weeks 1–4
   - Score is 0-100, explicitly labeled as "estimated" in all outputs
   - Start conservative: only flag very obvious patterns
 - Commit burst detection: 3+ commits within 30 minutes
-- Sync command: `govproxy sync git` — analyzes commits since last sync
+- Sync command: `toprope sync git` — analyzes commits since last sync
 - Configurable repo inclusion/exclusion list
 - Store as git_snapshots: one row per developer per day
 
 **Acceptance:**
-- `govproxy sync git` pulls commit and PR data for configured repos
+- `toprope sync git` pulls commit and PR data for configured repos
 - git_snapshots populated with correct daily aggregates per developer
 - Churn rate calculated correctly: test with fixture where developer modifies same file twice in 24h
 - AI signature score produces non-zero values for obviously AI-patterned commits in test fixtures
@@ -782,8 +782,8 @@ Duration: Weeks 1–4
   jane@wmg.rs,cursor,pro,20,reimbursed
   jane@wmg.rs,claude_code,max,200,reimbursed
   ```
-- CLI: `govproxy expenses import ./data/expenses/q2-2026.csv`
-- CLI: `govproxy expenses show [--team frontend]` — current subscriptions with costs
+- CLI: `toprope expenses import ./data/expenses/q2-2026.csv`
+- CLI: `toprope expenses show [--team frontend]` — current subscriptions with costs
 - Column mapping configuration in YAML config
 - Subscription registry: creates/updates subscriptions table records
 - Match imported data to developers via email
@@ -795,7 +795,7 @@ Duration: Weeks 1–4
 - CSV import creates subscription records linked to developers
 - Flexible column mapping: works with different CSV formats
 - Duplicate detection: "Jane has both Cursor Pro ($20/mo) and Copilot Business ($19/mo)"
-- `govproxy expenses show` displays a clean summary table
+- `toprope expenses show` displays a clean summary table
 - Handles missing developers gracefully (warns, doesn't crash)
 - Handles malformed CSV rows (skips with warning)
 - Unit tests with various CSV formats and edge cases
@@ -840,9 +840,9 @@ Duration: Weeks 1–4
 - Duplicate tool detector: developer has subscriptions for 2+ tools in the same category (IDE-based AI: Copilot + Cursor, or terminal-based: Claude Code + Codex)
 - Cost outlier detector: developer's cost-per-PR is >3x team average
 - Waste alert creation: stores in waste_alerts table with type, details, estimated monthly waste
-- Waste resolution: CLI `govproxy waste resolve <alert-id> --reason justified` to dismiss with explanation
-- CLI: `govproxy waste show` — list active waste alerts with total monthly waste
-- CLI: `govproxy waste summary` — aggregate waste by team
+- Waste resolution: CLI `toprope waste resolve <alert-id> --reason justified` to dismiss with explanation
+- CLI: `toprope waste show` — list active waste alerts with total monthly waste
+- CLI: `toprope waste summary` — aggregate waste by team
 
 **Acceptance:**
 - Correctly identifies a developer with an active Copilot subscription and zero activity in 14 days
@@ -861,9 +861,9 @@ Duration: Weeks 1–4
 **What:** CLI tools for quick status checking and setup validation.
 
 **Deliverables:**
-- `govproxy status` — quick summary:
+- `toprope status` — quick summary:
   ```
-  GovProxy Status
+  Toprope Status
   ──────────────────────────
   Developers:     22 registered (18 active)
   Teams:          6
@@ -872,7 +872,7 @@ Duration: Weeks 1–4
   Waste detected: 3 alerts ($177/mo potential savings)
   Data coverage:  HIGH: 15 devs | MEDIUM: 4 devs | LOW: 3 devs
   ```
-- `govproxy doctor` — validate setup:
+- `toprope doctor` — validate setup:
   - Check: config file exists and is valid
   - Check: database exists and migrations are current
   - Check: GitHub API token is valid and has correct scopes
@@ -882,8 +882,8 @@ Duration: Weeks 1–4
   - Report issues with suggested fixes
 
 **Acceptance:**
-- `govproxy status` shows accurate, up-to-date summary
-- `govproxy doctor` catches: missing config, invalid token, wrong API scopes, unreachable model endpoint
+- `toprope status` shows accurate, up-to-date summary
+- `toprope doctor` catches: missing config, invalid token, wrong API scopes, unreachable model endpoint
 - Doctor output includes actionable fix suggestions for each issue
 - Both commands work when database is empty (first run)
 
@@ -898,11 +898,11 @@ Duration: Weeks 1–4
 - Configurable sync times per connector (from config)
 - Sync pipeline order: Copilot API → Claude Code API → Windsurf API → Git Analysis → (future connectors)
 - Sync logging: each run logged with start time, end time, records processed, errors
-- CLI: `govproxy sync all` — manual trigger for full sync
-- CLI: `govproxy sync copilot` — manual trigger for single connector
-- CLI: `govproxy sync claude-code` — manual trigger for Claude Code connector
-- CLI: `govproxy sync windsurf` — manual trigger for Windsurf connector
-- CLI: `govproxy sync git` — manual trigger for git analysis
+- CLI: `toprope sync all` — manual trigger for full sync
+- CLI: `toprope sync copilot` — manual trigger for single connector
+- CLI: `toprope sync claude-code` — manual trigger for Claude Code connector
+- CLI: `toprope sync windsurf` — manual trigger for Windsurf connector
+- CLI: `toprope sync git` — manual trigger for git analysis
 - Graceful error handling: one connector failing doesn't block others
 - Sync state tracking: each connector remembers last successful sync to avoid re-processing
 
@@ -928,7 +928,7 @@ After 4 weeks, you have:
 - A REST API exposing all data (ready for dashboard in Phase 2)
 - CLI tools for management, diagnostics, and manual operations
 
-**Test:** Run `govproxy doctor` to verify setup (checks all three API tokens + git access). Run `govproxy sync all` to pull data from all sources. Run `govproxy status` to see the unified summary across Copilot, Claude Code, and Windsurf. Run `govproxy waste show` to see cross-tool waste alerts. Open `http://localhost:8080/api/overview` to see the unified API response.
+**Test:** Run `toprope doctor` to verify setup (checks all three API tokens + git access). Run `toprope sync all` to pull data from all sources. Run `toprope status` to see the unified summary across Copilot, Claude Code, and Windsurf. Run `toprope waste show` to see cross-tool waste alerts. Open `http://localhost:8080/api/overview` to see the unified API response.
 
 This validates the entire multi-tool data pipeline before investing in the dashboard UI.
 
@@ -962,40 +962,40 @@ GET  /health/detailed                  → Connector status, last sync times
 
 ```bash
 # Server
-govproxy start                                     # Start server
-govproxy start --config ./govproxy.config.yaml     # Custom config
-govproxy doctor                                    # Validate setup
-govproxy status                                    # Quick summary
+toprope start                                     # Start server
+toprope start --config ./toprope.config.yaml     # Custom config
+toprope doctor                                    # Validate setup
+toprope status                                    # Quick summary
 
 # Database
-govproxy db migrate                                # Apply migrations
-govproxy db status                                 # Show migration state
+toprope db migrate                                # Apply migrations
+toprope db status                                 # Show migration state
 
 # Teams & Developers
-govproxy team add --name <name> --manager <manager>
-govproxy team list
-govproxy dev add --name "Name" --email e@mail --team <team> --github <username>
-govproxy dev list [--team <name>]
-govproxy dev link --id <id> --copilot <username>
+toprope team add --name <name> --manager <manager>
+toprope team list
+toprope dev add --name "Name" --email e@mail --team <team> --github <username>
+toprope dev list [--team <name>]
+toprope dev link --id <id> --copilot <username>
 
 # Sync
-govproxy sync all                                  # Full sync (all connectors)
-govproxy sync copilot                              # Copilot only
-govproxy sync claude-code                          # Claude Code only
-govproxy sync windsurf                             # Windsurf only
-govproxy sync git                                  # Git analysis only
+toprope sync all                                  # Full sync (all connectors)
+toprope sync copilot                              # Copilot only
+toprope sync claude-code                          # Claude Code only
+toprope sync windsurf                             # Windsurf only
+toprope sync git                                  # Git analysis only
 
 # Expenses
-govproxy expenses import ./path/to/file.csv
-govproxy expenses show [--team <name>]
+toprope expenses import ./path/to/file.csv
+toprope expenses show [--team <name>]
 
 # Waste
-govproxy waste show                                # Active waste alerts
-govproxy waste summary                             # Waste by team
-govproxy waste resolve <alert-id> --reason <text>
+toprope waste show                                # Active waste alerts
+toprope waste summary                             # Waste by team
+toprope waste resolve <alert-id> --reason <text>
 
 # Export
-govproxy export --format csv --from 2026-05-01 --to 2026-05-31
+toprope export --format csv --from 2026-05-01 --to 2026-05-31
 ```
 
 ---
@@ -1003,7 +1003,7 @@ govproxy export --format csv --from 2026-05-01 --to 2026-05-31
 ## 11. CLAUDE.md (Drop Into Project Root)
 
 ```markdown
-# GovProxy
+# Toprope
 
 ## Overview
 AI adoption intelligence platform for engineering teams.
@@ -1067,10 +1067,10 @@ Phase 1: Git Analysis + Tool Connectors (Copilot, Claude Code, Windsurf) + Found
 1.12 Scheduled sync + data pipeline automation
 
 ## Testing
-Run: govproxy doctor (validates setup — checks all 3 API tokens + git access)
-Run: govproxy sync all (pulls data from Copilot, Claude Code, Windsurf, and git)
-Run: govproxy status (shows unified summary across all tools)
-Run: govproxy waste show (shows cross-tool waste alerts)
+Run: toprope doctor (validates setup — checks all 3 API tokens + git access)
+Run: toprope sync all (pulls data from Copilot, Claude Code, Windsurf, and git)
+Run: toprope status (shows unified summary across all tools)
+Run: toprope waste show (shows cross-tool waste alerts)
 Test API: curl http://localhost:8080/api/overview
 ```
 
@@ -1103,4 +1103,4 @@ After 4 weeks of dogfooding at WMG:
 
 ---
 
-*End of Document — GovProxy V1 Build Specification*
+*End of Document — Toprope V1 Build Specification*

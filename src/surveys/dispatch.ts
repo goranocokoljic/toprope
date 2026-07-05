@@ -18,7 +18,7 @@ import type {Developer} from '../registry/types';
 import {getDeveloperById} from '../registry/developers';
 import {resolveSetting} from '../settings/store';
 import {createSlackClient, type SlackClient} from '../slack/client';
-import type {GovProxyConfig} from '../config/types';
+import type {TopropeConfig} from '../config/types';
 import {buildSurveyMessage, deliverSurveyByEmail} from './delivery';
 import {createLogEmailer, type Emailer} from './email';
 import {
@@ -63,7 +63,7 @@ export type SurveyDispatchOverrides = Omit<DispatchDeps, 'db'>;
  * back to email). One place for this conditional so the server, CLI, and
  * scheduler don't each re-derive it.
  */
-export function surveySlackClientFromConfig(config: GovProxyConfig): SlackClient | undefined {
+export function surveySlackClientFromConfig(config: TopropeConfig): SlackClient | undefined {
     return config.slack?.enabled && config.slack.bot_token
         ? createSlackClient(config.slack.bot_token)
         : undefined;
@@ -77,7 +77,7 @@ export function surveySlackClientFromConfig(config: GovProxyConfig): SlackClient
  */
 export function buildSurveyDispatchDeps(
     db: Database.Database,
-    config: GovProxyConfig,
+    config: TopropeConfig,
     overrides: SurveyDispatchOverrides = {},
 ): DispatchDeps {
     return {

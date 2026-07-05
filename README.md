@@ -1,6 +1,6 @@
 <div align="center">
 
-# GovProxy
+# Toprope
 
 ### Finally answer the question your VP keeps asking: *is our AI investment actually working?*
 
@@ -8,7 +8,7 @@
 Connect your tools, connect your repos, and get one honest, unified view of how
 your organization adopts AI — across every tool, every billing model, every team.
 
-[Quick start](#-quick-start) · [Why GovProxy](#-why-govproxy) · [Features](#-what-you-get) · [Documentation](./documentation/README.md)
+[Quick start](#-quick-start) · [Why Toprope](#-why-toprope) · [Features](#-what-you-get) · [Documentation](./documentation/README.md)
 
 </div>
 
@@ -28,9 +28,9 @@ Vendor dashboards don't fix this. Each one only shows its own tool. None of them
 will tell you that one developer holds seats on three tools and barely uses any of
 them, or that a team on Cursor is pulling ahead of a team on Copilot.
 
-## 💡 Why GovProxy
+## 💡 Why Toprope
 
-GovProxy is the single pane of glass that sits beside your tools and reads from
+Toprope is the single pane of glass that sits beside your tools and reads from
 all of them. It pulls from **tool APIs, git repositories, expense data, and
 developer self-reports**, normalizes everything into one model, and surfaces the
 insights no single vendor can:
@@ -50,7 +50,7 @@ insights no single vendor can:
 ### Built on three promises
 
 - **Honest about what it knows.** Every insight is tagged HIGH / MEDIUM / LOW /
-  NONE confidence. GovProxy never invents usage it can't measure — a git-only team
+  NONE confidence. Toprope never invents usage it can't measure — a git-only team
   still gets real value, clearly labeled as estimated.
 - **Private by design.** Individual data is visible only to that developer.
   Managers see team aggregates, never individual scorecards. Coaching, never
@@ -92,28 +92,28 @@ npm install
 npm run build
 
 # 2. Initialize the database
-npx govproxy db migrate
+npx toprope db migrate
 
 # 3. Register a team, a developer, and your dashboard login
-npx govproxy team add --name frontend --department engineering --manager you
-npx govproxy dev add  --name "Ada Lovelace" --team frontend --email ada@acme.com --github adalovelace
-npx govproxy user create-admin --email you@acme.com     # prints a temp password
+npx toprope team add --name frontend --department engineering --manager you
+npx toprope dev add  --name "Ada Lovelace" --team frontend --email ada@acme.com --github adalovelace
+npx toprope user create-admin --email you@acme.com     # prints a temp password
 
 # 4. Add credentials (see the configuration guide), then validate
-npx govproxy doctor
+npx toprope doctor
 
 # 5. Pull data from everything that's connected
-npx govproxy sync all
+npx toprope sync all
 
 # 6. See it
-npx govproxy status        # unified CLI summary
+npx toprope status        # unified CLI summary
 npm run dev                # then open http://localhost:8080/dashboard
 ```
 
 Want trends immediately, without waiting weeks?
 
 ```bash
-npx govproxy aggregate backfill     # builds 12 months of trends from your snapshots
+npx toprope aggregate backfill     # builds 12 months of trends from your snapshots
 ```
 
 The [first-hour walkthrough](./documentation/getting-started.md) covers every step
@@ -121,7 +121,7 @@ in detail, including connecting tools and importing expenses.
 
 ### Configuration in 30 seconds
 
-GovProxy reads one file, `govproxy.config.yaml`. Put non-secret IDs (your org
+Toprope reads one file, `toprope.config.yaml`. Put non-secret IDs (your org
 names) in the YAML and secrets in environment variables via `${VAR}` placeholders:
 
 ```yaml
@@ -138,7 +138,7 @@ connectors:
 ```
 
 Two ready-made variants ship for common setups:
-`govproxy.github-only.config.yaml` and `govproxy.bitbucket.config.yaml`. The
+`toprope.github-only.config.yaml` and `toprope.bitbucket.config.yaml`. The
 [configuration reference](./documentation/configuration.md) documents every
 option.
 
@@ -173,19 +173,19 @@ node-cron · React · Tailwind.
 ## 🧰 Common commands
 
 ```bash
-npx govproxy doctor            # validate config, DB, and connector credentials
-npx govproxy status            # unified summary across all sources
-npx govproxy sync all          # pull from every connected source
-npx govproxy waste show        # find wasted spend, grouped by type
-npx govproxy expenses import <file.csv>   # import subscription costs
-npx govproxy summary generate --level monthly --period 2026-05 --scope org
+npx toprope doctor            # validate config, DB, and connector credentials
+npx toprope status            # unified summary across all sources
+npx toprope sync all          # pull from every connected source
+npx toprope waste show        # find wasted spend, grouped by type
+npx toprope expenses import <file.csv>   # import subscription costs
+npx toprope summary generate --level monthly --period 2026-05 --scope org
 ```
 
 Full list in the [CLI reference](./documentation/cli-reference.md).
 
 ## 🗺 Status
 
-GovProxy is built and verified through five phases — data pipeline, dashboard,
+Toprope is built and verified through five phases — data pipeline, dashboard,
 aggregation + AI summaries, complete data picture + analytics, and developer
 coaching. Next up is **production hardening & scale** (PostgreSQL, SSO/SAML, full
 RBAC). The [roadmap](./dev-docs/GovProxy_Roadmap_Source_of_Truth.md) is the source

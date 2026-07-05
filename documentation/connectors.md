@@ -1,13 +1,13 @@
 # Connectors
 
-Connectors pull data from external sources into GovProxy's unified snapshot model.
+Connectors pull data from external sources into Toprope's unified snapshot model.
 There are four **tool API connectors** (Copilot, Claude Code, Windsurf, Cursor)
 and a **multi-provider git analyzer** (GitHub, GitLab, Bitbucket). All write
 `tool_snapshots` (tools) or `git_snapshots` (git) as one row per developer per
 day, at data-quality tier **HIGH** for APIs and **MEDIUM** for git analysis.
 
 Before a connector's data can attribute to a person, that person must be linked to
-the matching identity with `govproxy dev link` (see
+the matching identity with `toprope dev link` (see
 [Getting started](./getting-started.md#3-initialize-the-database-and-register-people)).
 
 ## Common behavior
@@ -20,9 +20,9 @@ Every connector:
   duplicates.
 - Obeys the **API-wins rule**: a measured snapshot overrides any prior
   self-report for the same developer/day/tool.
-- Can be triggered manually (`govproxy sync <name>`) or on the configured cron.
+- Can be triggered manually (`toprope sync <name>`) or on the configured cron.
 
-Validate any connector's credentials with `npx govproxy doctor`.
+Validate any connector's credentials with `npx toprope doctor`.
 
 ## GitHub Copilot
 
@@ -43,7 +43,7 @@ connectors:
 - **Token scope:** a GitHub PAT with repo read, plus `manage_billing:copilot` and
   org-admin rights for the Copilot metrics/billing endpoints.
 - **Identity:** link with `--copilot <github-username>`.
-- **Sync:** `npx govproxy sync copilot`
+- **Sync:** `npx toprope sync copilot`
 
 ## Claude Code
 
@@ -64,7 +64,7 @@ connectors:
 - **Credential:** an Anthropic Enterprise **Admin API key** with Usage Analytics
   permission.
 - **Identity:** link with `--claude <email>`.
-- **Sync:** `npx govproxy sync claude-code`
+- **Sync:** `npx toprope sync claude-code`
 
 ## Windsurf
 
@@ -84,7 +84,7 @@ connectors:
 - **Credential:** a Windsurf service key (Team Settings → Service Keys) with
   analytics permission.
 - **Identity:** link with `--windsurf <email>`.
-- **Sync:** `npx govproxy sync windsurf`
+- **Sync:** `npx toprope sync windsurf`
 
 ## Cursor
 
@@ -103,7 +103,7 @@ connectors:
 
 - **Credential:** a Cursor Enterprise service key.
 - **Identity:** link with `--cursor <email-or-id>`.
-- **Sync:** `npx govproxy sync cursor`
+- **Sync:** `npx toprope sync cursor`
 
 ## Git repository analysis
 
@@ -141,12 +141,12 @@ connectors:
 - **Identity:** git activity attributes by matching the commit author to a
   developer's linked `--github` / `--bitbucket` / `--gitlab` username or one of
   their `--git-email` addresses.
-- **Sync:** `npx govproxy sync git` (add `--provider <type>` to sync just one
+- **Sync:** `npx toprope sync git` (add `--provider <type>` to sync just one
   provider in a multi-provider setup).
 
 ### Multi-provider git
 
-GovProxy normalizes GitHub, GitLab, and Bitbucket into one git data model, so all
+Toprope normalizes GitHub, GitLab, and Bitbucket into one git data model, so all
 git-derived views and coaching work identically across providers. Two ways to
 configure:
 
@@ -160,7 +160,7 @@ Provider notes:
 - **GitHub** — REST API; cloud and Enterprise.
 - **Bitbucket** — REST API 2.0; app-password / token / OAuth; cloud and Server.
   Raw-author parsing handles Bitbucket's commit author format. See the shipped
-  `govproxy.bitbucket.config.yaml`.
+  `toprope.bitbucket.config.yaml`.
 - **GitLab** — REST API v4; PAT / OAuth / job-token; cloud and self-managed;
   understands projects/MRs/notes terminology and subgroups.
 
@@ -169,7 +169,7 @@ Provider notes:
 
 ## The sync pipeline
 
-`govproxy sync all` runs every connector in order — **Copilot → Claude Code →
+`toprope sync all` runs every connector in order — **Copilot → Claude Code →
 Windsurf → Cursor → Git** — then evaluates plan-change ROI. When the server runs,
 the same pipeline runs on the per-connector cron schedule, with per-connector sync
 state so only new data is processed. See

@@ -157,7 +157,7 @@ export interface UsageSignalResult {
      * windows (null when there is no sample). A correlation that compares a low-tier
      * git-estimate window against a high-tier measured one is only as trustworthy as
      * its weakest input, so the surfacing layer (6.2.7) must label the signal with
-     * this basis rather than implying it is all measured — GovProxy tags every data
+     * this basis rather than implying it is all measured — Toprope tags every data
      * point high/medium/low and this signal is no exception.
      */
     basis: DataQuality | null;

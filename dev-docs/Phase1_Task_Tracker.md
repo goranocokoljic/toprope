@@ -1,4 +1,4 @@
-# GovProxy — Phase 1 Task Tracker
+# Toprope — Phase 1 Task Tracker
 
 **Phase 1: Git Analysis + Tool Connectors (Copilot, Claude Code, Windsurf) + Foundation**
 
@@ -19,7 +19,7 @@ Duration: Weeks 1–4 | 12 Tasks
 8. Address feedback + re-test
 9. Merge to main
 10. Tag: v0.1.X
-11. Verify: govproxy doctor (smoke test after merge)
+11. Verify: toprope doctor (smoke test after merge)
 ```
 
 ---
@@ -43,7 +43,7 @@ Initialize the project with all core tooling configured and working.
 - [ ] CLAUDE.md in project root (copy from V1 Build Spec Section 11)
 - [ ] Working npm scripts: `dev`, `build`, `test`, `lint`
 - [ ] Docker and docker-compose files (basic, for future use)
-- [ ] govproxy.config.yaml with sensible defaults
+- [ ] toprope.config.yaml with sensible defaults
 - [ ] Config loader that reads YAML and validates against JSON Schema
 - [ ] `GET /health` endpoint returning `{"status": "ok"}`
 - [ ] ESLint + Prettier configured
@@ -83,14 +83,14 @@ Create SQLite database with the full schema and a versioned migration system.
 - [ ] Migration 004: weekly_aggregates, monthly_aggregates, quarterly_aggregates tables
 - [ ] Migration 005: summaries, waste_alerts tables
 - [ ] Migration 006: all indexes
-- [ ] CLI command: `govproxy db migrate`
-- [ ] CLI command: `govproxy db status`
+- [ ] CLI command: `toprope db migrate`
+- [ ] CLI command: `toprope db status`
 
 ### Acceptance Criteria
 
-- [ ] `govproxy db migrate` creates all tables and indexes
+- [ ] `toprope db migrate` creates all tables and indexes
 - [ ] Running migrate again is idempotent (no errors, no duplicate tables)
-- [ ] `govproxy db status` shows all 6 migrations as applied
+- [ ] `toprope db status` shows all 6 migrations as applied
 - [ ] Unit tests verify table creation
 - [ ] Unit tests verify basic CRUD (insert + select) for each core table
 - [ ] Migration files are plain SQL, easy to read and modify
@@ -113,13 +113,13 @@ Manage developers, teams, and cross-tool identity mapping.
 
 ### Deliverables
 
-- [ ] CLI: `govproxy team add --name <name> --department <dept> --manager <manager>`
-- [ ] CLI: `govproxy team list`
-- [ ] CLI: `govproxy dev add --name "Name" --email email --team <team> --github <username>`
-- [ ] CLI: `govproxy dev list [--team <name>]`
-- [ ] CLI: `govproxy dev link --id <dev-id> --copilot <username> --claude <email> --windsurf <email>`
+- [ ] CLI: `toprope team add --name <name> --department <dept> --manager <manager>`
+- [ ] CLI: `toprope team list`
+- [ ] CLI: `toprope dev add --name "Name" --email email --team <team> --github <username>`
+- [ ] CLI: `toprope dev list [--team <name>]`
+- [ ] CLI: `toprope dev link --id <dev-id> --copilot <username> --claude <email> --windsurf <email>`
 - [ ] Auto-discovery: pull developer list from GitHub org members API
-- [ ] Config-based team definitions loaded from govproxy.config.yaml teams section
+- [ ] Config-based team definitions loaded from toprope.config.yaml teams section
 - [ ] Developer external_ids JSON stores identity mappings for Copilot, Claude Code, Windsurf
 
 ### Acceptance Criteria
@@ -164,7 +164,7 @@ and store as tool_snapshots in the unified schema.
   - Populate features_used JSON: {"completions": N, "chat": N, "code_review": N}
   - Populate models_used JSON: {"gpt-4o": N, "claude-sonnet": N}
 - [ ] Sync job (src/connectors/copilot/sync.ts)
-  - CLI: `govproxy sync copilot`
+  - CLI: `toprope sync copilot`
   - Pulls data since last successful sync
   - Stores snapshots with data_quality: "high", data_source: "api"
   - Handles pagination, rate limits (GitHub 5000 req/hr), retries
@@ -176,7 +176,7 @@ and store as tool_snapshots in the unified schema.
 
 ### Acceptance Criteria
 
-- [ ] `govproxy sync copilot` pulls data and creates tool_snapshots records
+- [ ] `toprope sync copilot` pulls data and creates tool_snapshots records
 - [ ] One row per developer per day in tool_snapshots
 - [ ] Interaction count, acceptance count, acceptance rate calculated correctly
 - [ ] Features_used and models_used JSON populated correctly
@@ -224,14 +224,14 @@ and Claude Code Analytics Admin API, store as tool_snapshots.
   - Populate features_used JSON: {"chat": N, "code_generation": N, "agent_sessions": N}
   - Populate estimated_cost from API response
 - [ ] Sync job (src/connectors/claude-code/sync.ts)
-  - CLI: `govproxy sync claude-code`
+  - CLI: `toprope sync claude-code`
   - Implements ConnectorInterface
   - Pulls data since last successful sync
   - Handles pagination, rate limits, errors
 
 ### Acceptance Criteria
 
-- [ ] `govproxy sync claude-code` pulls data and creates tool_snapshots records
+- [ ] `toprope sync claude-code` pulls data and creates tool_snapshots records
 - [ ] One row per developer per day in tool_snapshots
 - [ ] Session count, commit count, PR count, lines changed correctly extracted
 - [ ] Estimated cost populated from API data
@@ -272,14 +272,14 @@ and store as tool_snapshots.
   - Populate: interaction_count, acceptance_count, acceptance_rate
   - Populate features_used JSON: {"autocomplete": N, "cascade": N, "chat": N, "flows": N}
 - [ ] Sync job (src/connectors/windsurf/sync.ts)
-  - CLI: `govproxy sync windsurf`
+  - CLI: `toprope sync windsurf`
   - Implements ConnectorInterface
   - Handles different permission requirements per endpoint
   - Handles API errors and auth issues
 
 ### Acceptance Criteria
 
-- [ ] `govproxy sync windsurf` pulls data and creates tool_snapshots records
+- [ ] `toprope sync windsurf` pulls data and creates tool_snapshots records
 - [ ] One row per developer per day in tool_snapshots
 - [ ] AI-generated code percentage correctly captured
 - [ ] Features_used JSON correctly populated with Windsurf-specific features
@@ -327,14 +327,14 @@ Store as daily git_snapshots. Uses GitHub REST API only — no repo cloning.
   - Start very conservative — only flag obvious patterns
   - Score explicitly labeled as "estimated" everywhere it appears
 - [ ] Commit burst detection: flag 3+ commits within 30 minutes
-- [ ] Sync job: `govproxy sync git`
+- [ ] Sync job: `toprope sync git`
   - Configurable repo inclusion/exclusion list
   - Processes commits since last sync
   - Stores as git_snapshots: one row per developer per day
 
 ### Acceptance Criteria
 
-- [ ] `govproxy sync git` pulls commit and PR data for configured repos
+- [ ] `toprope sync git` pulls commit and PR data for configured repos
 - [ ] git_snapshots populated with correct daily aggregates per developer
 - [ ] Churn rate calculated correctly (test: developer modifies same file twice in 24h)
 - [ ] AI signature score > 0 for obviously AI-patterned test fixtures
@@ -376,8 +376,8 @@ has which tool at what cost, regardless of billing model.
   - Billing model classification: company_managed, reimbursed, personal, unknown
   - Default cost values from config when CSV doesn't include cost
   - Total cost calculation per developer, per team, per org
-- [ ] CLI: `govproxy expenses import ./path/to/file.csv`
-- [ ] CLI: `govproxy expenses show [--team <name>]`
+- [ ] CLI: `toprope expenses import ./path/to/file.csv`
+- [ ] CLI: `toprope expenses show [--team <name>]`
 - [ ] Duplicate subscription detection: flag developers with overlapping tools
 
 ### Acceptance Criteria
@@ -385,7 +385,7 @@ has which tool at what cost, regardless of billing model.
 - [ ] CSV import creates subscription records linked to correct developers
 - [ ] Flexible column mapping: works with at least 3 different CSV formats (test fixtures)
 - [ ] Duplicate detection: flags "Jane has both Cursor Pro and Copilot Business"
-- [ ] `govproxy expenses show` displays clean summary table with costs
+- [ ] `toprope expenses show` displays clean summary table with costs
 - [ ] Missing developers warned (not crashed)
 - [ ] Malformed CSV rows skipped with warning + line number
 - [ ] Default costs applied when CSV omits cost column
@@ -481,10 +481,10 @@ wasted spend: unused seats, underutilized developers, duplicate coverage.
 - [ ] Waste alert management
   - Store in waste_alerts table: type, details JSON, estimated monthly waste
   - No duplicate alerts for same condition
-  - CLI: `govproxy waste resolve <id> --reason <text>` to dismiss with explanation
+  - CLI: `toprope waste resolve <id> --reason <text>` to dismiss with explanation
   - Resolved alerts don't reappear for same condition
-- [ ] CLI: `govproxy waste show` — list active alerts with total waste
-- [ ] CLI: `govproxy waste summary` — waste by team with totals
+- [ ] CLI: `toprope waste show` — list active alerts with total waste
+- [ ] CLI: `toprope waste summary` — waste by team with totals
 
 ### Acceptance Criteria
 
@@ -496,8 +496,8 @@ wasted spend: unused seats, underutilized developers, duplicate coverage.
 - [ ] Monthly waste calculation correct: unused $40/mo Cursor seat = $40/mo waste
 - [ ] No duplicate alerts: same condition doesn't create multiple alerts on re-run
 - [ ] Resolved alerts stay resolved (don't reappear)
-- [ ] `govproxy waste show` output is clean, actionable, grouped by type
-- [ ] `govproxy waste summary` shows per-team breakdown with total
+- [ ] `toprope waste show` output is clean, actionable, grouped by type
+- [ ] `toprope waste summary` shows per-team breakdown with total
 - [ ] Unit tests with fixture scenarios for each waste type
 ```
 
@@ -518,9 +518,9 @@ CLI tools for quick status overview and setup validation.
 
 ### Deliverables
 
-- [ ] `govproxy status` — quick unified summary
+- [ ] `toprope status` — quick unified summary
   ```
-  GovProxy Status
+  Toprope Status
   ──────────────────────────────────
   Developers:     22 registered (18 active)
   Teams:          6
@@ -533,7 +533,7 @@ CLI tools for quick status overview and setup validation.
   Waste detected: 3 alerts ($177/mo potential savings)
   Data coverage:  HIGH: 15 devs | MEDIUM: 4 devs | LOW: 3 devs
   ```
-- [ ] `govproxy doctor` — validate entire setup
+- [ ] `toprope doctor` — validate entire setup
   - Check: config file exists and is valid YAML
   - Check: database exists and all migrations applied
   - Check: GitHub API token valid and has correct scopes (repo, copilot)
@@ -546,10 +546,10 @@ CLI tools for quick status overview and setup validation.
 
 ### Acceptance Criteria
 
-- [ ] `govproxy status` shows accurate real-time summary
+- [ ] `toprope status` shows accurate real-time summary
 - [ ] Status shows per-connector sync state with last sync time
 - [ ] Status shows data coverage breakdown
-- [ ] `govproxy doctor` catches: missing config, invalid tokens for each service
+- [ ] `toprope doctor` catches: missing config, invalid tokens for each service
 - [ ] Doctor catches: wrong API scopes, unreachable model endpoint
 - [ ] Doctor gives actionable fix suggestion for every failure
 - [ ] Both commands work when database is empty (first run)
@@ -587,11 +587,11 @@ Automate the multi-connector data collection pipeline to run on schedule.
   - Each connector tracks last successful sync timestamp
   - Only processes data since last sync (no duplicates)
 - [ ] CLI manual triggers
-  - `govproxy sync all` — runs full pipeline
-  - `govproxy sync copilot` — single connector
-  - `govproxy sync claude-code` — single connector
-  - `govproxy sync windsurf` — single connector
-  - `govproxy sync git` — git analysis only
+  - `toprope sync all` — runs full pipeline
+  - `toprope sync copilot` — single connector
+  - `toprope sync claude-code` — single connector
+  - `toprope sync windsurf` — single connector
+  - `toprope sync git` — git analysis only
 - [ ] Error recovery
   - Failed sync retried once after 5 minute delay
   - Persistent failure logged as alert, doesn't block next scheduled run
@@ -616,15 +616,15 @@ Automate the multi-connector data collection pipeline to run on schedule.
 After all 12 tasks are merged to main:
 
 ```
-[ ] govproxy doctor — all checks pass (3 APIs + git + database)
-[ ] govproxy sync all — pulls data from all 4 sources without errors
-[ ] govproxy status — shows unified summary with all connectors
-[ ] govproxy waste show — shows cross-tool waste alerts
+[ ] toprope doctor — all checks pass (3 APIs + git + database)
+[ ] toprope sync all — pulls data from all 4 sources without errors
+[ ] toprope status — shows unified summary with all connectors
+[ ] toprope waste show — shows cross-tool waste alerts
 [ ] curl /api/overview — returns unified org summary with data from all tools
 [ ] curl /api/teams — returns team list with cross-tool metrics
 [ ] curl /api/developers/:id/timeline — returns 90-day daily activity
 [ ] npm test — all tests pass
-[ ] govproxy expenses import test.csv — imports correctly
+[ ] toprope expenses import test.csv — imports correctly
 [ ] Scheduled sync runs overnight without intervention
 ```
 
@@ -635,4 +635,4 @@ Next: Phase 2 — Dashboard + Waste Detection UI (Weeks 5–6)
 
 ---
 
-*End of Document — GovProxy Phase 1 Task Tracker*
+*End of Document — Toprope Phase 1 Task Tracker*

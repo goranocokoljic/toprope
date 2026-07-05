@@ -11,7 +11,7 @@
  * middleware confines developers to /api/me, so these /api/admin routes are
  * reachable only by the manager/admin role — and even then only to remove.
  *
- * On AUTHORITY: GovProxy's role model is binary (admin | developer) with no
+ * On AUTHORITY: Toprope's role model is binary (admin | developer) with no
  * per-team-lead role, and every /api/admin route is the full-org admin/manager
  * surface. So the `team` a remove names is NOT a verified "I lead this team"
  * claim — it is the team whose showcase the action is scoped to. It bounds WHICH

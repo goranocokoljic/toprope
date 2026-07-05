@@ -1,4 +1,4 @@
-# GovProxy — Phase 3 Task Tracker
+# Toprope — Phase 3 Task Tracker
 
 **Phase 3: Aggregation Engine + AI-Generated Summaries**
 
@@ -378,7 +378,7 @@ Default depth: 12 months back from today, configurable via --from.
 
 ### Deliverables
 - [ ] src/aggregation/backfill.ts
-- [ ] CLI: govproxy aggregate backfill [--from <date>] [--to <date>]
+- [ ] CLI: toprope aggregate backfill [--from <date>] [--to <date>]
       - default --from = today minus 12 months
       - default --to = today
 - [ ] Iterates every period boundary in range and computes weekly, monthly,
@@ -428,10 +428,10 @@ stay current without manual intervention.
 - [ ] Each job computes the just-completed period for all developers/teams
 - [ ] Jobs run after daily sync has completed (schedule ordering vs Phase 1 sync)
 - [ ] Manual triggers:
-      govproxy aggregate --period weekly --date <date>
-      govproxy aggregate --period monthly --date <date>
-      govproxy aggregate --period quarterly --date <date>
-      govproxy aggregate --period yearly --date <date>
+      toprope aggregate --period weekly --date <date>
+      toprope aggregate --period monthly --date <date>
+      toprope aggregate --period quarterly --date <date>
+      toprope aggregate --period yearly --date <date>
 - [ ] Job logging: start, end, periods/rows computed, errors
 - [ ] A failed job logs and alerts but does not block other scheduled jobs
 - [ ] Idempotent (safe to re-run any job for any period)
@@ -478,7 +478,7 @@ infra during this task.
 - [ ] Input payload explicitly includes a "data_basis" field stating the tier
       (e.g., "git analysis + expense data; no direct tool usage") so the prompt
       (Task 3.8) can carry it into the narrative
-- [ ] Config (govproxy.config.yaml) for summaries:
+- [ ] Config (toprope.config.yaml) for summaries:
       summaries:
         model:
           type: ollama
@@ -604,8 +604,8 @@ summaries columns (existing): id, scope, scope_name, period_type, period_value,
       parameter passed into the prompt (e.g., "focus on cost")
 - [ ] Staleness check runs after each aggregate recompute: if an aggregate for a
       period changed and a summary exists for it, mark the summary stale
-- [ ] CLI: govproxy summary generate --level <l> --period <p> --scope <s>
-- [ ] CLI: govproxy summary show --level <l> --period <p> --scope <s>
+- [ ] CLI: toprope summary generate --level <l> --period <p> --scope <s>
+- [ ] CLI: toprope summary show --level <l> --period <p> --scope <s>
 
 ### Acceptance Criteria
 - [ ] Generating a summary stores text, model_used, input_hash, generated_at
@@ -831,4 +831,4 @@ git-estimate to measured, with no schema changes.
 
 ---
 
-*End of Document — GovProxy Phase 3 Task Tracker*
+*End of Document — Toprope Phase 3 Task Tracker*

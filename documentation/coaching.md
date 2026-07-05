@@ -1,6 +1,6 @@
 # Developer coaching
 
-Coaching is GovProxy's differentiator and the heart of Phase 5. It turns the
+Coaching is Toprope's differentiator and the heart of Phase 5. It turns the
 platform from a *measurement* tool into a *capability-building* one: a private
 mirror that helps developers get better at AI-assisted work, while managers see
 only team-level patterns.
@@ -17,7 +17,7 @@ capture**.
 
 ## Pillar 1 — Available-data coaching
 
-Coaching grounded in data GovProxy already has. Works for everyone, git-only
+Coaching grounded in data Toprope already has. Works for everyone, git-only
 included. Served privately at `GET /api/me/coaching`.
 
 - **Churn self-reflection** — "Your code churn on recent commits is elevated — you

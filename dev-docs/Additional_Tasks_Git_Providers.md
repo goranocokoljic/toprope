@@ -1,4 +1,4 @@
-# GovProxy — Additional Tasks: Multi-Provider Git Connectors
+# Toprope — Additional Tasks: Multi-Provider Git Connectors
 
 **Bitbucket + GitLab Support for Git Repository Analysis**
 
@@ -436,8 +436,8 @@ This replaces the original Task 1.7 analysis code.
   - For each provider: create instance via factory, fetch data, run analysis
   - Store results as git_snapshots (one row per developer per day)
   - Track sync state per provider independently
-  - CLI: `govproxy sync git` runs all configured providers
-  - CLI: `govproxy sync git --provider bitbucket` runs single provider
+  - CLI: `toprope sync git` runs all configured providers
+  - CLI: `toprope sync git --provider bitbucket` runs single provider
 - [ ] Developer mapping
   - Match git authors (email/username) to developer_id via external_ids
   - Handle multiple email addresses per developer
@@ -451,8 +451,8 @@ This replaces the original Task 1.7 analysis code.
 - [ ] Commit bursts detected correctly across providers
 - [ ] Multi-provider sync: Bitbucket repos + GitHub repos analyzed in same run
 - [ ] Per-provider sync state tracked independently
-- [ ] `govproxy sync git --provider bitbucket` only syncs Bitbucket
-- [ ] `govproxy sync git` syncs all configured providers
+- [ ] `toprope sync git --provider bitbucket` only syncs Bitbucket
+- [ ] `toprope sync git` syncs all configured providers
 - [ ] Developer mapping works with email matching across providers
 - [ ] Unmatched authors flagged but don't block analysis
 - [ ] git_snapshots have correct data_source per provider
@@ -506,15 +506,15 @@ The original Task 1.7 was estimated at Day 10–14 (5 days). The expanded multi-
 
 ```bash
 # Git sync — all providers
-govproxy sync git
+toprope sync git
 
 # Git sync — single provider
-govproxy sync git --provider bitbucket
-govproxy sync git --provider github
-govproxy sync git --provider gitlab
+toprope sync git --provider bitbucket
+toprope sync git --provider github
+toprope sync git --provider gitlab
 
 # Developer git identity mapping
-govproxy dev link --id <dev-id> --git-email "goran@wmg.rs" --git-email "goran@personal.com"
+toprope dev link --id <dev-id> --git-email "goran@wmg.rs" --git-email "goran@personal.com"
 ```
 
 ---
@@ -522,7 +522,7 @@ govproxy dev link --id <dev-id> --git-email "goran@wmg.rs" --git-email "goran@pe
 ## Updated Doctor Checks
 
 ```
-govproxy doctor output (git section):
+toprope doctor output (git section):
 
 Git Providers:
   ✓ Bitbucket: workspace 'wmg-workspace' accessible (23 repos)
@@ -537,11 +537,11 @@ Git Providers:
 ## Phase 1 Completion Checklist (Updated)
 
 ```
-[ ] govproxy doctor — all checks pass (3 tool APIs + 3 git providers + database)
-[ ] govproxy sync all — pulls data from all sources without errors
-[ ] govproxy sync git — syncs from all configured git providers
-[ ] govproxy sync git --provider bitbucket — syncs Bitbucket only
-[ ] govproxy status — shows all git providers with last sync time
+[ ] toprope doctor — all checks pass (3 tool APIs + 3 git providers + database)
+[ ] toprope sync all — pulls data from all sources without errors
+[ ] toprope sync git — syncs from all configured git providers
+[ ] toprope sync git --provider bitbucket — syncs Bitbucket only
+[ ] toprope status — shows all git providers with last sync time
 [ ] git_snapshots contain data from all configured providers
 [ ] Same developer committing to Bitbucket + GitHub repos has unified git_snapshots
 [ ] curl /api/overview — unified summary includes git data from all providers

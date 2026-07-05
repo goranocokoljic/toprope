@@ -1,6 +1,6 @@
-# GovProxy — Claude Code Instructions
+# Toprope — Claude Code Instructions
 
-# GovProxy
+# Toprope
 
 ## Review knowledge base (graduated rules)
 Recurring code-review findings that graduated into always-on project rules. Honor them
@@ -69,10 +69,10 @@ Phase 1: Git Analysis + Tool Connectors (Copilot, Claude Code, Windsurf) + Found
 1.12 Scheduled sync + data pipeline automation
 
 ## Testing
-Run: govproxy doctor (validates setup — checks all 3 API tokens + git access)
-Run: govproxy sync all (pulls data from Copilot, Claude Code, Windsurf, and git)
-Run: govproxy status (shows unified summary across all tools)
-Run: govproxy waste show (shows cross-tool waste alerts)
+Run: toprope doctor (validates setup — checks all 3 API tokens + git access)
+Run: toprope sync all (pulls data from Copilot, Claude Code, Windsurf, and git)
+Run: toprope status (shows unified summary across all tools)
+Run: toprope waste show (shows cross-tool waste alerts)
 Test API: curl http://localhost:8080/api/overview
 
 ## Project
@@ -90,7 +90,7 @@ Product Vision: `/dev-docs/product-vision/Product_Vision_v2.md`
 | Test       | `npm test`           |
 | Lint       | `npm run lint`       |
 | Typecheck  | `npm run typecheck`  |
-| CLI        | `npx govproxy <cmd>` |
+| CLI        | `npx toprope <cmd>` |
 
 Server starts on port 8080. `GET /health` must always return `{"status":"ok"}`.
 

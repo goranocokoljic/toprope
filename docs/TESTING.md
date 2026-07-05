@@ -1,6 +1,6 @@
-# GovProxy — Initial Testing Guide
+# Toprope — Initial Testing Guide
 
-A short, practical walkthrough for testing GovProxy after Phase 1 (tasks 1.1–1.12).
+A short, practical walkthrough for testing Toprope after Phase 1 (tasks 1.1–1.12).
 You'll configure credentials, register developers, pull data, and inspect results
 via the CLI and REST API.
 
@@ -13,25 +13,25 @@ via the CLI and REST API.
 
 ```powershell
 npm install
-npm run build      # compiles to dist/ — required for the `npx govproxy` CLI
+npm run build      # compiles to dist/ — required for the `npx toprope` CLI
 ```
 
 You can run the CLI two ways:
 
-- **Built:** `npx govproxy <cmd>` (needs `npm run build` first)
+- **Built:** `npx toprope <cmd>` (needs `npm run build` first)
 - **From source (no build):** `npx tsx src/cli.ts <cmd>`
 
-This guide uses `npx govproxy`.
+This guide uses `npx toprope`.
 
 ---
 
 ## 2. Configure credentials
 
-GovProxy reads `govproxy.config.yaml` and substitutes `${VAR}` placeholders from
+Toprope reads `toprope.config.yaml` and substitutes `${VAR}` placeholders from
 environment variables at load time. Two things to set: **edit the YAML** for the
 non-secret IDs, and **export env vars** for the secrets.
 
-### 2a. Edit `govproxy.config.yaml`
+### 2a. Edit `toprope.config.yaml`
 
 Replace the placeholder org/IDs (these are NOT env-substituted):
 
@@ -46,11 +46,11 @@ Replace the placeholder org/IDs (these are NOT env-substituted):
 `doctor` command checks every enabled connector, so disabling avoids noise.
 
 > **Shortcut for a GitHub-only run:** use the ready-made
-> [`govproxy.github-only.config.yaml`](../govproxy.github-only.config.yaml)
+> [`toprope.github-only.config.yaml`](../toprope.github-only.config.yaml)
 > (Copilot + Git enabled, Anthropic/Windsurf disabled). Pass it to any CLI
-> command with `-c`, e.g. `npx govproxy doctor -c govproxy.github-only.config.yaml`,
+> command with `-c`, e.g. `npx toprope doctor -c toprope.github-only.config.yaml`,
 > or point the dev server at it:
-> `$env:GOVPROXY_CONFIG = "govproxy.github-only.config.yaml"; npm run dev`.
+> `$env:TOPROPE_CONFIG = "toprope.github-only.config.yaml"; npm run dev`.
 > Edit the `your-org` / `your-repo` placeholders before running.
 
 ### 2b. Export secrets (env vars)
@@ -104,25 +104,25 @@ login to the developer's linked `--github` username (step 4).
 ## 4. Initialize DB & register developers
 
 ```powershell
-npx govproxy db migrate          # creates ./data/govproxy.db and applies migrations
+npx toprope db migrate          # creates ./data/toprope.db and applies migrations
 
 # Teams
-npx govproxy team add --name frontend --department engineering --manager goran
-npx govproxy team list
+npx toprope team add --name frontend --department engineering --manager goran
+npx toprope team list
 
 # Developers (email is needed for expense import; github for git/copilot mapping)
-npx govproxy dev add --name "Ada Lovelace" --team frontend --email ada@acme.com --github adalovelace
-npx govproxy dev list
+npx toprope dev add --name "Ada Lovelace" --team frontend --email ada@acme.com --github adalovelace
+npx toprope dev list
 
 # Link tool identities so synced data attributes to the right developer
-npx govproxy dev link --id <dev-id> --copilot adalovelace --claude ada@acme.com --windsurf ada@acme.com
+npx toprope dev link --id <dev-id> --copilot adalovelace --claude ada@acme.com --windsurf ada@acme.com
 ```
 
 Optional: auto-discover org members from GitHub (needs `GITHUB_TOKEN` set, or `--token`):
 
 ```powershell
 $env:GITHUB_TOKEN = "ghp_..."
-npx govproxy dev discover --org my-org --team frontend
+npx toprope dev discover --org my-org --team frontend
 ```
 
 ---
@@ -130,7 +130,7 @@ npx govproxy dev discover --org my-org --team frontend
 ## 5. Validate setup
 
 ```powershell
-npx govproxy doctor
+npx toprope doctor
 ```
 
 Checks the config file, DB migrations, and **live reachability** of each enabled
@@ -143,12 +143,12 @@ before syncing.
 ## 6. Pull data
 
 ```powershell
-npx govproxy sync all            # runs Copilot → Claude Code → Windsurf → Git
+npx toprope sync all            # runs Copilot → Claude Code → Windsurf → Git
 # or individually:
-npx govproxy sync copilot
-npx govproxy sync claude-code
-npx govproxy sync windsurf
-npx govproxy sync git
+npx toprope sync copilot
+npx toprope sync claude-code
+npx toprope sync windsurf
+npx toprope sync git
 ```
 
 Each prints `N written, M skipped`. Snapshots are one row per developer/day/tool
@@ -161,15 +161,15 @@ and are idempotent (re-running updates rather than duplicates).
 ### Via CLI
 
 ```powershell
-npx govproxy status              # unified summary: devs, connectors, cost, waste, data quality
-npx govproxy waste show          # runs detection + lists active alerts by type
-npx govproxy waste summary       # waste grouped by team
-npx govproxy expenses show       # subscriptions + monthly cost (optional --team <name>)
+npx toprope status              # unified summary: devs, connectors, cost, waste, data quality
+npx toprope waste show          # runs detection + lists active alerts by type
+npx toprope waste summary       # waste grouped by team
+npx toprope expenses show       # subscriptions + monthly cost (optional --team <name>)
 ```
 
 ### Via REST API
 
-Start the server **with `npm run dev`** (see Gotchas — `govproxy start` only
+Start the server **with `npm run dev`** (see Gotchas — `toprope start` only
 serves `/health`):
 
 ```powershell
@@ -216,7 +216,7 @@ Import it (developers must already exist with matching emails — register them 
 step 4 first, or edit the emails to match yours):
 
 ```powershell
-npx govproxy expenses import .\data\expenses\sample-subs.csv
+npx toprope expenses import .\data\expenses\sample-subs.csv
 ```
 
 CSV columns: `developer_email, tool, plan, monthly_cost, billing_model`. A blank
@@ -226,14 +226,14 @@ CSV columns: `developer_email, tool, plan, monthly_cost, billing_model`. A blank
 (plus aliases like `company`, `expensed`). Then:
 
 ```powershell
-npx govproxy waste show          # unused seats (14+ days inactive), duplicates, etc.
+npx toprope waste show          # unused seats (14+ days inactive), duplicates, etc.
 ```
 
 ---
 
 ## Gotchas
 
-- **Use `npm run dev` for the API, not `govproxy start`.** The CLI `start`
+- **Use `npm run dev` for the API, not `toprope start`.** The CLI `start`
   command currently mounts only `/health` — the `/api/*` routes and the
   scheduler are wired up by `npm run dev` (`src/server.ts`).
 - **`GITHUB_TOKEN` is not a reliable fallback for the connectors.** Because the

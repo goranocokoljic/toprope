@@ -22,7 +22,7 @@
  *
  *   * LEAD REMOVE. A team lead removes a showcase from their team's gallery
  *     (published/unpublished → removed). SCOPED to a named team, not gated by a
- *     per-team-lead identity (GovProxy's role model is binary admin|developer, as the
+ *     per-team-lead identity (Toprope's role model is binary admin|developer, as the
  *     Phase 5 governance notes): `team` bounds WHICH showcases may be touched (the
  *     showcase must belong to that team's gallery), not WHO may moderate. The removal
  *     is LOGGED in the contribution audit trail (the `removed` event), atomically with

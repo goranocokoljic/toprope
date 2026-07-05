@@ -1,14 +1,14 @@
 # Configuration
 
-GovProxy is configured through a single declarative YAML file,
-`govproxy.config.yaml`, validated against a JSON Schema at load time. This chapter
+Toprope is configured through a single declarative YAML file,
+`toprope.config.yaml`, validated against a JSON Schema at load time. This chapter
 is the complete reference for every section.
 
 ## How configuration loads
 
-- The server and CLI look for `govproxy.config.yaml` in the current working
+- The server and CLI look for `toprope.config.yaml` in the current working
   directory by default. Override with the `-c, --config <path>` flag (CLI) or the
-  `GOVPROXY_CONFIG` environment variable (server).
+  `TOPROPE_CONFIG` environment variable (server).
 - Any `${VAR}` placeholder is substituted from an environment variable **at load
   time**. Use this for every secret — never commit tokens to the YAML.
 - The file is validated against a schema; an invalid or malformed config fails
@@ -43,11 +43,11 @@ $env:GIT_API_TOKEN    = "ghp_..."
 
 ## Full annotated example
 
-The repository ships a complete `govproxy.config.yaml`. Two ready-made variants
+The repository ships a complete `toprope.config.yaml`. Two ready-made variants
 also ship for common cases:
 
-- `govproxy.github-only.config.yaml` — Copilot + Git only (others disabled)
-- `govproxy.bitbucket.config.yaml` — Bitbucket-primary git setup
+- `toprope.github-only.config.yaml` — Copilot + Git only (others disabled)
+- `toprope.bitbucket.config.yaml` — Bitbucket-primary git setup
 
 Below is the reference, section by section.
 
@@ -67,7 +67,7 @@ server logs a warning that session cookies would travel over plaintext HTTP.
 ```yaml
 storage:
   type: "sqlite"
-  sqlite_path: "./data/govproxy.db"
+  sqlite_path: "./data/toprope.db"
 ```
 
 SQLite is the only V1 storage backend (PostgreSQL is a Phase-6 item). The path is
@@ -203,7 +203,7 @@ bot below.
 
 ### `slack` (self-reporting bot)
 
-A full Slack app with the `/govproxy-log` slash command and interactive forms,
+A full Slack app with the `/toprope-log` slash command and interactive forms,
 plus optional anomaly alerts and an end-of-day prompt. Authenticated by a bot
 token and signing secret. See [Self-reporting](./self-reporting.md) and
 [Anomalies, surveys & Slack](./anomalies-surveys-slack.md).
@@ -219,7 +219,7 @@ slack:
     channels: []          # Slack channel IDs, e.g. ["C0123ABCD"]
   # anomaly_alerts:
   #   channels: ["C0123ABCD"]
-  #   dashboard_url: "https://govproxy.example.com"
+  #   dashboard_url: "https://toprope.example.com"
 ```
 
 ### `surveys`
@@ -247,7 +247,7 @@ dashboard:
 
 The Phase-1 single `admin_password` is retained so old configs still load but is
 no longer enforced — authentication is now per-user accounts created with
-`govproxy user create-admin`. See [Dashboard](./dashboard.md).
+`toprope user create-admin`. See [Dashboard](./dashboard.md).
 
 ### `teams`
 
@@ -266,7 +266,7 @@ teams:
 
 ## Per-team and per-developer settings
 
-Beyond this file, GovProxy stores runtime settings in the database with a
+Beyond this file, Toprope stores runtime settings in the database with a
 consistent model: a **global default**, an optional **per-team override**, and a
 **permission toggle** that controls whether managers may change team-level
 behavior. These cover leaderboard visibility, anomaly thresholds, survey-trigger

@@ -1,6 +1,6 @@
 # Operations & troubleshooting
 
-Running GovProxy day to day: the scheduler, the sync pipeline, health checks, and
+Running Toprope day to day: the scheduler, the sync pipeline, health checks, and
 the gotchas worth knowing before they bite you.
 
 ## Running the server
@@ -52,15 +52,15 @@ cleanly on server shutdown.
 Run a full manual sync any time:
 
 ```powershell
-npx govproxy sync all
+npx toprope sync all
 ```
 
 ## Health & diagnostics
 
 ```powershell
 curl http://localhost:8080/health     # -> {"status":"ok"}
-npx govproxy doctor                    # config + DB + live credential checks
-npx govproxy status                    # unified operational summary
+npx toprope doctor                    # config + DB + live credential checks
+npx toprope status                    # unified operational summary
 ```
 
 `doctor` is your first stop for any "it's not pulling data" problem — it checks
@@ -70,7 +70,7 @@ connector's credentials, with a `Fix:` hint per failure.
 ## Backups & data
 
 - The entire dataset is the SQLite file at `storage.sqlite_path` (default
-  `./data/govproxy.db`). Back it up by copying the file (ideally while the server
+  `./data/toprope.db`). Back it up by copying the file (ideally while the server
   is stopped, or using SQLite's backup API).
 - Imported expense CSVs live under `expenses.import_path`.
 - Snapshots are append-only; aggregates are immutable once computed — so restoring
@@ -83,7 +83,7 @@ connector's credentials, with a `Fix:` hint per failure.
 
 - Set `dashboard.auth.cookie_secure: true` and serve over HTTPS (directly or
   behind a TLS-terminating proxy).
-- Create accounts with `govproxy user create-admin`; rotate the generated
+- Create accounts with `toprope user create-admin`; rotate the generated
   temporary password on first login.
 - Keep all tokens in environment variables, never in the committed YAML.
 - Bind `server.host` to loopback if the dashboard is only reached via a local
@@ -95,7 +95,7 @@ connector's credentials, with a `Fix:` hint per failure.
 
 These are the sharp edges most likely to trip up a first deployment:
 
-- **Use `npm run dev` or `node dist/server.js`, not `govproxy start`.** The
+- **Use `npm run dev` or `node dist/server.js`, not `toprope start`.** The
   `start` CLI subcommand currently mounts only `/health`; the full `/api/*` routes
   and scheduler come from the server entry point.
 - **`GITHUB_TOKEN` is not a fallback for the connectors.** Because the YAML sets
@@ -117,8 +117,8 @@ These are the sharp edges most likely to trip up a first deployment:
 
 | Concern | Location |
 |---|---|
-| Config | `govproxy.config.yaml` (or `$GOVPROXY_CONFIG`) |
-| Database | `storage.sqlite_path` (default `./data/govproxy.db`) |
+| Config | `toprope.config.yaml` (or `$TOPROPE_CONFIG`) |
+| Database | `storage.sqlite_path` (default `./data/toprope.db`) |
 | Migrations | `src/storage/migrations/` (copied to `dist/` on build) |
 | Server entry | `src/server.ts` → `dist/server.js` |
 | CLI entry | `bin/index.js` → `dist/cli.js` |

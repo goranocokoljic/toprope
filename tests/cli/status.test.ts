@@ -5,7 +5,7 @@ import {runMigrations} from '../../src/storage/migrator';
 import {addTeam} from '../../src/registry/teams';
 import {addDeveloper} from '../../src/registry/developers';
 import {printStatus} from '../../src/cli/status';
-import type {GovProxyConfig} from '../../src/config/types';
+import type {TopropeConfig} from '../../src/config/types';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../src/storage/migrations');
 
@@ -16,7 +16,7 @@ function makeDb(): Database.Database {
     return db;
 }
 
-function baseConfig(): GovProxyConfig {
+function baseConfig(): TopropeConfig {
     return {
         server: {port: 8080, host: '0.0.0.0'},
         storage: {type: 'sqlite', sqlite_path: ':memory:'},
@@ -33,7 +33,7 @@ function baseConfig(): GovProxyConfig {
         alerts: {},
         dashboard: {},
         teams: [],
-    } as unknown as GovProxyConfig;
+    } as unknown as TopropeConfig;
 }
 
 function daysAgo(n: number): string {
@@ -67,7 +67,7 @@ describe('printStatus', () => {
     it('works on empty database (first run)', () => {
         expect(() => printStatus(db, baseConfig())).not.toThrow();
         const combined = output.join('\n');
-        expect(combined).toContain('GovProxy Status');
+        expect(combined).toContain('Toprope Status');
         expect(combined).toContain('Developers:');
         expect(combined).toContain('0 registered');
     });

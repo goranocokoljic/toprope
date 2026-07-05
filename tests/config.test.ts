@@ -18,8 +18,8 @@ describe('loadConfig', () => {
         expect(config.expenses.subscription_defaults?.copilot_business).toBe(19);
     });
 
-    it('loads the main govproxy.config.yaml successfully', () => {
-        const configPath = path.resolve(process.cwd(), 'govproxy.config.yaml');
+    it('loads the main toprope.config.yaml successfully', () => {
+        const configPath = path.resolve(process.cwd(), 'toprope.config.yaml');
         const config = loadConfig(configPath);
         expect(config.server.port).toBe(8080);
         expect(config.teams).toHaveLength(2);

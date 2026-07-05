@@ -1,4 +1,4 @@
-# GovProxy — Phase 2 Task Tracker
+# Toprope — Phase 2 Task Tracker
 
 **Phase 2: The Dashboard — Manager & Developer Views**
 
@@ -140,7 +140,7 @@ and secure session management.
 - [ ] First-login flow: must_change_password forces password change before
       any other action
 - [ ] Frontend: login screen, password-change screen, logout, auth-guarded routes
-- [ ] CLI: `govproxy user create-admin` to bootstrap the first admin account
+- [ ] CLI: `toprope user create-admin` to bootstrap the first admin account
 
 ### Acceptance Criteria
 - [ ] Passwords stored only as argon2/bcrypt hashes; verified by inspecting DB
@@ -153,7 +153,7 @@ and secure session management.
 - [ ] First login forces password change before dashboard access
 - [ ] Logout invalidates the session; subsequent requests with the old session fail
 - [ ] Sessions expire per configured expiry
-- [ ] `govproxy user create-admin` bootstraps the first admin
+- [ ] `toprope user create-admin` bootstraps the first admin
 - [ ] Unit tests: hashing, login success/failure, role enforcement, session
       lifecycle, cross-developer access prevention (this last one is critical)
 ```
@@ -683,7 +683,7 @@ technical founder but unrealistic for other team leads, and it undermines the
 only) wrapping the existing capabilities.
 
 NOTE on terminology: "plans" here means the AI tool subscription plans tracked
-for cost analysis (Copilot Business, Claude Code Max, etc.) — NOT GovProxy's
+for cost analysis (Copilot Business, Claude Code Max, etc.) — NOT Toprope's
 own pricing tiers.
 
 ### Goal
@@ -956,4 +956,4 @@ Next: Phase 3 — Aggregation Engine + AI-Generated Summaries
 
 ---
 
-*End of Document — GovProxy Phase 2 Task Tracker*
+*End of Document — Toprope Phase 2 Task Tracker*

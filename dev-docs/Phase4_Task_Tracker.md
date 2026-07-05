@@ -1,4 +1,4 @@
-# GovProxy — Phase 4 Task Tracker
+# Toprope — Phase 4 Task Tracker
 
 **Phase 4: Complete the Data Picture + Close Analytics Gaps**
 
@@ -87,19 +87,19 @@ for any team that uses Cursor.
       - models_used JSON
       - estimated_cost where derivable
 - [ ] src/connectors/cursor/sync.ts — implements ConnectorInterface
-      - CLI: `govproxy sync cursor`
-      - folded into `govproxy sync all`
+      - CLI: `toprope sync cursor`
+      - folded into `toprope sync all`
       - scheduled sync slot (configurable time)
       - pagination, rate limits, errors handled gracefully
       - sync-state tracking (no duplicate processing)
 - [ ] Config block under connectors.cursor (enabled, service_key, sync_interval,
       sync_time)
-- [ ] `govproxy doctor` check: Cursor service key valid + analytics accessible
-- [ ] `govproxy dev link --cursor <identifier>` already exists from Phase 1;
+- [ ] `toprope doctor` check: Cursor service key valid + analytics accessible
+- [ ] `toprope dev link --cursor <identifier>` already exists from Phase 1;
       confirm it maps correctly
 
 ### Acceptance Criteria
-- [ ] `govproxy sync cursor` pulls data and creates tool_snapshots (one row per
+- [ ] `toprope sync cursor` pulls data and creates tool_snapshots (one row per
       developer per day)
 - [ ] interaction/acceptance counts and acceptance_rate correct
 - [ ] features_used distinguishes autocomplete vs Composer vs chat (enables the
@@ -158,7 +158,7 @@ CREATE TABLE self_reports (
 - [ ] Migration creating self_reports
 - [ ] src/selfreport/core.ts — create/store a self-report, aggregate into
       tool_snapshots respecting the API-wins rule
-- [ ] CLI: `govproxy log --tool <tool> [--minutes N] [--task "..."] [--date YYYY-MM-DD]`
+- [ ] CLI: `toprope log --tool <tool> [--minutes N] [--task "..."] [--date YYYY-MM-DD]`
       (date defaults to today)
 - [ ] Authenticated to the developer (uses their own identity; a developer can
       only log for themselves)
@@ -167,7 +167,7 @@ CREATE TABLE self_reports (
       beyond aggregate activity
 
 ### Acceptance Criteria
-- [ ] `govproxy log --tool cursor --minutes 90 --task "refactor auth"` stores a
+- [ ] `toprope log --tool cursor --minutes 90 --task "refactor auth"` stores a
       self_report and marks the developer active for that tool/date
 - [ ] Self-report appears as data_source="self_report", data_quality="medium" in
       the developer's snapshots
@@ -200,7 +200,7 @@ rather than a terminal command.
 
 ### Deliverables
 - [ ] Slack app integration (bot token, signing secret in config/env)
-- [ ] Slash command (e.g. /govproxy-log) opening a quick interactive form:
+- [ ] Slash command (e.g. /toprope-log) opening a quick interactive form:
       tool (buttons), optional rough time (buttons: <30m / ~1h / ~half-day /
       ~full-day), optional task text
 - [ ] Optional scheduled gentle prompt (configurable): e.g. end-of-day
@@ -256,7 +256,7 @@ sibling task 4.4.)
       company-managed (heuristics from the expense source / fields), writing to
       subscriptions.billing_model, flagged as inferred where uncertain
 - [ ] Import summary report: rows imported, matched, unmatched, duplicates skipped
-- [ ] CLI: `govproxy expenses import <file> [--profile <name>]`
+- [ ] CLI: `toprope expenses import <file> [--profile <name>]`
 
 ### Acceptance Criteria
 - [ ] At least 3 distinct import profiles work against fixture files
@@ -323,7 +323,7 @@ For each tool/developer in the period:
 - [ ] Tolerance for cost_discrepancy configurable (e.g., ignore < $1 rounding)
 - [ ] billing_model-aware: company-managed seats not expected in reimbursement
       feeds are not falsely flagged as subscription_no_expense
-- [ ] CLI: `govproxy expenses reconcile [--period YYYY-MM]`
+- [ ] CLI: `toprope expenses reconcile [--period YYYY-MM]`
 - [ ] Admin UI surface: list of open reconciliation results with resolve/ignore
       actions (resolve records a note; ignore suppresses that result)
 - [ ] API: GET /api/admin/reconciliation, POST /api/admin/reconciliation/:id/resolve
@@ -503,7 +503,7 @@ baseline" → no anomalies fired. This prevents early-weeks false positives.
 - [ ] Minimum-baseline guard enforced
 - [ ] basis (tier) set correctly per metric
 - [ ] Idempotent: re-running a period doesn't duplicate anomalies
-- [ ] CLI: `govproxy anomaly scan [--period <p>]`
+- [ ] CLI: `toprope anomaly scan [--period <p>]`
 
 ### Acceptance Criteria
 - [ ] Statistical method flags a value > threshold std-devs from baseline mean
@@ -840,4 +840,4 @@ Next: Phase 5 — Developer Coaching.
 
 ---
 
-*End of Document — GovProxy Phase 4 Task Tracker*
+*End of Document — Toprope Phase 4 Task Tracker*

@@ -1,7 +1,8 @@
 import Fastify, {type FastifyInstance} from 'fastify';
 import path from 'path';
 import {loadConfig} from './config/loader';
-import type {GovProxyConfig} from './config/types';
+import {readEnvWithLegacyFallback} from './config/compat';
+import type {TopropeConfig} from './config/types';
 import {openDb} from './storage/db';
 import {runMigrations} from './storage/migrator';
 import {registerSessionAuth} from './auth/middleware';
@@ -55,7 +56,7 @@ import {startSurveyScheduler} from './surveys/scheduler';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, './storage/migrations');
 
-export function buildServer(_config?: Partial<GovProxyConfig>): FastifyInstance {
+export function buildServer(_config?: Partial<TopropeConfig>): FastifyInstance {
     const app = Fastify({
         logger: process.env.NODE_ENV !== 'test',
     });
@@ -67,7 +68,7 @@ export function buildServer(_config?: Partial<GovProxyConfig>): FastifyInstance 
     return app;
 }
 
-export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInstance {
+export function buildServerWithDb(config: Partial<TopropeConfig>): FastifyInstance {
     const app = Fastify({
         logger: process.env.NODE_ENV !== 'test',
     });
@@ -214,7 +215,7 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
     // client is constructed only when the bot is enabled with a token, so
     // delivery cleanly degrades to email otherwise.
     registerSurveyRoutes(app, db, {
-        slackClient: surveySlackClientFromConfig(config as GovProxyConfig),
+        slackClient: surveySlackClientFromConfig(config as TopropeConfig),
         emailer: createLogEmailer((line) => app.log.info(line)),
         log: (message, err) => app.log.error({err}, `[surveys] ${message}`),
     });
@@ -233,7 +234,7 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
     if (dbPath !== ':memory:') {
         // Connector syncs only run when a connectors block is configured.
         const connectorTasks = config.connectors
-            ? startScheduler(config as GovProxyConfig, dbPath)
+            ? startScheduler(config as TopropeConfig, dbPath)
             : [];
         // Aggregation rollups run on their own period boundaries (04:00+ UTC),
         // deliberately after the connector syncs so each rollup folds a
@@ -243,7 +244,7 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
         // included), so coupling them to a connectors block would silently
         // starve the trend tables.
         const aggregationTasks = startAggregationScheduler(dbPath, {
-            notifier: buildAnomalyNotifier(dbPath, config as GovProxyConfig, app),
+            notifier: buildAnomalyNotifier(dbPath, config as TopropeConfig, app),
         });
         // Summary auto-generation (weekly + monthly) fires just after the matching
         // aggregation job, generating each scope's narrative for the just-completed
@@ -256,7 +257,7 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
         // Optional daily survey trigger sweep (Task 4.3). Self-gates on
         // surveys.enabled, returning [] otherwise. Runs detection + dispatch and
         // retries stranded auto-surveys.
-        const surveyTasks = startSurveyScheduler(dbPath, config as GovProxyConfig);
+        const surveyTasks = startSurveyScheduler(dbPath, config as TopropeConfig);
         app.addHook('onClose', () => {
             for (const task of [
                 ...connectorTasks,
@@ -283,7 +284,7 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
  */
 function buildAnomalyNotifier(
     dbPath: string,
-    config: GovProxyConfig,
+    config: TopropeConfig,
     app: FastifyInstance,
 ): (() => void) | undefined {
     const slack = config.slack;
@@ -302,7 +303,9 @@ function buildAnomalyNotifier(
 }
 
 async function main(): Promise<void> {
-    const configPath = process.env.GOVPROXY_CONFIG ?? path.resolve(process.cwd(), 'govproxy.config.yaml');
+    const configPath =
+        readEnvWithLegacyFallback('TOPROPE_CONFIG') ??
+        path.resolve(process.cwd(), 'toprope.config.yaml');
     const config = loadConfig(configPath);
 
     const app = buildServerWithDb(config);

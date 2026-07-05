@@ -1,4 +1,4 @@
-# GovProxy — Phase 2 Design Document
+# Toprope — Phase 2 Design Document
 
 **Phase 2: The Dashboard — Manager & Developer Views**
 
@@ -250,7 +250,7 @@ Phase 1 exposed user/team/subscription management only via CLI. That's fine for 
 - **Subscriptions & plans:** assign a tool subscription to a developer, set plan and monthly cost, change or end a subscription (drives the lifecycle handling in 5.1c)
 - **Data sources:** view connector and git provider status (read-only in Phase 2; configuration stays in config file)
 
-**Terminology note:** "plans" here means the *AI tool subscription plans* the platform tracks for cost analysis (Copilot Business, Claude Code Max, Windsurf Teams, etc.) — NOT GovProxy's own pricing tiers. The Admin UI manages the former.
+**Terminology note:** "plans" here means the *AI tool subscription plans* the platform tracks for cost analysis (Copilot Business, Claude Code Max, Windsurf Teams, etc.) — NOT Toprope's own pricing tiers. The Admin UI manages the former.
 
 ### 5.1c Subscription Lifecycle Handling
 
@@ -488,4 +488,4 @@ By the end of Phase 2:
 
 ---
 
-*End of Document — GovProxy Phase 2 Design (DRAFT FOR DISCUSSION)*
+*End of Document — Toprope Phase 2 Design (DRAFT FOR DISCUSSION)*

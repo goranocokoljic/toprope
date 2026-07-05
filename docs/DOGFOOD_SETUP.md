@@ -1,4 +1,4 @@
-# GovProxy — Dogfood Setup Guide
+# Toprope — Dogfood Setup Guide
 
 **Goal:** a manager goes from a fresh clone to a working dashboard — real data,
 both roles, in **under one hour**. This is the deployment path validated for the
@@ -42,13 +42,13 @@ npm run build      # compiles server + dashboard into dist/
 
 Start from one of the checked-in samples and edit in place:
 
-- `govproxy.bitbucket.config.yaml` — Bitbucket-only (matches WMG).
-- `govproxy.github-only.config.yaml` — GitHub-only.
+- `toprope.bitbucket.config.yaml` — Bitbucket-only (matches WMG).
+- `toprope.github-only.config.yaml` — GitHub-only.
 
-Copy one to `govproxy.config.yaml` (the default the CLI and server look for):
+Copy one to `toprope.config.yaml` (the default the CLI and server look for):
 
 ```powershell
-Copy-Item govproxy.bitbucket.config.yaml govproxy.config.yaml
+Copy-Item toprope.bitbucket.config.yaml toprope.config.yaml
 ```
 
 Set the `server`, `storage`, and `connectors` blocks. Enable only the connectors
@@ -73,8 +73,8 @@ $env:DASHBOARD_PASSWORD     = "..."            # only if your config references 
 ## 3. Initialize the database & validate setup (5 min)
 
 ```powershell
-npx govproxy db migrate     # create the SQLite schema
-npx govproxy doctor         # validate every configured token + git provider
+npx toprope db migrate     # create the SQLite schema
+npx toprope doctor         # validate every configured token + git provider
 ```
 
 `doctor` is the single best pre-flight check — it confirms each connector token
@@ -92,29 +92,29 @@ Claude Code, Windsurf) are attached with `dev link`:
 
 ```powershell
 # 1. create the developer record (prints the generated developer id)
-npx govproxy dev add --name "Jane Dev" --team engineering `
+npx toprope dev add --name "Jane Dev" --team engineering `
     --email jane@company.com `
     --bitbucket jane-bb --git-email jane@personal.com
 
 # 2. link AI-tool identities to that id (note: --claude, not --claude-code)
-npx govproxy dev link --id <dev-id> --copilot jane-gh --claude jane@company.com
+npx toprope dev link --id <dev-id> --copilot jane-gh --claude jane@company.com
 ```
 
-For GitHub orgs you can bootstrap the roster with `npx govproxy dev discover`.
+For GitHub orgs you can bootstrap the roster with `npx toprope dev discover`.
 Any unmatched commit authors are printed at the end of `sync git` — add them and
 re-sync to raise their data quality from LOW to MEDIUM/HIGH.
 
 (Optional) import subscription costs so waste detection and Plan ROI have spend
-data: `npx govproxy expenses import subscriptions.csv`.
+data: `npx toprope expenses import subscriptions.csv`.
 
 ---
 
 ## 5. First data pull (10–20 min)
 
 ```powershell
-npx govproxy sync all       # pulls every enabled connector + git provider
-npx govproxy status         # unified cross-tool summary — confirms data landed
-npx govproxy waste show     # cross-tool waste alerts
+npx toprope sync all       # pulls every enabled connector + git provider
+npx toprope status         # unified cross-tool summary — confirms data landed
+npx toprope waste show     # cross-tool waste alerts
 ```
 
 `sync all` is incremental and idempotent; it writes one append-only snapshot per
@@ -125,7 +125,7 @@ developer per day per tool. Re-running it never rewrites history.
 ## 6. Create your login & start the dashboard (10 min)
 
 ```powershell
-npx govproxy user create-admin --email you@company.com
+npx toprope user create-admin --email you@company.com
 ```
 
 A temporary password is printed; you will be forced to change it on first login.
@@ -137,11 +137,11 @@ node dist/server.js
 # or, for live-reload development: npm run dev
 ```
 
-The server reads `govproxy.config.yaml` (override with `$env:GOVPROXY_CONFIG`).
+The server reads `toprope.config.yaml` (override with `$env:TOPROPE_CONFIG`).
 Open **http://localhost:8080/dashboard** and log in.
 
 > ⚠️ Use `node dist/server.js` (or `npm run dev`) to serve the dashboard. The
-> `govproxy start` CLI command currently brings up only the `/health` probe, not
+> `toprope start` CLI command currently brings up only the `/health` probe, not
 > the dashboard — see `docs/KNOWN_ISSUES.md`.
 
 ---
@@ -177,8 +177,8 @@ one pass so the dashboard has trend depth immediately instead of accumulating it
 forward over weeks:
 
 ```powershell
-npx govproxy aggregate backfill          # trailing 12 months (default)
-# npx govproxy aggregate backfill --from 2024-01-01 --to 2025-12-31
+npx toprope aggregate backfill          # trailing 12 months (default)
+# npx toprope aggregate backfill --from 2024-01-01 --to 2025-12-31
 ```
 
 Backfill is idempotent — re-running overwrites, never duplicates. After it runs,
@@ -193,7 +193,7 @@ reads), not by re-folding daily snapshots.
 
 Summaries default to a **local Ollama model** so nothing — no code, no commit
 contents, only aggregate numbers — ever leaves your network. Add a `summaries`
-block to `govproxy.config.yaml`:
+block to `toprope.config.yaml`:
 
 ```yaml
 summaries:
@@ -222,11 +222,11 @@ when you need them:
 
 ```powershell
 # on-demand (quarterly / yearly are never auto-generated)
-npx govproxy summary generate --level quarterly --period 2026-Q2 --scope team:backend
-npx govproxy summary generate --level yearly    --period 2026    --scope org
+npx toprope summary generate --level quarterly --period 2026-Q2 --scope team:backend
+npx toprope summary generate --level yearly    --period 2026    --scope org
 
 # read a stored summary
-npx govproxy summary show --level monthly --period 2026-05 --scope org
+npx toprope summary show --level monthly --period 2026-05 --scope org
 ```
 
 In the dashboard, the **maturity trend chart** (Organization Overview + Team
@@ -272,8 +272,8 @@ connectors:
     service_key: "${CURSOR_SERVICE_KEY}"   # Cursor Analytics API service key
 ```
 
-Link each developer's Cursor identity (`npx govproxy dev link --id <dev-id>
---cursor jane@company.com`), then `npx govproxy sync all` pulls it like any other
+Link each developer's Cursor identity (`npx toprope dev link --id <dev-id>
+--cursor jane@company.com`), then `npx toprope sync all` pulls it like any other
 connector. `doctor` validates the key.
 
 ### 9b. Self-reporting (CLI + Slack)
@@ -286,7 +286,7 @@ measured API data: if a connector later syncs the same day, the measured row win
 
 ```powershell
 # CLI: log usage for yourself
-npx govproxy log --tool cursor --minutes 90 --task "refactored auth"
+npx toprope log --tool cursor --minutes 90 --task "refactored auth"
 ```
 
 For the **Slack bot** (slash command + interactive form), add a top-level `slack`
@@ -309,8 +309,8 @@ the billing model. Reconciliation then compares charges against the subscription
 registry for a period and flags mismatches so total spend is trustworthy:
 
 ```powershell
-npx govproxy expenses import expenses.csv --profile expensify
-npx govproxy expenses reconcile --period 2026-06
+npx toprope expenses import expenses.csv --profile expensify
+npx toprope expenses reconcile --period 2026-06
 ```
 
 Three mismatch types surface (`expense_no_subscription`, `subscription_no_expense`,
@@ -340,7 +340,7 @@ slack:
 
 ### 9e. Data-prompted surveys
 
-When a trigger fires (usage drop, unused new seat, plan change, anomaly), GovProxy
+When a trigger fires (usage drop, unused new seat, plan change, anomaly), Toprope
 can ask the developer a short question ("your usage dropped 40% — did you switch
 tools?"). Each trigger is **manual by default** (queued for manager approval) or
 **auto-send** per a Settings toggle (global default + per-team override under the
@@ -466,5 +466,5 @@ as your liveness probe.
 | `doctor` fails on a provider | Re-check the env var name matches the `${VAR}` in your config; confirm the token scope can read repos. |
 | Developers show LOW data quality | Their git-email/tool identity isn't mapped — add it (step 4) and re-sync. |
 | Empty charts | Pick a wider time range (the selector defaults to the smallest range that fits available history); confirm `sync all` ran. |
-| Dashboard 404 at `/dashboard` | You started `govproxy start` instead of `node dist/server.js`. |
+| Dashboard 404 at `/dashboard` | You started `toprope start` instead of `node dist/server.js`. |
 | Login locked out | The login limiter throttles repeated failures per IP; wait and retry. |

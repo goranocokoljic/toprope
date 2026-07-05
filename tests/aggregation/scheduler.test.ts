@@ -363,7 +363,7 @@ describe('runScheduledAggregationJob — the production cron-fire path', () => {
     beforeEach(() => {
         // A real on-disk DB so the function can open its own short-lived handle,
         // exactly as a cron fire does.
-        dbPath = path.join(os.tmpdir(), `govproxy-sched-${randomUUID()}.db`);
+        dbPath = path.join(os.tmpdir(), `toprope-sched-${randomUUID()}.db`);
         const seed = openDb(dbPath);
         try {
             runMigrations(seed, MIGRATIONS_DIR);

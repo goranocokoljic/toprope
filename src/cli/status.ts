@@ -1,5 +1,5 @@
 import type Database from 'better-sqlite3';
-import type {GovProxyConfig} from '../config/types';
+import type {TopropeConfig} from '../config/types';
 
 interface ConnectorStatus {
     name: string;
@@ -39,7 +39,7 @@ function formatTimeAgo(isoTime: string | null): string {
     return 'just now';
 }
 
-function collectStatus(db: Database.Database, config: GovProxyConfig): StatusData {
+function collectStatus(db: Database.Database, config: TopropeConfig): StatusData {
     const cutoff = new Date();
     cutoff.setDate(cutoff.getDate() - 30);
     const cutoffDate = cutoff.toISOString().slice(0, 10);
@@ -142,12 +142,12 @@ function collectStatus(db: Database.Database, config: GovProxyConfig): StatusDat
     };
 }
 
-export function printStatus(db: Database.Database, config: GovProxyConfig): void {
+export function printStatus(db: Database.Database, config: TopropeConfig): void {
     const data = collectStatus(db, config);
     const LINE = '─'.repeat(50);
 
     console.log('');
-    console.log('GovProxy Status');
+    console.log('Toprope Status');
     console.log(LINE);
 
     const label = (l: string, v: string): void => {

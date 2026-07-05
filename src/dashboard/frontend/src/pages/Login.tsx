@@ -44,7 +44,7 @@ export function Login(): JSX.Element {
                 className="w-full max-w-sm space-y-5 rounded-card border border-border bg-surface p-8 shadow-card"
             >
                 <div>
-                    <h1 className="font-display text-2xl font-semibold text-foreground">GovProxy</h1>
+                    <h1 className="font-display text-2xl font-semibold text-foreground">Toprope</h1>
                     <p className="mt-1 text-sm text-muted">Sign in to your account</p>
                 </div>
 
