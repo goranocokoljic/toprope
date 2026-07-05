@@ -41,7 +41,7 @@ export interface RegisterSlackRoutesOptions {
 
 /**
  * Register the Slack bot's HTTP endpoints:
- *   POST /slack/commands       — the /govproxy-log slash command
+ *   POST /slack/commands       — the /toprope-log slash command
  *   POST /slack/interactivity  — modal submissions + button clicks
  *
  * Both live outside /api, so the session-auth gate doesn't apply; every request

@@ -1,6 +1,6 @@
 # REST API reference
 
-GovProxy exposes a JSON REST API that powers the dashboard and supports
+Toprope exposes a JSON REST API that powers the dashboard and supports
 automation/export. This is a reference to the available endpoints, grouped by
 area. Start the server with `npm run dev` (development) or `node dist/server.js`
 (production); the API listens on port 8080.

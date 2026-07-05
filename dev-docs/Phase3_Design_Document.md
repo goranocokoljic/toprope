@@ -1,4 +1,4 @@
-# GovProxy — Phase 3 Design Document
+# Toprope — Phase 3 Design Document
 
 **Phase 3: Aggregation Engine + AI-Generated Summaries**
 
@@ -95,14 +95,14 @@ node-cron jobs at period boundaries:
 - Quarterly: quarter start 05:00 UTC
 - Yearly: Jan 1 05:00 UTC
 
-Each job is idempotent — re-running for a period recomputes and overwrites that period's aggregate from immutable daily data, so a re-run is always safe. A manual CLI trigger (`govproxy aggregate --period weekly --date <date>`) supports backfill and testing.
+Each job is idempotent — re-running for a period recomputes and overwrites that period's aggregate from immutable daily data, so a re-run is always safe. A manual CLI trigger (`toprope aggregate --period weekly --date <date>`) supports backfill and testing.
 
 ### 3.5 Backfill
 
 On first deployment (or when onboarding a company with existing git history), a backfill command computes all historical aggregates from whatever daily snapshots exist:
 
 ```
-govproxy aggregate backfill --from <date> --to <date>
+toprope aggregate backfill --from <date> --to <date>
 ```
 
 Default backfill depth is 12 months (configurable via `--from`), which keeps the first backfill fast and the trend data relevant. This matters for your dogfood: once Phase 1 has pulled WMG's git history, backfill produces the trend history immediately rather than waiting weeks for it to accumulate forward.
@@ -266,11 +266,11 @@ ALTER TABLE summaries ADD COLUMN is_stale INTEGER DEFAULT 0;
 ### 6.3 New CLI Commands
 
 ```bash
-govproxy aggregate --period weekly --date 2026-05-19   # compute one period
-govproxy aggregate backfill --from 2026-01-01 --to 2026-05-25
-govproxy summary generate --level weekly --period 2026-W21 --scope team:backend
-govproxy summary generate --level monthly --period 2026-05 --scope org
-govproxy summary show --level monthly --period 2026-05 --scope org
+toprope aggregate --period weekly --date 2026-05-19   # compute one period
+toprope aggregate backfill --from 2026-01-01 --to 2026-05-25
+toprope summary generate --level weekly --period 2026-W21 --scope team:backend
+toprope summary generate --level monthly --period 2026-05 --scope org
+toprope summary show --level monthly --period 2026-05 --scope org
 ```
 
 ### 6.4 New API Endpoints
@@ -334,4 +334,4 @@ By the end of Phase 3:
 
 ---
 
-*End of Document — GovProxy Phase 3 Design (DRAFT FOR DISCUSSION)*
+*End of Document — Toprope Phase 3 Design (DRAFT FOR DISCUSSION)*

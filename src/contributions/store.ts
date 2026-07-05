@@ -379,7 +379,7 @@ export function getContributionTags(db: Database.Database, contributionId: strin
 /**
  * Append one governance/lifecycle action to a contribution's audit trail and
  * return the stored event. The trail is append-only — there is no update or
- * delete for events, mirroring the append-only posture of the rest of GovProxy.
+ * delete for events, mirroring the append-only posture of the rest of Toprope.
  */
 export function addReviewEvent(db: Database.Database, input: NewReviewEvent): ContributionReviewEvent {
     const id = randomUUID();

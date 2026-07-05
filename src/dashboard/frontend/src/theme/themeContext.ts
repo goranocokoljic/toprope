@@ -2,7 +2,7 @@ import {createContext} from 'react';
 
 export type Theme = 'light' | 'dark';
 
-export const THEME_STORAGE_KEY = 'govproxy-theme';
+export const THEME_STORAGE_KEY = 'toprope-theme';
 
 export interface ThemeContextValue {
     theme: Theme;

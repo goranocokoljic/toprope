@@ -1,6 +1,6 @@
 # Aggregation & AI summaries
 
-This chapter covers GovProxy's longitudinal layer: how daily snapshots become
+This chapter covers Toprope's longitudinal layer: how daily snapshots become
 trends, the AI maturity score, and the automated narrative reports.
 
 ## Aggregation engine
@@ -20,7 +20,7 @@ Properties:
 
 - **Idempotent** — re-computing a period overwrites cleanly; it never duplicates.
 - **Delta-aware** — each aggregate carries period-over-period changes for key
-  metrics. The first period of a series has **null** deltas; GovProxy never shows
+  metrics. The first period of a series has **null** deltas; Toprope never shows
   a fake 0%.
 - **Tier-aware** — aggregates fold whatever snapshots exist (git-only and
   expense-only deployments included), carrying the honest data basis forward.
@@ -33,10 +33,10 @@ the same code path the scheduler uses:
 
 ```powershell
 # Just-completed period:
-npx govproxy aggregate --period weekly
+npx toprope aggregate --period weekly
 
 # A specific period (the one containing this date):
-npx govproxy aggregate --period monthly --date 2026-05-15
+npx toprope aggregate --period monthly --date 2026-05-15
 ```
 
 ### Backfill — instant trend depth
@@ -45,8 +45,8 @@ Don't wait weeks for charts. Backfill aggregates from the daily snapshots you
 already have:
 
 ```powershell
-npx govproxy aggregate backfill                          # last 12 months
-npx govproxy aggregate backfill --from 2025-01-01 --to 2026-06-01
+npx toprope aggregate backfill                          # last 12 months
+npx toprope aggregate backfill --from 2025-01-01 --to 2026-06-01
 ```
 
 Backfill the **oldest range first and without gaps** — deltas aren't cascaded, so
@@ -108,9 +108,9 @@ measured tool usage.
 ### Generating and reading summaries
 
 ```powershell
-npx govproxy summary generate --level monthly --period 2026-05 --scope org
-npx govproxy summary generate --level weekly  --period 2026-W21 --scope team:frontend
-npx govproxy summary show     --level monthly --period 2026-05 --scope org
+npx toprope summary generate --level monthly --period 2026-05 --scope org
+npx toprope summary generate --level weekly  --period 2026-W21 --scope team:frontend
+npx toprope summary show     --level monthly --period 2026-05 --scope org
 ```
 
 - **Period keys:** `YYYY-Wnn` (weekly), `YYYY-MM` (monthly), `YYYY-Qn`

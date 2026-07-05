@@ -3,7 +3,7 @@
 Maps the Phase 6 task tracker (`Phase6_Task_Tracker.md`) to the GitHub issues that
 were imported from it, and gives the exact harness commands to execute them.
 
-- **Repo:** `goranocokoljic/govproxy`
+- **Repo:** `goranocokoljic/toprope`
 - **Milestone:** `Phase 6: Improvement Layer - Knowledge Sharing + Showcase` (#4) — on all 27 issues
 - **Labels:** `phase-6` (all) · `epic` (the 3 parents only — **never run these**) ·
   `epic-6.1` / `epic-6.2` / `epic-6.3` (membership) · `standalone` (6.4 / 6.5)

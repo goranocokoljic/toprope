@@ -18,12 +18,12 @@ import {
 } from './blocks';
 
 // Shown whenever a Slack user with no developer mapping tries to log usage. The
-// fix is an admin action (`govproxy dev link --id <id> --slack <slack-user-id>`),
+// fix is an admin action (`toprope dev link --id <id> --slack <slack-user-id>`),
 // so the message points the developer at their admin rather than at a self-serve
 // step they can't perform.
 export const UNLINKED_MESSAGE =
     "Your Slack account isn't linked to a developer profile yet, so I can't log this. " +
-    'Ask your admin to link your Slack account (they can run `govproxy dev link`).';
+    'Ask your admin to link your Slack account (they can run `toprope dev link`).';
 
 export interface SlackHandlerDeps {
     db: Database.Database;
@@ -80,7 +80,7 @@ export interface SlashCommandBody {
 }
 
 /**
- * Handle the `/govproxy-log` slash command: if the Slack user is linked to a
+ * Handle the `/toprope-log` slash command: if the Slack user is linked to a
  * developer, open the logging modal; otherwise reply with the unlinked message.
  * Identity is the *calling* Slack user — there is no way to target anyone else.
  */

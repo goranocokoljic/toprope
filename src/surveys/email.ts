@@ -2,7 +2,7 @@
  * Email delivery seam for surveys (Task 4.3 / #98).
  *
  * Surveys prefer the Slack bot (Task 4.2); email is the fallback when a
- * developer has no linked Slack id. GovProxy has no SMTP/transport dependency
+ * developer has no linked Slack id. Toprope has no SMTP/transport dependency
  * today, so this is a thin interface plus a logging implementation: it records
  * what would be sent and is the single place to drop in a real transport
  * (nodemailer, SES, a corporate relay) later. Tests inject a capturing fake.

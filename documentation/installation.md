@@ -1,6 +1,6 @@
 # Installation
 
-GovProxy is self-hosted. You can run it directly with Node.js or in Docker. This
+Toprope is self-hosted. You can run it directly with Node.js or in Docker. This
 chapter gets a server running; [Getting started](./getting-started.md) walks
 through populating it with data.
 
@@ -19,8 +19,8 @@ through populating it with data.
 ## Install from source
 
 ```powershell
-git clone <your-fork-or-repo-url> govproxy
-cd govproxy
+git clone <your-fork-or-repo-url> toprope
+cd toprope
 npm install
 npm run build        # compiles TypeScript to dist/ and builds the dashboard
 ```
@@ -31,7 +31,7 @@ npm run build        # compiles TypeScript to dist/ and builds the dashboard
 
 `npm run build` does three things: builds the React dashboard, compiles the
 server/CLI TypeScript to `dist/`, and copies the SQL migrations and the built
-dashboard assets into `dist/`. You need it before using the `npx govproxy` CLI or
+dashboard assets into `dist/`. You need it before using the `npx toprope` CLI or
 running the production server.
 
 ## Running the server
@@ -51,7 +51,7 @@ API, the dashboard, and the background scheduler.
 To point the dev server at an alternate config file:
 
 ```powershell
-$env:GOVPROXY_CONFIG = "govproxy.github-only.config.yaml"; npm run dev
+$env:TOPROPE_CONFIG = "toprope.github-only.config.yaml"; npm run dev
 ```
 
 ### Production
@@ -62,10 +62,10 @@ node dist/server.js
 ```
 
 `dist/server.js` is the package's main entry point. It loads
-`govproxy.config.yaml` (or the file named by `GOVPROXY_CONFIG`), runs migrations,
+`toprope.config.yaml` (or the file named by `TOPROPE_CONFIG`), runs migrations,
 mounts the full API and dashboard, and starts the scheduler.
 
-> **Known limitation:** the `govproxy start` CLI subcommand currently mounts only
+> **Known limitation:** the `toprope start` CLI subcommand currently mounts only
 > `/health`, not the full API. Use `node dist/server.js` (production) or
 > `npm run dev` (development) to serve `/api/*` and the dashboard. This is tracked
 > in [Operations & troubleshooting](./operations-and-troubleshooting.md#gotchas).
@@ -91,7 +91,7 @@ shipped `CMD` against the production-entry note above if the container serves on
 After `npm run build`, the CLI is available as:
 
 ```powershell
-npx govproxy <command>
+npx toprope <command>
 ```
 
 Or run it from source without building:
@@ -101,14 +101,14 @@ npx tsx src/cli.ts <command>
 ```
 
 Every command accepts `-c, --config <path>` to select a config file (default:
-`govproxy.config.yaml` in the current directory). See the full
+`toprope.config.yaml` in the current directory). See the full
 [CLI reference](./cli-reference.md).
 
 ## Verifying the install
 
 ```powershell
-npx govproxy db migrate     # create ./data/govproxy.db and apply all migrations
-npx govproxy doctor         # validate config, database, and connector credentials
+npx toprope db migrate     # create ./data/toprope.db and apply all migrations
+npx toprope doctor         # validate config, database, and connector credentials
 ```
 
 `doctor` reports each check with a `Fix:` hint on failure. Get it green before
@@ -117,5 +117,5 @@ config file and database.
 
 ## Next steps
 
-- [Configuration](./configuration.md) — set up `govproxy.config.yaml`
+- [Configuration](./configuration.md) — set up `toprope.config.yaml`
 - [Getting started](./getting-started.md) — register teams/developers and pull your first data

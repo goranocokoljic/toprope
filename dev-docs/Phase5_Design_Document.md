@@ -1,4 +1,4 @@
-# GovProxy — Phase 5 Design Document
+# Toprope — Phase 5 Design Document
 
 **Phase 5: Developer Coaching**
 
@@ -398,4 +398,4 @@ By the end of Phase 5:
 
 ---
 
-*End of Document — GovProxy Phase 5 Design (decisions resolved)*
+*End of Document — Toprope Phase 5 Design (decisions resolved)*

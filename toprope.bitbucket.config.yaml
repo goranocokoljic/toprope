@@ -8,19 +8,19 @@
 #   $env:DASHBOARD_PASSWORD     = "something"
 #
 # Then:
-#   npx govproxy db migrate   -c govproxy.bitbucket.config.yaml
-#   npx govproxy doctor       -c govproxy.bitbucket.config.yaml
-#   npx govproxy sync git --provider bitbucket -c govproxy.bitbucket.config.yaml
-#   npx govproxy status       -c govproxy.bitbucket.config.yaml
+#   npx toprope db migrate   -c toprope.bitbucket.config.yaml
+#   npx toprope doctor       -c toprope.bitbucket.config.yaml
+#   npx toprope sync git --provider bitbucket -c toprope.bitbucket.config.yaml
+#   npx toprope status       -c toprope.bitbucket.config.yaml
 #
-# `govproxy doctor` validates each configured provider (it lists the workspace
+# `toprope doctor` validates each configured provider (it lists the workspace
 # repos to confirm auth + reachability), so it will verify this Bitbucket setup.
 #
 # To attribute commits to people, register developers with the email they
 # commit under (and/or their Bitbucket nickname):
-#   npx govproxy dev add --name "Jane Dev" --team engineering \
+#   npx toprope dev add --name "Jane Dev" --team engineering \
 #       --email jane@company.com --bitbucket jane-bb \
-#       --git-email jane@personal.com -c govproxy.bitbucket.config.yaml
+#       --git-email jane@personal.com -c toprope.bitbucket.config.yaml
 # Unmatched commit authors are listed in the `sync git` output.
 
 server:
@@ -29,7 +29,7 @@ server:
 
 storage:
   type: "sqlite"
-  sqlite_path: "./data/govproxy.db"
+  sqlite_path: "./data/toprope.db"
 
 connectors:
   copilot:

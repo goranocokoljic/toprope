@@ -228,7 +228,7 @@ describe('importCsv — developer matching', () => {
 
 // Helper: write a CSV string to a temp file and import it with the standard profile.
 function importCsvInline(db: Database.Database, csv: string): ReturnType<typeof importCsv> {
-    const tmp = path.join(os.tmpdir(), `govproxy-richer-${Date.now()}-${Math.random().toString(36).slice(2)}.csv`);
+    const tmp = path.join(os.tmpdir(), `toprope-richer-${Date.now()}-${Math.random().toString(36).slice(2)}.csv`);
     fs.writeFileSync(tmp, csv);
     try {
         return importCsv(db, tmp, {subscription_defaults: {}});

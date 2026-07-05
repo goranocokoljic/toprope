@@ -348,7 +348,7 @@ export function getFeedbackCounts(db: Database.Database, contributionId: string)
 
 /**
  * Record a usage event (viewed | applied | …) and return the stored row. The log
- * is append-only — there is no update or delete, mirroring GovProxy's append-only
+ * is append-only — there is no update or delete, mirroring Toprope's append-only
  * posture; it is the raw material the later usage-signal correlation (6.2.4)
  * joins against metric movement.
  */

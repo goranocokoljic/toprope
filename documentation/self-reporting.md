@@ -15,7 +15,7 @@ Two guarantees:
 
 - **The private task descriptor never enters the aggregated snapshot** and is
   never shared with managers or models. Only the developer can see it (via
-  `govproxy log list`).
+  `toprope log list`).
 - **API-wins rule:** a self-report never overrides a measured API snapshot for the
   same developer/day/tool. If an API sync later produces real data, it replaces
   the self-report placeholder — but the raw self-report is always kept on record.
@@ -26,9 +26,9 @@ Identity is resolved from the environment, not a flag — there is no way to log
 another developer's behalf:
 
 ```powershell
-$env:GOVPROXY_DEVELOPER_ID = "<your-dev-id>"
+$env:TOPROPE_DEVELOPER_ID = "<your-dev-id>"
 # or
-$env:GOVPROXY_DEVELOPER_EMAIL = "you@acme.com"
+$env:TOPROPE_DEVELOPER_EMAIL = "you@acme.com"
 ```
 
 ## CLI
@@ -38,12 +38,12 @@ Valid `--tool` values are `copilot`, `cursor`, `claude_code`, `windsurf`,
 
 ```powershell
 # Log usage for today (or a specific --date)
-npx govproxy log --tool claude_code --minutes 90 --task "refactored the billing module"
-npx govproxy log --tool copilot --date 2026-06-12
+npx toprope log --tool claude_code --minutes 90 --task "refactored the billing module"
+npx toprope log --tool copilot --date 2026-06-12
 
 # Review your own self-reports (includes the private task descriptors)
-npx govproxy log list
-npx govproxy log list --tool claude_code --from 2026-06-01 --to 2026-06-13 --limit 20
+npx toprope log list
+npx toprope log list --tool claude_code --from 2026-06-01 --to 2026-06-13 --limit 20
 ```
 
 The command confirms whether you were newly marked active, were already active, or
@@ -58,8 +58,8 @@ exposes the same capability through a slash command and an interactive form:
 1. Configure and enable the `slack` bot — see
    [Anomalies, surveys & Slack → Slack](./anomalies-surveys-slack.md#1-the-self-reporting-bot-slack).
 2. Link each developer's Slack id:
-   `govproxy dev link --id <dev-id> --slack <U…>`.
-3. The developer runs the `/govproxy-log` slash command, fills the modal (tool,
+   `toprope dev link --id <dev-id> --slack <U…>`.
+3. The developer runs the `/toprope-log` slash command, fills the modal (tool,
    minutes, optional task), and submits. Every inbound request is verified by
    Slack signing secret.
 

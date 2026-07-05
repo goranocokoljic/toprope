@@ -1,4 +1,4 @@
-# GovProxy — Dogfood Readiness Checklist
+# Toprope — Dogfood Readiness Checklist
 
 **Phase 2 close-out (Task 2.12).** This is the final gate before real WMG users
 see the dashboard. Each item maps to an acceptance criterion in issue #47 and is
@@ -73,9 +73,9 @@ npx vitest run tests/integration           # just the 2.12 integration suite
 These are environment checks, not code tests — tick them on the actual host:
 
 - [ ] `npm run build` succeeds on the target machine.
-- [ ] `npx govproxy doctor` is green for every configured connector + provider.
-- [ ] `npx govproxy sync all` completes and `npx govproxy status` shows data.
-- [ ] At least one admin account exists (`govproxy user create-admin`).
+- [ ] `npx toprope doctor` is green for every configured connector + provider.
+- [ ] `npx toprope sync all` completes and `npx toprope status` shows data.
+- [ ] At least one admin account exists (`toprope user create-admin`).
 - [ ] Dashboard reachable at `http://<host>:8080/dashboard`; `/health` returns ok.
 - [ ] If bound to a non-loopback host, `dashboard.auth.cookie_secure` is enabled
       behind HTTPS (the server logs a warning otherwise).

@@ -12,7 +12,7 @@
  *     this manager-facing path can create or alter a showcase example's content.
  *
  *   * The action is SCOPED to a named team, not gated by a per-team-lead identity.
- *     GovProxy's role model is binary (admin | developer) with no team-lead role,
+ *     Toprope's role model is binary (admin | developer) with no team-lead role,
  *     so `team` is the team whose showcase the removal is scoped to — it bounds
  *     WHICH examples may be touched, not WHO may moderate. An example belongs to
  *     team T's showcase when it is team-scoped to T, OR its author is currently on

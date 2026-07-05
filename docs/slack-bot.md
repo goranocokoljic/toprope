@@ -8,7 +8,7 @@ descriptor stays private to the developer and is never sent to managers or model
 
 ## How it works
 
-- `/govproxy-log` opens a modal: tool (required), rough time (optional buttons),
+- `/toprope-log` opens a modal: tool (required), rough time (optional buttons),
   and an optional private task note.
 - Submitting logs the usage for the **submitting** Slack user only — there is no
   way to log on behalf of anyone else. The Slack user id is mapped to a
@@ -28,7 +28,7 @@ signature *is* the authentication.
 ## Slack app setup
 
 1. Create a Slack app (https://api.slack.com/apps).
-2. **Slash Commands** → create `/govproxy-log` with the request URL
+2. **Slash Commands** → create `/toprope-log` with the request URL
    `https://<your-host>/slack/commands`.
 3. **Interactivity & Shortcuts** → enable, request URL
    `https://<your-host>/slack/interactivity`.
@@ -56,7 +56,7 @@ Map each developer to their Slack user id (find it in their Slack profile →
 does not currently expose Slack:
 
 ```
-govproxy dev link --id <developer-id> --slack U0123ABCD
+toprope dev link --id <developer-id> --slack U0123ABCD
 ```
 
 A Slack id can be linked to only one developer; attempting to reuse one is

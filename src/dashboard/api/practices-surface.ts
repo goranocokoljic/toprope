@@ -191,7 +191,7 @@ export function registerPracticeSurfaceRoutes(app: FastifyInstance, db: Database
             }
 
             // Append-only: each view is a fresh row (no per-developer/metric dedup
-            // here, matching GovProxy's append-only posture). The 6.2.4 correlation
+            // here, matching Toprope's append-only posture). The 6.2.4 correlation
             // tolerates repeat rows by anchoring on each developer's FIRST engagement,
             // so a developer re-viewing a practice cannot skew the sample beyond their
             // single first-engagement contribution.

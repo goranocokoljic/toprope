@@ -1,7 +1,7 @@
 # Expenses & waste detection
 
-GovProxy turns cost data into actionable savings. You import what your AI tools
-cost, GovProxy ties each charge to a developer and tool, and the waste engine
+Toprope turns cost data into actionable savings. You import what your AI tools
+cost, Toprope ties each charge to a developer and tool, and the waste engine
 flags spend that isn't earning its keep. This is the feature that pays for the
 product: reclaiming one or two unused seats a month typically covers it.
 
@@ -11,8 +11,8 @@ Subscriptions come from CSV files exported from your expense system or a manual
 sheet.
 
 ```powershell
-npx govproxy expenses import .\data\expenses\q2-2026.csv
-npx govproxy expenses import .\data\expenses\expensify-export.csv --profile expensify
+npx toprope expenses import .\data\expenses\q2-2026.csv
+npx toprope expenses import .\data\expenses\expensify-export.csv --profile expensify
 ```
 
 ### CSV format and column mapping
@@ -38,7 +38,7 @@ alan@acme.com,cursor,pro,20,personal
 ### Import profiles (Expensify, Concur, custom)
 
 Real expense exports rarely match the standard columns. Named **import profiles**
-map a source system's columns onto GovProxy's model. Built-in profiles include
+map a source system's columns onto Toprope's model. Built-in profiles include
 `standard`, `expensify`, and `concur`; you can add your own under
 `expenses.import_profiles`:
 
@@ -67,8 +67,8 @@ doesn't match.
 Rows whose developer can't be matched aren't dropped — they're queued:
 
 ```powershell
-npx govproxy expenses unmatched                      # review the queue
-npx govproxy expenses resolve <charge-id> --dev <developer-id>   # attribute it
+npx toprope expenses unmatched                      # review the queue
+npx toprope expenses resolve <charge-id> --dev <developer-id>   # attribute it
 ```
 
 A resolved recurring charge creates/updates a subscription; a one-time charge is
@@ -80,7 +80,7 @@ Reconciliation compares imported expense charges against the subscription
 registry for a period and flags mismatches so your spend total can be trusted:
 
 ```powershell
-npx govproxy expenses reconcile --period 2026-05 [--tolerance 1]
+npx toprope expenses reconcile --period 2026-05 [--tolerance 1]
 ```
 
 Result types:
@@ -97,7 +97,7 @@ open results in the dashboard's **Admin → Reconciliation** screen or via
 ### Viewing subscriptions
 
 ```powershell
-npx govproxy expenses show [--team frontend]
+npx toprope expenses show [--team frontend]
 ```
 
 Shows each subscription (developer, tool, plan, cost, billing model), org/team
@@ -109,8 +109,8 @@ Cursor).
 The waste engine analyzes subscriptions against usage and flags wasted spend.
 
 ```powershell
-npx govproxy waste show       # run detection + list alerts grouped by type
-npx govproxy waste summary    # waste grouped by team
+npx toprope waste show       # run detection + list alerts grouped by type
+npx toprope waste summary    # waste grouped by team
 ```
 
 ### Alert types
@@ -137,7 +137,7 @@ transition-aware, so switching a developer's plan doesn't trigger a false unused
 ### Plan-change ROI
 
 When a subscription is upgraded (handled as revoke-old + create-new so history is
-preserved), GovProxy captures a baseline and, after a settling period, compares
+preserved), Toprope captures a baseline and, after a settling period, compares
 post-upgrade usage. If the higher tier isn't justified by a usage rise it raises a
 **plan_roi** alert — framed as a review, not a verdict. Plan-ROI is re-evaluated
 automatically after every `sync all` and `waste show`.
@@ -145,7 +145,7 @@ automatically after every `sync all` and `waste show`.
 ### Resolving alerts
 
 ```powershell
-npx govproxy waste resolve <alert-id> --reason "reallocated to new hire"
+npx toprope waste resolve <alert-id> --reason "reallocated to new hire"
 ```
 
 Resolution is an audited workflow: alerts can be reallocated, upgraded, justified,

@@ -3,7 +3,7 @@ server:
   host: "0.0.0.0"
 storage:
   type: "sqlite"
-  sqlite_path: "./data/govproxy.db"
+  sqlite_path: "./data/toprope.db"
 connectors:
   copilot:
     enabled: true

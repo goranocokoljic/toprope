@@ -19,7 +19,7 @@ import {
     surveySlackClientFromConfig,
     type DispatchDeps,
 } from '../../src/surveys/dispatch';
-import type {GovProxyConfig} from '../../src/config/types';
+import type {TopropeConfig} from '../../src/config/types';
 import {getSurveyById, listSurveys} from '../../src/surveys/store';
 import type {SurveyTriggerCandidate} from '../../src/surveys/triggers';
 
@@ -343,8 +343,8 @@ describe('runTriggerSweep', () => {
 });
 
 describe('buildSurveyDispatchDeps / surveySlackClientFromConfig', () => {
-    function cfg(partial: Partial<GovProxyConfig>): GovProxyConfig {
-        return partial as GovProxyConfig;
+    function cfg(partial: Partial<TopropeConfig>): TopropeConfig {
+        return partial as TopropeConfig;
     }
 
     it('derives no Slack client when the bot is disabled or tokenless', () => {

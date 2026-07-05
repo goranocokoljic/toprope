@@ -12,7 +12,7 @@ function sign(secret: string, timestamp: string, body: string): string {
 describe('verifySlackSignature', () => {
     const now = 1_700_000_000;
     const ts = String(now);
-    const body = 'token=abc&user_id=U1&command=%2Fgovproxy-log';
+    const body = 'token=abc&user_id=U1&command=%2Ftoprope-log';
 
     it('accepts a correctly signed, fresh request', () => {
         const signature = sign(SECRET, ts, body);

@@ -1,13 +1,13 @@
-import type { GovProxyConfig } from './types';
+import type { TopropeConfig } from './types';
 
-export const defaultConfig: GovProxyConfig = {
+export const defaultConfig: TopropeConfig = {
     server: {
         port: 8080,
         host: '0.0.0.0',
     },
     storage: {
         type: 'sqlite',
-        sqlite_path: './data/govproxy.db',
+        sqlite_path: './data/toprope.db',
     },
     connectors: {
         copilot: { enabled: false, sync_interval: 'daily', sync_time: '02:00' },

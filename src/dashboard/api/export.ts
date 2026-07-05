@@ -108,7 +108,7 @@ function sendCsv(reply: FastifyReply, rows: ExportRow[], truncated: boolean): Fa
     }
 
     void reply.header('Content-Type', 'text/csv; charset=utf-8');
-    void reply.header('Content-Disposition', 'attachment; filename="govproxy-export.csv"');
+    void reply.header('Content-Disposition', 'attachment; filename="toprope-export.csv"');
     if (truncated) {
         void reply.header('X-Truncated', 'true');
     }

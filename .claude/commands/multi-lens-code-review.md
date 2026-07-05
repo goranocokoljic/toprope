@@ -1,6 +1,6 @@
 ---
 description: >-
-  Multi-lens code review of the current branch's changes for GovProxy.
+  Multi-lens code review of the current branch's changes for Toprope.
   The parent captures the diff once and dispatches four independent
   reviewer subagents in parallel — Senior Overlord, Security/Correctness,
   Occam's Razor, Test Adequacy — each with an isolated, diff-only context,
@@ -16,7 +16,7 @@ argument-hint: "[anchor: what this change does and why — the bug/issue/feature
 
 Parallel, isolated review. The parent orchestrator captures the diff
 once, dispatches four independent subagents — one per lens — and
-concatenates their returned sections into a single file. GovProxy is a
+concatenates their returned sections into a single file. Toprope is a
 single Node/TypeScript repo on GitHub, so there is one diff to review
 and (optionally) one PR to post to.
 
@@ -107,7 +107,7 @@ Batch the independent commands into a single message.
 - The remaining text is the anchor.
 
 **Extract the issue number** (for the filename and PR linkage only, not
-for diff scoping). GovProxy branches are `feature/issue-{n}-{slug}`:
+for diff scoping). Toprope branches are `feature/issue-{n}-{slug}`:
 
     BRANCH=$(git rev-parse --abbrev-ref HEAD)
     ISSUE=$(echo "$BRANCH" | grep -oE 'issue-[0-9]+' | grep -oE '[0-9]+' | head -1)
@@ -177,7 +177,7 @@ verbatim:
   sections."
 - **The anchor:** the one-line `$ARGUMENTS` restatement (or "no anchor
   provided").
-- **The context:** the base branch, and that this is the GovProxy repo
+- **The context:** the base branch, and that this is the Toprope repo
   (so the subagent can apply the investigation policy against the real
   working tree).
 - **The lens prompt** for that subagent's lens, copied verbatim from the
@@ -244,7 +244,7 @@ What edge case is unhandled because the author tested the happy path —
 empty API response, missing developer, a day with zero activity, a CSV
 row with a malformed amount?
 
-Mind the GovProxy invariants: daily snapshots are the atomic unit and
+Mind the Toprope invariants: daily snapshots are the atomic unit and
 **append-only** (never mutate history); all timestamps are UTC ISO; data
 quality is tagged per point (high/medium/low). A change that quietly
 breaks one of these is exactly the kind of thing you'll regret owning.
@@ -330,7 +330,7 @@ it claims to exercise):
 - **Untested branches & paths.** Error paths, `catch` blocks, early
   returns, and discriminated-union arms the diff adds that no test
   exercises. New source with zero covering test is the strongest finding.
-- **GovProxy edge cases.** When the changed code touches them, these must
+- **Toprope edge cases.** When the changed code touches them, these must
   be tested: a zero-activity day, a missing/unknown developer, a
   malformed CSV amount or date, an empty or paginated connector API
   response, a duplicate-day write (append-only must hold), and UTC date

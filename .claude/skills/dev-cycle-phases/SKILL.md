@@ -363,7 +363,7 @@ until a test proves it. Hold every new or changed module to this bar:
    - error and early-return paths (thrown errors, caught-and-handled branches,
      empty/None results).
 
-   GovProxy-specific cases that must be tested when the code touches them: a
+   Toprope-specific cases that must be tested when the code touches them: a
    zero-activity day, a missing/unknown developer, a malformed CSV amount or date,
    an empty or paginated connector API response, a duplicate-day write (append-only
    must hold), and UTC date boundaries. Don't test trivial glue or pure type

@@ -59,7 +59,7 @@ describe('Slack routes', () => {
     }
 
     it('rejects a request with a bad signature (401)', async () => {
-        const body = 'user_id=U_ALICE&trigger_id=t1&command=%2Fgovproxy-log';
+        const body = 'user_id=U_ALICE&trigger_id=t1&command=%2Ftoprope-log';
         const res = await app.inject({
             method: 'POST',
             url: '/slack/commands',
@@ -76,7 +76,7 @@ describe('Slack routes', () => {
 
     it('handles a correctly signed slash command and opens a modal', async () => {
         seedLinked('U_ALICE');
-        const body = 'user_id=U_ALICE&trigger_id=t1&command=%2Fgovproxy-log';
+        const body = 'user_id=U_ALICE&trigger_id=t1&command=%2Ftoprope-log';
         const res = await app.inject({
             method: 'POST',
             url: '/slack/commands',
@@ -88,7 +88,7 @@ describe('Slack routes', () => {
     });
 
     it('returns the unlinked ephemeral message for an unmapped user', async () => {
-        const body = 'user_id=U_STRANGER&trigger_id=t1&command=%2Fgovproxy-log';
+        const body = 'user_id=U_STRANGER&trigger_id=t1&command=%2Ftoprope-log';
         const res = await app.inject({
             method: 'POST',
             url: '/slack/commands',

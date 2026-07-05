@@ -1,4 +1,4 @@
-# GovProxy — Phase 6 Task Tracker
+# Toprope — Phase 6 Task Tracker
 
 **Phase 6: Improvement Layer — Knowledge Sharing + Showcase**
 
@@ -1016,4 +1016,4 @@ Next: Phase 7 — Production Hardening & Scale (PostgreSQL, SSO/SAML, RBAC).
 
 ---
 
-*End of Document — GovProxy Phase 6 Task Tracker*
+*End of Document — Toprope Phase 6 Task Tracker*

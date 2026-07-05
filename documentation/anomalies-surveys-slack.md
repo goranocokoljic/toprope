@@ -6,7 +6,7 @@ the developer about it, and **Slack** is the delivery channel for both.
 
 ## Anomaly detection
 
-GovProxy watches for metrics that deviate meaningfully from their own baseline —
+Toprope watches for metrics that deviate meaningfully from their own baseline —
 usage drops, runaway spend, churn spikes — and raises anomalies for review.
 
 ### How it works
@@ -27,9 +27,9 @@ usage drops, runaway spend, churn spikes — and raises anomalies for review.
 Scans run automatically after the weekly aggregation. To run manually:
 
 ```powershell
-npx govproxy anomaly scan                      # just-completed ISO week
-npx govproxy anomaly scan --period 2026-05-18  # any date in the target week
-npx govproxy anomaly list --scope team --status open
+npx toprope anomaly scan                      # just-completed ISO week
+npx toprope anomaly scan --period 2026-05-18  # any date in the target week
+npx toprope anomaly list --scope team --status open
 ```
 
 ### Surfacing
@@ -44,7 +44,7 @@ override), or via `/api/settings/anomaly`.
 
 ## Data-prompted surveys
 
-When the data raises a question, GovProxy can ask the developer directly — turning
+When the data raises a question, Toprope can ask the developer directly — turning
 a metric into context. ("We see your Copilot usage dropped 40% — did you switch
 tools?")
 
@@ -72,12 +72,12 @@ surveys:
 Or drive it manually and manage the queue from the CLI:
 
 ```powershell
-npx govproxy survey run                       # detect triggers + dispatch
-npx govproxy survey queue                      # list surveys awaiting send
-npx govproxy survey send <survey-id>           # send a queued survey
-npx govproxy survey create --developer <id> --question "..."   # manual survey
-npx govproxy survey dismiss <survey-id>
-npx govproxy survey responses                  # answered surveys + responses
+npx toprope survey run                       # detect triggers + dispatch
+npx toprope survey queue                      # list surveys awaiting send
+npx toprope survey send <survey-id>           # send a queued survey
+npx toprope survey create --developer <id> --question "..."   # manual survey
+npx toprope survey dismiss <survey-id>
+npx toprope survey responses                  # answered surveys + responses
 ```
 
 ### Privacy
@@ -89,11 +89,11 @@ standalone individual metric. Developers respond in Slack or via
 
 ## Slack
 
-GovProxy uses Slack two distinct ways. Don't confuse them:
+Toprope uses Slack two distinct ways. Don't confuse them:
 
 ### 1. The self-reporting bot (`slack`)
 
-A full Slack app with the `/govproxy-log` slash command and interactive forms,
+A full Slack app with the `/toprope-log` slash command and interactive forms,
 used for [self-reporting](./self-reporting.md), survey delivery, anomaly alerts,
 and the optional end-of-day prompt. Authenticated by a **bot token + signing
 secret** (every inbound request is HMAC-verified).
@@ -109,12 +109,12 @@ slack:
     channels: ["C0123ABCD"]
   anomaly_alerts:
     channels: ["C0123ABCD"]                  # where notable/high anomalies post
-    dashboard_url: "https://govproxy.example.com"   # builds the "view in dashboard" link
+    dashboard_url: "https://toprope.example.com"   # builds the "view in dashboard" link
 ```
 
 Setup: create a Slack app, add the slash command pointing at your server, install
 it to the workspace for the `xoxb-` token, and copy the signing secret. Link each
-developer's Slack id with `govproxy dev link --id <dev-id> --slack <U…>` before
+developer's Slack id with `toprope dev link --id <dev-id> --slack <U…>` before
 they can log. The bot's routes are only mounted when `slack.enabled` is true.
 
 ### 2. The waste webhook (`alerts.slack`)

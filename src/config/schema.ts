@@ -1,4 +1,4 @@
-// Plain JSON Schema for govproxy.config.yaml validation
+// Plain JSON Schema for toprope.config.yaml validation
 export const configSchema: Record<string, unknown> = {
     type: 'object',
     required: ['server', 'storage', 'connectors'],

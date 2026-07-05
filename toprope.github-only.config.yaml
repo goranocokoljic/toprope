@@ -3,9 +3,9 @@
 # with a single GitHub PAT and no Anthropic/Windsurf keys.
 #
 # Use it with:
-#   npx govproxy doctor   -c govproxy.github-only.config.yaml
-#   npx govproxy sync all -c govproxy.github-only.config.yaml
-#   $env:GOVPROXY_CONFIG = "govproxy.github-only.config.yaml"; npm run dev
+#   npx toprope doctor   -c toprope.github-only.config.yaml
+#   npx toprope sync all -c toprope.github-only.config.yaml
+#   $env:TOPROPE_CONFIG = "toprope.github-only.config.yaml"; npm run dev
 
 server:
   port: 8080
@@ -13,7 +13,7 @@ server:
 
 storage:
   type: "sqlite"
-  sqlite_path: "./data/govproxy.db"
+  sqlite_path: "./data/toprope.db"
 
 connectors:
   copilot:

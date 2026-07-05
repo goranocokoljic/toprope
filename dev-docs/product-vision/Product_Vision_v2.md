@@ -1,4 +1,4 @@
-# GovProxy — Revised Product Vision
+# Toprope — Revised Product Vision
 
 **AI Adoption Intelligence Platform for Engineering Organizations**
 
@@ -10,9 +10,9 @@ Version 2.0 — May 2026 | Confidential
 
 ## 1. Executive Summary
 
-GovProxy is an AI adoption intelligence platform that gives engineering leadership a unified, cross-tool view of how their organization uses AI-assisted development tools — regardless of which tools are in use, how they're billed, or who manages the accounts.
+Toprope is an AI adoption intelligence platform that gives engineering leadership a unified, cross-tool view of how their organization uses AI-assisted development tools — regardless of which tools are in use, how they're billed, or who manages the accounts.
 
-Unlike vendor-specific dashboards (Copilot Metrics, Cursor Analytics, Claude Code Analytics) that show usage for their own tool only, GovProxy aggregates data from every source available — tool APIs, git repositories, expense data, and developer self-reports — normalizes it into a unified model, and surfaces the insights that no single vendor provides:
+Unlike vendor-specific dashboards (Copilot Metrics, Cursor Analytics, Claude Code Analytics) that show usage for their own tool only, Toprope aggregates data from every source available — tool APIs, git repositories, expense data, and developer self-reports — normalizes it into a unified model, and surfaces the insights that no single vendor provides:
 
 - Which tools are actually being used, and by whom?
 - Are we getting value from our AI tool investment, or wasting money on idle seats?
@@ -20,7 +20,7 @@ Unlike vendor-specific dashboards (Copilot Metrics, Cursor Analytics, Claude Cod
 - Which teams are thriving with AI? Which need help?
 - What does the quarterly AI adoption report look like for executive leadership?
 
-**Core thesis:** Every engineering organization is now spending significant money on AI tools. Nobody can answer the question "is it working?" because the data is fragmented across vendor dashboards, personal accounts, expense reports, and gut feelings. GovProxy is the single pane of glass that answers that question.
+**Core thesis:** Every engineering organization is now spending significant money on AI tools. Nobody can answer the question "is it working?" because the data is fragmented across vendor dashboards, personal accounts, expense reports, and gut feelings. Toprope is the single pane of glass that answers that question.
 
 ---
 
@@ -50,7 +50,7 @@ Every major AI tool vendor now has usage analytics:
 - **Claude Code** — Enterprise Analytics API with per-user metrics, sessions, commits, PRs, cost
 - **Windsurf** — Enterprise API with service key auth, analytics endpoints, usage dashboards
 
-These are useful individually. But they each show only their own tool. No vendor will tell you "your developer would be more productive on a competitor's tool" or "this developer has seats on three tools and barely uses any of them." The cross-tool unified view is the gap GovProxy fills.
+These are useful individually. But they each show only their own tool. No vendor will tell you "your developer would be more productive on a competitor's tool" or "this developer has seats on three tools and barely uses any of them." The cross-tool unified view is the gap Toprope fills.
 
 ### 2.3 Target Buyer
 
@@ -71,7 +71,7 @@ These are useful individually. But they each show only their own tool. No vendor
 
 ### Pillar 1: Multi-Source Data Collection
 
-GovProxy doesn't depend on a single data collection method. It works with whatever data sources are available and clearly communicates the confidence level of its insights.
+Toprope doesn't depend on a single data collection method. It works with whatever data sources are available and clearly communicates the confidence level of its insights.
 
 **Tier 1: Tool API Connectors (highest data quality)**
 
@@ -297,17 +297,17 @@ Each aggregate stores: averages, totals, min/max, percentiles, and deltas from p
 
 No existing tool answers the question: "Across all our AI tools, billing models, and teams — are we getting value from our AI investment, and how do we improve?"
 
-DX and Jellyfish are the closest competitors. They offer connectors for some AI tools and correlate with engineering metrics. But they're broad engineering productivity platforms, not AI-adoption-focused. Their AI tool coverage is a feature, not the product. GovProxy makes AI adoption intelligence the entire product, going deeper on waste detection, multi-source data collection, longitudinal tracking, AI-generated reports, and developer coaching.
+DX and Jellyfish are the closest competitors. They offer connectors for some AI tools and correlate with engineering metrics. But they're broad engineering productivity platforms, not AI-adoption-focused. Their AI tool coverage is a feature, not the product. Toprope makes AI adoption intelligence the entire product, going deeper on waste detection, multi-source data collection, longitudinal tracking, AI-generated reports, and developer coaching.
 
 ### 5.3 Positioning
 
-> "GovProxy is the AI adoption intelligence platform for engineering teams. Connect your tools, connect your repos, and finally answer the question your VP keeps asking: is our AI investment working?"
+> "Toprope is the AI adoption intelligence platform for engineering teams. Connect your tools, connect your repos, and finally answer the question your VP keeps asking: is our AI investment working?"
 
 ---
 
 ## 6. Platform Agnostic by Design
 
-GovProxy works with every major AI development tool and every billing model:
+Toprope works with every major AI development tool and every billing model:
 
 **Tool Coverage (via API connectors):**
 - GitHub Copilot (Business, Enterprise)
@@ -369,22 +369,22 @@ GovProxy works with every major AI development tool and every billing model:
 | Risk | Severity | Mitigation |
 |---|---|---|
 | Vendor APIs change or get restricted | High | Connector architecture isolates changes. Community maintains connectors. Multiple data sources reduce dependency on any single API. |
-| DX/Jellyfish adds deeper AI adoption features | High | Move fast. GovProxy goes deeper on AI-specific intelligence than broad engineering platforms can. |
+| DX/Jellyfish adds deeper AI adoption features | High | Move fast. Toprope goes deeper on AI-specific intelligence than broad engineering platforms can. |
 | Companies resist tracking individual developer metrics | Medium | Strict privacy boundaries. Individual data visible only to the developer. Managers see aggregates only. Frame as organizational intelligence, not surveillance. |
 | Git-based AI detection has false positives | Medium | Use as correlation signal, not definitive classification. Combine with tool API data when available. Be transparent about confidence levels. |
 | Tool API access requires Enterprise plans that cost more | Medium | Git analysis works without any tool API. Platform provides value even with zero connectors. Enterprise plans are the target buyer's reality anyway. |
-| Naming — GovProxy is a working name | Low | Finalize before public launch. No brand investment in the working name. |
+| Naming — Toprope is a working name | Low | Finalize before public launch. No brand investment in the working name. |
 
 ---
 
 ## 10. PureContext Synergy
 
-GovProxy and PureContext serve different but complementary roles:
+Toprope and PureContext serve different but complementary roles:
 
-- **GovProxy** measures and improves how organizations adopt AI tools
+- **Toprope** measures and improves how organizations adopt AI tools
 - **PureContext** optimizes the context that goes into AI prompts
 
-Data from GovProxy (which teams have high code churn, which developers loop frequently) could inform PureContext's optimization strategies. PureContext's token savings could appear as a measurable improvement in GovProxy's cost-per-outcome metrics.
+Data from Toprope (which teams have high code churn, which developers loop frequently) could inform PureContext's optimization strategies. PureContext's token savings could appear as a measurable improvement in Toprope's cost-per-outcome metrics.
 
 Together: measure your AI adoption, coach your developers, and optimize every token.
 
@@ -400,4 +400,4 @@ If it works for you — if you can open a dashboard on Monday morning and know e
 
 ---
 
-*End of Document — GovProxy Product Vision v2.0*
+*End of Document — Toprope Product Vision v2.0*

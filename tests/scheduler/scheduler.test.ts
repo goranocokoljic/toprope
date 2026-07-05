@@ -1,9 +1,9 @@
 import {describe, it, expect} from 'vitest';
 import {parseSyncTimeToCron, buildConnectorSchedule} from '../../src/scheduler/scheduler';
-import type {GovProxyConfig} from '../../src/config/types';
+import type {TopropeConfig} from '../../src/config/types';
 import {defaultConfig} from '../../src/config/defaults';
 
-function makeConfig(overrides: Partial<GovProxyConfig> = {}): GovProxyConfig {
+function makeConfig(overrides: Partial<TopropeConfig> = {}): TopropeConfig {
     return {...defaultConfig, ...overrides};
 }
 
