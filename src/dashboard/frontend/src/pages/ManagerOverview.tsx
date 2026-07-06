@@ -21,7 +21,7 @@ import {formatCurrency, formatPercent, formatDateTick} from '../components/forma
 import {inclusiveDayCount} from '../timeRange/range';
 import type {OverviewData, ToolDistributionEntry, WasteTeamSummary} from '../api/types';
 
-// The connectors GovProxy can pull from. We always list all three so the
+// The connectors Toprope can pull from. We always list all three so the
 // cold-start panel shows what's still unconnected, not just what's wired up.
 // Each id must match the tool string the backend writes into tool_snapshots
 // (see each connector's transformer, e.g. claude-code → 'claude_code'); the

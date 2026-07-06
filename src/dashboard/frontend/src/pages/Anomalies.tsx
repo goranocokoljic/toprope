@@ -33,7 +33,7 @@ function AnomalyActions({anomaly}: {anomaly: AnomalyAlert}): JSX.Element {
                 type="button"
                 onClick={() => resolve.mutate(anomaly.id)}
                 disabled={pending}
-                className="rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-white disabled:opacity-60"
+                className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-primary/90 disabled:opacity-60"
             >
                 {resolve.isPending ? 'Saving…' : 'Resolve'}
             </button>

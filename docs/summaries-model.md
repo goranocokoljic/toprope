@@ -1,8 +1,8 @@
 # Summary Model — Default & Infrastructure Requirements
 
-GovProxy's AI-generated summaries (weekly / monthly / quarterly / yearly) are
+Toprope's AI-generated summaries (weekly / monthly / quarterly / yearly) are
 produced by a configurable text-generation model. The model is configured under
-`summaries.model` in `govproxy.config.yaml`, with optional per-level overrides.
+`summaries.model` in `toprope.config.yaml`, with optional per-level overrides.
 
 ## Why local by default
 
@@ -54,7 +54,7 @@ ollama pull llama3.1:70b
 ollama pull llama3.1:8b
 ```
 
-`govproxy doctor` checks that the configured Ollama endpoint is reachable when
+`toprope doctor` checks that the configured Ollama endpoint is reachable when
 summaries are enabled.
 
 ## Graceful failure
@@ -135,8 +135,8 @@ curl http://localhost:11434/api/generate \
 
 > Once Task 3.9 ships, the same spot-check is one command:
 > ```bash
-> npx govproxy summary generate --level weekly --period 2026-W21 --scope team:backend
-> npx govproxy summary show     --level weekly --period 2026-W21 --scope team:backend
+> npx toprope summary generate --level weekly --period 2026-W21 --scope team:backend
+> npx toprope summary show     --level weekly --period 2026-W21 --scope team:backend
 > ```
 
 Read the output and confirm by eye that it:

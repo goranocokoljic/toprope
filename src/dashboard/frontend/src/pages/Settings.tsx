@@ -19,9 +19,9 @@ import type {
 // A settings section groups related keys under a labeled subheading, so the
 // global and per-team panels render Leaderboard / ROI / Surveys / Anomaly alerts
 // as distinct blocks rather than one flat list (Task 4.12).
-type Section = 'Leaderboard' | 'ROI' | 'Surveys' | 'Anomaly alerts' | 'Coaching';
+type Section = 'Leaderboard' | 'ROI' | 'Surveys' | 'Anomaly alerts' | 'Coaching' | 'Best Practices';
 
-const SECTION_ORDER: Section[] = ['Leaderboard', 'ROI', 'Surveys', 'Anomaly alerts', 'Coaching'];
+const SECTION_ORDER: Section[] = ['Leaderboard', 'ROI', 'Surveys', 'Anomaly alerts', 'Coaching', 'Best Practices'];
 
 interface BaseField {
     key: keyof GlobalSettings;
@@ -106,6 +106,7 @@ const FIELDS: Field[] = [
             {value: 'org_wide', label: 'Org-wide'},
         ],
     },
+    {key: 'showcase_ai_annotation_enabled', label: 'Showcase AI annotation enabled', type: 'boolean', section: 'Coaching', teamOverridable: true},
     {
         key: 'nudge_default_frequency',
         label: 'Default nudge frequency',
@@ -125,6 +126,33 @@ const FIELDS: Field[] = [
         type: 'boolean',
         section: 'Coaching',
         teamOverridable: false,
+    },
+    // Best Practices & curation (Task 6.4 / #173). The master switch, the per-team
+    // contribution model, and who may curate — all overridable per team under the
+    // same coaching_managers_can_override flag as the Coaching section above.
+    {key: 'bestpractices_enabled', label: 'Best practices enabled', type: 'boolean', section: 'Best Practices', teamOverridable: true},
+    {
+        key: 'best_practice_contribution_model',
+        label: 'Contribution model',
+        type: 'enum',
+        section: 'Best Practices',
+        teamOverridable: true,
+        options: [
+            {value: 'top_down', label: 'Top-down (leads publish)'},
+            {value: 'bottom_up', label: 'Bottom-up (anyone, feedback-ranked)'},
+            {value: 'hybrid', label: 'Hybrid (anyone, lead-endorsed)'},
+        ],
+    },
+    {
+        key: 'curator_permission',
+        label: 'Who may act as lead/curator',
+        type: 'enum',
+        section: 'Best Practices',
+        teamOverridable: true,
+        options: [
+            {value: 'managers_admins', label: 'Managers & admins'},
+            {value: 'any_member', label: 'Any member'},
+        ],
     },
 ];
 
@@ -332,7 +360,7 @@ function GlobalPanel(): JSX.Element {
                         type="button"
                         onClick={onSave}
                         disabled={update.isPending}
-                        className="rounded-md bg-accent px-4 py-2 text-sm font-medium text-white disabled:opacity-60"
+                        className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-primary/90 disabled:opacity-60"
                     >
                         {update.isPending ? 'Saving…' : 'Save global settings'}
                     </button>
@@ -435,7 +463,7 @@ function TeamPanel(): JSX.Element {
                                 type="button"
                                 onClick={onSave}
                                 disabled={update.isPending}
-                                className="rounded-md bg-accent px-4 py-2 text-sm font-medium text-white disabled:opacity-60"
+                                className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-primary/90 disabled:opacity-60"
                             >
                                 {update.isPending ? 'Saving…' : 'Save team overrides'}
                             </button>
@@ -582,7 +610,7 @@ function AnomalyDetectionPanel(): JSX.Element {
                         type="button"
                         onClick={onSave}
                         disabled={update.isPending}
-                        className="rounded-md bg-accent px-4 py-2 text-sm font-medium text-white disabled:opacity-60"
+                        className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-primary/90 disabled:opacity-60"
                     >
                         {update.isPending ? 'Saving…' : 'Save anomaly config'}
                     </button>

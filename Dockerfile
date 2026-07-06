@@ -16,7 +16,7 @@ RUN npm ci --omit=dev
 
 COPY --from=builder /app/dist ./dist
 COPY bin/ ./bin/
-COPY govproxy.config.yaml ./
+COPY toprope.config.yaml ./
 
 RUN mkdir -p data
 

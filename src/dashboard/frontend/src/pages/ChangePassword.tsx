@@ -106,7 +106,7 @@ export function ChangePassword(): JSX.Element {
                 <button
                     type="submit"
                     disabled={submitting}
-                    className="w-full rounded-md bg-accent px-4 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-60"
+                    className="w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-60"
                 >
                     {submitting ? 'Saving…' : 'Change password'}
                 </button>

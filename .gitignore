@@ -27,4 +27,11 @@ reports/
 # Local dev-cycle wrapper (personal workflow helper, not part of the package)
 run-issues.ps1
 dev-cycle-logs/
-dev-cycle-analytics/
+# Ignore local analytics, but keep the review knowledge base tracked (it's the
+# accumulating source of truth). Note: glob the CONTENTS, not the dir, so the
+# negations below can re-include specific files.
+dev-cycle-analytics/*
+!dev-cycle-analytics/review-lessons.jsonl
+!dev-cycle-analytics/REVIEW_KB.md
+
+backup/

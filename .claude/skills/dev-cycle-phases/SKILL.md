@@ -28,6 +28,150 @@ addition is a phase marker emitted at the start of each phase (see below).
 ## Invocation
 `/dev-cycle-phases {issue-number}` — e.g. `/dev-cycle-phases 1`
 
+Mode flags (see **Run modes** below) select stacked-epic batching:
+- `/dev-cycle-phases 153 --epic-branch epic/issue-151-browse-ui --epic-issue 151` — build child 153 onto the epic branch.
+- `/dev-cycle-phases 151 --finalize-epic 153,154,155,156 --epic-branch epic/issue-151-browse-ui` — review the whole stack and land it.
+
+---
+
+## Run modes
+
+This skill runs in one of three modes, chosen by the invocation flags. **Default
+mode** (no mode flags) is the original standalone-issue flow in Phases 1–8 below and
+is **unchanged** — use it for any normal, non-epic issue.
+
+The other two modes implement **stacked-epic batching**: an epic's children are each
+built on a shared epic integration branch (cheap per-child gate, no review loop,
+nothing merged to develop), then the epic runs the full multi-lens review **once** on
+the whole stack and lands it in a single PR to develop. This removes the per-child
+review/PR overhead while keeping develop free of un-reviewed code.
+
+> **When `--epic-branch` or `--finalize-epic` is present you are in a non-default
+> mode. The per-phase deltas in this section OVERRIDE the default Phase 2/3/5/6/7
+> behavior below.** Most dangerously: a child must never branch off develop or merge
+> to develop, and a child issue must never be closed by the child run.
+
+### Flags
+
+| Flag | Mode | Meaning |
+|------|------|---------|
+| `--epic-branch <name>` (without `--finalize-epic`) | **subtask** | This issue is a child of an epic. Stack it on `<name>`; do **not** PR to develop, do **not** close the issue. |
+| `--epic-issue <N>` | subtask | The parent epic's issue number, for context resolution. |
+| `--fast-lens <on\|off>` | subtask | Run the single-lens SEC quick pass after the gate. Default **on**. |
+| `--finalize-epic <csv>` | **epic-finalize** | This issue is the epic. Its children (`<csv>`, e.g. `153,154,155,156`) are already stacked on `--epic-branch`; review the whole stack, PR to develop, merge, close the epic **and** every child. |
+
+The scheduling script owns the epic-branch **name** and passes it in. When testing this
+skill by hand, use `epic/issue-{epic-number}-{slug}`.
+
+### Subtask mode — `--epic-branch <name>` (no `--finalize-epic`)
+
+Build one child on the epic branch. Deltas from the default flow, by phase:
+
+- **Phase 1 (read):** unchanged, but resolve the **epic** (`--epic-issue`) in full for
+  its cross-cutting acceptance criteria. Read sibling children only where this child
+  explicitly references them (per the existing epic/sibling resolution rules).
+- **Phase 2 (branch):** stack on the epic branch — do **not** branch off develop.
+  ```bash
+  EPIC_BRANCH="<name>"          # passed via --epic-branch
+  # First child creates the epic branch off develop; later children reuse it.
+  if ! git rev-parse --verify "$EPIC_BRANCH" >/dev/null 2>&1; then
+    git checkout develop && git pull origin develop
+    git checkout -b "$EPIC_BRANCH"
+  else
+    git checkout "$EPIC_BRANCH"
+    git pull --ff-only 2>/dev/null || true
+  fi
+  git checkout -b feature/issue-{number}-{slug}    # child branch OFF the epic branch
+  ```
+  Resume: if a merge commit for this child already exists on the epic branch
+  (`git log "$EPIC_BRANCH" --grep "merge(#{number})"`), the child is already done —
+  skip to the success sentinel.
+- **Phase 3 (implement):** unchanged.
+- **Phase 4 (build+test):** unchanged — the **full** gate (build + test + coverage)
+  still runs per child. A child that breaks the build or drops a new file to 0% does
+  not advance.
+- **Fast lens (replaces Phase 6 for children; only if `--fast-lens on`):** emit
+  `DEVCYCLE_PHASE: review | fast SEC`. Dispatch a **single** Security/Correctness
+  reviewer subagent over this child's diff
+  (`git diff $(git merge-base "$EPIC_BRANCH" HEAD)..HEAD`) using the `[SEC]` lens prompt
+  from `/multi-lens-code-review` — **one pass only, no cycles, not the full four lenses.**
+  Fix only **Critical/High** findings here (you hold the implementation intent — "fix
+  while hot"), then re-run the gate. Medium/Low are deferred to the epic review. Keep
+  this deliberately cheap; it is a safety net, not the real review.
+- **Phase 5 (pr):** **skipped.** A child never opens a PR to develop.
+- **Phase 7 (merge):** merge the child into the **epic branch** — never develop —
+  keeping a merge commit for history, and do **not** close the issue:
+  ```bash
+  git checkout "$EPIC_BRANCH"
+  git merge --no-ff feature/issue-{number}-{slug} \
+    -m "merge(#{number}): {slug} into ${EPIC_BRANCH}"
+  git branch -d feature/issue-{number}-{slug}
+  git push origin "$EPIC_BRANCH" 2>/dev/null || true   # only if the epic branch is tracked
+  ```
+  The child issue stays **open** — epic-finalize closes it.
+- **Phase 8 (report):** skip the per-issue report file (the epic writes one report
+  covering all children). Still end with the `DEVCYCLE_OK` / `DEVCYCLE_FAIL` sentinel so
+  the runner can sequence the next child.
+
+Markers emitted in subtask mode: `read`, `branch`, `implement`, `build+test`,
+(`review | fast SEC`), `merge`. `pr` is **not** emitted.
+
+### Epic-finalize mode — `--finalize-epic <csv> --epic-branch <name>`
+
+Every child is already stacked on `<name>`. Review the whole epic and land it.
+
+- **Phase 1 (read):** read the **epic** issue in full **and** each child's
+  title + acceptance criteria. The combined acceptance set = every child's criteria +
+  the epic's cross-cutting criteria; this is what the review anchors on.
+- **Phase 2 (branch):** check out the **existing** epic branch (do not create it):
+  `git checkout "$EPIC_BRANCH" && git pull --ff-only 2>/dev/null || true`.
+- **Phase 3 (implement):** usually **skipped** — the epic is an umbrella and its code is
+  the children. Implement only if the epic issue itself carries acceptance criteria that
+  no child owns.
+- **Phase 4 (build+test):** run the full gate on the **integrated** epic branch. The
+  coverage gate applies to every file the epic diff (vs develop) adds or changes.
+- **Phase 5 (pr):** open the **single** PR for the whole epic. List `Closes #` for the
+  epic **and every child** so the PR documents the full set:
+  ```bash
+  gh pr create --base develop \
+    --title "feat(#{epic}): {epic title}" \
+    --body "$(cat <<'EOF'
+  Closes #{epic}
+  Closes #{child1}
+  Closes #{child2}
+  ...
+
+  ## Summary
+  {one bullet per child: what it added}
+
+  ## Acceptance Criteria
+  {combined: every child's criteria + the epic's cross-cutting criteria, - [x] each}
+
+  ## Test plan
+  {per-child criterion -> test mapping + per-changed-file coverage for the whole stack}
+
+  🤖 Generated with [Claude Code](https://claude.ai/code)
+  EOF
+  )"
+  ```
+- **Phase 6 (review):** the **full four-lens loop**, exactly as the default Phase 6, but
+  the diff under review is the entire stack (`merge-base develop..$EPIC_BRANCH`). Run up
+  to `MAX_CYCLES`, fix blockers on the epic branch, and emit the same
+  `DEVCYCLE_METRIC:` lines. Anchor on the combined epic + children intent.
+- **Phase 7 (merge):** squash-merge the epic PR to develop, then close the epic **and
+  every child** (the `Closes #` lines don't auto-fire — this merges to develop, not main):
+  ```bash
+  gh pr merge {epic-pr} --squash --delete-branch
+  for n in {epic} {children…}; do gh issue close "$n"; done
+  git checkout develop && git pull origin develop
+  ```
+- **Phase 8 (report):** write `reports/issue-{epic}.md` for the whole epic — one
+  "What was built" subsection per child, the combined acceptance criteria, and the
+  single review outcome.
+
+Markers emitted in epic-finalize mode: `read`, `branch`, (`build+test`), `pr`,
+`review | cycle n/m`, `merge`. `implement` is usually **not** emitted.
+
 ---
 
 ## Phase reporting (REQUIRED)
@@ -51,6 +195,9 @@ Rules:
   `DEVCYCLE_PHASE: review | cycle 2/3`
 - On a resume, emit the marker for whatever phase you actually resume into, even if it is
   not `read` — the runner expects phases to be able to jump.
+- In **subtask** and **epic-finalize** modes some phases are skipped or reordered (see
+  **Run modes**). Emit only the markers your mode actually runs — the runner tolerates a
+  subset and out-of-order jumps; it never requires the full `read…merge` sequence.
 - These markers are in addition to, and never replace, the final `DEVCYCLE_OK` /
   `DEVCYCLE_FAIL` result line. Never print a phase marker on the very last line.
 
@@ -96,7 +243,41 @@ Extract and confirm with the user:
   test coverage** — each one must end the cycle with a test that proves it)
 - Any linked spec sections or design notes
 
-Cross-reference with `Additional_Tasks_Git_Providers.md` for the matching task section, **and read the corresponding section of `dev-docs/Phase2_Design_Document.md`** for the detailed design (architecture, data shapes, component breakdown, decisions) behind this issue. Summarize what will be built and list the acceptance criteria explicitly before writing any code. If anything is ambiguous, ask before starting.
+### Epic & sibling context resolution (REQUIRED when the issue references them)
+
+From the epic-and-subtask trackers (Phase 6+), a child issue inherits context **by
+reference** rather than restating it. Resolve those references before summarizing:
+
+1. **Epic parent — always, in full.** If the issue body contains an `Epic: #NN` line
+   (or otherwise names a parent epic issue), fetch it and read it completely:
+   ```bash
+   gh issue view NN --comments
+   ```
+   The epic carries the shared mental model and the **cross-cutting acceptance
+   criteria** that apply to every child — treat those as additional acceptance
+   criteria for this issue.
+
+2. **Referenced siblings — selectively, compactly.** Scan this issue's body for
+   explicit references to sibling tasks (e.g. `6.1.5`, `6.2.6`, or a bare `#NN`
+   pointing at another child of the same epic — phrases like "via the 6.1.2 gate",
+   "uses 6.1.5 search", "stored in practice_metric_pins (6.2.1)"). For each one that
+   is named, fetch it but read only its **title + Scope + Acceptance Criteria** — you
+   need its contract, not its whole body:
+   ```bash
+   gh issue view NN --json title,body
+   ```
+   - For siblings **already merged**, the codebase is the source of truth — lean on
+     Phase 3's code exploration for their actual shape; the issue just tells you which
+     module to go read.
+   - For siblings **not yet built** that this task must anticipate (a hook to leave, a
+     contract to honor), the issue is the only source — capture what this task must
+     provide for them.
+
+3. **Do NOT fetch every sibling of the epic** — only the ones this issue actually
+   names. Pulling an epic's full child set into context bloats the run and has been
+   observed to make runs loop; targeted-by-reference keeps it lean.
+
+Cross-reference with `Additional_Tasks_Git_Providers.md` for the matching task section, **and read the corresponding section of the relevant phase design document** (e.g. `dev-docs/Phase2_Design_Document.md`, or the design doc named by the issue's phase) for the detailed design (architecture, data shapes, component breakdown, decisions) behind this issue. Summarize what will be built and list the acceptance criteria explicitly **(including the epic's cross-cutting criteria and any sibling contracts you must honor)** before writing any code. If anything is ambiguous, ask before starting.
 
 ---
 
@@ -136,6 +317,24 @@ EXISTING_PR=$(gh pr list --state open --search "issue-${ISSUE}" \
 
 Emit `DEVCYCLE_PHASE: implement` first.
 
+### Review-KB pitfalls (REQUIRED — do this before writing code)
+
+Pull the lessons distilled from past code reviews for the area you are about to
+touch, so you avoid repeating findings the reviewers already caught once. From the
+acceptance criteria and design doc, identify the module globs this issue will touch
+(e.g. `src/practices/**`, `src/dashboard/api/**`), then run:
+
+```bash
+node scripts/kb/retrieve.mjs --paths "<comma-separated globs you will touch>" --top 8
+```
+
+Treat each printed pitfall as a hard constraint on your implementation — these are
+recurring, real findings from this codebase, not generic advice. If the output is the
+empty marker (`<!-- review-KB: no relevant active lessons -->`), there's nothing
+relevant; proceed. (Graduated rules are already in your context via `CLAUDE.md`'s
+import of `dev-docs/review-rules.md`, so this step only surfaces the *area-specific*
+active lessons that haven't graduated.)
+
 If resuming an interrupted run (Phase 2 found existing work), first determine
 what is already complete — read the PR, inspect the diff, run the gate — and
 continue from the first unfinished step instead of restarting. Commits already
@@ -164,7 +363,7 @@ until a test proves it. Hold every new or changed module to this bar:
    - error and early-return paths (thrown errors, caught-and-handled branches,
      empty/None results).
 
-   GovProxy-specific cases that must be tested when the code touches them: a
+   Toprope-specific cases that must be tested when the code touches them: a
    zero-activity day, a missing/unknown developer, a malformed CSV amount or date,
    an empty or paginated connector API response, a duplicate-day write (append-only
    must hold), and UTC date boundaries. Don't test trivial glue or pure type
@@ -417,6 +616,53 @@ coverage numbers, and any manual verification}
 
 Keep it factual and concise — it should let someone understand what shipped without opening
 the diff. (`reports/` can be committed as project history or gitignored — your choice.)
+
+### Distill review findings into the knowledge base (REQUIRED)
+
+Feed this run's review findings back into the KB so future implementations avoid them.
+You already hold every blocker you fixed this cycle (Phase 6) plus the deferred
+Medium/Low findings — that *is* the input; you do not need to re-read the review files,
+though `reviews/issue-{number}-multi-pass-*.md` is there if you want to confirm wording.
+
+1. See what the KB already knows so you merge instead of duplicating:
+   ```bash
+   node scripts/kb/catalog.mjs
+   ```
+2. For each **generalizable** finding from this issue (a rule a future implementer
+   could follow — skip one-off, issue-specific nits and pure style), build one JSON
+   item. If it matches an existing lesson from the catalog, set `match_id` to that
+   lesson's id (this increments its recurrence); otherwise omit `match_id` to create a
+   new candidate. Write the array to a temp file:
+   ```json
+   [
+     {
+       "match_id": "<existing-lesson-id, or omit for a new one>",
+       "title": "<short canonical name>",
+       "category": "security|correctness|over-abstraction|performance|testing|data-integrity|determinism|api-contract",
+       "rule": "<terse imperative generalizable rule>",
+       "rationale": "#{number}: <what actually went wrong>",
+       "severity": "critical|high|medium",
+       "source_issue": {number},
+       "file_globs": ["<globs for the area this issue touched>"]
+     }
+   ]
+   ```
+3. Apply it:
+   ```bash
+   node scripts/kb/apply.mjs --in <temp-file>.json
+   ```
+   A finding that recurs across 2+ issues auto-promotes to **active** and starts
+   surfacing to the implementer (Phase 3). Promotion to the always-loaded cold path is
+   a separate human-gated step (`node scripts/kb/graduate.mjs --list`) — do **not**
+   graduate from the skill.
+4. Commit the updated store so the KB persists:
+   ```bash
+   git add dev-cycle-analytics/review-lessons.jsonl
+   git commit -m "chore(#{number}): distill review findings into KB" && git push
+   ```
+   (If this run found zero generalizable findings — a clean review — skip this section.)
+
+See `dev-cycle-analytics/REVIEW_KB.md` for the full lifecycle.
 
 **Then tell the user:**
 - Issue number and title

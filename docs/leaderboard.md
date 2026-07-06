@@ -5,7 +5,7 @@ default and is disabled by design.**
 
 ## Why it is off by default
 
-A ranked leaderboard of developers conflicts with GovProxy's core
+A ranked leaderboard of developers conflicts with Toprope's core
 coaching-not-surveillance principle. The default manager experience is the
 privacy-respecting utilization view — non-adopters surface only in the
 waste/utilization context, never as a ranked list.

@@ -1,6 +1,6 @@
 import cron from 'node-cron';
 import path from 'path';
-import type {GovProxyConfig} from '../config/types';
+import type {TopropeConfig} from '../config/types';
 import {openDb} from '../storage/db';
 import {runMigrations} from '../storage/migrator';
 import {CopilotSync} from '../connectors/copilot/sync';
@@ -26,11 +26,11 @@ interface ScheduledConnector {
 }
 
 type AnySync = CopilotSync | ClaudeCodeSync | WindsurfSync | CursorSync | GitSync;
-function makeCopilotSync(config: GovProxyConfig): AnySync {
+function makeCopilotSync(config: TopropeConfig): AnySync {
     return new CopilotSync(config.connectors.copilot);
 }
 
-export function buildConnectorSchedule(config: GovProxyConfig): ScheduledConnector[] {
+export function buildConnectorSchedule(config: TopropeConfig): ScheduledConnector[] {
     return [
         {
             name: 'copilot',
@@ -66,7 +66,7 @@ export function buildConnectorSchedule(config: GovProxyConfig): ScheduledConnect
 }
 
 export function startScheduler(
-    config: GovProxyConfig,
+    config: TopropeConfig,
     dbPath: string,
 ): ReturnType<typeof cron.schedule>[] {
     const schedule = buildConnectorSchedule(config);

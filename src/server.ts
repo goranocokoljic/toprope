@@ -1,7 +1,8 @@
 import Fastify, {type FastifyInstance} from 'fastify';
 import path from 'path';
 import {loadConfig} from './config/loader';
-import type {GovProxyConfig} from './config/types';
+import {readEnvWithLegacyFallback} from './config/compat';
+import type {TopropeConfig} from './config/types';
 import {openDb} from './storage/db';
 import {runMigrations} from './storage/migrator';
 import {registerSessionAuth} from './auth/middleware';
@@ -33,8 +34,13 @@ import {registerCaptureRoutes} from './dashboard/api/captures';
 import {registerKeyRoutes} from './dashboard/api/keys';
 import {registerRealtimeCoachingRoutes} from './dashboard/api/realtime-coaching';
 import {registerRetrospectiveRoutes} from './dashboard/api/retrospectives';
+import {registerImprovementReviewRoutes} from './dashboard/api/improvement-reviews';
 import {registerShowcaseRoutes} from './dashboard/api/showcase';
 import {registerShowcaseAdminRoutes} from './dashboard/api/showcase-admin';
+import {registerShowcaseBrowseRoutes} from './dashboard/api/showcase-browse';
+import {registerPracticeAuthoringRoutes} from './dashboard/api/practices';
+import {registerPracticeSurfaceRoutes} from './dashboard/api/practices-surface';
+import {registerPracticeBrowseRoutes} from './dashboard/api/practices-browse';
 import {registerDashboardStatic} from './dashboard/static';
 import {createSlackClient} from './slack/client';
 import {notifyNewAnomalies} from './anomaly/notify';
@@ -50,7 +56,7 @@ import {startSurveyScheduler} from './surveys/scheduler';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, './storage/migrations');
 
-export function buildServer(_config?: Partial<GovProxyConfig>): FastifyInstance {
+export function buildServer(_config?: Partial<TopropeConfig>): FastifyInstance {
     const app = Fastify({
         logger: process.env.NODE_ENV !== 'test',
     });
@@ -62,7 +68,7 @@ export function buildServer(_config?: Partial<GovProxyConfig>): FastifyInstance 
     return app;
 }
 
-export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInstance {
+export function buildServerWithDb(config: Partial<TopropeConfig>): FastifyInstance {
     const app = Fastify({
         logger: process.env.NODE_ENV !== 'test',
     });
@@ -148,6 +154,14 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
     // opt-in #2), and persists ONLY the narrative output — never the key/plaintext.
     // All /api/me, developer-private; no manager path.
     registerRetrospectiveRoutes(app, db);
+    // Private "How Could This Be Better" tool (Task 6.5 / #174): the SEPARATE,
+    // purpose-built counterpart to the deliberately-excluded showcase critique. A
+    // developer runs it on their OWN captured conversations for self-directed
+    // improvement — its own entry point, the same transient-decrypt + LOCAL-default
+    // (cloud only via the Phase 5 double-opt-in) privacy posture, persisting only
+    // the constructive narrative + specific suggestions. Fully private: no publish
+    // path, no manager path — this is where the sharp feedback lives.
+    registerImprovementReviewRoutes(app, db);
     // Exemplary-conversation showcase (Task 5.8): the deliberate, OWNER-ONLY bridge
     // from a private encrypted capture to an org-visible example. Promote transiently
     // decrypts one of the developer's OWN sessions into an editable draft; publish
@@ -165,13 +179,43 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
     // developer; every removal is team-bounded, logged, and notifies the author.
     registerShowcaseAdminRoutes(app, db);
 
+    // Showcase browse/governance for the Epic 6.3 unit model (Task 6.3.9): /api/me,
+    // developer-scoped — the gallery (list/search published showcases the viewer may
+    // see via 6.1.5 search + 6.1.4 scope), the unit detail (curators' note + outcome +
+    // inline-annotated conversation + clearly-AI secondary annotation + cross-linked
+    // practices), the author's OWN unpublish, and their removal-notice feed. Reads only
+    // the published, redacted unit — never a private capture. The team-lead REMOVE for
+    // this model is an /api/admin route (above); this self-service surface has no
+    // publish path, so the Phase 5 rule carries: a lead removes, but never publishes
+    // for a developer.
+    registerShowcaseBrowseRoutes(app, db);
+
+    // Best-practice rich authoring editor (Task 6.2.3): /api/me, developer-owned —
+    // markdown + code blocks + embedded {{metric}} references rendered to a safe
+    // (sanitized) preview, metric refs producing auto-surfacing tags, every save
+    // routed through the 6.1.3 versioning primitive. No manager path.
+    registerPracticeAuthoringRoutes(app, db);
+
+    // Contextual best-practice display (Task 6.2.7): /api/me, developer-scoped —
+    // GET the practices to surface next to a metric (viewer-scoped surfacing from
+    // 6.2.5/6.2.6, wrapped in encouraging copy) and POST a "viewed" usage event for
+    // a surfaced practice (feeds the 6.2.4 usage signal). Records only what was shown.
+    registerPracticeSurfaceRoutes(app, db);
+
+    // Best-practice browse UI (Task 6.2.8): /api/me, developer-scoped — the
+    // non-contextual discovery path. List/search published practices the viewer may
+    // see (6.1.5 search + 6.1.4 scope), read one in full (rendered content + feedback +
+    // history access + model-aware create/edit gates + showcase cross-links), and
+    // toggle helpful/not-helpful feedback (6.2.4). Every read/write is viewer-scoped.
+    registerPracticeBrowseRoutes(app, db);
+
     // Data-prompted surveys (Task 4.3): manager queue + developer self-service.
     // Survey delivery prefers the Slack bot when configured, with an email
     // fallback (a logging emailer until a real transport is wired). The Slack
     // client is constructed only when the bot is enabled with a token, so
     // delivery cleanly degrades to email otherwise.
     registerSurveyRoutes(app, db, {
-        slackClient: surveySlackClientFromConfig(config as GovProxyConfig),
+        slackClient: surveySlackClientFromConfig(config as TopropeConfig),
         emailer: createLogEmailer((line) => app.log.info(line)),
         log: (message, err) => app.log.error({err}, `[surveys] ${message}`),
     });
@@ -190,7 +234,7 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
     if (dbPath !== ':memory:') {
         // Connector syncs only run when a connectors block is configured.
         const connectorTasks = config.connectors
-            ? startScheduler(config as GovProxyConfig, dbPath)
+            ? startScheduler(config as TopropeConfig, dbPath)
             : [];
         // Aggregation rollups run on their own period boundaries (04:00+ UTC),
         // deliberately after the connector syncs so each rollup folds a
@@ -200,7 +244,7 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
         // included), so coupling them to a connectors block would silently
         // starve the trend tables.
         const aggregationTasks = startAggregationScheduler(dbPath, {
-            notifier: buildAnomalyNotifier(dbPath, config as GovProxyConfig, app),
+            notifier: buildAnomalyNotifier(dbPath, config as TopropeConfig, app),
         });
         // Summary auto-generation (weekly + monthly) fires just after the matching
         // aggregation job, generating each scope's narrative for the just-completed
@@ -213,7 +257,7 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
         // Optional daily survey trigger sweep (Task 4.3). Self-gates on
         // surveys.enabled, returning [] otherwise. Runs detection + dispatch and
         // retries stranded auto-surveys.
-        const surveyTasks = startSurveyScheduler(dbPath, config as GovProxyConfig);
+        const surveyTasks = startSurveyScheduler(dbPath, config as TopropeConfig);
         app.addHook('onClose', () => {
             for (const task of [
                 ...connectorTasks,
@@ -240,7 +284,7 @@ export function buildServerWithDb(config: Partial<GovProxyConfig>): FastifyInsta
  */
 function buildAnomalyNotifier(
     dbPath: string,
-    config: GovProxyConfig,
+    config: TopropeConfig,
     app: FastifyInstance,
 ): (() => void) | undefined {
     const slack = config.slack;
@@ -259,7 +303,9 @@ function buildAnomalyNotifier(
 }
 
 async function main(): Promise<void> {
-    const configPath = process.env.GOVPROXY_CONFIG ?? path.resolve(process.cwd(), 'govproxy.config.yaml');
+    const configPath =
+        readEnvWithLegacyFallback('TOPROPE_CONFIG') ??
+        path.resolve(process.cwd(), 'toprope.config.yaml');
     const config = loadConfig(configPath);
 
     const app = buildServerWithDb(config);

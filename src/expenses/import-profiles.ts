@@ -16,12 +16,12 @@ export type ChargeType = 'recurring_monthly' | 'recurring_annual' | 'one_time';
 // Built-in profiles so three distinct expense systems import out-of-the-box with
 // no config. Config `import_profiles` can override these or add new ones.
 //
-// - standard: GovProxy's own canonical columns (the Phase 1 format).
+// - standard: Toprope's own canonical columns (the Phase 1 format).
 // - expensify: a typical Expensify report export. Reimbursement system → charges
 //   default to `reimbursed` when the row carries no explicit billing model.
 // - concur: a typical SAP Concur export. Also a reimbursement system.
 export const BUILTIN_PROFILES: Record<string, ImportProfile> = {
-    // The canonical GovProxy format: every column already uses the standard field
+    // The canonical Toprope format: every column already uses the standard field
     // name, so an empty mapping is correct — buildFieldIndex falls back to the
     // field's own name when it isn't remapped. The legacy top-level
     // `expenses.column_mapping` is layered over this in resolveProfile.

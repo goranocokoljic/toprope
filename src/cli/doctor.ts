@@ -1,6 +1,7 @@
 import fs from 'fs';
 import type Database from 'better-sqlite3';
-import type {GovProxyConfig} from '../config/types';
+import type {TopropeConfig} from '../config/types';
+import {resolveConfigPathWithLegacyFallback} from '../config/compat';
 import {getMigrationStatus} from '../storage/migrator';
 import {resolveGitProviderConfigs} from '../connectors/git/providers/config';
 import {createGitProvider} from '../connectors/git/providers/factory';
@@ -23,14 +24,17 @@ function fail(label: string, detail: string, fix: string): CheckResult {
 }
 
 async function checkConfigFile(configPath: string): Promise<CheckResult> {
-    if (!fs.existsSync(configPath)) {
+    // Honor the legacy govproxy.* fallback so doctor reports the file that is
+    // actually loaded, not the (possibly absent) new-name default.
+    const resolvedPath = resolveConfigPathWithLegacyFallback(configPath);
+    if (!fs.existsSync(resolvedPath)) {
         return fail(
             'Config file',
             `Not found: ${configPath}`,
-            'Create govproxy.config.yaml — see docs/setup.md for a template.',
+            'Create toprope.config.yaml — see docs/setup.md for a template.',
         );
     }
-    return pass('Config file', `Found: ${configPath}`);
+    return pass('Config file', `Found: ${resolvedPath}`);
 }
 
 function checkDatabase(db: Database.Database, migrationsDir: string): CheckResult {
@@ -41,7 +45,7 @@ function checkDatabase(db: Database.Database, migrationsDir: string): CheckResul
             return fail(
                 'Database migrations',
                 `${pending.length} pending migration(s): ${pending.map((m) => m.name).join(', ')}`,
-                'Run: govproxy db migrate',
+                'Run: toprope db migrate',
             );
         }
         return pass('Database migrations', `All ${statuses.length} migration(s) applied`);
@@ -49,12 +53,12 @@ function checkDatabase(db: Database.Database, migrationsDir: string): CheckResul
         return fail(
             'Database migrations',
             `Cannot read migrations: ${err instanceof Error ? err.message : String(err)}`,
-            'Ensure the database is accessible and run: govproxy db migrate',
+            'Ensure the database is accessible and run: toprope db migrate',
         );
     }
 }
 
-async function checkGitHubToken(config: GovProxyConfig): Promise<CheckResult> {
+async function checkGitHubToken(config: TopropeConfig): Promise<CheckResult> {
     const {copilot} = config.connectors;
     if (!copilot.enabled) {
         return pass('GitHub API token', 'Copilot connector disabled — skipped');
@@ -111,7 +115,7 @@ async function checkGitHubToken(config: GovProxyConfig): Promise<CheckResult> {
     }
 }
 
-async function checkCopilotAccess(config: GovProxyConfig): Promise<CheckResult> {
+async function checkCopilotAccess(config: TopropeConfig): Promise<CheckResult> {
     const {copilot} = config.connectors;
     if (!copilot.enabled) {
         return pass('Copilot API access', 'Copilot connector disabled — skipped');
@@ -171,7 +175,7 @@ async function checkCopilotAccess(config: GovProxyConfig): Promise<CheckResult> 
     }
 }
 
-async function checkAnthropicKey(config: GovProxyConfig): Promise<CheckResult> {
+async function checkAnthropicKey(config: TopropeConfig): Promise<CheckResult> {
     const {claude_code} = config.connectors;
     if (!claude_code.enabled) {
         return pass('Anthropic API key', 'Claude Code connector disabled — skipped');
@@ -242,7 +246,7 @@ async function checkAnthropicKey(config: GovProxyConfig): Promise<CheckResult> {
     }
 }
 
-async function checkWindsurfKey(config: GovProxyConfig): Promise<CheckResult> {
+async function checkWindsurfKey(config: TopropeConfig): Promise<CheckResult> {
     const {windsurf} = config.connectors;
     if (!windsurf.enabled) {
         return pass('Windsurf service key', 'Windsurf connector disabled — skipped');
@@ -296,7 +300,7 @@ async function checkWindsurfKey(config: GovProxyConfig): Promise<CheckResult> {
     }
 }
 
-async function checkCursorKey(config: GovProxyConfig): Promise<CheckResult> {
+async function checkCursorKey(config: TopropeConfig): Promise<CheckResult> {
     const {cursor} = config.connectors;
     if (!cursor.enabled) {
         return pass('Cursor service key', 'Cursor connector disabled — skipped');
@@ -448,7 +452,7 @@ async function checkOneGitProvider(pc: GitProviderConfig): Promise<CheckResult> 
     return pass(label, `${gitProviderIdentifier(pc)} reachable (${configured.length} configured repo(s) verified)`);
 }
 
-async function checkGitProviders(config: GovProxyConfig): Promise<CheckResult[]> {
+async function checkGitProviders(config: TopropeConfig): Promise<CheckResult[]> {
     const {git} = config.connectors;
     if (!git.enabled) {
         return [pass('Git providers', 'Git connector disabled — skipped')];
@@ -506,7 +510,7 @@ async function checkGitProviders(config: GovProxyConfig): Promise<CheckResult[]>
     return results;
 }
 
-async function checkSummaryModel(config: GovProxyConfig): Promise<CheckResult> {
+async function checkSummaryModel(config: TopropeConfig): Promise<CheckResult> {
     const {summaries} = config;
     if (!summaries?.enabled) {
         return pass('Summary model', 'Summaries disabled — skipped');
@@ -615,12 +619,12 @@ async function checkSummaryModel(config: GovProxyConfig): Promise<CheckResult> {
 
 export async function runDoctor(
     db: Database.Database,
-    config: GovProxyConfig,
+    config: TopropeConfig,
     configPath: string,
     migrationsDir: string,
 ): Promise<boolean> {
     console.log('');
-    console.log('GovProxy Doctor');
+    console.log('Toprope Doctor');
     console.log('─'.repeat(50));
 
     const checks: CheckResult[] = [];
@@ -650,10 +654,10 @@ export async function runDoctor(
 
     console.log('');
     if (allPassed) {
-        console.log('All checks passed. GovProxy is ready.');
+        console.log('All checks passed. Toprope is ready.');
     } else {
         const failed = checks.filter((c) => !c.passed).length;
-        console.error(`${failed} check(s) failed. Fix the issues above and re-run govproxy doctor.`);
+        console.error(`${failed} check(s) failed. Fix the issues above and re-run toprope doctor.`);
     }
     console.log('');
 

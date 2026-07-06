@@ -19,7 +19,7 @@ function httpsGet(url: string, token: string): Promise<unknown> {
         const options = {
             headers: {
                 Authorization: `Bearer ${token}`,
-                'User-Agent': 'govproxy/0.1.0',
+                'User-Agent': 'toprope/0.1.0',
                 Accept: 'application/vnd.github+json',
             },
         };

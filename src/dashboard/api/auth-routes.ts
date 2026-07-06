@@ -24,7 +24,7 @@ export interface AuthRoutesOptions {
 let dummyHashPromise: Promise<string> | null = null;
 function getDummyHash(): Promise<string> {
     if (!dummyHashPromise) {
-        dummyHashPromise = hashPassword('govproxy-timing-equalizer');
+        dummyHashPromise = hashPassword('toprope-timing-equalizer');
     }
     return dummyHashPromise;
 }

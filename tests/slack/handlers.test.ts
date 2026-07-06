@@ -93,7 +93,7 @@ describe('handleSlashCommand', () => {
     it('opens the log modal for a linked developer', async () => {
         seedLinkedDev(db, 'U_ALICE');
         const result = await handleSlashCommand(
-            {user_id: 'U_ALICE', trigger_id: 'trig-1', command: '/govproxy-log'},
+            {user_id: 'U_ALICE', trigger_id: 'trig-1', command: '/toprope-log'},
             {db, client},
         );
         expect(result.status).toBe(200);

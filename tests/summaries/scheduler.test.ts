@@ -351,7 +351,7 @@ describe('runScheduledSummaryJob — the production cron-fire path', () => {
     let dbPath: string;
 
     beforeEach(() => {
-        dbPath = path.join(os.tmpdir(), `govproxy-sum-sched-${randomUUID()}.db`);
+        dbPath = path.join(os.tmpdir(), `toprope-sum-sched-${randomUUID()}.db`);
         const seed = openDb(dbPath);
         try {
             runMigrations(seed, MIGRATIONS_DIR);

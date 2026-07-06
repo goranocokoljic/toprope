@@ -225,7 +225,7 @@ describe('importCsv — malformed rows', () => {
         db = makeDb();
         addTeam(db, 'engineering');
         addDeveloper(db, 'Alice Smith', 'engineering', 'alice@example.com');
-        tmpFile = path.join(os.tmpdir(), `govproxy-test-${Date.now()}.csv`);
+        tmpFile = path.join(os.tmpdir(), `toprope-test-${Date.now()}.csv`);
     });
 
     afterEach(() => {
@@ -286,7 +286,7 @@ describe('importCsv — subscription lifecycle (change detection)', () => {
     beforeEach(() => {
         db = makeDb();
         seedDevelopers(db);
-        tmpFile = path.join(os.tmpdir(), `govproxy-test-lifecycle-${Date.now()}.csv`);
+        tmpFile = path.join(os.tmpdir(), `toprope-test-lifecycle-${Date.now()}.csv`);
     });
 
     afterEach(() => {
@@ -363,7 +363,7 @@ describe('importCsv — billing model normalization', () => {
         db = makeDb();
         addTeam(db, 'engineering');
         addDeveloper(db, 'Alice Smith', 'engineering', 'alice@example.com');
-        tmpFile = path.join(os.tmpdir(), `govproxy-test-${Date.now()}.csv`);
+        tmpFile = path.join(os.tmpdir(), `toprope-test-${Date.now()}.csv`);
     });
 
     afterEach(() => {

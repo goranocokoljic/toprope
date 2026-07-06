@@ -1,10 +1,10 @@
 {
-    "name": "govproxy",
+    "name": "toprope",
     "version": "0.1.0",
     "description": "AI adoption intelligence platform for engineering teams",
     "main": "dist/server.js",
     "bin": {
-        "govproxy": "./bin/index.js"
+        "toprope": "./bin/index.js"
     },
     "scripts": {
         "dev": "concurrently -n server,web -c blue,magenta \"npm:dev:server\" \"npm:dev:web\"",
@@ -30,11 +30,13 @@
         "commander": "^12.1.0",
         "fastify": "^5.2.1",
         "js-yaml": "^4.1.0",
+        "marked": "^18.0.5",
         "node-cron": "^3.0.3",
         "react": "^18.3.1",
         "react-dom": "^18.3.1",
         "react-router-dom": "^6.30.3",
-        "recharts": "^2.15.4"
+        "recharts": "^2.15.4",
+        "sanitize-html": "^2.17.5"
     },
     "devDependencies": {
         "@testing-library/jest-dom": "^6.9.1",
@@ -45,6 +47,7 @@
         "@types/node-cron": "^3.0.11",
         "@types/react": "^18.3.29",
         "@types/react-dom": "^18.3.7",
+        "@types/sanitize-html": "^2.16.1",
         "@typescript-eslint/eslint-plugin": "^7.18.0",
         "@typescript-eslint/parser": "^7.18.0",
         "@vitejs/plugin-react": "^4.7.0",

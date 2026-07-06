@@ -34,12 +34,12 @@ describe('resolveSelfDeveloperId', () => {
         db.close();
     });
 
-    it('resolves via GOVPROXY_DEVELOPER_ID', () => {
+    it('resolves via TOPROPE_DEVELOPER_ID', () => {
         const env = {[DEVELOPER_ID_ENV]: devId};
         expect(resolveSelfDeveloperId(db, env)).toBe(devId);
     });
 
-    it('resolves via GOVPROXY_DEVELOPER_EMAIL', () => {
+    it('resolves via TOPROPE_DEVELOPER_EMAIL', () => {
         const env = {[DEVELOPER_EMAIL_ENV]: 'alice@example.com'};
         expect(resolveSelfDeveloperId(db, env)).toBe(devId);
     });

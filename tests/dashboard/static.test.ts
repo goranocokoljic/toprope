@@ -12,7 +12,7 @@ import {createSession} from '../../src/auth/sessions';
 import {hashPassword} from '../../src/auth/password';
 
 function makeDist(): string {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'govproxy-dash-'));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'toprope-dash-'));
     fs.writeFileSync(path.join(dir, 'index.html'), '<!doctype html><div id="root">SPA</div>');
     return dir;
 }
@@ -26,7 +26,7 @@ describe('Dashboard static serving', () => {
     let distDir: string;
 
     beforeAll(async () => {
-        distDir = fs.mkdtempSync(path.join(os.tmpdir(), 'govproxy-dash-'));
+        distDir = fs.mkdtempSync(path.join(os.tmpdir(), 'toprope-dash-'));
         fs.writeFileSync(path.join(distDir, 'index.html'), '<!doctype html><div id="root">SPA</div>');
         fs.mkdirSync(path.join(distDir, 'assets'));
         fs.writeFileSync(path.join(distDir, 'assets', 'app.js'), 'console.log("hi");');
@@ -82,7 +82,7 @@ describe('Dashboard static serving', () => {
 
     it('returns false when no build is present', () => {
         const emptyApp = Fastify({logger: false});
-        const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'govproxy-empty-'));
+        const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'toprope-empty-'));
         try {
             expect(registerDashboardStatic(emptyApp, emptyDir)).toBe(false);
         } finally {
@@ -93,7 +93,7 @@ describe('Dashboard static serving', () => {
 
     it('returns a consistent JSON 404 shape even with no build present', async () => {
         const noBuildApp = Fastify({logger: false});
-        const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'govproxy-empty-'));
+        const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'toprope-empty-'));
         try {
             registerDashboardStatic(noBuildApp, emptyDir);
             await noBuildApp.ready();

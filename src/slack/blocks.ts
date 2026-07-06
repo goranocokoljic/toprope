@@ -5,9 +5,9 @@ import {basisLabel, describeAnomaly} from '../anomaly/surface';
 // Identifiers shared between the form builders here and the submission parser in
 // handlers.ts. Keeping them in one place avoids the form and the parser drifting
 // apart (a mismatch would silently drop a field).
-export const CALLBACK_LOG_SUBMIT = 'govproxy_log_submit';
-export const ACTION_OPEN_LOG = 'govproxy_open_log';
-export const ACTION_DISMISS_PROMPT = 'govproxy_dismiss_prompt';
+export const CALLBACK_LOG_SUBMIT = 'toprope_log_submit';
+export const ACTION_OPEN_LOG = 'toprope_open_log';
+export const ACTION_DISMISS_PROMPT = 'toprope_dismiss_prompt';
 
 export const BLOCK_TOOL = 'tool_block';
 export const ACTION_TOOL = 'tool_select';

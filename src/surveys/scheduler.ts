@@ -5,7 +5,7 @@ import {openDb} from '../storage/db';
 import {runMigrations} from '../storage/migrator';
 import {parseSyncTimeToCron} from '../scheduler/scheduler';
 import type {SlackClient} from '../slack/client';
-import type {GovProxyConfig} from '../config/types';
+import type {TopropeConfig} from '../config/types';
 import type {Emailer} from './email';
 import {buildSurveyDispatchDeps, runTriggerSweep, type SweepSummary} from './dispatch';
 
@@ -15,7 +15,7 @@ import {buildSurveyDispatchDeps, runTriggerSweep, type SweepSummary} from './dis
  * Mirrors the aggregation/summary schedulers: opt-in via `surveys.enabled`, a
  * single daily cron that runs detection + dispatch (and retries stranded
  * auto-surveys) against a short-lived DB handle. Without this, "auto-send" only
- * fires when an operator runs `govproxy survey run`; with it, triggered surveys
+ * fires when an operator runs `toprope survey run`; with it, triggered surveys
  * go out unattended and a transient delivery outage self-heals on the next tick.
  */
 
@@ -39,7 +39,7 @@ export interface SurveySchedulerOptions {
  */
 export async function runScheduledSurveySweep(
     dbPath: string,
-    config: GovProxyConfig,
+    config: TopropeConfig,
     options: SurveySchedulerOptions = {},
 ): Promise<SweepSummary | null> {
     const log = options.log ?? ((m: string, e?: unknown) => console.error(`[surveys] ${m}`, e ?? ''));
@@ -70,7 +70,7 @@ export async function runScheduledSurveySweep(
  */
 export function startSurveyScheduler(
     dbPath: string,
-    config: GovProxyConfig,
+    config: TopropeConfig,
     options: SurveySchedulerOptions = {},
 ): Array<ReturnType<typeof cron.schedule>> {
     if (!config.surveys?.enabled) return [];

@@ -1,4 +1,4 @@
-# GovProxy — Known Issues (Phase 2 Dogfood)
+# Toprope — Known Issues (Phase 2 Dogfood)
 
 Compiled at the close of Phase 2 (Task 2.12) as the gate before WMG dogfooding.
 Each entry notes impact and the workaround so dogfood users aren't surprised.
@@ -8,8 +8,8 @@ None of these block the dogfood; they are tracked for Phase 3.
 
 ## Deployment / operations
 
-### K-1. `govproxy start` serves only `/health`, not the dashboard
-**Impact:** medium. The `govproxy start` CLI command calls the health-only
+### K-1. `toprope start` serves only `/health`, not the dashboard
+**Impact:** medium. The `toprope start` CLI command calls the health-only
 `buildServer`, so it does **not** mount the API or the dashboard SPA. A manager
 who runs it will get a 404 at `/dashboard`.
 **Workaround:** start the dashboard with `node dist/server.js` (after
@@ -19,10 +19,10 @@ entrypoint. The setup guide documents this.
 remove it in favor of the documented entrypoint.
 
 ### K-2. No first-run config scaffold
-**Impact:** low. There is no `govproxy init` to generate `govproxy.config.yaml`;
+**Impact:** low. There is no `toprope init` to generate `toprope.config.yaml`;
 managers copy a sample by hand.
-**Workaround:** copy `govproxy.bitbucket.config.yaml` /
-`govproxy.github-only.config.yaml` to `govproxy.config.yaml` and edit. Covered in
+**Workaround:** copy `toprope.bitbucket.config.yaml` /
+`toprope.github-only.config.yaml` to `toprope.config.yaml` and edit. Covered in
 the setup guide.
 
 ### K-3. Frontend bundle ships as a single large chunk

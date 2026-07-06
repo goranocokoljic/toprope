@@ -13,8 +13,8 @@ import type {SurveyRecord} from './types';
 // Slack action ids. Each answer button is `survey_answer:<choiceValue>` (unique
 // within the actions block, and self-describing so the handler reads the choice
 // straight off the action_id); the survey id rides in the button `value`.
-export const ACTION_SURVEY_ANSWER_PREFIX = 'govproxy_survey_answer:';
-export const ACTION_SURVEY_DECLINE = 'govproxy_survey_decline';
+export const ACTION_SURVEY_ANSWER_PREFIX = 'toprope_survey_answer:';
+export const ACTION_SURVEY_DECLINE = 'toprope_survey_decline';
 
 // Slack caps button text at 75 chars; keep choice labels safe.
 function truncate(text: string, max = 75): string {
@@ -70,7 +70,7 @@ export function buildSurveyEmail(survey: SurveyRecord): {subject: string; body: 
         lines.push('');
     }
     lines.push(
-        'This quick check-in is voluntary — you can answer (or decline) from your GovProxy dashboard.',
+        'This quick check-in is voluntary — you can answer (or decline) from your Toprope dashboard.',
     );
     return {subject: 'A quick question about your AI tooling', body: lines.join('\n')};
 }

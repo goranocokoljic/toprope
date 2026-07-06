@@ -182,7 +182,7 @@ export interface SlackDailyPromptConfig {
 export interface SlackAnomalyAlertsConfig {
     // Slack channel IDs (e.g. "C0123ABCD") to post anomaly alerts into.
     channels?: string[];
-    // Dashboard base URL (e.g. "https://govproxy.example.com") used to build the
+    // Dashboard base URL (e.g. "https://toprope.example.com") used to build the
     // "view in dashboard" link. Omitted → the alert carries no deep link.
     dashboard_url?: string;
 }
@@ -204,7 +204,7 @@ export interface SlackBotConfig {
 // Data-prompted surveys (Task 4.3). Opt-in scheduled trigger sweep: when
 // enabled, the server runs survey trigger detection + dispatch on a daily cron,
 // so auto-send surveys actually go out (and stranded ones are retried) without a
-// manual `govproxy survey run`. Disabled by default — sweeps are operator-driven
+// manual `toprope survey run`. Disabled by default — sweeps are operator-driven
 // until switched on.
 export interface SurveysConfig {
     enabled?: boolean;
@@ -236,7 +236,7 @@ export interface TeamConfig {
     manager?: string;
 }
 
-export interface GovProxyConfig {
+export interface TopropeConfig {
     server: ServerConfig;
     storage: StorageConfig;
     connectors: ConnectorsConfig;

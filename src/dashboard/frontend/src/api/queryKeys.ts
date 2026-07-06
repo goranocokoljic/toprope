@@ -79,4 +79,19 @@ export const queryKeys = {
     // Expense reconciliation (Task 4.4): keyed by status so switching the filter
     // refetches the right slice of the queue.
     adminReconciliation: (status: string) => ['admin', 'reconciliation', status] as const,
+    // Contextual best-practice display (Task 6.2.7): the practices surfaced next to
+    // one metric, keyed by metric so each metric's affordance caches independently.
+    relatedPractices: (metric: string) => ['practices', 'related', metric] as const,
+    // Best-practice browse UI (Task 6.2.8): the searchable library. The list is keyed
+    // by a serialized filter signature so each query/tag/team/scope combination caches
+    // independently; detail and history are keyed by practice id.
+    practicesBrowse: (filterKey: string) => ['practices', 'browse', filterKey] as const,
+    practiceDetail: (id: string) => ['practices', 'detail', id] as const,
+    practiceHistory: (id: string) => ['practices', 'history', id] as const,
+    // Showcase browse/governance (Task 6.3.9): the gallery is keyed by a serialized
+    // filter signature so each query/tag/team/scope combination caches independently;
+    // the detail is keyed by showcase id; the removal feed is a single author-scoped list.
+    showcaseBrowse: (filterKey: string) => ['showcases', 'browse', filterKey] as const,
+    showcaseDetail: (id: string) => ['showcases', 'detail', id] as const,
+    showcaseRemovals: ['showcases', 'removals'] as const,
 };

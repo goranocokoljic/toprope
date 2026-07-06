@@ -67,7 +67,7 @@ import {
     sendSurvey,
 } from './surveys/dispatch';
 import {dismissSurvey, getSurveyById, listSurveys} from './surveys/store';
-import type {GovProxyConfig} from './config/types';
+import type {TopropeConfig} from './config/types';
 
 // Commander option collector for repeatable flags (e.g. --git-email).
 function collectValue(value: string, previous: string[]): string[] {
@@ -89,14 +89,14 @@ function parsePositiveIntFlag(name: string, value: string): number {
 const program = new Command();
 
 program
-    .name('govproxy')
+    .name('toprope')
     .description('AI adoption intelligence platform for engineering teams')
     .version('0.1.0');
 
 program
     .command('start')
-    .description('Start the GovProxy server')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .description('Start the Toprope server')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action(async (options: {config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const config = loadConfig(configPath);
@@ -127,7 +127,7 @@ const dbCommand = program.command('db').description('Database management');
 dbCommand
     .command('migrate')
     .description('Apply pending database migrations')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action((options: {config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const config = loadConfig(configPath);
@@ -148,7 +148,7 @@ dbCommand
 dbCommand
     .command('status')
     .description('Show migration status')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action((options: {config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const config = loadConfig(configPath);
@@ -193,7 +193,7 @@ teamCommand
     .requiredOption('--name <name>', 'Team name')
     .option('--department <dept>', 'Department')
     .option('--manager <manager>', 'Manager name or email')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action((options: {name: string; department?: string; manager?: string; config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const db = openRegistryDb(configPath);
@@ -212,7 +212,7 @@ teamCommand
 teamCommand
     .command('list')
     .description('List all teams')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action((options: {config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const db = openRegistryDb(configPath);
@@ -246,7 +246,7 @@ devCommand
     .option('--bitbucket <username>', 'Bitbucket username/nickname')
     .option('--gitlab <username>', 'GitLab username')
     .option('--git-email <email>', 'Additional git commit email (repeatable)', collectValue, [])
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action(
         (options: {
             name: string;
@@ -308,7 +308,7 @@ devCommand
     .command('list')
     .description('List developers')
     .option('--team <name>', 'Filter by team name')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action((options: {team?: string; config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const db = openRegistryDb(configPath);
@@ -348,7 +348,7 @@ devCommand
     .option('--gitlab <username>', 'GitLab username')
     .option('--slack <user-id>', 'Slack user id (for the self-reporting bot)')
     .option('--git-email <email>', 'Additional git commit email (repeatable)', collectValue, [])
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action(
         (options: {
             id: string;
@@ -441,7 +441,7 @@ devCommand
     .requiredOption('--org <org>', 'GitHub organization name')
     .option('--token <token>', 'GitHub API token (or set GITHUB_TOKEN env var)')
     .option('--team <team>', 'Default team to assign discovered developers to', 'discovered')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action(
         async (options: {org: string; token?: string; team: string; config: string}) => {
             const token = options.token ?? process.env.GITHUB_TOKEN;
@@ -478,7 +478,7 @@ userCommand
     .description('Bootstrap an admin account for dashboard login')
     .requiredOption('--email <email>', 'Admin email address')
     .option('--password <password>', 'Password (a temporary one is generated and printed if omitted)')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action(async (options: {email: string; password?: string; config: string}) => {
         const email = options.email.trim();
         if (!email.includes('@') || email.length > 320) {
@@ -532,7 +532,7 @@ const syncCommand = program.command('sync').description('Sync data from connecto
 syncCommand
     .command('all')
     .description('Run full sync pipeline: Copilot → Claude Code → Windsurf → Cursor → Git')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action(async (options: {config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const config = loadConfig(configPath);
@@ -574,7 +574,7 @@ syncCommand
 syncCommand
     .command('copilot')
     .description('Pull data from GitHub Copilot Metrics API')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action(async (options: {config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const config = loadConfig(configPath);
@@ -603,7 +603,7 @@ syncCommand
 syncCommand
     .command('claude-code')
     .description('Pull data from Anthropic Enterprise Analytics API')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action(async (options: {config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const config = loadConfig(configPath);
@@ -632,7 +632,7 @@ syncCommand
 syncCommand
     .command('windsurf')
     .description('Pull data from Windsurf Enterprise Analytics API')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action(async (options: {config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const config = loadConfig(configPath);
@@ -661,7 +661,7 @@ syncCommand
 syncCommand
     .command('cursor')
     .description('Pull data from Cursor Analytics API')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action(async (options: {config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const config = loadConfig(configPath);
@@ -690,7 +690,7 @@ syncCommand
 syncCommand
     .command('git')
     .description('Pull commit and PR data from configured git providers')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .option('--provider <type>', 'Only sync a specific provider (github, bitbucket, gitlab). Note: partial re-runs overwrite any existing multi-provider snapshot for the same developer+day.')
     .action(async (options: {config: string; provider?: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
@@ -723,7 +723,7 @@ expensesCommand
     .command('import <file>')
     .description('Import subscriptions from a CSV file')
     .option('--profile <name>', 'Import profile: standard | expensify | concur (or a configured one)', 'standard')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action((file: string, options: {profile: string; config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const config = loadConfig(configPath);
@@ -749,7 +749,7 @@ expensesCommand
             if (result.unmatched > 0) {
                 console.log('');
                 console.log(
-                    `${result.unmatched} row(s) need resolution. Run \`govproxy expenses unmatched\` to review.`,
+                    `${result.unmatched} row(s) need resolution. Run \`toprope expenses unmatched\` to review.`,
                 );
             }
         } catch (err) {
@@ -764,7 +764,7 @@ expensesCommand
 expensesCommand
     .command('unmatched')
     .description('List expense charges queued for manual resolution')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action((options: {config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const config = loadConfig(configPath);
@@ -793,7 +793,7 @@ expensesCommand
             }
             console.log('─'.repeat(80));
             console.log(
-                'Resolve with `govproxy expenses resolve <charge-id> --dev <developer-id>`.',
+                'Resolve with `toprope expenses resolve <charge-id> --dev <developer-id>`.',
             );
         } finally {
             db.close();
@@ -804,7 +804,7 @@ expensesCommand
     .command('resolve <charge-id>')
     .description('Assign a queued unmatched charge to a developer')
     .requiredOption('--dev <developer-id>', 'Developer ID to attribute the charge to')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action((chargeId: string, options: {dev: string; config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const config = loadConfig(configPath);
@@ -853,7 +853,7 @@ expensesCommand
     .description('Reconcile imported expenses against the subscription registry')
     .option('--period <YYYY-MM>', 'Period to reconcile (defaults to the latest expense period)')
     .option('--tolerance <amount>', 'Cost-discrepancy tolerance in dollars (overrides config)')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action((options: {period?: string; tolerance?: string; config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const config = loadConfig(configPath);
@@ -920,7 +920,7 @@ expensesCommand
     .command('show')
     .description('Show current subscriptions with costs')
     .option('--team <name>', 'Filter by team name')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action((options: {team?: string; config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const config = loadConfig(configPath);
@@ -1007,7 +1007,7 @@ const wasteCommand = program.command('waste').description('Waste detection and m
 wasteCommand
     .command('show')
     .description('Run waste detection and list active alerts grouped by type')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action((options: {config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const config = loadConfig(configPath);
@@ -1079,7 +1079,7 @@ wasteCommand
                 `Total: ${alerts.length} alert(s)  |  Estimated waste: $${totalWaste.toFixed(2)}/month`,
             );
             console.log('');
-            console.log('Use `govproxy waste resolve <id> --reason <text>` to dismiss an alert.');
+            console.log('Use `toprope waste resolve <id> --reason <text>` to dismiss an alert.');
         } finally {
             db.close();
         }
@@ -1088,7 +1088,7 @@ wasteCommand
 wasteCommand
     .command('summary')
     .description('Show waste summary grouped by team')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action((options: {config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const config = loadConfig(configPath);
@@ -1136,7 +1136,7 @@ wasteCommand
     .command('resolve <alert-id>')
     .description('Resolve a waste alert with a reason')
     .requiredOption('--reason <text>', 'Reason for dismissing the alert')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action((alertId: string, options: {reason: string; config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const config = loadConfig(configPath);
@@ -1191,7 +1191,7 @@ aggregateCommand
         '--date <date>',
         'Target the period containing this day (YYYY-MM-DD). Defaults to the just-completed period.',
     )
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action((options: {period?: string; date?: string; config: string}) => {
         // No --period and no subcommand → nothing to do; show help and exit non-zero.
         if (!options.period) {
@@ -1244,7 +1244,7 @@ aggregateCommand
     )
     .option('--from <date>', 'Inclusive range start (YYYY-MM-DD). Defaults to 12 months before --to')
     .option('--to <date>', 'Inclusive range end (YYYY-MM-DD). Defaults to today (UTC)')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action((options: {from?: string; to?: string; config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const config = loadConfig(configPath);
@@ -1313,7 +1313,7 @@ summaryCommand
     .requiredOption('--period <period>', 'Period key: YYYY-Wnn | YYYY-MM | YYYY-Qn | YYYY')
     .requiredOption('--scope <scope>', 'Scope: org | team:<name>')
     .option('--focus <text>', 'Optional regeneration focus passed into the prompt (e.g. "cost")')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action(
         async (options: {
             level: string;
@@ -1367,7 +1367,7 @@ summaryCommand
     .requiredOption('--level <level>', 'weekly | monthly | quarterly | yearly')
     .requiredOption('--period <period>', 'Period key: YYYY-Wnn | YYYY-MM | YYYY-Qn | YYYY')
     .requiredOption('--scope <scope>', 'Scope: org | team:<name>')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action((options: {level: string; period: string; scope: string; config: string}) => {
         let target: SummaryTarget;
         try {
@@ -1387,7 +1387,7 @@ summaryCommand
             if (!summary) {
                 console.error(
                     `No ${target.level} summary found for ${options.scope} ${target.period}. ` +
-                        'Run `govproxy summary generate` first.',
+                        'Run `toprope summary generate` first.',
                 );
                 found = false;
             } else {
@@ -1416,7 +1416,7 @@ const logCommand = program
 logCommand
     .description(
         'Log your own AI tool usage for a day (self-report). Identity comes from ' +
-            'GOVPROXY_DEVELOPER_ID or GOVPROXY_DEVELOPER_EMAIL — you can only log for yourself.',
+            'TOPROPE_DEVELOPER_ID or TOPROPE_DEVELOPER_EMAIL — you can only log for yourself.',
     )
     // Not a requiredOption: this command also hosts the `list` subcommand, and a
     // required option on the parent would be enforced even when invoking `log
@@ -1425,7 +1425,7 @@ logCommand
     .option('--minutes <n>', 'Optional rough effort in minutes')
     .option('--task <text>', 'Optional private task descriptor (never shared with managers or models)')
     .option('--date <date>', 'Usage date (YYYY-MM-DD). Defaults to today (UTC).')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action(
         (options: {
             tool?: string;
@@ -1491,7 +1491,7 @@ logCommand
     .option('--from <date>', 'Inclusive start date (YYYY-MM-DD)')
     .option('--to <date>', 'Inclusive end date (YYYY-MM-DD)')
     .option('--limit <n>', 'Maximum number of entries to show', '50')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action(
         (options: {tool?: string; from?: string; to?: string; limit: string; config: string}) => {
             const configPath = path.resolve(process.cwd(), options.config);
@@ -1536,7 +1536,7 @@ logCommand
 program
     .command('status')
     .description('Show a unified summary of developers, connectors, subscriptions, and waste')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action((options: {config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const config = loadConfig(configPath);
@@ -1552,8 +1552,8 @@ program
 
 program
     .command('doctor')
-    .description('Validate the entire GovProxy setup: config, database, and API tokens')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .description('Validate the entire Toprope setup: config, database, and API tokens')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action(async (options: {config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const config = loadConfig(configPath);
@@ -1574,7 +1574,7 @@ program
 // server and scheduler. Logs go to the console for CLI visibility.
 function buildDispatchDeps(
     db: ReturnType<typeof openDb>,
-    config: GovProxyConfig,
+    config: TopropeConfig,
 ): ReturnType<typeof buildSurveyDispatchDeps> {
     return buildSurveyDispatchDeps(db, config, {
         log: (message, err) => console.error(`[surveys] ${message}`, err ?? ''),
@@ -1588,7 +1588,7 @@ const surveyCommand = program
 surveyCommand
     .command('run')
     .description('Detect survey triggers and dispatch them (auto-send or queue per settings)')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action(async (options: {config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const config = loadConfig(configPath);
@@ -1615,7 +1615,7 @@ surveyCommand
 surveyCommand
     .command('queue')
     .description('List surveys awaiting a manager to send (status=queued)')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action((options: {config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const db = openRegistryDb(configPath);
@@ -1639,7 +1639,7 @@ surveyCommand
 surveyCommand
     .command('send <survey-id>')
     .description('Send a queued survey to its developer (Slack preferred, email fallback)')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action(async (surveyId: string, options: {config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const config = loadConfig(configPath);
@@ -1673,7 +1673,7 @@ surveyCommand
     .description('Create a manual survey for a developer (queued for you to send)')
     .requiredOption('--developer <id>', 'Developer id to survey')
     .requiredOption('--question <text>', 'The question to ask')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action((options: {developer: string; question: string; config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const db = openRegistryDb(configPath);
@@ -1688,7 +1688,7 @@ surveyCommand
                 return;
             }
             console.log(`Created manual survey ${survey.id} (queued). Send it with:`);
-            console.log(`  govproxy survey send ${survey.id}`);
+            console.log(`  toprope survey send ${survey.id}`);
         } finally {
             db.close();
         }
@@ -1697,7 +1697,7 @@ surveyCommand
 surveyCommand
     .command('dismiss <survey-id>')
     .description('Dismiss a queued survey without sending it')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action((surveyId: string, options: {config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const db = openRegistryDb(configPath);
@@ -1716,7 +1716,7 @@ surveyCommand
 surveyCommand
     .command('responses')
     .description('Show answered surveys with their response (context next to the data)')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action((options: {config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const db = openRegistryDb(configPath);
@@ -1755,7 +1755,7 @@ anomalyCommand
         '--period <date>',
         'Any date (YYYY-MM-DD) in the target ISO week. Defaults to the just-completed week.',
     )
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action((options: {period?: string; config: string}) => {
         const now = new Date();
         // Default to the just-completed week — what the scheduled scan would run
@@ -1792,7 +1792,7 @@ anomalyCommand
     .option('--scope <scope>', 'Filter by scope: developer | team')
     .option('--status <status>', 'Filter by status: open | acknowledged | resolved')
     .option('--period <week>', 'Filter by week_start (YYYY-MM-DD)')
-    .option('-c, --config <path>', 'Path to config file', 'govproxy.config.yaml')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action((options: {scope?: string; status?: string; period?: string; config: string}) => {
         if (options.scope && options.scope !== 'developer' && options.scope !== 'team') {
             console.error("Error: --scope must be 'developer' or 'team'.");

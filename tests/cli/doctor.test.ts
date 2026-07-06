@@ -5,7 +5,7 @@ import fs from 'fs';
 import os from 'os';
 import {runMigrations} from '../../src/storage/migrator';
 import {runDoctor, exactConfiguredRepos, findMissingRepos} from '../../src/cli/doctor';
-import type {GovProxyConfig} from '../../src/config/types';
+import type {TopropeConfig} from '../../src/config/types';
 import type {GitProviderConfig} from '../../src/connectors/git/providers/types';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../src/storage/migrations');
@@ -17,7 +17,7 @@ function makeDb(): Database.Database {
     return db;
 }
 
-function disabledConfig(): GovProxyConfig {
+function disabledConfig(): TopropeConfig {
     return {
         server: {port: 8080, host: '0.0.0.0'},
         storage: {type: 'sqlite', sqlite_path: ':memory:'},
@@ -34,7 +34,7 @@ function disabledConfig(): GovProxyConfig {
         alerts: {},
         dashboard: {},
         teams: [],
-    } as unknown as GovProxyConfig;
+    } as unknown as TopropeConfig;
 }
 
 describe('runDoctor', () => {
@@ -54,7 +54,7 @@ describe('runDoctor', () => {
             errors.push(args.join(' '));
         });
 
-        tmpConfigPath = path.join(os.tmpdir(), `govproxy-test-${Date.now()}.yaml`);
+        tmpConfigPath = path.join(os.tmpdir(), `toprope-test-${Date.now()}.yaml`);
         fs.writeFileSync(tmpConfigPath, 'server:\n  port: 8080\n');
     });
 
@@ -70,12 +70,12 @@ describe('runDoctor', () => {
         const result = await runDoctor(db, disabledConfig(), tmpConfigPath, MIGRATIONS_DIR);
         expect(result).toBe(true);
         const combined = output.join('\n');
-        expect(combined).toContain('GovProxy Doctor');
+        expect(combined).toContain('Toprope Doctor');
         expect(combined).toContain('All checks passed');
     });
 
     it('fails config check when config file missing', async () => {
-        const nonExistentPath = path.join(os.tmpdir(), 'govproxy-missing-12345.yaml');
+        const nonExistentPath = path.join(os.tmpdir(), 'toprope-missing-12345.yaml');
         const result = await runDoctor(db, disabledConfig(), nonExistentPath, MIGRATIONS_DIR);
         expect(result).toBe(false);
         const allOutput = [...output, ...errors].join('\n');
@@ -91,7 +91,7 @@ describe('runDoctor', () => {
     });
 
     it('fails database check when pending migrations exist', async () => {
-        const fakeMigrationsDir = path.join(os.tmpdir(), `govproxy-migrations-${Date.now()}`);
+        const fakeMigrationsDir = path.join(os.tmpdir(), `toprope-migrations-${Date.now()}`);
         fs.mkdirSync(fakeMigrationsDir, {recursive: true});
         fs.writeFileSync(
             path.join(fakeMigrationsDir, '999_pending.sql'),
@@ -244,7 +244,7 @@ describe('runDoctor', () => {
     });
 
     it('outputs fix suggestions for failed checks', async () => {
-        const nonExistentPath = path.join(os.tmpdir(), 'govproxy-missing-99999.yaml');
+        const nonExistentPath = path.join(os.tmpdir(), 'toprope-missing-99999.yaml');
         await runDoctor(db, disabledConfig(), nonExistentPath, MIGRATIONS_DIR);
         const allOutput = [...output, ...errors].join('\n');
         expect(allOutput).toContain('Fix:');

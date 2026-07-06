@@ -1,0 +1,87 @@
+# Bitbucket-only config for dogfooding / testing the Bitbucket provider.
+# Only the git connector (Bitbucket) is enabled — Copilot, Claude Code and
+# Windsurf are off so you can test with a single Bitbucket credential.
+#
+# Set these env vars first (PowerShell):
+#   $env:BITBUCKET_USERNAME     = "your-bitbucket-username"
+#   $env:BITBUCKET_APP_PASSWORD = "the-app-password-you-create"
+#   $env:DASHBOARD_PASSWORD     = "something"
+#
+# Then:
+#   npx toprope db migrate   -c toprope.bitbucket.config.yaml
+#   npx toprope doctor       -c toprope.bitbucket.config.yaml
+#   npx toprope sync git --provider bitbucket -c toprope.bitbucket.config.yaml
+#   npx toprope status       -c toprope.bitbucket.config.yaml
+#
+# `toprope doctor` validates each configured provider (it lists the workspace
+# repos to confirm auth + reachability), so it will verify this Bitbucket setup.
+#
+# To attribute commits to people, register developers with the email they
+# commit under (and/or their Bitbucket nickname):
+#   npx toprope dev add --name "Jane Dev" --team engineering \
+#       --email jane@company.com --bitbucket jane-bb \
+#       --git-email jane@personal.com -c toprope.bitbucket.config.yaml
+# Unmatched commit authors are listed in the `sync git` output.
+
+server:
+  port: 8080
+  host: "0.0.0.0"
+
+storage:
+  type: "sqlite"
+  sqlite_path: "./data/toprope.db"
+
+connectors:
+  copilot:
+    enabled: false
+
+  claude_code:
+    enabled: false
+
+  windsurf:
+    enabled: false
+
+  git:
+    enabled: true
+    # Multi-provider form is REQUIRED for Bitbucket. The single-provider
+    # shorthand (provider/org/api_token) only supports GitHub.
+    providers:
+      - type: "bitbucket"
+        workspace: "your-workspace-slug"      # <-- from bitbucket.org/<workspace>/<repo>
+        auth:
+          type: "app_password"                # app_password | access_token | oauth
+          username: "${BITBUCKET_USERNAME}"
+          app_password: "${BITBUCKET_APP_PASSWORD}"
+        # repos: [] (or omit) = ALL repos in the workspace you can read.
+        # To monitor only a subset, list EXACT repo slugs (globs do NOT work
+        # in this include list). exclude_repos DOES support globs.
+        repos: []
+        exclude_repos:
+          - "archived-*"
+    sync_interval: "daily"
+    sync_time: "03:00"
+    analysis:
+      churn_window_hours: 48
+      ai_signature_enabled: true
+
+expenses:
+  import_path: "./data/expenses/"
+
+summaries:
+  enabled: false
+
+alerts:
+  slack:
+    enabled: false
+  waste_threshold: 14
+
+dashboard:
+  enabled: true
+  auth:
+    type: "basic"
+    admin_password: "${DASHBOARD_PASSWORD}"
+
+teams:
+  - name: "engineering"
+    department: "engineering"
+    manager: "goran"

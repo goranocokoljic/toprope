@@ -47,6 +47,18 @@ import type {
     UserPreferences,
     CoachingPreferences,
     CoachingPreferencesPatch,
+    RelatedPractices,
+    PracticeBrowseList,
+    BrowsePracticeDetail,
+    PracticeHistoryEntry,
+    PracticeFeedbackSignal,
+    PracticeFeedbackResult,
+    PracticePreview,
+    OwnedPracticeView,
+    CreatedPractice,
+    ShowcaseGalleryList,
+    BrowseShowcaseDetail,
+    ShowcaseRemovalNotice,
     WasteAlert,
     WasteResolutionReason,
     WasteTeamSummary,
@@ -718,4 +730,171 @@ export const api = {
         );
         return body.data;
     },
+
+    // --- Contextual best-practice display (Task 6.2.7) ---
+    /**
+     * Best practices to surface next to a metric for the logged-in developer.
+     * Viewer-scoped server-side (the developer's own team); returns the ranked set
+     * plus the encouraging intro copy. An empty list is a normal result.
+     */
+    async getRelatedPractices(metric: string, limit?: number): Promise<RelatedPractices> {
+        const search = new URLSearchParams({metric});
+        if (limit !== undefined) {
+            search.set('limit', String(limit));
+        }
+        const body = await request<ApiEnvelope<RelatedPractices>>(
+            `/api/me/practices/related?${search.toString()}`,
+        );
+        return body.data;
+    },
+
+    /**
+     * Record that the developer viewed a surfaced practice next to a metric (feeds
+     * the 6.2.4 usage signal). Server gates this on the practice actually being
+     * surfaced to the viewer for that metric.
+     */
+    async recordPracticeView(id: string, metric: string): Promise<void> {
+        await postJson<ApiEnvelope<unknown>>(
+            `/api/me/practices/${encodeURIComponent(id)}/view`,
+            {metric},
+        );
+    },
+
+    // --- Best-practice browse UI (Task 6.2.8) ---
+    /**
+     * Browse / search the published practices the viewer may see. Free text plus
+     * tag/team/scope filters all flow through 6.1.5 search server-side; the response
+     * carries the viewer-team's active contribution model for the contribute entry point.
+     */
+    async browsePractices(filters: PracticeBrowseFilters = {}): Promise<PracticeBrowseList> {
+        const search = new URLSearchParams();
+        if (filters.q) search.set('q', filters.q);
+        if (filters.tag) search.set('tag', filters.tag);
+        if (filters.team) search.set('team', filters.team);
+        if (filters.scope) search.set('scope', filters.scope);
+        const qs = search.toString();
+        const body = await request<ApiEnvelope<PracticeBrowseList>>(
+            `/api/me/practices/browse${qs ? `?${qs}` : ''}`,
+        );
+        return body.data;
+    },
+
+    /** Full detail of one practice the viewer may see (rendered content, feedback, history access). */
+    async getPracticeDetail(id: string): Promise<BrowsePracticeDetail> {
+        const body = await request<ApiEnvelope<BrowsePracticeDetail>>(
+            `/api/me/practices/browse/${encodeURIComponent(id)}`,
+        );
+        return body.data;
+    },
+
+    /** Version history of a practice the viewer may see, oldest-first. */
+    async getPracticeHistory(id: string): Promise<PracticeHistoryEntry[]> {
+        const body = await request<ApiEnvelope<PracticeHistoryEntry[]>>(
+            `/api/me/practices/browse/${encodeURIComponent(id)}/history`,
+        );
+        return body.data;
+    },
+
+    /** Toggle the viewer's helpful / not-helpful feedback on a practice (6.2.4). */
+    async togglePracticeFeedback(
+        id: string,
+        signal: PracticeFeedbackSignal,
+    ): Promise<PracticeFeedbackResult> {
+        const body = await postJson<ApiEnvelope<PracticeFeedbackResult>>(
+            `/api/me/practices/browse/${encodeURIComponent(id)}/feedback`,
+            {signal},
+        );
+        return body.data;
+    },
+
+    // --- Best-practice authoring editor (Task 6.2.3, used by the 6.2.8 entry points) ---
+    /** Live markdown preview: sanitized HTML + the metric tags it implies. Persists nothing. */
+    async previewPractice(markdown: string): Promise<PracticePreview> {
+        const body = await postJson<ApiEnvelope<PracticePreview>>('/api/me/practices/preview', {markdown});
+        return body.data;
+    },
+
+    /** Create a draft practice from markdown. Team scope pins to the author's own team. */
+    async createPractice(input: {
+        title: string;
+        scope: 'org' | 'team';
+        markdown: string;
+    }): Promise<CreatedPractice> {
+        const body = await postJson<ApiEnvelope<CreatedPractice>>('/api/me/practices', input);
+        return body.data;
+    },
+
+    /** Load one of the viewer's OWN practices for editing (owner-scoped; 404 otherwise). */
+    async getOwnedPractice(id: string): Promise<OwnedPracticeView> {
+        const body = await request<ApiEnvelope<OwnedPracticeView>>(
+            `/api/me/practices/${encodeURIComponent(id)}`,
+        );
+        return body.data;
+    },
+
+    /** Save an edit to one of the viewer's OWN practices (appends a new version). */
+    async savePractice(id: string, markdown: string): Promise<void> {
+        await postJson<ApiEnvelope<unknown>>(
+            `/api/me/practices/${encodeURIComponent(id)}/save`,
+            {markdown},
+        );
+    },
+
+    // --- Showcase browse/governance (Task 6.3.9) ---
+    /**
+     * Browse / search the published showcases the viewer may see. Free text plus
+     * tag/team/scope filters all flow through 6.1.5 search server-side; results are
+     * scope-enforced so a showcase outside the viewer's scope never appears.
+     */
+    async browseShowcases(filters: ShowcaseBrowseFilters = {}): Promise<ShowcaseGalleryList> {
+        const search = new URLSearchParams();
+        if (filters.q) search.set('q', filters.q);
+        if (filters.tag) search.set('tag', filters.tag);
+        if (filters.team) search.set('team', filters.team);
+        if (filters.scope) search.set('scope', filters.scope);
+        const qs = search.toString();
+        const body = await request<ApiEnvelope<ShowcaseGalleryList>>(
+            `/api/me/showcase-units/browse${qs ? `?${qs}` : ''}`,
+        );
+        return body.data;
+    },
+
+    /** Full detail of one showcase the viewer may see (note + outcome + annotated turns + AI + cross-links). */
+    async getShowcaseDetail(id: string): Promise<BrowseShowcaseDetail> {
+        const body = await request<ApiEnvelope<BrowseShowcaseDetail>>(
+            `/api/me/showcase-units/${encodeURIComponent(id)}`,
+        );
+        return body.data;
+    },
+
+    /** Owner unpublish: remove one's OWN showcase from the gallery (author-scoped). */
+    async unpublishShowcase(id: string): Promise<BrowseShowcaseDetail['state']> {
+        const body = await postJson<ApiEnvelope<{state: string}>>(
+            `/api/me/showcase-units/${encodeURIComponent(id)}/unpublish`,
+            {},
+        );
+        return body.data.state;
+    },
+
+    /** The author's removal-notification feed — lead removals of their own showcases, newest first. */
+    async getShowcaseRemovals(): Promise<ShowcaseRemovalNotice[]> {
+        const body = await request<ApiEnvelope<ShowcaseRemovalNotice[]>>('/api/me/showcase-units/removals');
+        return body.data;
+    },
 };
+
+/** Query filters for {@link api.browsePractices}. */
+export interface PracticeBrowseFilters {
+    q?: string;
+    tag?: string;
+    team?: string;
+    scope?: 'org' | 'team';
+}
+
+/** Query filters for {@link api.browseShowcases}. */
+export interface ShowcaseBrowseFilters {
+    q?: string;
+    tag?: string;
+    team?: string;
+    scope?: 'org' | 'team';
+}

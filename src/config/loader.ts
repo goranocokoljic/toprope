@@ -3,7 +3,8 @@ import yaml from 'js-yaml';
 import Ajv from 'ajv';
 import { configSchema } from './schema';
 import { defaultConfig } from './defaults';
-import type { GovProxyConfig } from './types';
+import { resolveConfigPathWithLegacyFallback } from './compat';
+import type { TopropeConfig } from './types';
 
 const ajv = new Ajv({ allErrors: true });
 const validate = ajv.compile(configSchema);
@@ -47,12 +48,15 @@ function deepMerge<T extends Record<string, unknown>>(base: T, override: Partial
     return result;
 }
 
-export function loadConfig(configPath: string): GovProxyConfig {
-    if (!fs.existsSync(configPath)) {
+export function loadConfig(configPath: string): TopropeConfig {
+    // Backwards-compat: if the toprope.* config is absent but a legacy
+    // govproxy.* file sits beside it, load that (with a deprecation warning).
+    const resolvedPath = resolveConfigPathWithLegacyFallback(configPath);
+    if (!fs.existsSync(resolvedPath)) {
         throw new Error(`Config file not found: ${configPath}`);
     }
 
-    const raw = fs.readFileSync(configPath, 'utf-8');
+    const raw = fs.readFileSync(resolvedPath, 'utf-8');
     const parsed = yaml.load(raw) as Record<string, unknown>;
 
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -70,5 +74,5 @@ export function loadConfig(configPath: string): GovProxyConfig {
         throw new Error(`Invalid config:\n${messages}`);
     }
 
-    return merged as unknown as GovProxyConfig;
+    return merged as unknown as TopropeConfig;
 }

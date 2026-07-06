@@ -8,15 +8,15 @@ import {runMigrations} from '../../src/storage/migrator';
 import {addTeam} from '../../src/registry/teams';
 import {addDeveloper, linkDeveloper} from '../../src/registry/developers';
 import {setGlobalSetting} from '../../src/settings/store';
-import type {GovProxyConfig} from '../../src/config/types';
+import type {TopropeConfig} from '../../src/config/types';
 import {runScheduledSurveySweep, startSurveyScheduler} from '../../src/surveys/scheduler';
 import {FakeSlackClient} from '../slack/fake-client';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../src/storage/migrations');
 
 // Minimal config the scheduler actually reads (slack + surveys blocks only).
-function cfg(partial: Partial<GovProxyConfig>): GovProxyConfig {
-    return partial as GovProxyConfig;
+function cfg(partial: Partial<TopropeConfig>): TopropeConfig {
+    return partial as TopropeConfig;
 }
 
 describe('startSurveyScheduler gating', () => {
