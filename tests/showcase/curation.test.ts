@@ -240,7 +240,9 @@ describe('showcase curation — mandatory note gate + prominent display (#167)',
             outcomeLink: '   ',
         });
         const view = assembleCuratedUnit(db, contribution.id);
-        expect(view?.outcomeLink).toBe('   ');
+        // A whitespace-only link is normalized to null at the write boundary (#189): it
+        // is not a real link, so it's stored as absent rather than a blank string.
+        expect(view?.outcomeLink).toBeNull();
         expect(view?.hasOutcomeLink).toBe(false);
     });
 
@@ -250,7 +252,7 @@ describe('showcase curation — mandatory note gate + prominent display (#167)',
             title: 't',
             conversation: CONVERSATION,
             curatorsNote: 'note',
-            outcomeLink: 'goal: ship the parser',
+            outcomeLink: 'https://example.com/goal/ship-the-parser',
         });
         addShowcaseAnnotation(db, {
             contributionId: contribution.id,

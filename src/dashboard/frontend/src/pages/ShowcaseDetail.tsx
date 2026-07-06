@@ -52,6 +52,24 @@ export function ShowcaseDetail(): JSX.Element {
     return <ShowcaseDetailContent showcase={data} />;
 }
 
+/**
+ * A link safe to render as a clickable `<a href>`: the value only when it parses as an
+ * absolute http(s) URL, else null. Defense-in-depth against a stored `javascript:` /
+ * `data:` outcome link (stored XSS) — the server validates the scheme at the write
+ * boundary, but the renderer neutralizes anything non-http(s) by rendering it as plain
+ * text rather than a clickable link, so a link that predates the server gate (or arrives
+ * any other way) can never become script-bearing.
+ */
+function safeHttpUrl(value: string): string | null {
+    let url: URL;
+    try {
+        url = new URL(value);
+    } catch {
+        return null;
+    }
+    return url.protocol === 'http:' || url.protocol === 'https:' ? value : null;
+}
+
 function ShowcaseDetailContent({showcase}: {showcase: BrowseShowcaseDetail}): JSX.Element {
     return (
         <div className="space-y-5">
@@ -77,18 +95,7 @@ function ShowcaseDetailContent({showcase}: {showcase: BrowseShowcaseDetail}): JS
                     {showcase.curatorsNote}
                 </p>
                 {showcase.hasOutcomeLink && showcase.outcomeLink ? (
-                    <p className="mt-3 text-sm">
-                        <span className="text-muted">Outcome: </span>
-                        <a
-                            href={showcase.outcomeLink}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="text-accent underline"
-                            data-testid="outcome-link"
-                        >
-                            {showcase.outcomeLink}
-                        </a>
-                    </p>
+                    <OutcomeLink link={showcase.outcomeLink} />
                 ) : null}
             </Card>
 
@@ -98,6 +105,36 @@ function ShowcaseDetailContent({showcase}: {showcase: BrowseShowcaseDetail}): JS
 
             <CrossLinks showcase={showcase} />
         </div>
+    );
+}
+
+/**
+ * The outcome link — a clickable `<a href>` ONLY when the value is a safe http(s) URL;
+ * a non-http(s) value (e.g. a stored `javascript:` link) is neutralized to plain text
+ * so it can never execute. This is the render-side half of the outcome-link scheme
+ * validation (the server enforces the other half at the write boundary).
+ */
+function OutcomeLink({link}: {link: string}): JSX.Element {
+    const safe = safeHttpUrl(link);
+    return (
+        <p className="mt-3 text-sm">
+            <span className="text-muted">Outcome: </span>
+            {safe ? (
+                <a
+                    href={safe}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-accent underline"
+                    data-testid="outcome-link"
+                >
+                    {link}
+                </a>
+            ) : (
+                <span className="text-foreground" data-testid="outcome-link-unsafe">
+                    {link}
+                </span>
+            )}
+        </p>
     );
 }
 
