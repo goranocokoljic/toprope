@@ -18,6 +18,30 @@ import {
     unlinkPractice,
     upsertShowcaseUnit,
 } from '../../src/showcase/unitsStore';
+import {isValidOutcomeLink} from '../../src/showcase/unitsTypes';
+
+describe('isValidOutcomeLink (#189, SEC-1)', () => {
+    it('accepts http and https absolute URLs', () => {
+        expect(isValidOutcomeLink('https://example.com/pr/1')).toBe(true);
+        expect(isValidOutcomeLink('http://example.com')).toBe(true);
+        // Surrounding whitespace is tolerated (the store trims before storing).
+        expect(isValidOutcomeLink('  https://example.com  ')).toBe(true);
+    });
+
+    it('rejects dangerous schemes, non-URL strings, blanks, and non-strings', () => {
+        // eslint-disable-next-line no-script-url
+        expect(isValidOutcomeLink('javascript:alert(1)')).toBe(false);
+        expect(isValidOutcomeLink('data:text/html,<script>alert(1)</script>')).toBe(false);
+        expect(isValidOutcomeLink('ftp://host/x')).toBe(false);
+        expect(isValidOutcomeLink('PR#1')).toBe(false);
+        expect(isValidOutcomeLink('not a url')).toBe(false);
+        expect(isValidOutcomeLink('')).toBe(false);
+        expect(isValidOutcomeLink('   ')).toBe(false);
+        expect(isValidOutcomeLink(null)).toBe(false);
+        expect(isValidOutcomeLink(undefined)).toBe(false);
+        expect(isValidOutcomeLink(42)).toBe(false);
+    });
+});
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../src/storage/migrations');
 
@@ -80,14 +104,14 @@ describe('showcase unitsStore (#164)', () => {
             conversation: 'v1',
             curatorsNote: 'first',
             publishPath: 'self_publish',
-            outcomeLink: 'PR#1',
+            outcomeLink: 'https://example.com/pr/1',
         });
         upsertShowcaseUnit(db, {
             contributionId: 'sc1',
             conversation: 'v2',
             curatorsNote: 'second',
             publishPath: 'joint_curation',
-            outcomeLink: 'PR#2',
+            outcomeLink: 'https://example.com/pr/2',
             aiAnnotation: 'used few-shot prompting',
         });
         const read = getShowcaseUnit(db, 'sc1');
@@ -137,6 +161,58 @@ describe('showcase unitsStore (#164)', () => {
 
     it('returns undefined for a contribution with no unit', () => {
         expect(getShowcaseUnit(db, 'bp1')).toBeUndefined();
+    });
+
+    // --- outcome-link scheme GATE (#189, SEC-1) -----------------------------
+
+    it('rejects a javascript: outcome link at the write boundary (stored-XSS fail-closed)', () => {
+        expect(() =>
+            upsertShowcaseUnit(db, {
+                contributionId: 'sc1',
+                conversation: '[]',
+                curatorsNote: 'note',
+                publishPath: 'self_publish',
+                // eslint-disable-next-line no-script-url
+                outcomeLink: 'javascript:alert(1)',
+            }),
+        ).toThrow(/outcome_link must be an http\(s\) URL/);
+        expect(getShowcaseUnit(db, 'sc1')).toBeUndefined();
+    });
+
+    it('rejects a data: outcome link and a non-URL string at the write boundary', () => {
+        for (const bad of ['data:text/html,<script>alert(1)</script>', 'PR#1', 'not a url', 'ftp://host/x']) {
+            expect(() =>
+                upsertShowcaseUnit(db, {
+                    contributionId: 'sc1',
+                    conversation: '[]',
+                    curatorsNote: 'note',
+                    publishPath: 'self_publish',
+                    outcomeLink: bad,
+                }),
+            ).toThrow(/outcome_link must be an http\(s\) URL/);
+        }
+        expect(getShowcaseUnit(db, 'sc1')).toBeUndefined();
+    });
+
+    it('accepts http(s) outcome links and normalizes a blank one to null', () => {
+        const withLink = upsertShowcaseUnit(db, {
+            contributionId: 'sc1',
+            conversation: '[]',
+            curatorsNote: 'note',
+            publishPath: 'self_publish',
+            outcomeLink: '  https://example.com/pr/7  ',
+        });
+        // Trimmed and stored.
+        expect(withLink.outcomeLink).toBe('https://example.com/pr/7');
+
+        const blanked = upsertShowcaseUnit(db, {
+            contributionId: 'sc1',
+            conversation: '[]',
+            curatorsNote: 'note',
+            publishPath: 'self_publish',
+            outcomeLink: '   ',
+        });
+        expect(blanked.outcomeLink).toBeNull();
     });
 
     // --- annotations --------------------------------------------------------

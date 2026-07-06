@@ -51,6 +51,39 @@ export function isScrubTier(value: unknown): value is ScrubTier {
     return value === 'secret_high' || value === 'pii_hint_low';
 }
 
+/**
+ * The URL schemes an outcome link may use. Closed allowlist — an outcome link is
+ * rendered as a clickable `<a href>`, so a `javascript:`/`data:`/`file:` value would
+ * become a script-bearing or otherwise dangerous link (stored XSS). Only http(s) is
+ * permitted; anything else is rejected at the write boundary (fail-closed).
+ */
+export const OUTCOME_LINK_SCHEMES = ['http:', 'https:'] as const;
+
+/**
+ * Whether a value is a safe, clickable outcome link: a non-blank string that parses as
+ * an absolute URL whose scheme is on the {@link OUTCOME_LINK_SCHEMES} allowlist. Used
+ * as the single source of truth for outcome-link validity by both the write boundary
+ * (`upsertShowcaseUnit`, fail-closed) and the authoring route (400). A blank/absent
+ * link is NOT a valid link — the caller treats those as "no outcome" (null), so this
+ * predicate is only ever asked about a value that is meant to be a real link.
+ */
+export function isValidOutcomeLink(value: unknown): value is string {
+    if (typeof value !== 'string') {
+        return false;
+    }
+    const trimmed = value.trim();
+    if (trimmed === '') {
+        return false;
+    }
+    let url: URL;
+    try {
+        url = new URL(trimmed);
+    } catch {
+        return false;
+    }
+    return (OUTCOME_LINK_SCHEMES as readonly string[]).includes(url.protocol);
+}
+
 /** The 1:1 showcase-specific payload for a contribution. */
 export interface ShowcaseUnit {
     contributionId: string;

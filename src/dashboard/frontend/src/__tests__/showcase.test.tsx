@@ -197,6 +197,26 @@ describe('Showcase detail (Task 6.3.9 / #172)', () => {
         expect(screen.getByText('Test-first development')).toBeInTheDocument();
     });
 
+    it('neutralizes a non-http(s) outcome link, rendering it as plain text (no clickable href)', async () => {
+        // Defense-in-depth (#189, SEC-1): even if a dangerous scheme reaches the client,
+        // the renderer must not emit a clickable link. It shows the value as plain text.
+        // eslint-disable-next-line no-script-url
+        detailData = detail({outcomeLink: 'javascript:alert(1)', hasOutcomeLink: true});
+        renderAt('/developer/showcase/s1');
+        const plain = await screen.findByTestId('outcome-link-unsafe');
+        expect(plain).toHaveTextContent('javascript:alert(1)');
+        // No anchor was rendered for the unsafe link.
+        expect(screen.queryByTestId('outcome-link')).not.toBeInTheDocument();
+    });
+
+    it('renders a safe http(s) outcome link as a clickable anchor', async () => {
+        detailData = detail({outcomeLink: 'https://example.com/pr/9', hasOutcomeLink: true});
+        renderAt('/developer/showcase/s1');
+        const link = await screen.findByTestId('outcome-link');
+        expect(link).toHaveAttribute('href', 'https://example.com/pr/9');
+        expect(screen.queryByTestId('outcome-link-unsafe')).not.toBeInTheDocument();
+    });
+
     it('shows the AI annotation only when present and clearly labels it', async () => {
         detailData = detail({
             aiAnnotation: {

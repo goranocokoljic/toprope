@@ -28,6 +28,7 @@ import {randomUUID} from 'crypto';
 import {
     isPublishPath,
     isScrubTier,
+    isValidOutcomeLink,
     isVisibilityScope,
     type NewAnnotation,
     type NewConsent,
@@ -44,6 +45,31 @@ import {
 
 function nowIso(): string {
     return new Date().toISOString();
+}
+
+/**
+ * Normalize an outcome link at the write boundary. An absent/blank value is "no
+ * outcome" → null; a non-blank value MUST be a valid http(s) URL (see
+ * {@link isValidOutcomeLink}) or the write is rejected fail-closed — a stored
+ * `javascript:`/`data:` link would become a script-bearing clickable link (stored
+ * XSS) when the detail view renders it as an `<a href>`. Returns the trimmed link, or
+ * null. The route validates first for a clean 400; this is the belt-and-suspenders
+ * gate so no code path (or direct call) can persist an unsafe link.
+ */
+function coerceOutcomeLink(raw: string | null | undefined, contributionId: string): string | null {
+    if (raw === undefined || raw === null) {
+        return null;
+    }
+    const trimmed = raw.trim();
+    if (trimmed === '') {
+        return null;
+    }
+    if (!isValidOutcomeLink(trimmed)) {
+        throw new Error(
+            `[showcase] outcome_link must be an http(s) URL (contribution=${contributionId})`,
+        );
+    }
+    return trimmed;
 }
 
 interface ShowcaseUnitRow {
@@ -193,7 +219,7 @@ export function upsertShowcaseUnit(db: Database.Database, input: ShowcaseUnitInp
         );
     }
 
-    const outcomeLink = input.outcomeLink ?? null;
+    const outcomeLink = coerceOutcomeLink(input.outcomeLink, input.contributionId);
     const aiAnnotation = input.aiAnnotation ?? null;
 
     db.prepare(
