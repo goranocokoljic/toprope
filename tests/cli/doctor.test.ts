@@ -5,10 +5,21 @@ import fs from 'fs';
 import os from 'os';
 import {runMigrations} from '../../src/storage/migrator';
 import {runDoctor, exactConfiguredRepos, findMissingRepos} from '../../src/cli/doctor';
+import {createProvider} from '../../src/connectors/git/providers/store';
+import {loadServerKey} from '../../src/connectors/git/providers/secret';
 import type {TopropeConfig} from '../../src/config/types';
-import type {GitProviderConfig} from '../../src/connectors/git/providers/types';
+import type {GitProvider, GitProviderConfig} from '../../src/connectors/git/providers/types';
+
+// Keep createGitProvider real by default (so the invalid-config test still sees
+// the factory throw), but wrap it in a spy so the DB-provider test can stub one
+// call and avoid a live network probe.
+vi.mock('../../src/connectors/git/providers/factory', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('../../src/connectors/git/providers/factory')>();
+    return {...actual, createGitProvider: vi.fn(actual.createGitProvider)};
+});
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../src/storage/migrations');
+const DOCTOR_TEST_KEY = Buffer.alloc(32, 5).toString('base64');
 
 function makeDb(): Database.Database {
     const db = new Database(':memory:');
@@ -233,6 +244,62 @@ describe('runDoctor', () => {
         const allOutput = [...output, ...errors].join('\n');
         expect(allOutput).toContain('Git: bitbucket');
         expect(allOutput).toContain('workspace');
+    });
+
+    it('validates an enabled DB-connected provider even with no config providers (#196)', async () => {
+        const savedKey = process.env.TOPROPE_SECRET_KEY;
+        process.env.TOPROPE_SECRET_KEY = DOCTOR_TEST_KEY;
+        try {
+            // A UI-connected provider lives only in the DB, not in the config file.
+            createProvider(db, loadServerKey(), {
+                config: {type: 'github', org: 'db-org', auth: {type: 'token', api_token: 'db-token'}},
+                enabled: true,
+            });
+
+            const {createGitProvider} = await import('../../src/connectors/git/providers/factory');
+            const mockProvider = {
+                name: 'github',
+                checkAccess: vi.fn().mockResolvedValue(undefined),
+                listRepos: vi.fn().mockResolvedValue([]),
+                getCommits: vi.fn(),
+                getPullRequests: vi.fn(),
+                getReviewComments: vi.fn(),
+                getPRReviews: vi.fn(),
+                getCommitDiff: vi.fn(),
+            } as unknown as GitProvider;
+            (createGitProvider as ReturnType<typeof vi.fn>).mockReturnValueOnce(mockProvider);
+
+            const config = disabledConfig();
+            (config.connectors.git as {enabled: boolean}).enabled = true;
+
+            const result = await runDoctor(db, config, tmpConfigPath, MIGRATIONS_DIR);
+
+            const allOutput = [...output, ...errors].join('\n');
+            // The DB provider was picked up and checked — not reported as "none configured".
+            expect(allOutput).toContain('Git: github');
+            expect(allOutput).not.toContain('No git providers configured');
+            expect(createGitProvider).toHaveBeenCalledWith(
+                expect.objectContaining({type: 'github', org: 'db-org'}),
+            );
+            expect(result).toBe(true);
+        } finally {
+            if (savedKey === undefined) delete process.env.TOPROPE_SECRET_KEY;
+            else process.env.TOPROPE_SECRET_KEY = savedKey;
+        }
+    });
+
+    it('reports "no valid git providers" when a providers[] array has only malformed entries', async () => {
+        const config = disabledConfig();
+        // providers array present (non-empty) but every entry lacks a "type", so
+        // the resolver yields nothing → the array-specific diagnostic fires.
+        (config.connectors.git as {enabled: boolean; providers: unknown[]}).enabled = true;
+        (config.connectors.git as {enabled: boolean; providers: unknown[]}).providers = [{nope: true}];
+
+        const result = await runDoctor(db, config, tmpConfigPath, MIGRATIONS_DIR);
+
+        expect(result).toBe(false);
+        const allOutput = [...output, ...errors].join('\n');
+        expect(allOutput).toContain('No valid git providers configured');
     });
 
     it('skips summary model check when summaries disabled', async () => {

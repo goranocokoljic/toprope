@@ -3,7 +3,8 @@ import type Database from 'better-sqlite3';
 import type {TopropeConfig} from '../config/types';
 import {resolveConfigPathWithLegacyFallback} from '../config/compat';
 import {getMigrationStatus} from '../storage/migrator';
-import {resolveGitProviderConfigs} from '../connectors/git/providers/config';
+import {resolveAllGitProviders} from '../connectors/git/providers/resolve';
+import {loadServerKey} from '../connectors/git/providers/secret';
 import {createGitProvider} from '../connectors/git/providers/factory';
 import type {GitProvider, GitProviderConfig} from '../connectors/git/providers/types';
 import {trimTrailingSlash} from '../summaries/model-client';
@@ -452,55 +453,65 @@ async function checkOneGitProvider(pc: GitProviderConfig): Promise<CheckResult> 
     return pass(label, `${gitProviderIdentifier(pc)} reachable (${configured.length} configured repo(s) verified)`);
 }
 
-async function checkGitProviders(config: TopropeConfig): Promise<CheckResult[]> {
+function noGitProvidersDiagnostic(git: TopropeConfig['connectors']['git']): CheckResult {
+    // Nothing resolved from the DB or config — give a targeted setup hint based on
+    // what the config partially has. (If a DB provider existed, resolve wouldn't be
+    // empty, so these messages only speak to the config-file side.)
+    const usingProvidersArray = Array.isArray(git.providers) && git.providers.length > 0;
+    if (usingProvidersArray) {
+        return fail(
+            'Git providers',
+            'No valid git providers configured',
+            'Each connectors.git.providers[] entry needs a "type" of github, bitbucket, or gitlab.',
+        );
+    }
+    // Legacy GitHub shorthand (git.org + git.api_token). Give targeted hints.
+    const token = git.api_token ?? process.env.GITHUB_TOKEN ?? '';
+    const org = git.org ?? '';
+    if (!org && !token) {
+        return fail(
+            'Git providers',
+            'No git providers configured',
+            'Connect one in the UI (Admin → Connectors → Git), add connectors.git.providers[] (bitbucket/gitlab/github), or set git.org + git.api_token for the GitHub shorthand.',
+        );
+    }
+    if (!token) {
+        return fail(
+            'Git providers',
+            'GitHub shorthand configured but no API token',
+            'Set connectors.git.api_token in config or export GITHUB_TOKEN=<token>.',
+        );
+    }
+    if (!org) {
+        return fail(
+            'Git providers',
+            'GitHub shorthand configured but no org',
+            'Set connectors.git.org to your GitHub org login.',
+        );
+    }
+    // org + token both present yet nothing resolved — defensive fall-through.
+    return fail(
+        'Git providers',
+        'No valid git providers configured',
+        'Each connectors.git.providers[] entry needs a "type" of github, bitbucket, or gitlab.',
+    );
+}
+
+async function checkGitProviders(
+    db: Database.Database,
+    config: TopropeConfig,
+): Promise<CheckResult[]> {
     const {git} = config.connectors;
     if (!git.enabled) {
         return [pass('Git providers', 'Git connector disabled — skipped')];
     }
 
-    const usingProvidersArray = Array.isArray(git.providers) && git.providers.length > 0;
-    if (!usingProvidersArray) {
-        // Legacy GitHub shorthand (git.org + git.api_token). Give targeted hints.
-        const token = git.api_token ?? process.env.GITHUB_TOKEN ?? '';
-        const org = git.org ?? '';
-        if (!org && !token) {
-            return [
-                fail(
-                    'Git providers',
-                    'No git providers configured',
-                    'Add connectors.git.providers[] (bitbucket/gitlab/github), or set git.org + git.api_token for the GitHub shorthand.',
-                ),
-            ];
-        }
-        if (!token) {
-            return [
-                fail(
-                    'Git providers',
-                    'GitHub shorthand configured but no API token',
-                    'Set connectors.git.api_token in config or export GITHUB_TOKEN=<token>.',
-                ),
-            ];
-        }
-        if (!org) {
-            return [
-                fail(
-                    'Git providers',
-                    'GitHub shorthand configured but no org',
-                    'Set connectors.git.org to your GitHub org login.',
-                ),
-            ];
-        }
-    }
-
-    const providerConfigs = resolveGitProviderConfigs(git);
+    // DB-connected providers ∪ config-file providers (DB wins on overlap) — the
+    // same seam the sync pipeline uses, so doctor validates UI-connected
+    // providers for free.
+    const providerConfigs = resolveAllGitProviders(db, loadServerKey(), git);
     if (providerConfigs.length === 0) {
-        return [
-            fail(
-                'Git providers',
-                'No valid git providers configured',
-                'Each connectors.git.providers[] entry needs a "type" of github, bitbucket, or gitlab.',
-            ),
-        ];
+        return [noGitProvidersDiagnostic(git)];
     }
 
     const results: CheckResult[] = [];
@@ -636,7 +647,7 @@ export async function runDoctor(
     checks.push(await checkAnthropicKey(config));
     checks.push(await checkWindsurfKey(config));
     checks.push(await checkCursorKey(config));
-    checks.push(...(await checkGitProviders(config)));
+    checks.push(...(await checkGitProviders(db, config)));
     checks.push(await checkSummaryModel(config));
 
     let allPassed = true;

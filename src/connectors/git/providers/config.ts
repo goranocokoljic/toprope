@@ -29,3 +29,18 @@ export function resolveGitProviderConfigs(config: GitConnectorConfig): GitProvid
         },
     ];
 }
+
+// The container identifier for a provider — org (GitHub), workspace (Bitbucket),
+// group (GitLab). The canonical extraction reused wherever a raw container value
+// is needed (sync state keys, the resolver's (type, container) de-dupe key) so
+// the mapping lives in exactly one place.
+export function providerContainer(config: GitProviderConfig): string {
+    switch (config.type) {
+        case 'github':
+            return config.org;
+        case 'bitbucket':
+            return config.workspace;
+        case 'gitlab':
+            return config.group;
+    }
+}
