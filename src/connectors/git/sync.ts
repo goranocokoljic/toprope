@@ -4,7 +4,9 @@ import {aggregateDailyMetrics} from './analyzer.js';
 import {toAnalysisCommit, toAnalysisPR, toAnalysisReviewComment} from './analysis-types.js';
 import type {AnalysisCommit, AnalysisPR, AnalysisReviewComment} from './analysis-types.js';
 import {createGitProvider} from './providers/factory.js';
-import {resolveGitProviderConfigs} from './providers/config.js';
+import {providerContainer} from './providers/config.js';
+import {resolveAllGitProviders} from './providers/resolve.js';
+import {loadServerKey} from './providers/secret.js';
 import type {GitProviderConfig, GitProviderType, GitCommit, GitFileDiff, GitPR} from './providers/types.js';
 import type {ConnectorInterface, SyncResult} from '../types.js';
 import type {GitConnectorConfig} from '../../config/types.js';
@@ -196,13 +198,9 @@ function upsertSnapshot(db: Database.Database, snap: GitSnapshotRow): 'written' 
     return result.changes > 0 ? 'written' : 'skipped';
 }
 
-function providerIdentifier(config: GitProviderConfig): string {
-    switch (config.type) {
-        case 'github': return config.org;
-        case 'bitbucket': return config.workspace;
-        case 'gitlab': return config.group;
-    }
-}
+// Raw container identifier (org/workspace/group) for a provider — the canonical
+// helper, shared with the resolver so the mapping lives in one place.
+const providerIdentifier = providerContainer;
 
 function applyRepoFilter(
     repos: string[],
@@ -557,7 +555,7 @@ export class GitSync implements ConnectorInterface {
     }
 
     getLastSyncTime(db: Database.Database): string | null {
-        const providers = this.getProviderConfigs();
+        const providers = this.getProviderConfigs(db);
         let latest: string | null = null;
         for (const pc of providers) {
             const key = syncStateKey(pc.type, providerIdentifier(pc));
@@ -577,7 +575,7 @@ export class GitSync implements ConnectorInterface {
         const now = new Date().toISOString();
         const allUnmatched = new Set<string>();
 
-        const providerConfigs = this.getProviderConfigs().filter(
+        const providerConfigs = this.getProviderConfigs(db).filter(
             (pc) => !providerFilter || pc.type === providerFilter,
         );
 
@@ -706,7 +704,11 @@ export class GitSync implements ConnectorInterface {
         return {connector: CONNECTOR_NAME, snapshotsWritten, snapshotsSkipped, errors, lastSyncTime: now};
     }
 
-    private getProviderConfigs(): GitProviderConfig[] {
-        return resolveGitProviderConfigs(this.config);
+    // Resolve the providers this sync run should cover: DB-connected providers
+    // (via the store) merged with config-file providers, DB winning on overlap.
+    // Loads the server key here (fail-closed) so a UI-connected provider's token
+    // can be decrypted; a config-only setup with no key is unaffected.
+    private getProviderConfigs(db: Database.Database): GitProviderConfig[] {
+        return resolveAllGitProviders(db, loadServerKey(), this.config);
     }
 }

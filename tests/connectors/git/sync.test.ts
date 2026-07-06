@@ -5,12 +5,20 @@ import {runMigrations} from '../../../src/storage/migrator';
 import {addTeam} from '../../../src/registry/teams';
 import {addDeveloper} from '../../../src/registry/developers';
 import {GitSync} from '../../../src/connectors/git/sync';
+import {createProvider} from '../../../src/connectors/git/providers/store';
+import {loadServerKey} from '../../../src/connectors/git/providers/secret';
 import type {GitConnectorConfig} from '../../../src/config/types';
-import type {GitProvider, GitRepo, GitCommit, GitPR, GitReviewComment, GitFileDiff} from '../../../src/connectors/git/providers/types';
+import type {GitProvider, GitProviderConfig, GitRepo, GitCommit, GitPR, GitReviewComment, GitFileDiff} from '../../../src/connectors/git/providers/types';
 
-vi.mock('../../../src/connectors/git/providers/factory', () => ({
-    createGitProvider: vi.fn(),
-}));
+// Stub createGitProvider (so no network) but keep validateGitProviderConfig real,
+// so the store/codec that seed DB providers in the integration tests below work.
+vi.mock('../../../src/connectors/git/providers/factory', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('../../../src/connectors/git/providers/factory')>();
+    return {...actual, createGitProvider: vi.fn()};
+});
+
+// A valid base64-encoded 32-byte key so loadServerKey() succeeds for DB providers.
+const TEST_SECRET_KEY = Buffer.alloc(32, 9).toString('base64');
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../../src/storage/migrations');
 
@@ -847,5 +855,92 @@ describe('GitSync', () => {
 
             expect(getPRRecords()).toHaveLength(0);
         });
+    });
+});
+
+describe('GitSync with DB-connected providers (#196)', () => {
+    let db: Database.Database;
+    const savedKey = process.env.TOPROPE_SECRET_KEY;
+
+    beforeEach(() => {
+        db = makeDb();
+        vi.resetAllMocks();
+        process.env.TOPROPE_SECRET_KEY = TEST_SECRET_KEY;
+    });
+
+    afterEach(() => {
+        db.close();
+        vi.restoreAllMocks();
+        if (savedKey === undefined) delete process.env.TOPROPE_SECRET_KEY;
+        else process.env.TOPROPE_SECRET_KEY = savedKey;
+    });
+
+    function seedDbProvider(org: string, token: string, enabled = true): void {
+        createProvider(db, loadServerKey(), {
+            config: {type: 'github', org, auth: {type: 'token', api_token: token}} as GitProviderConfig,
+            enabled,
+        });
+    }
+
+    it('picks up an enabled DB provider and writes snapshots (no config providers)', async () => {
+        const devLogin = 'alice';
+        seedDev(db, devLogin);
+        seedDbProvider('db-org', 'db-token-1234');
+
+        const createGitProvider = await getCreateGitProvider();
+        const provider = makeMockProvider({
+            listRepos: vi.fn().mockResolvedValue([makeRepo('myrepo')]),
+            getCommits: vi.fn().mockResolvedValue([makeProviderCommit(devLogin)]),
+            getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+        });
+        createGitProvider.mockReturnValue(provider);
+
+        // No config providers — the only provider comes from the DB.
+        const result = await new GitSync({enabled: true}).sync(db);
+
+        // The decrypted DB provider config reached the factory...
+        expect(createGitProvider).toHaveBeenCalledWith(
+            expect.objectContaining({
+                type: 'github',
+                org: 'db-org',
+                auth: {type: 'token', api_token: 'db-token-1234'},
+            }),
+        );
+        // ...and produced snapshots.
+        expect(result.errors.filter((e) => !e.includes('Unmatched'))).toHaveLength(0);
+        expect(result.snapshotsWritten).toBeGreaterThan(0);
+        expect(countSnapshots(db)).toBeGreaterThan(0);
+    });
+
+    it('excludes a disabled DB provider from the sync run', async () => {
+        seedDbProvider('db-org', 'db-token', false);
+
+        const createGitProvider = await getCreateGitProvider();
+        createGitProvider.mockReturnValue(makeMockProvider());
+
+        // Disabled DB provider + no config providers → nothing to sync.
+        const result = await new GitSync({enabled: true}).sync(db);
+
+        expect(createGitProvider).not.toHaveBeenCalled();
+        expect(result.errors[0]).toMatch(/No git providers configured/);
+        expect(countSnapshots(db)).toBe(0);
+    });
+
+    it('runs both a DB provider and a differently-scoped config provider', async () => {
+        seedDev(db, 'alice');
+        seedDbProvider('db-org', 'db-token');
+
+        const createGitProvider = await getCreateGitProvider();
+        createGitProvider.mockReturnValue(makeMockProvider({listRepos: vi.fn().mockResolvedValue([])}));
+
+        // Config provider on a different container → both resolve and run.
+        const config: GitConnectorConfig = {
+            enabled: true,
+            providers: [{type: 'github', org: 'cfg-org', auth: {type: 'token', api_token: 'cfg-token'}}],
+        };
+        await new GitSync(config).sync(db);
+
+        const orgs = createGitProvider.mock.calls.map((c) => (c[0] as {org: string}).org).sort();
+        expect(orgs).toEqual(['cfg-org', 'db-org']);
     });
 });
