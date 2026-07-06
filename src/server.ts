@@ -38,6 +38,7 @@ import {registerImprovementReviewRoutes} from './dashboard/api/improvement-revie
 import {registerShowcaseRoutes} from './dashboard/api/showcase';
 import {registerShowcaseAdminRoutes} from './dashboard/api/showcase-admin';
 import {registerShowcaseBrowseRoutes} from './dashboard/api/showcase-browse';
+import {registerShowcaseAuthoringRoutes} from './dashboard/api/showcase-authoring';
 import {registerPracticeAuthoringRoutes} from './dashboard/api/practices';
 import {registerPracticeSurfaceRoutes} from './dashboard/api/practices-surface';
 import {registerPracticeBrowseRoutes} from './dashboard/api/practices-browse';
@@ -189,6 +190,16 @@ export function buildServerWithDb(config: Partial<TopropeConfig>): FastifyInstan
     // publish path, so the Phase 5 rule carries: a lead removes, but never publishes
     // for a developer.
     registerShowcaseBrowseRoutes(app, db);
+
+    // Showcase authoring/publish for the Epic 6.3 unit model (#189, epic #150 follow-up):
+    // /api/me, developer-owned — the production HTTP edge of the self-publish pipeline that
+    // previously lived only in the service layer. draft → annotate → scrub → (review-panel /
+    // redact) → submit → approve → confirm-review → publish. Every :id action is owner-scoped
+    // (a non-owner sees a uniform 404), and publish goes through the canonical publishShowcase
+    // so the mandatory curators'-note + manual-review gates and the developer-consent state
+    // gate always run — this surface adds no bypass. Distinct from the Phase 5 showcase routes
+    // (registerShowcaseRoutes), which operate on the separate showcase_examples store.
+    registerShowcaseAuthoringRoutes(app, db);
 
     // Best-practice rich authoring editor (Task 6.2.3): /api/me, developer-owned —
     // markdown + code blocks + embedded {{metric}} references rendered to a safe

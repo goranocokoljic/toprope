@@ -69,6 +69,50 @@ export function rejectUnknownKeys(
     return true;
 }
 
+/**
+ * A MANDATORY, non-blank, bounded string field: its trimmed value, or 400 (returns
+ * null). Trims because these feed titles/notes where surrounding whitespace is noise.
+ * Companion to {@link optionalString}, colocated here so an /api/me route reaching for
+ * "required bounded string" finds one home rather than hand-rolling a copy.
+ */
+export function requireString(value: unknown, field: string, maxLen: number, reply: FastifyReply): string | null {
+    if (typeof value !== 'string' || value.trim().length === 0) {
+        badRequest(reply, `${field} is required`);
+        return null;
+    }
+    const trimmed = value.trim();
+    if (trimmed.length > maxLen) {
+        badRequest(reply, `${field} exceeds the ${maxLen}-character limit`);
+        return null;
+    }
+    return trimmed;
+}
+
+/**
+ * An OPTIONAL bounded string field: absent/null/blank → null; a non-empty string
+ * within `maxLen` → its trimmed value; anything else → 400 (returns false). The single
+ * home for this shape, shared by every /api/me authoring route (practices, the Phase 5
+ * showcase publish form, and the 6.3 showcase authoring surface) so they can't drift.
+ */
+export function optionalString(value: unknown, field: string, maxLen: number, reply: FastifyReply): string | null | false {
+    if (value === undefined || value === null) {
+        return null;
+    }
+    if (typeof value !== 'string') {
+        badRequest(reply, `${field} must be a string`);
+        return false;
+    }
+    const trimmed = value.trim();
+    if (trimmed.length === 0) {
+        return null;
+    }
+    if (trimmed.length > maxLen) {
+        badRequest(reply, `${field} exceeds the ${maxLen}-character limit`);
+        return false;
+    }
+    return trimmed;
+}
+
 /** Read an optional querystring filter: a non-empty trimmed string, or undefined when absent/blank. */
 export function optionalQueryString(value: unknown): string | undefined {
     if (typeof value !== 'string') {
