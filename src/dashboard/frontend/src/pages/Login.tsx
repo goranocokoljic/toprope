@@ -2,6 +2,7 @@ import {useState, type FormEvent} from 'react';
 import {Navigate, useNavigate} from 'react-router-dom';
 import {useAuth} from '../auth/useAuth';
 import {ApiError} from '../api/client';
+import {Logo} from '../components/Logo';
 
 export function Login(): JSX.Element {
     const {user, loading, login} = useAuth();
@@ -44,8 +45,8 @@ export function Login(): JSX.Element {
                 className="w-full max-w-sm space-y-5 rounded-card border border-border bg-surface p-8 shadow-card"
             >
                 <div>
-                    <h1 className="font-display text-2xl font-semibold text-foreground">Toprope</h1>
-                    <p className="mt-1 text-sm text-muted">Sign in to your account</p>
+                    <Logo className="h-9" />
+                    <p className="mt-3 text-sm text-muted">Sign in to your account</p>
                 </div>
 
                 {error ? (
@@ -81,7 +82,7 @@ export function Login(): JSX.Element {
                 <button
                     type="submit"
                     disabled={submitting}
-                    className="w-full rounded-md bg-accent px-4 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-60"
+                    className="w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-60"
                 >
                     {submitting ? 'Signing in…' : 'Sign in'}
                 </button>

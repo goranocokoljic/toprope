@@ -194,7 +194,7 @@ function EditorForm(props: EditorFormProps): JSX.Element {
                         <button
                             type="submit"
                             disabled={!canSubmit || create.isPending || save.isPending}
-                            className="rounded-md bg-accent px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-accent/90 disabled:opacity-60"
+                            className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-primary/90 disabled:opacity-60"
                         >
                             {isEdit ? 'Save changes' : 'Save draft'}
                         </button>

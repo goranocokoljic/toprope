@@ -154,7 +154,7 @@ function ResolveControl({alert}: {alert: WasteAlert}): JSX.Element {
                 type="button"
                 onClick={() => resolve.mutate({id: alert.id, reason})}
                 disabled={resolve.isPending}
-                className="rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-white disabled:opacity-60"
+                className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-primary/90 disabled:opacity-60"
             >
                 {resolve.isPending ? 'Saving…' : 'Confirm'}
             </button>

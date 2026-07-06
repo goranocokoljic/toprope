@@ -360,7 +360,7 @@ function GlobalPanel(): JSX.Element {
                         type="button"
                         onClick={onSave}
                         disabled={update.isPending}
-                        className="rounded-md bg-accent px-4 py-2 text-sm font-medium text-white disabled:opacity-60"
+                        className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-primary/90 disabled:opacity-60"
                     >
                         {update.isPending ? 'Saving…' : 'Save global settings'}
                     </button>
@@ -463,7 +463,7 @@ function TeamPanel(): JSX.Element {
                                 type="button"
                                 onClick={onSave}
                                 disabled={update.isPending}
-                                className="rounded-md bg-accent px-4 py-2 text-sm font-medium text-white disabled:opacity-60"
+                                className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-primary/90 disabled:opacity-60"
                             >
                                 {update.isPending ? 'Saving…' : 'Save team overrides'}
                             </button>
@@ -610,7 +610,7 @@ function AnomalyDetectionPanel(): JSX.Element {
                         type="button"
                         onClick={onSave}
                         disabled={update.isPending}
-                        className="rounded-md bg-accent px-4 py-2 text-sm font-medium text-white disabled:opacity-60"
+                        className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-primary/90 disabled:opacity-60"
                     >
                         {update.isPending ? 'Saving…' : 'Save anomaly config'}
                     </button>
