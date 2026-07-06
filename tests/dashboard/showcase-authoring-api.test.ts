@@ -310,6 +310,7 @@ describe('Showcase authoring/publish API (#189)', () => {
             payload: {visibility_scope: 'team'},
         });
         expect(mismatch.statusCode).toBe(400);
+        expect(mismatch.json().message).toMatch(/must match this showcase's scope/);
         // The consent was not recorded, so publish is still gate-blocked.
         const publish = await app.inject({method: 'POST', url: `/api/me/showcase-units/${d.id}/publish`, headers: auth(aliceToken)});
         expect(publish.statusCode).toBe(409);

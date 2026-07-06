@@ -72,7 +72,8 @@ export function rejectUnknownKeys(
 /**
  * A MANDATORY, non-blank, bounded string field: its trimmed value, or 400 (returns
  * null). Trims because these feed titles/notes where surrounding whitespace is noise.
- * The one home for "required bounded string" shared by the /api/me authoring routes.
+ * Companion to {@link optionalString}, colocated here so an /api/me route reaching for
+ * "required bounded string" finds one home rather than hand-rolling a copy.
  */
 export function requireString(value: unknown, field: string, maxLen: number, reply: FastifyReply): string | null {
     if (typeof value !== 'string' || value.trim().length === 0) {

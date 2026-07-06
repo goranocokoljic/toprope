@@ -103,7 +103,6 @@ function ensureCaptureEnabled(db: Database.Database, userId: string, team: strin
     return true;
 }
 
-
 export function registerShowcaseRoutes(app: FastifyInstance, db: Database.Database): void {
     /**
      * Promote: transiently decrypt one of the developer's OWN retrospectives'
