@@ -420,6 +420,17 @@ export function resolveScrubFlag(db: Database.Database, id: string): boolean {
     return res.changes > 0;
 }
 
+/**
+ * Remove ALL scrub flags for a contribution. Used to make a re-scan idempotent: the
+ * auto-flag scanner (6.3.5) appends a fresh row per finding with no dedup, so re-running
+ * it would pile up duplicates and double-count the review panel. Clearing first means a
+ * re-scan reflects the CURRENT content exactly once. Returns the number of rows removed.
+ */
+export function deleteScrubFlags(db: Database.Database, contributionId: string): number {
+    const res = db.prepare('DELETE FROM scrub_flags WHERE contribution_id = ?').run(contributionId);
+    return res.changes;
+}
+
 // --- Showcase <-> best-practice cross-links ---------------------------------
 
 /**

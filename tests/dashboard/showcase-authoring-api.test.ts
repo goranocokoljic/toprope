@@ -297,6 +297,56 @@ describe('Showcase authoring/publish API (#189)', () => {
         expect(res.statusCode).toBe(400);
     });
 
+    it('rejects an approve whose visibility_scope disagrees with the draft scope (SO-1 consent binding)', async () => {
+        // Draft org, then try to consent to 'team' — the browse surface publishes at the
+        // draft scope (org), so consenting to a narrower reach would publish broader than
+        // agreed. The route must reject the mismatch, and nothing may reach `published`.
+        const d = await draft(aliceToken, {scope: 'org'});
+        await app.inject({method: 'POST', url: `/api/me/showcase-units/${d.id}/submit`, headers: auth(aliceToken)});
+        const mismatch = await app.inject({
+            method: 'POST',
+            url: `/api/me/showcase-units/${d.id}/approve`,
+            headers: auth(aliceToken),
+            payload: {visibility_scope: 'team'},
+        });
+        expect(mismatch.statusCode).toBe(400);
+        // The consent was not recorded, so publish is still gate-blocked.
+        const publish = await app.inject({method: 'POST', url: `/api/me/showcase-units/${d.id}/publish`, headers: auth(aliceToken)});
+        expect(publish.statusCode).toBe(409);
+        expect(getContribution(db, d.id)?.state).toBe('submitted');
+    });
+
+    it('a redaction AFTER review confirmation re-blocks publish until re-review (TST-1)', async () => {
+        // submit → approve → confirm-review → redact (content changed) → publish must be
+        // refused: the confirmation attested to content that no longer ships.
+        const d = await draft(aliceToken);
+        const id = d.id;
+        await app.inject({method: 'POST', url: `/api/me/showcase-units/${id}/submit`, headers: auth(aliceToken)});
+        await app.inject({
+            method: 'POST',
+            url: `/api/me/showcase-units/${id}/approve`,
+            headers: auth(aliceToken),
+            payload: {visibility_scope: 'org'},
+        });
+        await app.inject({method: 'POST', url: `/api/me/showcase-units/${id}/confirm-review`, headers: auth(aliceToken)});
+        // Redact after confirming — invalidates the `reviewed` event.
+        const redact = await app.inject({
+            method: 'POST',
+            url: `/api/me/showcase-units/${id}/redact`,
+            headers: auth(aliceToken),
+            payload: {redacted_conversation: '[{"id":"t0","role":"user","text":"cleaned"}]'},
+        });
+        expect(redact.statusCode).toBe(200);
+        const publish = await app.inject({method: 'POST', url: `/api/me/showcase-units/${id}/publish`, headers: auth(aliceToken)});
+        expect(publish.statusCode).toBe(409);
+        expect(publish.json().code).toBe('review_not_confirmed');
+        // Re-confirming the review after the redaction lets publish through.
+        await app.inject({method: 'POST', url: `/api/me/showcase-units/${id}/confirm-review`, headers: auth(aliceToken)});
+        const publish2 = await app.inject({method: 'POST', url: `/api/me/showcase-units/${id}/publish`, headers: auth(aliceToken)});
+        expect(publish2.statusCode).toBe(200);
+        expect(publish2.json().data.state).toBe('published');
+    });
+
     // --- annotations -----------------------------------------------------------
 
     it('rejects an annotation whose turn_ref anchors to no real turn (400)', async () => {
@@ -374,6 +424,37 @@ describe('Showcase authoring/publish API (#189)', () => {
         expect(redact.json().data.resolvedFlagIds).toEqual([secret!.id]);
         // The live unit now carries the redacted conversation.
         expect(getShowcaseUnit(db, id)?.conversation).toContain('[REDACTED]');
+    });
+
+    it('re-scrubbing is idempotent — flags do not accumulate duplicates (SO-2)', async () => {
+        const secretConvo = '[{"id":"t0","role":"user","text":"key is AKIAIOSFODNN7EXAMPLE and email a@b.com"}]';
+        const d = await draft(aliceToken, {conversation: secretConvo});
+        const first = await app.inject({method: 'POST', url: `/api/me/showcase-units/${d.id}/scrub`, headers: auth(aliceToken)});
+        const firstCount = (first.json().data.flags as unknown[]).length;
+        expect(firstCount).toBeGreaterThan(0);
+        const second = await app.inject({method: 'POST', url: `/api/me/showcase-units/${d.id}/scrub`, headers: auth(aliceToken)});
+        expect((second.json().data.flags as unknown[]).length).toBe(firstCount);
+        // The table holds exactly one scan's worth of flags, not two.
+        const total = db.prepare('SELECT COUNT(*) AS n FROM scrub_flags WHERE contribution_id = ?').get(d.id) as {n: number};
+        expect(total.n).toBe(firstCount);
+    });
+
+    it('scrubbing a published showcase is refused (409, pre-publish only) (SO-2)', async () => {
+        const id = await publishFullPipeline();
+        const res = await app.inject({method: 'POST', url: `/api/me/showcase-units/${id}/scrub`, headers: auth(aliceToken)});
+        expect(res.statusCode).toBe(409);
+        expect(res.json().code).toBe('not_pre_publish');
+    });
+
+    it('rejects an over-long annotation body (400)', async () => {
+        const d = await draft(aliceToken);
+        const res = await app.inject({
+            method: 'POST',
+            url: `/api/me/showcase-units/${d.id}/annotations`,
+            headers: auth(aliceToken),
+            payload: {turn_ref: 't0', body: 'x'.repeat(5001)},
+        });
+        expect(res.statusCode).toBe(400);
     });
 
     it('a redact with a non-array resolved_flag_ids is a 400', async () => {

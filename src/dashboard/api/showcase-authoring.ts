@@ -32,7 +32,7 @@
 import type {FastifyInstance, FastifyReply} from 'fastify';
 import type Database from 'better-sqlite3';
 import {requireDeveloperId} from './guards';
-import {asObject, badRequest, rejectUnknownKeys} from './body-validation';
+import {asObject, badRequest, optionalString, rejectUnknownKeys, requireString} from './body-validation';
 import {getDeveloperById} from '../../registry/developers';
 import {getContribution} from '../../contributions/store';
 import {ContributionStateError, type ContributionStateErrorCode} from '../../contributions/stateMachine';
@@ -59,7 +59,7 @@ import {
     type ShowcasePublishErrorCode,
 } from '../../showcase/publishPaths';
 import {scrubContribution} from '../../showcase/scrubDetector';
-import {getShowcaseUnit} from '../../showcase/unitsStore';
+import {deleteScrubFlags, getShowcaseUnit} from '../../showcase/unitsStore';
 import {isValidOutcomeLink, isVisibilityScope, SHOWCASE_CONTENT_TYPE} from '../../showcase/unitsTypes';
 
 const MAX_TITLE_LEN = 200;
@@ -163,46 +163,6 @@ function loadOwnedShowcase(db: Database.Database, developerId: string, id: strin
 /** Send the uniform owner-scoped 404 and return the reply. */
 function notOwned(reply: FastifyReply): FastifyReply {
     return reply.status(404).send({error: 'Not Found', message: 'Showcase not found'});
-}
-
-/**
- * A mandatory, non-blank, bounded string field: its trimmed value, or 400 (returns
- * null). Trims because these feed titles/notes where surrounding whitespace is noise.
- */
-function requireString(value: unknown, field: string, maxLen: number, reply: FastifyReply): string | null {
-    if (typeof value !== 'string' || value.trim().length === 0) {
-        badRequest(reply, `${field} is required`);
-        return null;
-    }
-    const trimmed = value.trim();
-    if (trimmed.length > maxLen) {
-        badRequest(reply, `${field} exceeds the ${maxLen}-character limit`);
-        return null;
-    }
-    return trimmed;
-}
-
-/**
- * An optional, bounded, trimmed string field: absent/null/blank → null; a non-blank
- * string within `maxLen` → its trimmed value; anything else → 400 (returns false).
- */
-function optionalString(value: unknown, field: string, maxLen: number, reply: FastifyReply): string | null | false {
-    if (value === undefined || value === null) {
-        return null;
-    }
-    if (typeof value !== 'string') {
-        badRequest(reply, `${field} must be a string`);
-        return false;
-    }
-    const trimmed = value.trim();
-    if (trimmed.length === 0) {
-        return null;
-    }
-    if (trimmed.length > maxLen) {
-        badRequest(reply, `${field} exceeds the ${maxLen}-character limit`);
-        return false;
-    }
-    return trimmed;
 }
 
 export function registerShowcaseAuthoringRoutes(app: FastifyInstance, db: Database.Database): void {
@@ -340,15 +300,30 @@ export function registerShowcaseAuthoringRoutes(app: FastifyInstance, db: Databa
      * Run the two-tier auto-flag scrubber over the showcase's CURRENT conversation and
      * persist each finding as a scrub flag for the manual review. Body: none. Owner-
      * scoped. FLAG-ONLY: it never edits the conversation; the mandatory manual review is
-     * the real control. Returns the stored flags (both tiers, deterministic order).
+     * the real control.
+     *
+     * IDEMPOTENT + pre-publish only: the scanner appends a fresh row per finding with no
+     * dedup, so this clears THIS contribution's prior auto-flags before re-scanning — a
+     * re-scrub reflects the current content exactly once rather than piling up duplicates
+     * that would double-count the review panel. It is also bounded to a pre-publish state
+     * (draft/submitted): scrubbing a published/removed showcase is a no-op the flow never
+     * needs, refused with 409. Returns the stored flags (both tiers, deterministic order).
      */
     app.post<{Params: {id: string}}>('/api/me/showcase-units/:id/scrub', async (request, reply) => {
         const developerId = requireDeveloperId(request, reply);
         if (!developerId) {
             return reply;
         }
-        if (!loadOwnedShowcase(db, developerId, request.params.id)) {
+        const contribution = loadOwnedShowcase(db, developerId, request.params.id);
+        if (!contribution) {
             return notOwned(reply);
+        }
+        if (contribution.state !== 'draft' && contribution.state !== 'submitted') {
+            return reply.status(409).send({
+                error: 'Conflict',
+                code: 'not_pre_publish',
+                message: `Cannot scrub a showcase in state '${contribution.state}'; it must be draft or submitted.`,
+            });
         }
         const unit = getShowcaseUnit(db, request.params.id);
         if (!unit) {
@@ -356,7 +331,11 @@ export function registerShowcaseAuthoringRoutes(app: FastifyInstance, db: Databa
             // corruption; surface it as the same uniform not-found rather than a 500.
             return notOwned(reply);
         }
-        const flags = scrubContribution(db, request.params.id, unit.conversation);
+        // Clear prior auto-flags then re-scan, atomically, so a re-scrub is idempotent.
+        const flags = db.transaction(() => {
+            deleteScrubFlags(db, request.params.id);
+            return scrubContribution(db, request.params.id, unit.conversation);
+        })();
         return {data: {flags}};
     });
 
@@ -471,7 +450,8 @@ export function registerShowcaseAuthoringRoutes(app: FastifyInstance, db: Databa
         if (!developerId) {
             return reply;
         }
-        if (!loadOwnedShowcase(db, developerId, request.params.id)) {
+        const contribution = loadOwnedShowcase(db, developerId, request.params.id);
+        if (!contribution) {
             return notOwned(reply);
         }
         const obj = asObject(request.body);
@@ -484,6 +464,20 @@ export function registerShowcaseAuthoringRoutes(app: FastifyInstance, db: Databa
         }
         if (!isVisibilityScope(obj.visibility_scope)) {
             badRequest(reply, 'visibility_scope must be one of: team, org');
+            return reply;
+        }
+        // Bind the consented reach to the reach that ACTUALLY governs publication. The
+        // browse surface resolves visibility from the contribution's draft-time scope,
+        // not from showcase_consent.visibility_scope; if the two disagree, the developer
+        // could consent to `team` yet publish `org`-wide (broader than they agreed to).
+        // So the recorded consent MUST match the effective publish scope — reject the
+        // mismatch rather than persist a misleading, non-binding consent (#189 SO-1).
+        if (obj.visibility_scope !== contribution.scope) {
+            badRequest(
+                reply,
+                `visibility_scope '${obj.visibility_scope}' must match this showcase's scope '${contribution.scope}'; ` +
+                    'change the scope when drafting to publish at a different reach.',
+            );
             return reply;
         }
         const note = optionalString(obj.note, 'note', MAX_NOTE_LEN, reply);

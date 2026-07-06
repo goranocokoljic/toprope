@@ -47,7 +47,7 @@ import {
     unpublishOwnExample,
 } from '../../showcase/store';
 import {isShowcaseScope, type ShowcaseScope} from '../../showcase/types';
-import {asObject, badRequest, decodeCaptureKey, rejectUnknownKeys} from './body-validation';
+import {asObject, badRequest, decodeCaptureKey, optionalString, rejectUnknownKeys} from './body-validation';
 import {parseShowcaseFilters, type ShowcaseFilterQuery} from './showcase-filters';
 
 // Allowlist exactly the fields each route accepts. The draft body legitimately
@@ -103,29 +103,6 @@ function ensureCaptureEnabled(db: Database.Database, userId: string, team: strin
     return true;
 }
 
-/**
- * Validate an OPTIONAL bounded-string field: absent/null → null; a non-empty
- * string within `maxLen` → its trimmed value; anything else → 400. Used for the
- * publish form's optional descriptors (task_type, tool, author_note).
- */
-function optionalString(value: unknown, field: string, maxLen: number, reply: FastifyReply): string | null | false {
-    if (value === undefined || value === null) {
-        return null;
-    }
-    if (typeof value !== 'string') {
-        badRequest(reply, `${field} must be a string`);
-        return false;
-    }
-    const trimmed = value.trim();
-    if (trimmed.length === 0) {
-        return null;
-    }
-    if (trimmed.length > maxLen) {
-        badRequest(reply, `${field} exceeds the ${maxLen}-character limit`);
-        return false;
-    }
-    return trimmed;
-}
 
 export function registerShowcaseRoutes(app: FastifyInstance, db: Database.Database): void {
     /**

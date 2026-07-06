@@ -5,6 +5,7 @@ import {runMigrations} from '../../src/storage/migrator';
 import {
     addAnnotation,
     addScrubFlag,
+    deleteScrubFlags,
     getConsent,
     getShowcaseUnit,
     linkPractice,
@@ -307,6 +308,20 @@ describe('showcase unitsStore (#164)', () => {
 
     it('resolveScrubFlag returns false for an unknown id', () => {
         expect(resolveScrubFlag(db, 'nope')).toBe(false);
+    });
+
+    it('deleteScrubFlags removes only this contribution’s flags and reports the count (#189)', () => {
+        addScrubFlag(db, {contributionId: 'sc1', tier: 'secret_high', finding: 'AWS key'});
+        addScrubFlag(db, {contributionId: 'sc1', tier: 'pii_hint_low', finding: 'email'});
+        seedContribution(db, 'sc2', 'showcase_example');
+        addScrubFlag(db, {contributionId: 'sc2', tier: 'secret_high', finding: 'other'});
+
+        expect(deleteScrubFlags(db, 'sc1')).toBe(2);
+        expect(listScrubFlags(db, 'sc1')).toEqual([]);
+        // A sibling contribution's flags are untouched.
+        expect(listScrubFlags(db, 'sc2')).toHaveLength(1);
+        // Deleting again is a no-op reporting zero rows removed.
+        expect(deleteScrubFlags(db, 'sc1')).toBe(0);
     });
 
     it('rejects an invalid scrub tier at the trust boundary (fail-closed)', () => {

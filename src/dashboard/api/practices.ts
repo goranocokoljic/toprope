@@ -23,7 +23,7 @@
 import type {FastifyInstance, FastifyReply} from 'fastify';
 import type Database from 'better-sqlite3';
 import {requireDeveloperId} from './guards';
-import {asObject, badRequest, rejectUnknownKeys} from './body-validation';
+import {asObject, badRequest, optionalString, rejectUnknownKeys} from './body-validation';
 import {getDeveloperById} from '../../registry/developers';
 import {getContribution, listContributions} from '../../contributions/store';
 import {getVersionHistory, VersioningError, type VersioningErrorCode} from '../../contributions/versioning';
@@ -90,29 +90,6 @@ function loadOwnedPractice(db: Database.Database, developerId: string, id: strin
         return undefined;
     }
     return contribution;
-}
-
-/**
- * Validate an optional bounded string field: absent/null → null; a non-empty string
- * within `maxLen` → its trimmed value; anything else → 400 (returns false).
- */
-function optionalString(value: unknown, field: string, maxLen: number, reply: FastifyReply): string | null | false {
-    if (value === undefined || value === null) {
-        return null;
-    }
-    if (typeof value !== 'string') {
-        badRequest(reply, `${field} must be a string`);
-        return false;
-    }
-    const trimmed = value.trim();
-    if (trimmed.length === 0) {
-        return null;
-    }
-    if (trimmed.length > maxLen) {
-        badRequest(reply, `${field} exceeds the ${maxLen}-character limit`);
-        return false;
-    }
-    return trimmed;
 }
 
 /**
