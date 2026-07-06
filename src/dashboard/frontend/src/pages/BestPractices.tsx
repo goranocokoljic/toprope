@@ -88,7 +88,7 @@ export function BestPractices(): JSX.Element {
                     </label>
                     <button
                         type="submit"
-                        className="rounded-md bg-accent px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-accent/90"
+                        className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-primary/90"
                     >
                         Search
                     </button>

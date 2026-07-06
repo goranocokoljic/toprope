@@ -23,12 +23,16 @@ module.exports = {
                 muted: withAlpha('--color-muted'),
                 accent: withAlpha('--color-accent'),
                 'accent-soft': withAlpha('--color-accent-soft'),
+                primary: withAlpha('--color-primary'),
+                'primary-soft': withAlpha('--color-primary-soft'),
                 success: withAlpha('--color-success'),
                 warning: withAlpha('--color-warning'),
                 danger: withAlpha('--color-danger'),
             },
             fontFamily: {
-                display: ['"Space Grotesk"', 'ui-sans-serif', 'system-ui', 'sans-serif'],
+                // Inter everywhere. `display` is kept as a semantic alias (used by
+                // headings) but now resolves to Inter, so the app uses one family.
+                display: ['Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'],
                 sans: ['Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'],
             },
             borderRadius: {

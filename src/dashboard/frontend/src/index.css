@@ -4,37 +4,44 @@
 
 /*
  * Design tokens — the single source of truth for the palette.
+ * Implements the Toprope Color System (dev-docs/COLOR_SYSTEM.md): a warm-tinted
+ * neutral ramp (ink-*), indigo as the interactive working color (--color-accent),
+ * orange as the single primary CTA (--color-primary), and semantic tiers.
  * Values are RGB channel triplets so Tailwind can apply opacity modifiers
  * (e.g. bg-accent/10). Dark mode swaps the same token names under .dark,
  * which ThemeProvider toggles on <html>.
  */
 @layer base {
     :root {
-        --color-canvas: 248 250 252; /* slate-50 */
-        --color-surface: 255 255 255; /* white */
-        --color-surface-raised: 255 255 255;
-        --color-border: 226 232 240; /* slate-200 */
-        --color-foreground: 15 23 42; /* slate-900 */
-        --color-muted: 100 116 139; /* slate-500 */
-        --color-accent: 79 70 229; /* indigo-600 */
-        --color-accent-soft: 224 231 255; /* indigo-100 */
-        --color-success: 22 163 74; /* green-600 */
-        --color-warning: 217 119 6; /* amber-600 */
-        --color-danger: 220 38 38; /* red-600 */
+        --color-canvas: 247 245 240; /* canvas #F7F5F0 */
+        --color-surface: 255 255 255; /* surface #FFFFFF */
+        --color-surface-raised: 252 250 246; /* ink-0 #FCFAF6 */
+        --color-border: 231 225 214; /* ink-100 #E7E1D6 */
+        --color-foreground: 31 27 22; /* ink-900 #1F1B16 */
+        --color-muted: 93 85 74; /* ink-500 #5D554A */
+        --color-accent: 91 91 214; /* indigo-600 #5B5BD6 — interactive state */
+        --color-accent-soft: 230 230 251; /* indigo-100 #E6E6FB */
+        --color-primary: 240 86 29; /* orange-600 #F0561D — primary CTA / brand */
+        --color-primary-soft: 252 230 220; /* orange-100 #FCE6DC */
+        --color-success: 47 143 91; /* positive #2F8F5B */
+        --color-warning: 201 138 30; /* caution #C98A1E */
+        --color-danger: 214 69 69; /* negative #D64545 */
     }
 
     .dark {
-        --color-canvas: 11 17 32; /* deep slate */
-        --color-surface: 17 24 39; /* gray-900 */
-        --color-surface-raised: 30 41 59; /* slate-800 */
-        --color-border: 30 41 59; /* slate-800 */
-        --color-foreground: 226 232 240; /* slate-200 */
-        --color-muted: 148 163 184; /* slate-400 */
-        --color-accent: 129 140 248; /* indigo-400 */
-        --color-accent-soft: 30 27 75; /* indigo-950 */
-        --color-success: 34 197 94; /* green-500 */
-        --color-warning: 245 158 11; /* amber-500 */
-        --color-danger: 248 113 113; /* red-400 */
+        --color-canvas: 16 15 14; /* surface-dark #100F0E */
+        --color-surface: 31 27 22; /* ink-900 #1F1B16 */
+        --color-surface-raised: 42 37 30; /* warm raised #2A251E */
+        --color-border: 59 53 45; /* ink-700 #3B352D */
+        --color-foreground: 243 239 231; /* ink-50 #F3EFE7 */
+        --color-muted: 176 167 151; /* ink-300 #B0A797 */
+        --color-accent: 138 138 230; /* indigo, lightened for dark #8A8AE6 */
+        --color-accent-soft: 44 44 87; /* deep indigo #2C2C57 */
+        --color-primary: 255 106 44; /* orange-500 #FF6A2C — brand on dark */
+        --color-primary-soft: 58 36 26; /* deep orange tint #3A241A */
+        --color-success: 79 179 125; /* positive, lightened #4FB37D */
+        --color-warning: 224 169 74; /* caution, lightened #E0A94A */
+        --color-danger: 232 107 107; /* negative, lightened #E86B6B */
     }
 
     html,
