@@ -56,16 +56,38 @@ function validateGitLab(config: GitLabProviderConfig): void {
     }
 }
 
-export function createGitProvider(config: GitProviderConfig): GitProvider {
+// Validate a provider config with the per-type rules, fail-closed on an
+// unknown type. This is the single canonical validation seam — `createGitProvider`
+// and any write path (e.g. the git_providers codec, #193) reuse it rather than
+// re-implementing provider validation.
+export function validateGitProviderConfig(config: GitProviderConfig): void {
     switch (config.type) {
         case 'github':
             validateGitHub(config);
-            return new GitHubProvider(config);
+            return;
         case 'bitbucket':
             validateBitbucket(config);
-            return new BitbucketProvider(config);
+            return;
         case 'gitlab':
             validateGitLab(config);
+            return;
+        default: {
+            const exhaustive: never = config;
+            throw new Error(
+                `Unsupported git provider type: "${(exhaustive as {type: string}).type}"`,
+            );
+        }
+    }
+}
+
+export function createGitProvider(config: GitProviderConfig): GitProvider {
+    validateGitProviderConfig(config);
+    switch (config.type) {
+        case 'github':
+            return new GitHubProvider(config);
+        case 'bitbucket':
+            return new BitbucketProvider(config);
+        case 'gitlab':
             return new GitLabProvider(config);
         default: {
             const exhaustive: never = config;
