@@ -199,14 +199,23 @@ export function decryptSecret(ciphertext: Buffer, meta: SecretMeta, serverKey: S
     if (meta.algo !== SECRET_ALGO) {
         throw new SecretCryptoError(`Unsupported secret algorithm: ${meta.algo}`);
     }
-    const iv = Buffer.from(meta.iv, 'base64');
-    const decipher = createDecipheriv('aes-256-gcm', serverKey.key, iv);
-    decipher.setAuthTag(Buffer.from(meta.auth_tag, 'base64'));
     try {
+        // Everything from IV/decipher construction onward runs inside the try: a
+        // corrupted stored `meta` (an IV or auth_tag that base64-decodes to the
+        // wrong length) makes createDecipheriv/setAuthTag throw a raw TypeError,
+        // and callers of this module catch SecretCryptoError — so keep the typed
+        // contract for malformed rows too, not only for GCM auth failures.
+        const iv = Buffer.from(meta.iv, 'base64');
+        // Pin the tag length to the full 128 bits so a truncated stored auth_tag
+        // can't be accepted and verified against a weakened tag.
+        const decipher = createDecipheriv('aes-256-gcm', serverKey.key, iv, {authTagLength: 16});
+        decipher.setAuthTag(Buffer.from(meta.auth_tag, 'base64'));
         return Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8');
     } catch {
-        // GCM auth failure (wrong key / tampered ciphertext / tampered tag) surfaces
-        // as a generic error — re-throw as our typed error so callers can catch it.
+        // Any failure in here — a GCM auth failure (wrong key / tampered ciphertext
+        // / tampered tag) or a malformed stored iv/auth_tag that decodes to the
+        // wrong length — is re-thrown as our typed error so callers can catch it.
+        // (The algo/key preconditions are checked above, outside this try.)
         throw new SecretCryptoError('Secret decryption failed: wrong key or tampered ciphertext');
     }
 }

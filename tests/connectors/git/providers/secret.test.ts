@@ -179,6 +179,23 @@ describe('encryptSecret / decryptSecret — round-trip + integrity (#194)', () =
         expect(() => decryptSecret(ciphertext, tampered, key)).toThrow(SecretCryptoError);
     });
 
+    it('throws the typed error (not a raw TypeError) when the stored auth_tag is a wrong length', () => {
+        const key = keyFrom(VALID_KEY_B64);
+        const {ciphertext, meta} = encryptSecret(TOKEN, key);
+        // A corrupted row whose auth_tag decodes to fewer than 16 bytes must still
+        // surface SecretCryptoError, since createDecipheriv/setAuthTag would
+        // otherwise throw a raw TypeError that callers don't catch.
+        const short: SecretMeta = {...meta, auth_tag: Buffer.from([1, 2, 3]).toString('base64')};
+        expect(() => decryptSecret(ciphertext, short, key)).toThrow(SecretCryptoError);
+    });
+
+    it('throws the typed error when the stored IV is a wrong length', () => {
+        const key = keyFrom(VALID_KEY_B64);
+        const {ciphertext, meta} = encryptSecret(TOKEN, key);
+        const emptyIv: SecretMeta = {...meta, iv: ''};
+        expect(() => decryptSecret(ciphertext, emptyIv, key)).toThrow(SecretCryptoError);
+    });
+
     it('rejects an unsupported algorithm in meta', () => {
         const key = keyFrom(VALID_KEY_B64);
         const {ciphertext, meta} = encryptSecret(TOKEN, key);
