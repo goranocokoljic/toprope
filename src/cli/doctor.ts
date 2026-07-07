@@ -366,7 +366,11 @@ function gitProviderIdentifier(pc: GitProviderConfig): string {
     }
 }
 
-function gitProviderFixHint(type: GitProviderConfig['type'], message?: string): string {
+// Remediation copy for a failed git-provider probe. The SINGLE source of this
+// text: `doctor` uses it for CLI output and the admin test-connection API (#198)
+// reuses it so UI errors match CLI errors verbatim. Keyed off the HTTP status in
+// the provider's thrown message when present, else a per-type setup hint.
+export function gitProviderFixHint(type: GitProviderConfig['type'], message?: string): string {
     const m = message ?? '';
     if (m.includes(' 401') || m.includes('(401)')) {
         return `${type}: credentials invalid or expired — generate a new token/app password with read access.`;
