@@ -182,6 +182,17 @@ providers. A multi-provider setup — e.g. Bitbucket as primary while also analy
 GitHub org — is just two connected providers, whether you add them in the UI, list
 them under `providers:` in YAML, or mix both.
 
+> **Multi-provider caveat — prefer a full sync over per-provider "Sync now".** Git
+> snapshots are keyed by `(developer, day)` with no provider dimension: a developer's
+> same-day activity across providers is merged into one row *within a single sync
+> run*. A **scoped** sync — the dashboard's per-provider **Sync now** button, or
+> `sync git --provider <type>` — fetches only that one provider and rewrites the day's
+> row from just its data, which can drop another provider's already-recorded
+> contribution for that same day until the next full sync re-establishes it. In a
+> multi-provider deployment, prefer a full `sync git` (or the scheduled sync) so
+> every provider's same-day activity is merged in one pass. (Tracked for a
+> merge-on-write fix in the shared sync pipeline.)
+
 ### Adding a provider from the dashboard
 
 **Secret key is required first.** Provider tokens added from the UI are encrypted at

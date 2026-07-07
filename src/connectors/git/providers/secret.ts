@@ -219,12 +219,3 @@ export function decryptSecret(ciphertext: Buffer, meta: SecretMeta, serverKey: S
         throw new SecretCryptoError('Secret decryption failed: wrong key or tampered ciphertext');
     }
 }
-
-/**
- * Generate a fresh AES-256 server key, base64-encoded for {@link SECRET_KEY_ENV}.
- * A setup/reference helper (e.g. for `doctor` or docs) so operators can mint a
- * valid key without hand-rolling `openssl`.
- */
-export function generateServerKeyBase64(): string {
-    return randomBytes(SECRET_KEY_BYTES).toString('base64');
-}
