@@ -365,6 +365,53 @@ export function deleteProvider(db: Database.Database, id: string): boolean {
     return db.prepare('DELETE FROM git_providers WHERE id = ?').run(id).changes > 0;
 }
 
+/** The terminal outcome of a sync run for a provider — mirrors the row's closed
+ *  `last_sync_status` set (never `'never'`; that is the pre-first-sync default). */
+export type SyncOutcomeStatus = 'ok' | 'error';
+
+/** What {@link recordSyncOutcome} persists onto a provider row after a sync run. */
+export interface SyncOutcome {
+    status: SyncOutcomeStatus;
+    /** When the run finished — UTC ISO. */
+    at: string;
+    /** The failure summary on `status: 'error'`; ignored (cleared) on `'ok'`. */
+    error?: string | null;
+}
+
+// Runtime allowlist for the outcome status (review-rule: allowlist at the write
+// boundary, not just the compile-time union) — a value the row CHECK would reject
+// is refused here first, with a clear message rather than a raw SQLITE_CONSTRAINT.
+const SYNC_OUTCOME_STATUSES: readonly SyncOutcomeStatus[] = ['ok', 'error'];
+
+/**
+ * Persist the terminal result of a sync-now run (GC1.7 / #199) onto the provider
+ * row: `last_sync_at`, `last_sync_status`(ok|error), and `last_sync_error`. On
+ * `ok` the error column is cleared; on `error` a non-blank summary is stored (a
+ * failed sync must surface its message to the UI, never a swallowed error — so a
+ * missing/blank message is coerced to a generic non-null sentinel rather than
+ * left NULL, which the UI would read as "clean"). Returns true when the row
+ * existed and was updated. Fail-closed on an unknown status.
+ */
+export function recordSyncOutcome(db: Database.Database, id: string, outcome: SyncOutcome): boolean {
+    if (!SYNC_OUTCOME_STATUSES.includes(outcome.status)) {
+        throw new GitProviderStoreError(
+            'not_found',
+            `Refusing to record unknown sync status: "${String(outcome.status)}"`,
+        );
+    }
+    // On error a non-null message is mandatory (see doc); on ok it is always NULL.
+    const errorText =
+        outcome.status === 'error'
+            ? (outcome.error && outcome.error.trim() !== '' ? outcome.error : 'Sync failed (no error message)')
+            : null;
+    const changes = db
+        .prepare(
+            'UPDATE git_providers SET last_sync_at = ?, last_sync_status = ?, last_sync_error = ? WHERE id = ?',
+        )
+        .run(outcome.at, outcome.status, errorText, id).changes;
+    return changes > 0;
+}
+
 /**
  * The masked, secret-free projection — the ONLY provider shape allowed to leave
  * the server. Drops `token_ciphertext`/`token_meta`, exposes `token_last4` + a

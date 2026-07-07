@@ -10,6 +10,7 @@ import {
     getProvider,
     GitProviderStoreError,
     listProviders,
+    recordSyncOutcome,
     toPublicProvider,
     updateProvider,
     type GitProviderRecord,
@@ -274,5 +275,72 @@ describe('provider store — delete (#195)', () => {
         expect(deleteProvider(db, rec.id)).toBe(true);
         expect(getProvider(db, rec.id)).toBeUndefined();
         expect(deleteProvider(db, rec.id)).toBe(false); // idempotent: already gone
+    });
+});
+
+describe('provider store — recordSyncOutcome (#199)', () => {
+    it('starts NULL/unset and records a successful outcome (at + ok, error cleared)', () => {
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        // A fresh provider has never synced.
+        expect(rec.last_sync_at).toBeNull();
+        expect(rec.last_sync_status).toBeNull();
+        expect(rec.last_sync_error).toBeNull();
+
+        const at = '2026-07-07T10:00:00.000Z';
+        expect(recordSyncOutcome(db, rec.id, {status: 'ok', at})).toBe(true);
+
+        const after = getProvider(db, rec.id);
+        expect(after?.last_sync_at).toBe(at);
+        expect(after?.last_sync_status).toBe('ok');
+        expect(after?.last_sync_error).toBeNull();
+    });
+
+    it('records an error outcome with its message surfaced', () => {
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        const at = '2026-07-07T11:00:00.000Z';
+        recordSyncOutcome(db, rec.id, {status: 'error', at, error: 'GitHub API error 401'});
+
+        const after = getProvider(db, rec.id);
+        expect(after?.last_sync_status).toBe('error');
+        expect(after?.last_sync_error).toBe('GitHub API error 401');
+        expect(after?.last_sync_at).toBe(at);
+    });
+
+    it('clears a prior error message when a later run succeeds', () => {
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        recordSyncOutcome(db, rec.id, {status: 'error', at: '2026-07-07T11:00:00.000Z', error: 'boom'});
+        recordSyncOutcome(db, rec.id, {status: 'ok', at: '2026-07-07T12:00:00.000Z'});
+
+        const after = getProvider(db, rec.id);
+        expect(after?.last_sync_status).toBe('ok');
+        // The stale error text must not linger — the UI would read it as still-failing.
+        expect(after?.last_sync_error).toBeNull();
+    });
+
+    it('coerces a blank/missing error message to a non-null sentinel (never swallowed as clean)', () => {
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        recordSyncOutcome(db, rec.id, {status: 'error', at: '2026-07-07T13:00:00.000Z', error: '   '});
+        const after = getProvider(db, rec.id);
+        // An error with no message must still be a non-null error string, so the
+        // row can never present as a clean (NULL-error) failure.
+        expect(after?.last_sync_status).toBe('error');
+        expect(after?.last_sync_error).not.toBeNull();
+        expect(after?.last_sync_error).toMatch(/no error message/);
+    });
+
+    it('returns false for an unknown id (no row updated)', () => {
+        expect(recordSyncOutcome(db, 'does-not-exist', {status: 'ok', at: '2026-07-07T10:00:00.000Z'})).toBe(false);
+    });
+
+    it('fails closed on an unknown status rather than writing a bad row', () => {
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        expect(() =>
+            recordSyncOutcome(db, rec.id, {
+                status: 'never' as unknown as 'ok',
+                at: '2026-07-07T10:00:00.000Z',
+            }),
+        ).toThrow(GitProviderStoreError);
+        // The row is untouched — no partial write from the rejected status.
+        expect(getProvider(db, rec.id)?.last_sync_status).toBeNull();
     });
 });
