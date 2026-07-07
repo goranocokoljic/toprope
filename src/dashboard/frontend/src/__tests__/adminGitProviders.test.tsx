@@ -9,11 +9,13 @@ import {AdminGitProviders, parseReposList, repoScopeLabel} from '../pages/admin/
 import type {AdminGitProvider} from '../api/types';
 
 /**
- * Tests for Admin → Git providers (GC1.8 / #200). Cover every acceptance
- * criterion: the provider-driven dynamic form (all 3 types + both app_password
- * branches), the single orange Save CTA / indigo interactive states, write-only
- * token behavior (masked + blank-keeps-existing), inline test-connection
- * success/error rendering, and read-only config rows.
+ * Tests for Admin → Git providers (GC1.8 / #200 + GC1.9 / #201). Cover every
+ * acceptance criterion: the provider-driven dynamic form (all 3 types + both
+ * app_password branches), the single orange Save CTA / indigo interactive states,
+ * write-only token behavior (masked + blank-keeps-existing), inline
+ * test-connection success/error rendering, read-only config rows, the per-provider
+ * repo-scope editor (all-vs-select payloads + archived-default), and the
+ * cold-start empty-state onboarding.
  */
 
 const DB_GITHUB: AdminGitProvider = {
@@ -60,7 +62,31 @@ const CONFIG_GITLAB: AdminGitProvider = {
     last_sync_error: null,
 };
 
+/** A DB provider with no repo filter — the "monitor all" starting point (#201). */
+const DB_MONITOR_ALL: AdminGitProvider = {
+    ...DB_GITHUB,
+    id: 'p-all',
+    container: 'mono-org',
+    repos_include: null,
+    repos_exclude: null,
+};
+
+interface RepoRow {
+    name: string;
+    archived: boolean;
+    defaultBranch: string | null;
+}
+
+interface DataSourceGitProvider {
+    provider: string;
+    connected: boolean;
+    developer_count: number;
+    last_sync: string | null;
+}
+
 let providers: AdminGitProvider[];
+let repos: RepoRow[];
+let dataSourceGitProviders: DataSourceGitProvider[];
 let fetchMock: Mock;
 
 function json(body: unknown, status = 200): Response {
@@ -73,12 +99,27 @@ function makeClient(): QueryClient {
 
 beforeEach(() => {
     providers = [structuredClone(DB_GITHUB), structuredClone(CONFIG_GITLAB)];
+    repos = [
+        {name: 'api', archived: false, defaultBranch: 'main'},
+        {name: 'web', archived: false, defaultBranch: 'main'},
+        {name: 'legacy', archived: true, defaultBranch: 'master'},
+    ];
+    // Default: no git snapshots collected yet (drives the empty-state gate).
+    dataSourceGitProviders = [];
 
     fetchMock = vi.fn(async (url: unknown, init?: RequestInit) => {
         const u = String(url);
         const method = (init?.method ?? 'GET').toUpperCase();
         const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
 
+        // Repo listing — GET /:id/repos (checked before the generic list route).
+        if (/\/git\/providers\/[^/]+\/repos$/.test(u) && method === 'GET') {
+            return json({data: repos});
+        }
+        // Data sources — drives the empty-state "no snapshots" signal.
+        if (/\/admin\/data-sources$/.test(u) && method === 'GET') {
+            return json({data: {connectors: [], git_providers: dataSourceGitProviders}});
+        }
         // Draft test — POST /test (no id). Return failure when the container says so.
         if (/\/git\/providers\/test$/.test(u) && method === 'POST') {
             if (String(body.container).includes('bad')) {
@@ -345,5 +386,174 @@ describe('AdminGitProviders — list + row actions', () => {
         await waitFor(() => {
             expect(lastCall(/\/git\/providers\/p-gh\/sync$/, 'POST')).toBeTruthy();
         });
+    });
+});
+
+describe('AdminGitProviders — repo-scope editor (#201)', () => {
+    it('defaults archived repos unchecked and writes only the non-archived selection', async () => {
+        // A monitor-all provider: switching to "Select repositories" seeds the
+        // picker with every NON-archived repo; archived ones stay unchecked.
+        providers = [structuredClone(DB_MONITOR_ALL)];
+        renderPage();
+
+        // The Repos cell is a button showing the current scope ("All repos").
+        const scopeButton = await screen.findByRole('button', {name: 'All repos'});
+        fireEvent.click(scopeButton);
+
+        // Enter select mode → triggers the /repos fetch.
+        fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
+
+        // Non-archived repos are pre-checked; the archived one is not.
+        const apiBox = await screen.findByRole('checkbox', {name: /api/});
+        expect(apiBox).toBeChecked();
+        expect(screen.getByRole('checkbox', {name: /web/})).toBeChecked();
+        const legacyBox = screen.getByRole('checkbox', {name: /legacy/});
+        expect(legacyBox).not.toBeChecked();
+
+        fireEvent.click(screen.getByRole('button', {name: 'Save scope'}));
+        await waitFor(() => {
+            const patch = lastCall(/\/git\/providers\/p-all$/, 'PATCH');
+            expect(patch).toBeTruthy();
+            const sent = JSON.parse(String(patch?.[1]?.body)) as Record<string, unknown>;
+            // Selecting writes repos_include with the non-archived set only.
+            expect(sent.repos).toEqual(['api', 'web']);
+            // Identity carried, token never re-sent.
+            expect(sent.type).toBe('github');
+            expect(sent).not.toHaveProperty('token');
+        });
+    });
+
+    it('lets the admin check an archived repo in explicitly', async () => {
+        providers = [structuredClone(DB_MONITOR_ALL)];
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', {name: 'All repos'}));
+        fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
+
+        const legacyBox = await screen.findByRole('checkbox', {name: /legacy/});
+        fireEvent.click(legacyBox); // opt the archived repo in
+        expect(legacyBox).toBeChecked();
+
+        fireEvent.click(screen.getByRole('button', {name: 'Save scope'}));
+        await waitFor(() => {
+            const sent = JSON.parse(
+                String(lastCall(/\/git\/providers\/p-all$/, 'PATCH')?.[1]?.body),
+            ) as Record<string, unknown>;
+            expect(sent.repos).toEqual(['api', 'web', 'legacy']);
+        });
+    });
+
+    it('clearing back to "Monitor all" removes the filter (PATCH omits repos)', async () => {
+        // DB_GITHUB starts with a repos_include list → editor opens in select mode.
+        renderPage();
+        const scopeButton = await screen.findByRole('button', {name: '3 selected'});
+        fireEvent.click(scopeButton);
+
+        // Switch to monitor-all and save.
+        fireEvent.click(screen.getByRole('radio', {name: 'Monitor all repositories'}));
+        fireEvent.click(screen.getByRole('button', {name: 'Save scope'}));
+
+        await waitFor(() => {
+            const patch = lastCall(/\/git\/providers\/p-gh$/, 'PATCH');
+            expect(patch).toBeTruthy();
+            const sent = JSON.parse(String(patch?.[1]?.body)) as Record<string, unknown>;
+            // Omitting `repos` clears repos_include server-side (monitor all).
+            expect(sent).not.toHaveProperty('repos');
+            // exclude_repos is preserved untouched (full-row replace).
+            expect(sent.exclude_repos).toEqual(['legacy']);
+        });
+    });
+
+    it('surfaces a repo-listing failure instead of a blank picker', async () => {
+        providers = [structuredClone(DB_MONITOR_ALL)];
+        // Make the /repos probe fail (server returns 502 on a listing error).
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const u = String(url);
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (/\/git\/providers\/[^/]+\/repos$/.test(u) && method === 'GET') {
+                return json({ok: false, error: 'boom'}, 502);
+            }
+            if (/\/git\/providers$/.test(u) && method === 'GET') return json({data: providers});
+            if (/\/admin\/data-sources$/.test(u)) {
+                return json({data: {connectors: [], git_providers: dataSourceGitProviders}});
+            }
+            return json({error: 'not found'}, 404);
+        });
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', {name: 'All repos'}));
+        fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
+        expect(await screen.findByText(/Couldn’t load repositories/)).toBeInTheDocument();
+        // Save must stay blocked: writing over a failed load would emit repos:[]
+        // and silently flip the provider from "monitor all" to "analyze nothing".
+        expect(screen.getByRole('button', {name: 'Save scope'})).toBeDisabled();
+        // Monitor-all is still saveable — no repo-list dependency.
+        fireEvent.click(screen.getByRole('radio', {name: 'Monitor all repositories'}));
+        expect(screen.getByRole('button', {name: 'Save scope'})).toBeEnabled();
+    });
+
+    it('blocks a select-mode save until the repo list has loaded', async () => {
+        // Hold the /repos response open so the list stays pending.
+        let releaseRepos: (() => void) | undefined;
+        const gate = new Promise<void>((resolve) => {
+            releaseRepos = resolve;
+        });
+        providers = [structuredClone(DB_MONITOR_ALL)];
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const u = String(url);
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (/\/git\/providers\/[^/]+\/repos$/.test(u) && method === 'GET') {
+                await gate;
+                return json({data: repos});
+            }
+            return base!(url, init);
+        });
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', {name: 'All repos'}));
+        fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
+        // While the list is still loading, select-mode Save is disabled.
+        expect(await screen.findByText(/Loading repositories/)).toBeInTheDocument();
+        expect(screen.getByRole('button', {name: 'Save scope'})).toBeDisabled();
+        // Once it resolves, Save becomes available.
+        releaseRepos?.();
+        await screen.findByRole('checkbox', {name: /api/});
+        expect(screen.getByRole('button', {name: 'Save scope'})).toBeEnabled();
+    });
+
+    it('does not offer a scope editor on read-only config rows', async () => {
+        renderPage();
+        const configCell = await screen.findByText('team');
+        const row = configCell.closest('tr') as HTMLElement;
+        // Config repo scope is plain text ("2 selected"), not an editable button.
+        expect(within(row).queryByRole('button', {name: '2 selected'})).not.toBeInTheDocument();
+        expect(within(row).getByText('2 selected')).toBeInTheDocument();
+    });
+});
+
+describe('AdminGitProviders — empty-state onboarding (#201)', () => {
+    it('shows the empty state only when there are no providers and no snapshots', async () => {
+        providers = [];
+        dataSourceGitProviders = [{provider: 'github', connected: false, developer_count: 0, last_sync: null}];
+        renderPage();
+        expect(await screen.findByTestId('git-empty-state')).toBeInTheDocument();
+        expect(screen.getByText('Connect your first git provider')).toBeInTheDocument();
+        // Onboarding points at identity management.
+        expect(screen.getByRole('link', {name: 'Manage developer identities'})).toBeInTheDocument();
+    });
+
+    it('hides the empty state once a provider exists (and shows the identity note)', async () => {
+        providers = [structuredClone(DB_GITHUB)];
+        renderPage();
+        await screen.findByText('acme-org');
+        expect(screen.queryByTestId('git-empty-state')).not.toBeInTheDocument();
+        expect(screen.getByTestId('identity-mapping-note')).toBeInTheDocument();
+    });
+
+    it('hides the empty state when snapshots exist even with no providers', async () => {
+        providers = [];
+        dataSourceGitProviders = [{provider: 'github', connected: true, developer_count: 5, last_sync: null}];
+        renderPage();
+        // Wait for the loaded (empty) list to settle, then assert no onboarding.
+        await screen.findByText(/No providers connected yet/);
+        expect(screen.queryByTestId('git-empty-state')).not.toBeInTheDocument();
     });
 });

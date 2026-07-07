@@ -935,6 +935,18 @@ export interface AdminGitProvider {
 }
 
 /**
+ * One repository as returned by `GET /api/admin/git/providers/:id/repos` — the
+ * repo-scope picker's source (GC1.9 / #201). Mirrors the server projection
+ * exactly (`{name, archived, defaultBranch}`). `archived` repos are shown in the
+ * picker but excluded from the default selection.
+ */
+export interface GitProviderRepo {
+    name: string;
+    archived: boolean;
+    defaultBranch: string | null;
+}
+
+/**
  * The connection-probe envelope both test-connection endpoints return. A failed
  * probe is a successful request that resolves to `{ok:false}` with a typed error
  * + a remediation hint — never a thrown HTTP error.

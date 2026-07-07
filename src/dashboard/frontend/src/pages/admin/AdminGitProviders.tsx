@@ -1,7 +1,11 @@
-import {useState, type ReactNode} from 'react';
+import {useMemo, useState, type ReactNode} from 'react';
+import {Link} from 'react-router-dom';
 import {Card} from '../../components/Card';
 import {Badge} from '../../components/Badge';
+import {StatePanel} from '../../components/StatePanel';
 import {
+    useAdminDataSources,
+    useAdminGitProviderRepos,
     useAdminGitProviders,
     useCreateAdminGitProvider,
     useDeleteAdminGitProvider,
@@ -16,7 +20,7 @@ import type {
     GitProviderProbeResult,
     GitProviderType,
 } from '../../api/types';
-import {ErrorText, PageHeader, PrimaryButton, SelectField, Table, Td, TextField, Th} from './adminUi';
+import {ErrorText, PageHeader, PrimaryButton, SecondaryButton, SelectField, Table, Td, TextField, Th} from './adminUi';
 
 /**
  * Admin → Connectors → Git (GC1.8 / #200). Lets an admin connect, test, edit,
@@ -130,12 +134,29 @@ export function repoScopeLabel(reposInclude: string | null): string {
 }
 
 /**
+ * Carry a provider's stored `exclude_repos` filter into a write body untouched.
+ * The server PATCH is a FULL-ROW REPLACE, so an omitted `exclude_repos` wipes the
+ * stored value; every edit that doesn't intend to change exclusions must re-send
+ * it. GitLab has no `exclude_repos` in its config shape, so it is only carried
+ * for github/bitbucket.
+ */
+function preserveExcludeRepos(
+    provider: Pick<AdminGitProvider, 'type' | 'repos_exclude'>,
+    input: GitProviderInput,
+): void {
+    if (provider.type !== 'gitlab') {
+        const exclude = parseReposList(provider.repos_exclude);
+        if (exclude !== undefined) input.exclude_repos = exclude;
+    }
+}
+
+/**
  * Round-trip a provider's stored repo scope into a write body. The server PATCH
  * is a FULL-ROW REPLACE (`updateProvider` always rewrites `repos_include`/
  * `repos_exclude`), so an omitted `repos` would silently wipe the stored filter
- * back to "monitor all". This form has no repo picker (that's #201), so any
- * edit/toggle must re-send the existing scope untouched. GitLab has no
- * `exclude_repos` in its config shape, so it is only carried for github/bitbucket.
+ * back to "monitor all". Edits that don't touch the repo scope (the add/edit
+ * form, the enable/disable toggle) must re-send the existing scope untouched; the
+ * repo-scope editor (#201) is the one path that intentionally rewrites `repos`.
  */
 function preserveReposInput(
     provider: Pick<AdminGitProvider, 'type' | 'repos_include' | 'repos_exclude'>,
@@ -143,10 +164,35 @@ function preserveReposInput(
 ): void {
     const include = parseReposList(provider.repos_include);
     if (include !== undefined) input.repos = include;
-    if (provider.type !== 'gitlab') {
-        const exclude = parseReposList(provider.repos_exclude);
-        if (exclude !== undefined) input.exclude_repos = exclude;
+    preserveExcludeRepos(provider, input);
+}
+
+/**
+ * Build the identity fields every PATCH must carry (the server re-validates the
+ * whole row on each write). Reused by the enable/disable toggle and the repo-scope
+ * editor so the two can't drift. The token is intentionally omitted — a PATCH with
+ * no token keeps the stored secret. `enabled` echoes the current state; callers
+ * that flip it (the toggle) override it after.
+ */
+function providerIdentityInput(provider: AdminGitProvider): GitProviderInput {
+    const input: GitProviderInput = {
+        type: provider.type,
+        container: provider.container,
+        auth_method: provider.auth_method,
+        enabled: provider.enabled,
+    };
+    if (
+        provider.type === 'bitbucket' &&
+        provider.auth_method === 'app_password' &&
+        provider.auth_username
+    ) {
+        input.username = provider.auth_username;
     }
+    if (provider.type === 'gitlab') {
+        if (provider.url) input.url = provider.url;
+        if (provider.include_subgroups !== null) input.include_subgroups = provider.include_subgroups;
+    }
+    return input;
 }
 
 /** Map a provider's `last_sync_status` to a badge tone. */
@@ -349,6 +395,144 @@ function ProviderForm({
     );
 }
 
+/**
+ * Per-provider repo-scope editor (GC1.9 / #201). Two modes:
+ *  - "Monitor all repositories" (default) — the PATCH omits `repos`, so the server
+ *    clears `repos_include` and every repo is analyzed.
+ *  - "Select repositories" — loads the provider's repos via `/repos` and writes the
+ *    checked set to `repos_include`. Archived repos are listed but excluded from
+ *    the default selection.
+ * The write reuses {@link providerIdentityInput} + {@link preserveExcludeRepos} so
+ * it carries the full row (the server re-validates every write) and never disturbs
+ * `exclude_repos`.
+ */
+function RepoScopeEditor({
+    provider,
+    onClose,
+}: {
+    provider: AdminGitProvider;
+    onClose: () => void;
+}): JSX.Element {
+    const stored = parseReposList(provider.repos_include);
+    const [mode, setMode] = useState<'all' | 'select'>(stored === undefined ? 'all' : 'select');
+    // null → follow the derived default seed; a concrete Set → the admin's edits.
+    const [edited, setEdited] = useState<Set<string> | null>(null);
+    const repos = useAdminGitProviderRepos(provider.id, mode === 'select');
+    const update = useUpdateAdminGitProvider();
+
+    const repoList = repos.data ?? [];
+    // Default selection when entering select mode: the stored include list if the
+    // provider already has one, else every NON-archived repo (archived excluded by
+    // default). Recomputes as the repo list loads; overridden once the admin edits.
+    const defaultSeed = useMemo(() => {
+        if (stored !== undefined) return new Set(stored);
+        return new Set(repoList.filter((r) => !r.archived).map((r) => r.name));
+    }, [stored, repoList]);
+    const selected = edited ?? defaultSeed;
+
+    function toggleRepo(name: string, checked: boolean): void {
+        const next = new Set(selected);
+        if (checked) next.add(name);
+        else next.delete(name);
+        setEdited(next);
+    }
+
+    // In "select" mode the selection derives from the loaded repo list, so a save
+    // must NOT proceed until that list is available: saving over an unloaded,
+    // errored, or empty repo source would emit `repos: []` and silently flip the
+    // provider from "monitor all" to "analyze nothing" (the PATCH is a full-row
+    // replace). "Monitor all" mode has no such dependency and is always saveable.
+    const selectSourceReady = repos.isSuccess && repoList.length > 0;
+    const canSave = !update.isPending && (mode === 'all' || selectSourceReady);
+
+    function save(): void {
+        const patch = providerIdentityInput(provider);
+        preserveExcludeRepos(provider, patch);
+        if (mode === 'select') {
+            // Deterministic order: repo-list order for listed repos, then any stored
+            // names no longer present (kept so a save can't silently drop them).
+            const listed = repoList.filter((r) => selected.has(r.name)).map((r) => r.name);
+            const extras = [...selected].filter((n) => !repoList.some((r) => r.name === n)).sort();
+            patch.repos = [...listed, ...extras];
+        }
+        // mode === 'all': omit `repos` → the server clears the filter (monitor all).
+        update.mutate({id: provider.id, patch}, {onSuccess: onClose});
+    }
+
+    return (
+        <div className="rounded-md border border-border bg-surface-raised/40 p-4">
+            <p className="mb-3 text-xs font-medium uppercase tracking-wider text-muted">Repository scope</p>
+            <div className="flex flex-col gap-2">
+                <label className="flex items-center gap-2 text-sm text-foreground">
+                    <input
+                        type="radio"
+                        name={`scope-${provider.id}`}
+                        checked={mode === 'all'}
+                        onChange={() => setMode('all')}
+                        className="h-4 w-4 accent-accent"
+                    />
+                    Monitor all repositories
+                </label>
+                <label className="flex items-center gap-2 text-sm text-foreground">
+                    <input
+                        type="radio"
+                        name={`scope-${provider.id}`}
+                        checked={mode === 'select'}
+                        onChange={() => setMode('select')}
+                        className="h-4 w-4 accent-accent"
+                    />
+                    Select repositories
+                </label>
+            </div>
+
+            {mode === 'select' ? (
+                <div className="mt-3" data-testid="repo-picker">
+                    {repos.isPending ? (
+                        <p className="text-sm text-muted">Loading repositories…</p>
+                    ) : repos.isError ? (
+                        <p className="text-sm text-danger">
+                            Couldn’t load repositories: {repos.error.message}
+                        </p>
+                    ) : repoList.length === 0 ? (
+                        <p className="text-sm text-muted">No repositories found for this provider.</p>
+                    ) : (
+                        <ul className="flex max-h-60 flex-col gap-1 overflow-y-auto pr-1">
+                            {repoList.map((r) => (
+                                <li key={r.name}>
+                                    <label className="flex items-center gap-2 text-sm text-foreground">
+                                        <input
+                                            type="checkbox"
+                                            checked={selected.has(r.name)}
+                                            onChange={(e) => toggleRepo(r.name, e.target.checked)}
+                                            className="h-4 w-4 accent-accent"
+                                        />
+                                        <span>{r.name}</span>
+                                        {r.archived ? (
+                                            <Badge tone="neutral" title="Archived — excluded by default">
+                                                Archived
+                                            </Badge>
+                                        ) : null}
+                                    </label>
+                                </li>
+                            ))}
+                        </ul>
+                    )}
+                </div>
+            ) : null}
+
+            <div className="mt-4 flex items-center gap-3">
+                <PrimaryButton type="button" onClick={save} disabled={!canSave}>
+                    {update.isPending ? 'Saving…' : 'Save scope'}
+                </PrimaryButton>
+                <SecondaryButton onClick={onClose} disabled={update.isPending}>
+                    Cancel
+                </SecondaryButton>
+                <ErrorText error={update.isError ? update.error : null} />
+            </div>
+        </div>
+    );
+}
+
 /** One row in the connected-providers table (DB or read-only config). */
 function ProviderRow({
     provider,
@@ -361,6 +545,7 @@ function ProviderRow({
     const remove = useDeleteAdminGitProvider();
     const sync = useSyncAdminGitProvider();
     const test = useTestAdminGitProvider();
+    const [scopeOpen, setScopeOpen] = useState(false);
 
     const isConfig = provider.source === 'config';
     const meta = PROVIDER_META[provider.type];
@@ -368,19 +553,8 @@ function ProviderRow({
     function toggleEnabled(): void {
         // A PATCH must carry the full provider identity (the server re-validates);
         // the token is omitted so the stored secret is kept.
-        const patch: GitProviderInput = {
-            type: provider.type,
-            container: provider.container,
-            auth_method: provider.auth_method,
-            enabled: !provider.enabled,
-        };
-        if (provider.type === 'bitbucket' && provider.auth_method === 'app_password' && provider.auth_username) {
-            patch.username = provider.auth_username;
-        }
-        if (provider.type === 'gitlab') {
-            if (provider.url) patch.url = provider.url;
-            if (provider.include_subgroups !== null) patch.include_subgroups = provider.include_subgroups;
-        }
+        const patch = providerIdentityInput(provider);
+        patch.enabled = !provider.enabled;
         // The PATCH is a full-row replace — carry the existing repo scope so a
         // simple enable/disable toggle can't silently reset it to "monitor all".
         preserveReposInput(provider, patch);
@@ -422,7 +596,21 @@ function ProviderRow({
                         </button>
                     )}
                 </Td>
-                <Td>{repoScopeLabel(provider.repos_include)}</Td>
+                <Td>
+                    {isConfig ? (
+                        repoScopeLabel(provider.repos_include)
+                    ) : (
+                        <button
+                            type="button"
+                            onClick={() => setScopeOpen((v) => !v)}
+                            aria-expanded={scopeOpen}
+                            className="text-sm font-medium text-accent hover:underline"
+                            title="Edit repository scope"
+                        >
+                            {repoScopeLabel(provider.repos_include)}
+                        </button>
+                    )}
+                </Td>
                 <Td>
                     <Badge tone={syncTone(provider.last_sync_status)}>
                         {provider.last_sync_status ?? 'never'}
@@ -477,17 +665,75 @@ function ProviderRow({
                     </td>
                 </tr>
             ) : null}
+            {scopeOpen && !isConfig ? (
+                <tr>
+                    <td colSpan={7} className="px-3 pb-4">
+                        <RepoScopeEditor provider={provider} onClose={() => setScopeOpen(false)} />
+                    </td>
+                </tr>
+            ) : null}
         </>
     );
 }
 
 /**
+ * A short link to developer-identity management. Connecting a provider only
+ * produces data for developers whose git identities are mapped; unmatched authors
+ * are dropped (design §10, findings #1/#2). Shown both in the cold-start onboarding
+ * and (post-connect) beneath the form so the admin knows where to resolve gaps.
+ */
+function IdentityMappingLink(): JSX.Element {
+    return (
+        <Link to="/admin/identities" className="font-medium text-accent hover:underline">
+            Manage developer identities
+        </Link>
+    );
+}
+
+/**
+ * Cold-start onboarding (GC1.9 / #201): shown only when there is genuinely nothing
+ * yet — no providers connected AND no git snapshots collected. Fixes the previous
+ * empty-dropdown confusion (finding #3) by pointing the admin at the add form and
+ * flagging the identity-mapping caveat up front.
+ */
+function GitEmptyState(): JSX.Element {
+    return (
+        <StatePanel
+            tone="accent"
+            testId="git-empty-state"
+            icon={<span aria-hidden>🔌</span>}
+            title="Connect your first git provider"
+            description="No git providers are connected and no activity has been collected yet. Add a provider below to start analyzing commits, PRs, and churn."
+        >
+            <p className="text-sm text-muted">
+                After connecting, only developers whose git identities are mapped will appear in the
+                data. <IdentityMappingLink />.
+            </p>
+        </StatePanel>
+    );
+}
+
+/**
  * Admin → Connectors → Git. Connected-provider list + provider-driven add/edit
- * form. Reached only by admins (route + API both gate it).
+ * form + per-provider repo-scope editor + cold-start onboarding. Reached only by
+ * admins (route + API both gate it).
  */
 export function AdminGitProviders(): JSX.Element {
     const providers = useAdminGitProviders();
+    const dataSources = useAdminDataSources();
     const [editing, setEditing] = useState<AdminGitProvider | null>(null);
+
+    const providerList = providers.data ?? [];
+    const hasProviders = providerList.length > 0;
+    // "No snapshots" = no git activity has ever been collected. /admin/data-sources
+    // reports per-provider developer counts from git_snapshots; any positive count
+    // means data exists. Snapshot state is only KNOWN once data-sources has loaded —
+    // until then (or on a load error) we assume data may exist and suppress the
+    // empty state, so it can never flash over a populated install.
+    const hasSnapshots = dataSources.data
+        ? dataSources.data.git_providers.some((g) => g.developer_count > 0)
+        : true;
+    const showEmptyState = !providers.isPending && !hasProviders && !hasSnapshots;
 
     return (
         <div className="space-y-6">
@@ -495,13 +741,20 @@ export function AdminGitProviders(): JSX.Element {
                 title="Git providers"
                 description="Connect GitHub, Bitbucket, and GitLab repositories for analysis."
             />
+            {showEmptyState ? <GitEmptyState /> : null}
             <ProviderForm key={editing?.id ?? 'new'} editing={editing} onDone={() => setEditing(null)} />
+            {hasProviders ? (
+                <p className="text-sm text-muted" data-testid="identity-mapping-note">
+                    Only developers whose git identities are mapped produce activity data — unmatched
+                    authors are dropped. <IdentityMappingLink />.
+                </p>
+            ) : null}
             <Card title="Connected providers">
                 {providers.isPending ? (
                     <p className="text-sm text-muted">Loading…</p>
                 ) : providers.isError ? (
                     <p className="text-sm text-danger">Failed to load: {providers.error.message}</p>
-                ) : (providers.data ?? []).length === 0 ? (
+                ) : !hasProviders ? (
                     <p className="text-sm text-muted">
                         No providers connected yet. Add one above to start analyzing git activity.
                     </p>
@@ -519,7 +772,7 @@ export function AdminGitProviders(): JSX.Element {
                             </>
                         }
                     >
-                        {(providers.data ?? []).map((p) => (
+                        {providerList.map((p) => (
                             <ProviderRow key={p.id} provider={p} onEdit={setEditing} />
                         ))}
                     </Table>
