@@ -76,6 +76,14 @@ export const queryKeys = {
     adminDevelopers: ['admin', 'developers'] as const,
     adminSubscriptions: ['admin', 'subscriptions'] as const,
     adminDataSources: ['admin', 'data-sources'] as const,
+    // Git providers (GC1 / #200): the admin-managed connection list. A single
+    // list key; every create/update/delete/sync mutation invalidates it so the
+    // masked rows + sync status reflect the latest server state.
+    adminGitProviders: ['admin', 'git-providers'] as const,
+    // One saved provider's repository list, for the repo-scope picker (GC1.9 /
+    // #201). Keyed by provider id so each provider's repos cache independently;
+    // only fetched when the admin opens "Select repositories".
+    adminGitProviderRepos: (id: string) => ['admin', 'git-providers', id, 'repos'] as const,
     // Expense reconciliation (Task 4.4): keyed by status so switching the filter
     // refetches the right slice of the queue.
     adminReconciliation: (status: string) => ['admin', 'reconciliation', status] as const,

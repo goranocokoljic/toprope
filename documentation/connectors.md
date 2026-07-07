@@ -112,6 +112,13 @@ of which AI tool they use — which is why a git-only deployment still gets usef
 adoption signals and PR/review coaching from day one. Analysis is **clone-free**:
 it reads commits, PRs/MRs, and reviews over the provider's REST API.
 
+> **The dashboard is now the primary way to connect git providers.** Add, test,
+> edit, remove, and sync providers — and pick which repositories are analyzed —
+> from **Admin → Git Providers** (`/admin/git-providers`), no config-file edit or
+> CLI required. YAML providers (below) remain fully supported and appear in that
+> UI as **read-only**. See [Connecting providers: dashboard or
+> YAML](#connecting-providers-dashboard-or-yaml).
+
 What it computes per developer per day (`git_snapshots`):
 
 - Commit count, lines added/removed, files changed
@@ -144,16 +151,76 @@ connectors:
 - **Sync:** `npx toprope sync git` (add `--provider <type>` to sync just one
   provider in a multi-provider setup).
 
-### Multi-provider git
+### Connecting providers: dashboard or YAML
 
-Toprope normalizes GitHub, GitLab, and Bitbucket into one git data model, so all
-git-derived views and coaching work identically across providers. Two ways to
-configure:
+There are **two supported ways** to connect a git provider, and both feed the same
+sync pipeline, `doctor`, and scheduler — analysis behaves identically whichever you
+use:
 
-1. **Single provider** — set `provider`, `org`, `api_token` as above.
-2. **Multiple providers** — supply a `providers:` list, each entry a full provider
-   config. This is how a WMG-style deployment runs Bitbucket as primary while also
-   analyzing a GitHub org.
+1. **Dashboard (primary)** — **Admin → Git Providers**. Pick a provider type, fill
+   the dynamic form (container + auth method + token, plus GitLab's optional
+   self-hosted URL and subgroup toggle), click **Test connection** to verify the
+   token before saving, then **Save**. You can later Test, Sync now, edit, remove,
+   toggle enabled, and set repo scope — all without touching a file. Providers added
+   here are stored in the database (tokens encrypted at rest; see
+   [Adding a provider from the dashboard](#adding-a-provider-from-the-dashboard)).
+2. **YAML (`connectors.git`)** — the config-file path shown above. Still fully
+   supported for git-only and file-driven deployments. Config-file providers show up
+   in the dashboard list flagged **Config** and are **read-only** there: you can Test
+   them, but editing or removing one means editing the YAML (the app never rewrites a
+   possibly read-only, mounted config file).
+
+**Precedence — the database wins.** Providers from both sources are merged at one
+seam and de-duplicated by `(type, container)` (e.g. the same GitHub `org`). If a
+provider exists in both the database and YAML, the **database entry wins** and the
+config one is shadowed (the shadowing is logged). So a UI edit always takes effect
+even when an older YAML entry names the same org.
+
+Toprope normalizes GitHub, GitLab, and Bitbucket into one git data model regardless
+of which path you use, so all git-derived views and coaching work identically across
+providers. A multi-provider setup — e.g. Bitbucket as primary while also analyzing a
+GitHub org — is just two connected providers, whether you add them in the UI, list
+them under `providers:` in YAML, or mix both.
+
+> **Multi-provider caveat — prefer a full sync over per-provider "Sync now".** Git
+> snapshots are keyed by `(developer, day)` with no provider dimension: a developer's
+> same-day activity across providers is merged into one row *within a single sync
+> run*. A **scoped** sync — the dashboard's per-provider **Sync now** button, or
+> `sync git --provider <type>` — fetches only that one provider and rewrites the day's
+> row from just its data, which can drop another provider's already-recorded
+> contribution for that same day until the next full sync re-establishes it. In a
+> multi-provider deployment, prefer a full `sync git` (or the scheduled sync) so
+> every provider's same-day activity is merged in one pass. (Tracked for a
+> merge-on-write fix in the shared sync pipeline.)
+
+### Adding a provider from the dashboard
+
+**Secret key is required first.** Provider tokens added from the UI are encrypted at
+rest with a server-held key, so the server needs a master key before it will store
+one. Set the `TOPROPE_SECRET_KEY` environment variable to a **base64-encoded,
+32-byte** key. The key handling is **fail-closed**: if it is unset (or not a valid
+32-byte base64 value), adding a **token** provider is refused with a clear setup
+message (HTTP 503) rather than storing a token in the clear — there is no
+plaintext-at-rest fallback. Generate one with either:
+
+```bash
+openssl rand -base64 32
+# or, with Node (cross-platform):
+node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+```
+
+then export it (see [Configuration → Secrets](./configuration.md#secrets-and-environment-variables)).
+
+**Repo scope — monitor all vs. select.** Every connected provider defaults to
+**Monitor all repositories** (all repos in the org/workspace/group). To narrow it,
+open the provider's repo-scope editor and switch to **Select repositories**: Toprope
+loads the provider's repos and you tick the ones to analyze. Archived repos are
+shown but excluded by default. Switch back to "Monitor all" at any time.
+
+**Tokens are write-only.** A token is accepted on create/update and **never**
+returned by the API afterwards — the dashboard only ever shows a masked value and the
+last four characters. Editing a provider without re-entering the token keeps the
+stored one; entering a new token replaces it.
 
 Provider notes:
 

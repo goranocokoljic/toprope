@@ -26,7 +26,8 @@ The shipped config references these variables. Export the ones you need:
 | Variable | Used by |
 |---|---|
 | `GITHUB_API_TOKEN` | Copilot connector |
-| `GIT_API_TOKEN` | Git connector (the same GitHub PAT is fine) |
+| `GIT_API_TOKEN` | Git connector, YAML path (the same GitHub PAT is fine) |
+| `TOPROPE_SECRET_KEY` | Encrypts git-provider tokens added from the dashboard (base64, 32 bytes) — **required** to add a token provider in the UI; fail-closed if unset |
 | `ANTHROPIC_ADMIN_API_KEY` | Claude Code connector |
 | `WINDSURF_SERVICE_KEY` | Windsurf connector |
 | `CURSOR_SERVICE_KEY` | Cursor connector |
@@ -38,6 +39,8 @@ The shipped config references these variables. Export the ones you need:
 ```powershell
 $env:GITHUB_API_TOKEN = "ghp_..."
 $env:GIT_API_TOKEN    = "ghp_..."
+# Required to add git-provider tokens from the dashboard (base64, 32 bytes):
+$env:TOPROPE_SECRET_KEY = "$(openssl rand -base64 32)"   # or a pre-generated key
 # ...etc. Env vars are per-session on Windows; re-export in each new terminal.
 ```
 
@@ -122,6 +125,15 @@ connectors:
     # Multi-provider: supply a `providers:` list to analyze GitHub + GitLab +
     # Bitbucket together. See documentation/connectors.md.
 ```
+
+> **The dashboard is the primary way to connect git providers now** — this
+> `connectors.git` block is still fully supported but optional. Providers added in
+> **Admin → Git Providers** are stored in the database (tokens encrypted with
+> `TOPROPE_SECRET_KEY`) and are editable in the UI; providers defined here in YAML
+> appear in the same UI as **read-only `Config`** entries. When both name the same
+> `(type, container)` — e.g. the same GitHub `org` — the **database entry wins** and
+> the YAML one is shadowed. See
+> [Connectors → Connecting providers](./connectors.md#connecting-providers-dashboard-or-yaml).
 
 ### `expenses`
 
