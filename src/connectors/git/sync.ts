@@ -13,6 +13,17 @@ import type {GitConnectorConfig} from '../../config/types.js';
 
 const CONNECTOR_NAME = 'git';
 
+/**
+ * Prefix of the advisory pushed into a SyncResult's `errors` when some commit
+ * authors have no developer record. This is NOT a sync failure — unmatched
+ * authors (CI bots, external contributors, not-yet-mapped humans) are the
+ * expected steady state and their commits are simply dropped. Callers that
+ * classify a run's outcome (e.g. the sync-now API) must exclude this advisory
+ * from genuine errors; exported so there is a single source of truth for the
+ * sentinel rather than a matched string literal that can drift.
+ */
+export const UNMATCHED_AUTHORS_PREFIX = 'Unmatched authors (no developer record found):';
+
 function syncStateKey(providerType: GitProviderType, identifier: string): string {
     return `git_last_sync:${providerType}:${identifier}`;
 }
@@ -730,9 +741,7 @@ export class GitSync implements ConnectorInterface {
         }
 
         if (allUnmatched.size > 0) {
-            errors.push(
-                `Unmatched authors (no developer record found): ${[...allUnmatched].join(', ')}`,
-            );
+            errors.push(`${UNMATCHED_AUTHORS_PREFIX} ${[...allUnmatched].join(', ')}`);
         }
 
         return {connector: CONNECTOR_NAME, snapshotsWritten, snapshotsSkipped, errors, lastSyncTime: now};

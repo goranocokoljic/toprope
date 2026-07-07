@@ -24,7 +24,7 @@ import {
 import {loadServerKey} from '../../../connectors/git/providers/secret';
 import {providerContainer, resolveGitProviderConfigs} from '../../../connectors/git/providers/config';
 import {createGitProvider} from '../../../connectors/git/providers/factory';
-import {GitSync} from '../../../connectors/git/sync';
+import {GitSync, UNMATCHED_AUTHORS_PREFIX} from '../../../connectors/git/sync';
 import {gitProviderFixHint} from '../../../cli/doctor';
 import type {GitConnectorConfig} from '../../../config/types';
 import type {GitProviderConfig, GitProviderType} from '../../../connectors/git/providers/types';
@@ -626,12 +626,19 @@ export function registerAdminGitProviderRoutes(
                 .syncProviders(db, [config])
                 .then((result) => {
                     // A sync that ran but collected per-repo/provider errors is an
-                    // error outcome with a surfaced message — never swallowed.
-                    if (result.errors.length > 0) {
+                    // error outcome with a surfaced message — never swallowed. But
+                    // the "unmatched authors" advisory is NOT a failure (CI bots and
+                    // external contributors are unmapped in nearly every real repo),
+                    // so it must not flip a provider that synced fine to red. Classify
+                    // and surface only genuine errors.
+                    const genuineErrors = result.errors.filter(
+                        (e) => !e.startsWith(UNMATCHED_AUTHORS_PREFIX),
+                    );
+                    if (genuineErrors.length > 0) {
                         recordSyncOutcome(db, id, {
                             status: 'error',
                             at: new Date().toISOString(),
-                            error: result.errors.join('; '),
+                            error: genuineErrors.join('; '),
                         });
                     } else {
                         recordSyncOutcome(db, id, {status: 'ok', at: new Date().toISOString()});

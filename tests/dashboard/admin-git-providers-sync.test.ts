@@ -221,6 +221,40 @@ describe('admin git-provider sync-now API (#199)', () => {
             expect(snap?.developer_id).toBe('dev-1');
         });
 
+        it('settles status=ok when the only "errors" are unmatched authors (bots), snapshots still written', async () => {
+            // Regression (SO-1): a healthy sync in a real repo almost always has
+            // some unmatched authors (CI bots, external contributors). runSync
+            // reports that as an advisory in `errors`; it must NOT flip a provider
+            // that synced fine to a red error state.
+            const id = await createGithub();
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('myrepo')]),
+                    // alice is mapped → dev-1; dependabot[bot] has no developer record.
+                    getCommits: vi
+                        .fn()
+                        .mockResolvedValue([makeCommit('alice'), makeCommit('dependabot[bot]')]),
+                    getCommitDiff: vi.fn().mockResolvedValue([
+                        {path: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'},
+                    ]),
+                }),
+            );
+
+            const res = await triggerSync(id);
+            expect(res.statusCode).toBe(202);
+
+            const row = await waitForSyncStatus(id, 'ok');
+            // The unmatched-authors advisory is not surfaced as a failure.
+            expect(row.last_sync_error).toBeNull();
+            expect(row.last_sync_at).not.toBeNull();
+            // The mapped author's snapshot was still written.
+            const snap = db
+                .prepare(`SELECT developer_id FROM git_snapshots WHERE date = '2024-01-15'`)
+                .get() as {developer_id: string} | undefined;
+            expect(snap?.developer_id).toBe('dev-1');
+        });
+
         it('persists status=error with the failure message when the provider fails', async () => {
             const id = await createGithub();
             const createGitProvider = await getCreateGitProvider();
