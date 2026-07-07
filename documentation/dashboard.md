@@ -87,6 +87,12 @@ through `/api/leaderboard/*`. Enable it only deliberately.
 - **Admin → Management** — users, teams, identity mapping, and subscriptions (a UI
   over the Phase-1 CLI capabilities).
 - **Admin → Reconciliation** — review expense/subscription mismatches.
+- **Admin → Git Providers** — connect, test, edit, remove, and sync git providers
+  (GitHub, GitLab, Bitbucket incl. self-hosted) and choose which repositories are
+  analyzed, entirely from the UI — the primary path, replacing config-file edits.
+  Adding a token provider requires `TOPROPE_SECRET_KEY` (see
+  [Connectors](./connectors.md#adding-a-provider-from-the-dashboard)). Config-file
+  providers show here as read-only.
 - **Settings** — global defaults plus per-team overrides under a permission model,
   covering anomaly thresholds, survey-trigger auto-send, plan-ROI thresholds,
   coaching-pillar enablement, leaderboard visibility, and alert channels.
