@@ -896,6 +896,80 @@ export interface AdminDataSources {
     git_providers: CoverageGitProvider[];
 }
 
+// --- Admin: git providers (GC1 / #197–#200) ------------------------------
+
+/** The three git provider types the dynamic form supports. */
+export type GitProviderType = 'github' | 'bitbucket' | 'gitlab';
+
+/** Where a provider row comes from: the DB (editable) or a config file (read-only). */
+export type GitProviderSource = 'db' | 'config';
+
+/**
+ * The masked provider DTO the admin API returns
+ * (`GET /api/admin/git/providers`). Mirrors the server's `AdminGitProviderDto`
+ * exactly (superset of the store's public projection + a `source`
+ * discriminator). Tokens are write-only end to end: this shape NEVER carries the
+ * secret — only `token_last4` + `token_masked` for display. `created_at`/
+ * `updated_at` are null for config-file providers (no lifecycle timestamps).
+ */
+export interface AdminGitProvider {
+    id: string;
+    source: GitProviderSource;
+    type: GitProviderType;
+    container: string;
+    url: string | null;
+    include_subgroups: boolean | null;
+    auth_method: string;
+    auth_username: string | null;
+    token_last4: string | null;
+    token_masked: string;
+    repos_include: string | null;
+    repos_exclude: string | null;
+    enabled: boolean;
+    created_at: string | null;
+    updated_at: string | null;
+    created_by: string | null;
+    last_sync_at: string | null;
+    last_sync_status: string | null;
+    last_sync_error: string | null;
+}
+
+/**
+ * The connection-probe envelope both test-connection endpoints return. A failed
+ * probe is a successful request that resolves to `{ok:false}` with a typed error
+ * + a remediation hint — never a thrown HTTP error.
+ */
+export interface GitProviderProbeResult {
+    ok: boolean;
+    error?: string;
+    hint?: string;
+}
+
+/** The write body for create/update — mirrors the server's fail-closed parser. */
+export interface GitProviderInput {
+    type: GitProviderType;
+    container: string;
+    auth_method?: string;
+    /** Write-only. Omit on update to keep the stored secret; required on create. */
+    token?: string;
+    /** Bitbucket app_password only. */
+    username?: string;
+    /** GitLab self-hosted base URL. */
+    url?: string;
+    /** GitLab only. */
+    include_subgroups?: boolean;
+    repos?: string[];
+    exclude_repos?: string[];
+    enabled?: boolean;
+}
+
+/** The status handle a sync-now trigger returns (fire-and-forget). */
+export interface GitProviderSyncHandle {
+    provider_id: string;
+    status: 'running';
+    started_at: string;
+}
+
 // --- Admin: expense reconciliation (Task 4.4 / #99) ----------------------
 
 export type ReconciliationResultType =

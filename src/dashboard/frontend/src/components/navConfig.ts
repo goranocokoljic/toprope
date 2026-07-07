@@ -46,6 +46,7 @@ const ADMIN_SECTION: NavSection = {
         {to: '/admin/subscriptions', label: 'Subscriptions'},
         {to: '/admin/reconciliation', label: 'Reconciliation'},
         {to: '/admin/data-sources', label: 'Data Sources'},
+        {to: '/admin/git-providers', label: 'Git Providers'},
         {to: '/settings', label: 'Settings'},
     ],
 };
