@@ -482,6 +482,41 @@ describe('AdminGitProviders — repo-scope editor (#201)', () => {
         fireEvent.click(await screen.findByRole('button', {name: 'All repos'}));
         fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
         expect(await screen.findByText(/Couldn’t load repositories/)).toBeInTheDocument();
+        // Save must stay blocked: writing over a failed load would emit repos:[]
+        // and silently flip the provider from "monitor all" to "analyze nothing".
+        expect(screen.getByRole('button', {name: 'Save scope'})).toBeDisabled();
+        // Monitor-all is still saveable — no repo-list dependency.
+        fireEvent.click(screen.getByRole('radio', {name: 'Monitor all repositories'}));
+        expect(screen.getByRole('button', {name: 'Save scope'})).toBeEnabled();
+    });
+
+    it('blocks a select-mode save until the repo list has loaded', async () => {
+        // Hold the /repos response open so the list stays pending.
+        let releaseRepos: (() => void) | undefined;
+        const gate = new Promise<void>((resolve) => {
+            releaseRepos = resolve;
+        });
+        providers = [structuredClone(DB_MONITOR_ALL)];
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const u = String(url);
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (/\/git\/providers\/[^/]+\/repos$/.test(u) && method === 'GET') {
+                await gate;
+                return json({data: repos});
+            }
+            return base!(url, init);
+        });
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', {name: 'All repos'}));
+        fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
+        // While the list is still loading, select-mode Save is disabled.
+        expect(await screen.findByText(/Loading repositories/)).toBeInTheDocument();
+        expect(screen.getByRole('button', {name: 'Save scope'})).toBeDisabled();
+        // Once it resolves, Save becomes available.
+        releaseRepos?.();
+        await screen.findByRole('checkbox', {name: /api/});
+        expect(screen.getByRole('button', {name: 'Save scope'})).toBeEnabled();
     });
 
     it('does not offer a scope editor on read-only config rows', async () => {

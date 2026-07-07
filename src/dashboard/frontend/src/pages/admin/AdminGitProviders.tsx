@@ -437,6 +437,14 @@ function RepoScopeEditor({
         setEdited(next);
     }
 
+    // In "select" mode the selection derives from the loaded repo list, so a save
+    // must NOT proceed until that list is available: saving over an unloaded,
+    // errored, or empty repo source would emit `repos: []` and silently flip the
+    // provider from "monitor all" to "analyze nothing" (the PATCH is a full-row
+    // replace). "Monitor all" mode has no such dependency and is always saveable.
+    const selectSourceReady = repos.isSuccess && repoList.length > 0;
+    const canSave = !update.isPending && (mode === 'all' || selectSourceReady);
+
     function save(): void {
         const patch = providerIdentityInput(provider);
         preserveExcludeRepos(provider, patch);
@@ -513,7 +521,7 @@ function RepoScopeEditor({
             ) : null}
 
             <div className="mt-4 flex items-center gap-3">
-                <PrimaryButton type="button" onClick={save} disabled={update.isPending}>
+                <PrimaryButton type="button" onClick={save} disabled={!canSave}>
                     {update.isPending ? 'Saving…' : 'Save scope'}
                 </PrimaryButton>
                 <SecondaryButton onClick={onClose} disabled={update.isPending}>
