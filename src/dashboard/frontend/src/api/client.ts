@@ -20,6 +20,7 @@ import type {
     MyPRReviewCoaching,
     GitProviderInput,
     GitProviderProbeResult,
+    GitProviderRepo,
     GitProviderSyncHandle,
     GlobalSettings,
     Leaderboard,
@@ -548,6 +549,19 @@ export const api = {
     async deleteAdminGitProvider(id: string): Promise<{id: string; deleted: boolean}> {
         const body = await deleteJson<ApiEnvelope<{id: string; deleted: boolean}>>(
             `/api/admin/git/providers/${encodeURIComponent(id)}`,
+        );
+        return body.data;
+    },
+
+    /**
+     * List a SAVED provider's repositories for the repo-scope picker (GC1.9 /
+     * #201). Returns `{name, archived, defaultBranch}` per repo. A failed listing
+     * is a 502 on the server, so this rejects (ApiError) rather than resolving —
+     * the picker surfaces the error and the admin can still choose "monitor all".
+     */
+    async getAdminGitProviderRepos(id: string): Promise<GitProviderRepo[]> {
+        const body = await request<ApiEnvelope<GitProviderRepo[]>>(
+            `/api/admin/git/providers/${encodeURIComponent(id)}/repos`,
         );
         return body.data;
     },

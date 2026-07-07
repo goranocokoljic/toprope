@@ -18,6 +18,7 @@ import type {
     AdminUserWithTempPassword,
     GitProviderInput,
     GitProviderProbeResult,
+    GitProviderRepo,
     GitProviderSyncHandle,
     ReconciliationResult,
     ReconciliationRunSummary,
@@ -212,6 +213,22 @@ export function useTestDraftGitProvider(): UseMutationResult<GitProviderProbeRes
 export function useSyncAdminGitProvider(): UseMutationResult<GitProviderSyncHandle, Error, string> {
     const invalidate = useInvalidateGitProviders();
     return useMutation({mutationFn: (id: string) => api.syncAdminGitProvider(id), onSuccess: invalidate});
+}
+
+/**
+ * List a saved provider's repositories for the repo-scope picker (GC1.9 / #201).
+ * `enabled` gates the fetch so the (potentially slow, network-bound) `/repos`
+ * probe only runs once the admin opens "Select repositories" for this provider.
+ */
+export function useAdminGitProviderRepos(
+    id: string,
+    enabled: boolean,
+): UseQueryResult<GitProviderRepo[], Error> {
+    return useQuery({
+        queryKey: queryKeys.adminGitProviderRepos(id),
+        queryFn: () => api.getAdminGitProviderRepos(id),
+        enabled,
+    });
 }
 
 // --- Expense reconciliation (Task 4.4 / #99) ---
