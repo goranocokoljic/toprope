@@ -131,7 +131,8 @@ connectors:
 > **Admin → Git Providers** are stored in the database (tokens encrypted with
 > `TOPROPE_SECRET_KEY`) and are editable in the UI; providers defined here in YAML
 > appear in the same UI as **read-only `Config`** entries. When both name the same
-> `(provider, org)`, the **database entry wins** and the YAML one is shadowed. See
+> `(type, container)` — e.g. the same GitHub `org` — the **database entry wins** and
+> the YAML one is shadowed. See
 > [Connectors → Connecting providers](./connectors.md#connecting-providers-dashboard-or-yaml).
 
 ### `expenses`
