@@ -569,12 +569,6 @@ export class GitSync implements ConnectorInterface {
     }
 
     async sync(db: Database.Database, providerFilter?: string): Promise<SyncResult> {
-        const errors: string[] = [];
-        let snapshotsWritten = 0;
-        let snapshotsSkipped = 0;
-        const now = new Date().toISOString();
-        const allUnmatched = new Set<string>();
-
         const providerConfigs = this.getProviderConfigs(db).filter(
             (pc) => !providerFilter || pc.type === providerFilter,
         );
@@ -587,9 +581,49 @@ export class GitSync implements ConnectorInterface {
                 errors: providerFilter
                     ? [`No provider of type '${providerFilter}' configured`]
                     : ['No git providers configured'],
-                lastSyncTime: now,
+                lastSyncTime: new Date().toISOString(),
             };
         }
+
+        return this.runSync(db, providerConfigs);
+    }
+
+    /**
+     * Run the sync pipeline over an EXPLICIT provider set — the seam the
+     * per-provider "sync now" API (GC1.7 / #199) triggers with a single provider.
+     * It reuses the exact fetch → merge → upsert path {@link sync} runs (no cloned
+     * sync logic): the ONLY difference is the caller supplies the provider configs
+     * instead of them being resolved from DB + config here. An empty list yields
+     * the same "nothing configured" shape rather than throwing.
+     */
+    async syncProviders(
+        db: Database.Database,
+        providerConfigs: GitProviderConfig[],
+    ): Promise<SyncResult> {
+        if (providerConfigs.length === 0) {
+            return {
+                connector: CONNECTOR_NAME,
+                snapshotsWritten: 0,
+                snapshotsSkipped: 0,
+                errors: ['No git providers configured'],
+                lastSyncTime: new Date().toISOString(),
+            };
+        }
+        return this.runSync(db, providerConfigs);
+    }
+
+    // The shared pipeline body for both entry points above. Assumes a non-empty,
+    // already-resolved provider set (callers own resolution + the empty case) so
+    // the fetch/merge/upsert logic lives in exactly one place.
+    private async runSync(
+        db: Database.Database,
+        providerConfigs: GitProviderConfig[],
+    ): Promise<SyncResult> {
+        const errors: string[] = [];
+        let snapshotsWritten = 0;
+        let snapshotsSkipped = 0;
+        const now = new Date().toISOString();
+        const allUnmatched = new Set<string>();
 
         const devLookup = buildDevLookupMap(db);
         const churnWindowHours = this.config.analysis?.churn_window_hours ?? 48;

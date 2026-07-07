@@ -15,6 +15,7 @@ import {
     getDecryptedConfig,
     getProvider,
     listProviders,
+    recordSyncOutcome,
     toPublicProvider,
     updateProvider,
     GitProviderStoreError,
@@ -23,6 +24,7 @@ import {
 import {loadServerKey} from '../../../connectors/git/providers/secret';
 import {providerContainer, resolveGitProviderConfigs} from '../../../connectors/git/providers/config';
 import {createGitProvider} from '../../../connectors/git/providers/factory';
+import {GitSync} from '../../../connectors/git/sync';
 import {gitProviderFixHint} from '../../../cli/doctor';
 import type {GitConnectorConfig} from '../../../config/types';
 import type {GitProviderConfig, GitProviderType} from '../../../connectors/git/providers/types';
@@ -57,6 +59,20 @@ export interface AdminGitProviderDto extends Omit<PublicGitProvider, 'created_at
     source: ProviderSource;
     created_at: string | null;
     updated_at: string | null;
+}
+
+/**
+ * The status handle a sync-now trigger returns (GC1.7 / #199). The POST is
+ * fire-and-forget: it resolves + starts the run, then returns this immediately
+ * with `status: 'running'`. The DURABLE outcome (ok|error + message + timestamp)
+ * lands on the provider row's `last_sync_*` columns, which the list endpoint
+ * already surfaces — so the UI polls the list to observe completion rather than a
+ * separate status endpoint.
+ */
+interface SyncTriggerHandle {
+    provider_id: string;
+    status: 'running';
+    started_at: string;
 }
 
 // A 400 the wire-body parser raises for a malformed/unknown request shape. Kept
@@ -367,6 +383,19 @@ export function registerAdminGitProviderRoutes(
     const configProviders = (): GitProviderConfig[] =>
         gitConfig ? resolveGitProviderConfigs(gitConfig) : [];
 
+    // Overlap guard for sync-now (#199): the set of provider ids with an in-flight
+    // run. Scoped to THIS route registration (one per app) so it is process-local
+    // and test-isolated — a fresh app in a test starts with an empty set. A second
+    // trigger for an id already in the set is rejected (409), so no two overlapping
+    // runs ever write the same provider's snapshots.
+    const inFlightSyncs = new Set<string>();
+
+    // A single GitSync bound to the same git config the list merge uses. Only its
+    // churn-window setting is read on the syncProviders path (providers are passed
+    // in explicitly), so a config-less registration still syncs correctly — the
+    // fallback carries `enabled: false` only to satisfy the base-config shape.
+    const gitSync = new GitSync(gitConfig ?? {enabled: false});
+
     app.get('/api/admin/git/providers', async (request, reply) => {
         if (!isAdmin(request)) return forbidden(reply);
         // DB providers first (store's deterministic created_at, id order), then
@@ -521,6 +550,117 @@ export function registerAdminGitProviderRoutes(
                 reply.status(502);
                 return {ok: false, error: message, hint: gitProviderFixHint(resolved.config.type, message)};
             }
+        },
+    );
+
+    // POST /:id/sync — trigger a sync for ONE saved DB provider (GC1.7 / #199).
+    // Fire-and-forget: it validates the target, starts the run on the shared
+    // GitSync pipeline scoped to just this provider, and returns a 202 status
+    // handle immediately. The terminal outcome is written to the row's last_sync_*
+    // columns when the run settles (surfaced via the list endpoint). Only DB rows
+    // are sync-able here: config-file providers are read-only (they sync via the
+    // scheduled pipeline), so their synthetic ids are rejected like PATCH/DELETE.
+    app.post<{Params: {id: string}}>(
+        '/api/admin/git/providers/:id/sync',
+        async (request, reply) => {
+            if (!isAdmin(request)) return forbidden(reply);
+            const {id} = request.params;
+
+            // Config-file providers have no row to update and are read-only in the UI.
+            if (configProviders().some((c) => configProviderId(c) === id)) {
+                return conflict(
+                    reply,
+                    'Config-file providers are read-only and sync via the scheduled pipeline, not individually',
+                );
+            }
+
+            const record = getProvider(db, id);
+            if (record === undefined) {
+                return notFound(reply, `Git provider not found: ${id}`);
+            }
+            // A disabled provider is intentionally excluded from syncs — typed 409,
+            // not a silent no-op, so the UI can tell the admin to enable it first.
+            if (record.enabled !== 1) {
+                return conflict(reply, 'Provider is disabled; enable it before syncing');
+            }
+            // Overlap guard: reject a duplicate trigger while a run is in flight so
+            // two overlapping runs never write the same provider's snapshots.
+            if (inFlightSyncs.has(id)) {
+                return conflict(reply, 'A sync is already in progress for this provider');
+            }
+
+            // Resolve the plaintext config (fail-closed on the server key) BEFORE
+            // marking the run in-flight, so a key-config error is a clean 503 and
+            // never leaves a stuck in-flight entry.
+            let config: GitProviderConfig;
+            try {
+                const decrypted = getDecryptedConfig(db, loadServerKey(), id);
+                // getProvider just confirmed the row exists; a concurrent delete is
+                // the only miss and is treated as not-found.
+                if (decrypted === undefined) {
+                    return notFound(reply, `Git provider not found: ${id}`);
+                }
+                config = decrypted;
+            } catch (err) {
+                if (err instanceof GitProviderStoreError && err.code === 'secret_key_unconfigured') {
+                    return serviceUnavailable(reply, err.message);
+                }
+                throw err;
+            }
+
+            inFlightSyncs.add(id);
+            const startedAt = new Date().toISOString();
+
+            // Kick off the run without awaiting it. syncProviders reuses the exact
+            // fetch→merge→upsert pipeline, scoped to just this provider. Whatever
+            // the outcome, we persist it to the row and clear the in-flight flag.
+            //
+            // Scoping note: like the scheduled sync, this is incremental (per-provider
+            // `since` sync-state) and the snapshot upsert is keyed on (developer_id,
+            // date). A run with no new commits in its window writes no snapshot; a run
+            // WITH new commits behaves exactly as a full scheduled sync does when only
+            // this provider has new commits in the window. Cross-provider same-day
+            // merge accuracy is a property of that shared pipeline model (owned by the
+            // git-sync design), not of this per-provider trigger — see the epic review.
+            void gitSync
+                .syncProviders(db, [config])
+                .then((result) => {
+                    // A sync that ran but collected per-repo/provider errors is an
+                    // error outcome with a surfaced message — never swallowed.
+                    if (result.errors.length > 0) {
+                        recordSyncOutcome(db, id, {
+                            status: 'error',
+                            at: new Date().toISOString(),
+                            error: result.errors.join('; '),
+                        });
+                    } else {
+                        recordSyncOutcome(db, id, {status: 'ok', at: new Date().toISOString()});
+                    }
+                })
+                .catch((err: unknown) => {
+                    // A thrown failure (e.g. an unexpected pipeline crash) is still
+                    // recorded as a status=error outcome, not lost.
+                    const message = err instanceof Error ? err.message : String(err);
+                    try {
+                        recordSyncOutcome(db, id, {
+                            status: 'error',
+                            at: new Date().toISOString(),
+                            error: message,
+                        });
+                    } catch (recordErr) {
+                        request.log.error(
+                            {err: recordErr, providerId: id},
+                            'failed to record git sync error outcome',
+                        );
+                    }
+                })
+                .finally(() => {
+                    inFlightSyncs.delete(id);
+                });
+
+            reply.status(202);
+            const handle: SyncTriggerHandle = {provider_id: id, status: 'running', started_at: startedAt};
+            return {data: handle};
         },
     );
 }

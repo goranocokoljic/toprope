@@ -944,3 +944,89 @@ describe('GitSync with DB-connected providers (#196)', () => {
         expect(orgs).toEqual(['cfg-org', 'db-org']);
     });
 });
+
+describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () => {
+    let db: Database.Database;
+
+    beforeEach(() => {
+        db = makeDb();
+        vi.resetAllMocks();
+    });
+
+    afterEach(() => {
+        db.close();
+        vi.restoreAllMocks();
+    });
+
+    it('runs the same fetch→merge→upsert pipeline for the one provided config (writes snapshots)', async () => {
+        const devLogin = 'alice';
+        seedDev(db, devLogin);
+
+        const createGitProvider = await getCreateGitProvider();
+        const provider = makeMockProvider({
+            listRepos: vi.fn().mockResolvedValue([makeRepo('myrepo')]),
+            getCommits: vi.fn().mockResolvedValue([makeProviderCommit(devLogin)]),
+            getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+        });
+        createGitProvider.mockReturnValue(provider);
+
+        const config: GitProviderConfig = {
+            type: 'github',
+            org: 'scoped-org',
+            auth: {type: 'token', api_token: 'scoped-token'},
+        };
+        const result = await new GitSync({enabled: false}).syncProviders(db, [config]);
+
+        // The exact config handed to syncProviders reached the factory (scoped run).
+        expect(createGitProvider).toHaveBeenCalledWith(
+            expect.objectContaining({type: 'github', org: 'scoped-org'}),
+        );
+        expect(result.errors.filter((e) => !e.includes('Unmatched'))).toHaveLength(0);
+        expect(result.snapshotsWritten).toBeGreaterThan(0);
+        expect(countSnapshots(db)).toBeGreaterThan(0);
+    });
+
+    it('returns the "nothing configured" shape for an empty provider set (no throw)', async () => {
+        const createGitProvider = await getCreateGitProvider();
+        createGitProvider.mockReturnValue(makeMockProvider());
+
+        const result = await new GitSync({enabled: false}).syncProviders(db, []);
+
+        expect(result.snapshotsWritten).toBe(0);
+        expect(result.errors[0]).toMatch(/No git providers configured/);
+        expect(createGitProvider).not.toHaveBeenCalled();
+    });
+
+    it('surfaces a provider failure as a sync error rather than throwing', async () => {
+        const createGitProvider = await getCreateGitProvider();
+        createGitProvider.mockReturnValue(
+            makeMockProvider({listRepos: vi.fn().mockRejectedValue(new Error('network failure'))}),
+        );
+
+        const config: GitProviderConfig = {
+            type: 'github',
+            org: 'scoped-org',
+            auth: {type: 'token', api_token: 'scoped-token'},
+        };
+        const result = await new GitSync({enabled: false}).syncProviders(db, [config]);
+
+        expect(result.errors.some((e) => /network failure/.test(e))).toBe(true);
+    });
+
+    it('scopes strictly to the passed provider — a second configured provider is untouched', async () => {
+        const createGitProvider = await getCreateGitProvider();
+        const provider = makeMockProvider({listRepos: vi.fn().mockResolvedValue([])});
+        createGitProvider.mockReturnValue(provider);
+
+        const only: GitProviderConfig = {
+            type: 'github',
+            org: 'only-org',
+            auth: {type: 'token', api_token: 'tok'},
+        };
+        await new GitSync({enabled: false}).syncProviders(db, [only]);
+
+        // Exactly one provider was constructed — the one we passed.
+        expect(createGitProvider).toHaveBeenCalledTimes(1);
+        expect(createGitProvider).toHaveBeenCalledWith(expect.objectContaining({org: 'only-org'}));
+    });
+});
