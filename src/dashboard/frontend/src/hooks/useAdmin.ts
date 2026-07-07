@@ -10,11 +10,15 @@ import {queryKeys} from '../api/queryKeys';
 import type {
     AdminDataSources,
     AdminDeveloper,
+    AdminGitProvider,
     AdminPasswordReset,
     AdminSubscription,
     AdminTeam,
     AdminUser,
     AdminUserWithTempPassword,
+    GitProviderInput,
+    GitProviderProbeResult,
+    GitProviderSyncHandle,
     ReconciliationResult,
     ReconciliationRunSummary,
     ReconciliationStatus,
@@ -157,6 +161,57 @@ export function useEndAdminSubscription(): UseMutationResult<AdminSubscription, 
 // --- Data sources (read-only) ---
 export function useAdminDataSources(): UseQueryResult<AdminDataSources, Error> {
     return useQuery({queryKey: queryKeys.adminDataSources, queryFn: api.getAdminDataSources});
+}
+
+// --- Git providers (GC1 / #200) ---
+// One list query; every write invalidates it so masked rows + sync status stay
+// fresh. Test-connection is a mutation (a probe with a result), not a query —
+// the admin triggers it explicitly and reads the ok/error inline.
+export function useAdminGitProviders(): UseQueryResult<AdminGitProvider[], Error> {
+    return useQuery({queryKey: queryKeys.adminGitProviders, queryFn: api.getAdminGitProviders});
+}
+
+function useInvalidateGitProviders(): () => void {
+    const qc = useQueryClient();
+    return () => void qc.invalidateQueries({queryKey: queryKeys.adminGitProviders});
+}
+
+export function useCreateAdminGitProvider(): UseMutationResult<AdminGitProvider, Error, GitProviderInput> {
+    const invalidate = useInvalidateGitProviders();
+    return useMutation({mutationFn: api.createAdminGitProvider, onSuccess: invalidate});
+}
+
+export function useUpdateAdminGitProvider(): UseMutationResult<
+    AdminGitProvider,
+    Error,
+    {id: string; patch: GitProviderInput}
+> {
+    const invalidate = useInvalidateGitProviders();
+    return useMutation({
+        mutationFn: ({id, patch}) => api.updateAdminGitProvider(id, patch),
+        onSuccess: invalidate,
+    });
+}
+
+export function useDeleteAdminGitProvider(): UseMutationResult<{id: string; deleted: boolean}, Error, string> {
+    const invalidate = useInvalidateGitProviders();
+    return useMutation({mutationFn: (id: string) => api.deleteAdminGitProvider(id), onSuccess: invalidate});
+}
+
+/** Probe a saved provider by id. Resolves to {ok:false} on a reachability/auth failure. */
+export function useTestAdminGitProvider(): UseMutationResult<GitProviderProbeResult, Error, string> {
+    return useMutation({mutationFn: (id: string) => api.testAdminGitProvider(id)});
+}
+
+/** Probe a draft (unsaved) provider from the form body before saving. */
+export function useTestDraftGitProvider(): UseMutationResult<GitProviderProbeResult, Error, GitProviderInput> {
+    return useMutation({mutationFn: api.testDraftGitProvider});
+}
+
+/** Trigger a sync for one saved provider; the outcome lands on the row (poll the list). */
+export function useSyncAdminGitProvider(): UseMutationResult<GitProviderSyncHandle, Error, string> {
+    const invalidate = useInvalidateGitProviders();
+    return useMutation({mutationFn: (id: string) => api.syncAdminGitProvider(id), onSuccess: invalidate});
 }
 
 // --- Expense reconciliation (Task 4.4 / #99) ---
