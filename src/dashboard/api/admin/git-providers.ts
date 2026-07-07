@@ -12,6 +12,7 @@ import {
 import {
     createProvider,
     deleteProvider,
+    getDecryptedConfig,
     getProvider,
     listProviders,
     toPublicProvider,
@@ -21,6 +22,8 @@ import {
 } from '../../../connectors/git/providers/store';
 import {loadServerKey} from '../../../connectors/git/providers/secret';
 import {providerContainer, resolveGitProviderConfigs} from '../../../connectors/git/providers/config';
+import {createGitProvider} from '../../../connectors/git/providers/factory';
+import {gitProviderFixHint} from '../../../cli/doctor';
 import type {GitConnectorConfig} from '../../../config/types';
 import type {GitProviderConfig, GitProviderType} from '../../../connectors/git/providers/types';
 
@@ -289,6 +292,66 @@ function replyStoreError(reply: Parameters<typeof forbidden>[0], err: GitProvide
 }
 
 /**
+ * The clean probe-result envelope the test-connection endpoints return. A failed
+ * probe is a *successful* execution of the "is this reachable?" job — it resolves
+ * to `{ok:false}` with a typed error + a remediation hint, NEVER a thrown 500.
+ */
+interface ProbeResult {
+    ok: boolean;
+    error?: string;
+    hint?: string;
+}
+
+// Run the cheap reachability/auth probe (checkAccess) against a fully-formed
+// provider config via the canonical factory. Resolves to {ok:true} on success and
+// a typed {ok:false, error, hint} on any failure (bad credentials, unreachable
+// host, unknown org). The hint reuses doctor's `gitProviderFixHint` so UI errors
+// read identically to `toprope doctor` (single source of remediation copy).
+async function probeProvider(config: GitProviderConfig): Promise<ProbeResult> {
+    try {
+        await createGitProvider(config).checkAccess();
+        return {ok: true};
+    } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return {ok: false, error: message, hint: gitProviderFixHint(config.type, message)};
+    }
+}
+
+/** Resolving a saved provider id to its full config: found, unknown, or key-blocked. */
+type SavedConfigResult =
+    | {kind: 'ok'; config: GitProviderConfig}
+    | {kind: 'not_found'}
+    | {kind: 'key_error'; message: string};
+
+// Resolve a SAVED provider (DB row or read-only config-file) by id to its full
+// GitProviderConfig incl. the plaintext token, for a test/repos probe. Config
+// providers carry their token inline (no key needed); DB providers are decrypted
+// with the server key (fail-closed → key_error). Existence is checked BEFORE the
+// key so an unknown id is a 404 even when the key is unconfigured (matches PATCH).
+// Membership in the config-id set — not prefix-parsing — decides the source, so a
+// crafted id can't masquerade as config by shape alone.
+function resolveSavedConfig(
+    db: Database.Database,
+    configs: GitProviderConfig[],
+    id: string,
+): SavedConfigResult {
+    const configMatch = configs.find((c) => configProviderId(c) === id);
+    if (configMatch) return {kind: 'ok', config: configMatch};
+    if (getProvider(db, id) === undefined) return {kind: 'not_found'};
+    try {
+        const config = getDecryptedConfig(db, loadServerKey(), id);
+        // getProvider just confirmed the row exists, so decrypt can't miss it.
+        if (config === undefined) return {kind: 'not_found'};
+        return {kind: 'ok', config};
+    } catch (err) {
+        if (err instanceof GitProviderStoreError && err.code === 'secret_key_unconfigured') {
+            return {kind: 'key_error', message: err.message};
+        }
+        throw err;
+    }
+}
+
+/**
  * Register the admin git-provider CRUD routes. `gitConfig` (optional) is the git
  * connector config; when present, its config-file providers are merged into the
  * GET list as read-only `source: "config"` rows. Omitting it (e.g. in a test that
@@ -395,4 +458,69 @@ export function registerAdminGitProviderRoutes(
         }
         return {data: {id, deleted: true}};
     });
+
+    // POST /:id/test — probe a SAVED provider (DB or read-only config-file) by
+    // reusing provider.checkAccess(). A failed probe is a 200 with {ok:false}: the
+    // request was processed; only the *result* is a reachability/auth failure.
+    app.post<{Params: {id: string}}>(
+        '/api/admin/git/providers/:id/test',
+        async (request, reply) => {
+            if (!isAdmin(request)) return forbidden(reply);
+            const {id} = request.params;
+            const resolved = resolveSavedConfig(db, configProviders(), id);
+            if (resolved.kind === 'not_found') return notFound(reply, `Git provider not found: ${id}`);
+            if (resolved.kind === 'key_error') return serviceUnavailable(reply, resolved.message);
+            return probeProvider(resolved.config);
+        },
+    );
+
+    // POST /test — probe a DRAFT (unsaved) provider from the submitted body. The
+    // token comes from the request and NOTHING is persisted. Validation reuses the
+    // same fail-closed parser as create (parseProviderBody) — unknown type/auth or
+    // a missing token is a 400 (can't probe without a credential).
+    app.post<{Body: unknown}>('/api/admin/git/providers/test', async (request, reply) => {
+        if (!isAdmin(request)) return forbidden(reply);
+        const body = asObject(request.body);
+        if (!body) return badRequest(reply, 'Request body must be an object');
+
+        let parsed: ParsedProviderBody;
+        try {
+            // tokenRequired = true: a draft with no credential can't be probed.
+            parsed = parseProviderBody(body, true);
+        } catch (err) {
+            if (err instanceof BadProviderRequestError) return badRequest(reply, err.message);
+            throw err;
+        }
+        // parsed.config carries the submitted token inline; no DB write occurs.
+        return probeProvider(parsed.config);
+    });
+
+    // GET /:id/repos — enumerate a SAVED provider's repositories for the picker.
+    // Returns {name, archived, defaultBranch} so the UI can list archived repos but
+    // exclude them by default. A failed listing is a clean 502 {ok:false}, not a 500.
+    app.get<{Params: {id: string}}>(
+        '/api/admin/git/providers/:id/repos',
+        async (request, reply) => {
+            if (!isAdmin(request)) return forbidden(reply);
+            const {id} = request.params;
+            const resolved = resolveSavedConfig(db, configProviders(), id);
+            if (resolved.kind === 'not_found') return notFound(reply, `Git provider not found: ${id}`);
+            if (resolved.kind === 'key_error') return serviceUnavailable(reply, resolved.message);
+
+            try {
+                const repos = await createGitProvider(resolved.config).listRepos();
+                return {
+                    data: repos.map((r) => ({
+                        name: r.name,
+                        archived: r.isArchived,
+                        defaultBranch: r.defaultBranch,
+                    })),
+                };
+            } catch (err) {
+                const message = err instanceof Error ? err.message : String(err);
+                reply.status(502);
+                return {ok: false, error: message, hint: gitProviderFixHint(resolved.config.type, message)};
+            }
+        },
+    );
 }
