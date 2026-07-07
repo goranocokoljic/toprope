@@ -4,6 +4,7 @@ import type {
     AdminPasswordReset,
     AdminSubscription,
     AdminTeam,
+    AdminGitProvider,
     AdminUser,
     AdminUserWithTempPassword,
     AnomalyAlert,
@@ -17,6 +18,10 @@ import type {
     DeveloperIdentity,
     DeveloperJourney,
     MyPRReviewCoaching,
+    GitProviderInput,
+    GitProviderProbeResult,
+    GitProviderRepo,
+    GitProviderSyncHandle,
     GlobalSettings,
     Leaderboard,
     LeaderboardAvailability,
@@ -137,6 +142,10 @@ async function patchJson<T>(path: string, body: unknown): Promise<T> {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(body),
     });
+}
+
+async function deleteJson<T>(path: string): Promise<T> {
+    return request<T>(path, {method: 'DELETE'});
 }
 
 /**
@@ -513,6 +522,69 @@ export const api = {
     // --- Admin: data sources (read-only) ---
     async getAdminDataSources(): Promise<AdminDataSources> {
         const body = await request<ApiEnvelope<AdminDataSources>>('/api/admin/data-sources');
+        return body.data;
+    },
+
+    // --- Admin: git providers (GC1 / #200) ---
+    // Every route is admin-gated server-side. Tokens are write-only: they are
+    // sent on create/update and NEVER returned — responses carry only the mask.
+    async getAdminGitProviders(): Promise<AdminGitProvider[]> {
+        const body = await request<ApiEnvelope<AdminGitProvider[]>>('/api/admin/git/providers');
+        return body.data;
+    },
+
+    async createAdminGitProvider(input: GitProviderInput): Promise<AdminGitProvider> {
+        const body = await postJson<ApiEnvelope<AdminGitProvider>>('/api/admin/git/providers', input);
+        return body.data;
+    },
+
+    async updateAdminGitProvider(id: string, patch: GitProviderInput): Promise<AdminGitProvider> {
+        const body = await patchJson<ApiEnvelope<AdminGitProvider>>(
+            `/api/admin/git/providers/${encodeURIComponent(id)}`,
+            patch,
+        );
+        return body.data;
+    },
+
+    async deleteAdminGitProvider(id: string): Promise<{id: string; deleted: boolean}> {
+        const body = await deleteJson<ApiEnvelope<{id: string; deleted: boolean}>>(
+            `/api/admin/git/providers/${encodeURIComponent(id)}`,
+        );
+        return body.data;
+    },
+
+    /**
+     * List a SAVED provider's repositories for the repo-scope picker (GC1.9 /
+     * #201). Returns `{name, archived, defaultBranch}` per repo. A failed listing
+     * is a 502 on the server, so this rejects (ApiError) rather than resolving —
+     * the picker surfaces the error and the admin can still choose "monitor all".
+     */
+    async getAdminGitProviderRepos(id: string): Promise<GitProviderRepo[]> {
+        const body = await request<ApiEnvelope<GitProviderRepo[]>>(
+            `/api/admin/git/providers/${encodeURIComponent(id)}/repos`,
+        );
+        return body.data;
+    },
+
+    /** Probe a SAVED provider (DB row or read-only config) by id. */
+    async testAdminGitProvider(id: string): Promise<GitProviderProbeResult> {
+        return postJson<GitProviderProbeResult>(
+            `/api/admin/git/providers/${encodeURIComponent(id)}/test`,
+            {},
+        );
+    },
+
+    /** Probe a DRAFT (unsaved) provider from the form body — nothing is persisted. */
+    async testDraftGitProvider(input: GitProviderInput): Promise<GitProviderProbeResult> {
+        return postJson<GitProviderProbeResult>('/api/admin/git/providers/test', input);
+    },
+
+    /** Trigger a sync for one saved DB provider (fire-and-forget). */
+    async syncAdminGitProvider(id: string): Promise<GitProviderSyncHandle> {
+        const body = await postJson<ApiEnvelope<GitProviderSyncHandle>>(
+            `/api/admin/git/providers/${encodeURIComponent(id)}/sync`,
+            {},
+        );
         return body.data;
     },
 

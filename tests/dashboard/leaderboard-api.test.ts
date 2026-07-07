@@ -1,4 +1,4 @@
-import {describe, it, expect, beforeEach, afterEach} from 'vitest';
+import {describe, it, expect, beforeEach, afterEach, vi} from 'vitest';
 import Fastify, {type FastifyInstance} from 'fastify';
 import type Database from 'better-sqlite3';
 import {makeTestDb} from './fixtures';
@@ -133,6 +133,12 @@ describe('Leaderboard API (Task 2.17)', () => {
     let devToken: string;
 
     beforeEach(async () => {
+        // Freeze the clock so the ranking's rolling 30-day window (relative to
+        // `new Date()`) always contains the 2026-05-29 seeds; otherwise these
+        // date-relative assertions rot as real wall-clock time advances past
+        // the window. Date-only fake so async fastify inject is unaffected.
+        vi.useFakeTimers({toFake: ['Date']});
+        vi.setSystemTime(new Date(NOW));
         db = makeTestDb();
         const hash = await hashPassword(PASSWORD);
         createUser(db, {email: 'admin@test.com', passwordHash: hash, role: 'admin'});
@@ -157,6 +163,7 @@ describe('Leaderboard API (Task 2.17)', () => {
     afterEach(async () => {
         await app.close();
         db.close();
+        vi.useRealTimers();
     });
 
     describe('default (leaderboard disabled)', () => {

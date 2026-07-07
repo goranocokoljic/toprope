@@ -120,7 +120,7 @@ export function buildServerWithDb(config: Partial<TopropeConfig>): FastifyInstan
     registerExportRoutes(app, db);
     registerSettingsRoutes(app, db);
     registerLeaderboardRoutes(app, db);
-    registerAdminRoutes(app, db);
+    registerAdminRoutes(app, db, config.connectors?.git);
     // Phase 3 reads: pre-computed aggregates, maturity trend, and AI summaries.
     registerAggregateRoutes(app, db);
     registerMaturityRoutes(app, db);

@@ -30,6 +30,16 @@ export function conflict(reply: FastifyReply, message: string): void {
     reply.status(409).send({error: 'Conflict', message});
 }
 
+/**
+ * A server-side misconfiguration the client cannot fix by changing its request —
+ * e.g. the git-provider secret key is unset (fail-closed). Deliberately 503, NOT
+ * 500: it is a known, recoverable operator condition with a clear remediation
+ * message, not an unhandled crash.
+ */
+export function serviceUnavailable(reply: FastifyReply, message: string): void {
+    reply.status(503).send({error: 'Service Unavailable', message});
+}
+
 /** Narrow an unknown request body to a plain key→value object, or null. */
 export function asObject(body: unknown): Record<string, unknown> | null {
     if (typeof body !== 'object' || body === null || Array.isArray(body)) {

@@ -4,12 +4,25 @@ import {aggregateDailyMetrics} from './analyzer.js';
 import {toAnalysisCommit, toAnalysisPR, toAnalysisReviewComment} from './analysis-types.js';
 import type {AnalysisCommit, AnalysisPR, AnalysisReviewComment} from './analysis-types.js';
 import {createGitProvider} from './providers/factory.js';
-import {resolveGitProviderConfigs} from './providers/config.js';
+import {providerContainer} from './providers/config.js';
+import {resolveAllGitProviders} from './providers/resolve.js';
+import {loadServerKey} from './providers/secret.js';
 import type {GitProviderConfig, GitProviderType, GitCommit, GitFileDiff, GitPR} from './providers/types.js';
 import type {ConnectorInterface, SyncResult} from '../types.js';
 import type {GitConnectorConfig} from '../../config/types.js';
 
 const CONNECTOR_NAME = 'git';
+
+/**
+ * Prefix of the advisory pushed into a SyncResult's `errors` when some commit
+ * authors have no developer record. This is NOT a sync failure — unmatched
+ * authors (CI bots, external contributors, not-yet-mapped humans) are the
+ * expected steady state and their commits are simply dropped. Callers that
+ * classify a run's outcome (e.g. the sync-now API) must exclude this advisory
+ * from genuine errors; exported so there is a single source of truth for the
+ * sentinel rather than a matched string literal that can drift.
+ */
+export const UNMATCHED_AUTHORS_PREFIX = 'Unmatched authors (no developer record found):';
 
 function syncStateKey(providerType: GitProviderType, identifier: string): string {
     return `git_last_sync:${providerType}:${identifier}`;
@@ -196,13 +209,9 @@ function upsertSnapshot(db: Database.Database, snap: GitSnapshotRow): 'written' 
     return result.changes > 0 ? 'written' : 'skipped';
 }
 
-function providerIdentifier(config: GitProviderConfig): string {
-    switch (config.type) {
-        case 'github': return config.org;
-        case 'bitbucket': return config.workspace;
-        case 'gitlab': return config.group;
-    }
-}
+// Raw container identifier (org/workspace/group) for a provider — the canonical
+// helper, shared with the resolver so the mapping lives in one place.
+const providerIdentifier = providerContainer;
 
 function applyRepoFilter(
     repos: string[],
@@ -557,7 +566,7 @@ export class GitSync implements ConnectorInterface {
     }
 
     getLastSyncTime(db: Database.Database): string | null {
-        const providers = this.getProviderConfigs();
+        const providers = this.getProviderConfigs(db);
         let latest: string | null = null;
         for (const pc of providers) {
             const key = syncStateKey(pc.type, providerIdentifier(pc));
@@ -571,13 +580,7 @@ export class GitSync implements ConnectorInterface {
     }
 
     async sync(db: Database.Database, providerFilter?: string): Promise<SyncResult> {
-        const errors: string[] = [];
-        let snapshotsWritten = 0;
-        let snapshotsSkipped = 0;
-        const now = new Date().toISOString();
-        const allUnmatched = new Set<string>();
-
-        const providerConfigs = this.getProviderConfigs().filter(
+        const providerConfigs = this.getProviderConfigs(db).filter(
             (pc) => !providerFilter || pc.type === providerFilter,
         );
 
@@ -589,9 +592,49 @@ export class GitSync implements ConnectorInterface {
                 errors: providerFilter
                     ? [`No provider of type '${providerFilter}' configured`]
                     : ['No git providers configured'],
-                lastSyncTime: now,
+                lastSyncTime: new Date().toISOString(),
             };
         }
+
+        return this.runSync(db, providerConfigs);
+    }
+
+    /**
+     * Run the sync pipeline over an EXPLICIT provider set — the seam the
+     * per-provider "sync now" API (GC1.7 / #199) triggers with a single provider.
+     * It reuses the exact fetch → merge → upsert path {@link sync} runs (no cloned
+     * sync logic): the ONLY difference is the caller supplies the provider configs
+     * instead of them being resolved from DB + config here. An empty list yields
+     * the same "nothing configured" shape rather than throwing.
+     */
+    async syncProviders(
+        db: Database.Database,
+        providerConfigs: GitProviderConfig[],
+    ): Promise<SyncResult> {
+        if (providerConfigs.length === 0) {
+            return {
+                connector: CONNECTOR_NAME,
+                snapshotsWritten: 0,
+                snapshotsSkipped: 0,
+                errors: ['No git providers configured'],
+                lastSyncTime: new Date().toISOString(),
+            };
+        }
+        return this.runSync(db, providerConfigs);
+    }
+
+    // The shared pipeline body for both entry points above. Assumes a non-empty,
+    // already-resolved provider set (callers own resolution + the empty case) so
+    // the fetch/merge/upsert logic lives in exactly one place.
+    private async runSync(
+        db: Database.Database,
+        providerConfigs: GitProviderConfig[],
+    ): Promise<SyncResult> {
+        const errors: string[] = [];
+        let snapshotsWritten = 0;
+        let snapshotsSkipped = 0;
+        const now = new Date().toISOString();
+        const allUnmatched = new Set<string>();
 
         const devLookup = buildDevLookupMap(db);
         const churnWindowHours = this.config.analysis?.churn_window_hours ?? 48;
@@ -698,15 +741,17 @@ export class GitSync implements ConnectorInterface {
         }
 
         if (allUnmatched.size > 0) {
-            errors.push(
-                `Unmatched authors (no developer record found): ${[...allUnmatched].join(', ')}`,
-            );
+            errors.push(`${UNMATCHED_AUTHORS_PREFIX} ${[...allUnmatched].join(', ')}`);
         }
 
         return {connector: CONNECTOR_NAME, snapshotsWritten, snapshotsSkipped, errors, lastSyncTime: now};
     }
 
-    private getProviderConfigs(): GitProviderConfig[] {
-        return resolveGitProviderConfigs(this.config);
+    // Resolve the providers this sync run should cover: DB-connected providers
+    // (via the store) merged with config-file providers, DB winning on overlap.
+    // Loads the server key here (fail-closed) so a UI-connected provider's token
+    // can be decrypted; a config-only setup with no key is unaffected.
+    private getProviderConfigs(db: Database.Database): GitProviderConfig[] {
+        return resolveAllGitProviders(db, loadServerKey(), this.config);
     }
 }

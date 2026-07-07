@@ -28,6 +28,7 @@ import {AdminIdentities} from './pages/admin/AdminIdentities';
 import {AdminSubscriptions} from './pages/admin/AdminSubscriptions';
 import {AdminReconciliation} from './pages/admin/AdminReconciliation';
 import {AdminDataSources} from './pages/admin/AdminDataSources';
+import {AdminGitProviders} from './pages/admin/AdminGitProviders';
 import {RequireAdmin} from './components/RequireAdmin';
 import {NotFound} from './pages/NotFound';
 
@@ -123,6 +124,14 @@ export function App(): JSX.Element {
                     element={
                         <RequireAdmin>
                             <AdminDataSources />
+                        </RequireAdmin>
+                    }
+                />
+                <Route
+                    path="admin/git-providers"
+                    element={
+                        <RequireAdmin>
+                            <AdminGitProviders />
                         </RequireAdmin>
                     }
                 />
