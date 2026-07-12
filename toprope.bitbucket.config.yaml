@@ -3,8 +3,10 @@
 # Windsurf are off so you can test with a single Bitbucket credential.
 #
 # Set these env vars first (PowerShell):
-#   $env:BITBUCKET_USERNAME     = "your-bitbucket-username"
-#   $env:BITBUCKET_APP_PASSWORD = "the-app-password-you-create"
+# Bitbucket Cloud app passwords are deprecated — use an Atlassian API token and
+# your Atlassian account email as the username (same Basic-auth path):
+#   $env:BITBUCKET_USERNAME     = "your-atlassian-account-email"   # e.g. you@company.com
+#   $env:BITBUCKET_APP_PASSWORD = "the-atlassian-api-token-you-create"
 #   $env:DASHBOARD_PASSWORD     = "something"
 #
 # Then:
@@ -50,8 +52,9 @@ connectors:
         workspace: "your-workspace-slug"      # <-- from bitbucket.org/<workspace>/<repo>
         auth:
           type: "app_password"                # app_password | access_token | oauth
-          username: "${BITBUCKET_USERNAME}"
-          app_password: "${BITBUCKET_APP_PASSWORD}"
+                                              # (app_password = Atlassian API token; see header)
+          username: "${BITBUCKET_USERNAME}"   # Atlassian account email
+          app_password: "${BITBUCKET_APP_PASSWORD}"  # Atlassian API token
         # repos: [] (or omit) = ALL repos in the workspace you can read.
         # To monitor only a subset, list EXACT repo slugs (globs do NOT work
         # in this include list). exclude_repos DOES support globs.

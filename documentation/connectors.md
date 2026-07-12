@@ -225,8 +225,11 @@ stored one; entering a new token replaces it.
 Provider notes:
 
 - **GitHub** — REST API; cloud and Enterprise.
-- **Bitbucket** — REST API 2.0; app-password / token / OAuth; cloud and Server.
-  Raw-author parsing handles Bitbucket's commit author format. See the shipped
+- **Bitbucket** — REST API 2.0; API token (Atlassian account email + token) /
+  access token / OAuth; cloud and Server. The `app_password` auth method is the
+  Atlassian API-token path (Bitbucket app passwords are deprecated; the same
+  Basic-auth flow now uses the account email as the username). Raw-author parsing
+  handles Bitbucket's commit author format. See the shipped
   `toprope.bitbucket.config.yaml`.
 - **GitLab** — REST API v4; PAT / OAuth / job-token; cloud and self-managed;
   understands projects/MRs/notes terminology and subgroups.
