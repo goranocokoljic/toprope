@@ -16,8 +16,10 @@ same window you run the commands from.
 ## 0. Prerequisites (5 min)
 
 - **Node.js 20+** and **npm** (`node -v`).
-- **Git access** to your repos and an **app password / access token** for the
-  provider that hosts them (Bitbucket, GitHub, or GitLab).
+- **Git access** to your repos and an **API token / access token** for the
+  provider that hosts them (Bitbucket, GitHub, or GitLab). For Bitbucket Cloud use
+  an **Atlassian API token** (app passwords are deprecated) — authenticate with
+  your Atlassian account email as the username.
 - API tokens for whichever AI tools you pay for (Copilot, Claude Code, Windsurf,
   Cursor). You can dogfood with a subset — connectors you leave `enabled: false`
   are simply skipped.
@@ -56,8 +58,8 @@ you have credentials for; multiple git providers can be configured at once. Then
 export the referenced secrets:
 
 ```powershell
-$env:BITBUCKET_USERNAME     = "your-bitbucket-username"
-$env:BITBUCKET_APP_PASSWORD = "the-app-password-you-create"
+$env:BITBUCKET_USERNAME     = "your-atlassian-account-email"   # e.g. you@company.com
+$env:BITBUCKET_APP_PASSWORD = "the-atlassian-api-token-you-create"
 $env:GITHUB_API_TOKEN       = "ghp_..."        # if GitHub is enabled
 $env:COPILOT_API_TOKEN      = "..."            # if Copilot is enabled
 $env:CLAUDE_CODE_API_TOKEN  = "..."            # if Claude Code is enabled
