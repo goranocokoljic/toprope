@@ -666,10 +666,11 @@ describe('GitSync', () => {
         await new GitSync(makeGithubConfig()).sync(db);
 
         const after1 = db
-            .prepare(`SELECT commits, lines_added FROM git_snapshots WHERE date = '2024-01-15'`)
-            .get() as {commits: number; lines_added: number};
+            .prepare(`SELECT commits, lines_added, avg_commit_size FROM git_snapshots WHERE date = '2024-01-15'`)
+            .get() as {commits: number; lines_added: number; avg_commit_size: number};
         expect(after1.commits).toBe(1);
         expect(after1.lines_added).toBe(50);
+        expect(after1.avg_commit_size).toBeGreaterThan(0);
 
         // Run 2: a NEW GitHub commit the same day (incremental — the `since` cursor
         // has advanced past c1, so run 2 fetches only c2). REPLACE would drop c1;
@@ -684,12 +685,63 @@ describe('GitSync', () => {
         await new GitSync(makeGithubConfig()).sync(db);
 
         const after2 = db
-            .prepare(`SELECT commits, lines_added, data_source FROM git_snapshots WHERE date = '2024-01-15'`)
-            .get() as {commits: number; lines_added: number; data_source: string};
+            .prepare(`SELECT commits, lines_added, data_source, avg_commit_size FROM git_snapshots WHERE date = '2024-01-15'`)
+            .get() as {commits: number; lines_added: number; data_source: string; avg_commit_size: number};
         expect(after2.commits).toBe(2); // c1 + c2, not just c2
         expect(after2.lines_added).toBe(100); // 50 + 50
         expect(after2.data_source).toBe('github'); // same provider on both runs
+        // Rate/score fields go through the commit-weighted re-merge path: two identical
+        // commits keep avg_commit_size stable (a break in the weighting would move it).
+        expect(after2.avg_commit_size).toBeCloseTo(after1.avg_commit_size, 10);
         expect(countSnapshots(db)).toBe(1);
+    });
+
+    it('re-delivered PRs and review comments do not double-count across incremental runs (#205, SEC-1)', async () => {
+        // PR author + a distinct reviewer, both known.
+        const aliceId = seedDev(db, 'alice');
+        const bobId = seedDev(db, 'bob');
+        const createGitProvider = await getCreateGitProvider();
+
+        // Providers fetch PRs by updated_at, so an active PR (and its comments) is
+        // re-fetched on every subsequent sync. Two runs deliver the SAME PR + comment;
+        // the day's prs_opened / prs_merged / review_comments_given must not inflate.
+        const makeProvider = (): GitProvider => makeMockProvider({
+            name: 'github',
+            listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+            getCommits: vi.fn().mockResolvedValue([]),
+            getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+            getReviewComments: vi.fn().mockResolvedValue([makeProviderReviewComment('bob')]),
+        });
+
+        createGitProvider.mockReturnValueOnce(makeProvider());
+        await new GitSync(makeGithubConfig()).sync(db);
+
+        // makeProviderPR: created 01-15 (prs_opened), merged 01-16 (prs_merged);
+        // comment by bob on 01-15 (review_comments_given).
+        const openedAfter1 = db
+            .prepare(`SELECT prs_opened FROM git_snapshots WHERE developer_id = ? AND date = '2024-01-15'`)
+            .get(aliceId) as {prs_opened: number};
+        expect(openedAfter1.prs_opened).toBe(1);
+
+        // Second run re-delivers the identical PR + comment.
+        createGitProvider.mockReturnValueOnce(makeProvider());
+        await new GitSync(makeGithubConfig()).sync(db);
+
+        const opened = db
+            .prepare(`SELECT prs_opened FROM git_snapshots WHERE developer_id = ? AND date = '2024-01-15'`)
+            .get(aliceId) as {prs_opened: number};
+        const merged = db
+            .prepare(`SELECT prs_merged, avg_time_to_merge_hours FROM git_snapshots WHERE developer_id = ? AND date = '2024-01-16'`)
+            .get(aliceId) as {prs_merged: number; avg_time_to_merge_hours: number};
+        const reviewed = db
+            .prepare(`SELECT review_comments_given FROM git_snapshots WHERE developer_id = ? AND date = '2024-01-15'`)
+            .get(bobId) as {review_comments_given: number};
+
+        // Additive summing would make each of these 2; the idempotent re-merge holds them at 1.
+        expect(opened.prs_opened).toBe(1);
+        expect(merged.prs_merged).toBe(1);
+        expect(merged.avg_time_to_merge_hours).toBeCloseTo(26, 5); // 01-15T08:00 → 01-16T10:00
+        expect(reviewed.review_comments_given).toBe(1);
     });
 
     it('tracks sync state independently per provider', async () => {

@@ -121,8 +121,20 @@ function resolveDeveloperId(
     return null;
 }
 
-// Merge two snapshots for the same (developer_id, date) from different providers.
-// Additive for counts; weighted average for rates and scores.
+// Commit-count-weighted mean of a rate/score field. When two snapshots' commit
+// counts add, a straight average would ignore that one side may represent far more
+// commits than the other. total===0 (no commits on either side) yields 0 — the
+// neutral value for these per-commit metrics.
+function commitWeightedAvg(aVal: number, aCommits: number, bVal: number, bCommits: number): number {
+    const total = aCommits + bCommits;
+    return total > 0 ? (aVal * aCommits + bVal * bCommits) / total : 0;
+}
+
+// Merge two snapshots for the same (developer_id, date) from DIFFERENT providers
+// WITHIN a single sync run. Every field is additive/combinable because the two sides
+// are genuinely disjoint (distinct providers, distinct PRs). This is NOT the right
+// rule for combining against a previously-stored row across runs — see
+// remergeStoredSnapshot for why PR/review fields must not be summed there.
 function mergeSnapshots(a: GitSnapshotRow, b: GitSnapshotRow): GitSnapshotRow {
     const totalCommits = a.commits + b.commits;
     const totalPrs = a.prs_merged + b.prs_merged;
@@ -133,14 +145,6 @@ function mergeSnapshots(a: GitSnapshotRow, b: GitSnapshotRow): GitSnapshotRow {
     } else {
         avgTTM = a.avg_time_to_merge_hours ?? b.avg_time_to_merge_hours;
     }
-
-    const avgCommitSize = totalCommits > 0
-        ? (a.avg_commit_size * a.commits + b.avg_commit_size * b.commits) / totalCommits
-        : 0;
-
-    const avgAiScore = totalCommits > 0
-        ? (a.ai_signature_score * a.commits + b.ai_signature_score * b.commits) / totalCommits
-        : 0;
 
     // Cross-provider churn cannot be recomputed without the full commit set; simple average is an approximation.
     const avgChurn = (a.code_churn_rate + b.code_churn_rate) / 2;
@@ -157,26 +161,71 @@ function mergeSnapshots(a: GitSnapshotRow, b: GitSnapshotRow): GitSnapshotRow {
         review_comments_given: a.review_comments_given + b.review_comments_given,
         avg_time_to_merge_hours: avgTTM,
         code_churn_rate: avgChurn,
-        ai_signature_score: avgAiScore,
-        avg_commit_size: avgCommitSize,
+        ai_signature_score: commitWeightedAvg(a.ai_signature_score, a.commits, b.ai_signature_score, b.commits),
+        avg_commit_size: commitWeightedAvg(a.avg_commit_size, a.commits, b.avg_commit_size, b.commits),
         commit_burst_count: a.commit_burst_count + b.commit_burst_count,
         data_source: a.data_source === b.data_source ? a.data_source : 'multi',
     };
 }
 
-// Re-merge the incoming snapshot against the stored (developer_id, date) row
-// rather than REPLACE-ing it. Each sync run's snapshot holds only the delta since
-// the provider's `since` cursor, and incremental windows never overlap, so
-// additively re-merging via the canonical mergeSnapshots ADDS the disjoint delta
-// without double-counting. This fixes:
-//   (a) a scoped/per-provider sync (CLI --provider, UI "Sync now") dropping another
-//       provider's same-day contribution — the old REPLACE overwrote the merged row
-//       with just this provider's metrics, and the incremental cursor never re-fetches
-//       the lost commits, so the loss was permanent; and
-//   (b) the latent same-provider cross-run loss — a second incremental run of the
-//       same provider on the same day used to replace the first run's row.
-// Runs inside runSync's outer db.transaction (upsert loop), so this SELECT → merge →
-// write is atomic — no other writer can slip a row in between the read and the write.
+// Re-merge an incoming per-run snapshot against the STORED (developer_id, date) row.
+// Deliberately different from mergeSnapshots (which combines DISTINCT providers within
+// one run and so may add every field): across runs the two sides are NOT disjoint.
+//   - Commit windows ARE disjoint (each run fetches commits on a [since, now] committer-
+//     date window that advances), so commit-derived counts are ADDED — this is the
+//     accumulation the issue asks for.
+//   - PR / review activity is RE-DELIVERED: providers fetch PRs by updated_at/updated_on
+//     (github/bitbucket getPullRequests), so a PR merely touched since the last cursor is
+//     re-fetched and re-aggregated on the next run, and its review comments are re-fetched
+//     unconditionally. Additively summing prs_opened/prs_merged/review_comments_given
+//     against the stored row would inflate them on essentially every scheduled sync of an
+//     active PR. So they are combined with max(): idempotent under re-delivery (re-seeing
+//     the same PRs never inflates) and never below the stored value (a scoped single-
+//     provider run cannot drop another provider's already-recorded PRs). The known cost is
+//     an undercount when genuinely-distinct PRs accrue across runs/providers on the same
+//     day — a bounded, conservative error rooted in git_snapshots having no provider
+//     dimension (tracked by the #192 SEC-2 follow-up), and far preferable to the unbounded
+//     per-sync inflation additive summing would produce.
+//   - Rate/score fields are commit-count-weighted so a small delta can't drag a large
+//     accumulated row halfway (the exponential-recency skew a straight mean would cause).
+function remergeStoredSnapshot(stored: GitSnapshotRow, incoming: GitSnapshotRow): GitSnapshotRow {
+    return {
+        developer_id: stored.developer_id,
+        date: stored.date,
+        commits: stored.commits + incoming.commits,
+        lines_added: stored.lines_added + incoming.lines_added,
+        lines_removed: stored.lines_removed + incoming.lines_removed,
+        files_changed: stored.files_changed + incoming.files_changed,
+        prs_opened: Math.max(stored.prs_opened, incoming.prs_opened),
+        prs_merged: Math.max(stored.prs_merged, incoming.prs_merged),
+        review_comments_given: Math.max(stored.review_comments_given, incoming.review_comments_given),
+        // avg_time_to_merge pairs with the (re-delivered) prs_merged; keep the first
+        // established value rather than averaging two re-observations of the same PRs.
+        avg_time_to_merge_hours: stored.avg_time_to_merge_hours ?? incoming.avg_time_to_merge_hours,
+        code_churn_rate: commitWeightedAvg(stored.code_churn_rate, stored.commits, incoming.code_churn_rate, incoming.commits),
+        ai_signature_score: commitWeightedAvg(stored.ai_signature_score, stored.commits, incoming.ai_signature_score, incoming.commits),
+        avg_commit_size: commitWeightedAvg(stored.avg_commit_size, stored.commits, incoming.avg_commit_size, incoming.commits),
+        commit_burst_count: stored.commit_burst_count + incoming.commit_burst_count,
+        data_source: stored.data_source === incoming.data_source ? stored.data_source : 'multi',
+    };
+}
+
+// Re-merge the incoming snapshot against the stored (developer_id, date) row rather
+// than REPLACE-ing it, so a scoped/per-provider sync (CLI --provider, UI "Sync now")
+// no longer overwrites the merged row with just its own metrics and permanently drops
+// another provider's same-day commits (the incremental cursor never re-fetches them),
+// and a second incremental run of the same provider on the same day accumulates rather
+// than replaces. remergeStoredSnapshot ADDS the disjoint commit delta while keeping the
+// re-delivered PR/review fields idempotent (see its doc). Runs inside runSync's outer
+// db.transaction (the upsert loop), so this SELECT → merge → write is atomic — no other
+// writer can slip a row in between the read and the write.
+//
+// Known trade-off of the issue's additive-incremental design: because commit counts are
+// added, re-fetching the same commits (a manual cursor reset or a full re-sync with an
+// empty `since`) double-counts them — the rows are no longer reconstructible by re-running
+// sync from scratch. Normal incremental operation never re-fetches a committed window, so
+// this is the accepted cost; a provider-dimension snapshot (the #192 SEC-2 follow-up) is
+// the durable fix.
 function upsertSnapshot(db: Database.Database, snap: GitSnapshotRow): 'written' | 'skipped' {
     const existing = db
         .prepare(
@@ -188,8 +237,8 @@ function upsertSnapshot(db: Database.Database, snap: GitSnapshotRow): 'written' 
         .get(snap.developer_id, snap.date) as GitSnapshotRow | undefined;
 
     // On conflict the stored row already contributed to `merged`, so writing the
-    // merged values is the additive result — not a clobber.
-    const merged = existing ? mergeSnapshots(existing, snap) : snap;
+    // merged values is the accumulated result — not a clobber.
+    const merged = existing ? remergeStoredSnapshot(existing, snap) : snap;
 
     const result = db
         .prepare(
