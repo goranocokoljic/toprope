@@ -164,7 +164,33 @@ function mergeSnapshots(a: GitSnapshotRow, b: GitSnapshotRow): GitSnapshotRow {
     };
 }
 
+// Re-merge the incoming snapshot against the stored (developer_id, date) row
+// rather than REPLACE-ing it. Each sync run's snapshot holds only the delta since
+// the provider's `since` cursor, and incremental windows never overlap, so
+// additively re-merging via the canonical mergeSnapshots ADDS the disjoint delta
+// without double-counting. This fixes:
+//   (a) a scoped/per-provider sync (CLI --provider, UI "Sync now") dropping another
+//       provider's same-day contribution — the old REPLACE overwrote the merged row
+//       with just this provider's metrics, and the incremental cursor never re-fetches
+//       the lost commits, so the loss was permanent; and
+//   (b) the latent same-provider cross-run loss — a second incremental run of the
+//       same provider on the same day used to replace the first run's row.
+// Runs inside runSync's outer db.transaction (upsert loop), so this SELECT → merge →
+// write is atomic — no other writer can slip a row in between the read and the write.
 function upsertSnapshot(db: Database.Database, snap: GitSnapshotRow): 'written' | 'skipped' {
+    const existing = db
+        .prepare(
+            `SELECT developer_id, date, commits, lines_added, lines_removed, files_changed,
+                    prs_opened, prs_merged, review_comments_given, avg_time_to_merge_hours,
+                    code_churn_rate, ai_signature_score, avg_commit_size, commit_burst_count, data_source
+             FROM git_snapshots WHERE developer_id = ? AND date = ?`,
+        )
+        .get(snap.developer_id, snap.date) as GitSnapshotRow | undefined;
+
+    // On conflict the stored row already contributed to `merged`, so writing the
+    // merged values is the additive result — not a clobber.
+    const merged = existing ? mergeSnapshots(existing, snap) : snap;
+
     const result = db
         .prepare(
             `INSERT INTO git_snapshots
@@ -189,21 +215,21 @@ function upsertSnapshot(db: Database.Database, snap: GitSnapshotRow): 'written' 
         )
         .run(
             randomUUID(),
-            snap.developer_id,
-            snap.date,
-            snap.commits,
-            snap.lines_added,
-            snap.lines_removed,
-            snap.files_changed,
-            snap.prs_opened,
-            snap.prs_merged,
-            snap.review_comments_given,
-            snap.avg_time_to_merge_hours,
-            snap.code_churn_rate,
-            snap.ai_signature_score,
-            snap.avg_commit_size,
-            snap.commit_burst_count,
-            snap.data_source,
+            merged.developer_id,
+            merged.date,
+            merged.commits,
+            merged.lines_added,
+            merged.lines_removed,
+            merged.files_changed,
+            merged.prs_opened,
+            merged.prs_merged,
+            merged.review_comments_given,
+            merged.avg_time_to_merge_hours,
+            merged.code_churn_rate,
+            merged.ai_signature_score,
+            merged.avg_commit_size,
+            merged.commit_burst_count,
+            merged.data_source,
         );
 
     return result.changes > 0 ? 'written' : 'skipped';

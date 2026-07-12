@@ -592,6 +592,106 @@ describe('GitSync', () => {
         expect(row!.data_source).toBe('multi');
     });
 
+    it('scoped per-provider sync merges into — not replaces — another provider\'s same-day row (#205)', async () => {
+        // Developer known under both providers, so both providers' commits resolve
+        // to the same (developer_id, date) row.
+        try { addTeam(db, 'eng'); } catch {}
+        const dev = addDeveloper(db, 'Alice', 'eng', 'alice@example.com', 'alice');
+        db.prepare(`UPDATE developers SET external_ids = '{"github":"alice","bitbucket":"alice-bb"}' WHERE id = ?`).run(dev.id);
+
+        const createGitProvider = await getCreateGitProvider();
+
+        // First scoped run (e.g. UI "Sync now" on GitHub): one GitHub commit on 01-15.
+        const githubProvider = makeMockProvider({
+            name: 'github',
+            listRepos: vi.fn().mockResolvedValue([makeRepo('gh-repo')]),
+            getCommits: vi.fn().mockResolvedValue([makeProviderCommit('alice', '2024-01-15T10:00:00Z', 'gh-1')]),
+            getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+        });
+        createGitProvider.mockReturnValueOnce(githubProvider);
+        await new GitSync({enabled: false}).syncProviders(db, [
+            {type: 'github', org: 'gh-org', auth: {type: 'token', api_token: 't'}},
+        ]);
+
+        const afterGithub = db
+            .prepare(`SELECT commits, data_source FROM git_snapshots WHERE developer_id = ? AND date = '2024-01-15'`)
+            .get(dev.id) as {commits: number; data_source: string};
+        expect(afterGithub.commits).toBe(1);
+        expect(afterGithub.data_source).toBe('github');
+
+        // Second scoped run (Sync now on Bitbucket): a DIFFERENT commit the same day.
+        // Under the old REPLACE upsert this run would overwrite the GitHub row and
+        // permanently drop the GitHub commit (its cursor won't re-fetch it).
+        const bitbucketProvider = makeMockProvider({
+            name: 'bitbucket',
+            listRepos: vi.fn().mockResolvedValue([makeRepo('bb-repo')]),
+            getCommits: vi.fn().mockResolvedValue([{
+                sha: 'bb-1',
+                author: {name: 'Alice', email: 'alice@example.com', username: 'alice-bb'},
+                date: '2024-01-15T14:00:00Z',
+                message: 'fix: bug',
+                additions: 20,
+                deletions: 3,
+                filesChanged: ['src/y.ts'],
+            }]),
+            getCommitDiff: vi.fn().mockResolvedValue([{path: 'src/y.ts', additions: 20, deletions: 3, status: 'modified'}]),
+        });
+        createGitProvider.mockReturnValueOnce(bitbucketProvider);
+        await new GitSync({enabled: false}).syncProviders(db, [
+            {type: 'bitbucket', workspace: 'bb-ws', auth: {type: 'app_password', username: 'u', app_password: 'p'}},
+        ]);
+
+        const merged = db
+            .prepare(`SELECT commits, data_source FROM git_snapshots WHERE developer_id = ? AND date = '2024-01-15'`)
+            .get(dev.id) as {commits: number; data_source: string};
+        // GitHub's contribution survived the scoped Bitbucket run: 1 + 1, not replaced by 1.
+        expect(merged.commits).toBe(2);
+        expect(merged.data_source).toBe('multi');
+        // Merged into the single existing row, not duplicated.
+        expect(countSnapshots(db)).toBe(1);
+    });
+
+    it('two incremental runs of the same provider on the same day accumulate rather than replace (#205)', async () => {
+        seedDev(db, 'alice');
+        const createGitProvider = await getCreateGitProvider();
+
+        // Run 1: one GitHub commit on 01-15.
+        const run1 = makeMockProvider({
+            name: 'github',
+            listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+            getCommits: vi.fn().mockResolvedValue([makeProviderCommit('alice', '2024-01-15T09:00:00Z', 'c1')]),
+            getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+        });
+        createGitProvider.mockReturnValueOnce(run1);
+        await new GitSync(makeGithubConfig()).sync(db);
+
+        const after1 = db
+            .prepare(`SELECT commits, lines_added FROM git_snapshots WHERE date = '2024-01-15'`)
+            .get() as {commits: number; lines_added: number};
+        expect(after1.commits).toBe(1);
+        expect(after1.lines_added).toBe(50);
+
+        // Run 2: a NEW GitHub commit the same day (incremental — the `since` cursor
+        // has advanced past c1, so run 2 fetches only c2). REPLACE would drop c1;
+        // the merge must accumulate to two commits.
+        const run2 = makeMockProvider({
+            name: 'github',
+            listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+            getCommits: vi.fn().mockResolvedValue([makeProviderCommit('alice', '2024-01-15T15:00:00Z', 'c2')]),
+            getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+        });
+        createGitProvider.mockReturnValueOnce(run2);
+        await new GitSync(makeGithubConfig()).sync(db);
+
+        const after2 = db
+            .prepare(`SELECT commits, lines_added, data_source FROM git_snapshots WHERE date = '2024-01-15'`)
+            .get() as {commits: number; lines_added: number; data_source: string};
+        expect(after2.commits).toBe(2); // c1 + c2, not just c2
+        expect(after2.lines_added).toBe(100); // 50 + 50
+        expect(after2.data_source).toBe('github'); // same provider on both runs
+        expect(countSnapshots(db)).toBe(1);
+    });
+
     it('tracks sync state independently per provider', async () => {
         const createGitProvider = await getCreateGitProvider();
         const githubProvider = makeMockProvider({name: 'github', listRepos: vi.fn().mockResolvedValue([])});
