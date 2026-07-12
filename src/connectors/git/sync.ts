@@ -199,9 +199,15 @@ function remergeStoredSnapshot(stored: GitSnapshotRow, incoming: GitSnapshotRow)
         prs_opened: Math.max(stored.prs_opened, incoming.prs_opened),
         prs_merged: Math.max(stored.prs_merged, incoming.prs_merged),
         review_comments_given: Math.max(stored.review_comments_given, incoming.review_comments_given),
-        // avg_time_to_merge pairs with the (re-delivered) prs_merged; keep the first
-        // established value rather than averaging two re-observations of the same PRs.
-        avg_time_to_merge_hours: stored.avg_time_to_merge_hours ?? incoming.avg_time_to_merge_hours,
+        // avg_time_to_merge pairs with prs_merged (which we take via max). Source it from
+        // the SAME side that owns the larger merge count so the (count, TTM) pair always
+        // matches a real observation — never a maxed count paired with a stale first-
+        // observed average from a different run. On a tie (the common same-PR re-delivery
+        // case) keep the first-observed value.
+        avg_time_to_merge_hours:
+            incoming.prs_merged > stored.prs_merged
+                ? incoming.avg_time_to_merge_hours ?? stored.avg_time_to_merge_hours
+                : stored.avg_time_to_merge_hours ?? incoming.avg_time_to_merge_hours,
         code_churn_rate: commitWeightedAvg(stored.code_churn_rate, stored.commits, incoming.code_churn_rate, incoming.commits),
         ai_signature_score: commitWeightedAvg(stored.ai_signature_score, stored.commits, incoming.ai_signature_score, incoming.commits),
         avg_commit_size: commitWeightedAvg(stored.avg_commit_size, stored.commits, incoming.avg_commit_size, incoming.commits),

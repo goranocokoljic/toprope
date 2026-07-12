@@ -744,6 +744,156 @@ describe('GitSync', () => {
         expect(reviewed.review_comments_given).toBe(1);
     });
 
+    it('a scoped run that adds commits does not drop another provider\'s already-recorded PR (#205, max never below stored)', async () => {
+        // Developer known under both providers.
+        try { addTeam(db, 'eng'); } catch {}
+        const dev = addDeveloper(db, 'Alice', 'eng', 'alice@example.com', 'alice');
+        db.prepare(`UPDATE developers SET external_ids = '{"github":"alice","bitbucket":"alice-bb"}' WHERE id = ?`).run(dev.id);
+
+        const createGitProvider = await getCreateGitProvider();
+
+        // Run 1 (GitHub): a PR opened 01-15, no commits → stored prs_opened=1.
+        const githubProvider = makeMockProvider({
+            name: 'github',
+            listRepos: vi.fn().mockResolvedValue([makeRepo('gh-repo')]),
+            getCommits: vi.fn().mockResolvedValue([]),
+            getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+        });
+        createGitProvider.mockReturnValueOnce(githubProvider);
+        await new GitSync({enabled: false}).syncProviders(db, [
+            {type: 'github', org: 'gh-org', auth: {type: 'token', api_token: 't'}},
+        ]);
+        expect(
+            (db.prepare(`SELECT prs_opened FROM git_snapshots WHERE developer_id = ? AND date = '2024-01-15'`)
+                .get(dev.id) as {prs_opened: number}).prs_opened,
+        ).toBe(1);
+
+        // Run 2 (Bitbucket, scoped): a COMMIT on the same day, NO PRs → incoming.prs_opened=0.
+        // remerge must keep the stored prs_opened (max(1,0)=1); a regression to `incoming`
+        // would drop it to 0 — the exact #205 data-loss bug, for PR fields.
+        const bitbucketProvider = makeMockProvider({
+            name: 'bitbucket',
+            listRepos: vi.fn().mockResolvedValue([makeRepo('bb-repo')]),
+            getCommits: vi.fn().mockResolvedValue([{
+                sha: 'bb-1',
+                author: {name: 'Alice', email: 'alice@example.com', username: 'alice-bb'},
+                date: '2024-01-15T14:00:00Z',
+                message: 'fix: bug',
+                additions: 10,
+                deletions: 2,
+                filesChanged: ['src/y.ts'],
+            }]),
+            getCommitDiff: vi.fn().mockResolvedValue([{path: 'src/y.ts', additions: 10, deletions: 2, status: 'modified'}]),
+        });
+        createGitProvider.mockReturnValueOnce(bitbucketProvider);
+        await new GitSync({enabled: false}).syncProviders(db, [
+            {type: 'bitbucket', workspace: 'bb-ws', auth: {type: 'app_password', username: 'u', app_password: 'p'}},
+        ]);
+
+        const row = db
+            .prepare(`SELECT prs_opened, commits FROM git_snapshots WHERE developer_id = ? AND date = '2024-01-15'`)
+            .get(dev.id) as {prs_opened: number; commits: number};
+        expect(row.prs_opened).toBe(1); // preserved, not dropped to 0
+        expect(row.commits).toBe(1); // Bitbucket's commit accumulated
+    });
+
+    it('commit-weights rate fields on re-merge (a small delta cannot drag a large accumulated row to a plain mean) (#205)', async () => {
+        seedDev(db, 'alice');
+        const createGitProvider = await getCreateGitProvider();
+
+        // avg_commit_size = (additions + deletions) / commits (per analyzer). Run 1:
+        // two commits @ 100 additions → stored avg_commit_size = 100 over 2 commits.
+        const bigCommit = (sha: string): GitCommit => ({
+            sha,
+            author: {name: 'alice', email: 'alice@example.com', username: 'alice'},
+            date: '2024-01-15T09:00:00Z',
+            message: 'feat: big',
+            additions: 100,
+            deletions: 0,
+            filesChanged: ['src/a.ts'],
+        });
+        createGitProvider.mockReturnValueOnce(makeMockProvider({
+            name: 'github',
+            listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+            getCommits: vi.fn().mockResolvedValue([bigCommit('b1'), bigCommit('b2')]),
+            getCommitDiff: vi.fn().mockResolvedValue([]),
+        }));
+        await new GitSync(makeGithubConfig()).sync(db);
+        expect(
+            (db.prepare(`SELECT commits, avg_commit_size FROM git_snapshots WHERE date = '2024-01-15'`)
+                .get() as {commits: number; avg_commit_size: number}).avg_commit_size,
+        ).toBeCloseTo(100, 5);
+
+        // Run 2: one small commit @ 20 additions (this run's avg_commit_size = 20).
+        createGitProvider.mockReturnValueOnce(makeMockProvider({
+            name: 'github',
+            listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+            getCommits: vi.fn().mockResolvedValue([{
+                sha: 's1',
+                author: {name: 'alice', email: 'alice@example.com', username: 'alice'},
+                date: '2024-01-15T15:00:00Z',
+                message: 'fix: small',
+                additions: 20,
+                deletions: 0,
+                filesChanged: ['src/a.ts'],
+            }]),
+            getCommitDiff: vi.fn().mockResolvedValue([]),
+        }));
+        await new GitSync(makeGithubConfig()).sync(db);
+
+        const row = db
+            .prepare(`SELECT commits, avg_commit_size FROM git_snapshots WHERE date = '2024-01-15'`)
+            .get() as {commits: number; avg_commit_size: number};
+        expect(row.commits).toBe(3);
+        // Commit-weighted: (100*2 + 20*1)/3 = 73.33 — NOT the plain mean (100+20)/2 = 60.
+        expect(row.avg_commit_size).toBeCloseTo(73.333, 2);
+    });
+
+    it('avg_time_to_merge tracks the run that owns the larger prs_merged, not a frozen first value (#205, SO-1)', async () => {
+        seedDev(db, 'alice');
+        const createGitProvider = await getCreateGitProvider();
+
+        // Run 1: one PR merged 01-16 → ttm 26h (created 01-15T08 → merged 01-16T10).
+        createGitProvider.mockReturnValueOnce(makeMockProvider({
+            name: 'github',
+            listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+            getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+        }));
+        await new GitSync(makeGithubConfig()).sync(db);
+        expect(
+            (db.prepare(`SELECT prs_merged, avg_time_to_merge_hours FROM git_snapshots WHERE developer_id = (SELECT id FROM developers WHERE external_ids = '{"github":"alice"}') AND date = '2024-01-16'`)
+                .get() as {prs_merged: number; avg_time_to_merge_hours: number}).avg_time_to_merge_hours,
+        ).toBeCloseTo(26, 5);
+
+        // Run 2 re-delivers PR#1 AND a distinct PR#2 also merged 01-16 with ttm 10h
+        // (created 01-16T00 → merged 01-16T10). incoming prs_merged=2, avg ttm=(26+10)/2=18.
+        const pr2: GitPR = {
+            id: '2',
+            title: 'feat: second',
+            author: {name: 'alice', email: 'alice@example.com', username: 'alice'},
+            state: 'merged',
+            createdAt: '2024-01-16T00:00:00Z',
+            mergedAt: '2024-01-16T10:00:00Z',
+            closedAt: '2024-01-16T10:00:00Z',
+            reviewers: [],
+            additions: 10,
+            deletions: 2,
+        };
+        createGitProvider.mockReturnValueOnce(makeMockProvider({
+            name: 'github',
+            listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+            getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice'), pr2]),
+        }));
+        await new GitSync(makeGithubConfig()).sync(db);
+
+        const row = db
+            .prepare(`SELECT prs_merged, avg_time_to_merge_hours FROM git_snapshots WHERE developer_id = (SELECT id FROM developers WHERE external_ids = '{"github":"alice"}') AND date = '2024-01-16'`)
+            .get() as {prs_merged: number; avg_time_to_merge_hours: number};
+        expect(row.prs_merged).toBe(2); // max(1, 2)
+        // TTM follows the larger-merge-count side (incoming, 18h), not the frozen 26h.
+        expect(row.avg_time_to_merge_hours).toBeCloseTo(18, 5);
+    });
+
     it('tracks sync state independently per provider', async () => {
         const createGitProvider = await getCreateGitProvider();
         const githubProvider = makeMockProvider({name: 'github', listRepos: vi.fn().mockResolvedValue([])});
