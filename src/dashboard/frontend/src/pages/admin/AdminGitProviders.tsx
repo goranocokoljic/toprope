@@ -59,7 +59,11 @@ const PROVIDER_META: Record<GitProviderType, ProviderMeta> = {
         containerLabel: 'Workspace',
         containerPlaceholder: 'my-workspace',
         authMethods: [
-            {value: 'app_password', label: 'App password (username + password)'},
+            // `app_password` is the stored discriminant (kept for wire/DB
+            // compatibility); Atlassian deprecated Bitbucket app passwords, so the
+            // label reflects their replacement — an API token authenticated with the
+            // Atlassian account email over the same Basic-auth path.
+            {value: 'app_password', label: 'API token (email + token)'},
             {value: 'access_token', label: 'Access token'},
             {value: 'oauth', label: 'OAuth token'},
         ],
@@ -327,14 +331,14 @@ function ProviderForm({
                 <div className="flex flex-wrap items-end gap-4">
                     {isBitbucketAppPassword ? (
                         <TextField
-                            label="Username"
+                            label="Atlassian account email"
                             value={username}
                             onChange={setUsername}
-                            placeholder="bitbucket-username"
+                            placeholder="you@company.com"
                         />
                     ) : null}
                     <TextField
-                        label={isBitbucketAppPassword ? 'App password' : 'Token'}
+                        label={isBitbucketAppPassword ? 'API token' : 'Token'}
                         value={token}
                         onChange={setToken}
                         type="password"

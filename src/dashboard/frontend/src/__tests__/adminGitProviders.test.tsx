@@ -224,12 +224,15 @@ describe('AdminGitProviders — dynamic form', () => {
         fireEvent.change(screen.getByRole('combobox', {name: 'Provider type'}), {target: {value: 'bitbucket'}});
         // Container label switches to Workspace.
         expect(screen.getByLabelText('Workspace')).toBeInTheDocument();
-        // Default method is app_password → username + "App password" fields.
-        expect(screen.getByLabelText('Username')).toBeInTheDocument();
-        expect(screen.getByLabelText('App password')).toBeInTheDocument();
-        // Switch to access_token → username disappears, field becomes "Token".
+        // Default method is app_password (stored discriminant, relabeled for the
+        // Atlassian API-token migration) → email + "API token" fields.
+        expect(screen.getByLabelText('Atlassian account email')).toBeInTheDocument();
+        expect(screen.getByLabelText('API token')).toBeInTheDocument();
+        // The auth-method option is relabeled but keeps its app_password value.
+        expect(screen.getByRole('option', {name: 'API token (email + token)'})).toBeInTheDocument();
+        // Switch to access_token → email disappears, field becomes "Token".
         fireEvent.change(screen.getByRole('combobox', {name: 'Auth method'}), {target: {value: 'access_token'}});
-        expect(screen.queryByLabelText('Username')).not.toBeInTheDocument();
+        expect(screen.queryByLabelText('Atlassian account email')).not.toBeInTheDocument();
         expect(screen.getByLabelText('Token')).toBeInTheDocument();
     });
 
@@ -268,6 +271,28 @@ describe('AdminGitProviders — create + test', () => {
         });
     });
 
+    it('creates a Bitbucket API-token provider keeping the app_password wire shape (email → username)', async () => {
+        // The label migration is display-only: the stored discriminant stays
+        // `app_password` and the Atlassian email is still sent in the `username`
+        // field, so the server's Basic-auth path is unchanged.
+        renderPage();
+        fireEvent.change(screen.getByRole('combobox', {name: 'Provider type'}), {target: {value: 'bitbucket'}});
+        fireEvent.change(screen.getByLabelText('Workspace'), {target: {value: 'my-workspace'}});
+        fireEvent.change(screen.getByLabelText('Atlassian account email'), {target: {value: 'jane@company.com'}});
+        fireEvent.change(screen.getByLabelText('API token'), {target: {value: 'atl_token'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Save'}));
+
+        await waitFor(() => {
+            const post = lastCall(/\/git\/providers$/, 'POST');
+            expect(post).toBeTruthy();
+            const sent = JSON.parse(String(post?.[1]?.body)) as Record<string, unknown>;
+            expect(sent.type).toBe('bitbucket');
+            expect(sent.auth_method).toBe('app_password');
+            expect(sent.username).toBe('jane@company.com');
+            expect(sent.token).toBe('atl_token');
+        });
+    });
+
     it('shows an inline success then an error+hint from the draft test', async () => {
         renderPage();
         // Success path.
@@ -291,15 +316,15 @@ describe('AdminGitProviders — create + test', () => {
         expect(screen.getByRole('button', {name: 'Test connection'})).toBeEnabled();
     });
 
-    it('requires a username before Save/Test for Bitbucket app_password', () => {
+    it('requires the account email before Save/Test for Bitbucket app_password', () => {
         renderPage();
         fireEvent.change(screen.getByRole('combobox', {name: 'Provider type'}), {target: {value: 'bitbucket'}});
         fireEvent.change(screen.getByLabelText('Workspace'), {target: {value: 'ws'}});
-        fireEvent.change(screen.getByLabelText('App password'), {target: {value: 'pw'}});
-        // Username still blank → both CTAs stay disabled (server would 400).
+        fireEvent.change(screen.getByLabelText('API token'), {target: {value: 'pw'}});
+        // Email still blank → both CTAs stay disabled (server would 400).
         expect(screen.getByRole('button', {name: 'Save'})).toBeDisabled();
         expect(screen.getByRole('button', {name: 'Test connection'})).toBeDisabled();
-        fireEvent.change(screen.getByLabelText('Username'), {target: {value: 'bob'}});
+        fireEvent.change(screen.getByLabelText('Atlassian account email'), {target: {value: 'bob@company.com'}});
         expect(screen.getByRole('button', {name: 'Save'})).toBeEnabled();
         expect(screen.getByRole('button', {name: 'Test connection'})).toBeEnabled();
     });
