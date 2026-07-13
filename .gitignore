@@ -35,3 +35,8 @@ dev-cycle-analytics/*
 !dev-cycle-analytics/REVIEW_KB.md
 
 backup/
+
+# Local SQLite dev database (generated at runtime, not project history)
+data/*.db
+data/*.db-shm
+data/*.db-wal
