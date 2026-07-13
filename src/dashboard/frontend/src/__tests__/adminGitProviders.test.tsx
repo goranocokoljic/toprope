@@ -6,6 +6,7 @@ import {cleanup, fireEvent, render, screen, waitFor, within} from '@testing-libr
 import {QueryClient, QueryClientProvider} from '@tanstack/react-query';
 import {MemoryRouter} from 'react-router-dom';
 import {AdminGitProviders, parseReposList, repoScopeLabel, syncProgressLabel} from '../pages/admin/AdminGitProviders';
+import {gitProvidersRefetchInterval} from '../hooks/useAdmin';
 import type {AdminGitProvider, GitSyncProgress, GitSyncStage} from '../api/types';
 
 /**
@@ -608,14 +609,15 @@ describe('syncProgressLabel (#209)', () => {
                 started_at: 't',
                 progress: {...base, repos_processed: 11, current_repo: 'infra'},
             }),
-        ).toContain('repo 12/12');
-        // Zero repos selected: 0/0, no phantom first repo.
+        ).toBe('Fetching activity — repo 12/12 (infra) · 34 commits · 5 PRs');
+        // Zero repos selected: 0/0, no phantom first repo — and no repo-name
+        // suffix when current_repo is null (full equality pins its absence).
         expect(
             syncProgressLabel({
                 started_at: 't',
                 progress: {...base, repos_total: 0, repos_processed: 0, current_repo: null},
             }),
-        ).toContain('repo 0/0');
+        ).toBe('Fetching activity — repo 0/0 · 34 commits · 5 PRs');
     });
 });
 
@@ -650,7 +652,11 @@ describe('AdminGitProviders — live sync progress (#209)', () => {
         expect(await screen.findByTestId('sync-progress')).toHaveTextContent('Starting sync…');
     });
 
-    it('polls the list while a sync is running and stops when it settles', async () => {
+    it('polls the list while a sync is running and hands the row back when it settles', async () => {
+        // The stop condition itself is proven deterministically by the
+        // gitProvidersRefetchInterval unit tests below — this test proves the
+        // WIRING: the hook actually re-fetches on the interval while a run is
+        // in flight, and the settle-observing poll clears the progress row.
         providers = [{...structuredClone(DB_GITHUB), active_sync: structuredClone(RUNNING_SYNC)}];
         renderPage();
         await screen.findByTestId('sync-progress');
@@ -662,12 +668,19 @@ describe('AdminGitProviders — live sync progress (#209)', () => {
         // The run settles server-side: the next poll observes an idle row…
         providers = [structuredClone(DB_GITHUB)];
         await waitFor(() => expect(listCalls()).toBeGreaterThan(initial), {timeout: 3000});
+        // …and the row hands back to the idle state.
         await waitFor(() => expect(screen.queryByTestId('sync-progress')).not.toBeInTheDocument());
-        // …and polling stops: no further list fetches after the idle observation.
-        const settled = listCalls();
-        await new Promise((r) => setTimeout(r, 1300));
-        expect(listCalls()).toBe(settled);
+        expect(screen.getByRole('button', {name: 'Sync now'})).toBeEnabled();
     }, 10000);
+
+    it('gitProvidersRefetchInterval: 1s only while some row has an in-flight run', () => {
+        const running = {...structuredClone(DB_GITHUB), active_sync: structuredClone(RUNNING_SYNC)};
+        const idle = structuredClone(DB_GITHUB);
+        expect(gitProvidersRefetchInterval([running, idle])).toBe(1000);
+        expect(gitProvidersRefetchInterval([idle])).toBe(false);
+        expect(gitProvidersRefetchInterval([])).toBe(false);
+        expect(gitProvidersRefetchInterval(undefined)).toBe(false);
+    });
 
     it('surfaces the server message when a duplicate trigger is rejected (409) AND refetches the list so the row picks up the in-flight run', async () => {
         const base = fetchMock.getMockImplementation();

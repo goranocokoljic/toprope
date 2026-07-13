@@ -228,7 +228,7 @@ export function syncProgressLabel(active: GitProviderActiveSync): string {
         case 'analyzing':
             return `Matching developers — ${p.developers_matched} matched`;
         case 'writing':
-            return `Writing snapshots — ${p.developers_matched} developers matched`;
+            return `Writing snapshots — ${p.developers_matched} developer${p.developers_matched === 1 ? '' : 's'} matched`;
     }
     // Runtime fallback, deliberately OUTSIDE the switch so the compiler still
     // enforces exhaustiveness over the union: p.stage is wire data, and a newer

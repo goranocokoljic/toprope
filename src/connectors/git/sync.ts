@@ -912,9 +912,6 @@ export class GitSync implements ConnectorInterface {
                 }
             }
 
-            report?.((p) => {
-                p.developers_matched = matchedDevelopers.size;
-            });
             setProviderLastSyncTime(db, stateKey, now);
         }
 

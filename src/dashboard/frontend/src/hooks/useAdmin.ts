@@ -168,6 +168,18 @@ export function useAdminDataSources(): UseQueryResult<AdminDataSources, Error> {
 // One list query; every write invalidates it so masked rows + sync status stay
 // fresh. Test-connection is a mutation (a probe with a result), not a query —
 // the admin triggers it explicitly and reads the ok/error inline.
+/**
+ * Poll cadence for the provider list (#209): 1s while any sync-now run is in
+ * flight, off otherwise. A pure function of the cached list so the stop/start
+ * condition is unit-testable deterministically — the hook wires it to
+ * `query.state.data`.
+ */
+export function gitProvidersRefetchInterval(
+    providers: AdminGitProvider[] | undefined,
+): number | false {
+    return providers?.some((p) => p.active_sync !== null) ? 1000 : false;
+}
+
 export function useAdminGitProviders(): UseQueryResult<AdminGitProvider[], Error> {
     return useQuery({
         queryKey: queryKeys.adminGitProviders,
@@ -176,8 +188,7 @@ export function useAdminGitProviders(): UseQueryResult<AdminGitProvider[], Error
         // (`active_sync`) streams in every second, and the poll that observes
         // the run settle both stops itself and already carries the terminal
         // last_sync_* outcome — no manual refresh.
-        refetchInterval: (query) =>
-            query.state.data?.some((p) => p.active_sync !== null) ? 1000 : false,
+        refetchInterval: (query) => gitProvidersRefetchInterval(query.state.data),
     });
 }
 

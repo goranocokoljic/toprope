@@ -1382,6 +1382,8 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
             }
             expect(new Set(snapshots.map((s) => s.stage)).size).toBe(4);
             expect(snapshots[0].stage).toBe('listing_repos');
+            // The wire contract: repos_total is null until listing completes.
+            expect(snapshots[0].repos_total).toBeNull();
 
             // (b) Every cumulative counter is monotonically non-decreasing.
             for (const key of MONOTONIC) {
