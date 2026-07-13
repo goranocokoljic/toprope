@@ -4,7 +4,7 @@ import path from 'path';
 import {runMigrations} from '../../../src/storage/migrator';
 import {addTeam} from '../../../src/registry/teams';
 import {addDeveloper} from '../../../src/registry/developers';
-import {GitSync, type GitSyncProgress} from '../../../src/connectors/git/sync';
+import {GitSync, type GitSyncProgress, type GitSyncStage} from '../../../src/connectors/git/sync';
 import {createProvider} from '../../../src/connectors/git/providers/store';
 import {loadServerKey} from '../../../src/connectors/git/providers/secret';
 import type {GitConnectorConfig} from '../../../src/config/types';
@@ -1365,9 +1365,23 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
                 snapshots.push(p),
             );
 
-            // (a) The stage sequence is exactly the pipeline order, no regressions.
-            const stageOrder = [...new Set(snapshots.map((s) => s.stage))];
-            expect(stageOrder).toEqual(['listing_repos', 'fetching', 'analyzing', 'writing']);
+            // (a) Stages never move backwards across ANY consecutive pair of
+            // emissions (rank-based, so a mid-run bounce back to an earlier
+            // stage fails — a first-occurrence dedup would hide that), and all
+            // four stages actually occur in the run.
+            const STAGE_RANK: Record<GitSyncStage, number> = {
+                listing_repos: 0,
+                fetching: 1,
+                analyzing: 2,
+                writing: 3,
+            };
+            for (let i = 1; i < snapshots.length; i++) {
+                expect(STAGE_RANK[snapshots[i].stage]).toBeGreaterThanOrEqual(
+                    STAGE_RANK[snapshots[i - 1].stage],
+                );
+            }
+            expect(new Set(snapshots.map((s) => s.stage)).size).toBe(4);
+            expect(snapshots[0].stage).toBe('listing_repos');
 
             // (b) Every cumulative counter is monotonically non-decreasing.
             for (const key of MONOTONIC) {

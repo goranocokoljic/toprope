@@ -51,9 +51,9 @@ describe('api client — error-message extraction (#209)', () => {
     });
 
     it('falls back to the generic message when the JSON body has no usable message', async () => {
-        stubFetch(JSON.stringify({error: 'Internal', message: '   '}), 500, 'application/json');
+        stubFetch(JSON.stringify({error: 'Bad Request', message: '   '}), 400, 'application/json');
         const err = await caught();
-        expect(err.message).toBe('Request to /api/overview failed with 500');
+        expect(err.message).toBe('Request to /api/overview failed with 400');
     });
 
     it('falls back to the generic message when the body is JSON without a message field', async () => {
@@ -61,5 +61,27 @@ describe('api client — error-message extraction (#209)', () => {
         const err = await caught();
         expect(err.status).toBe(403);
         expect(err.message).toBe('Request to /api/overview failed with 403');
+    });
+
+    it('surfaces the deliberate 503 remediation message (key-setup guidance is user-facing)', async () => {
+        stubFetch(
+            JSON.stringify({error: 'Service Unavailable', message: 'TOPROPE_SECRET_KEY is not set — configure a key'}),
+            503,
+            'application/json',
+        );
+        const err = await caught();
+        expect(err.status).toBe(503);
+        expect(err.message).toBe('TOPROPE_SECRET_KEY is not set — configure a key');
+    });
+
+    it('redacts unhandled 500 bodies: raw internal error text never reaches the UI', async () => {
+        stubFetch(
+            JSON.stringify({error: 'Internal Server Error', message: 'SQLITE_CONSTRAINT: UNIQUE constraint failed: git_providers.id'}),
+            500,
+            'application/json',
+        );
+        const err = await caught();
+        expect(err.status).toBe(500);
+        expect(err.message).toBe('Request to /api/overview failed with 500');
     });
 });

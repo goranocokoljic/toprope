@@ -229,11 +229,12 @@ export function syncProgressLabel(active: GitProviderActiveSync): string {
             return `Matching developers — ${p.developers_matched} matched`;
         case 'writing':
             return `Writing snapshots — ${p.developers_matched} developers matched`;
-        default:
-            // p.stage is wire data: a newer backend can emit a stage this cached
-            // bundle doesn't know. Degrade to a generic label, never a blank line.
-            return 'Syncing…';
     }
+    // Runtime fallback, deliberately OUTSIDE the switch so the compiler still
+    // enforces exhaustiveness over the union: p.stage is wire data, and a newer
+    // backend can emit a stage this cached bundle doesn't know. Degrade to a
+    // generic label, never a blank line.
+    return 'Syncing…';
 }
 
 /** Small indeterminate spinner shown next to live sync progress. */

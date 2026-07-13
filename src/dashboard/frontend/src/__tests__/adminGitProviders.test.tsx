@@ -6,7 +6,7 @@ import {cleanup, fireEvent, render, screen, waitFor, within} from '@testing-libr
 import {QueryClient, QueryClientProvider} from '@tanstack/react-query';
 import {MemoryRouter} from 'react-router-dom';
 import {AdminGitProviders, parseReposList, repoScopeLabel, syncProgressLabel} from '../pages/admin/AdminGitProviders';
-import type {AdminGitProvider, GitSyncProgress} from '../api/types';
+import type {AdminGitProvider, GitSyncProgress, GitSyncStage} from '../api/types';
 
 /**
  * Tests for Admin → Git providers (GC1.8 / #200 + GC1.9 / #201). Cover every
@@ -592,6 +592,15 @@ describe('syncProgressLabel (#209)', () => {
         ).toBe('Writing snapshots — 4 developers matched');
     });
 
+    it('degrades an unknown wire stage to a generic label (backend/bundle skew)', () => {
+        expect(
+            syncProgressLabel({
+                started_at: 't',
+                progress: {...base, stage: 'replicating' as GitSyncStage},
+            }),
+        ).toBe('Syncing…');
+    });
+
     it('never overshoots the repo counter on the last repo or an empty scope', () => {
         // Last repo in flight: processed 11 of 12 → position 12/12, not 13/12.
         expect(
@@ -660,7 +669,7 @@ describe('AdminGitProviders — live sync progress (#209)', () => {
         expect(listCalls()).toBe(settled);
     }, 10000);
 
-    it('surfaces the server message when a duplicate trigger is rejected (409)', async () => {
+    it('surfaces the server message when a duplicate trigger is rejected (409) AND refetches the list so the row picks up the in-flight run', async () => {
         const base = fetchMock.getMockImplementation();
         fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
             const u = String(url);
@@ -676,10 +685,55 @@ describe('AdminGitProviders — live sync progress (#209)', () => {
         renderPage();
         const ghCell = await screen.findByText('acme-org');
         const row = ghCell.closest('tr') as HTMLElement;
+        // The run the 409 complains about IS in flight server-side: the refetch
+        // the rejection triggers (onSettled invalidation) must observe it.
+        providers = [{...structuredClone(DB_GITHUB), active_sync: structuredClone(RUNNING_SYNC)}];
         fireEvent.click(within(row).getByRole('button', {name: 'Sync now'}));
         expect(
             await screen.findByText('A sync is already in progress for this provider'),
         ).toBeInTheDocument();
+        // The rejected trigger still invalidated the list: the row shows the
+        // actual in-flight run's progress (which also bootstraps polling).
+        expect(await screen.findByTestId('sync-progress')).toBeInTheDocument();
+        expect(screen.getByRole('button', {name: 'Syncing…'})).toBeDisabled();
+    });
+
+    it('keeps the Sync button down until the refetched list lands — no double-click window after the 202', async () => {
+        // Gate the list REFETCH that follows the 202 (the mount fetch passes).
+        let releaseList: (() => void) | undefined;
+        let listCalls = 0;
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const u = String(url);
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (/\/git\/providers$/.test(u) && method === 'GET') {
+                listCalls += 1;
+                if (listCalls > 1) {
+                    await new Promise<void>((r) => {
+                        releaseList = r;
+                    });
+                    return json({
+                        data: [{...structuredClone(DB_GITHUB), active_sync: structuredClone(RUNNING_SYNC)}],
+                    });
+                }
+            }
+            return base!(url, init);
+        });
+        renderPage();
+        const row = (await screen.findByText('acme-org')).closest('tr') as HTMLElement;
+        fireEvent.click(within(row).getByRole('button', {name: 'Sync now'}));
+
+        // The POST has resolved (202) but the invalidation refetch is gated:
+        // isPending must cover the refetch, so the button stays down — the gap
+        // where a double-click would 409 does not exist.
+        await waitFor(() => expect(releaseList).toBeDefined());
+        expect(screen.getByRole('button', {name: 'Syncing…'})).toBeDisabled();
+        expect(screen.queryByRole('button', {name: 'Sync now'})).not.toBeInTheDocument();
+
+        // Once the refetch lands the row seamlessly hands off to active_sync.
+        releaseList?.();
+        expect(await screen.findByTestId('sync-progress')).toBeInTheDocument();
+        expect(screen.getByRole('button', {name: 'Syncing…'})).toBeDisabled();
     });
 });
 

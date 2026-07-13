@@ -404,6 +404,15 @@ describe('admin git-provider sync-now API (#199)', () => {
                 commits_fetched: 1,
             });
 
+            // The richest snapshot (populated repo name + counters) is on the
+            // wire right now — it must carry no token material either.
+            const midRes = await app.inject({
+                method: 'GET',
+                url: '/api/admin/git/providers',
+                headers: authHeaders(adminToken),
+            });
+            expect(midRes.body).not.toContain('ghp_dbSECRET_TOKEN_ABCD');
+
             release();
             const row = await waitForSyncStatus(id, 'ok');
             expect(row.active_sync).toBeNull();
