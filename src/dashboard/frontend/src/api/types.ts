@@ -965,11 +965,15 @@ export interface GitProviderActiveSync {
 
 /**
  * One repository as returned by `GET /api/admin/git/providers/:id/repos` — the
- * repo-scope picker's source (GC1.9 / #201). Mirrors the server projection
- * exactly (`{name, archived, defaultBranch}`). `archived` repos are shown in the
- * picker but excluded from the default selection.
+ * repo-scope picker's source (GC1.9 / #201, reshaped in #213). Mirrors the
+ * server projection exactly: `slug` is the CANONICAL identifier the stored
+ * scope filters match against (GitHub repo name, Bitbucket slug, GitLab path)
+ * and is what a scope save must send back; `name` is the provider's
+ * human-readable display name, display-only. `archived` repos are shown in
+ * the picker but excluded from the default selection.
  */
 export interface GitProviderRepo {
+    slug: string;
     name: string;
     archived: boolean;
     defaultBranch: string | null;

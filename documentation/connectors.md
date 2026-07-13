@@ -213,16 +213,18 @@ then export it (see [Configuration → Secrets](./configuration.md#secrets-and-e
 
 **Repo scope — monitor all vs. select.** Every connected provider defaults to
 **Monitor all repositories** (all repos in the org/workspace/group). To narrow it,
-open the provider's repo-scope editor and switch to **Select repositories**: Toprope
-loads the provider's repos and you tick the ones to analyze (bulk **Select all** /
-**Clear selection** controls help in large workspaces). Archived repos are shown but
-excluded by default. Switch back to "Monitor all" at any time. Right after you
-connect a provider, the scope editor opens automatically so you can pick the active
-repositories before you trigger the first sync — in long-lived organizations most
-repos are dormant, and narrowing the scope keeps syncs fast and the data relevant.
-Note the new provider is live from the moment it is saved: a scheduled sync (or a
-"Sync now" click) that fires before you save a scope runs on the default
-monitor-all scope.
+click the provider row's **Repos** action: a dialog opens with the two modes, and
+**Select repositories** lists the provider's repos in a paginated, filterable table
+(25 per page; the filter matches the repo **slug** or its display **name** — both
+are shown as columns). Tick the repos to analyze; bulk **Select all** / **Clear
+selection** controls act on the full list, not just the visible page, and the
+selected count is always shown. Archived repos are listed but excluded by default.
+Switch back to "Monitor all" at any time. Right after you connect a provider, the
+dialog opens automatically so you can pick the active repositories before you
+trigger the first sync — in long-lived organizations most repos are dormant, and
+narrowing the scope keeps syncs fast and the data relevant. Note the new provider
+is live from the moment it is saved: a scheduled sync (or a "Sync now" click) that
+fires before you save a scope runs on the default monitor-all scope.
 
 **Deselecting a repo keeps its history.** Changing the scope only affects future
 syncs: a deselected repository stops being read, but everything already collected

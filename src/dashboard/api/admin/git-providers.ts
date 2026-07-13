@@ -550,8 +550,21 @@ export function registerAdminGitProviderRoutes(
     });
 
     // GET /:id/repos — enumerate a SAVED provider's repositories for the picker.
-    // Returns {name, archived, defaultBranch} so the UI can list archived repos but
-    // exclude them by default. A failed listing is a clean 502 {ok:false}, not a 500.
+    // Returns {slug, name, archived, defaultBranch} (#213): `slug` is the CANONICAL
+    // identifier (GitRepo.name — GitHub repo name, Bitbucket slug, GitLab path)
+    // that stored repo-scope filters match against and that saves must send back;
+    // `name` is the provider's human-readable display name, display-only.
+    //
+    // Accepted risk (#213 review): pre-#213 this projection's `name` WAS the
+    // canonical id, so a stale cached bundle that PATCHes `name` values back as
+    // `repos` would store display names that match nothing at sync time; the
+    // reverse skew (new bundle, old server) just crashes the picker on the
+    // missing `slug` field and corrupts nothing. Server and bundle deploy
+    // together, the window is one un-refreshed tab, and both directions
+    // self-heal on refresh/re-save — deliberately NOT validated server-side (a
+    // probe on every save would fail saves whenever the provider is unreachable).
+    //
+    // A failed listing is a clean 502 {ok:false}, not a 500.
     app.get<{Params: {id: string}}>(
         '/api/admin/git/providers/:id/repos',
         async (request, reply) => {
@@ -565,7 +578,12 @@ export function registerAdminGitProviderRoutes(
                 const repos = await createGitProvider(resolved.config).listRepos();
                 return {
                     data: repos.map((r) => ({
-                        name: r.name,
+                        slug: r.name,
+                        // Fall back to the canonical name when the provider has
+                        // no distinct display name (GitHub always; a Bitbucket/
+                        // GitLab response missing the field). `||` deliberately:
+                        // an empty-string display name must not blank the cell.
+                        name: r.displayName || r.name,
                         archived: r.isArchived,
                         defaultBranch: r.defaultBranch,
                     })),

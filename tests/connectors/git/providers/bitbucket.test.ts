@@ -26,6 +26,7 @@ function makeRepoFixture(overrides: Record<string, unknown> = {}): Record<string
     return {
         uuid: '{repo-uuid-1}',
         slug: 'my-repo',
+        name: 'My Repo',
         full_name: 'test-workspace/my-repo',
         mainbranch: {name: 'main'},
         scm: 'git',
@@ -180,9 +181,21 @@ describe('BitbucketProvider', () => {
                 id: '{repo-uuid-1}',
                 name: 'my-repo',
                 fullName: 'test-workspace/my-repo',
+                displayName: 'My Repo',
                 defaultBranch: 'main',
                 isArchived: false,
             });
+        });
+
+        it('leaves displayName unset when the API response has no name field (projection falls back to the slug)', async () => {
+            const fetchMock = makeFetchMock([{body: pagedResponse([makeRepoFixture({name: undefined})])}]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            const repos = await provider.listRepos();
+
+            expect(repos).toHaveLength(1);
+            expect(repos[0].name).toBe('my-repo');
+            expect(repos[0].displayName).toBeUndefined();
         });
 
         it('uses role=member in the request URL', async () => {

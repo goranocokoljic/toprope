@@ -96,6 +96,8 @@ interface RawPagedResponse<T> {
 interface RawRepo {
     uuid: string;
     slug: string;
+    /** Bitbucket's human-readable repository name (distinct from the slug). */
+    name?: string;
     full_name: string;
     mainbranch?: {name: string};
     scm: string;
@@ -244,6 +246,7 @@ export class BitbucketProvider implements GitProvider {
                 id: r.uuid,
                 name: r.slug,
                 fullName: r.full_name,
+                displayName: r.name,
                 defaultBranch: r.mainbranch?.name ?? 'main',
                 isArchived: false,
             }));
