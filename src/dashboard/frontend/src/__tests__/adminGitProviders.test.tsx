@@ -1007,6 +1007,50 @@ describe('AdminGitProviders — add-flow repo selection (#211)', () => {
         });
     });
 
+    it('keeps select-mode Save disabled when /repos succeeds with an EMPTY list', async () => {
+        // The third branch of the save guard: not pending, not errored — the
+        // provider genuinely has no repositories. Saving would emit repos: [].
+        providers = [structuredClone(DB_MONITOR_ALL)];
+        repos = [];
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', {name: 'All repos'}));
+        fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
+
+        expect(await screen.findByText('No repositories found for this provider.')).toBeInTheDocument();
+        expect(screen.getByRole('button', {name: 'Save scope'})).toBeDisabled();
+        // Monitor-all remains saveable — no repo-list dependency.
+        fireEvent.click(screen.getByRole('radio', {name: 'Monitor all repositories'}));
+        expect(screen.getByRole('button', {name: 'Save scope'})).toBeEnabled();
+    });
+
+    it('keeps the auto-opened editor AND prompt open when the scope save fails, with the error surfaced', async () => {
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const u = String(url);
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (/\/git\/providers\/p-new$/.test(u) && method === 'PATCH') {
+                return json({error: 'Bad Request', message: 'Scope rejected by the server'}, 400);
+            }
+            return base!(url, init);
+        });
+        renderPage();
+        fireEvent.change(screen.getByLabelText('Organization'), {target: {value: 'new-org'}});
+        fireEvent.change(screen.getByLabelText('Token'), {target: {value: 'ghp_secret'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Save'}));
+        await screen.findByTestId('scope-prompt');
+
+        fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
+        await screen.findByRole('checkbox', {name: /api/});
+        fireEvent.click(screen.getByRole('button', {name: 'Save scope'}));
+
+        // The failed save surfaces the server's message and leaves both the
+        // editor and the one-shot prompt in place so the admin can retry.
+        expect(await screen.findByText('Scope rejected by the server')).toBeInTheDocument();
+        expect(screen.getByTestId('scope-prompt')).toBeInTheDocument();
+        expect(screen.getByText('Repository scope')).toBeInTheDocument();
+        expect(screen.getByRole('button', {name: 'Save scope'})).toBeEnabled();
+    });
+
     it('opening a stored empty scope ("None selected") immediately shows the guard: warning visible, Save disabled', async () => {
         // A legacy-saved dead scope: repos_include '[]' round-trips as a real
         // empty selection, so the editor opens in select mode already empty.
