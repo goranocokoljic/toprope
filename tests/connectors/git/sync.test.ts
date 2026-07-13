@@ -48,6 +48,7 @@ function makeRepo(name: string): GitRepo {
         id: name,
         name,
         fullName: `test-org/${name}`,
+        displayName: name,
         defaultBranch: 'main',
         isArchived: false,
     };

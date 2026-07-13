@@ -3,6 +3,8 @@ import {Link} from 'react-router-dom';
 import {Card} from '../../components/Card';
 import {Badge} from '../../components/Badge';
 import {StatePanel} from '../../components/StatePanel';
+import {Modal} from '../../components/Modal';
+import {DataTable, type Column} from '../../components/DataTable';
 import {
     useAdminDataSources,
     useAdminGitProviderRepos,
@@ -19,6 +21,7 @@ import type {
     GitProviderActiveSync,
     GitProviderInput,
     GitProviderProbeResult,
+    GitProviderRepo,
     GitProviderType,
 } from '../../api/types';
 import {ErrorText, PageHeader, PrimaryButton, SecondaryButton, SelectField, Table, Td, TextField, Th} from './adminUi';
@@ -452,20 +455,24 @@ function ProviderForm({
 }
 
 /**
- * Per-provider repo-scope editor (GC1.9 / #201). Two modes:
+ * Per-provider repo-scope MODAL (GC1.9 / #201, redesigned in #213). Two modes:
  *  - "Monitor all repositories" (default) — the PATCH omits `repos`, so the server
  *    clears `repos_include` and every repo is analyzed.
  *  - "Select repositories" — loads the provider's repos via `/repos` and writes the
- *    checked set to `repos_include`. Archived repos are listed but excluded from
+ *    checked SLUG set to `repos_include`. Repos render as a paginated, filterable
+ *    table with Slug + Name columns; archived repos are listed but excluded from
  *    the default selection.
  * The write reuses {@link providerIdentityInput} + {@link preserveExcludeRepos} so
  * it carries the full row (the server re-validates every write) and never disturbs
- * `exclude_repos`.
+ * `exclude_repos`. Selection is keyed on `slug` — the canonical identifier stored
+ * scope filters match against; `name` is display-only.
  *
  * `prompt` (#211) renders the just-connected intro asking the admin to narrow the
- * scope before the first sync — the add flow auto-opens the editor with it.
+ * scope before the first sync — the add flow auto-opens the modal with it.
  */
-function RepoScopeEditor({
+const REPO_PAGE_SIZE = 25;
+
+function RepoScopeModal({
     provider,
     onClose,
     prompt,
@@ -478,6 +485,8 @@ function RepoScopeEditor({
     const [mode, setMode] = useState<'all' | 'select'>(stored === undefined ? 'all' : 'select');
     // null → follow the derived default seed; a concrete Set → the admin's edits.
     const [edited, setEdited] = useState<Set<string> | null>(null);
+    const [filter, setFilter] = useState('');
+    const [page, setPage] = useState(0);
     const repos = useAdminGitProviderRepos(provider.id, mode === 'select');
     const update = useUpdateAdminGitProvider();
 
@@ -485,7 +494,7 @@ function RepoScopeEditor({
     // Every non-archived repo — the single source for both the default seed and
     // the "Select all" bulk action, so the two can't drift apart.
     const allNonArchived = useMemo(
-        () => new Set(repoList.filter((r) => !r.archived).map((r) => r.name)),
+        () => new Set(repoList.filter((r) => !r.archived).map((r) => r.slug)),
         [repoList],
     );
     // Default selection when entering select mode: the stored include list if the
@@ -494,12 +503,63 @@ function RepoScopeEditor({
     const defaultSeed = stored !== undefined ? new Set(stored) : allNonArchived;
     const selected = edited ?? defaultSeed;
 
-    function toggleRepo(name: string, checked: boolean): void {
+    // Case-insensitive substring filter over slug OR display name; pagination
+    // applies to the FILTERED list. The page index is clamped (not reset via an
+    // effect) so shrinking the result set can never leave an out-of-range page.
+    const query = filter.trim().toLowerCase();
+    const filtered = query
+        ? repoList.filter(
+              (r) => r.slug.toLowerCase().includes(query) || r.name.toLowerCase().includes(query),
+          )
+        : repoList;
+    const pageCount = Math.max(1, Math.ceil(filtered.length / REPO_PAGE_SIZE));
+    const safePage = Math.min(page, pageCount - 1);
+    const visibleRows = filtered.slice(safePage * REPO_PAGE_SIZE, (safePage + 1) * REPO_PAGE_SIZE);
+
+    function toggleRepo(slug: string, checked: boolean): void {
         const next = new Set(selected);
-        if (checked) next.add(name);
-        else next.delete(name);
+        if (checked) next.add(slug);
+        else next.delete(slug);
         setEdited(next);
     }
+
+    // Table columns: checkbox / Slug / Name (+ archived badge). Selection and
+    // filtering already control the order and visible set, so column sorting is
+    // deliberately off. The checkbox is labelled by the SLUG (the identifier the
+    // save writes), not the display name.
+    const columns: Column<GitProviderRepo>[] = [
+        {
+            key: 'selected',
+            header: '',
+            sortable: false,
+            render: (r) => (
+                <input
+                    type="checkbox"
+                    aria-label={r.slug}
+                    checked={selected.has(r.slug)}
+                    onChange={(e) => toggleRepo(r.slug, e.target.checked)}
+                    className="h-4 w-4 accent-accent"
+                />
+            ),
+        },
+        {key: 'slug', header: 'Slug', accessor: (r) => r.slug, sortable: false},
+        {
+            key: 'name',
+            header: 'Name',
+            accessor: (r) => r.name,
+            sortable: false,
+            render: (r) => (
+                <span className="flex items-center gap-2">
+                    {r.name}
+                    {r.archived ? (
+                        <Badge tone="neutral" title="Archived — excluded by default">
+                            Archived
+                        </Badge>
+                    ) : null}
+                </span>
+            ),
+        },
+    ];
 
     // In "select" mode the selection derives from the loaded repo list, so a save
     // must NOT proceed until that list is available: saving over an unloaded,
@@ -521,10 +581,10 @@ function RepoScopeEditor({
         const patch = providerIdentityInput(provider);
         preserveExcludeRepos(provider, patch);
         if (mode === 'select') {
-            // Deterministic order: repo-list order for listed repos, then any stored
+            // Deterministic order: repo-list order for listed slugs, then any stored
             // names no longer present (kept so a save can't silently drop them).
-            const listed = repoList.filter((r) => selected.has(r.name)).map((r) => r.name);
-            const extras = [...selected].filter((n) => !repoList.some((r) => r.name === n)).sort();
+            const listed = repoList.filter((r) => selected.has(r.slug)).map((r) => r.slug);
+            const extras = [...selected].filter((s) => !repoList.some((r) => r.slug === s)).sort();
             patch.repos = [...listed, ...extras];
         }
         // mode === 'all': omit `repos` → the server clears the filter (monitor all).
@@ -532,8 +592,7 @@ function RepoScopeEditor({
     }
 
     return (
-        <div className="rounded-md border border-border bg-surface-raised/40 p-4">
-            <p className="mb-3 text-xs font-medium uppercase tracking-wider text-muted">Repository scope</p>
+        <Modal title={`Repository scope — ${provider.container}`} onClose={onClose} testId="repo-scope-modal">
             {prompt ? (
                 <p className="mb-3 text-sm text-foreground" role="status" data-testid="scope-prompt">
                     Provider connected. Choose which repositories to analyze before the first sync —
@@ -579,48 +638,74 @@ function RepoScopeEditor({
                             {/* Bulk toggles: with hundreds of repos and only a handful
                                 active, per-checkbox editing from the all-selected seed
                                 is impractical — clear first, then tick the active few.
-                                "Select all" IS the default seed and deliberately rebuilds
-                                from the LISTED repos: opted-in archived repos are reset
-                                (re-tickable individually), and stored names absent from
-                                the listing are dropped — those have no checkbox, so once
-                                cleared they can only be restored by re-saving via API. */}
-                            <div className="mb-2 flex gap-3">
-                                <button
-                                    type="button"
-                                    onClick={() => setEdited(new Set(allNonArchived))}
-                                    title="Selects every non-archived repository"
-                                    className="text-xs font-medium text-accent hover:underline"
-                                >
-                                    Select all
-                                </button>
-                                <button
-                                    type="button"
-                                    onClick={() => setEdited(new Set())}
-                                    className="text-xs font-medium text-accent hover:underline"
-                                >
-                                    Clear selection
-                                </button>
+                                Both operate on the FULL repo list, not the filtered
+                                page. "Select all" IS the default seed and deliberately
+                                rebuilds from the LISTED repos: opted-in archived repos
+                                are reset (re-tickable individually), and stored names
+                                absent from the listing are dropped — those have no
+                                checkbox, so once cleared they can only be restored by
+                                re-saving via API. */}
+                            <div className="mb-2 flex flex-wrap items-end justify-between gap-3">
+                                <div className="flex gap-3">
+                                    <button
+                                        type="button"
+                                        onClick={() => setEdited(new Set(allNonArchived))}
+                                        title="Selects every non-archived repository"
+                                        className="text-xs font-medium text-accent hover:underline"
+                                    >
+                                        Select all
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => setEdited(new Set())}
+                                        className="text-xs font-medium text-accent hover:underline"
+                                    >
+                                        Clear selection
+                                    </button>
+                                </div>
+                                {/* Bulk actions affect rows on every page — keep the
+                                    total selected count in permanent view. */}
+                                <span className="text-xs text-muted" data-testid="selected-count">
+                                    {selected.size} of {repoList.length} selected
+                                </span>
                             </div>
-                            <ul className="flex max-h-60 flex-col gap-1 overflow-y-auto pr-1">
-                                {repoList.map((r) => (
-                                    <li key={r.name}>
-                                        <label className="flex items-center gap-2 text-sm text-foreground">
-                                            <input
-                                                type="checkbox"
-                                                checked={selected.has(r.name)}
-                                                onChange={(e) => toggleRepo(r.name, e.target.checked)}
-                                                className="h-4 w-4 accent-accent"
-                                            />
-                                            <span>{r.name}</span>
-                                            {r.archived ? (
-                                                <Badge tone="neutral" title="Archived — excluded by default">
-                                                    Archived
-                                                </Badge>
-                                            ) : null}
-                                        </label>
-                                    </li>
-                                ))}
-                            </ul>
+                            <TextField
+                                label="Filter repositories"
+                                value={filter}
+                                onChange={(v) => {
+                                    setFilter(v);
+                                    setPage(0);
+                                }}
+                                placeholder="Filter by slug or name"
+                            />
+                            <div className="mt-2">
+                                <DataTable
+                                    columns={columns}
+                                    rows={visibleRows}
+                                    getRowKey={(r) => r.slug}
+                                    caption="Repositories"
+                                    emptyMessage="No repositories match the filter."
+                                />
+                            </div>
+                            {pageCount > 1 ? (
+                                <div className="mt-2 flex items-center gap-3" data-testid="repo-pagination">
+                                    <SecondaryButton
+                                        onClick={() => setPage(Math.max(0, safePage - 1))}
+                                        disabled={safePage === 0}
+                                    >
+                                        Previous
+                                    </SecondaryButton>
+                                    <span className="text-sm text-muted">
+                                        Page {safePage + 1} of {pageCount}
+                                    </span>
+                                    <SecondaryButton
+                                        onClick={() => setPage(Math.min(pageCount - 1, safePage + 1))}
+                                        disabled={safePage === pageCount - 1}
+                                    >
+                                        Next
+                                    </SecondaryButton>
+                                </div>
+                            ) : null}
                             {emptySelection ? (
                                 <p className="mt-2 text-sm text-danger" data-testid="empty-selection-warning">
                                     Select at least one repository — an empty selection would analyze
@@ -647,7 +732,7 @@ function RepoScopeEditor({
                 </SecondaryButton>
                 <ErrorText error={update.isError ? update.error : null} />
             </div>
-        </div>
+        </Modal>
     );
 }
 
@@ -743,19 +828,9 @@ function ProviderRow({
                     )}
                 </Td>
                 <Td>
-                    {isConfig ? (
-                        repoScopeLabel(provider.repos_include)
-                    ) : (
-                        <button
-                            type="button"
-                            onClick={() => (scopeVisible ? closeScope() : setScopeOpen(true))}
-                            aria-expanded={scopeVisible}
-                            className="text-sm font-medium text-accent hover:underline"
-                            title="Edit repository scope"
-                        >
-                            {repoScopeLabel(provider.repos_include)}
-                        </button>
-                    )}
+                    {/* Scope summary is plain text (#213); editing moved to the
+                        explicit "Repos" action button in the Actions column. */}
+                    {repoScopeLabel(provider.repos_include)}
                 </Td>
                 <Td>
                     <Badge tone={syncTone(provider.last_sync_status)}>
@@ -783,6 +858,12 @@ function ProviderRow({
                                     title={provider.enabled ? undefined : 'Enable the provider to sync'}
                                 >
                                     {syncRunning ? 'Syncing…' : 'Sync now'}
+                                </AccentButton>
+                                <AccentButton
+                                    onClick={() => setScopeOpen(true)}
+                                    title="Choose which repositories to analyze"
+                                >
+                                    Repos
                                 </AccentButton>
                                 <button
                                     type="button"
@@ -832,12 +913,10 @@ function ProviderRow({
                     </td>
                 </tr>
             ) : null}
+            {/* The modal renders through a portal, so mounting it between table
+                rows is legal — no DOM ends up inside the table. */}
             {scopeVisible && !isConfig ? (
-                <tr>
-                    <td colSpan={7} className="px-3 pb-4">
-                        <RepoScopeEditor provider={provider} onClose={closeScope} prompt={promptScope} />
-                    </td>
-                </tr>
+                <RepoScopeModal provider={provider} onClose={closeScope} prompt={promptScope} />
             ) : null}
         </>
     );

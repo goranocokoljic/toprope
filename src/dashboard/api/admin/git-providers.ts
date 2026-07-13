@@ -550,8 +550,11 @@ export function registerAdminGitProviderRoutes(
     });
 
     // GET /:id/repos — enumerate a SAVED provider's repositories for the picker.
-    // Returns {name, archived, defaultBranch} so the UI can list archived repos but
-    // exclude them by default. A failed listing is a clean 502 {ok:false}, not a 500.
+    // Returns {slug, name, archived, defaultBranch} (#213): `slug` is the CANONICAL
+    // identifier (GitRepo.name — GitHub repo name, Bitbucket slug, GitLab path)
+    // that stored repo-scope filters match against and that saves must send back;
+    // `name` is the provider's human-readable display name, display-only. A failed
+    // listing is a clean 502 {ok:false}, not a 500.
     app.get<{Params: {id: string}}>(
         '/api/admin/git/providers/:id/repos',
         async (request, reply) => {
@@ -565,7 +568,8 @@ export function registerAdminGitProviderRoutes(
                 const repos = await createGitProvider(resolved.config).listRepos();
                 return {
                     data: repos.map((r) => ({
-                        name: r.name,
+                        slug: r.name,
+                        name: r.displayName,
                         archived: r.isArchived,
                         defaultBranch: r.defaultBranch,
                     })),

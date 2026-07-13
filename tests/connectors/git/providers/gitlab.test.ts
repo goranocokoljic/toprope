@@ -234,6 +234,7 @@ describe('GitLabProvider', () => {
                 id: '1001',
                 name: 'test-group/my-repo',
                 fullName: 'test-group/my-repo',
+                displayName: 'My Repo',
                 defaultBranch: 'main',
                 isArchived: false,
             });

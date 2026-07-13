@@ -226,6 +226,7 @@ export class GitLabProvider implements GitProvider {
                     id: String(p.id),
                     name: p.path_with_namespace,
                     fullName: p.path_with_namespace,
+                    displayName: p.name,
                     defaultBranch: p.default_branch ?? 'main',
                     isArchived: false,
                 });

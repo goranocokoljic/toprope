@@ -47,7 +47,16 @@ function makeMockProvider(overrides: Partial<GitProvider> = {}): GitProvider {
 }
 
 function makeRepo(name: string, isArchived: boolean, defaultBranch = 'main'): GitRepo {
-    return {id: name, name, fullName: `db-org/${name}`, defaultBranch, isArchived};
+    // displayName deliberately differs from the canonical name so the projection
+    // test can prove which field feeds which column (#213).
+    return {
+        id: name,
+        name,
+        fullName: `db-org/${name}`,
+        displayName: `Display ${name}`,
+        defaultBranch,
+        isArchived,
+    };
 }
 
 async function getCreateGitProvider() {
@@ -358,7 +367,7 @@ describe('admin git-provider test + repos API (#198)', () => {
     });
 
     describe('GET /:id/repos — repository listing', () => {
-        it('returns {name, archived, defaultBranch} incl. an archived repo', async () => {
+        it('returns {slug, name, archived, defaultBranch} incl. an archived repo — slug is the canonical id, name the display name (#213)', async () => {
             const id = await createGithub();
             const createGitProvider = await getCreateGitProvider();
             createGitProvider.mockReturnValue(
@@ -376,13 +385,18 @@ describe('admin git-provider test + repos API (#198)', () => {
                 headers: authHeaders(adminToken),
             });
             expect(res.statusCode).toBe(200);
-            const repos = res.json().data as {name: string; archived: boolean; defaultBranch: string}[];
+            const repos = res.json().data as {
+                slug: string;
+                name: string;
+                archived: boolean;
+                defaultBranch: string;
+            }[];
             expect(repos).toEqual([
-                {name: 'active-svc', archived: false, defaultBranch: 'main'},
-                {name: 'legacy-svc', archived: true, defaultBranch: 'master'},
+                {slug: 'active-svc', name: 'Display active-svc', archived: false, defaultBranch: 'main'},
+                {slug: 'legacy-svc', name: 'Display legacy-svc', archived: true, defaultBranch: 'master'},
             ]);
             // The archived flag is surfaced so the UI can exclude archived by default.
-            expect(repos.find((r) => r.name === 'legacy-svc')?.archived).toBe(true);
+            expect(repos.find((r) => r.slug === 'legacy-svc')?.archived).toBe(true);
         });
 
         it('returns an empty list when the provider has no repos', async () => {

@@ -26,6 +26,7 @@ function makeRepoFixture(overrides: Record<string, unknown> = {}): Record<string
     return {
         uuid: '{repo-uuid-1}',
         slug: 'my-repo',
+        name: 'My Repo',
         full_name: 'test-workspace/my-repo',
         mainbranch: {name: 'main'},
         scm: 'git',
@@ -180,6 +181,7 @@ describe('BitbucketProvider', () => {
                 id: '{repo-uuid-1}',
                 name: 'my-repo',
                 fullName: 'test-workspace/my-repo',
+                displayName: 'My Repo',
                 defaultBranch: 'main',
                 isArchived: false,
             });

@@ -234,6 +234,8 @@ export class GitHubProvider implements GitProvider {
                     id: String(r.id),
                     name: r.name,
                     fullName: r.full_name,
+                    // GitHub has no display name distinct from the repo name.
+                    displayName: r.name,
                     defaultBranch: r.default_branch,
                     isArchived: false,
                 });

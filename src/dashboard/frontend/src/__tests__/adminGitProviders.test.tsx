@@ -75,6 +75,7 @@ const DB_MONITOR_ALL: AdminGitProvider = {
 };
 
 interface RepoRow {
+    slug: string;
     name: string;
     archived: boolean;
     defaultBranch: string | null;
@@ -108,9 +109,9 @@ beforeEach(() => {
     createCount = 0;
     providers = [structuredClone(DB_GITHUB), structuredClone(CONFIG_GITLAB)];
     repos = [
-        {name: 'api', archived: false, defaultBranch: 'main'},
-        {name: 'web', archived: false, defaultBranch: 'main'},
-        {name: 'legacy', archived: true, defaultBranch: 'master'},
+        {slug: 'api', name: 'API Service', archived: false, defaultBranch: 'main'},
+        {slug: 'web', name: 'Web App', archived: false, defaultBranch: 'main'},
+        {slug: 'legacy', name: 'Old Legacy', archived: true, defaultBranch: 'master'},
     ];
     // Default: no git snapshots collected yet (drives the empty-state gate).
     dataSourceGitProviders = [];
@@ -447,9 +448,8 @@ describe('AdminGitProviders — repo-scope editor (#201)', () => {
         providers = [structuredClone(DB_MONITOR_ALL)];
         renderPage();
 
-        // The Repos cell is a button showing the current scope ("All repos").
-        const scopeButton = await screen.findByRole('button', {name: 'All repos'});
-        fireEvent.click(scopeButton);
+        // The scope modal opens from the row's "Repos" action button (#213).
+        fireEvent.click(await screen.findByRole('button', {name: 'Repos'}));
 
         // Enter select mode → triggers the /repos fetch.
         fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
@@ -477,7 +477,7 @@ describe('AdminGitProviders — repo-scope editor (#201)', () => {
     it('lets the admin check an archived repo in explicitly', async () => {
         providers = [structuredClone(DB_MONITOR_ALL)];
         renderPage();
-        fireEvent.click(await screen.findByRole('button', {name: 'All repos'}));
+        fireEvent.click(await screen.findByRole('button', {name: 'Repos'}));
         fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
 
         const legacyBox = await screen.findByRole('checkbox', {name: /legacy/});
@@ -496,8 +496,7 @@ describe('AdminGitProviders — repo-scope editor (#201)', () => {
     it('clearing back to "Monitor all" removes the filter (PATCH omits repos)', async () => {
         // DB_GITHUB starts with a repos_include list → editor opens in select mode.
         renderPage();
-        const scopeButton = await screen.findByRole('button', {name: '3 selected'});
-        fireEvent.click(scopeButton);
+        fireEvent.click(await screen.findByRole('button', {name: 'Repos'}));
 
         // Switch to monitor-all and save.
         fireEvent.click(screen.getByRole('radio', {name: 'Monitor all repositories'}));
@@ -530,7 +529,7 @@ describe('AdminGitProviders — repo-scope editor (#201)', () => {
             return json({error: 'not found'}, 404);
         });
         renderPage();
-        fireEvent.click(await screen.findByRole('button', {name: 'All repos'}));
+        fireEvent.click(await screen.findByRole('button', {name: 'Repos'}));
         fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
         expect(await screen.findByText(/Couldn’t load repositories/)).toBeInTheDocument();
         // Save must stay blocked: writing over a failed load would emit repos:[]
@@ -559,7 +558,7 @@ describe('AdminGitProviders — repo-scope editor (#201)', () => {
             return base!(url, init);
         });
         renderPage();
-        fireEvent.click(await screen.findByRole('button', {name: 'All repos'}));
+        fireEvent.click(await screen.findByRole('button', {name: 'Repos'}));
         fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
         // While the list is still loading, select-mode Save is disabled.
         expect(await screen.findByText(/Loading repositories/)).toBeInTheDocument();
@@ -574,8 +573,8 @@ describe('AdminGitProviders — repo-scope editor (#201)', () => {
         renderPage();
         const configCell = await screen.findByText('team');
         const row = configCell.closest('tr') as HTMLElement;
-        // Config repo scope is plain text ("2 selected"), not an editable button.
-        expect(within(row).queryByRole('button', {name: '2 selected'})).not.toBeInTheDocument();
+        // Config repo scope is plain text ("2 selected") with no Repos action.
+        expect(within(row).queryByRole('button', {name: 'Repos'})).not.toBeInTheDocument();
         expect(within(row).getByText('2 selected')).toBeInTheDocument();
     });
 });
@@ -802,7 +801,7 @@ describe('AdminGitProviders — add-flow repo selection (#211)', () => {
 
         fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
         expect(screen.queryByTestId('scope-prompt')).not.toBeInTheDocument();
-        expect(screen.queryByText('Repository scope')).not.toBeInTheDocument();
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
         // No PATCH was sent — the provider stays on the default monitor-all.
         expect(lastCall(/\/git\/providers\/p-new$/, 'PATCH')).toBeUndefined();
     });
@@ -830,11 +829,11 @@ describe('AdminGitProviders — add-flow repo selection (#211)', () => {
         });
         // …the editor and prompt close on save…
         await waitFor(() => expect(screen.queryByTestId('scope-prompt')).not.toBeInTheDocument());
-        expect(screen.queryByText('Repository scope')).not.toBeInTheDocument();
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
         // …and stay closed after the post-save list refetch lands (the flag was
         // cleared, so the refetched row must not re-prompt): the row now shows
         // the saved scope.
-        expect(await screen.findByRole('button', {name: '1 selected'})).toBeInTheDocument();
+        expect(await screen.findByText('1 selected')).toBeInTheDocument();
         expect(screen.queryByTestId('scope-prompt')).not.toBeInTheDocument();
     });
 
@@ -845,16 +844,18 @@ describe('AdminGitProviders — add-flow repo selection (#211)', () => {
         fireEvent.click(screen.getByRole('button', {name: 'Save'}));
         await screen.findByTestId('scope-prompt');
 
-        // Open the pre-existing provider's editor from its repos cell, then
-        // close it the same way — the new provider's prompt must survive both.
-        // The editor-count assertions prove the other row's editor really
-        // opened and closed (i.e. its closeScope RAN), so this test cannot
-        // pass vacuously if the toggle itself breaks.
-        fireEvent.click(screen.getByRole('button', {name: '3 selected'}));
-        expect(screen.getAllByText('Repository scope')).toHaveLength(2);
+        // Open the pre-existing provider's modal from ITS row's Repos action,
+        // then close it — the new provider's prompt must survive both. The
+        // dialog-count assertions prove the other modal really opened and
+        // closed (i.e. its closeScope RAN), so this test cannot pass vacuously
+        // if the open/close path itself breaks.
+        const ghRow = screen.getByText('acme-org').closest('tr') as HTMLElement;
+        fireEvent.click(within(ghRow).getByRole('button', {name: 'Repos'}));
+        expect(screen.getAllByRole('dialog')).toHaveLength(2);
         expect(screen.getByTestId('scope-prompt')).toBeInTheDocument();
-        fireEvent.click(screen.getByRole('button', {name: '3 selected'}));
-        expect(screen.getAllByText('Repository scope')).toHaveLength(1);
+        const ghDialog = screen.getByRole('dialog', {name: 'Repository scope — acme-org'});
+        fireEvent.click(within(ghDialog).getByRole('button', {name: 'Cancel'}));
+        expect(screen.getAllByRole('dialog')).toHaveLength(1);
         expect(screen.getByTestId('scope-prompt')).toBeInTheDocument();
         expect(document.querySelector('input[name="scope-p-new"]')).not.toBeNull();
     });
@@ -878,22 +879,21 @@ describe('AdminGitProviders — add-flow repo selection (#211)', () => {
         expect(document.querySelector('input[name="scope-p-new"]')).toBeNull();
     });
 
-    it('the repos-cell button closes the auto-opened editor and dismisses the prompt', async () => {
+    it("the modal's close button dismisses the auto-opened editor and the prompt", async () => {
         renderPage();
         fireEvent.change(screen.getByLabelText('Organization'), {target: {value: 'new-org'}});
         fireEvent.change(screen.getByLabelText('Token'), {target: {value: 'ghp_secret'}});
         fireEvent.click(screen.getByRole('button', {name: 'Save'}));
         await screen.findByTestId('scope-prompt');
 
-        // The just-created provider's repos cell reads "All repos" (only row
-        // that does — the fixture row shows "3 selected").
-        fireEvent.click(screen.getByRole('button', {name: 'All repos'}));
+        fireEvent.click(screen.getByRole('button', {name: 'Close dialog'}));
         expect(screen.queryByTestId('scope-prompt')).not.toBeInTheDocument();
-        expect(screen.queryByText('Repository scope')).not.toBeInTheDocument();
-        // Re-opening from the same cell is a normal (non-prompted) editor, and
-        // the never-saved provider is still on its "Monitor all" default.
-        fireEvent.click(screen.getByRole('button', {name: 'All repos'}));
-        expect(screen.getByText('Repository scope')).toBeInTheDocument();
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+        // Re-opening from the new row's Repos action is a normal (non-prompted)
+        // modal, and the never-saved provider is still on "Monitor all".
+        const newRow = screen.getByText('new-org').closest('tr') as HTMLElement;
+        fireEvent.click(within(newRow).getByRole('button', {name: 'Repos'}));
+        expect(screen.getByRole('dialog')).toBeInTheDocument();
         expect(screen.queryByTestId('scope-prompt')).not.toBeInTheDocument();
         expect(screen.getByRole('radio', {name: 'Monitor all repositories'})).toBeChecked();
     });
@@ -901,7 +901,7 @@ describe('AdminGitProviders — add-flow repo selection (#211)', () => {
     it('blocks saving an empty selection — the one-click Clear cannot silently disable collection', async () => {
         providers = [structuredClone(DB_MONITOR_ALL)];
         renderPage();
-        fireEvent.click(await screen.findByRole('button', {name: 'All repos'}));
+        fireEvent.click(await screen.findByRole('button', {name: 'Repos'}));
         fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
         await screen.findByRole('checkbox', {name: /api/});
 
@@ -927,12 +927,12 @@ describe('AdminGitProviders — add-flow repo selection (#211)', () => {
         // the negative assertions below cannot pass by racing it.
         expect(await screen.findByText('Add git provider')).toBeInTheDocument();
         expect(screen.queryByTestId('scope-prompt')).not.toBeInTheDocument();
-        expect(screen.queryByText('Repository scope')).not.toBeInTheDocument();
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     });
 
     it('shows the keep-history data-policy note in the manually opened editor, without the add-flow prompt', async () => {
         renderPage();
-        fireEvent.click(await screen.findByRole('button', {name: '3 selected'}));
+        fireEvent.click(await screen.findByRole('button', {name: 'Repos'}));
         expect(await screen.findByTestId('scope-policy-note')).toHaveTextContent(
             /only affects future syncs — data already collected from deselected repositories is kept/,
         );
@@ -942,7 +942,7 @@ describe('AdminGitProviders — add-flow repo selection (#211)', () => {
     it('Clear selection empties the picker so a few active repos can be ticked; Select all restores the non-archived set', async () => {
         providers = [structuredClone(DB_MONITOR_ALL)];
         renderPage();
-        fireEvent.click(await screen.findByRole('button', {name: 'All repos'}));
+        fireEvent.click(await screen.findByRole('button', {name: 'Repos'}));
         fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
         await screen.findByRole('checkbox', {name: /api/});
 
@@ -963,7 +963,7 @@ describe('AdminGitProviders — add-flow repo selection (#211)', () => {
     it('Select all matches the default seed: non-archived only, archived stays opt-in', async () => {
         providers = [structuredClone(DB_MONITOR_ALL)];
         renderPage();
-        fireEvent.click(await screen.findByRole('button', {name: 'All repos'}));
+        fireEvent.click(await screen.findByRole('button', {name: 'Repos'}));
         fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
         await screen.findByRole('checkbox', {name: /api/});
 
@@ -977,7 +977,7 @@ describe('AdminGitProviders — add-flow repo selection (#211)', () => {
     it('Select all RESETS an opted-in archived repo back to unchecked (documented, deliberate)', async () => {
         providers = [structuredClone(DB_MONITOR_ALL)];
         renderPage();
-        fireEvent.click(await screen.findByRole('button', {name: 'All repos'}));
+        fireEvent.click(await screen.findByRole('button', {name: 'Repos'}));
         fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
         const legacyBox = await screen.findByRole('checkbox', {name: /legacy/});
 
@@ -992,7 +992,7 @@ describe('AdminGitProviders — add-flow repo selection (#211)', () => {
         // Stored scope references "gone", which /repos no longer returns.
         providers = [{...structuredClone(DB_MONITOR_ALL), repos_include: '["api","gone"]'}];
         renderPage();
-        fireEvent.click(await screen.findByRole('button', {name: '2 selected'}));
+        fireEvent.click(await screen.findByRole('button', {name: 'Repos'}));
         await screen.findByRole('checkbox', {name: /api/});
 
         fireEvent.click(screen.getByRole('button', {name: 'Select all'}));
@@ -1013,7 +1013,7 @@ describe('AdminGitProviders — add-flow repo selection (#211)', () => {
         providers = [structuredClone(DB_MONITOR_ALL)];
         repos = [];
         renderPage();
-        fireEvent.click(await screen.findByRole('button', {name: 'All repos'}));
+        fireEvent.click(await screen.findByRole('button', {name: 'Repos'}));
         fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
 
         expect(await screen.findByText('No repositories found for this provider.')).toBeInTheDocument();
@@ -1047,7 +1047,7 @@ describe('AdminGitProviders — add-flow repo selection (#211)', () => {
         // editor and the one-shot prompt in place so the admin can retry.
         expect(await screen.findByText('Scope rejected by the server')).toBeInTheDocument();
         expect(screen.getByTestId('scope-prompt')).toBeInTheDocument();
-        expect(screen.getByText('Repository scope')).toBeInTheDocument();
+        expect(screen.getByRole('dialog')).toBeInTheDocument();
         expect(screen.getByRole('button', {name: 'Save scope'})).toBeEnabled();
     });
 
@@ -1056,7 +1056,7 @@ describe('AdminGitProviders — add-flow repo selection (#211)', () => {
         // empty selection, so the editor opens in select mode already empty.
         providers = [{...structuredClone(DB_MONITOR_ALL), repos_include: '[]'}];
         renderPage();
-        fireEvent.click(await screen.findByRole('button', {name: 'None selected'}));
+        fireEvent.click(await screen.findByRole('button', {name: 'Repos'}));
         await screen.findByRole('checkbox', {name: /api/});
 
         expect(screen.getByTestId('empty-selection-warning')).toBeInTheDocument();
@@ -1064,6 +1064,130 @@ describe('AdminGitProviders — add-flow repo selection (#211)', () => {
         // Recovery: ticking a repo lifts the guard.
         fireEvent.click(screen.getByRole('checkbox', {name: /api/}));
         expect(screen.getByRole('button', {name: 'Save scope'})).toBeEnabled();
+    });
+});
+
+describe('AdminGitProviders — repo-scope modal (#213)', () => {
+    async function openSelectMode(): Promise<void> {
+        fireEvent.click(await screen.findByRole('button', {name: 'Repos'}));
+        fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
+        await screen.findByRole('checkbox', {name: 'api'});
+    }
+
+    it('opens as an accessible dialog from the Repos action, with Slug and Name columns', async () => {
+        providers = [structuredClone(DB_MONITOR_ALL)];
+        renderPage();
+        await openSelectMode();
+
+        const dialog = screen.getByRole('dialog', {name: 'Repository scope — mono-org'});
+        expect(dialog).toHaveAttribute('aria-modal', 'true');
+        // Table columns: canonical slug + display name, archived badge on the row.
+        expect(within(dialog).getByRole('columnheader', {name: 'Slug'})).toBeInTheDocument();
+        expect(within(dialog).getByRole('columnheader', {name: 'Name'})).toBeInTheDocument();
+        expect(within(dialog).getByText('api')).toBeInTheDocument();
+        expect(within(dialog).getByText('API Service')).toBeInTheDocument();
+        expect(within(dialog).getByText('Old Legacy')).toBeInTheDocument();
+        expect(within(dialog).getByText('Archived')).toBeInTheDocument();
+        // The bulk-effect indicator is always visible in select mode.
+        expect(within(dialog).getByTestId('selected-count')).toHaveTextContent('2 of 3 selected');
+    });
+
+    it('Escape closes the modal without saving', async () => {
+        providers = [structuredClone(DB_MONITOR_ALL)];
+        renderPage();
+        await openSelectMode();
+
+        fireEvent.keyDown(screen.getByRole('dialog'), {key: 'Escape'});
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+        expect(lastCall(/\/git\/providers\/p-all$/, 'PATCH')).toBeUndefined();
+    });
+
+    it('a backdrop click closes the modal without saving', async () => {
+        providers = [structuredClone(DB_MONITOR_ALL)];
+        renderPage();
+        await openSelectMode();
+
+        fireEvent.click(screen.getByTestId('repo-scope-modal-backdrop'));
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+        expect(lastCall(/\/git\/providers\/p-all$/, 'PATCH')).toBeUndefined();
+    });
+
+    it('filters the table by slug or display name, case-insensitively, and clearing restores all rows', async () => {
+        providers = [structuredClone(DB_MONITOR_ALL)];
+        renderPage();
+        await openSelectMode();
+
+        const filter = screen.getByLabelText('Filter repositories');
+        // By slug.
+        fireEvent.change(filter, {target: {value: 'web'}});
+        expect(screen.getByRole('checkbox', {name: 'web'})).toBeInTheDocument();
+        expect(screen.queryByRole('checkbox', {name: 'api'})).not.toBeInTheDocument();
+        // By display name, different case.
+        fireEvent.change(filter, {target: {value: 'api SERVICE'}});
+        expect(screen.getByRole('checkbox', {name: 'api'})).toBeInTheDocument();
+        expect(screen.queryByRole('checkbox', {name: 'web'})).not.toBeInTheDocument();
+        // No match → empty-table message, and Save stays enabled (selection is intact).
+        fireEvent.change(filter, {target: {value: 'nothing-matches'}});
+        expect(screen.getByText('No repositories match the filter.')).toBeInTheDocument();
+        // Clearing restores every row.
+        fireEvent.change(filter, {target: {value: ''}});
+        expect(screen.getAllByRole('checkbox')).toHaveLength(3);
+    });
+
+    it('paginates at 25 rows per page; selection survives paging and filtering and saves the full set', async () => {
+        providers = [structuredClone(DB_MONITOR_ALL)];
+        repos = Array.from({length: 30}, (_, i) => ({
+            slug: `repo-${i}`,
+            name: `Repo ${i}`,
+            archived: false,
+            defaultBranch: 'main',
+        }));
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', {name: 'Repos'}));
+        fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
+        await screen.findByRole('checkbox', {name: 'repo-0'});
+
+        // Page 1 shows 25 of 30 rows.
+        expect(screen.getAllByRole('checkbox')).toHaveLength(25);
+        expect(screen.getByText('Page 1 of 2')).toBeInTheDocument();
+        expect(screen.queryByRole('checkbox', {name: 'repo-29'})).not.toBeInTheDocument();
+
+        // Clear (acts on the FULL list), tick one repo on page 1…
+        fireEvent.click(screen.getByRole('button', {name: 'Clear selection'}));
+        expect(screen.getByTestId('selected-count')).toHaveTextContent('0 of 30 selected');
+        fireEvent.click(screen.getByRole('checkbox', {name: 'repo-0'}));
+
+        // …one on page 2…
+        fireEvent.click(screen.getByRole('button', {name: 'Next'}));
+        expect(screen.getByText('Page 2 of 2')).toBeInTheDocument();
+        expect(screen.getAllByRole('checkbox')).toHaveLength(5);
+        fireEvent.click(screen.getByRole('checkbox', {name: 'repo-29'}));
+
+        // …and one found via the filter (which resets to page 1 of the result).
+        fireEvent.change(screen.getByLabelText('Filter repositories'), {target: {value: 'Repo 7'}});
+        fireEvent.click(screen.getByRole('checkbox', {name: 'repo-7'}));
+        fireEvent.change(screen.getByLabelText('Filter repositories'), {target: {value: ''}});
+
+        // The selection accumulated across pages and filters…
+        expect(screen.getByTestId('selected-count')).toHaveTextContent('3 of 30 selected');
+        // …and page-1 state survived the round trip.
+        expect(screen.getByRole('checkbox', {name: 'repo-0'})).toBeChecked();
+
+        // Save writes the full selected set in repo-list order.
+        fireEvent.click(screen.getByRole('button', {name: 'Save scope'}));
+        await waitFor(() => {
+            const sent = JSON.parse(
+                String(lastCall(/\/git\/providers\/p-all$/, 'PATCH')?.[1]?.body),
+            ) as Record<string, unknown>;
+            expect(sent.repos).toEqual(['repo-0', 'repo-7', 'repo-29']);
+        });
+    });
+
+    it('hides pagination when the repo list fits on one page', async () => {
+        providers = [structuredClone(DB_MONITOR_ALL)];
+        renderPage();
+        await openSelectMode();
+        expect(screen.queryByTestId('repo-pagination')).not.toBeInTheDocument();
     });
 });
 

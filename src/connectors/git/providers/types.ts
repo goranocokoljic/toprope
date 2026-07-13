@@ -8,8 +8,21 @@ export interface GitAuthor {
 
 export interface GitRepo {
     id: string;
+    /**
+     * The canonical repo identifier the sync pipeline filters and fetches by
+     * (GitHub repo name, Bitbucket slug, GitLab path_with_namespace). Stored
+     * repo-scope filters (`repos_include`/`repos_exclude`) match against THIS
+     * value — it must stay stable.
+     */
     name: string;
     fullName: string;
+    /**
+     * The provider's human-readable repository name, for display only (#213):
+     * Bitbucket/GitLab expose a display name distinct from the slug/path;
+     * GitHub has no separate display name, so it equals `name` there. Never
+     * used for filtering or API paths.
+     */
+    displayName: string;
     defaultBranch: string;
     isArchived: boolean;
 }

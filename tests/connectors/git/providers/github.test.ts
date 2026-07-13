@@ -116,6 +116,7 @@ describe('GitHubProvider', () => {
                 id: '1001',
                 name: 'my-repo',
                 fullName: 'test-org/my-repo',
+                displayName: 'my-repo',
                 defaultBranch: 'main',
                 isArchived: false,
             });
