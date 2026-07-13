@@ -169,7 +169,16 @@ export function useAdminDataSources(): UseQueryResult<AdminDataSources, Error> {
 // fresh. Test-connection is a mutation (a probe with a result), not a query —
 // the admin triggers it explicitly and reads the ok/error inline.
 export function useAdminGitProviders(): UseQueryResult<AdminGitProvider[], Error> {
-    return useQuery({queryKey: queryKeys.adminGitProviders, queryFn: api.getAdminGitProviders});
+    return useQuery({
+        queryKey: queryKeys.adminGitProviders,
+        queryFn: api.getAdminGitProviders,
+        // Poll only while a sync-now run is in flight (#209): live progress
+        // (`active_sync`) streams in every second, and the poll that observes
+        // the run settle both stops itself and already carries the terminal
+        // last_sync_* outcome — no manual refresh.
+        refetchInterval: (query) =>
+            query.state.data?.some((p) => p.active_sync !== null) ? 1000 : false,
+    });
 }
 
 function useInvalidateGitProviders(): () => void {

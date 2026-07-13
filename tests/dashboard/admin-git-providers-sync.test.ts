@@ -91,11 +91,22 @@ function authHeaders(token: string): Record<string, string> {
     return {cookie: `${SESSION_COOKIE}=${token}`};
 }
 
+interface SyncProgressRow {
+    stage: string;
+    repos_total: number | null;
+    repos_processed: number;
+    current_repo: string | null;
+    commits_fetched: number;
+    prs_fetched: number;
+    developers_matched: number;
+}
+
 interface ProviderListRow {
     id: string;
     last_sync_status: string | null;
     last_sync_at: string | null;
     last_sync_error: string | null;
+    active_sync: {started_at: string; progress: SyncProgressRow | null} | null;
 }
 
 describe('admin git-provider sync-now API (#199)', () => {
@@ -306,6 +317,89 @@ describe('admin git-provider sync-now API (#199)', () => {
             const third = await triggerSync(id);
             expect(third.statusCode).toBe(202);
             await waitForSyncStatus(id, 'ok');
+        });
+
+        it('exposes active_sync on the list while a run is in flight and clears it after (#209)', async () => {
+            const id = await createGithub();
+            // Idle rows carry active_sync: null (the UI's "nothing running" signal).
+            expect((await readProvider(id))?.active_sync).toBeNull();
+
+            // Gate listRepos so the run parks in the listing stage.
+            let release!: () => void;
+            const gate = new Promise<void>((r) => {
+                release = r;
+            });
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockImplementation(async () => {
+                        await gate;
+                        return [];
+                    }),
+                }),
+            );
+
+            const res = await triggerSync(id);
+            expect(res.statusCode).toBe(202);
+
+            const running = await readProvider(id);
+            expect(running?.active_sync).not.toBeNull();
+            expect(running?.active_sync?.started_at).toEqual(expect.any(String));
+            // The listing stage was emitted before the (gated) listRepos call.
+            expect(running?.active_sync?.progress?.stage).toBe('listing_repos');
+
+            release();
+            await waitForSyncStatus(id, 'ok');
+            // Settled: the in-flight entry is cleared again.
+            expect((await readProvider(id))?.active_sync).toBeNull();
+        });
+
+        it('streams cumulative progress counters as repos are fetched (#209)', async () => {
+            const id = await createGithub();
+            // Two repos; the second repo's commit fetch is gated so the run parks
+            // mid-fetch with repo1 fully processed.
+            let release!: () => void;
+            const gate = new Promise<void>((r) => {
+                release = r;
+            });
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1'), makeRepo('repo2')]),
+                    getCommits: vi.fn().mockImplementation(async (repo: string) => {
+                        if (repo === 'repo2') {
+                            await gate;
+                            return [];
+                        }
+                        return [makeCommit('alice')];
+                    }),
+                    getCommitDiff: vi.fn().mockResolvedValue([
+                        {path: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'},
+                    ]),
+                }),
+            );
+
+            expect((await triggerSync(id)).statusCode).toBe(202);
+
+            // Poll the same surface the UI polls until repo1 has completed.
+            const deadline = Date.now() + 2000;
+            let progress: SyncProgressRow | null | undefined;
+            while (Date.now() < deadline) {
+                progress = (await readProvider(id))?.active_sync?.progress;
+                if (progress?.repos_processed === 1) break;
+                await new Promise((r) => setTimeout(r, 10));
+            }
+            expect(progress).toMatchObject({
+                stage: 'fetching',
+                repos_total: 2,
+                repos_processed: 1,
+                current_repo: 'repo2',
+                commits_fetched: 1,
+            });
+
+            release();
+            const row = await waitForSyncStatus(id, 'ok');
+            expect(row.active_sync).toBeNull();
         });
 
         it('returns a typed 404 for an unknown id', async () => {

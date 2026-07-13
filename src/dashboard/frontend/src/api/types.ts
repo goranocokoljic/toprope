@@ -932,6 +932,35 @@ export interface AdminGitProvider {
     last_sync_at: string | null;
     last_sync_status: string | null;
     last_sync_error: string | null;
+    /** Non-null only while a sync-now run is in flight for this provider (#209). */
+    active_sync: GitProviderActiveSync | null;
+}
+
+/** The stages a sync run passes through, in pipeline order (#209). */
+export type GitSyncStage = 'listing_repos' | 'fetching' | 'analyzing' | 'writing';
+
+/**
+ * The pipeline's latest progress snapshot for an in-flight sync — mirrors the
+ * server's `GitSyncProgress` exactly. Counters are cumulative over the run.
+ */
+export interface GitSyncProgress {
+    stage: GitSyncStage;
+    /** Repos selected for the run; null until listing has completed. */
+    repos_total: number | null;
+    repos_processed: number;
+    current_repo: string | null;
+    commits_fetched: number;
+    prs_fetched: number;
+    developers_matched: number;
+}
+
+/**
+ * Live state of an in-flight sync-now run, from the provider list's
+ * `active_sync` (#209). `progress` is null until the first pipeline emission.
+ */
+export interface GitProviderActiveSync {
+    started_at: string;
+    progress: GitSyncProgress | null;
 }
 
 /**

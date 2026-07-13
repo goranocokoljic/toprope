@@ -122,7 +122,20 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     });
 
     if (!res.ok) {
-        throw new ApiError(res.status, `Request to ${path} failed with ${res.status}`);
+        // Prefer the server's typed error body ({error, message}) so the UI can
+        // show "A sync is already in progress…" or the key-setup remediation
+        // instead of a bare status code; fall back to the generic line when the
+        // body isn't JSON or carries no message.
+        let message = `Request to ${path} failed with ${res.status}`;
+        try {
+            const body = (await res.json()) as {message?: unknown};
+            if (typeof body.message === 'string' && body.message.trim() !== '') {
+                message = body.message;
+            }
+        } catch {
+            // Non-JSON error body — keep the generic message.
+        }
+        throw new ApiError(res.status, message);
     }
 
     return (await res.json()) as T;

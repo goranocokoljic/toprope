@@ -16,6 +16,7 @@ import {
 } from '../../hooks/useAdmin';
 import type {
     AdminGitProvider,
+    GitProviderActiveSync,
     GitProviderInput,
     GitProviderProbeResult,
     GitProviderType,
@@ -204,6 +205,41 @@ function syncTone(status: string | null): 'success' | 'danger' | 'neutral' {
     if (status === 'ok') return 'success';
     if (status === 'error') return 'danger';
     return 'neutral';
+}
+
+/**
+ * Human-readable line for an in-flight sync's progress snapshot (#209) — stage
+ * plus the counters that stage has meaningfully advanced. Exported for tests.
+ */
+export function syncProgressLabel(active: GitProviderActiveSync): string {
+    const p = active.progress;
+    if (!p) return 'Starting sync…';
+    switch (p.stage) {
+        case 'listing_repos':
+            return 'Listing repositories…';
+        case 'fetching': {
+            const total = p.repos_total ?? 0;
+            // repos_processed counts COMPLETED repos; the one in flight is +1,
+            // clamped so the label never overshoots (12/12, not 13/12; 0/0).
+            const position = Math.min(p.repos_processed + 1, total);
+            const repo = p.current_repo ? ` (${p.current_repo})` : '';
+            return `Fetching activity — repo ${position}/${total}${repo} · ${p.commits_fetched} commits · ${p.prs_fetched} PRs`;
+        }
+        case 'analyzing':
+            return `Matching developers — ${p.developers_matched} matched`;
+        case 'writing':
+            return `Writing snapshots — ${p.developers_matched} developers matched`;
+    }
+}
+
+/** Small indeterminate spinner shown next to live sync progress. */
+function Spinner(): JSX.Element {
+    return (
+        <span
+            aria-hidden
+            className="inline-block h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-accent border-t-transparent"
+        />
+    );
 }
 
 /** Render the probe result (ok/error + hint) inline after a Test connection. */
@@ -553,6 +589,9 @@ function ProviderRow({
 
     const isConfig = provider.source === 'config';
     const meta = PROVIDER_META[provider.type];
+    // A run is in flight server-side (from the polled list) OR the trigger POST
+    // is still pending — either way the button stays down and shows progress.
+    const syncRunning = provider.active_sync !== null || sync.isPending;
 
     function toggleEnabled(): void {
         // A PATCH must carry the full provider identity (the server re-validates);
@@ -637,10 +676,10 @@ function ProviderRow({
                             <>
                                 <AccentButton
                                     onClick={() => sync.mutate(provider.id)}
-                                    disabled={sync.isPending || !provider.enabled}
+                                    disabled={syncRunning || !provider.enabled}
                                     title={provider.enabled ? undefined : 'Enable the provider to sync'}
                                 >
-                                    {sync.isPending ? 'Syncing…' : 'Sync now'}
+                                    {syncRunning ? 'Syncing…' : 'Sync now'}
                                 </AccentButton>
                                 <button
                                     type="button"
@@ -662,6 +701,27 @@ function ProviderRow({
                     </div>
                 </Td>
             </tr>
+            {provider.active_sync ? (
+                <tr>
+                    <td colSpan={7} className="px-3 pb-3">
+                        <span
+                            className="flex items-center gap-2 text-sm text-muted"
+                            role="status"
+                            data-testid="sync-progress"
+                        >
+                            <Spinner />
+                            {syncProgressLabel(provider.active_sync)}
+                        </span>
+                    </td>
+                </tr>
+            ) : null}
+            {sync.isError ? (
+                <tr>
+                    <td colSpan={7} className="px-3 pb-3">
+                        <ErrorText error={sync.error} />
+                    </td>
+                </tr>
+            ) : null}
             {test.data ? (
                 <tr>
                     <td colSpan={7} className="px-3 pb-3">

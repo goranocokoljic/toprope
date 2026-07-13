@@ -222,6 +222,13 @@ returned by the API afterwards — the dashboard only ever shows a masked value 
 last four characters. Editing a provider without re-entering the token keeps the
 stored one; entering a new token replaces it.
 
+**Sync now shows live progress.** Triggering a per-provider sync from the dashboard
+streams the run's progress under the provider row — the current stage (listing
+repositories → fetching activity → matching developers → writing snapshots) with
+live repo/commit/PR/developer counters — and the row reflects the terminal ok/error
+outcome when the run settles, without a manual refresh. A second trigger while a
+run is in flight is rejected with a visible "sync already in progress" message.
+
 Provider notes:
 
 - **GitHub** — REST API; cloud and Enterprise.
