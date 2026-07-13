@@ -246,7 +246,7 @@ export class BitbucketProvider implements GitProvider {
                 id: r.uuid,
                 name: r.slug,
                 fullName: r.full_name,
-                displayName: r.name ?? r.slug,
+                displayName: r.name,
                 defaultBranch: r.mainbranch?.name ?? 'main',
                 isArchived: false,
             }));

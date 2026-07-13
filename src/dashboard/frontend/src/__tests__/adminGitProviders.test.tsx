@@ -1102,12 +1102,51 @@ describe('AdminGitProviders — repo-scope modal (#213)', () => {
         expect(lastCall(/\/git\/providers\/p-all$/, 'PATCH')).toBeUndefined();
     });
 
-    it('a backdrop click closes the modal without saving', async () => {
+    it('a genuine backdrop click closes the modal without saving; a drag-release from inside does not', async () => {
         providers = [structuredClone(DB_MONITOR_ALL)];
         renderPage();
         await openSelectMode();
 
-        fireEvent.click(screen.getByTestId('repo-scope-modal-backdrop'));
+        const backdrop = screen.getByTestId('repo-scope-modal-p-all-backdrop');
+        // Drag that STARTS inside the dialog (e.g. selecting filter text) and
+        // releases over the dim area must NOT discard the selection session.
+        fireEvent.mouseDown(screen.getByLabelText('Filter repositories'));
+        fireEvent.click(backdrop);
+        expect(screen.getByRole('dialog')).toBeInTheDocument();
+
+        // A real backdrop click (press + release on the backdrop) closes.
+        fireEvent.mouseDown(backdrop);
+        fireEvent.click(backdrop);
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+        expect(lastCall(/\/git\/providers\/p-all$/, 'PATCH')).toBeUndefined();
+    });
+
+    it('Escape in one stacked dialog closes only that dialog (the prompt survives)', async () => {
+        renderPage();
+        fireEvent.change(screen.getByLabelText('Organization'), {target: {value: 'new-org'}});
+        fireEvent.change(screen.getByLabelText('Token'), {target: {value: 'ghp_secret'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Save'}));
+        await screen.findByTestId('scope-prompt');
+
+        const ghRow = screen.getByText('acme-org').closest('tr') as HTMLElement;
+        fireEvent.click(within(ghRow).getByRole('button', {name: 'Repos'}));
+        expect(screen.getAllByRole('dialog')).toHaveLength(2);
+
+        const ghDialog = screen.getByRole('dialog', {name: 'Repository scope — acme-org'});
+        fireEvent.keyDown(ghDialog, {key: 'Escape'});
+        // Only the acme dialog closed; the prompted modal is untouched.
+        expect(screen.getAllByRole('dialog')).toHaveLength(1);
+        expect(screen.getByTestId('scope-prompt')).toBeInTheDocument();
+    });
+
+    it('Escape while typing in the filter closes the dialog (standard dialog semantics, documented intent)', async () => {
+        providers = [structuredClone(DB_MONITOR_ALL)];
+        renderPage();
+        await openSelectMode();
+
+        const filter = screen.getByLabelText('Filter repositories');
+        filter.focus();
+        fireEvent.keyDown(filter, {key: 'Escape'});
         expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
         expect(lastCall(/\/git\/providers\/p-all$/, 'PATCH')).toBeUndefined();
     });
@@ -1122,6 +1161,9 @@ describe('AdminGitProviders — repo-scope modal (#213)', () => {
         fireEvent.change(filter, {target: {value: 'web'}});
         expect(screen.getByRole('checkbox', {name: 'web'})).toBeInTheDocument();
         expect(screen.queryByRole('checkbox', {name: 'api'})).not.toBeInTheDocument();
+        // The selected-count denominator stays the FULL list while filtering —
+        // that is the "bulk actions act on the full list" signal.
+        expect(screen.getByTestId('selected-count')).toHaveTextContent('2 of 3 selected');
         // By display name, different case.
         fireEvent.change(filter, {target: {value: 'api SERVICE'}});
         expect(screen.getByRole('checkbox', {name: 'api'})).toBeInTheDocument();
@@ -1163,10 +1205,15 @@ describe('AdminGitProviders — repo-scope modal (#213)', () => {
         expect(screen.getAllByRole('checkbox')).toHaveLength(5);
         fireEvent.click(screen.getByRole('checkbox', {name: 'repo-29'}));
 
-        // …and one found via the filter (which resets to page 1 of the result).
+        // …and one found via the filter (which resets to page 1 of the result;
+        // a single-result page also hides the pagination controls entirely).
         fireEvent.change(screen.getByLabelText('Filter repositories'), {target: {value: 'Repo 7'}});
+        expect(screen.queryByTestId('repo-pagination')).not.toBeInTheDocument();
         fireEvent.click(screen.getByRole('checkbox', {name: 'repo-7'}));
         fireEvent.change(screen.getByLabelText('Filter repositories'), {target: {value: ''}});
+        // Clearing the filter restarts from page 1 (the filter change resets the
+        // page; the safePage clamp alone would have left the user on page 2).
+        expect(screen.getByText('Page 1 of 2')).toBeInTheDocument();
 
         // The selection accumulated across pages and filters…
         expect(screen.getByTestId('selected-count')).toHaveTextContent('3 of 30 selected');
@@ -1188,6 +1235,34 @@ describe('AdminGitProviders — repo-scope modal (#213)', () => {
         renderPage();
         await openSelectMode();
         expect(screen.queryByTestId('repo-pagination')).not.toBeInTheDocument();
+    });
+
+    it('exactly 25 repos is still a single page (boundary)', async () => {
+        providers = [structuredClone(DB_MONITOR_ALL)];
+        repos = Array.from({length: 25}, (_, i) => ({
+            slug: `repo-${i}`,
+            name: `Repo ${i}`,
+            archived: false,
+            defaultBranch: 'main',
+        }));
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', {name: 'Repos'}));
+        fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
+        await screen.findByRole('checkbox', {name: 'repo-0'});
+        expect(screen.getAllByRole('checkbox')).toHaveLength(25);
+        expect(screen.queryByTestId('repo-pagination')).not.toBeInTheDocument();
+    });
+
+    it('footnotes stored slugs missing from the listing instead of blending them into the count', async () => {
+        providers = [{...structuredClone(DB_MONITOR_ALL), repos_include: '["api","gone"]'}];
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', {name: 'Repos'}));
+        await screen.findByRole('checkbox', {name: 'api'});
+        // "gone" is selected (stored) but not listed: 1 listed of 3, +1 extra —
+        // never "2 of 3" (or worse, a numerator above the denominator).
+        expect(screen.getByTestId('selected-count')).toHaveTextContent(
+            '1 of 3 selected (+1 not listed)',
+        );
     });
 });
 

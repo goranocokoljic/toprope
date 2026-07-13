@@ -375,6 +375,9 @@ describe('admin git-provider test + repos API (#198)', () => {
                     listRepos: vi.fn().mockResolvedValue([
                         makeRepo('active-svc', false, 'main'),
                         makeRepo('legacy-svc', true, 'master'),
+                        // No display name (e.g. GitHub) → the projection falls
+                        // back to the canonical slug for the `name` column.
+                        {...makeRepo('plain-svc', false, 'main'), displayName: undefined},
                     ]),
                 }),
             );
@@ -394,6 +397,7 @@ describe('admin git-provider test + repos API (#198)', () => {
             expect(repos).toEqual([
                 {slug: 'active-svc', name: 'Display active-svc', archived: false, defaultBranch: 'main'},
                 {slug: 'legacy-svc', name: 'Display legacy-svc', archived: true, defaultBranch: 'master'},
+                {slug: 'plain-svc', name: 'plain-svc', archived: false, defaultBranch: 'main'},
             ]);
             // The archived flag is surfaced so the UI can exclude archived by default.
             expect(repos.find((r) => r.slug === 'legacy-svc')?.archived).toBe(true);

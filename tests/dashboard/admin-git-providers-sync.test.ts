@@ -50,7 +50,6 @@ function makeRepo(name: string): GitRepo {
         id: name,
         name,
         fullName: `db-org/${name}`,
-        displayName: name,
         defaultBranch: 'main',
         isArchived: false,
     };

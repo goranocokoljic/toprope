@@ -96,11 +96,14 @@ function AccentButton({
     onClick,
     disabled,
     title,
+    ariaHasPopup,
 }: {
     children: ReactNode;
     onClick?: () => void;
     disabled?: boolean;
     title?: string;
+    /** Set to 'dialog' on buttons that open a modal (announced to AT). */
+    ariaHasPopup?: 'dialog';
 }): JSX.Element {
     return (
         <button
@@ -108,6 +111,7 @@ function AccentButton({
             onClick={onClick}
             disabled={disabled}
             title={title}
+            aria-haspopup={ariaHasPopup}
             className="rounded-md border border-accent/40 bg-accent-soft px-3 py-1.5 text-sm font-medium text-accent transition-colors hover:bg-accent hover:text-white disabled:opacity-50"
         >
             {children}
@@ -454,6 +458,9 @@ function ProviderForm({
     );
 }
 
+/** Client-side page size for the repo table (#213). */
+const REPO_PAGE_SIZE = 25;
+
 /**
  * Per-provider repo-scope MODAL (GC1.9 / #201, redesigned in #213). Two modes:
  *  - "Monitor all repositories" (default) — the PATCH omits `repos`, so the server
@@ -470,8 +477,6 @@ function ProviderForm({
  * `prompt` (#211) renders the just-connected intro asking the admin to narrow the
  * scope before the first sync — the add flow auto-opens the modal with it.
  */
-const REPO_PAGE_SIZE = 25;
-
 function RepoScopeModal({
     provider,
     onClose,
@@ -525,13 +530,13 @@ function RepoScopeModal({
 
     // Table columns: checkbox / Slug / Name (+ archived badge). Selection and
     // filtering already control the order and visible set, so column sorting is
-    // deliberately off. The checkbox is labelled by the SLUG (the identifier the
-    // save writes), not the display name.
+    // deliberately off (render-only columns are unsortable by DataTable's
+    // contract; the Slug accessor needs the explicit opt-out). The checkbox is
+    // labelled by the SLUG (the identifier the save writes), not the display name.
     const columns: Column<GitProviderRepo>[] = [
         {
             key: 'selected',
             header: '',
-            sortable: false,
             render: (r) => (
                 <input
                     type="checkbox"
@@ -546,8 +551,6 @@ function RepoScopeModal({
         {
             key: 'name',
             header: 'Name',
-            accessor: (r) => r.name,
-            sortable: false,
             render: (r) => (
                 <span className="flex items-center gap-2">
                     {r.name}
@@ -571,6 +574,10 @@ function RepoScopeModal({
     // "Monitor all" mode has no such dependency and is always saveable.
     const selectSourceReady = repos.isSuccess && repoList.length > 0;
     const emptySelection = mode === 'select' && selectSourceReady && selected.size === 0;
+    // The count line separates LISTED selections from stored slugs the listing
+    // no longer returns (extras) — blending them could read "4 of 3 selected".
+    const listedSelectedCount = repoList.filter((r) => selected.has(r.slug)).length;
+    const unlistedSelectedCount = selected.size - listedSelectedCount;
     const canSave =
         !update.isPending && (mode === 'all' || (selectSourceReady && !emptySelection));
 
@@ -592,7 +599,13 @@ function RepoScopeModal({
     }
 
     return (
-        <Modal title={`Repository scope — ${provider.container}`} onClose={onClose} testId="repo-scope-modal">
+        <Modal
+            title={`Repository scope — ${provider.container}`}
+            onClose={onClose}
+            // Provider-scoped so stacked modals (#211 prompt + another row's)
+            // never render duplicate test ids.
+            testId={`repo-scope-modal-${provider.id}`}
+        >
             {prompt ? (
                 <p className="mb-3 text-sm text-foreground" role="status" data-testid="scope-prompt">
                     Provider connected. Choose which repositories to analyze before the first sync —
@@ -666,7 +679,10 @@ function RepoScopeModal({
                                 {/* Bulk actions affect rows on every page — keep the
                                     total selected count in permanent view. */}
                                 <span className="text-xs text-muted" data-testid="selected-count">
-                                    {selected.size} of {repoList.length} selected
+                                    {listedSelectedCount} of {repoList.length} selected
+                                    {unlistedSelectedCount > 0
+                                        ? ` (+${unlistedSelectedCount} not listed)`
+                                        : ''}
                                 </span>
                             </div>
                             <TextField
@@ -690,7 +706,7 @@ function RepoScopeModal({
                             {pageCount > 1 ? (
                                 <div className="mt-2 flex items-center gap-3" data-testid="repo-pagination">
                                     <SecondaryButton
-                                        onClick={() => setPage(Math.max(0, safePage - 1))}
+                                        onClick={() => setPage(safePage - 1)}
                                         disabled={safePage === 0}
                                     >
                                         Previous
@@ -699,7 +715,7 @@ function RepoScopeModal({
                                         Page {safePage + 1} of {pageCount}
                                     </span>
                                     <SecondaryButton
-                                        onClick={() => setPage(Math.min(pageCount - 1, safePage + 1))}
+                                        onClick={() => setPage(safePage + 1)}
                                         disabled={safePage === pageCount - 1}
                                     >
                                         Next
@@ -862,6 +878,7 @@ function ProviderRow({
                                 <AccentButton
                                     onClick={() => setScopeOpen(true)}
                                     title="Choose which repositories to analyze"
+                                    ariaHasPopup="dialog"
                                 >
                                     Repos
                                 </AccentButton>

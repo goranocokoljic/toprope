@@ -17,12 +17,13 @@ export interface GitRepo {
     name: string;
     fullName: string;
     /**
-     * The provider's human-readable repository name, for display only (#213):
-     * Bitbucket/GitLab expose a display name distinct from the slug/path;
-     * GitHub has no separate display name, so it equals `name` there. Never
-     * used for filtering or API paths.
+     * The provider's human-readable repository name, for display only (#213).
+     * Set only where the provider exposes a name distinct from the slug/path
+     * (Bitbucket, GitLab); absent for GitHub. The sole consumer (the admin
+     * `/repos` projection) falls back to `name`. Never used for filtering or
+     * API paths.
      */
-    displayName: string;
+    displayName?: string;
     defaultBranch: string;
     isArchived: boolean;
 }
