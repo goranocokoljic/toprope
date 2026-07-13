@@ -1,23 +1,37 @@
-import {useMemo, useState, type ReactNode} from 'react';
+import {useEffect, useMemo, useState, type ReactNode} from 'react';
 
 export type SortDirection = 'asc' | 'desc';
+
+/** An active sort: the column key plus its direction. */
+export interface SortState {
+    key: string;
+    direction: SortDirection;
+}
 
 export interface Column<T> {
     /** Stable column id; also the sort key. */
     key: string;
     header: ReactNode;
     /**
-     * Value used for the default cell text AND for sorting. Provide for any
-     * sortable column. Columns with only `render` and no `accessor` are not
-     * sortable. Return `null` for a row with no value in this column — such rows
-     * always sort to the END, in BOTH directions (see the sort comparator), so a
+     * Value used for the default cell text AND for self-mode sorting. Provide
+     * for any column that should sort in the classic self-sorting mode —
+     * without an accessor a column can only sort in CONTROLLED mode (via
+     * `sortable: true`, where the parent's comparator owns the ordering).
+     * Return `null` for a row with no value in this column — such rows always
+     * sort to the END, in BOTH directions (see the sort comparator), so a
      * "no data" row never reads as the best or worst ranked value.
      */
     accessor?: (row: T) => string | number | null;
     /** Custom cell renderer; falls back to the accessor value. */
     render?: (row: T) => ReactNode;
     align?: 'left' | 'right' | 'center';
-    /** Force-disable sorting even when an accessor is present. */
+    /**
+     * `false` force-disables sorting even when an accessor is present.
+     * `true` force-enables a render-only column — honored ONLY in controlled
+     * mode (the parent comparator sorts); in self-sorting mode it is ignored,
+     * because without an accessor the header would announce a sort that never
+     * reorders anything.
+     */
     sortable?: boolean;
 }
 
@@ -26,7 +40,7 @@ export interface DataTableProps<T> {
     rows: T[];
     /** Stable key per row (for React reconciliation). */
     getRowKey: (row: T) => string;
-    initialSort?: {key: string; direction: SortDirection};
+    initialSort?: SortState;
     emptyMessage?: string;
     caption?: string;
     /**
@@ -35,11 +49,12 @@ export interface DataTableProps<T> {
      * callback, `sort` drives the header indicators, and `rows` are rendered
      * AS GIVEN (pre-sorted by the parent). Use this when sorting must compose
      * with parent-side concerns like pagination or a comparator the accessors
-     * can't express (e.g. grouped selection-status ordering). Omit both props
-     * for the classic self-sorting behavior.
+     * can't express (e.g. grouped selection-status ordering). Pass BOTH props
+     * together (a `sort` without `onSortChange` is ignored — warned in dev);
+     * omit both for the classic self-sorting behavior.
      */
-    sort?: {key: string; direction: SortDirection} | null;
-    onSortChange?: (sort: {key: string; direction: SortDirection}) => void;
+    sort?: SortState;
+    onSortChange?: (sort: SortState) => void;
 }
 
 const ALIGN_CLASS: Record<'left' | 'right' | 'center', string> = {
@@ -48,12 +63,13 @@ const ALIGN_CLASS: Record<'left' | 'right' | 'center', string> = {
     center: 'text-center',
 };
 
-function isSortable<T>(col: Column<T>): boolean {
-    // Explicit `sortable: true` force-enables a render-only column (meaningful
-    // in controlled mode, where the parent's comparator doesn't need an
-    // accessor); otherwise a column sorts iff it has an accessor and hasn't
-    // opted out.
-    if (col.sortable === true) return true;
+function isSortable<T>(col: Column<T>, controlled: boolean): boolean {
+    // Controlled mode: the parent comparator owns the ordering, so an explicit
+    // flag wins and a render-only column may force-enable; otherwise the
+    // accessor decides. Self-sorting mode stays FAIL-CLOSED: only accessor
+    // columns can actually sort, so a force-enabled render-only column must
+    // not show a header that would announce a sort it can't perform.
+    if (controlled) return col.sortable ?? col.accessor !== undefined;
     return col.accessor !== undefined && col.sortable !== false;
 }
 
@@ -81,12 +97,24 @@ export function DataTable<T>({
     onSortChange,
 }: DataTableProps<T>): JSX.Element {
     const controlled = onSortChange !== undefined;
-    const [internalSort, setInternalSort] = useState<{key: string; direction: SortDirection} | null>(
-        initialSort ?? null,
-    );
+    const [internalSort, setInternalSort] = useState<SortState | null>(initialSort ?? null);
     // In controlled mode the parent's sort drives the header indicators and the
     // rows arrive pre-sorted; otherwise this component owns both.
     const sort = controlled ? controlledSort ?? null : internalSort;
+
+    // Dev-time guard against half-configuring the controlled seam: both halves
+    // silently misbehave otherwise (an ignored `sort`, or dead `initialSort`).
+    useEffect(() => {
+        if (!import.meta.env.DEV) return;
+        if (controlledSort !== undefined && !controlled) {
+            console.warn('DataTable: `sort` was provided without `onSortChange` — it is ignored. Pass both for controlled sorting.');
+        }
+        if (controlled && initialSort !== undefined) {
+            console.warn('DataTable: `initialSort` is ignored when sorting is controlled; drive `sort` instead.');
+        }
+        // Mount-only sanity check: the mode is a structural choice, not runtime state.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
 
     const sortedRows = useMemo(() => {
         if (controlled || !sort) {
@@ -116,14 +144,14 @@ export function DataTable<T>({
     }, [rows, columns, sort, controlled]);
 
     function toggleSort(key: string): void {
-        const next = (current: {key: string; direction: SortDirection} | null): {key: string; direction: SortDirection} => {
+        const next = (current: SortState | null): SortState => {
             if (current?.key === key) {
                 return {key, direction: current.direction === 'asc' ? 'desc' : 'asc'};
             }
             return {key, direction: 'asc'};
         };
-        if (controlled) {
-            onSortChange?.(next(sort));
+        if (onSortChange) {
+            onSortChange(next(sort));
         } else {
             setInternalSort(next);
         }
@@ -136,7 +164,7 @@ export function DataTable<T>({
                 <thead>
                     <tr className="border-b border-border bg-surface-raised">
                         {columns.map((col) => {
-                            const sortable = isSortable(col);
+                            const sortable = isSortable(col, controlled);
                             const active = sort?.key === col.key;
                             const align = col.align ?? 'left';
                             return (

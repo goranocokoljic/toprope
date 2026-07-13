@@ -216,6 +216,54 @@ describe('DataTable', () => {
         render(<DataTable columns={COLUMNS} rows={[]} getRowKey={(r) => r.name} emptyMessage="Nothing here" />);
         expect(screen.getByText('Nothing here')).toBeInTheDocument();
     });
+
+    it('self-sorting mode fails closed: sortable:false and render-only columns get plain headers', () => {
+        const columns: Column<Row>[] = [
+            // Accessor present but explicitly opted out — plain header.
+            {key: 'name', header: 'Team', accessor: (r) => r.name, sortable: false},
+            // Render-only column — cannot sort without an accessor.
+            {key: 'flag', header: 'Flag', render: () => 'x'},
+            // Render-only with a force-enable: honored ONLY in controlled mode;
+            // uncontrolled it must NOT render a sort button that would announce
+            // a sort it can't perform (#215).
+            {key: 'fake', header: 'Fake', render: () => 'y', sortable: true},
+        ];
+        render(<DataTable columns={columns} rows={ROWS} getRowKey={(r) => r.name} />);
+        expect(screen.queryByRole('button', {name: /Team/})).not.toBeInTheDocument();
+        expect(screen.queryByRole('button', {name: /Flag/})).not.toBeInTheDocument();
+        expect(screen.queryByRole('button', {name: /Fake/})).not.toBeInTheDocument();
+        expect(screen.getByRole('columnheader', {name: 'Fake'})).toHaveAttribute('aria-sort', 'none');
+    });
+
+    it('controlled mode: header clicks report through onSortChange, rows render as given, force-enable works', () => {
+        const changes: {key: string; direction: string}[] = [];
+        render(
+            <DataTable
+                columns={[
+                    {key: 'name', header: 'Team', accessor: (r: Row) => r.name},
+                    {key: 'fake', header: 'Fake', render: () => 'y', sortable: true},
+                ]}
+                rows={ROWS}
+                getRowKey={(r) => r.name}
+                sort={{key: 'name', direction: 'asc'}}
+                onSortChange={(s) => changes.push(s)}
+            />,
+        );
+        // Rows are rendered AS GIVEN — the parent owns the ordering.
+        expect(bodyOrder()).toEqual(['frontend', 'backend', 'platform']);
+        // The active sort prop drives the indicator.
+        expect(screen.getByRole('columnheader', {name: /Team/})).toHaveAttribute('aria-sort', 'ascending');
+        // Clicking the active header reports a direction toggle; clicking the
+        // force-enabled render-only header reports a fresh ascending sort.
+        fireEvent.click(screen.getByRole('button', {name: /Team/}));
+        fireEvent.click(screen.getByRole('button', {name: /Fake/}));
+        expect(changes).toEqual([
+            {key: 'name', direction: 'desc'},
+            {key: 'fake', direction: 'asc'},
+        ]);
+        // Rows still untouched — controlled mode never self-sorts.
+        expect(bodyOrder()).toEqual(['frontend', 'backend', 'platform']);
+    });
 });
 
 // --- TimeRangeSelector -----------------------------------------------------

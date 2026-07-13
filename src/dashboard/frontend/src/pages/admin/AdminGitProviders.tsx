@@ -4,7 +4,7 @@ import {Card} from '../../components/Card';
 import {Badge} from '../../components/Badge';
 import {StatePanel} from '../../components/StatePanel';
 import {Modal} from '../../components/Modal';
-import {DataTable, type Column, type SortDirection} from '../../components/DataTable';
+import {DataTable, type Column, type SortState} from '../../components/DataTable';
 import {
     useAdminDataSources,
     useAdminGitProviderRepos,
@@ -496,10 +496,7 @@ function RepoScopeModal({
     // shows the stored selection on page 1, immediately amendable. On a fresh
     // monitor-all provider the seed selects everything, so this degrades to a
     // plain name ordering.
-    const [sort, setSort] = useState<{key: string; direction: SortDirection}>({
-        key: 'selected',
-        direction: 'asc',
-    });
+    const [sort, setSort] = useState<SortState>({key: 'selected', direction: 'asc'});
     const repos = useAdminGitProviderRepos(provider.id, mode === 'select');
     const update = useUpdateAdminGitProvider();
 
@@ -527,14 +524,22 @@ function RepoScopeModal({
           )
         : repoList;
 
+    // One slug collation everywhere: numeric-aware for humane ordering, with a
+    // plain comparison appended so numerically equal but textually distinct
+    // slugs ("repo-1" vs "repo-01") still have an explicit total order rather
+    // than leaning on engine sort stability.
+    const bySlug = (a: GitProviderRepo, b: GitProviderRepo): number =>
+        a.slug.localeCompare(b.slug, undefined, {numeric: true}) || a.slug.localeCompare(b.slug);
     // Name is the universal secondary ordering (numeric-aware), slug the final
     // total-order tiebreak, so every sort is stable and deterministic.
     const byName = (a: GitProviderRepo, b: GitProviderRepo): number =>
-        a.name.localeCompare(b.name, undefined, {numeric: true}) || a.slug.localeCompare(b.slug);
+        a.name.localeCompare(b.name, undefined, {numeric: true}) || bySlug(a, b);
     // Selection-status sort groups selected repos first (asc) or last (desc),
     // name-ordered WITHIN each group in both directions (#215). It reads the
     // LIVE selection, so ticking a row while sorted by status regroups it
-    // immediately — the sort is an honest view, not a snapshot.
+    // immediately — the sort is an honest view, not a snapshot (a deliberate,
+    // reviewed trade-off: a row ticked on a later page relocates to the
+    // selected group at the front).
     const sortedFiltered = [...filtered].sort((a, b) => {
         if (sort.key === 'selected') {
             const rankDiff =
@@ -542,10 +547,7 @@ function RepoScopeModal({
             if (rankDiff !== 0) return sort.direction === 'asc' ? rankDiff : -rankDiff;
             return byName(a, b);
         }
-        const cmp =
-            sort.key === 'slug'
-                ? a.slug.localeCompare(b.slug, undefined, {numeric: true})
-                : byName(a, b);
+        const cmp = sort.key === 'slug' ? bySlug(a, b) : byName(a, b);
         return sort.direction === 'asc' ? cmp : -cmp;
     });
 
@@ -743,7 +745,12 @@ function RepoScopeModal({
                                     caption="Repositories"
                                     emptyMessage="No repositories match the filter."
                                     sort={sort}
-                                    onSortChange={setSort}
+                                    onSortChange={(next) => {
+                                        setSort(next);
+                                        // Match the filter's behavior: a
+                                        // re-ordered list restarts from page 1.
+                                        setPage(0);
+                                    }}
                                 />
                             </div>
                             {pageCount > 1 ? (
