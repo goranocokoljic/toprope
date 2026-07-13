@@ -2,7 +2,7 @@
 import '../test/setup';
 import '@testing-library/jest-dom/vitest';
 import {afterEach, describe, expect, it} from 'vitest';
-import {cleanup, fireEvent, render, screen} from '@testing-library/react';
+import {cleanup, fireEvent, render, screen, within} from '@testing-library/react';
 import {useState} from 'react';
 import {Modal} from '../components/Modal';
 
@@ -151,6 +151,31 @@ describe('Modal — dismissal', () => {
     });
 });
 
+function StackedHarness(): JSX.Element {
+    const [a, setA] = useState(false);
+    const [b, setB] = useState(false);
+    return (
+        <div>
+            <button type="button" onClick={() => setA(true)}>
+                Open A
+            </button>
+            <button type="button" onClick={() => setB(true)}>
+                Open B
+            </button>
+            {a ? (
+                <Modal title="Dialog A" onClose={() => setA(false)} testId="modal-a">
+                    <button type="button">A content</button>
+                </Modal>
+            ) : null}
+            {b ? (
+                <Modal title="Dialog B" onClose={() => setB(false)} testId="modal-b">
+                    <button type="button">B content</button>
+                </Modal>
+            ) : null}
+        </div>
+    );
+}
+
 describe('Modal — page interaction', () => {
     it('locks body scroll while open and restores it on close', () => {
         render(<Harness />);
@@ -158,5 +183,50 @@ describe('Modal — page interaction', () => {
         expect(document.body.style.overflow).toBe('hidden');
         fireEvent.click(screen.getByRole('button', {name: 'Close dialog'}));
         expect(document.body.style.overflow).toBe('');
+    });
+
+    it('restores the body overflow value that existed before the first modal opened', () => {
+        document.body.style.overflow = 'scroll';
+        render(<Harness />);
+        fireEvent.click(screen.getByRole('button', {name: 'Open'}));
+        expect(document.body.style.overflow).toBe('hidden');
+        fireEvent.click(screen.getByRole('button', {name: 'Close dialog'}));
+        expect(document.body.style.overflow).toBe('scroll');
+    });
+
+    it('keeps the scroll lock while ANY modal remains open, including non-LIFO closes', () => {
+        render(<StackedHarness />);
+        fireEvent.click(screen.getByRole('button', {name: 'Open A'}));
+        fireEvent.click(screen.getByRole('button', {name: 'Open B'}));
+        expect(document.body.style.overflow).toBe('hidden');
+
+        // Close A FIRST (non-LIFO): B is still open, so the lock must hold.
+        const dialogA = screen.getByTestId('modal-a');
+        fireEvent.click(within(dialogA).getByRole('button', {name: 'Close dialog'}));
+        expect(screen.queryByTestId('modal-a')).not.toBeInTheDocument();
+        expect(document.body.style.overflow).toBe('hidden');
+
+        // Closing the last modal releases the lock.
+        fireEvent.click(screen.getByRole('button', {name: 'Close dialog'}));
+        expect(document.body.style.overflow).toBe('');
+    });
+
+    it('document-level Escape closes only the TOPMOST of stacked modals', () => {
+        render(<StackedHarness />);
+        fireEvent.click(screen.getByRole('button', {name: 'Open A'}));
+        fireEvent.click(screen.getByRole('button', {name: 'Open B'}));
+        expect(screen.getAllByRole('dialog')).toHaveLength(2);
+
+        // Focus escaped every dialog: Escape from the body must close B (the
+        // topmost/last-opened), never both.
+        (document.activeElement as HTMLElement).blur();
+        fireEvent.keyDown(document.body, {key: 'Escape'});
+        expect(screen.queryByTestId('modal-b')).not.toBeInTheDocument();
+        expect(screen.getByTestId('modal-a')).toBeInTheDocument();
+
+        // A second body-level Escape closes the remaining dialog.
+        (document.activeElement as HTMLElement).blur();
+        fireEvent.keyDown(document.body, {key: 'Escape'});
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     });
 });

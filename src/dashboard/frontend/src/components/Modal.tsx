@@ -10,6 +10,9 @@ const FOCUSABLE =
 // with focus outside every dialog closes one dialog, not all), and the body
 // scroll lock is released only when the LAST modal closes (no LIFO assumption).
 const openModals: symbol[] = [];
+// The body's inline overflow before the FIRST modal locked it — restored, not
+// clobbered to '', when the last modal closes.
+let previousBodyOverflow = '';
 
 /**
  * Accessible modal dialog (#213). Rendered through a portal so it can be
@@ -63,6 +66,7 @@ export function Modal({
 
     useEffect(() => {
         const id = modalId.current;
+        if (openModals.length === 0) previousBodyOverflow = document.body.style.overflow;
         openModals.push(id);
         document.body.style.overflow = 'hidden';
 
@@ -83,8 +87,10 @@ export function Modal({
 
         return () => {
             document.removeEventListener('keydown', onDocumentKeyDown);
-            openModals.splice(openModals.indexOf(id), 1);
-            if (openModals.length === 0) document.body.style.overflow = '';
+            // Guarded: splice(-1, 1) would silently evict the TOPMOST entry.
+            const index = openModals.indexOf(id);
+            if (index !== -1) openModals.splice(index, 1);
+            if (openModals.length === 0) document.body.style.overflow = previousBodyOverflow;
         };
     }, []);
 

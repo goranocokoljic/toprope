@@ -1179,6 +1179,24 @@ describe('AdminGitProviders — repo-scope modal (#213)', () => {
         });
     });
 
+    it('saving while a filter is active writes the FULL selection, not the filtered view', async () => {
+        providers = [structuredClone(DB_MONITOR_ALL)];
+        renderPage();
+        await openSelectMode();
+
+        // Seeded selection = both non-archived repos. Filter down to one row,
+        // then save: the payload must carry the whole selection — deriving it
+        // from the filtered view would silently drop 'api' from the scope.
+        fireEvent.change(screen.getByLabelText('Filter repositories'), {target: {value: 'web'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Save scope'}));
+        await waitFor(() => {
+            const sent = JSON.parse(
+                String(lastCall(/\/git\/providers\/p-all$/, 'PATCH')?.[1]?.body),
+            ) as Record<string, unknown>;
+            expect(sent.repos).toEqual(['api', 'web']);
+        });
+    });
+
     it('Select all acts on the FULL list even while a filter hides most rows', async () => {
         providers = [structuredClone(DB_MONITOR_ALL)];
         repos = Array.from({length: 30}, (_, i) => ({

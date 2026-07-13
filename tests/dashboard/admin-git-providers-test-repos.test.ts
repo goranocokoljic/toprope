@@ -378,6 +378,9 @@ describe('admin git-provider test + repos API (#198)', () => {
                         // No display name (e.g. GitHub) → the projection falls
                         // back to the canonical slug for the `name` column.
                         {...makeRepo('plain-svc', false, 'main'), displayName: undefined},
+                        // Empty-string display name must ALSO fall back (the
+                        // projection deliberately uses ||, not ??).
+                        {...makeRepo('blank-svc', false, 'main'), displayName: ''},
                     ]),
                 }),
             );
@@ -398,6 +401,7 @@ describe('admin git-provider test + repos API (#198)', () => {
                 {slug: 'active-svc', name: 'Display active-svc', archived: false, defaultBranch: 'main'},
                 {slug: 'legacy-svc', name: 'Display legacy-svc', archived: true, defaultBranch: 'master'},
                 {slug: 'plain-svc', name: 'plain-svc', archived: false, defaultBranch: 'main'},
+                {slug: 'blank-svc', name: 'blank-svc', archived: false, defaultBranch: 'main'},
             ]);
             // The archived flag is surfaced so the UI can exclude archived by default.
             expect(repos.find((r) => r.slug === 'legacy-svc')?.archived).toBe(true);
