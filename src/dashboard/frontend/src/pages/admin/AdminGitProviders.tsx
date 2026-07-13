@@ -515,6 +515,9 @@ function RepoScopeEditor({
         !update.isPending && (mode === 'all' || (selectSourceReady && !emptySelection));
 
     function save(): void {
+        // Self-enforcing mirror of the button's disabled state: no future caller
+        // (keyboard wiring, form submit) may bypass the empty-selection guard.
+        if (!canSave) return;
         const patch = providerIdentityInput(provider);
         preserveExcludeRepos(provider, patch);
         if (mode === 'select') {
@@ -576,11 +579,11 @@ function RepoScopeEditor({
                             {/* Bulk toggles: with hundreds of repos and only a handful
                                 active, per-checkbox editing from the all-selected seed
                                 is impractical — clear first, then tick the active few.
-                                "Select all" IS the default seed (archived repos stay
-                                excluded, opted in individually) — note it deliberately
-                                rebuilds from the LISTED repos, so stored names absent
-                                from the listing and opted-in archived repos are reset;
-                                individual ticking, not Select all, re-includes those. */}
+                                "Select all" IS the default seed and deliberately rebuilds
+                                from the LISTED repos: opted-in archived repos are reset
+                                (re-tickable individually), and stored names absent from
+                                the listing are dropped — those have no checkbox, so once
+                                cleared they can only be restored by re-saving via API. */}
                             <div className="mb-2 flex gap-3">
                                 <button
                                     type="button"
@@ -665,7 +668,7 @@ function ProviderRow({
     provider: AdminGitProvider;
     onEdit: (p: AdminGitProvider) => void;
     promptScope: boolean;
-    onScopeClose?: () => void;
+    onScopeClose: () => void;
 }): JSX.Element {
     const update = useUpdateAdminGitProvider();
     const remove = useDeleteAdminGitProvider();
@@ -684,7 +687,7 @@ function ProviderRow({
         // Clear the page's just-created flag only when THIS row owns the prompt:
         // closing another row's editor must not dismiss the new provider's
         // auto-opened editor (and discard its unsaved picker state).
-        if (promptScope) onScopeClose?.();
+        if (promptScope) onScopeClose();
     }
 
     const isConfig = provider.source === 'config';
