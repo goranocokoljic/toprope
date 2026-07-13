@@ -24,7 +24,13 @@ const CONNECTOR_NAME = 'git';
  */
 export const UNMATCHED_AUTHORS_PREFIX = 'Unmatched authors (no developer record found):';
 
-/** The stages a sync run passes through, in pipeline order (GC#209). */
+/**
+ * The stages a sync run passes through, in pipeline order (GC#209). The network
+ * fetch dominates wall time, so `listing_repos`/`fetching` are what a 1s HTTP
+ * poll realistically observes; `analyzing`/`writing` are synchronous and brief —
+ * part of the wire contract and visible to a direct listener, but a poll will
+ * rarely catch them.
+ */
 export type GitSyncStage = 'listing_repos' | 'fetching' | 'analyzing' | 'writing';
 
 /**
@@ -450,8 +456,11 @@ async function fetchProviderData(
         allExclude.length > 0 ? allExclude : undefined,
     );
 
-    // repos_total accumulates (+=) rather than assigns so a multi-provider run
-    // keeps the counters cumulative across providers, matching the other counts.
+    // Accumulate (+=) rather than assign, matching the other counters' cumulative
+    // semantics. Today the only listener-bearing caller is the single-provider
+    // sync-now trigger (so this reads as that provider's repo count); a future
+    // multi-provider listener would also see the stage revisit 'listing_repos'
+    // per provider — design that presentation when such a caller exists.
     report?.((p) => {
         p.stage = 'fetching';
         p.repos_total = (p.repos_total ?? 0) + reposToSync.length;

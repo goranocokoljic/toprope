@@ -11,6 +11,7 @@ import {hashPassword} from '../../src/auth/password';
 import {SESSION_COOKIE} from '../../src/auth/cookies';
 import type {GitConnectorConfig} from '../../src/config/types';
 import type {GitProvider, GitRepo, GitCommit} from '../../src/connectors/git/providers/types';
+import type {GitSyncProgress} from '../../src/connectors/git/sync';
 
 // Stub createGitProvider so no test hits the network, but keep the rest of the
 // factory (validateGitProviderConfig) real so the store/codec seeding + decrypt
@@ -91,22 +92,12 @@ function authHeaders(token: string): Record<string, string> {
     return {cookie: `${SESSION_COOKIE}=${token}`};
 }
 
-interface SyncProgressRow {
-    stage: string;
-    repos_total: number | null;
-    repos_processed: number;
-    current_repo: string | null;
-    commits_fetched: number;
-    prs_fetched: number;
-    developers_matched: number;
-}
-
 interface ProviderListRow {
     id: string;
     last_sync_status: string | null;
     last_sync_at: string | null;
     last_sync_error: string | null;
-    active_sync: {started_at: string; progress: SyncProgressRow | null} | null;
+    active_sync: {started_at: string; progress: GitSyncProgress | null} | null;
 }
 
 describe('admin git-provider sync-now API (#199)', () => {
@@ -282,6 +273,13 @@ describe('admin git-provider sync-now API (#199)', () => {
             // The message is surfaced to the UI, not swallowed.
             expect(row.last_sync_error).toMatch(/401/);
             expect(row.last_sync_at).not.toBeNull();
+
+            // An ERROR outcome must also clear the in-flight registry (#209):
+            // the row goes idle and a fresh trigger is accepted, not 409'd.
+            expect(row.active_sync).toBeNull();
+            const retry = await triggerSync(id);
+            expect(retry.statusCode).toBe(202);
+            await waitForSyncStatus(id, 'error');
         });
 
         it('rejects a duplicate trigger while a run is in flight (409, overlap guard)', async () => {
@@ -348,6 +346,15 @@ describe('admin git-provider sync-now API (#199)', () => {
             // The listing stage was emitted before the (gated) listRepos call.
             expect(running?.active_sync?.progress?.stage).toBe('listing_repos');
 
+            // The list payload never carries token material, including while the
+            // in-flight progress snapshot is being served.
+            const listRes = await app.inject({
+                method: 'GET',
+                url: '/api/admin/git/providers',
+                headers: authHeaders(adminToken),
+            });
+            expect(listRes.body).not.toContain('ghp_dbSECRET_TOKEN_ABCD');
+
             release();
             await waitForSyncStatus(id, 'ok');
             // Settled: the in-flight entry is cleared again.
@@ -383,7 +390,7 @@ describe('admin git-provider sync-now API (#199)', () => {
 
             // Poll the same surface the UI polls until repo1 has completed.
             const deadline = Date.now() + 2000;
-            let progress: SyncProgressRow | null | undefined;
+            let progress: GitSyncProgress | null | undefined;
             while (Date.now() < deadline) {
                 progress = (await readProvider(id))?.active_sync?.progress;
                 if (progress?.repos_processed === 1) break;

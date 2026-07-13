@@ -229,6 +229,10 @@ export function syncProgressLabel(active: GitProviderActiveSync): string {
             return `Matching developers — ${p.developers_matched} matched`;
         case 'writing':
             return `Writing snapshots — ${p.developers_matched} developers matched`;
+        default:
+            // p.stage is wire data: a newer backend can emit a stage this cached
+            // bundle doesn't know. Degrade to a generic label, never a blank line.
+            return 'Syncing…';
     }
 }
 

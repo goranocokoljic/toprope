@@ -4,7 +4,7 @@ import path from 'path';
 import {runMigrations} from '../../../src/storage/migrator';
 import {addTeam} from '../../../src/registry/teams';
 import {addDeveloper} from '../../../src/registry/developers';
-import {GitSync} from '../../../src/connectors/git/sync';
+import {GitSync, type GitSyncProgress} from '../../../src/connectors/git/sync';
 import {createProvider} from '../../../src/connectors/git/providers/store';
 import {loadServerKey} from '../../../src/connectors/git/providers/secret';
 import type {GitConnectorConfig} from '../../../src/config/types';
@@ -1330,5 +1330,103 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
         // Exactly one provider was constructed — the one we passed.
         expect(createGitProvider).toHaveBeenCalledTimes(1);
         expect(createGitProvider).toHaveBeenCalledWith(expect.objectContaining({org: 'only-org'}));
+    });
+
+    describe('syncProviders — progress listener (#209)', () => {
+        const CONFIG: GitProviderConfig = {
+            type: 'github',
+            org: 'test-org',
+            auth: {type: 'token', api_token: 'test-token'},
+        };
+
+        // Counters the pipeline promises are cumulative — they must never move
+        // backwards across emissions.
+        const MONOTONIC: Array<'repos_processed' | 'commits_fetched' | 'prs_fetched' | 'developers_matched'> = [
+            'repos_processed',
+            'commits_fetched',
+            'prs_fetched',
+            'developers_matched',
+        ];
+
+        it('emits the full stage sequence with monotonic counters and a final developer count', async () => {
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1'), makeRepo('repo2')]),
+                    getCommits: vi.fn().mockResolvedValue([makeProviderCommit('alice')]),
+                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+                    getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+                }),
+            );
+
+            const snapshots: GitSyncProgress[] = [];
+            const result = await new GitSync({enabled: false}).syncProviders(db, [CONFIG], (p) =>
+                snapshots.push(p),
+            );
+
+            // (a) The stage sequence is exactly the pipeline order, no regressions.
+            const stageOrder = [...new Set(snapshots.map((s) => s.stage))];
+            expect(stageOrder).toEqual(['listing_repos', 'fetching', 'analyzing', 'writing']);
+
+            // (b) Every cumulative counter is monotonically non-decreasing.
+            for (const key of MONOTONIC) {
+                for (let i = 1; i < snapshots.length; i++) {
+                    expect(snapshots[i][key]).toBeGreaterThanOrEqual(snapshots[i - 1][key]);
+                }
+            }
+
+            // (c) The final snapshot carries the full run totals: both repos
+            // processed, both commits and both PRs counted (one per repo), and
+            // exactly one distinct developer resolved.
+            const final = snapshots[snapshots.length - 1];
+            expect(final).toMatchObject({
+                stage: 'writing',
+                repos_total: 2,
+                repos_processed: 2,
+                current_repo: null,
+                commits_fetched: 2,
+                prs_fetched: 2,
+                developers_matched: 1,
+            });
+            // The run itself succeeded and wrote alice's snapshots — one for the
+            // commit day (Jan 15) and one for the PR-merge day (Jan 16).
+            expect(result.errors.filter((e) => !/Unmatched authors/.test(e))).toEqual([]);
+            expect(countSnapshots(db)).toBe(2);
+
+            // Listener snapshots are independent copies, not one shared object.
+            expect(snapshots[0]).not.toBe(snapshots[1]);
+        });
+
+        it('counts a repo whose commit fetch fails as processed, so the N/M counter still reaches M', async () => {
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('bad-repo'), makeRepo('good-repo')]),
+                    getCommits: vi.fn().mockImplementation(async (repo: string) => {
+                        if (repo === 'bad-repo') throw new Error('GitHub API error 500');
+                        return [makeProviderCommit('alice')];
+                    }),
+                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+                }),
+            );
+
+            const snapshots: GitSyncProgress[] = [];
+            const result = await new GitSync({enabled: false}).syncProviders(db, [CONFIG], (p) =>
+                snapshots.push(p),
+            );
+
+            // The failed repo still counts as processed — the counter reaches the
+            // total instead of freezing at "repo 1/2" forever.
+            const final = snapshots[snapshots.length - 1];
+            expect(final.repos_processed).toBe(2);
+            expect(final.repos_total).toBe(2);
+            expect(final.current_repo).toBeNull();
+            expect(final.stage).toBe('writing');
+            // Only the good repo's commit was counted, and the failure surfaced.
+            expect(final.commits_fetched).toBe(1);
+            expect(result.errors.some((e) => /bad-repo.*Failed to fetch commits/.test(e))).toBe(true);
+        });
     });
 });
