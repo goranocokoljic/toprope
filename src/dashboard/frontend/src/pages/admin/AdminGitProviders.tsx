@@ -268,13 +268,19 @@ function ProbeResultView({result}: {result: GitProviderProbeResult}): JSX.Elemen
  * The add/edit form. `editing` pre-fills the fields for an existing DB provider
  * (token stays blank → keep the stored secret); `null` is the add form (token
  * required). Keyed by the caller so switching add ⇄ edit remounts a clean state.
+ *
+ * `onCreated` (#211) fires with the server's created provider on the CREATE path
+ * only — the page uses it to auto-open the new row's repo-scope editor so the
+ * admin narrows the scope before the first sync. Edits never fire it.
  */
 function ProviderForm({
     editing,
     onDone,
+    onCreated,
 }: {
     editing: AdminGitProvider | null;
     onDone: () => void;
+    onCreated: (created: AdminGitProvider) => void;
 }): JSX.Element {
     const create = useCreateAdminGitProvider();
     const update = useUpdateAdminGitProvider();
@@ -337,7 +343,12 @@ function ProviderForm({
         if (isEdit && editing) {
             update.mutate({id: editing.id, patch: input}, {onSuccess: onDone});
         } else {
-            create.mutate(input, {onSuccess: onDone});
+            create.mutate(input, {
+                onSuccess: (created) => {
+                    onCreated(created);
+                    onDone();
+                },
+            });
         }
     }
 
@@ -450,13 +461,18 @@ function ProviderForm({
  * The write reuses {@link providerIdentityInput} + {@link preserveExcludeRepos} so
  * it carries the full row (the server re-validates every write) and never disturbs
  * `exclude_repos`.
+ *
+ * `prompt` (#211) renders the just-connected intro asking the admin to narrow the
+ * scope before the first sync — the add flow auto-opens the editor with it.
  */
 function RepoScopeEditor({
     provider,
     onClose,
+    prompt,
 }: {
     provider: AdminGitProvider;
     onClose: () => void;
+    prompt: boolean;
 }): JSX.Element {
     const stored = parseReposList(provider.repos_include);
     const [mode, setMode] = useState<'all' | 'select'>(stored === undefined ? 'all' : 'select');
@@ -466,13 +482,16 @@ function RepoScopeEditor({
     const update = useUpdateAdminGitProvider();
 
     const repoList = repos.data ?? [];
+    // Every non-archived repo — the single source for both the default seed and
+    // the "Select all" bulk action, so the two can't drift apart.
+    const allNonArchived = useMemo(
+        () => new Set(repoList.filter((r) => !r.archived).map((r) => r.name)),
+        [repoList],
+    );
     // Default selection when entering select mode: the stored include list if the
     // provider already has one, else every NON-archived repo (archived excluded by
     // default). Recomputes as the repo list loads; overridden once the admin edits.
-    const defaultSeed = useMemo(() => {
-        if (stored !== undefined) return new Set(stored);
-        return new Set(repoList.filter((r) => !r.archived).map((r) => r.name));
-    }, [stored, repoList]);
+    const defaultSeed = stored !== undefined ? new Set(stored) : allNonArchived;
     const selected = edited ?? defaultSeed;
 
     function toggleRepo(name: string, checked: boolean): void {
@@ -486,11 +505,19 @@ function RepoScopeEditor({
     // must NOT proceed until that list is available: saving over an unloaded,
     // errored, or empty repo source would emit `repos: []` and silently flip the
     // provider from "monitor all" to "analyze nothing" (the PATCH is a full-row
-    // replace). "Monitor all" mode has no such dependency and is always saveable.
+    // replace). The same guard covers an EMPTY selection (#211): "Clear selection"
+    // makes it a one-click state, and a saved `repos: []` is a silent kill switch
+    // on collection — disabling the provider is the intended way to pause it.
+    // "Monitor all" mode has no such dependency and is always saveable.
     const selectSourceReady = repos.isSuccess && repoList.length > 0;
-    const canSave = !update.isPending && (mode === 'all' || selectSourceReady);
+    const emptySelection = mode === 'select' && selectSourceReady && selected.size === 0;
+    const canSave =
+        !update.isPending && (mode === 'all' || (selectSourceReady && !emptySelection));
 
     function save(): void {
+        // Self-enforcing mirror of the button's disabled state: no future caller
+        // (keyboard wiring, form submit) may bypass the empty-selection guard.
+        if (!canSave) return;
         const patch = providerIdentityInput(provider);
         preserveExcludeRepos(provider, patch);
         if (mode === 'select') {
@@ -507,6 +534,13 @@ function RepoScopeEditor({
     return (
         <div className="rounded-md border border-border bg-surface-raised/40 p-4">
             <p className="mb-3 text-xs font-medium uppercase tracking-wider text-muted">Repository scope</p>
+            {prompt ? (
+                <p className="mb-3 text-sm text-foreground" role="status" data-testid="scope-prompt">
+                    Provider connected. Choose which repositories to analyze before the first sync —
+                    large workspaces often contain many inactive repositories, and narrowing the scope
+                    keeps syncs fast and the data relevant.
+                </p>
+            ) : null}
             <div className="flex flex-col gap-2">
                 <label className="flex items-center gap-2 text-sm text-foreground">
                     <input
@@ -541,29 +575,68 @@ function RepoScopeEditor({
                     ) : repoList.length === 0 ? (
                         <p className="text-sm text-muted">No repositories found for this provider.</p>
                     ) : (
-                        <ul className="flex max-h-60 flex-col gap-1 overflow-y-auto pr-1">
-                            {repoList.map((r) => (
-                                <li key={r.name}>
-                                    <label className="flex items-center gap-2 text-sm text-foreground">
-                                        <input
-                                            type="checkbox"
-                                            checked={selected.has(r.name)}
-                                            onChange={(e) => toggleRepo(r.name, e.target.checked)}
-                                            className="h-4 w-4 accent-accent"
-                                        />
-                                        <span>{r.name}</span>
-                                        {r.archived ? (
-                                            <Badge tone="neutral" title="Archived — excluded by default">
-                                                Archived
-                                            </Badge>
-                                        ) : null}
-                                    </label>
-                                </li>
-                            ))}
-                        </ul>
+                        <>
+                            {/* Bulk toggles: with hundreds of repos and only a handful
+                                active, per-checkbox editing from the all-selected seed
+                                is impractical — clear first, then tick the active few.
+                                "Select all" IS the default seed and deliberately rebuilds
+                                from the LISTED repos: opted-in archived repos are reset
+                                (re-tickable individually), and stored names absent from
+                                the listing are dropped — those have no checkbox, so once
+                                cleared they can only be restored by re-saving via API. */}
+                            <div className="mb-2 flex gap-3">
+                                <button
+                                    type="button"
+                                    onClick={() => setEdited(new Set(allNonArchived))}
+                                    title="Selects every non-archived repository"
+                                    className="text-xs font-medium text-accent hover:underline"
+                                >
+                                    Select all
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => setEdited(new Set())}
+                                    className="text-xs font-medium text-accent hover:underline"
+                                >
+                                    Clear selection
+                                </button>
+                            </div>
+                            <ul className="flex max-h-60 flex-col gap-1 overflow-y-auto pr-1">
+                                {repoList.map((r) => (
+                                    <li key={r.name}>
+                                        <label className="flex items-center gap-2 text-sm text-foreground">
+                                            <input
+                                                type="checkbox"
+                                                checked={selected.has(r.name)}
+                                                onChange={(e) => toggleRepo(r.name, e.target.checked)}
+                                                className="h-4 w-4 accent-accent"
+                                            />
+                                            <span>{r.name}</span>
+                                            {r.archived ? (
+                                                <Badge tone="neutral" title="Archived — excluded by default">
+                                                    Archived
+                                                </Badge>
+                                            ) : null}
+                                        </label>
+                                    </li>
+                                ))}
+                            </ul>
+                            {emptySelection ? (
+                                <p className="mt-2 text-sm text-danger" data-testid="empty-selection-warning">
+                                    Select at least one repository — an empty selection would analyze
+                                    nothing. To pause collection entirely, disable the provider instead.
+                                </p>
+                            ) : null}
+                        </>
                     )}
                 </div>
             ) : null}
+
+            {/* Deactivation data policy (#211): narrowing is forward-looking only. */}
+            <p className="mt-3 text-xs text-muted" data-testid="scope-policy-note">
+                Changing the scope only affects future syncs — data already collected from
+                deselected repositories is kept.
+            </p>
 
             <div className="mt-4 flex items-center gap-3">
                 <PrimaryButton type="button" onClick={save} disabled={!canSave}>
@@ -578,19 +651,44 @@ function RepoScopeEditor({
     );
 }
 
-/** One row in the connected-providers table (DB or read-only config). */
+/**
+ * One row in the connected-providers table (DB or read-only config).
+ *
+ * `promptScope` (#211): true for a provider the admin JUST connected — the row
+ * mounts with the repo-scope editor open and an intro prompting a selection
+ * before the first sync. `onScopeClose` clears that page-level flag when the
+ * editor closes (save or cancel), so it never re-prompts.
+ */
 function ProviderRow({
     provider,
     onEdit,
+    promptScope,
+    onScopeClose,
 }: {
     provider: AdminGitProvider;
     onEdit: (p: AdminGitProvider) => void;
+    promptScope: boolean;
+    onScopeClose: () => void;
 }): JSX.Element {
     const update = useUpdateAdminGitProvider();
     const remove = useDeleteAdminGitProvider();
     const sync = useSyncAdminGitProvider();
     const test = useTestAdminGitProvider();
     const [scopeOpen, setScopeOpen] = useState(false);
+    // Derived (not mount-time-seeded): the create flow's hook-level invalidation
+    // is awaited BEFORE the created callback runs, so this row mounts from the
+    // refetched list first and the prompt flag lands on a re-render — a
+    // mount-seeded useState would read false and never open. Do not "simplify"
+    // this into an initial-state seed.
+    const scopeVisible = scopeOpen || promptScope;
+
+    function closeScope(): void {
+        setScopeOpen(false);
+        // Clear the page's just-created flag only when THIS row owns the prompt:
+        // closing another row's editor must not dismiss the new provider's
+        // auto-opened editor (and discard its unsaved picker state).
+        if (promptScope) onScopeClose();
+    }
 
     const isConfig = provider.source === 'config';
     const meta = PROVIDER_META[provider.type];
@@ -650,8 +748,8 @@ function ProviderRow({
                     ) : (
                         <button
                             type="button"
-                            onClick={() => setScopeOpen((v) => !v)}
-                            aria-expanded={scopeOpen}
+                            onClick={() => (scopeVisible ? closeScope() : setScopeOpen(true))}
+                            aria-expanded={scopeVisible}
                             className="text-sm font-medium text-accent hover:underline"
                             title="Edit repository scope"
                         >
@@ -734,10 +832,10 @@ function ProviderRow({
                     </td>
                 </tr>
             ) : null}
-            {scopeOpen && !isConfig ? (
+            {scopeVisible && !isConfig ? (
                 <tr>
                     <td colSpan={7} className="px-3 pb-4">
-                        <RepoScopeEditor provider={provider} onClose={() => setScopeOpen(false)} />
+                        <RepoScopeEditor provider={provider} onClose={closeScope} prompt={promptScope} />
                     </td>
                 </tr>
             ) : null}
@@ -791,6 +889,10 @@ export function AdminGitProviders(): JSX.Element {
     const providers = useAdminGitProviders();
     const dataSources = useAdminDataSources();
     const [editing, setEditing] = useState<AdminGitProvider | null>(null);
+    // The provider the admin JUST connected (#211): its row mounts with the
+    // repo-scope editor open, prompting a selection before the first sync.
+    // Cleared when that editor closes (save or cancel) so it never re-prompts.
+    const [justCreatedId, setJustCreatedId] = useState<string | null>(null);
 
     const providerList = providers.data ?? [];
     const hasProviders = providerList.length > 0;
@@ -811,7 +913,14 @@ export function AdminGitProviders(): JSX.Element {
                 description="Connect GitHub, Bitbucket, and GitLab repositories for analysis."
             />
             {showEmptyState ? <GitEmptyState /> : null}
-            <ProviderForm key={editing?.id ?? 'new'} editing={editing} onDone={() => setEditing(null)} />
+            <ProviderForm
+                key={editing?.id ?? 'new'}
+                editing={editing}
+                onDone={() => setEditing(null)}
+                // Creating a second provider deliberately moves the one-shot
+                // prompt to it — the previous provider's prompt is dismissed.
+                onCreated={(created) => setJustCreatedId(created.id)}
+            />
             {hasProviders ? (
                 <p className="text-sm text-muted" data-testid="identity-mapping-note">
                     Only developers whose git identities are mapped produce activity data — unmatched
@@ -842,7 +951,13 @@ export function AdminGitProviders(): JSX.Element {
                         }
                     >
                         {providerList.map((p) => (
-                            <ProviderRow key={p.id} provider={p} onEdit={setEditing} />
+                            <ProviderRow
+                                key={p.id}
+                                provider={p}
+                                onEdit={setEditing}
+                                promptScope={p.id === justCreatedId}
+                                onScopeClose={() => setJustCreatedId(null)}
+                            />
                         ))}
                     </Table>
                 )}
