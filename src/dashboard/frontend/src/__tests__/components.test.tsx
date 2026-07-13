@@ -271,6 +271,47 @@ describe('DataTable', () => {
         // Rows still untouched — controlled mode never self-sorts.
         expect(bodyOrder()).toEqual(['frontend', 'backend', 'platform']);
     });
+
+    it('controlled mode: a sort prop naming a NON-sortable column key never announces a sort', () => {
+        render(
+            <DataTable
+                columns={[
+                    {key: 'name', header: 'Team', accessor: (r: Row) => r.name},
+                    {key: 'plain', header: 'Plain', render: () => 'z'},
+                ]}
+                rows={ROWS}
+                getRowKey={(r) => r.name}
+                // Misused: 'plain' is render-only without a force-enable, so its
+                // header is not sortable — it must stay aria-sort='none' even
+                // though the sort prop names its key.
+                sort={{key: 'plain', direction: 'asc'}}
+                onSortChange={() => undefined}
+            />,
+        );
+        expect(screen.getByRole('columnheader', {name: 'Plain'})).toHaveAttribute('aria-sort', 'none');
+    });
+
+    it('controlled mode without a sort yet ("start unsorted"): rows as given, no indicators, first click reports asc', () => {
+        const changes: {key: string; direction: string}[] = [];
+        render(
+            <DataTable
+                columns={COLUMNS}
+                rows={ROWS}
+                getRowKey={(r) => r.name}
+                onSortChange={(s) => changes.push(s)}
+            />,
+        );
+        // No sort supplied: rows render as given and every header is inactive —
+        // internal/initialSort state must NOT leak in.
+        expect(bodyOrder()).toEqual(['frontend', 'backend', 'platform']);
+        expect(screen.getByRole('columnheader', {name: /Team/})).toHaveAttribute('aria-sort', 'none');
+        expect(screen.getByRole('columnheader', {name: /Cost/})).toHaveAttribute('aria-sort', 'none');
+        // The first click on any header reports a fresh ascending sort.
+        fireEvent.click(screen.getByRole('button', {name: /Cost/}));
+        expect(changes).toEqual([{key: 'cost', direction: 'asc'}]);
+        // Still not self-sorted — the parent owns the ordering.
+        expect(bodyOrder()).toEqual(['frontend', 'backend', 'platform']);
+    });
 });
 
 // --- TimeRangeSelector -----------------------------------------------------
