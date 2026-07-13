@@ -8,12 +8,13 @@ import {Modal} from '../components/Modal';
 
 /**
  * Unit tests for the reusable Modal (#213): focus management (move-in on open,
- * restore-to-opener on close), the Tab focus trap behind aria-modal, Escape
- * closing without leaking to a sibling dialog, drag-release NOT closing (only a
- * genuine backdrop click does), and the body scroll lock.
+ * restore-to-opener on close), the Tab focus trap behind aria-modal — including
+ * the document-level backstop for focus that escaped the dialog subtree —
+ * Escape closing, drag-release in EITHER direction NOT closing (only a genuine
+ * press-and-release backdrop click does), and the body scroll lock.
  */
 
-function Harness({children}: {children?: React.ReactNode}): JSX.Element {
+function Harness(): JSX.Element {
     const [open, setOpen] = useState(false);
     return (
         <div>
@@ -22,12 +23,8 @@ function Harness({children}: {children?: React.ReactNode}): JSX.Element {
             </button>
             {open ? (
                 <Modal title="Test dialog" onClose={() => setOpen(false)} testId="test-modal">
-                    {children ?? (
-                        <>
-                            <input aria-label="First field" />
-                            <button type="button">Last button</button>
-                        </>
-                    )}
+                    <input aria-label="First field" />
+                    <button type="button">Last button</button>
                 </Modal>
             ) : null}
         </div>
@@ -85,6 +82,25 @@ describe('Modal — focus management', () => {
         fireEvent.keyDown(dialog, {key: 'Tab', shiftKey: true});
         expect(document.activeElement).toBe(lastButton);
     });
+
+    it('keeps Escape and Tab working when focus has escaped the dialog subtree (document-level backstop)', () => {
+        render(<Harness />);
+        fireEvent.click(screen.getByRole('button', {name: 'Open'}));
+        const dialog = screen.getByRole('dialog');
+
+        // Focus escapes to <body> — e.g. a just-clicked, now-disabled button.
+        (document.activeElement as HTMLElement).blur();
+        expect(document.activeElement).toBe(document.body);
+
+        // Tab from the body is intercepted and pulled back into the dialog…
+        fireEvent.keyDown(document.body, {key: 'Tab'});
+        expect(document.activeElement).toBe(dialog);
+
+        // …and Escape from the body still closes the dialog.
+        (document.activeElement as HTMLElement).blur();
+        fireEvent.keyDown(document.body, {key: 'Escape'});
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    });
 });
 
 describe('Modal — dismissal', () => {
@@ -93,6 +109,7 @@ describe('Modal — dismissal', () => {
         fireEvent.click(screen.getByRole('button', {name: 'Open'}));
         const backdrop = screen.getByTestId('test-modal-backdrop');
         fireEvent.mouseDown(backdrop);
+        fireEvent.mouseUp(backdrop);
         fireEvent.click(backdrop);
         expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     });
@@ -101,10 +118,24 @@ describe('Modal — dismissal', () => {
         render(<Harness />);
         fireEvent.click(screen.getByRole('button', {name: 'Open'}));
         const backdrop = screen.getByTestId('test-modal-backdrop');
+        const field = screen.getByLabelText('First field');
         // Press inside the dialog (e.g. selecting filter text)…
-        fireEvent.mouseDown(screen.getByLabelText('First field'));
+        fireEvent.mouseDown(field);
         // …release over the dim area: the browser dispatches click on the
         // common ancestor — the backdrop. The dialog must survive.
+        fireEvent.mouseUp(backdrop);
+        fireEvent.click(backdrop);
+        expect(screen.getByRole('dialog')).toBeInTheDocument();
+    });
+
+    it('the reverse drag — press on the backdrop, release inside the dialog — does NOT close either', () => {
+        render(<Harness />);
+        fireEvent.click(screen.getByRole('button', {name: 'Open'}));
+        const backdrop = screen.getByTestId('test-modal-backdrop');
+        const field = screen.getByLabelText('First field');
+        // Mis-press on the dim area, corrected by releasing on the dialog.
+        fireEvent.mouseDown(backdrop);
+        fireEvent.mouseUp(field);
         fireEvent.click(backdrop);
         expect(screen.getByRole('dialog')).toBeInTheDocument();
     });
@@ -114,6 +145,7 @@ describe('Modal — dismissal', () => {
         fireEvent.click(screen.getByRole('button', {name: 'Open'}));
         const field = screen.getByLabelText('First field');
         fireEvent.mouseDown(field);
+        fireEvent.mouseUp(field);
         fireEvent.click(field);
         expect(screen.getByRole('dialog')).toBeInTheDocument();
     });

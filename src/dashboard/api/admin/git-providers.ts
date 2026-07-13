@@ -557,9 +557,11 @@ export function registerAdminGitProviderRoutes(
     //
     // Accepted risk (#213 review): pre-#213 this projection's `name` WAS the
     // canonical id, so a stale cached bundle that PATCHes `name` values back as
-    // `repos` would store display names that match nothing at sync time. Server
-    // and bundle deploy together, the window is one un-refreshed tab, and the
-    // scope self-heals on re-save — deliberately NOT validated server-side (a
+    // `repos` would store display names that match nothing at sync time; the
+    // reverse skew (new bundle, old server) just crashes the picker on the
+    // missing `slug` field and corrupts nothing. Server and bundle deploy
+    // together, the window is one un-refreshed tab, and both directions
+    // self-heal on refresh/re-save — deliberately NOT validated server-side (a
     // probe on every save would fail saves whenever the provider is unreachable).
     //
     // A failed listing is a clean 502 {ok:false}, not a 500.
@@ -579,8 +581,9 @@ export function registerAdminGitProviderRoutes(
                         slug: r.name,
                         // Fall back to the canonical name when the provider has
                         // no distinct display name (GitHub always; a Bitbucket/
-                        // GitLab response missing the field).
-                        name: r.displayName ?? r.name,
+                        // GitLab response missing the field). `||` deliberately:
+                        // an empty-string display name must not blank the cell.
+                        name: r.displayName || r.name,
                         archived: r.isArchived,
                         defaultBranch: r.defaultBranch,
                     })),

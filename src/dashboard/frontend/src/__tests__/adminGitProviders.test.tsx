@@ -1081,6 +1081,8 @@ describe('AdminGitProviders — repo-scope modal (#213)', () => {
 
         const dialog = screen.getByRole('dialog', {name: 'Repository scope — mono-org'});
         expect(dialog).toHaveAttribute('aria-modal', 'true');
+        // The opener announces that it launches a dialog.
+        expect(screen.getByRole('button', {name: 'Repos'})).toHaveAttribute('aria-haspopup', 'dialog');
         // Table columns: canonical slug + display name, archived badge on the row.
         expect(within(dialog).getByRole('columnheader', {name: 'Slug'})).toBeInTheDocument();
         expect(within(dialog).getByRole('columnheader', {name: 'Name'})).toBeInTheDocument();
@@ -1116,9 +1118,86 @@ describe('AdminGitProviders — repo-scope modal (#213)', () => {
 
         // A real backdrop click (press + release on the backdrop) closes.
         fireEvent.mouseDown(backdrop);
+        fireEvent.mouseUp(backdrop);
         fireEvent.click(backdrop);
         expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
         expect(lastCall(/\/git\/providers\/p-all$/, 'PATCH')).toBeUndefined();
+    });
+
+    it('no close affordance works while a save is in flight — the PATCH outcome cannot land invisibly', async () => {
+        // Gate the PATCH so the save stays pending under our control.
+        let releasePatch: (() => void) | undefined;
+        const gate = new Promise<void>((resolve) => {
+            releasePatch = resolve;
+        });
+        providers = [structuredClone(DB_MONITOR_ALL)];
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const u = String(url);
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (/\/git\/providers\/p-all$/.test(u) && method === 'PATCH') {
+                await gate;
+            }
+            return base!(url, init);
+        });
+        renderPage();
+        await openSelectMode();
+        fireEvent.click(screen.getByRole('button', {name: 'Save scope'}));
+        expect(await screen.findByRole('button', {name: 'Saving…'})).toBeInTheDocument();
+
+        // Esc, the × button, and a genuine backdrop click are all inert mid-save.
+        const dialog = screen.getByRole('dialog');
+        fireEvent.keyDown(dialog, {key: 'Escape'});
+        expect(screen.getByRole('dialog')).toBeInTheDocument();
+        fireEvent.click(screen.getByRole('button', {name: 'Close dialog'}));
+        expect(screen.getByRole('dialog')).toBeInTheDocument();
+        const backdrop = screen.getByTestId('repo-scope-modal-p-all-backdrop');
+        fireEvent.mouseDown(backdrop);
+        fireEvent.mouseUp(backdrop);
+        fireEvent.click(backdrop);
+        expect(screen.getByRole('dialog')).toBeInTheDocument();
+
+        // Once the save settles, the modal closes through the success path.
+        releasePatch?.();
+        await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    });
+
+    it('a plain save preserves a stored slug the listing no longer returns (extras)', async () => {
+        providers = [{...structuredClone(DB_MONITOR_ALL), repos_include: '["api","gone"]'}];
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', {name: 'Repos'}));
+        await screen.findByRole('checkbox', {name: 'api'});
+
+        // No Select all, no Clear — just save the stored selection as-is.
+        fireEvent.click(screen.getByRole('button', {name: 'Save scope'}));
+        await waitFor(() => {
+            const sent = JSON.parse(
+                String(lastCall(/\/git\/providers\/p-all$/, 'PATCH')?.[1]?.body),
+            ) as Record<string, unknown>;
+            // Listed slugs in repo-list order, then the preserved unlisted extra.
+            expect(sent.repos).toEqual(['api', 'gone']);
+        });
+    });
+
+    it('Select all acts on the FULL list even while a filter hides most rows', async () => {
+        providers = [structuredClone(DB_MONITOR_ALL)];
+        repos = Array.from({length: 30}, (_, i) => ({
+            slug: `repo-${i}`,
+            name: `Repo ${i}`,
+            archived: false,
+            defaultBranch: 'main',
+        }));
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', {name: 'Repos'}));
+        fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
+        await screen.findByRole('checkbox', {name: 'repo-0'});
+
+        fireEvent.click(screen.getByRole('button', {name: 'Clear selection'}));
+        // Filter down to a single visible row, then Select all: the FULL list is
+        // selected, not just the visible/filtered page.
+        fireEvent.change(screen.getByLabelText('Filter repositories'), {target: {value: 'Repo 7'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Select all'}));
+        expect(screen.getByTestId('selected-count')).toHaveTextContent('30 of 30 selected');
     });
 
     it('Escape in one stacked dialog closes only that dialog (the prompt survives)', async () => {
@@ -1189,9 +1268,10 @@ describe('AdminGitProviders — repo-scope modal (#213)', () => {
         fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
         await screen.findByRole('checkbox', {name: 'repo-0'});
 
-        // Page 1 shows 25 of 30 rows.
+        // Page 1 shows 25 of 30 rows; Previous is inert at the lower bound.
         expect(screen.getAllByRole('checkbox')).toHaveLength(25);
         expect(screen.getByText('Page 1 of 2')).toBeInTheDocument();
+        expect(screen.getByRole('button', {name: 'Previous'})).toBeDisabled();
         expect(screen.queryByRole('checkbox', {name: 'repo-29'})).not.toBeInTheDocument();
 
         // Clear (acts on the FULL list), tick one repo on page 1…
@@ -1199,9 +1279,10 @@ describe('AdminGitProviders — repo-scope modal (#213)', () => {
         expect(screen.getByTestId('selected-count')).toHaveTextContent('0 of 30 selected');
         fireEvent.click(screen.getByRole('checkbox', {name: 'repo-0'}));
 
-        // …one on page 2…
+        // …one on page 2 (Next is inert at the upper bound)…
         fireEvent.click(screen.getByRole('button', {name: 'Next'}));
         expect(screen.getByText('Page 2 of 2')).toBeInTheDocument();
+        expect(screen.getByRole('button', {name: 'Next'})).toBeDisabled();
         expect(screen.getAllByRole('checkbox')).toHaveLength(5);
         fireEvent.click(screen.getByRole('checkbox', {name: 'repo-29'}));
 

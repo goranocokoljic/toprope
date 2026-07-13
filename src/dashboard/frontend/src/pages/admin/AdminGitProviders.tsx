@@ -581,6 +581,13 @@ function RepoScopeModal({
     const canSave =
         !update.isPending && (mode === 'all' || (selectSourceReady && !emptySelection));
 
+    // Every close affordance (Cancel, Esc, ×, backdrop) funnels through this
+    // guard: dismissing mid-save would let the PATCH land (or fail) invisibly —
+    // the exact state the disabled Cancel exists to prevent.
+    function requestClose(): void {
+        if (!update.isPending) onClose();
+    }
+
     function save(): void {
         // Self-enforcing mirror of the button's disabled state: no future caller
         // (keyboard wiring, form submit) may bypass the empty-selection guard.
@@ -601,7 +608,7 @@ function RepoScopeModal({
     return (
         <Modal
             title={`Repository scope — ${provider.container}`}
-            onClose={onClose}
+            onClose={requestClose}
             // Provider-scoped so stacked modals (#211 prompt + another row's)
             // never render duplicate test ids.
             testId={`repo-scope-modal-${provider.id}`}
@@ -743,7 +750,7 @@ function RepoScopeModal({
                 <PrimaryButton type="button" onClick={save} disabled={!canSave}>
                     {update.isPending ? 'Saving…' : 'Save scope'}
                 </PrimaryButton>
-                <SecondaryButton onClick={onClose} disabled={update.isPending}>
+                <SecondaryButton onClick={requestClose} disabled={update.isPending}>
                     Cancel
                 </SecondaryButton>
                 <ErrorText error={update.isError ? update.error : null} />

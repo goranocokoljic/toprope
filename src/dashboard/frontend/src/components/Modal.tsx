@@ -5,6 +5,12 @@ import {createPortal} from 'react-dom';
 const FOCUSABLE =
     'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
+// Module-level registry of open modals, in mount order. Drives two behaviors:
+// document-level keyboard handling responds only on the TOPMOST modal (so Esc
+// with focus outside every dialog closes one dialog, not all), and the body
+// scroll lock is released only when the LAST modal closes (no LIFO assumption).
+const openModals: symbol[] = [];
+
 /**
  * Accessible modal dialog (#213). Rendered through a portal so it can be
  * mounted from anywhere (including inside a table) without breaking DOM
@@ -13,16 +19,17 @@ const FOCUSABLE =
  *  - Focus moves onto the dialog on open and back to the opener on close
  *    (skipped if the opener has unmounted meanwhile).
  *  - Tab is TRAPPED inside the dialog (aria-modal promises an inert
- *    background — without the trap, focus walks into the covered page and
- *    Escape goes dead once it leaves the dialog subtree).
- *  - Body scroll is locked while any modal is open.
- *  - Escape closes; the event does not propagate further (a stacked dialog
- *    must not close its sibling).
- *  - A backdrop CLICK closes only when the interaction also STARTED on the
- *    backdrop: `click` fires on the common ancestor of mousedown/mouseup, so
- *    a drag that starts inside the dialog (text selection in a filter input,
- *    a sloppy checkbox press) and releases over the dimmed area must NOT
- *    discard the dialog's unsaved state.
+ *    background). The trap survives focus escaping the subtree (e.g. a
+ *    just-clicked pagination button disabling itself blurs focus to <body>):
+ *    a document-level listener on the topmost modal pulls focus back on Tab
+ *    and keeps Escape working.
+ *  - Body scroll is locked while any modal is open (ref-counted).
+ *  - Escape closes the topmost dialog only; the event does not propagate.
+ *  - A backdrop CLICK closes only when the interaction both STARTED and ENDED
+ *    on the backdrop: `click` fires on the common ancestor of mousedown and
+ *    mouseup, so a drag in either direction (text selection escaping the
+ *    dialog, or a mis-press on the dim area corrected onto the dialog) must
+ *    NOT discard the dialog's unsaved state.
  */
 export function Modal({
     title,
@@ -37,6 +44,11 @@ export function Modal({
 }): JSX.Element {
     const dialogRef = useRef<HTMLDivElement>(null);
     const mouseDownOnBackdrop = useRef(false);
+    const mouseUpOnBackdrop = useRef(false);
+    const modalId = useRef(Symbol('modal'));
+    // Latest onClose without re-subscribing the document listener every render.
+    const onCloseRef = useRef(onClose);
+    onCloseRef.current = onClose;
 
     useEffect(() => {
         // Move focus into the dialog; restore it to the opener on close unless
@@ -50,12 +62,29 @@ export function Modal({
     }, []);
 
     useEffect(() => {
-        // Lock body scroll while open. Restores the previous value so stacked
-        // modals closing in LIFO order unwind correctly.
-        const previous = document.body.style.overflow;
+        const id = modalId.current;
+        openModals.push(id);
         document.body.style.overflow = 'hidden';
+
+        // Keyboard backstop for focus that escaped the dialog subtree — the
+        // element-level handler below never sees those events. Topmost modal only.
+        function onDocumentKeyDown(event: KeyboardEvent): void {
+            if (openModals[openModals.length - 1] !== id) return;
+            const dialog = dialogRef.current;
+            if (!dialog || dialog.contains(event.target as Node)) return;
+            if (event.key === 'Escape') {
+                onCloseRef.current();
+            } else if (event.key === 'Tab') {
+                event.preventDefault();
+                dialog.focus();
+            }
+        }
+        document.addEventListener('keydown', onDocumentKeyDown);
+
         return () => {
-            document.body.style.overflow = previous;
+            document.removeEventListener('keydown', onDocumentKeyDown);
+            openModals.splice(openModals.indexOf(id), 1);
+            if (openModals.length === 0) document.body.style.overflow = '';
         };
     }, []);
 
@@ -93,10 +122,20 @@ export function Modal({
             onMouseDown={(e) => {
                 mouseDownOnBackdrop.current = e.target === e.currentTarget;
             }}
+            onMouseUp={(e) => {
+                mouseUpOnBackdrop.current = e.target === e.currentTarget;
+            }}
             onClick={(e) => {
-                // Close only for a genuine backdrop click: both the press and
-                // the release happened on the backdrop itself.
-                if (e.target === e.currentTarget && mouseDownOnBackdrop.current) onClose();
+                // Close only for a genuine backdrop click: press AND release
+                // both landed on the backdrop itself — never a drag that
+                // crossed the dialog boundary in either direction.
+                if (
+                    e.target === e.currentTarget &&
+                    mouseDownOnBackdrop.current &&
+                    mouseUpOnBackdrop.current
+                ) {
+                    onClose();
+                }
             }}
             data-testid={testId ? `${testId}-backdrop` : undefined}
         >

@@ -240,6 +240,17 @@ describe('GitLabProvider', () => {
             });
         });
 
+        it('leaves displayName unset when the API response has no name field (projection falls back to the path)', async () => {
+            const fetchMock = makeFetchMock([{body: [makeProjectFixture({name: undefined})]}]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            const repos = await provider.listRepos();
+
+            expect(repos).toHaveLength(1);
+            expect(repos[0].name).toBe('test-group/my-repo');
+            expect(repos[0].displayName).toBeUndefined();
+        });
+
         it('uses groups/{group}/projects endpoint with URL-encoded group', async () => {
             const fetchMock = makeFetchMock([{body: []}]);
             vi.stubGlobal('fetch', fetchMock);

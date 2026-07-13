@@ -46,13 +46,7 @@ function makeMockProvider(overrides: Partial<GitProvider> = {}): GitProvider {
 }
 
 function makeRepo(name: string): GitRepo {
-    return {
-        id: name,
-        name,
-        fullName: `db-org/${name}`,
-        defaultBranch: 'main',
-        isArchived: false,
-    };
+    return {id: name, name, fullName: `db-org/${name}`, defaultBranch: 'main', isArchived: false};
 }
 
 function makeCommit(username: string): GitCommit {

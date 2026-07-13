@@ -113,7 +113,8 @@ function globMatch(pattern: string, str: string): boolean {
 
 interface RawProject {
     id: number;
-    name: string;
+    /** GitLab's human-readable project name — typed optional so a payload missing it degrades to the path (#213). */
+    name?: string;
     path: string;
     path_with_namespace: string;
     default_branch: string;
