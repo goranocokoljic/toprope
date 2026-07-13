@@ -24,6 +24,50 @@ const CONNECTOR_NAME = 'git';
  */
 export const UNMATCHED_AUTHORS_PREFIX = 'Unmatched authors (no developer record found):';
 
+/**
+ * The stages a sync run passes through, in pipeline order (GC#209). The network
+ * fetch dominates wall time, so `listing_repos`/`fetching` are what a 1s HTTP
+ * poll realistically observes; `analyzing`/`writing` are synchronous and brief —
+ * part of the wire contract and visible to a direct listener, but a poll will
+ * rarely catch them.
+ */
+export type GitSyncStage = 'listing_repos' | 'fetching' | 'analyzing' | 'writing';
+
+/**
+ * A live progress snapshot of an in-flight sync run, emitted through the
+ * optional listener {@link GitSync.syncProviders} accepts (GC#209). Field names
+ * are wire-shaped (snake_case) because the admin API serves each snapshot
+ * verbatim on the provider list's `active_sync.progress` — one shape end to
+ * end, nothing to drift. Counters are cumulative across the whole run; the
+ * per-provider "sync now" trigger passes exactly one provider, so there they
+ * read as that provider's counts.
+ */
+export interface GitSyncProgress {
+    stage: GitSyncStage;
+    /** Repos selected for the run; null until listing has completed. */
+    repos_total: number | null;
+    repos_processed: number;
+    /** The repo currently being fetched (fetching stage only). */
+    current_repo: string | null;
+    commits_fetched: number;
+    prs_fetched: number;
+    /** Distinct developers resolved from the fetched activity (analyzing stage on). */
+    developers_matched: number;
+}
+
+/**
+ * Listener for progress snapshots. Called synchronously between pipeline steps
+ * with a fresh copy each time — it must be cheap and must not block (the
+ * sync-now API just stores the latest snapshot for the list endpoint to serve).
+ */
+export type GitSyncProgressListener = (progress: GitSyncProgress) => void;
+
+// Mutate-then-emit reporter threaded through the pipeline: applies `mutate` to
+// the run's single progress state, then emits a defensive copy so a listener
+// can never mutate pipeline state. Undefined when no listener was passed, so
+// the scheduled path pays nothing.
+type ProgressReporter = (mutate: (progress: GitSyncProgress) => void) => void;
+
 function syncStateKey(providerType: GitProviderType, identifier: string): string {
     return `git_last_sync:${providerType}:${identifier}`;
 }
@@ -362,6 +406,7 @@ async function fetchProviderData(
     providerConfig: GitProviderConfig,
     now: string,
     db: Database.Database,
+    report?: ProgressReporter,
 ): Promise<ProviderFetchResult> {
     const errors: string[] = [];
     const allCommits: AnalysisCommit[] = [];
@@ -383,6 +428,10 @@ async function fetchProviderData(
     const {include: includeRepos, exclude: excludeFromList} = parseRepoFilters(rawRepos);
     const allExclude = [...excludeFromList, ...(excludeRepos ?? [])];
 
+    report?.((p) => {
+        p.stage = 'listing_repos';
+        p.current_repo = null;
+    });
     let repoNames: string[] = [];
     try {
         const repos = await provider.listRepos();
@@ -407,7 +456,20 @@ async function fetchProviderData(
         allExclude.length > 0 ? allExclude : undefined,
     );
 
+    // Accumulate (+=) rather than assign, matching the other counters' cumulative
+    // semantics. Today the only listener-bearing caller is the single-provider
+    // sync-now trigger (so this reads as that provider's repo count); a future
+    // multi-provider listener would also see the stage revisit 'listing_repos'
+    // per provider — design that presentation when such a caller exists.
+    report?.((p) => {
+        p.stage = 'fetching';
+        p.repos_total = (p.repos_total ?? 0) + reposToSync.length;
+    });
+
     for (const repoName of reposToSync) {
+        report?.((p) => {
+            p.current_repo = repoName;
+        });
         let rawCommits: GitCommit[] = [];
         try {
             rawCommits = await provider.getCommits(repoName, since, now);
@@ -415,8 +477,16 @@ async function fetchProviderData(
             errors.push(
                 `[${providerType}/${repoName}] Failed to fetch commits: ${err instanceof Error ? err.message : String(err)}`,
             );
+            // A failed repo still counts as processed so the N/M counter reaches M.
+            report?.((p) => {
+                p.repos_processed += 1;
+                p.current_repo = null;
+            });
             continue;
         }
+        report?.((p) => {
+            p.commits_fetched += rawCommits.length;
+        });
 
         for (const rawCommit of rawCommits) {
             let diffs: GitFileDiff[] = [];
@@ -438,6 +508,9 @@ async function fetchProviderData(
                 `[${providerType}/${repoName}] Failed to fetch PRs: ${err instanceof Error ? err.message : String(err)}`,
             );
         }
+        report?.((p) => {
+            p.prs_fetched += rawPRs.length;
+        });
 
         let commentFetchFailures = 0;
         let reviewFetchFailures = 0;
@@ -505,6 +578,11 @@ async function fetchProviderData(
                 `[${providerType}/${repoName}] Failed to fetch review verdicts for ${reviewFetchFailures} PR(s)`,
             );
         }
+
+        report?.((p) => {
+            p.repos_processed += 1;
+            p.current_repo = null;
+        });
     }
 
     return {
@@ -687,10 +765,15 @@ export class GitSync implements ConnectorInterface {
      * sync logic): the ONLY difference is the caller supplies the provider configs
      * instead of them being resolved from DB + config here. An empty list yields
      * the same "nothing configured" shape rather than throwing.
+     *
+     * `onProgress` (optional, GC#209) receives a {@link GitSyncProgress} snapshot
+     * as the run advances — the sync-now API stores the latest one so the admin
+     * UI can poll live progress. Omitted on the scheduled path (no observer).
      */
     async syncProviders(
         db: Database.Database,
         providerConfigs: GitProviderConfig[],
+        onProgress?: GitSyncProgressListener,
     ): Promise<SyncResult> {
         if (providerConfigs.length === 0) {
             return {
@@ -701,7 +784,7 @@ export class GitSync implements ConnectorInterface {
                 lastSyncTime: new Date().toISOString(),
             };
         }
-        return this.runSync(db, providerConfigs);
+        return this.runSync(db, providerConfigs, onProgress);
     }
 
     // The shared pipeline body for both entry points above. Assumes a non-empty,
@@ -710,12 +793,34 @@ export class GitSync implements ConnectorInterface {
     private async runSync(
         db: Database.Database,
         providerConfigs: GitProviderConfig[],
+        onProgress?: GitSyncProgressListener,
     ): Promise<SyncResult> {
         const errors: string[] = [];
         let snapshotsWritten = 0;
         let snapshotsSkipped = 0;
         const now = new Date().toISOString();
         const allUnmatched = new Set<string>();
+
+        // One mutable progress state for the whole run; every report merges into
+        // it and emits a copy, so the listener always sees cumulative counters.
+        const progressState: GitSyncProgress = {
+            stage: 'listing_repos',
+            repos_total: null,
+            repos_processed: 0,
+            current_repo: null,
+            commits_fetched: 0,
+            prs_fetched: 0,
+            developers_matched: 0,
+        };
+        const report: ProgressReporter | undefined = onProgress
+            ? (mutate): void => {
+                  mutate(progressState);
+                  onProgress({...progressState});
+              }
+            : undefined;
+        // Distinct developers resolved anywhere in the run (snapshots or PR
+        // records) — the developers_matched counter's source.
+        const matchedDevelopers = new Set<string>();
 
         const devLookup = buildDevLookupMap(db);
         const churnWindowHours = this.config.analysis?.churn_window_hours ?? 48;
@@ -726,10 +831,15 @@ export class GitSync implements ConnectorInterface {
         const fetchResults: Array<{result: ProviderFetchResult; providerType: GitProviderType}> = [];
 
         for (const pc of providerConfigs) {
-            const result = await fetchProviderData(pc, now, db);
+            const result = await fetchProviderData(pc, now, db, report);
             errors.push(...result.errors);
             fetchResults.push({result, providerType: pc.type});
         }
+
+        report?.((p) => {
+            p.stage = 'analyzing';
+            p.current_repo = null;
+        });
 
         // Accumulate snapshots from all providers into a single map keyed by
         // "developer_id:date" so same-day multi-provider data is merged.
@@ -749,7 +859,10 @@ export class GitSync implements ConnectorInterface {
                     record.authorLogin,
                     record.authorEmail,
                 );
-                if (developerId) resolvedPRRecords.push({record, developerId});
+                if (developerId) {
+                    resolvedPRRecords.push({record, developerId});
+                    matchedDevelopers.add(developerId);
+                }
             }
 
             if (commits.length === 0 && prs.length === 0 && reviewComments.length === 0) {
@@ -772,6 +885,7 @@ export class GitSync implements ConnectorInterface {
                 const emailForLogin = commits.find((c) => c.authorLogin === login)?.authorEmail ?? null;
                 const developerId = resolveDeveloperId(devLookup, providerType, login, emailForLogin);
                 if (!developerId) continue;
+                matchedDevelopers.add(developerId);
 
                 for (const [, metrics] of byDate) {
                     const snap: GitSnapshotRow = {
@@ -800,6 +914,11 @@ export class GitSync implements ConnectorInterface {
 
             setProviderLastSyncTime(db, stateKey, now);
         }
+
+        report?.((p) => {
+            p.stage = 'writing';
+            p.developers_matched = matchedDevelopers.size;
+        });
 
         // Upsert all merged snapshots + per-PR records in a single transaction
         const insertMany = db.transaction(() => {

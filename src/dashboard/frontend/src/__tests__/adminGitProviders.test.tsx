@@ -5,8 +5,9 @@ import {afterEach, beforeEach, describe, expect, it, vi, type Mock} from 'vitest
 import {cleanup, fireEvent, render, screen, waitFor, within} from '@testing-library/react';
 import {QueryClient, QueryClientProvider} from '@tanstack/react-query';
 import {MemoryRouter} from 'react-router-dom';
-import {AdminGitProviders, parseReposList, repoScopeLabel} from '../pages/admin/AdminGitProviders';
-import type {AdminGitProvider} from '../api/types';
+import {AdminGitProviders, parseReposList, repoScopeLabel, syncProgressLabel} from '../pages/admin/AdminGitProviders';
+import {gitProvidersRefetchInterval} from '../hooks/useAdmin';
+import type {AdminGitProvider, GitSyncProgress, GitSyncStage} from '../api/types';
 
 /**
  * Tests for Admin → Git providers (GC1.8 / #200 + GC1.9 / #201). Cover every
@@ -38,6 +39,7 @@ const DB_GITHUB: AdminGitProvider = {
     last_sync_at: '2026-07-01T10:00:00.000Z',
     last_sync_status: 'ok',
     last_sync_error: null,
+    active_sync: null,
 };
 
 const CONFIG_GITLAB: AdminGitProvider = {
@@ -60,6 +62,7 @@ const CONFIG_GITLAB: AdminGitProvider = {
     last_sync_at: null,
     last_sync_status: null,
     last_sync_error: null,
+    active_sync: null,
 };
 
 /** A DB provider with no repo filter — the "monitor all" starting point (#201). */
@@ -551,6 +554,199 @@ describe('AdminGitProviders — repo-scope editor (#201)', () => {
         // Config repo scope is plain text ("2 selected"), not an editable button.
         expect(within(row).queryByRole('button', {name: '2 selected'})).not.toBeInTheDocument();
         expect(within(row).getByText('2 selected')).toBeInTheDocument();
+    });
+});
+
+describe('syncProgressLabel (#209)', () => {
+    const base: GitSyncProgress = {
+        stage: 'fetching',
+        repos_total: 12,
+        repos_processed: 2,
+        current_repo: 'web',
+        commits_fetched: 34,
+        prs_fetched: 5,
+        developers_matched: 0,
+    };
+
+    it('falls back to a starting line before the first pipeline emission', () => {
+        expect(syncProgressLabel({started_at: 't', progress: null})).toBe('Starting sync…');
+    });
+
+    it('labels every stage with its counters', () => {
+        expect(syncProgressLabel({started_at: 't', progress: {...base, stage: 'listing_repos'}})).toBe(
+            'Listing repositories…',
+        );
+        expect(syncProgressLabel({started_at: 't', progress: base})).toBe(
+            'Fetching activity — repo 3/12 (web) · 34 commits · 5 PRs',
+        );
+        expect(
+            syncProgressLabel({
+                started_at: 't',
+                progress: {...base, stage: 'analyzing', developers_matched: 4},
+            }),
+        ).toBe('Matching developers — 4 matched');
+        expect(
+            syncProgressLabel({
+                started_at: 't',
+                progress: {...base, stage: 'writing', developers_matched: 4},
+            }),
+        ).toBe('Writing snapshots — 4 developers matched');
+    });
+
+    it('degrades an unknown wire stage to a generic label (backend/bundle skew)', () => {
+        expect(
+            syncProgressLabel({
+                started_at: 't',
+                progress: {...base, stage: 'replicating' as GitSyncStage},
+            }),
+        ).toBe('Syncing…');
+    });
+
+    it('never overshoots the repo counter on the last repo or an empty scope', () => {
+        // Last repo in flight: processed 11 of 12 → position 12/12, not 13/12.
+        expect(
+            syncProgressLabel({
+                started_at: 't',
+                progress: {...base, repos_processed: 11, current_repo: 'infra'},
+            }),
+        ).toBe('Fetching activity — repo 12/12 (infra) · 34 commits · 5 PRs');
+        // Zero repos selected: 0/0, no phantom first repo — and no repo-name
+        // suffix when current_repo is null (full equality pins its absence).
+        expect(
+            syncProgressLabel({
+                started_at: 't',
+                progress: {...base, repos_total: 0, repos_processed: 0, current_repo: null},
+            }),
+        ).toBe('Fetching activity — repo 0/0 · 34 commits · 5 PRs');
+    });
+});
+
+describe('AdminGitProviders — live sync progress (#209)', () => {
+    const RUNNING_SYNC = {
+        started_at: '2026-07-13T10:00:00.000Z',
+        progress: {
+            stage: 'fetching',
+            repos_total: 12,
+            repos_processed: 2,
+            current_repo: 'web',
+            commits_fetched: 34,
+            prs_fetched: 5,
+            developers_matched: 0,
+        },
+    } as const;
+
+    it('shows the progress line and disables the Sync button while a run is in flight', async () => {
+        providers = [{...structuredClone(DB_GITHUB), active_sync: structuredClone(RUNNING_SYNC)}];
+        renderPage();
+        const progress = await screen.findByTestId('sync-progress');
+        expect(progress).toHaveTextContent('Fetching activity — repo 3/12 (web) · 34 commits · 5 PRs');
+        expect(screen.getByRole('button', {name: 'Syncing…'})).toBeDisabled();
+        expect(screen.queryByRole('button', {name: 'Sync now'})).not.toBeInTheDocument();
+    });
+
+    it('shows a starting line when the run has not emitted progress yet', async () => {
+        providers = [
+            {...structuredClone(DB_GITHUB), active_sync: {started_at: '2026-07-13T10:00:00.000Z', progress: null}},
+        ];
+        renderPage();
+        expect(await screen.findByTestId('sync-progress')).toHaveTextContent('Starting sync…');
+    });
+
+    it('polls the list while a sync is running and hands the row back when it settles', async () => {
+        // The stop condition itself is proven deterministically by the
+        // gitProvidersRefetchInterval unit tests below — this test proves the
+        // WIRING: the hook actually re-fetches on the interval while a run is
+        // in flight, and the settle-observing poll clears the progress row.
+        providers = [{...structuredClone(DB_GITHUB), active_sync: structuredClone(RUNNING_SYNC)}];
+        renderPage();
+        await screen.findByTestId('sync-progress');
+        const listCalls = (): number =>
+            fetchMock.mock.calls.filter(
+                (c) => /\/git\/providers$/.test(String(c[0])) && (c[1]?.method ?? 'GET').toUpperCase() === 'GET',
+            ).length;
+        const initial = listCalls();
+        // The run settles server-side: the next poll observes an idle row…
+        providers = [structuredClone(DB_GITHUB)];
+        await waitFor(() => expect(listCalls()).toBeGreaterThan(initial), {timeout: 3000});
+        // …and the row hands back to the idle state.
+        await waitFor(() => expect(screen.queryByTestId('sync-progress')).not.toBeInTheDocument());
+        expect(screen.getByRole('button', {name: 'Sync now'})).toBeEnabled();
+    }, 10000);
+
+    it('gitProvidersRefetchInterval: 1s only while some row has an in-flight run', () => {
+        const running = {...structuredClone(DB_GITHUB), active_sync: structuredClone(RUNNING_SYNC)};
+        const idle = structuredClone(DB_GITHUB);
+        expect(gitProvidersRefetchInterval([running, idle])).toBe(1000);
+        expect(gitProvidersRefetchInterval([idle])).toBe(false);
+        expect(gitProvidersRefetchInterval([])).toBe(false);
+        expect(gitProvidersRefetchInterval(undefined)).toBe(false);
+    });
+
+    it('surfaces the server message when a duplicate trigger is rejected (409) AND refetches the list so the row picks up the in-flight run', async () => {
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const u = String(url);
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (/\/git\/providers\/[^/]+\/sync$/.test(u) && method === 'POST') {
+                return json(
+                    {error: 'Conflict', message: 'A sync is already in progress for this provider'},
+                    409,
+                );
+            }
+            return base!(url, init);
+        });
+        renderPage();
+        const ghCell = await screen.findByText('acme-org');
+        const row = ghCell.closest('tr') as HTMLElement;
+        // The run the 409 complains about IS in flight server-side: the refetch
+        // the rejection triggers (onSettled invalidation) must observe it.
+        providers = [{...structuredClone(DB_GITHUB), active_sync: structuredClone(RUNNING_SYNC)}];
+        fireEvent.click(within(row).getByRole('button', {name: 'Sync now'}));
+        expect(
+            await screen.findByText('A sync is already in progress for this provider'),
+        ).toBeInTheDocument();
+        // The rejected trigger still invalidated the list: the row shows the
+        // actual in-flight run's progress (which also bootstraps polling).
+        expect(await screen.findByTestId('sync-progress')).toBeInTheDocument();
+        expect(screen.getByRole('button', {name: 'Syncing…'})).toBeDisabled();
+    });
+
+    it('keeps the Sync button down until the refetched list lands — no double-click window after the 202', async () => {
+        // Gate the list REFETCH that follows the 202 (the mount fetch passes).
+        let releaseList: (() => void) | undefined;
+        let listCalls = 0;
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const u = String(url);
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (/\/git\/providers$/.test(u) && method === 'GET') {
+                listCalls += 1;
+                if (listCalls > 1) {
+                    await new Promise<void>((r) => {
+                        releaseList = r;
+                    });
+                    return json({
+                        data: [{...structuredClone(DB_GITHUB), active_sync: structuredClone(RUNNING_SYNC)}],
+                    });
+                }
+            }
+            return base!(url, init);
+        });
+        renderPage();
+        const row = (await screen.findByText('acme-org')).closest('tr') as HTMLElement;
+        fireEvent.click(within(row).getByRole('button', {name: 'Sync now'}));
+
+        // The POST has resolved (202) but the invalidation refetch is gated:
+        // isPending must cover the refetch, so the button stays down — the gap
+        // where a double-click would 409 does not exist.
+        await waitFor(() => expect(releaseList).toBeDefined());
+        expect(screen.getByRole('button', {name: 'Syncing…'})).toBeDisabled();
+        expect(screen.queryByRole('button', {name: 'Sync now'})).not.toBeInTheDocument();
+
+        // Once the refetch lands the row seamlessly hands off to active_sync.
+        releaseList?.();
+        expect(await screen.findByTestId('sync-progress')).toBeInTheDocument();
+        expect(screen.getByRole('button', {name: 'Syncing…'})).toBeDisabled();
     });
 });
 

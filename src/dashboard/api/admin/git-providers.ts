@@ -24,7 +24,7 @@ import {
 import {loadServerKey} from '../../../connectors/git/providers/secret';
 import {providerContainer, resolveGitProviderConfigs} from '../../../connectors/git/providers/config';
 import {createGitProvider} from '../../../connectors/git/providers/factory';
-import {GitSync, UNMATCHED_AUTHORS_PREFIX} from '../../../connectors/git/sync';
+import {GitSync, UNMATCHED_AUTHORS_PREFIX, type GitSyncProgress} from '../../../connectors/git/sync';
 import {gitProviderFixHint} from '../../../cli/doctor';
 import type {GitConnectorConfig} from '../../../config/types';
 import type {GitProviderConfig, GitProviderType} from '../../../connectors/git/providers/types';
@@ -50,15 +50,30 @@ import type {GitProviderConfig, GitProviderType} from '../../../connectors/git/p
 type ProviderSource = 'db' | 'config';
 
 /**
+ * Live state of an in-flight sync-now run, surfaced on the provider list so the
+ * UI can poll it (#209). `progress` is the pipeline's latest snapshot, null
+ * until the first emission lands. The same object doubles as the in-memory
+ * registry entry the sync route maintains — one shape, nothing to map.
+ */
+export interface ActiveSyncDto {
+    started_at: string;
+    progress: GitSyncProgress | null;
+}
+
+/**
  * The masked provider DTO the admin API returns. A superset of the store's
  * {@link PublicGitProvider} with a `source` discriminator; `created_at`/
  * `updated_at` are nullable because config-file providers have no lifecycle
- * timestamps. Never carries token ciphertext/plaintext.
+ * timestamps. Never carries token ciphertext/plaintext. `active_sync` is
+ * non-null only while a sync-now run is in flight for this provider (#209) —
+ * process-local state, so it is always null for config rows (they sync via the
+ * scheduled pipeline only).
  */
 export interface AdminGitProviderDto extends Omit<PublicGitProvider, 'created_at' | 'updated_at'> {
     source: ProviderSource;
     created_at: string | null;
     updated_at: string | null;
+    active_sync: ActiveSyncDto | null;
 }
 
 /**
@@ -290,11 +305,17 @@ function configProviderToDto(config: GitProviderConfig): AdminGitProviderDto {
         last_sync_at: null,
         last_sync_status: null,
         last_sync_error: null,
+        active_sync: null,
     };
 }
 
-function dbProviderToDto(record: Parameters<typeof toPublicProvider>[0]): AdminGitProviderDto {
-    return {...toPublicProvider(record), source: 'db'};
+// `activeSync` is the route registration's in-flight entry for this row (null
+// when no run is in flight — the common case for create/update responses).
+function dbProviderToDto(
+    record: Parameters<typeof toPublicProvider>[0],
+    activeSync: ActiveSyncDto | null = null,
+): AdminGitProviderDto {
+    return {...toPublicProvider(record), source: 'db', active_sync: activeSync};
 }
 
 // Map a typed store error to an HTTP reply. secret_key_unconfigured is a
@@ -383,12 +404,14 @@ export function registerAdminGitProviderRoutes(
     const configProviders = (): GitProviderConfig[] =>
         gitConfig ? resolveGitProviderConfigs(gitConfig) : [];
 
-    // Overlap guard for sync-now (#199): the set of provider ids with an in-flight
-    // run. Scoped to THIS route registration (one per app) so it is process-local
-    // and test-isolated — a fresh app in a test starts with an empty set. A second
-    // trigger for an id already in the set is rejected (409), so no two overlapping
-    // runs ever write the same provider's snapshots.
-    const inFlightSyncs = new Set<string>();
+    // Overlap guard AND live-progress registry for sync-now (#199/#209): one
+    // entry per provider id with an in-flight run, carrying its start time and
+    // the pipeline's latest progress snapshot (served on the list as
+    // `active_sync`). Scoped to THIS route registration (one per app) so it is
+    // process-local and test-isolated — a fresh app in a test starts empty. A
+    // second trigger for an id already present is rejected (409), so no two
+    // overlapping runs ever write the same provider's snapshots.
+    const activeSyncs = new Map<string, ActiveSyncDto>();
 
     // A single GitSync bound to the same git config the list merge uses. Only its
     // churn-window setting is read on the syncProviders path (providers are passed
@@ -400,7 +423,9 @@ export function registerAdminGitProviderRoutes(
         if (!isAdmin(request)) return forbidden(reply);
         // DB providers first (store's deterministic created_at, id order), then
         // config-file providers in declaration order — a total, stable ordering.
-        const dbRows = listProviders(db).map(dbProviderToDto);
+        const dbRows = listProviders(db).map((record) =>
+            dbProviderToDto(record, activeSyncs.get(record.id) ?? null),
+        );
         const configRows = configProviders().map(configProviderToDto);
         return {data: [...dbRows, ...configRows]};
     });
@@ -467,7 +492,7 @@ export function registerAdminGitProviderRoutes(
                     token: parsed.token,
                     enabled: parsed.enabled,
                 });
-                return {data: dbProviderToDto(record)};
+                return {data: dbProviderToDto(record, activeSyncs.get(id) ?? null)};
             } catch (err) {
                 if (err instanceof GitProviderStoreError) return replyStoreError(reply, err);
                 return badRequest(reply, err instanceof Error ? err.message : String(err));
@@ -585,7 +610,7 @@ export function registerAdminGitProviderRoutes(
             }
             // Overlap guard: reject a duplicate trigger while a run is in flight so
             // two overlapping runs never write the same provider's snapshots.
-            if (inFlightSyncs.has(id)) {
+            if (activeSyncs.has(id)) {
                 return conflict(reply, 'A sync is already in progress for this provider');
             }
 
@@ -608,8 +633,11 @@ export function registerAdminGitProviderRoutes(
                 throw err;
             }
 
-            inFlightSyncs.add(id);
             const startedAt = new Date().toISOString();
+            // The registry entry is mutated in place by the progress listener
+            // below; the GET list serves whatever snapshot it holds right now.
+            const active: ActiveSyncDto = {started_at: startedAt, progress: null};
+            activeSyncs.set(id, active);
 
             // Kick off the run without awaiting it. syncProviders reuses the exact
             // fetch→merge→upsert pipeline, scoped to just this provider. Whatever
@@ -623,7 +651,9 @@ export function registerAdminGitProviderRoutes(
             // merge accuracy is a property of that shared pipeline model (owned by the
             // git-sync design), not of this per-provider trigger — see the epic review.
             void gitSync
-                .syncProviders(db, [config])
+                .syncProviders(db, [config], (progress) => {
+                    active.progress = progress;
+                })
                 .then((result) => {
                     // A sync that ran but collected per-repo/provider errors is an
                     // error outcome with a surfaced message — never swallowed. But
@@ -662,7 +692,7 @@ export function registerAdminGitProviderRoutes(
                     }
                 })
                 .finally(() => {
-                    inFlightSyncs.delete(id);
+                    activeSyncs.delete(id);
                 });
 
             reply.status(202);

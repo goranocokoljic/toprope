@@ -168,13 +168,37 @@ export function useAdminDataSources(): UseQueryResult<AdminDataSources, Error> {
 // One list query; every write invalidates it so masked rows + sync status stay
 // fresh. Test-connection is a mutation (a probe with a result), not a query —
 // the admin triggers it explicitly and reads the ok/error inline.
-export function useAdminGitProviders(): UseQueryResult<AdminGitProvider[], Error> {
-    return useQuery({queryKey: queryKeys.adminGitProviders, queryFn: api.getAdminGitProviders});
+/**
+ * Poll cadence for the provider list (#209): 1s while any sync-now run is in
+ * flight, off otherwise. A pure function of the cached list so the stop/start
+ * condition is unit-testable deterministically — the hook wires it to
+ * `query.state.data`.
+ */
+export function gitProvidersRefetchInterval(
+    providers: AdminGitProvider[] | undefined,
+): number | false {
+    return providers?.some((p) => p.active_sync !== null) ? 1000 : false;
 }
 
-function useInvalidateGitProviders(): () => void {
+export function useAdminGitProviders(): UseQueryResult<AdminGitProvider[], Error> {
+    return useQuery({
+        queryKey: queryKeys.adminGitProviders,
+        queryFn: api.getAdminGitProviders,
+        // Poll only while a sync-now run is in flight (#209): live progress
+        // (`active_sync`) streams in every second, and the poll that observes
+        // the run settle both stops itself and already carries the terminal
+        // last_sync_* outcome — no manual refresh.
+        refetchInterval: (query) => gitProvidersRefetchInterval(query.state.data),
+    });
+}
+
+// Returns the invalidation PROMISE so mutations that return it from their
+// callback keep `isPending` true until the refetched list lands — the button
+// can't re-enable against stale data (e.g. `active_sync` still null right
+// after a sync trigger's 202).
+function useInvalidateGitProviders(): () => Promise<void> {
     const qc = useQueryClient();
-    return () => void qc.invalidateQueries({queryKey: queryKeys.adminGitProviders});
+    return () => qc.invalidateQueries({queryKey: queryKeys.adminGitProviders});
 }
 
 export function useCreateAdminGitProvider(): UseMutationResult<AdminGitProvider, Error, GitProviderInput> {
@@ -209,10 +233,15 @@ export function useTestDraftGitProvider(): UseMutationResult<GitProviderProbeRes
     return useMutation({mutationFn: api.testDraftGitProvider});
 }
 
-/** Trigger a sync for one saved provider; the outcome lands on the row (poll the list). */
+/**
+ * Trigger a sync for one saved provider; the outcome lands on the row (poll the
+ * list). Invalidation runs on SETTLED, not success-only: a 409 ("already in
+ * progress") or 503 must also refresh the list so the row picks up the actual
+ * in-flight run and polling starts — otherwise the UI contradicts its own error.
+ */
 export function useSyncAdminGitProvider(): UseMutationResult<GitProviderSyncHandle, Error, string> {
     const invalidate = useInvalidateGitProviders();
-    return useMutation({mutationFn: (id: string) => api.syncAdminGitProvider(id), onSuccess: invalidate});
+    return useMutation({mutationFn: (id: string) => api.syncAdminGitProvider(id), onSettled: invalidate});
 }
 
 /**

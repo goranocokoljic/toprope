@@ -122,7 +122,26 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     });
 
     if (!res.ok) {
-        throw new ApiError(res.status, `Request to ${path} failed with ${res.status}`);
+        // Prefer the server's typed error body ({error, message}) so the UI can
+        // show "A sync is already in progress…" instead of a bare status code.
+        // Only 4xx and 503 qualify: those are DELIBERATE messages written for
+        // users (validation errors, conflicts, the 503 key-setup remediation —
+        // see serviceUnavailable in admin/helpers.ts). Other 5xx bodies come
+        // from Fastify's default handler echoing a raw internal err.message
+        // (SQLite constraints etc.) — keep the generic line for those.
+        const isTypedStatus = (res.status >= 400 && res.status < 500) || res.status === 503;
+        let message = `Request to ${path} failed with ${res.status}`;
+        if (isTypedStatus) {
+            try {
+                const body = (await res.json()) as {message?: unknown};
+                if (typeof body.message === 'string' && body.message.trim() !== '') {
+                    message = body.message;
+                }
+            } catch {
+                // Non-JSON error body — keep the generic message.
+            }
+        }
+        throw new ApiError(res.status, message);
     }
 
     return (await res.json()) as T;
