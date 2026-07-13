@@ -75,20 +75,20 @@ Run the **children only**, in order. Default model is `opus` (override with `-Mo
 
 ```powershell
 # Epic 6.1 — shared primitives (do first, fully)
-./run-issues-panel.ps1 151 152 153 154 155 -Panel
+./tr-harness.ps1 151 152 153 154 155 -Panel
 
 # Epic 6.2 — best practices
-./run-issues-panel.ps1 156 157 158 159 160 161 162 163 -Panel
+./tr-harness.ps1 156 157 158 159 160 161 162 163 -Panel
 
 # Epic 6.3 — showcase
-./run-issues-panel.ps1 164 165 166 167 168 169 170 171 172 -Panel
+./tr-harness.ps1 164 165 166 167 168 169 170 171 172 -Panel
 
 # Standalone settings + private tool (6.4 reads settings used by 6.2/6.3)
-./run-issues-panel.ps1 173 174 -Panel
+./tr-harness.ps1 173 174 -Panel
 ```
 
 The harness stops at the first hard failure, so a bad run never cascades into the rest
-of the queue. You can also run a single issue (`./run-issues-panel.ps1 151`) or split a
+of the queue. You can also run a single issue (`./tr-harness.ps1 151`) or split a
 batch across sessions.
 
 > **Never** pass an epic number (148/149/150) to the harness — there is no code unit to

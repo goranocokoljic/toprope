@@ -4,7 +4,7 @@ description: |
   Full development cycle for a single GitHub issue: read issue → create branch → implement →
   build + test + coverage → open PR → code review loop (max 3x) → merge → report done.
   Identical to dev-cycle, but emits DEVCYCLE_PHASE: markers at each phase boundary so a
-  supervising runner (run-issues-panel.ps1) can show live phase state.
+  supervising runner (tr-harness.ps1) can show live phase state.
   Invoke as: /dev-cycle-phases {issue-number}
   Triggers on: start issue, work on issue, implement issue, dev cycle, build cycle.
 allowed-tools:
@@ -190,6 +190,9 @@ The `<name>` MUST be one of this fixed vocabulary, in this order over the run:
 Rules:
 - Print the marker **before** doing the work of that phase.
 - Print it as plain assistant text on its own line — not inside a tool call.
+- No markdown around the marker: no backticks, no bold, no code fence. The line must
+  start with the literal characters `DEVCYCLE_PHASE:`. (This doc renders markers as
+  inline code for readability — do not copy the backticks.)
 - For the review loop (Phase 6), print the marker at the start of **each** iteration and
   append the cycle number as a detail after a pipe:
   `DEVCYCLE_PHASE: review | cycle 2/3`
@@ -210,9 +213,10 @@ loop so the supervising runner can record findings counts and split review time
 from fix time. Each on its own line, plain assistant text, exactly in these forms:
 
 ```
-DEVCYCLE_METRIC: review_done | review_cycle=N | critical=C high=H medium=M low=L style=S
-DEVCYCLE_METRIC: fix_start   | review_cycle=N
-DEVCYCLE_METRIC: fix_done    | review_cycle=N
+DEVCYCLE_METRIC: review_done  | review_cycle=N | critical=C high=H medium=M low=L style=S
+DEVCYCLE_METRIC: fix_start    | review_cycle=N
+DEVCYCLE_METRIC: fix_done     | review_cycle=N
+DEVCYCLE_METRIC: dispositions | review_cycle=N | fixed=F rejected_intentional=RI rejected_wrong=RW deferred=D
 ```
 
 - `review_done` — print **once per cycle**, right after you have read the review
@@ -222,9 +226,26 @@ DEVCYCLE_METRIC: fix_done    | review_cycle=N
   finding ranked High folds into `high=`, and so on.
 - `fix_start` — print right before you begin editing files to fix findings.
 - `fix_done` — print right after the cycle's `git push` succeeds.
+- `dispositions` — print **once per cycle**, after you have decided the fate of
+  every deduped finding: right after `fix_done`, or right after `review_done` when
+  the cycle has no fix pass. The four counts cover ALL of the cycle's deduped
+  findings and must sum to the same total as `review_done`'s buckets:
+  - `fixed` — the finding led to a code/test change in this cycle.
+  - `rejected_intentional` — the flagged code is deliberately structured that way
+    because of a real, **verifiable** constraint (a library limitation, an
+    architectural rule in CLAUDE.md, an acceptance criterion). Name the constraint
+    in your prose before emitting the line — "I meant to do it" is not a constraint.
+  - `rejected_wrong` — the reviewer's claim is factually incorrect, and you
+    verified that against the code, not from memory.
+  - `deferred` — real but non-blocking; intentionally left as a follow-up (the
+    Medium/Low findings you file on exit).
+  Be honest. These counts exist to measure whether context-blind reviewers produce
+  false positives (`rejected_*`); classifying "couldn't be bothered" as a rejection
+  poisons that signal — when in doubt between `deferred` and `rejected_*`, it is
+  `deferred`.
 - Skip `fix_start`/`fix_done` for any cycle with zero Blocker findings (you exit
-  without a blocker-fix pass — emit only `review_done`). Medium is no longer
-  auto-fixed, so a Medium-only cycle also emits just `review_done`.
+  without a blocker-fix pass — emit only `review_done` + `dispositions`). Medium is
+  no longer auto-fixed, so a Medium-only cycle also emits just those two.
 - These are analytics only; like phase markers, never put one on the last line.
 
 ---
@@ -489,7 +510,12 @@ Initialize `REVIEW_CYCLE=1`. Repeat up to `MAX_CYCLES` times:
    DEVCYCLE_METRIC: review_done | review_cycle={REVIEW_CYCLE} | critical={C} high={H} medium={M} low={L} style={S}
    ```
 3. If there are zero Blocker findings → exit loop and go to Phase 7. Medium / Low / Style do NOT block exit. (Blockers converge reliably; Medium oscillates — chasing it to zero burns cycles and has been observed to introduce fresh blockers. The real guarantee is "merged with zero blockers.") Any unfixed Medium/Low findings are filed as follow-ups — see "On a clean exit" below.
-4. **Auto-fix all Blocker findings without pausing to ask the user.** Emit `DEVCYCLE_METRIC: fix_start | review_cycle={REVIEW_CYCLE}` before your first edit. Fix in this context — you hold the implementation intent, and each finding carries the reviewer's independent reasoning. **A [TST] blocker is fixed by writing the missing test (and any code change it exposes), not by deleting or weakening the test.**
+   Before leaving the loop, adjudicate each deduped finding (see the `dispositions`
+   definition under Analytics reporting) and emit:
+   ```
+   DEVCYCLE_METRIC: dispositions | review_cycle={REVIEW_CYCLE} | fixed=0 rejected_intentional={RI} rejected_wrong={RW} deferred={D}
+   ```
+4. **Auto-fix all Blocker findings without pausing to ask the user.** Emit `DEVCYCLE_METRIC: fix_start | review_cycle={REVIEW_CYCLE}` before your first edit. Fix in this context — you hold the implementation intent, and each finding carries the reviewer's independent reasoning. As you work through the findings, track each one's disposition (`fixed` / `rejected_intentional` / `rejected_wrong` / `deferred`) — you will report the counts after the push. When you reject a finding, state the verifiable constraint or the factual error in your text at the moment you decide it. **A [TST] blocker is fixed by writing the missing test (and any code change it exposes), not by deleting or weakening the test.**
    **Medium findings are discretionary — do NOT auto-fix them broadly.** Apply a Medium fix only when it is clearly safe and self-contained (e.g. a one-line correctness tweak, or adding one missing edge-case test, in code the blocker fixes already touch). Do not refactor for Medium: broad Medium fixes spawn new findings and have introduced fresh blockers in practice. Leave everything else for the after-loop follow-up.
    Apply Low/Style at your judgment; skip if risky or out of scope. Only stop to ask the user when a fix is genuinely ambiguous, would change agreed scope, or conflicts with an acceptance criterion — otherwise keep going.
 5. Commit:
@@ -501,12 +527,14 @@ Initialize `REVIEW_CYCLE=1`. Repeat up to `MAX_CYCLES` times:
    ```bash
    npm run build && npm test && npm run test:coverage
    ```
-7. Push, then emit the fix-done metric:
+7. Push, then emit the fix-done metric and the cycle's dispositions (counts across
+   ALL deduped findings, summing to `review_done`'s total):
    ```bash
    git push
    ```
    ```
    DEVCYCLE_METRIC: fix_done | review_cycle={REVIEW_CYCLE}
+   DEVCYCLE_METRIC: dispositions | review_cycle={REVIEW_CYCLE} | fixed={F} rejected_intentional={RI} rejected_wrong={RW} deferred={D}
    ```
 8. If `REVIEW_CYCLE < MAX_CYCLES`: increment counter, repeat from step 1
 9. If `REVIEW_CYCLE == MAX_CYCLES`: exit loop

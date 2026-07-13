@@ -8,6 +8,13 @@
 
 - **Security gates must fail closed and validate at runtime.** An authorization/approval gate must reject any unrecognized value (fail-closed), validate the value with a runtime allowlist rather than a compile-time union, and be inverted so the permissive branch is the only explicitly named one.
   - _Why:_ Recurred in #152 (the publish gate used positive equality gate === 'required-approval', so any typo or unvalidated route param fell through and published with no approval check).
+- **Range-validate numeric/threshold config on both bounds.** Validators at a trust boundary must enforce upper bounds, integrality, and semantic ranges (not just finite-and-non-negative), and clamp privacy-protecting thresholds to a hard floor; checking only the lower bound lets an admin value exhaust resources or silently disable a safety guard.
+  - _Why:_ Recurred in #107 (baselineWindow:100000000 the engine iterates per scan), #123 (rejectThreshold:50 / aiSignatureThreshold:0 made 'struggling' unreachable), and #159 (minSample:1 with no floor could expose one developer).
+
+## correctness
+
+- **Docs, config keys, and parity claims must match the code.** Verify every documented config key against the actual loader (loaders silently ignore unknown keys), and never justify a change by claiming it 'mirrors' another module unless that module actually does the same thing; note deliberately out-of-scope alignments.
+  - _Why:_ Recurred in #108 (docs said dashboard_base_url but the key is dashboard_url, yielding Slack alerts with no deep link and no error) and #145 (docstrings claimed parity with Pillar 3 cohort resolution, which actually filters by per-developer opt-in, not team-level exclusion).
 
 ## over-abstraction
 
@@ -15,6 +22,11 @@
   - _Why:_ Recurred in #104 (re-derived tier/trend SQL), #107 (re-implemented override gate by hardcoding the flag), #122/#126/#130/#131 (byte-for-byte copied period-walk/decode/coerce/preference plumbing), #123 (rework_rate duplicate column), and #155 (re-implemented visibility orchestration and forked a quieter row decoder).
 - **Don't build scope without a real production caller.** Build exactly what the issue's acceptance criteria require: do not add config knobs, precedence chains, alternate code paths, network transports, scoring algorithms, runtime predicates/guards, or layered wrapper functions whose only callers are tests or their own definitions; defer the seam until a real consumer exists.
   - _Why:_ Recurred in #102 (speculative per-team overrides and percentageBaseline mode), #125/#127 (uncalled RealtimeCoach config and httpCaptureTransport), #154 (a 3-line rule fractured into uncalled wrappers and read helpers), #157 (90 LOC of a sibling task's scoring), #159 (test-only options object), and #162 (test-only SCOLDING_WORDS blocklist/isEncouraging predicate).
+
+## performance
+
+- **Resolve sets in one query; no per-row fan-out or full scans.** Resolve cohort/membership/hidden-id sets once with a single JOIN/query before any loop and do in-memory checks inside, and fetch a single entity with a point-read plus the shared visibility check; never run O(N) per-row DB round-trips or scan the whole visible set and JS-filter to one row on every request.
+  - _Why:_ Recurred in #132 (org opt-in resolution fired ~D×(3+2·prefs) synchronous queries), #161 (the pinned-practice loop re-ran the hides query per id), and #163 (loadVisiblePractice scanned all visible practices and .filter(...)[0] on every detail/history/feedback request).
 
 ## testing
 
@@ -25,6 +37,8 @@
 
 - **Validate entity existence and lifecycle state before a write.** Before writing a flag, endorsing/ranking, or appending an audit/outcome row, fetch the target and assert it exists and is in the expected lifecycle/precondition state (returning a typed not_found/not_published error, not a raw DB error), and require FK or existence/canonicalization checks on actor and functional-key columns; a non-blank check alone lets a typo/ghost id write a row that silently does nothing.
   - _Why:_ Recurred in #157 (endorsePractice/orderPracticePool acted on draft/removed rows and surfaced a raw SQLITE_CONSTRAINT), #126 (recovery/complete logged unconditionally without a matching open initiate), and #151/#154 (audit actor/author ids had no FK and a mis-cased team recorded a hide that hid nothing yet 'succeeded').
+- **Wrap read-modify-write and multi-statement writes in a transaction.** Any read-then-write that preserves omitted fields, or any check-then-act/multi-statement mutation (including MAX(version)+1), must run inside a single db.transaction; a UNIQUE backstop turns a race into a fail-fast error, it does not serialize.
+  - _Why:_ Recurred in #156 (setPracticeDetails did a non-atomic read-merge-UPSERT) and #151 (addContributionVersion computed MAX(version)+1 in a deferred tx with a doc overstating collision safety).
 
 ## determinism
 
