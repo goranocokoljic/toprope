@@ -166,4 +166,14 @@ Columns with an `accessor` are sortable (clicking the header toggles asc/desc);
 add `sortable: false` to opt out. Sorting copies the array — the caller's `rows`
 are never mutated. `render` supplies rich cells; `accessor` supplies the sort key
 and default text.
-```
+
+**Controlled sort (#215).** Pass `sort` + `onSortChange` together and the parent
+owns the ordering: header clicks report the next `{key, direction}` through the
+callback, `sort` drives the indicators/aria-sort, and `rows` render AS GIVEN
+(pre-sorted by the parent). Use it when sorting must compose with parent-side
+pagination or a comparator accessors can't express (e.g. the repo-scope modal's
+grouped selection sort). In controlled mode `sortable: true` force-enables a
+render-only column; in self-sorting mode that flag is ignored (fail-closed — the
+table can't sort without an accessor). Passing `sort` without `onSortChange` is a
+mistake and warns in dev (an `onSortChange` with no `sort` yet is the legitimate
+"start unsorted" state).

@@ -4,7 +4,7 @@ import {Card} from '../../components/Card';
 import {Badge} from '../../components/Badge';
 import {StatePanel} from '../../components/StatePanel';
 import {Modal} from '../../components/Modal';
-import {DataTable, type Column} from '../../components/DataTable';
+import {DataTable, type Column, type SortState} from '../../components/DataTable';
 import {
     useAdminDataSources,
     useAdminGitProviderRepos,
@@ -492,6 +492,11 @@ function RepoScopeModal({
     const [edited, setEdited] = useState<Set<string> | null>(null);
     const [filter, setFilter] = useState('');
     const [page, setPage] = useState(0);
+    // Default ordering is selection-first (#215): reopening a narrowed scope
+    // shows the stored selection on page 1, immediately amendable. On a fresh
+    // monitor-all provider the seed selects everything, so this degrades to a
+    // plain name ordering.
+    const [sort, setSort] = useState<SortState>({key: 'selected', direction: 'asc'});
     const repos = useAdminGitProviderRepos(provider.id, mode === 'select');
     const update = useUpdateAdminGitProvider();
 
@@ -508,18 +513,47 @@ function RepoScopeModal({
     const defaultSeed = stored !== undefined ? new Set(stored) : allNonArchived;
     const selected = edited ?? defaultSeed;
 
-    // Case-insensitive substring filter over slug OR display name; pagination
-    // applies to the FILTERED list. The page index is clamped (not reset via an
-    // effect) so shrinking the result set can never leave an out-of-range page.
+    // Case-insensitive substring filter over slug OR display name, then SORT,
+    // then pagination — sorting must order the whole filtered list, never a
+    // single page. The page index is clamped (not reset via an effect) so
+    // shrinking the result set can never leave an out-of-range page.
     const query = filter.trim().toLowerCase();
     const filtered = query
         ? repoList.filter(
               (r) => r.slug.toLowerCase().includes(query) || r.name.toLowerCase().includes(query),
           )
         : repoList;
-    const pageCount = Math.max(1, Math.ceil(filtered.length / REPO_PAGE_SIZE));
+
+    // One slug collation everywhere: numeric-aware for humane ordering, with a
+    // plain comparison appended so numerically equal but textually distinct
+    // slugs ("repo-1" vs "repo-01") still have an explicit total order rather
+    // than leaning on engine sort stability.
+    const bySlug = (a: GitProviderRepo, b: GitProviderRepo): number =>
+        a.slug.localeCompare(b.slug, undefined, {numeric: true}) || a.slug.localeCompare(b.slug);
+    // Name is the universal secondary ordering (numeric-aware), slug the final
+    // total-order tiebreak, so every sort is stable and deterministic.
+    const byName = (a: GitProviderRepo, b: GitProviderRepo): number =>
+        a.name.localeCompare(b.name, undefined, {numeric: true}) || bySlug(a, b);
+    // Selection-status sort groups selected repos first (asc) or last (desc),
+    // name-ordered WITHIN each group in both directions (#215). It reads the
+    // LIVE selection, so ticking a row while sorted by status regroups it
+    // immediately — the sort is an honest view, not a snapshot (a deliberate,
+    // reviewed trade-off: a row ticked on a later page relocates to the
+    // selected group at the front).
+    const sortedFiltered = [...filtered].sort((a, b) => {
+        if (sort.key === 'selected') {
+            const rankDiff =
+                (selected.has(a.slug) ? 0 : 1) - (selected.has(b.slug) ? 0 : 1);
+            if (rankDiff !== 0) return sort.direction === 'asc' ? rankDiff : -rankDiff;
+            return byName(a, b);
+        }
+        const cmp = sort.key === 'slug' ? bySlug(a, b) : byName(a, b);
+        return sort.direction === 'asc' ? cmp : -cmp;
+    });
+
+    const pageCount = Math.max(1, Math.ceil(sortedFiltered.length / REPO_PAGE_SIZE));
     const safePage = Math.min(page, pageCount - 1);
-    const visibleRows = filtered.slice(safePage * REPO_PAGE_SIZE, (safePage + 1) * REPO_PAGE_SIZE);
+    const visibleRows = sortedFiltered.slice(safePage * REPO_PAGE_SIZE, (safePage + 1) * REPO_PAGE_SIZE);
 
     function toggleRepo(slug: string, checked: boolean): void {
         const next = new Set(selected);
@@ -528,15 +562,16 @@ function RepoScopeModal({
         setEdited(next);
     }
 
-    // Table columns: checkbox / Slug / Name (+ archived badge). Selection and
-    // filtering already control the order and visible set, so column sorting is
-    // deliberately off (render-only columns are unsortable by DataTable's
-    // contract; the Slug accessor needs the explicit opt-out). The checkbox is
-    // labelled by the SLUG (the identifier the save writes), not the display name.
+    // Table columns: checkbox / Slug / Name (+ archived badge). All three sort
+    // (#215) through DataTable's CONTROLLED mode — the comparator above owns
+    // the ordering so it composes with filtering and pagination; the render-only
+    // Selected and Name columns force-enable their headers with sortable: true.
+    // The checkbox is labelled by the SLUG (the identifier the save writes).
     const columns: Column<GitProviderRepo>[] = [
         {
             key: 'selected',
-            header: '',
+            header: 'Selected',
+            sortable: true,
             render: (r) => (
                 <input
                     type="checkbox"
@@ -547,10 +582,11 @@ function RepoScopeModal({
                 />
             ),
         },
-        {key: 'slug', header: 'Slug', accessor: (r) => r.slug, sortable: false},
+        {key: 'slug', header: 'Slug', accessor: (r) => r.slug},
         {
             key: 'name',
             header: 'Name',
+            sortable: true,
             render: (r) => (
                 <span className="flex items-center gap-2">
                     {r.name}
@@ -708,6 +744,13 @@ function RepoScopeModal({
                                     getRowKey={(r) => r.slug}
                                     caption="Repositories"
                                     emptyMessage="No repositories match the filter."
+                                    sort={sort}
+                                    onSortChange={(next) => {
+                                        setSort(next);
+                                        // Match the filter's behavior: a
+                                        // re-ordered list restarts from page 1.
+                                        setPage(0);
+                                    }}
                                 />
                             </div>
                             {pageCount > 1 ? (
