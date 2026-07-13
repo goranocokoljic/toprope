@@ -156,9 +156,20 @@ beforeEach(() => {
             providers = [...providers, created];
             return json({data: created}, 201);
         }
-        // Update (PATCH /:id).
+        // Update (PATCH /:id) — full-row replace like the server: apply the sent
+        // scope/enabled to the stored row so post-save refetches see the result.
         if (/\/git\/providers\/[^/]+$/.test(u) && method === 'PATCH') {
-            return json({data: {...DB_GITHUB, enabled: body.enabled as boolean ?? true}});
+            const id = decodeURIComponent(u.split('/').pop() ?? '');
+            const existing = providers.find((p) => p.id === id) ?? DB_GITHUB;
+            const updated: AdminGitProvider = {
+                ...existing,
+                enabled: (body.enabled as boolean | undefined) ?? existing.enabled,
+                repos_include: body.repos !== undefined ? JSON.stringify(body.repos) : null,
+                repos_exclude:
+                    body.exclude_repos !== undefined ? JSON.stringify(body.exclude_repos) : null,
+            };
+            providers = providers.map((p) => (p.id === id ? updated : p));
+            return json({data: updated});
         }
         // Delete.
         if (/\/git\/providers\/[^/]+$/.test(u) && method === 'DELETE') {
@@ -789,15 +800,99 @@ describe('AdminGitProviders — add-flow repo selection (#211)', () => {
         expect(lastCall(/\/git\/providers\/p-new$/, 'PATCH')).toBeUndefined();
     });
 
+    it('completes the canonical journey: create → prompt → select repos → save → prompt gone and stays gone', async () => {
+        renderPage();
+        fireEvent.change(screen.getByLabelText('Organization'), {target: {value: 'new-org'}});
+        fireEvent.change(screen.getByLabelText('Token'), {target: {value: 'ghp_secret'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Save'}));
+        await screen.findByTestId('scope-prompt');
+
+        // Narrow the auto-opened editor to a single active repo and save.
+        fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
+        await screen.findByRole('checkbox', {name: /api/});
+        fireEvent.click(screen.getByRole('button', {name: 'Clear selection'}));
+        fireEvent.click(screen.getByRole('checkbox', {name: /api/}));
+        fireEvent.click(screen.getByRole('button', {name: 'Save scope'}));
+
+        // The PATCH targeted the JUST-CREATED provider with the narrowed scope…
+        await waitFor(() => {
+            const patch = lastCall(/\/git\/providers\/p-new$/, 'PATCH');
+            expect(patch).toBeTruthy();
+            const sent = JSON.parse(String(patch?.[1]?.body)) as Record<string, unknown>;
+            expect(sent.repos).toEqual(['api']);
+        });
+        // …the editor and prompt close on save…
+        await waitFor(() => expect(screen.queryByTestId('scope-prompt')).not.toBeInTheDocument());
+        expect(screen.queryByText('Repository scope')).not.toBeInTheDocument();
+        // …and stay closed after the post-save list refetch lands (the flag was
+        // cleared, so the refetched row must not re-prompt): the row now shows
+        // the saved scope.
+        expect(await screen.findByRole('button', {name: '1 selected'})).toBeInTheDocument();
+        expect(screen.queryByTestId('scope-prompt')).not.toBeInTheDocument();
+    });
+
+    it('closing ANOTHER row\'s scope editor does not dismiss the just-created provider\'s prompt', async () => {
+        renderPage();
+        fireEvent.change(screen.getByLabelText('Organization'), {target: {value: 'new-org'}});
+        fireEvent.change(screen.getByLabelText('Token'), {target: {value: 'ghp_secret'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Save'}));
+        await screen.findByTestId('scope-prompt');
+
+        // Open the pre-existing provider's editor from its repos cell, then
+        // close it the same way — the new provider's prompt must survive both.
+        fireEvent.click(screen.getByRole('button', {name: '3 selected'}));
+        expect(screen.getByTestId('scope-prompt')).toBeInTheDocument();
+        fireEvent.click(screen.getByRole('button', {name: '3 selected'}));
+        expect(screen.getByTestId('scope-prompt')).toBeInTheDocument();
+        expect(document.querySelector('input[name="scope-p-new"]')).not.toBeNull();
+    });
+
+    it('the repos-cell button closes the auto-opened editor and dismisses the prompt', async () => {
+        renderPage();
+        fireEvent.change(screen.getByLabelText('Organization'), {target: {value: 'new-org'}});
+        fireEvent.change(screen.getByLabelText('Token'), {target: {value: 'ghp_secret'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Save'}));
+        await screen.findByTestId('scope-prompt');
+
+        // The just-created provider's repos cell reads "All repos" (only row
+        // that does — the fixture row shows "3 selected").
+        fireEvent.click(screen.getByRole('button', {name: 'All repos'}));
+        expect(screen.queryByTestId('scope-prompt')).not.toBeInTheDocument();
+        expect(screen.queryByText('Repository scope')).not.toBeInTheDocument();
+        // Re-opening from the same cell is a normal (non-prompted) editor.
+        fireEvent.click(screen.getByRole('button', {name: 'All repos'}));
+        expect(screen.getByText('Repository scope')).toBeInTheDocument();
+        expect(screen.queryByTestId('scope-prompt')).not.toBeInTheDocument();
+    });
+
+    it('blocks saving an empty selection — the one-click Clear cannot silently disable collection', async () => {
+        providers = [structuredClone(DB_MONITOR_ALL)];
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', {name: 'All repos'}));
+        fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
+        await screen.findByRole('checkbox', {name: /api/});
+
+        fireEvent.click(screen.getByRole('button', {name: 'Clear selection'}));
+        expect(screen.getByTestId('empty-selection-warning')).toHaveTextContent(
+            /Select at least one repository/,
+        );
+        expect(screen.getByRole('button', {name: 'Save scope'})).toBeDisabled();
+        // Ticking one repo lifts the guard and hides the warning.
+        fireEvent.click(screen.getByRole('checkbox', {name: /api/}));
+        expect(screen.queryByTestId('empty-selection-warning')).not.toBeInTheDocument();
+        expect(screen.getByRole('button', {name: 'Save scope'})).toBeEnabled();
+    });
+
     it('does NOT auto-open the editor after editing an existing provider', async () => {
         renderPage();
         const ghCell = await screen.findByText('acme-org');
         const row = ghCell.closest('tr') as HTMLElement;
         fireEvent.click(within(row).getByRole('button', {name: 'Edit'}));
         fireEvent.click(screen.getByRole('button', {name: 'Save'}));
-        await waitFor(() => {
-            expect(lastCall(/\/git\/providers\/p-gh$/, 'PATCH')).toBeTruthy();
-        });
+        // Anchor on the form reverting to add mode — that proves the mutation's
+        // whole onSuccess chain (invalidation → callbacks → onDone) settled, so
+        // the negative assertions below cannot pass by racing it.
+        expect(await screen.findByText('Add git provider')).toBeInTheDocument();
         expect(screen.queryByTestId('scope-prompt')).not.toBeInTheDocument();
         expect(screen.queryByText('Repository scope')).not.toBeInTheDocument();
     });

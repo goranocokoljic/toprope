@@ -218,14 +218,18 @@ loads the provider's repos and you tick the ones to analyze (bulk **Select all**
 **Clear selection** controls help in large workspaces). Archived repos are shown but
 excluded by default. Switch back to "Monitor all" at any time. Right after you
 connect a provider, the scope editor opens automatically so you can pick the active
-repositories **before the first sync** — in long-lived organizations most repos are
-dormant, and narrowing the scope keeps syncs fast and the data relevant.
+repositories before you trigger the first sync — in long-lived organizations most
+repos are dormant, and narrowing the scope keeps syncs fast and the data relevant.
+Note the new provider is live from the moment it is saved: a scheduled sync (or a
+"Sync now" click) that fires before you save a scope runs on the default
+monitor-all scope.
 
 **Deselecting a repo keeps its history.** Changing the scope only affects future
 syncs: a deselected repository stops being read, but everything already collected
-from it (daily snapshots, PR records) is retained — snapshots are append-only and
-are never rewritten. Re-selecting the repo later resumes collection from the
-provider's incremental cursor.
+from it (daily snapshots, PR records) is retained — snapshots are never deleted
+(same-day rows are merged, not replaced). Re-selecting the repo later resumes
+collection from the provider's incremental cursor; activity during the deselected
+period is **not** backfilled.
 
 **Tokens are write-only.** A token is accepted on create/update and **never**
 returned by the API afterwards — the dashboard only ever shows a masked value and the
