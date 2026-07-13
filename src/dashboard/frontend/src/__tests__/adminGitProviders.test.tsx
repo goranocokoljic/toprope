@@ -138,7 +138,8 @@ beforeEach(() => {
         if (/\/git\/providers\/[^/]+\/sync$/.test(u) && method === 'POST') {
             return json({data: {provider_id: 'p-gh', status: 'running', started_at: '2026-07-07T00:00:00.000Z'}}, 202);
         }
-        // Create.
+        // Create. A fresh provider has no repo filter (monitor all) and no
+        // sync history — mirrors the server's create response.
         if (/\/git\/providers$/.test(u) && method === 'POST') {
             const created: AdminGitProvider = {
                 ...DB_GITHUB,
@@ -146,6 +147,11 @@ beforeEach(() => {
                 type: body.type as AdminGitProvider['type'],
                 container: String(body.container),
                 auth_method: String(body.auth_method),
+                repos_include: null,
+                repos_exclude: null,
+                last_sync_at: null,
+                last_sync_status: null,
+                last_sync_error: null,
             };
             providers = [...providers, created];
             return json({data: created}, 201);
@@ -747,6 +753,97 @@ describe('AdminGitProviders — live sync progress (#209)', () => {
         releaseList?.();
         expect(await screen.findByTestId('sync-progress')).toBeInTheDocument();
         expect(screen.getByRole('button', {name: 'Syncing…'})).toBeDisabled();
+    });
+});
+
+describe('AdminGitProviders — add-flow repo selection (#211)', () => {
+    it('auto-opens the repo-scope editor for the just-created provider, with the pre-sync prompt', async () => {
+        renderPage();
+        fireEvent.change(screen.getByLabelText('Organization'), {target: {value: 'new-org'}});
+        fireEvent.change(screen.getByLabelText('Token'), {target: {value: 'ghp_secret'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Save'}));
+
+        // After the create + list refetch, the NEW provider's row carries an
+        // open scope editor with the prompt.
+        expect(await screen.findByTestId('scope-prompt')).toHaveTextContent(
+            /Choose which repositories to analyze before the first sync/,
+        );
+        // It targets the just-created provider (its radio group), not another row.
+        expect(document.querySelector('input[name="scope-p-new"]')).not.toBeNull();
+        expect(document.querySelector('input[name="scope-p-gh"]')).toBeNull();
+        // Default stays "Monitor all" until the admin chooses otherwise.
+        expect(screen.getByRole('radio', {name: 'Monitor all repositories'})).toBeChecked();
+    });
+
+    it('closing the auto-opened editor dismisses the prompt without saving a scope', async () => {
+        renderPage();
+        fireEvent.change(screen.getByLabelText('Organization'), {target: {value: 'new-org'}});
+        fireEvent.change(screen.getByLabelText('Token'), {target: {value: 'ghp_secret'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Save'}));
+        await screen.findByTestId('scope-prompt');
+
+        fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
+        expect(screen.queryByTestId('scope-prompt')).not.toBeInTheDocument();
+        expect(screen.queryByText('Repository scope')).not.toBeInTheDocument();
+        // No PATCH was sent — the provider stays on the default monitor-all.
+        expect(lastCall(/\/git\/providers\/p-new$/, 'PATCH')).toBeUndefined();
+    });
+
+    it('does NOT auto-open the editor after editing an existing provider', async () => {
+        renderPage();
+        const ghCell = await screen.findByText('acme-org');
+        const row = ghCell.closest('tr') as HTMLElement;
+        fireEvent.click(within(row).getByRole('button', {name: 'Edit'}));
+        fireEvent.click(screen.getByRole('button', {name: 'Save'}));
+        await waitFor(() => {
+            expect(lastCall(/\/git\/providers\/p-gh$/, 'PATCH')).toBeTruthy();
+        });
+        expect(screen.queryByTestId('scope-prompt')).not.toBeInTheDocument();
+        expect(screen.queryByText('Repository scope')).not.toBeInTheDocument();
+    });
+
+    it('shows the keep-history data-policy note in the manually opened editor, without the add-flow prompt', async () => {
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', {name: '3 selected'}));
+        expect(await screen.findByTestId('scope-policy-note')).toHaveTextContent(
+            /only affects future syncs — data already collected from deselected repositories is kept/,
+        );
+        expect(screen.queryByTestId('scope-prompt')).not.toBeInTheDocument();
+    });
+
+    it('Clear selection empties the picker so a few active repos can be ticked; Select all restores the non-archived set', async () => {
+        providers = [structuredClone(DB_MONITOR_ALL)];
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', {name: 'All repos'}));
+        fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
+        await screen.findByRole('checkbox', {name: /api/});
+
+        // Clear, then tick only the one active repo — the 400-repo workspace flow.
+        fireEvent.click(screen.getByRole('button', {name: 'Clear selection'}));
+        expect(screen.getByRole('checkbox', {name: /api/})).not.toBeChecked();
+        expect(screen.getByRole('checkbox', {name: /web/})).not.toBeChecked();
+        fireEvent.click(screen.getByRole('checkbox', {name: /api/}));
+        fireEvent.click(screen.getByRole('button', {name: 'Save scope'}));
+        await waitFor(() => {
+            const sent = JSON.parse(
+                String(lastCall(/\/git\/providers\/p-all$/, 'PATCH')?.[1]?.body),
+            ) as Record<string, unknown>;
+            expect(sent.repos).toEqual(['api']);
+        });
+    });
+
+    it('Select all matches the default seed: non-archived only, archived stays opt-in', async () => {
+        providers = [structuredClone(DB_MONITOR_ALL)];
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', {name: 'All repos'}));
+        fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
+        await screen.findByRole('checkbox', {name: /api/});
+
+        fireEvent.click(screen.getByRole('button', {name: 'Clear selection'}));
+        fireEvent.click(screen.getByRole('button', {name: 'Select all'}));
+        expect(screen.getByRole('checkbox', {name: /api/})).toBeChecked();
+        expect(screen.getByRole('checkbox', {name: /web/})).toBeChecked();
+        expect(screen.getByRole('checkbox', {name: /legacy/})).not.toBeChecked();
     });
 });
 
