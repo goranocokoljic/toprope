@@ -1365,6 +1365,115 @@ describe('AdminGitProviders — repo-scope modal (#213)', () => {
     });
 });
 
+describe('AdminGitProviders — sortable repo table (#215)', () => {
+    /** Visible row order as checkbox aria-labels (= slugs), top to bottom. */
+    const rowOrder = (): string[] =>
+        screen.getAllByRole('checkbox').map((el) => el.getAttribute('aria-label') ?? '');
+
+    // Slug order (alpha, bravo, charlie) deliberately INVERTS name order
+    // (Alpha Tool → charlie, Mike App → bravo, Zulu Service → alpha) so slug
+    // and name sorts produce distinguishable sequences.
+    const DIVERGENT_REPOS: RepoRow[] = [
+        {slug: 'alpha', name: 'Zulu Service', archived: false, defaultBranch: 'main'},
+        {slug: 'bravo', name: 'Mike App', archived: false, defaultBranch: 'main'},
+        {slug: 'charlie', name: 'Alpha Tool', archived: false, defaultBranch: 'main'},
+    ];
+
+    it('opens a stored selection selected-first, name-ordered within each group', async () => {
+        providers = [{...structuredClone(DB_MONITOR_ALL), repos_include: '["web"]'}];
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', {name: 'Repos'}));
+        await screen.findByRole('checkbox', {name: 'web'});
+
+        // Selected (web) first; unselected follow by name: API Service < Old Legacy.
+        expect(rowOrder()).toEqual(['web', 'api', 'legacy']);
+        // The active default sort is announced on the Selected header.
+        expect(screen.getByRole('columnheader', {name: /Selected/})).toHaveAttribute(
+            'aria-sort',
+            'ascending',
+        );
+    });
+
+    it('brings a stored selection from a later page onto page 1', async () => {
+        providers = [{...structuredClone(DB_MONITOR_ALL), repos_include: '["repo-29"]'}];
+        repos = Array.from({length: 30}, (_, i) => ({
+            slug: `repo-${i}`,
+            name: `Repo ${i}`,
+            archived: false,
+            defaultBranch: 'main',
+        }));
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', {name: 'Repos'}));
+        await screen.findByRole('checkbox', {name: 'repo-29'});
+
+        // In listing order repo-29 lives on page 2; selection-first sorting
+        // surfaces it as the very first row of page 1.
+        expect(rowOrder()[0]).toBe('repo-29');
+        expect(screen.getByText('Page 1 of 2')).toBeInTheDocument();
+    });
+
+    it('sorts by slug and by name in both directions across the FULL list', async () => {
+        providers = [structuredClone(DB_MONITOR_ALL)];
+        repos = structuredClone(DIVERGENT_REPOS);
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', {name: 'Repos'}));
+        fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
+        await screen.findByRole('checkbox', {name: 'alpha'});
+
+        // Default (all selected via the seed) degrades to name order.
+        expect(rowOrder()).toEqual(['charlie', 'bravo', 'alpha']);
+
+        // Slug ascending, then descending.
+        fireEvent.click(screen.getByRole('button', {name: /Slug/}));
+        expect(rowOrder()).toEqual(['alpha', 'bravo', 'charlie']);
+        expect(screen.getByRole('columnheader', {name: /Slug/})).toHaveAttribute('aria-sort', 'ascending');
+        fireEvent.click(screen.getByRole('button', {name: /Slug/}));
+        expect(rowOrder()).toEqual(['charlie', 'bravo', 'alpha']);
+        expect(screen.getByRole('columnheader', {name: /Slug/})).toHaveAttribute('aria-sort', 'descending');
+
+        // Name ascending (differs from slug ascending), then descending.
+        fireEvent.click(screen.getByRole('button', {name: /^Name/}));
+        expect(rowOrder()).toEqual(['charlie', 'bravo', 'alpha']);
+        fireEvent.click(screen.getByRole('button', {name: /^Name/}));
+        expect(rowOrder()).toEqual(['alpha', 'bravo', 'charlie']);
+    });
+
+    it('selection-status sort groups selected-then-name, toggles to unselected-first, and regroups live on tick', async () => {
+        providers = [{...structuredClone(DB_MONITOR_ALL), repos_include: '["bravo"]'}];
+        repos = structuredClone(DIVERGENT_REPOS);
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', {name: 'Repos'}));
+        await screen.findByRole('checkbox', {name: 'bravo'});
+
+        // Selected group (bravo) first; unselected by name: Alpha Tool, Zulu.
+        expect(rowOrder()).toEqual(['bravo', 'charlie', 'alpha']);
+
+        // Ticking a repo regroups it immediately (live view): charlie joins the
+        // selected group, which stays name-ordered (Alpha Tool < Mike App).
+        fireEvent.click(screen.getByRole('checkbox', {name: 'charlie'}));
+        expect(rowOrder()).toEqual(['charlie', 'bravo', 'alpha']);
+
+        // Toggling the direction puts the unselected group first, still
+        // name-ordered within each group.
+        fireEvent.click(screen.getByRole('button', {name: /Selected/}));
+        expect(rowOrder()).toEqual(['alpha', 'charlie', 'bravo']);
+    });
+
+    it('sorting composes with the filter (ordering applies to the filtered set)', async () => {
+        providers = [structuredClone(DB_MONITOR_ALL)];
+        repos = structuredClone(DIVERGENT_REPOS);
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', {name: 'Repos'}));
+        fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
+        await screen.findByRole('checkbox', {name: 'alpha'});
+
+        fireEvent.click(screen.getByRole('button', {name: /Slug/}));
+        // 'o' matches bravo (slug) and charlie (name "Alpha Tool") only.
+        fireEvent.change(screen.getByLabelText('Filter repositories'), {target: {value: 'o'}});
+        expect(rowOrder()).toEqual(['bravo', 'charlie']);
+    });
+});
+
 describe('AdminGitProviders — empty-state onboarding (#201)', () => {
     it('shows the empty state only when there are no providers and no snapshots', async () => {
         providers = [];

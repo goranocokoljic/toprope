@@ -29,6 +29,17 @@ export interface DataTableProps<T> {
     initialSort?: {key: string; direction: SortDirection};
     emptyMessage?: string;
     caption?: string;
+    /**
+     * CONTROLLED sort (#215): when `onSortChange` is provided, the parent owns
+     * sorting — header clicks report the next {key, direction} through the
+     * callback, `sort` drives the header indicators, and `rows` are rendered
+     * AS GIVEN (pre-sorted by the parent). Use this when sorting must compose
+     * with parent-side concerns like pagination or a comparator the accessors
+     * can't express (e.g. grouped selection-status ordering). Omit both props
+     * for the classic self-sorting behavior.
+     */
+    sort?: {key: string; direction: SortDirection} | null;
+    onSortChange?: (sort: {key: string; direction: SortDirection}) => void;
 }
 
 const ALIGN_CLASS: Record<'left' | 'right' | 'center', string> = {
@@ -38,6 +49,11 @@ const ALIGN_CLASS: Record<'left' | 'right' | 'center', string> = {
 };
 
 function isSortable<T>(col: Column<T>): boolean {
+    // Explicit `sortable: true` force-enables a render-only column (meaningful
+    // in controlled mode, where the parent's comparator doesn't need an
+    // accessor); otherwise a column sorts iff it has an accessor and hasn't
+    // opted out.
+    if (col.sortable === true) return true;
     return col.accessor !== undefined && col.sortable !== false;
 }
 
@@ -61,11 +77,19 @@ export function DataTable<T>({
     initialSort,
     emptyMessage = 'No rows to show',
     caption,
+    sort: controlledSort,
+    onSortChange,
 }: DataTableProps<T>): JSX.Element {
-    const [sort, setSort] = useState<{key: string; direction: SortDirection} | null>(initialSort ?? null);
+    const controlled = onSortChange !== undefined;
+    const [internalSort, setInternalSort] = useState<{key: string; direction: SortDirection} | null>(
+        initialSort ?? null,
+    );
+    // In controlled mode the parent's sort drives the header indicators and the
+    // rows arrive pre-sorted; otherwise this component owns both.
+    const sort = controlled ? controlledSort ?? null : internalSort;
 
     const sortedRows = useMemo(() => {
-        if (!sort) {
+        if (controlled || !sort) {
             return rows;
         }
         const col = columns.find((c) => c.key === sort.key);
@@ -89,15 +113,20 @@ export function DataTable<T>({
             }
             return factor * compareValues(av, bv);
         });
-    }, [rows, columns, sort]);
+    }, [rows, columns, sort, controlled]);
 
     function toggleSort(key: string): void {
-        setSort((current) => {
+        const next = (current: {key: string; direction: SortDirection} | null): {key: string; direction: SortDirection} => {
             if (current?.key === key) {
                 return {key, direction: current.direction === 'asc' ? 'desc' : 'asc'};
             }
             return {key, direction: 'asc'};
-        });
+        };
+        if (controlled) {
+            onSortChange?.(next(sort));
+        } else {
+            setInternalSort(next);
+        }
     }
 
     return (

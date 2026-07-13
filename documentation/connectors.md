@@ -214,9 +214,12 @@ then export it (see [Configuration → Secrets](./configuration.md#secrets-and-e
 **Repo scope — monitor all vs. select.** Every connected provider defaults to
 **Monitor all repositories** (all repos in the org/workspace/group). To narrow it,
 click the provider row's **Repos** action: a dialog opens with the two modes, and
-**Select repositories** lists the provider's repos in a paginated, filterable table
-(25 per page; the filter matches the repo **slug** or its display **name** — both
-are shown as columns). Tick the repos to analyze; bulk **Select all** / **Clear
+**Select repositories** lists the provider's repos in a paginated, filterable,
+sortable table (25 per page; the filter matches the repo **slug** or its display
+**name** — both are shown as columns, and all three columns including selection
+status sort ascending/descending). The table opens sorted **selected-first** (then
+by name), so an existing selection sits on page 1 and adding one more repo to it is
+a matter of ticking it. Tick the repos to analyze; bulk **Select all** / **Clear
 selection** controls act on the full list, not just the visible page, and the
 selected count is always shown. Archived repos are listed but excluded by default.
 Switch back to "Monitor all" at any time. Right after you connect a provider, the
