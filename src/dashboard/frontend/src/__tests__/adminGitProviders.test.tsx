@@ -1375,11 +1375,14 @@ describe('AdminGitProviders — sortable repo table (#215)', () => {
     // one (a comparator that sorted "name" by inverted slug would fail):
     //   slug asc:  alpha, bravo, charlie, delta
     //   name asc:  charlie (Alpha Tool), delta (Delta House), bravo (Mike App), alpha (Zulu Service)
+    // The LISTING order below is shuffled so it matches neither slug nor name
+    // order in either direction — the save-payload test can then prove the
+    // payload derives from the listing, not from any normalized sort.
     const DIVERGENT_REPOS: RepoRow[] = [
-        {slug: 'alpha', name: 'Zulu Service', archived: false, defaultBranch: 'main'},
         {slug: 'bravo', name: 'Mike App', archived: false, defaultBranch: 'main'},
-        {slug: 'charlie', name: 'Alpha Tool', archived: false, defaultBranch: 'main'},
         {slug: 'delta', name: 'Delta House', archived: false, defaultBranch: 'main'},
+        {slug: 'alpha', name: 'Zulu Service', archived: false, defaultBranch: 'main'},
+        {slug: 'charlie', name: 'Alpha Tool', archived: false, defaultBranch: 'main'},
     ];
 
     it('opens a stored selection selected-first, name-ordered within each group', async () => {
@@ -1459,13 +1462,14 @@ describe('AdminGitProviders — sortable repo table (#215)', () => {
         fireEvent.click(screen.getByRole('button', {name: /Slug/}));
         expect(rowOrder()).toEqual(['delta', 'charlie', 'bravo', 'alpha']);
 
-        // …then save: the payload derives from the LISTING order, not the view.
+        // …then save: the payload derives from the LISTING order — which the
+        // fixture deliberately makes distinct from every sorted order.
         fireEvent.click(screen.getByRole('button', {name: 'Save scope'}));
         await waitFor(() => {
             const sent = JSON.parse(
                 String(lastCall(/\/git\/providers\/p-all$/, 'PATCH')?.[1]?.body),
             ) as Record<string, unknown>;
-            expect(sent.repos).toEqual(['alpha', 'bravo', 'charlie', 'delta']);
+            expect(sent.repos).toEqual(['bravo', 'delta', 'alpha', 'charlie']);
         });
     });
 

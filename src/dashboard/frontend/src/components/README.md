@@ -174,6 +174,6 @@ callback, `sort` drives the indicators/aria-sort, and `rows` render AS GIVEN
 pagination or a comparator accessors can't express (e.g. the repo-scope modal's
 grouped selection sort). In controlled mode `sortable: true` force-enables a
 render-only column; in self-sorting mode that flag is ignored (fail-closed — the
-table can't sort without an accessor). Passing only one of the pair is a mistake
-and warns in dev.
-```
+table can't sort without an accessor). Passing `sort` without `onSortChange` is a
+mistake and warns in dev (an `onSortChange` with no `sort` yet is the legitimate
+"start unsorted" state).

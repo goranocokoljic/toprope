@@ -165,7 +165,9 @@ export function DataTable<T>({
                     <tr className="border-b border-border bg-surface-raised">
                         {columns.map((col) => {
                             const sortable = isSortable(col, controlled);
-                            const active = sort?.key === col.key;
+                            // A non-sortable header must never announce a sort,
+                            // even if a (misused) sort prop names its key.
+                            const active = sortable && sort?.key === col.key;
                             const align = col.align ?? 'left';
                             return (
                                 <th

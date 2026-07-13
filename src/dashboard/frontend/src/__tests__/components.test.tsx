@@ -242,6 +242,11 @@ describe('DataTable', () => {
                 columns={[
                     {key: 'name', header: 'Team', accessor: (r: Row) => r.name},
                     {key: 'fake', header: 'Fake', render: () => 'y', sortable: true},
+                    // The explicit opt-out beats the accessor default, and a
+                    // render-only column without the force-enable stays plain —
+                    // in CONTROLLED mode too.
+                    {key: 'optout', header: 'OptOut', accessor: (r: Row) => r.cost, sortable: false},
+                    {key: 'plain', header: 'Plain', render: () => 'z'},
                 ]}
                 rows={ROWS}
                 getRowKey={(r) => r.name}
@@ -249,6 +254,8 @@ describe('DataTable', () => {
                 onSortChange={(s) => changes.push(s)}
             />,
         );
+        expect(screen.queryByRole('button', {name: /OptOut/})).not.toBeInTheDocument();
+        expect(screen.queryByRole('button', {name: /Plain/})).not.toBeInTheDocument();
         // Rows are rendered AS GIVEN — the parent owns the ordering.
         expect(bodyOrder()).toEqual(['frontend', 'backend', 'platform']);
         // The active sort prop drives the indicator.
