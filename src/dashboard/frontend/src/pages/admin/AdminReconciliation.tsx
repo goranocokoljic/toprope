@@ -10,9 +10,9 @@ import type {ReconciliationResult, ReconciliationResultType, ReconciliationStatu
 import {
     ErrorText,
     PageHeader,
+    PaginatedTable,
     PrimaryButton,
     SecondaryButton,
-    Table,
     Td,
     TextField,
     Th,
@@ -179,7 +179,7 @@ export function AdminReconciliation(): JSX.Element {
                 ) : (results.data ?? []).length === 0 ? (
                     <p className="text-sm text-muted">No {status === 'all' ? '' : status} results.</p>
                 ) : (
-                    <Table
+                    <PaginatedTable
                         head={
                             <>
                                 <Th>Period</Th>
@@ -191,8 +191,9 @@ export function AdminReconciliation(): JSX.Element {
                                 <Th>Action</Th>
                             </>
                         }
-                    >
-                        {(results.data ?? []).map((r) => (
+                        rows={results.data ?? []}
+                        ariaLabel="Reconciliation pages"
+                        renderRow={(r) => (
                             <tr key={r.id} className="border-b border-border/60 align-top">
                                 <Td>{r.period}</Td>
                                 <Td>
@@ -211,8 +212,8 @@ export function AdminReconciliation(): JSX.Element {
                                     <ResultActions result={r} />
                                 </Td>
                             </tr>
-                        ))}
-                    </Table>
+                        )}
+                    />
                 )}
             </Card>
         </div>

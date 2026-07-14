@@ -185,6 +185,9 @@ function DeveloperList({team}: {team: TeamDetailData}): JSX.Element {
                 initialSort={{key: 'name', direction: 'asc'}}
                 emptyMessage="No developers in this team yet."
                 caption="Developers with aggregate activity, tools, and cost — not ranked against each other"
+                // Developers within a team; paginate above one page (a large team
+                // would otherwise render an unbounded list). 25/page.
+                pageSize={25}
             />
         </Card>
     );

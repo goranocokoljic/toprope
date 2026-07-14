@@ -1288,8 +1288,8 @@ describe('AdminGitProviders — repo-scope modal (#213)', () => {
 
         // Page 1 shows 25 of 30 rows; Previous is inert at the lower bound.
         expect(screen.getAllByRole('checkbox')).toHaveLength(25);
-        expect(screen.getByText('Page 1 of 2')).toBeInTheDocument();
-        expect(screen.getByRole('button', {name: 'Previous'})).toBeDisabled();
+        expect(screen.getByRole('button', {name: 'Page 1'})).toHaveAttribute('aria-current', 'page');
+        expect(screen.getByRole('button', {name: 'Previous page'})).toBeDisabled();
         expect(screen.queryByRole('checkbox', {name: 'repo-29'})).not.toBeInTheDocument();
 
         // Clear (acts on the FULL list), tick one repo on page 1…
@@ -1298,9 +1298,9 @@ describe('AdminGitProviders — repo-scope modal (#213)', () => {
         fireEvent.click(screen.getByRole('checkbox', {name: 'repo-0'}));
 
         // …one on page 2 (Next is inert at the upper bound)…
-        fireEvent.click(screen.getByRole('button', {name: 'Next'}));
-        expect(screen.getByText('Page 2 of 2')).toBeInTheDocument();
-        expect(screen.getByRole('button', {name: 'Next'})).toBeDisabled();
+        fireEvent.click(screen.getByRole('button', {name: 'Next page'}));
+        expect(screen.getByRole('button', {name: 'Page 2'})).toHaveAttribute('aria-current', 'page');
+        expect(screen.getByRole('button', {name: 'Next page'})).toBeDisabled();
         expect(screen.getAllByRole('checkbox')).toHaveLength(5);
         fireEvent.click(screen.getByRole('checkbox', {name: 'repo-29'}));
 
@@ -1312,7 +1312,7 @@ describe('AdminGitProviders — repo-scope modal (#213)', () => {
         fireEvent.change(screen.getByLabelText('Filter repositories'), {target: {value: ''}});
         // Clearing the filter restarts from page 1 (the filter change resets the
         // page; the safePage clamp alone would have left the user on page 2).
-        expect(screen.getByText('Page 1 of 2')).toBeInTheDocument();
+        expect(screen.getByRole('button', {name: 'Page 1'})).toHaveAttribute('aria-current', 'page');
 
         // The selection accumulated across pages and filters…
         expect(screen.getByTestId('selected-count')).toHaveTextContent('3 of 30 selected');
@@ -1350,6 +1350,31 @@ describe('AdminGitProviders — repo-scope modal (#213)', () => {
         await screen.findByRole('checkbox', {name: 'repo-0'});
         expect(screen.getAllByRole('checkbox')).toHaveLength(25);
         expect(screen.queryByTestId('repo-pagination')).not.toBeInTheDocument();
+    });
+
+    it('jumps directly to a numbered page (the old prev/next-only pager could not)', async () => {
+        providers = [structuredClone(DB_MONITOR_ALL)];
+        // 60 repos / 25 per page = 3 pages, so page 3 exists as a numbered target.
+        repos = Array.from({length: 60}, (_, i) => ({
+            slug: `repo-${String(i).padStart(2, '0')}`,
+            name: `Repo ${i}`,
+            archived: false,
+            defaultBranch: 'main',
+        }));
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', {name: 'Repos'}));
+        fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
+        await screen.findByRole('checkbox', {name: 'repo-00'});
+
+        // Sort by slug so page order is deterministic (repo-00 … repo-59).
+        fireEvent.click(screen.getByRole('button', {name: /Slug/}));
+        // A single numbered click leaps straight to page 3 — the last 10 rows.
+        fireEvent.click(screen.getByRole('button', {name: 'Page 3'}));
+        expect(screen.getByRole('button', {name: 'Page 3'})).toHaveAttribute('aria-current', 'page');
+        expect(screen.getAllByRole('checkbox')).toHaveLength(10);
+        expect(screen.getByRole('checkbox', {name: 'repo-50'})).toBeInTheDocument();
+        expect(screen.getByRole('checkbox', {name: 'repo-59'})).toBeInTheDocument();
+        expect(screen.queryByRole('checkbox', {name: 'repo-00'})).not.toBeInTheDocument();
     });
 
     it('footnotes stored slugs missing from the listing instead of blending them into the count', async () => {
@@ -1415,7 +1440,7 @@ describe('AdminGitProviders — sortable repo table (#215)', () => {
         // In listing order repo-29 lives on page 2; selection-first sorting
         // surfaces it as the very first row of page 1.
         expect(rowOrder()[0]).toBe('repo-29');
-        expect(screen.getByText('Page 1 of 2')).toBeInTheDocument();
+        expect(screen.getByRole('button', {name: 'Page 1'})).toHaveAttribute('aria-current', 'page');
     });
 
     it('sorts by slug and by name in both directions across the FULL list', async () => {
@@ -1489,10 +1514,10 @@ describe('AdminGitProviders — sortable repo table (#215)', () => {
         // Move to page 2, then sort descending by slug: the sort applies to the
         // FULL list (repo-29, which lived on page 2, now heads page 1) and the
         // pager restarts from page 1, matching the filter's behavior.
-        fireEvent.click(screen.getByRole('button', {name: 'Next'}));
+        fireEvent.click(screen.getByRole('button', {name: 'Next page'}));
         fireEvent.click(screen.getByRole('button', {name: /Slug/}));
         fireEvent.click(screen.getByRole('button', {name: /Slug/}));
-        expect(screen.getByText('Page 1 of 2')).toBeInTheDocument();
+        expect(screen.getByRole('button', {name: 'Page 1'})).toHaveAttribute('aria-current', 'page');
         expect(rowOrder()[0]).toBe('repo-29');
     });
 

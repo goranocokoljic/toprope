@@ -7,7 +7,12 @@ import {Card} from '../components/Card';
 import {SkeletonTable} from '../components/Skeleton';
 import {ErrorState} from '../components/ErrorState';
 import {EmptyState} from '../components/EmptyState';
+import {Pagination} from '../components/Pagination';
+import {usePagination} from '../components/usePagination';
 import {formatDateTick} from '../components/format';
+
+/** Client-side page size for the showcase gallery (#226). */
+const SHOWCASE_PAGE_SIZE = 12;
 
 /**
  * Showcase gallery (Task 6.3.9 / #172) — the browsable, searchable library of
@@ -38,6 +43,10 @@ export function Showcase(): JSX.Element {
 
     const showcases = data?.showcases ?? [];
     const hasActiveFilters = Boolean(filters.q || filters.tag || filters.scope);
+    // A new search/filter refetches → fresh reference → page resets to 1; stable
+    // across a pager click (same `data` reference), so paging holds. The loading
+    // `?? []` case is safe: usePagination treats two empty arrays as one identity.
+    const paged = usePagination(showcases, SHOWCASE_PAGE_SIZE);
 
     return (
         <div className="space-y-6">
@@ -130,11 +139,23 @@ export function Showcase(): JSX.Element {
             ) : null}
 
             {!isPending && !isError && showcases.length > 0 ? (
-                <ul className="space-y-3" data-testid="showcase-list">
-                    {showcases.map((showcase) => (
-                        <ShowcaseRow key={showcase.id} showcase={showcase} />
-                    ))}
-                </ul>
+                <>
+                    <ul className="space-y-3" data-testid="showcase-list">
+                        {paged.pageItems.map((showcase) => (
+                            <ShowcaseRow key={showcase.id} showcase={showcase} />
+                        ))}
+                    </ul>
+                    {paged.pageCount > 1 ? (
+                        <div className="flex justify-end">
+                            <Pagination
+                                page={paged.page}
+                                pageCount={paged.pageCount}
+                                onPageChange={paged.setPage}
+                                ariaLabel="Showcase pages"
+                            />
+                        </div>
+                    ) : null}
+                </>
             ) : null}
         </div>
     );

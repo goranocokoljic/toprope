@@ -12,10 +12,10 @@ import type {AdminUser} from '../../api/types';
 import {
     ErrorText,
     PageHeader,
+    PaginatedTable,
     PrimaryButton,
     SecondaryButton,
     SelectField,
-    Table,
     Td,
     TempPasswordBanner,
     TextField,
@@ -166,7 +166,7 @@ export function AdminUsers(): JSX.Element {
                 ) : users.isError ? (
                     <p className="text-sm text-danger">Failed to load: {users.error.message}</p>
                 ) : (
-                    <Table
+                    <PaginatedTable
                         head={
                             <>
                                 <Th>Email</Th>
@@ -176,11 +176,10 @@ export function AdminUsers(): JSX.Element {
                                 <Th>Actions</Th>
                             </>
                         }
-                    >
-                        {(users.data ?? []).map((u) => (
-                            <UserRow key={u.id} user={u} />
-                        ))}
-                    </Table>
+                        rows={users.data ?? []}
+                        ariaLabel="User pages"
+                        renderRow={(u) => <UserRow key={u.id} user={u} />}
+                    />
                 )}
             </Card>
         </div>

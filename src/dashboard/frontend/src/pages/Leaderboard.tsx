@@ -1,4 +1,4 @@
-import {useState} from 'react';
+import {useMemo, useState} from 'react';
 import {Card} from '../components/Card';
 import {DataTable, type Column} from '../components/DataTable';
 import {ErrorState} from '../components/ErrorState';
@@ -27,6 +27,51 @@ function metricCell(entry: LeaderboardEntry, metric: LeaderboardMetric): string 
 function LeaderboardTable({team, metric}: {team: string; metric: LeaderboardMetric}): JSX.Element {
     const {data, isPending, isError, error, refetch} = useLeaderboard(team, metric);
 
+    // Memoized on `metric` so the columns reference is STABLE across re-renders:
+    // DataTable's post-sort memo (and thus the pageSize pager's page state) keys
+    // off the columns identity, so a fresh array each render would snap the pager
+    // back to page 1 on any background re-render (matches the module-constant
+    // columns the sibling TeamsList / TeamDetail boards use). Declared BEFORE the
+    // early returns so the hook order is stable (rules of hooks).
+    const columns: Column<LeaderboardEntry>[] = useMemo(
+        () => [
+            {key: 'rank', header: '#', accessor: (r) => r.rank, align: 'right'},
+            {key: 'name', header: 'Developer', accessor: (r) => r.name},
+            {
+                key: 'value',
+                header: METRIC_OPTIONS.find((m) => m.value === metric)?.label ?? 'Score',
+                accessor: (r) => r.value,
+                render: (r) => {
+                    // On the acceptance board, a developer below the server's
+                    // sample floor is ranked at value 0 but still shows a real
+                    // (possibly high) rate — flag it so a "100% yet ranked last"
+                    // row reads as deliberate, not a bug. The floor signal is
+                    // value===0 while the underlying rate is positive.
+                    const lowSample = metric === 'acceptance' && r.value === 0 && r.acceptance_rate > 0;
+                    return (
+                        <span className="font-medium text-foreground">
+                            {metricCell(r, metric)}
+                            {lowSample ? (
+                                <span className="ml-1 text-xs font-normal text-muted">(low sample)</span>
+                            ) : null}
+                        </span>
+                    );
+                },
+                align: 'right',
+            },
+            {key: 'interactions', header: 'Interactions', accessor: (r) => r.interactions, align: 'right'},
+            {
+                key: 'acceptance_rate',
+                header: 'Acceptance',
+                accessor: (r) => r.acceptance_rate,
+                render: (r) => formatPercent(r.acceptance_rate),
+                align: 'right',
+            },
+            {key: 'commits', header: 'Commits', accessor: (r) => r.commits, align: 'right'},
+        ],
+        [metric],
+    );
+
     if (isPending) {
         return <SkeletonTable rows={5} />;
     }
@@ -42,42 +87,6 @@ function LeaderboardTable({team, metric}: {team: string; metric: LeaderboardMetr
         );
     }
 
-    const columns: Column<LeaderboardEntry>[] = [
-        {key: 'rank', header: '#', accessor: (r) => r.rank, align: 'right'},
-        {key: 'name', header: 'Developer', accessor: (r) => r.name},
-        {
-            key: 'value',
-            header: METRIC_OPTIONS.find((m) => m.value === metric)?.label ?? 'Score',
-            accessor: (r) => r.value,
-            render: (r) => {
-                // On the acceptance board, a developer below the server's
-                // sample floor is ranked at value 0 but still shows a real
-                // (possibly high) rate — flag it so a "100% yet ranked last"
-                // row reads as deliberate, not a bug. The floor signal is
-                // value===0 while the underlying rate is positive.
-                const lowSample = metric === 'acceptance' && r.value === 0 && r.acceptance_rate > 0;
-                return (
-                    <span className="font-medium text-foreground">
-                        {metricCell(r, metric)}
-                        {lowSample ? (
-                            <span className="ml-1 text-xs font-normal text-muted">(low sample)</span>
-                        ) : null}
-                    </span>
-                );
-            },
-            align: 'right',
-        },
-        {key: 'interactions', header: 'Interactions', accessor: (r) => r.interactions, align: 'right'},
-        {
-            key: 'acceptance_rate',
-            header: 'Acceptance',
-            accessor: (r) => r.acceptance_rate,
-            render: (r) => formatPercent(r.acceptance_rate),
-            align: 'right',
-        },
-        {key: 'commits', header: 'Commits', accessor: (r) => r.commits, align: 'right'},
-    ];
-
     return (
         <DataTable
             columns={columns}
@@ -85,6 +94,9 @@ function LeaderboardTable({team, metric}: {team: string; metric: LeaderboardMetr
             getRowKey={(r) => r.developer_id}
             initialSort={{key: 'rank', direction: 'asc'}}
             caption={`Leaderboard for ${team} by ${metric}`}
+            // One row per developer — can grow large. Client-side over the
+            // already-fetched list; 25/page.
+            pageSize={25}
         />
     );
 }

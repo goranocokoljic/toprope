@@ -177,3 +177,55 @@ render-only column; in self-sorting mode that flag is ignored (fail-closed — t
 table can't sort without an accessor). Passing `sort` without `onSortChange` is a
 mistake and warns in dev (an `onSortChange` with no `sort` yet is the legitimate
 "start unsorted" state).
+
+**Opt-in pagination (#221).** Pass `pageSize` and the table paginates its
+POST-SORT rows via `usePagination` and renders a `<Pagination>` footer:
+```tsx
+<DataTable columns={columns} rows={teams} getRowKey={(t) => t.id} pageSize={25} />
+```
+Sorting reorders the full list first, then the current page is sliced; a sort
+change (or any new `rows` identity — a filter/search) resets to page 1. Omit
+`pageSize` and every existing consumer renders the same table with all rows and no
+footer. `paginationLabel` overrides the pager's `<nav aria-label>`.
+
+**Stability requirement.** When `pageSize` is set, the page holds only while BOTH
+`rows` and `columns` are stable references — the table's post-sort rows identity
+(which the pager keys off) depends on `columns`, so an inline `columns` array
+(fresh each render) snaps the pager back to page 1 on any re-render. Use a
+module-level or `useMemo`'d `columns` (as TeamsList / TeamDetail / Leaderboard do).
+
+---
+
+## Pagination (`Pagination`, `paginationRange`, `usePagination`)
+
+One reusable, accessible pager used everywhere the app renders a large
+collection — no view hand-rolls prev/next, page math, or slicing.
+
+### `paginationRange({page, pageCount, siblingCount = 1, boundaryCount = 1})`
+Pure function returning the visible tokens `(number | 'ellipsis')[]`.
+`boundaryCount` pages pinned at each end, `siblingCount` on each side of `page`,
+an `'ellipsis'` for every gap wider than one page — and the hidden page's number
+when a gap hides exactly one (never `… 4 …`). `page` is clamped; `pageCount <= 1`
+→ `[1]`. Tested independently of the markup.
+```ts
+paginationRange({page: 7, pageCount: 20, siblingCount: 2})
+// → [1, 'ellipsis', 5, 6, 7, 8, 9, 'ellipsis', 20]
+```
+
+### `<Pagination>`
+Presentational, owns no state. Props: `page`, `pageCount`, `onPageChange`,
+`siblingCount?`, `boundaryCount?`, `disabled?`, `showFirstLast?` (default true),
+`ariaLabel?`. Renders First / Previous / numbered+ellipsis / Next / Last;
+First+Previous disabled on page 1, Next+Last on the last page; `aria-current="page"`
+on the active number; `<nav aria-label>`; ellipses are inert `<span>`s. Renders
+nothing when `pageCount <= 1`.
+
+### `usePagination(items, pageSize)`
+Client-side page state for an already-fetched list — the single home for the
+epic's page-state hygiene: it **clamps** `page` into range when `items` shrinks
+(the `safePage` lesson) and **resets to page 1** when the `items` REFERENCE
+changes (a new array from a filter/sort/search). Returns
+`{page, setPage, pageCount, pageItems}`. Pass a STABLE reference (memoize derived
+lists with `useMemo`) so an unrelated re-render doesn't reset the page. Non-table
+card/gallery lists use this hook + `<Pagination>`; every `DataTable` consumer gets
+it for free via `pageSize`.

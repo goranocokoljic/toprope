@@ -6,9 +6,9 @@ import type {AdminTeam} from '../../api/types';
 import {
     ErrorText,
     PageHeader,
+    PaginatedTable,
     PrimaryButton,
     SecondaryButton,
-    Table,
     Td,
     TextField,
     Th,
@@ -140,7 +140,7 @@ export function AdminTeams(): JSX.Element {
                 ) : teams.isError ? (
                     <p className="text-sm text-danger">Failed to load: {teams.error.message}</p>
                 ) : (
-                    <Table
+                    <PaginatedTable
                         head={
                             <>
                                 <Th>Name</Th>
@@ -150,11 +150,10 @@ export function AdminTeams(): JSX.Element {
                                 <Th>Actions</Th>
                             </>
                         }
-                    >
-                        {(teams.data ?? []).map((t) => (
-                            <TeamRow key={t.name} team={t} />
-                        ))}
-                    </Table>
+                        rows={teams.data ?? []}
+                        ariaLabel="Team pages"
+                        renderRow={(t) => <TeamRow key={t.name} team={t} />}
+                    />
                 )}
             </Card>
         </div>

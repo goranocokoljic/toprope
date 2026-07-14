@@ -7,7 +7,8 @@ import {QueryClient, QueryClientProvider} from '@tanstack/react-query';
 import {MemoryRouter} from 'react-router-dom';
 import {AdminUsers} from '../pages/admin/AdminUsers';
 import {AdminSubscriptions} from '../pages/admin/AdminSubscriptions';
-import type {AdminDeveloper, AdminSubscription, AdminUser} from '../api/types';
+import {AdminTeams} from '../pages/admin/AdminTeams';
+import type {AdminDeveloper, AdminSubscription, AdminTeam, AdminUser} from '../api/types';
 
 const DEVELOPERS: AdminDeveloper[] = [
     {id: 'dev-1', name: 'Alice Dev', email: 'alice@test.com', team: 'frontend', external_ids: {}, created_at: '2026-01-01T00:00:00.000Z'},
@@ -113,6 +114,31 @@ describe('AdminUsers page', () => {
         expect(await screen.findByText('admin@test.com')).toBeInTheDocument();
     });
 
+    it('paginates the user table at 25 rows per page and navigates pages', async () => {
+        users = Array.from({length: 30}, (_, i) => ({
+            id: `u-${String(i).padStart(2, '0')}`,
+            email: `user${String(i).padStart(2, '0')}@test.com`,
+            role: 'developer' as const,
+            developer_id: null,
+            developer_name: null,
+            must_change_password: false,
+            created_at: '2026-01-01T00:00:00.000Z',
+            deactivated_at: null,
+            active: true,
+        }));
+        renderPage(<AdminUsers />);
+        await screen.findByText('user00@test.com');
+
+        // Page 1 caps at 25 rows; the 26th user is off-page.
+        expect(document.querySelectorAll('tbody tr')).toHaveLength(25);
+        expect(screen.queryByText('user25@test.com')).not.toBeInTheDocument();
+
+        fireEvent.click(screen.getByRole('button', {name: 'Next page'}));
+        expect(document.querySelectorAll('tbody tr')).toHaveLength(5);
+        expect(screen.getByText('user25@test.com')).toBeInTheDocument();
+        expect(screen.queryByText('user00@test.com')).not.toBeInTheDocument();
+    });
+
     it('creating a user surfaces the one-time temporary password', async () => {
         renderPage(<AdminUsers />);
         const email = await screen.findByPlaceholderText('user@company.com');
@@ -133,6 +159,33 @@ describe('AdminUsers page', () => {
 });
 
 describe('AdminSubscriptions page', () => {
+    it('paginates the subscription table at 25 rows per page', async () => {
+        subscriptions = Array.from({length: 30}, (_, i) => ({
+            id: `s-${String(i).padStart(2, '0')}`,
+            developer_id: `dev-${i}`,
+            developer_name: `Dev ${String(i).padStart(2, '0')}`,
+            developer_email: `dev${i}@test.com`,
+            team: 'frontend',
+            tool: 'copilot',
+            plan: 'Business',
+            billing_model: 'company_managed',
+            monthly_cost: 19,
+            seat_assigned_at: '2026-02-01T00:00:00.000Z',
+            seat_revoked_at: null,
+            data_source: 'admin',
+        }));
+        renderPage(<AdminSubscriptions />);
+        await screen.findByText('Dev 00');
+
+        expect(document.querySelectorAll('tbody tr')).toHaveLength(25);
+        expect(screen.queryByText('Dev 25')).not.toBeInTheDocument();
+
+        fireEvent.click(screen.getByRole('button', {name: 'Next page'}));
+        expect(document.querySelectorAll('tbody tr')).toHaveLength(5);
+        expect(screen.getByText('Dev 25')).toBeInTheDocument();
+        expect(screen.queryByText('Dev 00')).not.toBeInTheDocument();
+    });
+
     it('assigns a subscription via POST', async () => {
         renderPage(<AdminSubscriptions />);
         // The developer select is labelled "Developer"; wait for its option to
@@ -153,5 +206,32 @@ describe('AdminSubscriptions page', () => {
             expect(sent.developer_id).toBe('dev-1');
             expect(sent.tool).toBe('copilot');
         });
+    });
+});
+
+describe('AdminTeams page', () => {
+    it('paginates the team table at 25 rows per page', async () => {
+        const teams: AdminTeam[] = Array.from({length: 30}, (_, i) => ({
+            name: `team-${String(i).padStart(2, '0')}`,
+            department: 'Engineering',
+            manager: 'Mae',
+            created_at: '2026-01-01T00:00:00.000Z',
+            archived_at: null,
+            developer_count: 3,
+        }));
+        fetchMock.mockImplementation(async (url: unknown) => {
+            if (String(url).includes('/api/admin/teams')) return json({data: teams});
+            return json({error: 'not found'}, 404);
+        });
+        renderPage(<AdminTeams />);
+        await screen.findByText('team-00');
+
+        expect(document.querySelectorAll('tbody tr')).toHaveLength(25);
+        expect(screen.queryByText('team-25')).not.toBeInTheDocument();
+
+        fireEvent.click(screen.getByRole('button', {name: 'Next page'}));
+        expect(document.querySelectorAll('tbody tr')).toHaveLength(5);
+        expect(screen.getByText('team-29')).toBeInTheDocument();
+        expect(screen.queryByText('team-00')).not.toBeInTheDocument();
     });
 });

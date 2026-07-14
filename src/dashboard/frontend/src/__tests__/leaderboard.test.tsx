@@ -166,6 +166,49 @@ describe('Leaderboard page', () => {
         });
     });
 
+    it('paginates the board at 25 rows per page and navigates pages', async () => {
+        // A 30-developer board spills onto a second page.
+        const entries: LeaderboardData['entries'] = Array.from({length: 30}, (_, i) => ({
+            rank: i + 1,
+            developer_id: `d${i}`,
+            name: `Dev ${String(i).padStart(2, '0')}`,
+            value: 30 - i,
+            interactions: 10,
+            acceptances: 5,
+            acceptance_rate: 0.5,
+            commits: 1,
+        }));
+        fetchMock = vi.fn(async (url: unknown) => {
+            const u = String(url);
+            if (u.includes('/api/leaderboard/availability')) return json({data: AVAILABLE});
+            if (u.includes('/api/leaderboard/')) {
+                return json({data: {team: 'eng', metric: 'activity', from: '2026-05-01', to: '2026-05-30', entries}});
+            }
+            if (u.includes('/api/teams')) {
+                const data = [{name: 'eng'}];
+                return json({data, pagination: {page: 1, limit: 100, total: data.length}});
+            }
+            return json({error: 'not found'}, 404);
+        });
+        vi.stubGlobal('fetch', fetchMock);
+
+        renderWith(<Leaderboard />);
+        const select = await screen.findByRole('combobox', {name: /team/i});
+        await screen.findByRole('option', {name: 'eng'});
+        fireEvent.change(select, {target: {value: 'eng'}});
+        await screen.findByText('Dev 00');
+
+        // Page 1 caps at 25 rows; the 26th developer is off-page.
+        expect(document.querySelectorAll('tbody tr')).toHaveLength(25);
+        expect(screen.queryByText('Dev 25')).not.toBeInTheDocument();
+
+        // Jump to page 2 → the remaining 5 rows, now including Dev 25.
+        fireEvent.click(screen.getByRole('button', {name: 'Next page'}));
+        expect(document.querySelectorAll('tbody tr')).toHaveLength(5);
+        expect(screen.getByText('Dev 25')).toBeInTheDocument();
+        expect(screen.queryByText('Dev 00')).not.toBeInTheDocument();
+    });
+
     it('marks a low-sample developer on the acceptance board (100% yet floored)', async () => {
         renderWith(<Leaderboard />);
         const teamSelect = await screen.findByRole('combobox', {name: /team/i});

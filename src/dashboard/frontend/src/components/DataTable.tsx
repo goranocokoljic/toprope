@@ -1,5 +1,8 @@
 import {useEffect, useMemo, useState, type ReactNode} from 'react';
 
+import {Pagination} from './Pagination';
+import {usePagination} from './usePagination';
+
 export type SortDirection = 'asc' | 'desc';
 
 /** An active sort: the column key plus its direction. */
@@ -55,6 +58,17 @@ export interface DataTableProps<T> {
      */
     sort?: SortState;
     onSortChange?: (sort: SortState) => void;
+    /**
+     * Opt-in client-side pagination (#221). When set, the table paginates its
+     * POST-SORT rows via {@link usePagination} and renders a `<Pagination>`
+     * footer; sorting still reorders the whole list first, and a sort change
+     * resets to page 1 (the sorted array's identity changes). Omitting
+     * `pageSize` leaves every existing consumer byte-for-byte unchanged: all
+     * rows render, no footer. Page size per view is the caller's choice.
+     */
+    pageSize?: number;
+    /** Accessible label for the pager's `<nav>` when `pageSize` is set. */
+    paginationLabel?: string;
 }
 
 const ALIGN_CLASS: Record<'left' | 'right' | 'center', string> = {
@@ -95,6 +109,8 @@ export function DataTable<T>({
     caption,
     sort: controlledSort,
     onSortChange,
+    pageSize,
+    paginationLabel,
 }: DataTableProps<T>): JSX.Element {
     const controlled = onSortChange !== undefined;
     const [internalSort, setInternalSort] = useState<SortState | null>(initialSort ?? null);
@@ -143,6 +159,18 @@ export function DataTable<T>({
         });
     }, [rows, columns, sort, controlled]);
 
+    // Pagination applies AFTER sorting, over the fully-ordered list. The hook is
+    // called unconditionally (rules of hooks); when `pageSize` is omitted we feed
+    // it a page big enough to hold everything, so it yields a single page and the
+    // pager renders nothing — `displayRows` then stays the untouched sorted list.
+    const paged = usePagination(sortedRows, pageSize && pageSize > 0 ? pageSize : Number.MAX_SAFE_INTEGER);
+    const paginated = pageSize !== undefined && pageSize > 0;
+    const displayRows = paginated ? paged.pageItems : sortedRows;
+    // Only wrap + render the footer when there is more than one page — a
+    // single-page paginated table renders exactly like an unpaginated one (no
+    // empty pager wrapper), matching the card-list / PaginatedTable adopters.
+    const showPager = paginated && paged.pageCount > 1;
+
     function toggleSort(key: string): void {
         const next = (current: SortState | null): SortState => {
             if (current?.key === key) {
@@ -157,7 +185,7 @@ export function DataTable<T>({
         }
     }
 
-    return (
+    const table = (
         <div className="overflow-x-auto rounded-card border border-border">
             <table className="w-full border-collapse text-sm">
                 {caption ? <caption className="sr-only">{caption}</caption> : null}
@@ -196,14 +224,14 @@ export function DataTable<T>({
                     </tr>
                 </thead>
                 <tbody>
-                    {sortedRows.length === 0 ? (
+                    {displayRows.length === 0 ? (
                         <tr>
                             <td colSpan={columns.length} className="px-4 py-8 text-center text-sm text-muted">
                                 {emptyMessage}
                             </td>
                         </tr>
                     ) : (
-                        sortedRows.map((row) => (
+                        displayRows.map((row) => (
                             <tr
                                 key={getRowKey(row)}
                                 className="border-b border-border last:border-0 hover:bg-surface-raised"
@@ -222,6 +250,24 @@ export function DataTable<T>({
                     )}
                 </tbody>
             </table>
+        </div>
+    );
+
+    // Existing consumers are unchanged: with no `pageSize` (or a single page of
+    // rows) this returns just the scroll container — no wrapper, no footer.
+    if (!showPager) return table;
+
+    return (
+        <div className="flex flex-col gap-3">
+            {table}
+            <div className="flex justify-end">
+                <Pagination
+                    page={paged.page}
+                    pageCount={paged.pageCount}
+                    onPageChange={paged.setPage}
+                    ariaLabel={paginationLabel ?? (typeof caption === 'string' ? caption : 'Pagination')}
+                />
+            </div>
         </div>
     );
 }
