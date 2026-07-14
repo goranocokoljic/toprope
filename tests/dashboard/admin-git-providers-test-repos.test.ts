@@ -467,6 +467,53 @@ describe('admin git-provider test + repos API (#198)', () => {
             expect(JSON.parse(row?.repos_include ?? '[]')).toEqual(['active-svc']);
         });
 
+        it('strips a saved exclude_repos filter too, so excluded repos are offered again (#217, bitbucket)', async () => {
+            // The symmetric half of the bug: an EXCLUDE filter would otherwise
+            // keep those repos out of the picker. Faithful factory honors
+            // exclude_repos, and captures the config it receives so we can pin
+            // that BOTH filter halves were stripped at the call boundary.
+            const WORKSPACE = ['active-svc', 'legacy-svc', 'other-svc'];
+            let lastConfig: GitProviderConfig | undefined;
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockImplementation((cfg: GitProviderConfig) => {
+                lastConfig = cfg;
+                const exclude = cfg.type === 'bitbucket' ? cfg.exclude_repos ?? [] : [];
+                const visible = WORKSPACE.filter((n) => !exclude.includes(n));
+                return makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue(visible.map((n) => makeRepo(n, false, 'main'))),
+                });
+            });
+
+            // Save a bitbucket provider that EXCLUDES one repo.
+            const create = await app.inject({
+                method: 'POST',
+                url: '/api/admin/git/providers',
+                headers: authHeaders(adminToken),
+                payload: {
+                    type: 'bitbucket',
+                    container: 'db-ws',
+                    auth_method: 'access_token',
+                    token: 'bb_token',
+                    exclude_repos: ['legacy-svc'],
+                },
+            });
+            expect(create.statusCode).toBe(201);
+            const id = create.json().data.id as string;
+
+            const res = await app.inject({
+                method: 'GET',
+                url: `/api/admin/git/providers/${id}/repos`,
+                headers: authHeaders(adminToken),
+            });
+            expect(res.statusCode).toBe(200);
+            const slugs = (res.json().data as {slug: string}[]).map((r) => r.slug);
+            // The excluded repo is offered again — the picker sees the full set.
+            expect(slugs).toEqual(WORKSPACE);
+            // Both filter halves were stripped on the config handed to the factory.
+            expect(lastConfig?.repos).toBeUndefined();
+            expect(lastConfig?.type === 'bitbucket' ? lastConfig.exclude_repos : 'n/a').toBeUndefined();
+        });
+
         it('returns a clean 502 {ok:false, error, hint} on a listing failure — not a 500', async () => {
             const id = await createGithub();
             const createGitProvider = await getCreateGitProvider();
