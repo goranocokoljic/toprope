@@ -354,6 +354,20 @@ async function probeProvider(config: GitProviderConfig): Promise<ProbeResult> {
     }
 }
 
+// A copy of the config with the include/exclude repo filter stripped (#217).
+// The repo-scope PICKER must list the WHOLE workspace so an admin can add repos
+// beyond the current selection — but every provider's `listRepos()` applies its
+// own `shouldInclude()` against the config's `repos`/`exclude_repos`, so a saved
+// provider would otherwise only ever list the repos it already syncs. Setting the
+// optional filters to `undefined` (never mutating the stored config) makes
+// `shouldInclude` accept everything; sync/doctor keep using the untouched config.
+function repoListingConfig(config: GitProviderConfig): GitProviderConfig {
+    const next: GitProviderConfig = {...config, repos: undefined};
+    // exclude_repos exists only on github/bitbucket; gitlab has no such field.
+    if (next.type !== 'gitlab') next.exclude_repos = undefined;
+    return next;
+}
+
 /** Resolving a saved provider id to its full config: found, unknown, or key-blocked. */
 type SavedConfigResult =
     | {kind: 'ok'; config: GitProviderConfig}
@@ -575,7 +589,9 @@ export function registerAdminGitProviderRoutes(
             if (resolved.kind === 'key_error') return serviceUnavailable(reply, resolved.message);
 
             try {
-                const repos = await createGitProvider(resolved.config).listRepos();
+                // List the FULL workspace (filter stripped) so the picker can
+                // offer repos beyond the saved selection (#217).
+                const repos = await createGitProvider(repoListingConfig(resolved.config)).listRepos();
                 return {
                     data: repos.map((r) => ({
                         slug: r.name,

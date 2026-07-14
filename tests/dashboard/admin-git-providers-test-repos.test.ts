@@ -10,7 +10,7 @@ import {createUser} from '../../src/auth/users';
 import {hashPassword} from '../../src/auth/password';
 import {SESSION_COOKIE} from '../../src/auth/cookies';
 import type {GitConnectorConfig} from '../../src/config/types';
-import type {GitProvider, GitRepo} from '../../src/connectors/git/providers/types';
+import type {GitProvider, GitProviderConfig, GitRepo} from '../../src/connectors/git/providers/types';
 
 // Stub createGitProvider so no test hits the network, but keep
 // validateGitProviderConfig real so the store/codec that seed + decrypt DB
@@ -416,6 +416,102 @@ describe('admin git-provider test + repos API (#198)', () => {
             });
             expect(res.statusCode).toBe(200);
             expect(res.json().data).toEqual([]);
+        });
+
+        it('lists the FULL workspace for a provider with a saved repo filter — the picker can add repos beyond the selection (#217)', async () => {
+            // A faithful factory: the returned provider's listRepos honors
+            // config.repos exactly as the real shouldInclude does. So if the
+            // route passed the SAVED (filtered) config, only the selected repo
+            // would come back — the bug this test guards against.
+            const WORKSPACE = ['active-svc', 'legacy-svc', 'other-svc'];
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockImplementation((cfg: GitProviderConfig) => {
+                const include = 'repos' in cfg ? cfg.repos ?? [] : [];
+                const visible =
+                    include.length > 0 ? WORKSPACE.filter((n) => include.includes(n)) : WORKSPACE;
+                return makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue(visible.map((n) => makeRepo(n, false, 'main'))),
+                });
+            });
+
+            // Save a provider scoped to a SINGLE repo out of the three.
+            const create = await app.inject({
+                method: 'POST',
+                url: '/api/admin/git/providers',
+                headers: authHeaders(adminToken),
+                payload: {type: 'github', container: 'db-org', token: 'ghp_x', repos: ['active-svc']},
+            });
+            expect(create.statusCode).toBe(201);
+            const id = create.json().data.id as string;
+
+            const res = await app.inject({
+                method: 'GET',
+                url: `/api/admin/git/providers/${id}/repos`,
+                headers: authHeaders(adminToken),
+            });
+            expect(res.statusCode).toBe(200);
+            const slugs = (res.json().data as {slug: string}[]).map((r) => r.slug);
+            // All three repos are offered, not just the one already saved.
+            expect(slugs).toEqual(WORKSPACE);
+
+            // The stored config is NOT mutated: the saved scope still reads back
+            // as the single-repo filter (so the next sync honors it).
+            const list = await app.inject({
+                method: 'GET',
+                url: '/api/admin/git/providers',
+                headers: authHeaders(adminToken),
+            });
+            const row = (list.json().data as {id: string; repos_include: string | null}[]).find(
+                (p) => p.id === id,
+            );
+            expect(JSON.parse(row?.repos_include ?? '[]')).toEqual(['active-svc']);
+        });
+
+        it('strips a saved exclude_repos filter too, so excluded repos are offered again (#217, bitbucket)', async () => {
+            // The symmetric half of the bug: an EXCLUDE filter would otherwise
+            // keep those repos out of the picker. Faithful factory honors
+            // exclude_repos, and captures the config it receives so we can pin
+            // that BOTH filter halves were stripped at the call boundary.
+            const WORKSPACE = ['active-svc', 'legacy-svc', 'other-svc'];
+            let lastConfig: GitProviderConfig | undefined;
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockImplementation((cfg: GitProviderConfig) => {
+                lastConfig = cfg;
+                const exclude = cfg.type === 'bitbucket' ? cfg.exclude_repos ?? [] : [];
+                const visible = WORKSPACE.filter((n) => !exclude.includes(n));
+                return makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue(visible.map((n) => makeRepo(n, false, 'main'))),
+                });
+            });
+
+            // Save a bitbucket provider that EXCLUDES one repo.
+            const create = await app.inject({
+                method: 'POST',
+                url: '/api/admin/git/providers',
+                headers: authHeaders(adminToken),
+                payload: {
+                    type: 'bitbucket',
+                    container: 'db-ws',
+                    auth_method: 'access_token',
+                    token: 'bb_token',
+                    exclude_repos: ['legacy-svc'],
+                },
+            });
+            expect(create.statusCode).toBe(201);
+            const id = create.json().data.id as string;
+
+            const res = await app.inject({
+                method: 'GET',
+                url: `/api/admin/git/providers/${id}/repos`,
+                headers: authHeaders(adminToken),
+            });
+            expect(res.statusCode).toBe(200);
+            const slugs = (res.json().data as {slug: string}[]).map((r) => r.slug);
+            // The excluded repo is offered again — the picker sees the full set.
+            expect(slugs).toEqual(WORKSPACE);
+            // Both filter halves were stripped on the config handed to the factory.
+            expect(lastConfig?.repos).toBeUndefined();
+            expect(lastConfig?.type === 'bitbucket' ? lastConfig.exclude_repos : 'n/a').toBeUndefined();
         });
 
         it('returns a clean 502 {ok:false, error, hint} on a listing failure — not a 500', async () => {
