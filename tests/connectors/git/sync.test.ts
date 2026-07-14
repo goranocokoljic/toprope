@@ -1466,6 +1466,18 @@ describe('firstSyncSince — first-sync window math (#228)', () => {
         expect(firstSyncSince('2026-01-10T00:00:00.000Z', 3)).toBe('2025-10-10T00:00:00.000Z');
     });
 
+    it('day-overflow on an end-of-month `now` shortens the window (never widens it)', () => {
+        // Mar 31 − 1 month = "Feb 31" → JS normalizes forward to Mar 3, so the window
+        // is ~28 days, a few days SHORTER than a calendar month. Pinned deliberately:
+        // the drift is safe (it can only under-import, never re-drain quota).
+        expect(firstSyncSince('2026-03-31T00:00:00.000Z', 1)).toBe('2026-03-03T00:00:00.000Z');
+        // The resulting `since` is strictly AFTER a naive month-earlier date, proving
+        // the window only ever narrows.
+        expect(Date.parse(firstSyncSince('2026-03-31T00:00:00.000Z', 1))).toBeGreaterThan(
+            Date.parse('2026-02-28T00:00:00.000Z'),
+        );
+    });
+
     it('falls back to "" (walk all history) when the window is undefined', () => {
         expect(firstSyncSince('2026-03-15T12:00:00.000Z', undefined)).toBe('');
     });

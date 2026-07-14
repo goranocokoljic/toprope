@@ -40,6 +40,7 @@ const DB_GITHUB: AdminGitProvider = {
     last_sync_status: 'ok',
     last_sync_error: null,
     active_sync: null,
+    first_sync_pending: false,
 };
 
 const CONFIG_GITLAB: AdminGitProvider = {
@@ -63,6 +64,7 @@ const CONFIG_GITLAB: AdminGitProvider = {
     last_sync_status: null,
     last_sync_error: null,
     active_sync: null,
+    first_sync_pending: false,
 };
 
 /** A DB provider with no repo filter — the "monitor all" starting point (#201). */
@@ -161,6 +163,8 @@ beforeEach(() => {
                 last_sync_at: null,
                 last_sync_status: null,
                 last_sync_error: null,
+                // A freshly created provider has no cursor yet — first sync pending.
+                first_sync_pending: true,
             };
             providers = [...providers, created];
             return json({data: created}, 201);
@@ -468,6 +472,7 @@ describe('AdminGitProviders — list + row actions', () => {
             container: 'fresh-org',
             last_sync_at: null,
             last_sync_status: null,
+            first_sync_pending: true,
         });
         renderPage();
         const cell = await screen.findByText('fresh-org');
@@ -507,6 +512,7 @@ describe('AdminGitProviders — list + row actions', () => {
             container: 'fresh-two',
             last_sync_at: null,
             last_sync_status: null,
+            first_sync_pending: true,
         });
         renderPage();
         const cell = await screen.findByText('fresh-two');
@@ -518,6 +524,11 @@ describe('AdminGitProviders — list + row actions', () => {
         // Above the ceiling (60) is clamped, never emitted raw to the server.
         fireEvent.change(input, {target: {value: '999'}});
         expect(input.value).toBe('60');
+        // Below the floor (1) is clamped up.
+        fireEvent.change(input, {target: {value: '0'}});
+        expect(input.value).toBe('1');
+        fireEvent.change(input, {target: {value: '-5'}});
+        expect(input.value).toBe('1');
         // A blank/non-numeric entry falls back to the default.
         fireEvent.change(input, {target: {value: ''}});
         expect(input.value).toBe('6');

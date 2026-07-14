@@ -888,9 +888,11 @@ function ProviderRow({
     // First-sync history window (months). Only meaningful — and only surfaced —
     // before this provider has ever synced: once a cursor exists the server ignores
     // it (re-widening would double-count), so the input disappears and "Sync now"
-    // sends no window.
+    // sends no window. Gate on the server's cursor-derived `first_sync_pending`, NOT
+    // `last_sync_at`: the latter only tracks sync-now runs, so it would keep showing
+    // the (server-ignored) input after a scheduled/CLI first sync.
     const [windowMonths, setWindowMonths] = useState(FIRST_SYNC_WINDOW_DEFAULT_MONTHS);
-    const isFirstSync = provider.last_sync_at === null;
+    const isFirstSync = provider.first_sync_pending;
     // Derived (not mount-time-seeded): the create flow's hook-level invalidation
     // is awaited BEFORE the created callback runs, so this row mounts from the
     // refetched list first and the prompt flag lands on a re-render — a

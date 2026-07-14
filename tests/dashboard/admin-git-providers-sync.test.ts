@@ -98,6 +98,7 @@ interface ProviderListRow {
     last_sync_at: string | null;
     last_sync_error: string | null;
     active_sync: {started_at: string; progress: GitSyncProgress | null} | null;
+    first_sync_pending: boolean;
 }
 
 describe('admin git-provider sync-now API (#199)', () => {
@@ -527,6 +528,46 @@ describe('admin git-provider sync-now API (#199)', () => {
             // A rejected request must never have kicked off the pipeline.
             expect(getCommits).not.toHaveBeenCalled();
             expect((await readProvider(id))?.last_sync_status).toBeNull();
+        });
+
+        it('treats an explicit null months (and a non-object body) as the default, not a 400', async () => {
+            const id = await createGithub();
+            const getCommits = await armGetCommits();
+
+            // Explicit null → absent → default window (still a first sync, so clamps).
+            const before = Date.now();
+            const res = await triggerSyncBody(id, {months: null as unknown as number});
+            expect(res.statusCode).toBe(202);
+            await waitForSyncStatus(id, 'ok');
+            const since = getCommits.mock.calls[0][1] as string;
+            expect(since).not.toBe('');
+            const expected = new Date(before);
+            expected.setUTCMonth(expected.getUTCMonth() - 6);
+            expect(Math.abs(Date.parse(since) - expected.getTime())).toBeLessThan(60_000);
+        });
+    });
+
+    // #228 SO-1 fix — first_sync_pending is derived from the pipeline cursor, not
+    // from last_sync_at (which only the sync-now route writes and so goes stale
+    // after a scheduled/CLI first sync).
+    describe('first_sync_pending signal (#228)', () => {
+        it('is true for a never-synced provider and false once a cursor exists, even with last_sync_at still null', async () => {
+            const id = await createGithub();
+            // Brand new: no cursor → first sync pending.
+            expect((await readProvider(id))?.first_sync_pending).toBe(true);
+
+            // Simulate a scheduled/CLI sync: the pipeline writes the cursor
+            // (git_last_sync:github:db-org) but NOT last_sync_at.
+            db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+                'git_last_sync:github:db-org',
+                '2026-01-01T00:00:00.000Z',
+            );
+
+            const row = await readProvider(id);
+            expect(row?.first_sync_pending).toBe(false);
+            // The divergence the fix targets: last_sync_at is still null yet the
+            // window is no longer offered.
+            expect(row?.last_sync_at).toBeNull();
         });
     });
 });

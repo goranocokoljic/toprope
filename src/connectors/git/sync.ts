@@ -83,7 +83,11 @@ export interface SyncRunOptions {
      * snapshot upsert is additive, so re-widening the window on a later run would
      * double-count the already-recorded span. Omitting it (undefined) preserves the
      * legacy "walk all history on first sync" behavior — the scheduled path passes
-     * nothing and is deliberately unchanged.
+     * nothing and is deliberately unchanged. Residual exposure (out of scope for
+     * #228, which scoped the cap to the "Sync now" button): a fresh org first synced
+     * by the scheduler or `toprope sync all` — including config-file providers, which
+     * can ONLY sync that way — still walks all history and drains the quota. Bounding
+     * the automated path is a follow-up, not this issue.
      */
     firstSyncWindowMonths?: number;
 }
@@ -94,6 +98,12 @@ export interface SyncRunOptions {
  * bounds / a bad `now`) falls back to '' — i.e. walk all history — so a caller that
  * skips the window, or an out-of-range value that slipped past validation, degrades
  * to the legacy behavior rather than importing a wrong window. Exported for tests.
+ *
+ * The bounds/integer/NaN checks are a DELIBERATE belt-and-suspenders backstop: the
+ * only production caller is the API route, which already rejects out-of-range values
+ * fail-closed (parseFirstSyncWindowMonths). Keeping this a total, self-defending pure
+ * function lets it stand alone and honors the project rule to range-validate numeric
+ * config on both bounds even if a future caller forgets to.
  */
 export function firstSyncSince(now: string, months: number | undefined): string {
     if (
@@ -107,7 +117,11 @@ export function firstSyncSince(now: string, months: number | undefined): string 
     const start = new Date(now);
     if (Number.isNaN(start.getTime())) return '';
     // UTC month arithmetic (all toprope timestamps are UTC); JS handles the year
-    // rollover when the subtraction crosses January.
+    // rollover when the subtraction crosses January. Day-of-month is preserved, so a
+    // long-month `now` (e.g. Mar 31) minus 1 lands on the normalized short-month date
+    // (Mar 3), making the window a few days SHORTER than a strict calendar month —
+    // never longer. That direction is safe (it can only under-import, never re-drain
+    // quota), and the window start is inherently coarse, so we accept the drift.
     start.setUTCMonth(start.getUTCMonth() - months);
     return start.toISOString();
 }
@@ -118,8 +132,24 @@ export function firstSyncSince(now: string, months: number | undefined): string 
 // the scheduled path pays nothing.
 type ProgressReporter = (mutate: (progress: GitSyncProgress) => void) => void;
 
-function syncStateKey(providerType: GitProviderType, identifier: string): string {
+export function syncStateKey(providerType: GitProviderType, identifier: string): string {
     return `git_last_sync:${providerType}:${identifier}`;
+}
+
+/**
+ * Every git sync-state cursor key currently stored, resolved in ONE query. The
+ * admin list uses this to tell whether a provider's FIRST sync is still pending
+ * (no cursor yet) — the real gate the "Sync now" window input keys off. Read once
+ * per list request and membership-tested in memory, never per-row: a stored cursor
+ * (written by the pipeline on EVERY path — sync-now, scheduler, and CLI) is the
+ * authoritative "has synced" signal, and it diverges from the row's `last_sync_at`
+ * column (which only the sync-now route writes).
+ */
+export function loadProviderCursorKeys(db: Database.Database): Set<string> {
+    const rows = db
+        .prepare("SELECT key FROM sync_state WHERE key LIKE 'git_last_sync:%'")
+        .all() as Array<{key: string}>;
+    return new Set(rows.map((r) => r.key));
 }
 
 interface SyncStateRow {

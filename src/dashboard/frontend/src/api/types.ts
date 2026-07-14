@@ -934,6 +934,13 @@ export interface AdminGitProvider {
     last_sync_error: string | null;
     /** Non-null only while a sync-now run is in flight for this provider (#209). */
     active_sync: GitProviderActiveSync | null;
+    /**
+     * True when the provider has never completed a sync (no stored pipeline cursor).
+     * Drives the first-sync history-window input on "Sync now" (#228) — this is the
+     * authoritative signal, not `last_sync_at` (which only the sync-now route writes
+     * and so goes stale after a scheduled/CLI first sync).
+     */
+    first_sync_pending: boolean;
 }
 
 /** The stages a sync run passes through, in pipeline order (#209). */

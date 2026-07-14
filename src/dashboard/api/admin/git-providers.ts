@@ -30,6 +30,8 @@ import {
     FIRST_SYNC_WINDOW_MIN_MONTHS,
     FIRST_SYNC_WINDOW_MAX_MONTHS,
     FIRST_SYNC_WINDOW_DEFAULT_MONTHS,
+    syncStateKey,
+    loadProviderCursorKeys,
     type GitSyncProgress,
 } from '../../../connectors/git/sync';
 import {gitProviderFixHint} from '../../../cli/doctor';
@@ -81,6 +83,16 @@ export interface AdminGitProviderDto extends Omit<PublicGitProvider, 'created_at
     created_at: string | null;
     updated_at: string | null;
     active_sync: ActiveSyncDto | null;
+    /**
+     * True when this provider has NEVER completed a sync — i.e. it has no stored
+     * pipeline cursor yet. This is the real "first sync pending" gate the "Sync now"
+     * first-sync history-window input keys off (#228), NOT the row's `last_sync_at`:
+     * the cursor is written by the pipeline on every path (sync-now, scheduler, CLI)
+     * whereas `last_sync_at` is written only by the sync-now route, so they diverge
+     * after a scheduled/CLI first sync. Always false for config-file rows (read-only;
+     * they never show the window input).
+     */
+    first_sync_pending: boolean;
 }
 
 /**
@@ -339,16 +351,28 @@ function configProviderToDto(config: GitProviderConfig): AdminGitProviderDto {
         last_sync_status: null,
         last_sync_error: null,
         active_sync: null,
+        // Config rows are read-only and never show the window input.
+        first_sync_pending: false,
     };
 }
 
 // `activeSync` is the route registration's in-flight entry for this row (null
 // when no run is in flight — the common case for create/update responses).
+// `firstSyncPending` is whether this provider still lacks a pipeline cursor; it
+// defaults to true because the only caller that omits it is the create route
+// (a brand-new provider has never synced). The list/patch routes derive it from
+// the stored cursor set (see loadProviderCursorKeys).
 function dbProviderToDto(
     record: Parameters<typeof toPublicProvider>[0],
     activeSync: ActiveSyncDto | null = null,
+    firstSyncPending = true,
 ): AdminGitProviderDto {
-    return {...toPublicProvider(record), source: 'db', active_sync: activeSync};
+    return {
+        ...toPublicProvider(record),
+        source: 'db',
+        active_sync: activeSync,
+        first_sync_pending: firstSyncPending,
+    };
 }
 
 // Map a typed store error to an HTTP reply. secret_key_unconfigured is a
@@ -470,8 +494,14 @@ export function registerAdminGitProviderRoutes(
         if (!isAdmin(request)) return forbidden(reply);
         // DB providers first (store's deterministic created_at, id order), then
         // config-file providers in declaration order — a total, stable ordering.
+        // Resolve the stored cursor set ONCE (not per row) to drive first_sync_pending.
+        const cursorKeys = loadProviderCursorKeys(db);
         const dbRows = listProviders(db).map((record) =>
-            dbProviderToDto(record, activeSyncs.get(record.id) ?? null),
+            dbProviderToDto(
+                record,
+                activeSyncs.get(record.id) ?? null,
+                !cursorKeys.has(syncStateKey(record.type, record.container)),
+            ),
         );
         const configRows = configProviders().map(configProviderToDto);
         return {data: [...dbRows, ...configRows]};
@@ -539,7 +569,16 @@ export function registerAdminGitProviderRoutes(
                     token: parsed.token,
                     enabled: parsed.enabled,
                 });
-                return {data: dbProviderToDto(record, activeSyncs.get(id) ?? null)};
+                // An edit may rename the container (and thus the cursor key), so
+                // recompute first_sync_pending against the stored cursor set.
+                const cursorKeys = loadProviderCursorKeys(db);
+                return {
+                    data: dbProviderToDto(
+                        record,
+                        activeSyncs.get(id) ?? null,
+                        !cursorKeys.has(syncStateKey(record.type, record.container)),
+                    ),
+                };
             } catch (err) {
                 if (err instanceof GitProviderStoreError) return replyStoreError(reply, err);
                 return badRequest(reply, err instanceof Error ? err.message : String(err));
