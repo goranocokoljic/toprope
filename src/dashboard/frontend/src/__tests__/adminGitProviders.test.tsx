@@ -40,6 +40,7 @@ const DB_GITHUB: AdminGitProvider = {
     last_sync_status: 'ok',
     last_sync_error: null,
     active_sync: null,
+    first_sync_pending: false,
 };
 
 const CONFIG_GITLAB: AdminGitProvider = {
@@ -63,6 +64,7 @@ const CONFIG_GITLAB: AdminGitProvider = {
     last_sync_status: null,
     last_sync_error: null,
     active_sync: null,
+    first_sync_pending: false,
 };
 
 /** A DB provider with no repo filter — the "monitor all" starting point (#201). */
@@ -161,6 +163,8 @@ beforeEach(() => {
                 last_sync_at: null,
                 last_sync_status: null,
                 last_sync_error: null,
+                // A freshly created provider has no cursor yet — first sync pending.
+                first_sync_pending: true,
             };
             providers = [...providers, created];
             return json({data: created}, 201);
@@ -440,6 +444,94 @@ describe('AdminGitProviders — list + row actions', () => {
         await waitFor(() => {
             expect(lastCall(/\/git\/providers\/p-gh\/sync$/, 'POST')).toBeTruthy();
         });
+    });
+
+    // #228 — first-sync history window input.
+    it('an already-synced row shows NO window input and syncs with no months', async () => {
+        renderPage();
+        const ghCell = await screen.findByText('acme-org'); // DB_GITHUB: last_sync_at set
+        const row = ghCell.closest('tr') as HTMLElement;
+        // Once a provider has synced, the window is meaningless (server ignores it).
+        expect(
+            within(row).queryByLabelText('First-sync history window in months'),
+        ).not.toBeInTheDocument();
+
+        fireEvent.click(within(row).getByRole('button', {name: 'Sync now'}));
+        await waitFor(() => {
+            const call = lastCall(/\/git\/providers\/p-gh\/sync$/, 'POST');
+            expect(call).toBeTruthy();
+            const body = JSON.parse(String(call?.[1]?.body)) as Record<string, unknown>;
+            expect(body).not.toHaveProperty('months');
+        });
+    });
+
+    it('a first-sync row shows the window input (default 6) and posts the chosen months', async () => {
+        providers.push({
+            ...structuredClone(DB_GITHUB),
+            id: 'p-fresh',
+            container: 'fresh-org',
+            last_sync_at: null,
+            last_sync_status: null,
+            first_sync_pending: true,
+        });
+        renderPage();
+        const cell = await screen.findByText('fresh-org');
+        const row = cell.closest('tr') as HTMLElement;
+        const input = within(row).getByLabelText(
+            'First-sync history window in months',
+        ) as HTMLInputElement;
+        // Defaults to 6 months.
+        expect(input.value).toBe('6');
+
+        // Default press → months: 6.
+        fireEvent.click(within(row).getByRole('button', {name: 'Sync now'}));
+        await waitFor(() => {
+            const call = lastCall(/\/git\/providers\/p-fresh\/sync$/, 'POST');
+            expect(call).toBeTruthy();
+            const body = JSON.parse(String(call?.[1]?.body)) as Record<string, unknown>;
+            expect(body.months).toBe(6);
+        });
+
+        // Wait out the pending state so the input is interactive again.
+        await waitFor(() => expect(input).toBeEnabled());
+        // Change the window → the next press carries the new value.
+        fireEvent.change(input, {target: {value: '3'}});
+        expect(input.value).toBe('3');
+        fireEvent.click(within(row).getByRole('button', {name: 'Sync now'}));
+        await waitFor(() => {
+            const call = lastCall(/\/git\/providers\/p-fresh\/sync$/, 'POST');
+            const body = JSON.parse(String(call?.[1]?.body)) as Record<string, unknown>;
+            expect(body.months).toBe(3);
+        });
+    });
+
+    it('clamps an out-of-range window entry to the valid bounds before syncing', async () => {
+        providers.push({
+            ...structuredClone(DB_GITHUB),
+            id: 'p-fresh2',
+            container: 'fresh-two',
+            last_sync_at: null,
+            last_sync_status: null,
+            first_sync_pending: true,
+        });
+        renderPage();
+        const cell = await screen.findByText('fresh-two');
+        const row = cell.closest('tr') as HTMLElement;
+        const input = within(row).getByLabelText(
+            'First-sync history window in months',
+        ) as HTMLInputElement;
+
+        // Above the ceiling (60) is clamped, never emitted raw to the server.
+        fireEvent.change(input, {target: {value: '999'}});
+        expect(input.value).toBe('60');
+        // Below the floor (1) is clamped up.
+        fireEvent.change(input, {target: {value: '0'}});
+        expect(input.value).toBe('1');
+        fireEvent.change(input, {target: {value: '-5'}});
+        expect(input.value).toBe('1');
+        // A blank/non-numeric entry falls back to the default.
+        fireEvent.change(input, {target: {value: ''}});
+        expect(input.value).toBe('6');
     });
 });
 

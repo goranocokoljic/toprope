@@ -94,6 +94,25 @@ const PROVIDER_META: Record<GitProviderType, ProviderMeta> = {
 
 const PROVIDER_TYPES: GitProviderType[] = ['github', 'bitbucket', 'gitlab'];
 
+// First-sync history-window bounds (months), mirrored from the server's
+// FIRST_SYNC_WINDOW_* constants (sync.ts) — they can't be imported across the
+// server/client bundle boundary, so keep them in sync by hand. The server
+// re-validates fail-closed regardless, so this input is UX, not the guard.
+const FIRST_SYNC_WINDOW_MIN_MONTHS = 1;
+const FIRST_SYNC_WINDOW_MAX_MONTHS = 60;
+const FIRST_SYNC_WINDOW_DEFAULT_MONTHS = 6;
+
+/**
+ * Clamp a raw months input to the valid integer window; a blank/non-numeric entry
+ * falls back to the default so the control can never emit an out-of-range value the
+ * server would reject.
+ */
+function clampWindowMonths(raw: string): number {
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isNaN(parsed)) return FIRST_SYNC_WINDOW_DEFAULT_MONTHS;
+    return Math.min(FIRST_SYNC_WINDOW_MAX_MONTHS, Math.max(FIRST_SYNC_WINDOW_MIN_MONTHS, parsed));
+}
+
 /**
  * Indigo (accent) button for interactive actions like "Test connection". The
  * single orange primary CTA (Save) uses {@link PrimaryButton}; every other
@@ -866,6 +885,14 @@ function ProviderRow({
     const sync = useSyncAdminGitProvider();
     const test = useTestAdminGitProvider();
     const [scopeOpen, setScopeOpen] = useState(false);
+    // First-sync history window (months). Only meaningful — and only surfaced —
+    // before this provider has ever synced: once a cursor exists the server ignores
+    // it (re-widening would double-count), so the input disappears and "Sync now"
+    // sends no window. Gate on the server's cursor-derived `first_sync_pending`, NOT
+    // `last_sync_at`: the latter only tracks sync-now runs, so it would keep showing
+    // the (server-ignored) input after a scheduled/CLI first sync.
+    const [windowMonths, setWindowMonths] = useState(FIRST_SYNC_WINDOW_DEFAULT_MONTHS);
+    const isFirstSync = provider.first_sync_pending;
     // Derived (not mount-time-seeded): the create flow's hook-level invalidation
     // is awaited BEFORE the created callback runs, so this row mounts from the
     // refetched list first and the prompt flag lands on a re-render — a
@@ -958,8 +985,31 @@ function ProviderRow({
                         </AccentButton>
                         {!isConfig ? (
                             <>
+                                {isFirstSync ? (
+                                    <label className="flex items-center gap-1 text-xs text-muted">
+                                        <span>Last</span>
+                                        <input
+                                            type="number"
+                                            min={FIRST_SYNC_WINDOW_MIN_MONTHS}
+                                            max={FIRST_SYNC_WINDOW_MAX_MONTHS}
+                                            step={1}
+                                            value={windowMonths}
+                                            onChange={(e) => setWindowMonths(clampWindowMonths(e.target.value))}
+                                            disabled={syncRunning || !provider.enabled}
+                                            aria-label="First-sync history window in months"
+                                            title="First sync only: how many months of history to import"
+                                            className="w-14 rounded border border-border bg-surface px-1.5 py-0.5 text-xs text-foreground disabled:opacity-50"
+                                        />
+                                        <span>months</span>
+                                    </label>
+                                ) : null}
                                 <AccentButton
-                                    onClick={() => sync.mutate(provider.id)}
+                                    onClick={() =>
+                                        sync.mutate({
+                                            id: provider.id,
+                                            months: isFirstSync ? windowMonths : undefined,
+                                        })
+                                    }
                                     disabled={syncRunning || !provider.enabled}
                                     title={provider.enabled ? undefined : 'Enable the provider to sync'}
                                 >

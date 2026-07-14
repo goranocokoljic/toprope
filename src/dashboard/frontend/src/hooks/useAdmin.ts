@@ -239,9 +239,17 @@ export function useTestDraftGitProvider(): UseMutationResult<GitProviderProbeRes
  * progress") or 503 must also refresh the list so the row picks up the actual
  * in-flight run and polling starts — otherwise the UI contradicts its own error.
  */
-export function useSyncAdminGitProvider(): UseMutationResult<GitProviderSyncHandle, Error, string> {
+export function useSyncAdminGitProvider(): UseMutationResult<
+    GitProviderSyncHandle,
+    Error,
+    {id: string; months?: number}
+> {
     const invalidate = useInvalidateGitProviders();
-    return useMutation({mutationFn: (id: string) => api.syncAdminGitProvider(id), onSettled: invalidate});
+    return useMutation({
+        mutationFn: ({id, months}: {id: string; months?: number}) =>
+            api.syncAdminGitProvider(id, months),
+        onSettled: invalidate,
+    });
 }
 
 /**

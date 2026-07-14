@@ -24,7 +24,16 @@ import {
 import {loadServerKey} from '../../../connectors/git/providers/secret';
 import {providerContainer, resolveGitProviderConfigs} from '../../../connectors/git/providers/config';
 import {createGitProvider} from '../../../connectors/git/providers/factory';
-import {GitSync, UNMATCHED_AUTHORS_PREFIX, type GitSyncProgress} from '../../../connectors/git/sync';
+import {
+    GitSync,
+    UNMATCHED_AUTHORS_PREFIX,
+    FIRST_SYNC_WINDOW_MIN_MONTHS,
+    FIRST_SYNC_WINDOW_MAX_MONTHS,
+    FIRST_SYNC_WINDOW_DEFAULT_MONTHS,
+    syncStateKey,
+    loadProviderCursorKeys,
+    type GitSyncProgress,
+} from '../../../connectors/git/sync';
 import {gitProviderFixHint} from '../../../cli/doctor';
 import type {GitConnectorConfig} from '../../../config/types';
 import type {GitProviderConfig, GitProviderType} from '../../../connectors/git/providers/types';
@@ -74,6 +83,16 @@ export interface AdminGitProviderDto extends Omit<PublicGitProvider, 'created_at
     created_at: string | null;
     updated_at: string | null;
     active_sync: ActiveSyncDto | null;
+    /**
+     * True when this provider has NEVER completed a sync — i.e. it has no stored
+     * pipeline cursor yet. This is the real "first sync pending" gate the "Sync now"
+     * first-sync history-window input keys off (#228), NOT the row's `last_sync_at`:
+     * the cursor is written by the pipeline on every path (sync-now, scheduler, CLI)
+     * whereas `last_sync_at` is written only by the sync-now route, so they diverge
+     * after a scheduled/CLI first sync. Always false for config-file rows (read-only;
+     * they never show the window input).
+     */
+    first_sync_pending: boolean;
 }
 
 /**
@@ -157,6 +176,32 @@ function optionalBoolean(body: Record<string, unknown>, field: string): boolean 
     if (value === undefined || value === null) return undefined;
     if (typeof value !== 'boolean') {
         throw new BadProviderRequestError(`${field} must be a boolean`);
+    }
+    return value;
+}
+
+// Parse the optional first-sync history window (in months) from the /sync body.
+// An absent body or absent `months` field ⇒ the default window. A PRESENT value is
+// validated fail-closed at this trust boundary: it must be an integer within the
+// hard bounds — a non-number, non-integer, or out-of-range value is a 400, never
+// silently coerced or clamped (an admin typo must not quietly disable the guard or
+// re-drain the whole rate-limit budget). The pipeline only honors it on a
+// provider's first sync; once a cursor exists it is ignored regardless.
+function parseFirstSyncWindowMonths(rawBody: unknown): number {
+    const body = asObject(rawBody);
+    if (!body || body.months === undefined || body.months === null) {
+        return FIRST_SYNC_WINDOW_DEFAULT_MONTHS;
+    }
+    const value = body.months;
+    if (
+        typeof value !== 'number' ||
+        !Number.isInteger(value) ||
+        value < FIRST_SYNC_WINDOW_MIN_MONTHS ||
+        value > FIRST_SYNC_WINDOW_MAX_MONTHS
+    ) {
+        throw new BadProviderRequestError(
+            `months must be an integer between ${FIRST_SYNC_WINDOW_MIN_MONTHS} and ${FIRST_SYNC_WINDOW_MAX_MONTHS}`,
+        );
     }
     return value;
 }
@@ -306,16 +351,28 @@ function configProviderToDto(config: GitProviderConfig): AdminGitProviderDto {
         last_sync_status: null,
         last_sync_error: null,
         active_sync: null,
+        // Config rows are read-only and never show the window input.
+        first_sync_pending: false,
     };
 }
 
 // `activeSync` is the route registration's in-flight entry for this row (null
 // when no run is in flight — the common case for create/update responses).
+// `firstSyncPending` is whether this provider still lacks a pipeline cursor; it
+// defaults to true because the only caller that omits it is the create route
+// (a brand-new provider has never synced). The list/patch routes derive it from
+// the stored cursor set (see loadProviderCursorKeys).
 function dbProviderToDto(
     record: Parameters<typeof toPublicProvider>[0],
     activeSync: ActiveSyncDto | null = null,
+    firstSyncPending = true,
 ): AdminGitProviderDto {
-    return {...toPublicProvider(record), source: 'db', active_sync: activeSync};
+    return {
+        ...toPublicProvider(record),
+        source: 'db',
+        active_sync: activeSync,
+        first_sync_pending: firstSyncPending,
+    };
 }
 
 // Map a typed store error to an HTTP reply. secret_key_unconfigured is a
@@ -437,8 +494,14 @@ export function registerAdminGitProviderRoutes(
         if (!isAdmin(request)) return forbidden(reply);
         // DB providers first (store's deterministic created_at, id order), then
         // config-file providers in declaration order — a total, stable ordering.
+        // Resolve the stored cursor set ONCE (not per row) to drive first_sync_pending.
+        const cursorKeys = loadProviderCursorKeys(db);
         const dbRows = listProviders(db).map((record) =>
-            dbProviderToDto(record, activeSyncs.get(record.id) ?? null),
+            dbProviderToDto(
+                record,
+                activeSyncs.get(record.id) ?? null,
+                !cursorKeys.has(syncStateKey(record.type, record.container)),
+            ),
         );
         const configRows = configProviders().map(configProviderToDto);
         return {data: [...dbRows, ...configRows]};
@@ -506,7 +569,16 @@ export function registerAdminGitProviderRoutes(
                     token: parsed.token,
                     enabled: parsed.enabled,
                 });
-                return {data: dbProviderToDto(record, activeSyncs.get(id) ?? null)};
+                // An edit may rename the container (and thus the cursor key), so
+                // recompute first_sync_pending against the stored cursor set.
+                const cursorKeys = loadProviderCursorKeys(db);
+                return {
+                    data: dbProviderToDto(
+                        record,
+                        activeSyncs.get(id) ?? null,
+                        !cursorKeys.has(syncStateKey(record.type, record.container)),
+                    ),
+                };
             } catch (err) {
                 if (err instanceof GitProviderStoreError) return replyStoreError(reply, err);
                 return badRequest(reply, err instanceof Error ? err.message : String(err));
@@ -619,11 +691,23 @@ export function registerAdminGitProviderRoutes(
     // columns when the run settles (surfaced via the list endpoint). Only DB rows
     // are sync-able here: config-file providers are read-only (they sync via the
     // scheduled pipeline), so their synthetic ids are rejected like PATCH/DELETE.
-    app.post<{Params: {id: string}}>(
+    app.post<{Params: {id: string}; Body: unknown}>(
         '/api/admin/git/providers/:id/sync',
         async (request, reply) => {
             if (!isAdmin(request)) return forbidden(reply);
             const {id} = request.params;
+
+            // First-sync history window (months): validated fail-closed before any
+            // work starts. Only applied on a provider's first sync (empty cursor);
+            // the pipeline ignores it once a cursor exists, so pressing "Sync now"
+            // again can't re-widen the window and double-count.
+            let firstSyncWindowMonths: number;
+            try {
+                firstSyncWindowMonths = parseFirstSyncWindowMonths(request.body);
+            } catch (err) {
+                if (err instanceof BadProviderRequestError) return badRequest(reply, err.message);
+                throw err;
+            }
 
             // Config-file providers have no row to update and are read-only in the UI.
             if (configProviders().some((c) => configProviderId(c) === id)) {
@@ -685,9 +769,14 @@ export function registerAdminGitProviderRoutes(
             // merge accuracy is a property of that shared pipeline model (owned by the
             // git-sync design), not of this per-provider trigger — see the epic review.
             void gitSync
-                .syncProviders(db, [config], (progress) => {
-                    active.progress = progress;
-                })
+                .syncProviders(
+                    db,
+                    [config],
+                    (progress) => {
+                        active.progress = progress;
+                    },
+                    {firstSyncWindowMonths},
+                )
                 .then((result) => {
                     // A sync that ran but collected per-repo/provider errors is an
                     // error outcome with a surfaced message — never swallowed. But

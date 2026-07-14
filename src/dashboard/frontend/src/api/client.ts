@@ -598,11 +598,15 @@ export const api = {
         return postJson<GitProviderProbeResult>('/api/admin/git/providers/test', input);
     },
 
-    /** Trigger a sync for one saved DB provider (fire-and-forget). */
-    async syncAdminGitProvider(id: string): Promise<GitProviderSyncHandle> {
+    /**
+     * Trigger a sync for one saved DB provider (fire-and-forget). `months` sets the
+     * first-sync history window and is sent only when provided (the server defaults
+     * it and ignores it entirely once the provider has a stored cursor).
+     */
+    async syncAdminGitProvider(id: string, months?: number): Promise<GitProviderSyncHandle> {
         const body = await postJson<ApiEnvelope<GitProviderSyncHandle>>(
             `/api/admin/git/providers/${encodeURIComponent(id)}/sync`,
-            {},
+            months === undefined ? {} : {months},
         );
         return body.data;
     },
