@@ -62,6 +62,56 @@ export interface GitSyncProgress {
  */
 export type GitSyncProgressListener = (progress: GitSyncProgress) => void;
 
+// Hard bounds for the first-sync history window (in whole months), enforced at the
+// API trust boundary AND defensively here. Integer, inclusive on both ends: the
+// lower bound keeps the window meaningful (a 0-month window would import nothing on
+// the first sync), the upper bound stops "6 months" quietly becoming "walk the
+// org's entire history" and re-draining the very rate-limit quota this feature
+// exists to protect.
+export const FIRST_SYNC_WINDOW_MIN_MONTHS = 1;
+export const FIRST_SYNC_WINDOW_MAX_MONTHS = 60;
+export const FIRST_SYNC_WINDOW_DEFAULT_MONTHS = 6;
+
+/** Knobs a sync run accepts beyond the provider set. */
+export interface SyncRunOptions {
+    /**
+     * On a provider's FIRST sync (no stored cursor yet) clamp the history window to
+     * `now - firstSyncWindowMonths` instead of walking all history from ''. This is
+     * the lever that stops run #1 draining a provider's whole rate-limit budget.
+     *
+     * IGNORED once a provider has a stored cursor: `since` is cursor-derived and the
+     * snapshot upsert is additive, so re-widening the window on a later run would
+     * double-count the already-recorded span. Omitting it (undefined) preserves the
+     * legacy "walk all history on first sync" behavior — the scheduled path passes
+     * nothing and is deliberately unchanged.
+     */
+    firstSyncWindowMonths?: number;
+}
+
+/**
+ * The `since` cursor for a provider's FIRST sync given a window in whole months:
+ * `now - months`, in UTC ISO. `undefined` months (or a value outside the hard
+ * bounds / a bad `now`) falls back to '' — i.e. walk all history — so a caller that
+ * skips the window, or an out-of-range value that slipped past validation, degrades
+ * to the legacy behavior rather than importing a wrong window. Exported for tests.
+ */
+export function firstSyncSince(now: string, months: number | undefined): string {
+    if (
+        months === undefined ||
+        !Number.isInteger(months) ||
+        months < FIRST_SYNC_WINDOW_MIN_MONTHS ||
+        months > FIRST_SYNC_WINDOW_MAX_MONTHS
+    ) {
+        return '';
+    }
+    const start = new Date(now);
+    if (Number.isNaN(start.getTime())) return '';
+    // UTC month arithmetic (all toprope timestamps are UTC); JS handles the year
+    // rollover when the subtraction crosses January.
+    start.setUTCMonth(start.getUTCMonth() - months);
+    return start.toISOString();
+}
+
 // Mutate-then-emit reporter threaded through the pipeline: applies `mutate` to
 // the run's single progress state, then emits a defensive copy so a listener
 // can never mutate pipeline state. Undefined when no listener was passed, so
@@ -407,6 +457,7 @@ async function fetchProviderData(
     now: string,
     db: Database.Database,
     report?: ProgressReporter,
+    firstSyncWindowMonths?: number,
 ): Promise<ProviderFetchResult> {
     const errors: string[] = [];
     const allCommits: AnalysisCommit[] = [];
@@ -418,7 +469,12 @@ async function fetchProviderData(
     const providerType = provider.name;
     const identifier = providerIdentifier(providerConfig);
     const stateKey = syncStateKey(providerType, identifier);
-    const since = getProviderLastSyncTime(db, stateKey) ?? '';
+    // First sync (no stored cursor): optionally clamp the window to the last N
+    // months so run #1 doesn't walk the whole history. Once a cursor exists it is
+    // the source of truth and firstSyncWindowMonths is IGNORED — re-widening `since`
+    // against additive snapshots would double-count (see SyncRunOptions).
+    const storedCursor = getProviderLastSyncTime(db, stateKey);
+    const since = storedCursor ?? firstSyncSince(now, firstSyncWindowMonths);
 
     const rawRepos = 'repos' in providerConfig ? providerConfig.repos : undefined;
     const excludeRepos =
@@ -774,6 +830,7 @@ export class GitSync implements ConnectorInterface {
         db: Database.Database,
         providerConfigs: GitProviderConfig[],
         onProgress?: GitSyncProgressListener,
+        options?: SyncRunOptions,
     ): Promise<SyncResult> {
         if (providerConfigs.length === 0) {
             return {
@@ -784,7 +841,7 @@ export class GitSync implements ConnectorInterface {
                 lastSyncTime: new Date().toISOString(),
             };
         }
-        return this.runSync(db, providerConfigs, onProgress);
+        return this.runSync(db, providerConfigs, onProgress, options);
     }
 
     // The shared pipeline body for both entry points above. Assumes a non-empty,
@@ -794,6 +851,7 @@ export class GitSync implements ConnectorInterface {
         db: Database.Database,
         providerConfigs: GitProviderConfig[],
         onProgress?: GitSyncProgressListener,
+        options?: SyncRunOptions,
     ): Promise<SyncResult> {
         const errors: string[] = [];
         let snapshotsWritten = 0;
@@ -831,7 +889,7 @@ export class GitSync implements ConnectorInterface {
         const fetchResults: Array<{result: ProviderFetchResult; providerType: GitProviderType}> = [];
 
         for (const pc of providerConfigs) {
-            const result = await fetchProviderData(pc, now, db, report);
+            const result = await fetchProviderData(pc, now, db, report, options?.firstSyncWindowMonths);
             errors.push(...result.errors);
             fetchResults.push({result, providerType: pc.type});
         }

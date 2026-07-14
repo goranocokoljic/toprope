@@ -152,6 +152,20 @@ describe('admin git-provider sync-now API (#199)', () => {
         });
     }
 
+    // Trigger with an explicit JSON body (the first-sync window flow, #228).
+    async function triggerSyncBody(
+        id: string,
+        payload: Record<string, unknown>,
+        token = adminToken,
+    ): ReturnType<FastifyInstance['inject']> {
+        return app.inject({
+            method: 'POST',
+            url: `/api/admin/git/providers/${id}/sync`,
+            headers: authHeaders(token),
+            payload,
+        });
+    }
+
     async function readProvider(id: string): Promise<ProviderListRow | undefined> {
         const res = await app.inject({
             method: 'GET',
@@ -449,6 +463,69 @@ describe('admin git-provider sync-now API (#199)', () => {
             expect(res.statusCode).toBe(503);
             expect(res.json().message).toMatch(/TOPROPE_SECRET_KEY is not set/);
             // No run started — no in-flight leak, status untouched.
+            expect((await readProvider(id))?.last_sync_status).toBeNull();
+        });
+    });
+
+    describe('POST /:id/sync — first-sync history window (#228)', () => {
+        // Mock getCommits so the run resolves fast AND we can read the `since`
+        // argument the window computed. Returns [] so no snapshot bookkeeping runs.
+        async function armGetCommits(): Promise<ReturnType<typeof vi.fn>> {
+            const getCommits = vi.fn().mockResolvedValue([]);
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits,
+                }),
+            );
+            return getCommits;
+        }
+
+        it('forwards a valid months window to the first sync (since ≈ now − months)', async () => {
+            const id = await createGithub();
+            const getCommits = await armGetCommits();
+
+            const before = Date.now();
+            const res = await triggerSyncBody(id, {months: 3});
+            expect(res.statusCode).toBe(202);
+            await waitForSyncStatus(id, 'ok');
+
+            const since = getCommits.mock.calls[0][1] as string;
+            expect(since).not.toBe('');
+            const expected = new Date(before);
+            expected.setUTCMonth(expected.getUTCMonth() - 3);
+            expect(Math.abs(Date.parse(since) - expected.getTime())).toBeLessThan(60_000);
+        });
+
+        it('defaults to a 6-month window when the body omits months', async () => {
+            const id = await createGithub();
+            const getCommits = await armGetCommits();
+
+            const before = Date.now();
+            // No payload at all — the default must still clamp (not walk all history).
+            const res = await triggerSync(id);
+            expect(res.statusCode).toBe(202);
+            await waitForSyncStatus(id, 'ok');
+
+            const since = getCommits.mock.calls[0][1] as string;
+            expect(since).not.toBe('');
+            const expected = new Date(before);
+            expected.setUTCMonth(expected.getUTCMonth() - 6);
+            expect(Math.abs(Date.parse(since) - expected.getTime())).toBeLessThan(60_000);
+        });
+
+        it('rejects an out-of-range or non-integer months with 400 and starts no run', async () => {
+            const id = await createGithub();
+            const getCommits = await armGetCommits();
+
+            for (const bad of [0, -1, 1000, 3.5, 'six', true]) {
+                const res = await triggerSyncBody(id, {months: bad});
+                expect(res.statusCode).toBe(400);
+                expect(res.json().message).toMatch(/months must be an integer/);
+            }
+            // A rejected request must never have kicked off the pipeline.
+            expect(getCommits).not.toHaveBeenCalled();
             expect((await readProvider(id))?.last_sync_status).toBeNull();
         });
     });

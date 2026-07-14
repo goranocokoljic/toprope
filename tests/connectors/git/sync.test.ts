@@ -4,7 +4,15 @@ import path from 'path';
 import {runMigrations} from '../../../src/storage/migrator';
 import {addTeam} from '../../../src/registry/teams';
 import {addDeveloper} from '../../../src/registry/developers';
-import {GitSync, type GitSyncProgress, type GitSyncStage} from '../../../src/connectors/git/sync';
+import {
+    GitSync,
+    firstSyncSince,
+    FIRST_SYNC_WINDOW_MIN_MONTHS,
+    FIRST_SYNC_WINDOW_MAX_MONTHS,
+    FIRST_SYNC_WINDOW_DEFAULT_MONTHS,
+    type GitSyncProgress,
+    type GitSyncStage,
+} from '../../../src/connectors/git/sync';
 import {createProvider} from '../../../src/connectors/git/providers/store';
 import {loadServerKey} from '../../../src/connectors/git/providers/secret';
 import type {GitConnectorConfig} from '../../../src/config/types';
@@ -1444,5 +1452,107 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
             expect(final.commits_fetched).toBe(1);
             expect(result.errors.some((e) => /bad-repo.*Failed to fetch commits/.test(e))).toBe(true);
         });
+    });
+});
+
+describe('firstSyncSince — first-sync window math (#228)', () => {
+    it('clamps to now − N months in UTC for an in-range integer', () => {
+        expect(firstSyncSince('2026-03-15T12:00:00.000Z', 6)).toBe('2025-09-15T12:00:00.000Z');
+        expect(firstSyncSince('2026-03-15T12:00:00.000Z', 1)).toBe('2026-02-15T12:00:00.000Z');
+    });
+
+    it('handles the year rollover when the subtraction crosses January', () => {
+        expect(firstSyncSince('2026-02-15T00:00:00.000Z', 6)).toBe('2025-08-15T00:00:00.000Z');
+        expect(firstSyncSince('2026-01-10T00:00:00.000Z', 3)).toBe('2025-10-10T00:00:00.000Z');
+    });
+
+    it('falls back to "" (walk all history) when the window is undefined', () => {
+        expect(firstSyncSince('2026-03-15T12:00:00.000Z', undefined)).toBe('');
+    });
+
+    it('falls back to "" for out-of-range or non-integer months (fail-safe, not clamp)', () => {
+        // Below the floor, above the ceiling, and fractional — each degrades to the
+        // legacy behavior rather than silently importing a wrong window.
+        expect(firstSyncSince('2026-03-15T12:00:00.000Z', FIRST_SYNC_WINDOW_MIN_MONTHS - 1)).toBe('');
+        expect(firstSyncSince('2026-03-15T12:00:00.000Z', FIRST_SYNC_WINDOW_MAX_MONTHS + 1)).toBe('');
+        expect(firstSyncSince('2026-03-15T12:00:00.000Z', 3.5)).toBe('');
+        expect(firstSyncSince('2026-03-15T12:00:00.000Z', Number.NaN)).toBe('');
+    });
+
+    it('falls back to "" when now is not a parseable date', () => {
+        expect(firstSyncSince('not-a-date', 6)).toBe('');
+    });
+});
+
+describe('GitSync.syncProviders — first-sync window plumbing (#228)', () => {
+    let db: Database.Database;
+
+    beforeEach(() => {
+        db = makeDb();
+        vi.resetAllMocks();
+    });
+
+    afterEach(() => {
+        db.close();
+        vi.restoreAllMocks();
+    });
+
+    const CONFIG: GitProviderConfig = {
+        type: 'github',
+        org: 'test-org',
+        auth: {type: 'token', api_token: 'test-token'},
+    };
+    // The cursor key the pipeline reads/writes for this provider.
+    const STATE_KEY = 'git_last_sync:github:test-org';
+
+    // Run one sync and return the `since` argument getCommits was invoked with.
+    async function sinceForRun(options?: {firstSyncWindowMonths?: number}): Promise<string> {
+        const createGitProvider = await getCreateGitProvider();
+        const getCommits = vi.fn().mockResolvedValue([]);
+        createGitProvider.mockReturnValue(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                getCommits,
+            }),
+        );
+        await new GitSync({enabled: false}).syncProviders(db, [CONFIG], undefined, options);
+        expect(getCommits).toHaveBeenCalled();
+        return getCommits.mock.calls[0][1] as string;
+    }
+
+    it('clamps the first-sync window to ~now − months when no cursor exists', async () => {
+        const before = Date.now();
+        const since = await sinceForRun({firstSyncWindowMonths: 3});
+        expect(since).not.toBe('');
+        const expected = new Date(before);
+        expected.setUTCMonth(expected.getUTCMonth() - 3);
+        // Within a minute of the computed instant (wall-clock advances during the run).
+        expect(Math.abs(Date.parse(since) - expected.getTime())).toBeLessThan(60_000);
+    });
+
+    it('walks all history ("") on the first sync when no window option is passed', async () => {
+        // The scheduled path passes no options — behavior must be unchanged.
+        expect(await sinceForRun(undefined)).toBe('');
+        // The first run stored a cursor (even with 0 commits); clear it so this
+        // asserts the fresh-first-sync path again with an empty options object.
+        db.prepare('DELETE FROM sync_state').run();
+        expect(await sinceForRun({})).toBe('');
+    });
+
+    it('IGNORES the window once a cursor exists — since is the cursor, not now − months', async () => {
+        // Double-count guard: snapshots are additive and `since` is cursor-derived,
+        // so a later "Sync now" must not re-widen the window and re-import the span.
+        const cursor = '2025-01-01T00:00:00.000Z';
+        db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(STATE_KEY, cursor);
+        const since = await sinceForRun({firstSyncWindowMonths: 3});
+        expect(since).toBe(cursor);
+    });
+
+    it('applies the DEFAULT window constant like the API does when asked for it', async () => {
+        const before = Date.now();
+        const since = await sinceForRun({firstSyncWindowMonths: FIRST_SYNC_WINDOW_DEFAULT_MONTHS});
+        const expected = new Date(before);
+        expected.setUTCMonth(expected.getUTCMonth() - FIRST_SYNC_WINDOW_DEFAULT_MONTHS);
+        expect(Math.abs(Date.parse(since) - expected.getTime())).toBeLessThan(60_000);
     });
 });
