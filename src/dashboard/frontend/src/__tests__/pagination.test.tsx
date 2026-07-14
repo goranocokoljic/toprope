@@ -241,19 +241,41 @@ describe('usePagination', () => {
         expect(result.current.pageItems).toEqual(b.slice(0, 10));
     });
 
-    it('treats successive fresh empty arrays as one identity (no reset loop while loading)', () => {
+    it('does not infinite-loop when items is a FRESH [] each render (the data ?? [] loading pattern)', () => {
+        // The callback builds a brand-new empty array on EVERY render — including
+        // the adjust-state-during-render re-render — exactly like `data ?? []`
+        // recomputed in a component body while loading. Passing the array as a
+        // renderHook prop would keep a stable reference across the internal
+        // re-render and NOT exercise the guard; building it inline does. Without
+        // the empty-array identity guard this resets forever and renderHook throws
+        // "Too many re-renders".
+        const {result, rerender} = renderHook(() => usePagination([] as number[], 10));
+        expect(result.current.page).toBe(1);
+        rerender();
+        rerender();
+        expect(result.current.page).toBe(1);
+    });
+
+    it('resets to page 1 when an empty list becomes populated', () => {
         const {result, rerender} = renderHook(({items}) => usePagination(items, 10), {
             initialProps: {items: [] as number[]},
         });
-        expect(result.current.page).toBe(1);
-        // A different empty-array reference each render (the `data ?? []` pattern)
-        // must NOT loop — renderHook would throw "Too many re-renders" if it did.
-        rerender({items: []});
-        rerender({items: []});
-        expect(result.current.page).toBe(1);
-        // Empty → populated still surfaces the first page of the new list.
         rerender({items: [1, 2, 3]});
+        expect(result.current.page).toBe(1);
         expect(result.current.pageItems).toEqual([1, 2, 3]);
+    });
+
+    it('lower-clamps a below-range page (setPage(0)/negative) to 1 — no negative slice', () => {
+        const items = [10, 20, 30, 40, 50]; // stable reference across re-renders
+        const {result} = renderHook(() => usePagination(items, 2));
+        act(() => result.current.setPage(2));
+        expect(result.current.pageItems).toEqual([30, 40]);
+        act(() => result.current.setPage(0));
+        expect(result.current.page).toBe(1);
+        expect(result.current.pageItems).toEqual([10, 20]);
+        act(() => result.current.setPage(-5));
+        expect(result.current.page).toBe(1);
+        expect(result.current.pageItems).toEqual([10, 20]);
     });
 
     it('does not reset the page on a re-render with the same items reference', () => {
