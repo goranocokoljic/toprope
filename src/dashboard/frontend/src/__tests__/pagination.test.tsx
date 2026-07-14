@@ -2,6 +2,7 @@
 import '../test/setup';
 import '@testing-library/jest-dom/vitest';
 import {afterEach, describe, expect, it, vi} from 'vitest';
+import {useState} from 'react';
 import {act, cleanup, fireEvent, render, renderHook, screen} from '@testing-library/react';
 
 import {paginationRange} from '../components/paginationRange';
@@ -71,6 +72,17 @@ describe('paginationRange', () => {
             4,
             5,
             'ellipsis',
+            8,
+        ]);
+        // Mirror on the RIGHT: 8 pages, current 5 → left gap hides pages 2–3
+        // (→ ellipsis), right gap hides only page 7 (→ literal number, not `… 7 …`).
+        expect(paginationRange({page: 5, pageCount: 8, siblingCount: 1})).toEqual([
+            1,
+            'ellipsis',
+            4,
+            5,
+            6,
+            7,
             8,
         ]);
     });
@@ -289,6 +301,31 @@ describe('DataTable pageSize', () => {
         render(<DataTable columns={COLUMNS} rows={makeRows(30)} getRowKey={(r) => r.name} />);
         expect(bodyNames()).toHaveLength(30);
         expect(screen.queryByRole('navigation')).not.toBeInTheDocument();
+    });
+
+    it('keeps the current page across a parent re-render when rows/columns references are stable', () => {
+        // Regression guard for the Leaderboard inline-columns bug: a parent
+        // re-render that changes NOTHING about the rows/columns identity must not
+        // snap the pager back to page 1 (usePagination keys its identity-reset off
+        // the post-sort rows, whose identity depends on the columns reference).
+        const rows = makeRows(30);
+        function Harness(): JSX.Element {
+            const [, force] = useState(0);
+            return (
+                <>
+                    <button type="button" onClick={() => force((n) => n + 1)}>
+                        rerender
+                    </button>
+                    <DataTable columns={COLUMNS} rows={rows} getRowKey={(r) => r.name} pageSize={10} />
+                </>
+            );
+        }
+        render(<Harness />);
+        fireEvent.click(screen.getByRole('button', {name: 'Page 2'}));
+        expect(bodyNames()[0]).toBe('row-010');
+        // Force a parent re-render with stable rows/columns → page must hold.
+        fireEvent.click(screen.getByRole('button', {name: 'rerender'}));
+        expect(bodyNames()[0]).toBe('row-010');
     });
 
     it('sorts the whole list before paging and resets to page 1 on a sort change', () => {

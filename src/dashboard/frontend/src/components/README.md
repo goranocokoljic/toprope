@@ -185,8 +185,14 @@ POST-SORT rows via `usePagination` and renders a `<Pagination>` footer:
 ```
 Sorting reorders the full list first, then the current page is sliced; a sort
 change (or any new `rows` identity — a filter/search) resets to page 1. Omit
-`pageSize` and every existing consumer is byte-for-byte unchanged (all rows, no
-footer). `paginationLabel` overrides the pager's `<nav aria-label>`.
+`pageSize` and every existing consumer renders the same table with all rows and no
+footer. `paginationLabel` overrides the pager's `<nav aria-label>`.
+
+**Stability requirement.** When `pageSize` is set, the page holds only while BOTH
+`rows` and `columns` are stable references — the table's post-sort rows identity
+(which the pager keys off) depends on `columns`, so an inline `columns` array
+(fresh each render) snaps the pager back to page 1 on any re-render. Use a
+module-level or `useMemo`'d `columns` (as TeamsList / TeamDetail / Leaderboard do).
 
 ---
 

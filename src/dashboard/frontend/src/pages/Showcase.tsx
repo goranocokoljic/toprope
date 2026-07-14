@@ -15,12 +15,6 @@ import {formatDateTick} from '../components/format';
 const SHOWCASE_PAGE_SIZE = 12;
 
 /**
- * Stable empty fallback: `usePagination` resets to page 1 on an items-reference
- * change, so a fresh `[]` literal each render (while data loads) would loop.
- */
-const NO_SHOWCASES: BrowseShowcaseSummary[] = [];
-
-/**
  * Showcase gallery (Task 6.3.9 / #172) — the browsable, searchable library of
  * exemplar AI conversations the org has chosen to celebrate.
  *
@@ -47,10 +41,11 @@ export function Showcase(): JSX.Element {
         setFilters({});
     }
 
-    const showcases = data?.showcases ?? NO_SHOWCASES;
+    const showcases = data?.showcases ?? [];
     const hasActiveFilters = Boolean(filters.q || filters.tag || filters.scope);
     // A new search/filter refetches → fresh reference → page resets to 1; stable
-    // across a pager click (same `data` reference), so paging holds.
+    // across a pager click (same `data` reference), so paging holds. The loading
+    // `?? []` case is safe: usePagination treats two empty arrays as one identity.
     const paged = usePagination(showcases, SHOWCASE_PAGE_SIZE);
 
     return (

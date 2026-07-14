@@ -16,12 +16,6 @@ import {contributionModelExplainer, contributionModelLabel} from '../components/
 const PRACTICE_PAGE_SIZE = 12;
 
 /**
- * Stable empty fallback: `usePagination` resets to page 1 on an items-reference
- * change, so a fresh `[]` literal each render (while data loads) would loop.
- */
-const NO_PRACTICES: BrowsePracticeSummary[] = [];
-
-/**
  * Best-practice browse UI (Task 6.2.8 / #163) — the browsable, searchable library.
  *
  * The non-contextual discovery path that complements the contextual surfacing (6.2.7):
@@ -47,11 +41,12 @@ export function BestPractices(): JSX.Element {
         setFilters({});
     }
 
-    const practices = data?.practices ?? NO_PRACTICES;
+    const practices = data?.practices ?? [];
     const hasActiveFilters = Boolean(filters.q || filters.tag || filters.scope);
     // A new search/filter refetches, so `practices` is a fresh reference and the
     // hook resets to page 1; the clamp guards a shrink. Stable across a pager
-    // click (same `data` reference), so paging holds.
+    // click (same `data` reference), so paging holds. The loading `?? []` case is
+    // safe: usePagination treats two empty arrays as one identity (no reset loop).
     const paged = usePagination(practices, PRACTICE_PAGE_SIZE);
 
     return (

@@ -166,6 +166,10 @@ export function DataTable<T>({
     const paged = usePagination(sortedRows, pageSize && pageSize > 0 ? pageSize : Number.MAX_SAFE_INTEGER);
     const paginated = pageSize !== undefined && pageSize > 0;
     const displayRows = paginated ? paged.pageItems : sortedRows;
+    // Only wrap + render the footer when there is more than one page — a
+    // single-page paginated table renders exactly like an unpaginated one (no
+    // empty pager wrapper), matching the card-list / PaginatedTable adopters.
+    const showPager = paginated && paged.pageCount > 1;
 
     function toggleSort(key: string): void {
         const next = (current: SortState | null): SortState => {
@@ -249,9 +253,9 @@ export function DataTable<T>({
         </div>
     );
 
-    // Byte-for-byte unchanged for existing consumers: no `pageSize` → just the
-    // scroll container, no wrapper, no footer.
-    if (!paginated) return table;
+    // Existing consumers are unchanged: with no `pageSize` (or a single page of
+    // rows) this returns just the scroll container — no wrapper, no footer.
+    if (!showPager) return table;
 
     return (
         <div className="flex flex-col gap-3">

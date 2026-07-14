@@ -21,7 +21,12 @@ export interface UsePaginationResult<T> {
  *  2. **Reset on identity change** — when the `items` REFERENCE changes (a new
  *     array from a filter/sort/search), the page snaps back to 1. This relies on
  *     the caller passing a STABLE reference across renders (memoize derived
- *     lists with `useMemo`) so an unrelated re-render doesn't reset the page.
+ *     lists with `useMemo`) so an unrelated re-render doesn't reset the page. A
+ *     fresh NON-empty array every render will reset every render — memoize it.
+ *     (An empty `data ?? []` fallback is the one exception the guard below
+ *     tolerates.) When feeding this via `DataTable`'s `pageSize`, the same
+ *     stability requirement extends to the `columns` prop, since the table's
+ *     post-sort rows identity depends on it.
  *
  * `DataTable`'s `pageSize` and every card/gallery list use this; it owns no
  * rendering, only the page math.
@@ -44,8 +49,9 @@ export function usePagination<T>(items: T[], pageSize: number): UsePaginationRes
     const pageCount = Math.max(1, Math.ceil(items.length / size));
     // Clamp every render so `page` state briefly exceeding range (a shrink that
     // didn't change identity, or the frame before the reset commits) can never
-    // slice out of bounds.
-    const safePage = Math.min(page, pageCount);
+    // slice out of bounds. Clamp BOTH bounds so the public `setPage` — exposed
+    // unclamped — can't produce a negative slice from a `setPage(0)`/negative.
+    const safePage = Math.min(Math.max(page, 1), pageCount);
     const pageItems = items.slice((safePage - 1) * size, safePage * size);
 
     return {page: safePage, setPage, pageCount, pageItems};
