@@ -252,6 +252,42 @@ describe('TeamsList', () => {
         expect(teamRowOrder()).toEqual(['frontend', 'backend']);
     });
 
+    it('paginates the team list at 25 rows per page and navigates pages', async () => {
+        const many: TeamListItem[] = Array.from({length: 30}, (_, i) => ({
+            name: `team-${String(i).padStart(2, '0')}`,
+            department: 'Engineering',
+            manager: 'Mae',
+            developer_count: 3,
+            active_count: 2,
+            tool_mix: ['copilot'],
+            total_monthly_cost: 100,
+            utilization_rate: 0.6,
+        }));
+        fetchMock.mockImplementation(async (url: unknown) => {
+            const path = new URL(String(url), 'http://localhost').pathname;
+            if (path === '/api/teams') {
+                return new Response(JSON.stringify(paginated(many)), {
+                    status: 200,
+                    headers: {'Content-Type': 'application/json'},
+                });
+            }
+            return routeFetch(url);
+        });
+        renderList();
+        await screen.findByRole('table');
+
+        // Default name-asc sort → page 1 caps at 25 rows (team-00 … team-24).
+        expect(document.querySelectorAll('tbody tr')).toHaveLength(25);
+        expect(teamRowOrder()[0]).toBe('team-00');
+        expect(screen.queryByRole('link', {name: 'team-25'})).not.toBeInTheDocument();
+
+        // Page 2 → the last 5 rows.
+        fireEvent.click(screen.getByRole('button', {name: 'Next page'}));
+        expect(document.querySelectorAll('tbody tr')).toHaveLength(5);
+        expect(screen.getByRole('link', {name: 'team-29'})).toBeInTheDocument();
+        expect(screen.queryByRole('link', {name: 'team-00'})).not.toBeInTheDocument();
+    });
+
     it('shows an empty state when there are no teams', async () => {
         fetchMock.mockImplementation(async (url: unknown) => {
             const path = new URL(String(url), 'http://localhost').pathname;
@@ -343,6 +379,36 @@ describe('TeamDetail', () => {
         const adoptionSelector = screen.getAllByTestId('time-range-selector')[0];
         fireEvent.click(within(adoptionSelector).getByRole('button', {name: '90d'}));
         await waitFor(() => expect(trendCalls().some((u) => u.includes('range=90d'))).toBe(true));
+    });
+
+    it('paginates the developer list at 25 rows per page', async () => {
+        const developers = Array.from({length: 30}, (_, i) => ({
+            id: `dev-${String(i).padStart(2, '0')}`,
+            name: `Dev ${String(i).padStart(2, '0')}`,
+            email: `dev${i}@example.com`,
+            tools: ['copilot'],
+            activity_summary: {active_days_30d: 5, total_interactions_30d: 10},
+            subscription_cost: 100,
+            has_waste: false,
+        }));
+        const bigDetail: TeamDetailData = {...TEAM_DETAIL, developer_count: 30, developers};
+        fetchMock.mockImplementation(async (url: unknown) => {
+            const path = new URL(String(url), 'http://localhost').pathname;
+            if (path === '/api/teams/frontend') return jsonResponse(bigDetail);
+            return routeFetch(url);
+        });
+        renderDetail();
+        await screen.findByRole('heading', {name: 'frontend'});
+        const table = await screen.findByRole('table');
+
+        // Default name-asc → page 1 caps at 25 developer rows.
+        expect(within(table).getAllByRole('row').length).toBe(26); // 25 body rows + header
+        expect(within(table).queryByText('Dev 25')).not.toBeInTheDocument();
+
+        // The pager renders as a sibling of the table, not inside it.
+        fireEvent.click(screen.getByRole('button', {name: 'Next page'}));
+        expect(within(table).getByText('Dev 25')).toBeInTheDocument();
+        expect(within(table).queryByText('Dev 00')).not.toBeInTheDocument();
     });
 
     it('shows a not-found state for an unknown team', async () => {

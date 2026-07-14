@@ -7,8 +7,19 @@ import {Card} from '../components/Card';
 import {SkeletonTable} from '../components/Skeleton';
 import {ErrorState} from '../components/ErrorState';
 import {EmptyState} from '../components/EmptyState';
+import {Pagination} from '../components/Pagination';
+import {usePagination} from '../components/usePagination';
 import {formatPercent, formatDateTick} from '../components/format';
 import {contributionModelExplainer, contributionModelLabel} from '../components/practiceModel';
+
+/** Client-side page size for the practice browse list (#226). */
+const PRACTICE_PAGE_SIZE = 12;
+
+/**
+ * Stable empty fallback: `usePagination` resets to page 1 on an items-reference
+ * change, so a fresh `[]` literal each render (while data loads) would loop.
+ */
+const NO_PRACTICES: BrowsePracticeSummary[] = [];
 
 /**
  * Best-practice browse UI (Task 6.2.8 / #163) — the browsable, searchable library.
@@ -36,8 +47,12 @@ export function BestPractices(): JSX.Element {
         setFilters({});
     }
 
-    const practices = data?.practices ?? [];
+    const practices = data?.practices ?? NO_PRACTICES;
     const hasActiveFilters = Boolean(filters.q || filters.tag || filters.scope);
+    // A new search/filter refetches, so `practices` is a fresh reference and the
+    // hook resets to page 1; the clamp guards a shrink. Stable across a pager
+    // click (same `data` reference), so paging holds.
+    const paged = usePagination(practices, PRACTICE_PAGE_SIZE);
 
     return (
         <div className="space-y-6">
@@ -130,11 +145,23 @@ export function BestPractices(): JSX.Element {
             ) : null}
 
             {!isPending && !isError && practices.length > 0 ? (
-                <ul className="space-y-3" data-testid="practice-list">
-                    {practices.map((practice) => (
-                        <PracticeRow key={practice.id} practice={practice} />
-                    ))}
-                </ul>
+                <>
+                    <ul className="space-y-3" data-testid="practice-list">
+                        {paged.pageItems.map((practice) => (
+                            <PracticeRow key={practice.id} practice={practice} />
+                        ))}
+                    </ul>
+                    {paged.pageCount > 1 ? (
+                        <div className="flex justify-end">
+                            <Pagination
+                                page={paged.page}
+                                pageCount={paged.pageCount}
+                                onPageChange={paged.setPage}
+                                ariaLabel="Practice pages"
+                            />
+                        </div>
+                    ) : null}
+                </>
             ) : null}
         </div>
     );

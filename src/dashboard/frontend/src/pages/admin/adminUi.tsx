@@ -1,5 +1,8 @@
 import type {ReactNode} from 'react';
 
+import {Pagination} from '../../components/Pagination';
+import {usePagination} from '../../components/usePagination';
+
 /**
  * Small presentational primitives shared by the Admin Management screens
  * (Task 2.13). Centralized so every admin form/table reads consistently and
@@ -148,6 +151,47 @@ export function Table({head, children}: {head: ReactNode; children: ReactNode}):
 
 export function Th({children}: {children: ReactNode}): JSX.Element {
     return <th className="px-3 py-2 font-medium">{children}</th>;
+}
+
+/**
+ * The raw `<Table>` plus shared client-side pagination (#225): one canonical
+ * wrapper so no admin view hand-rolls the `usePagination` + `<Pagination>`
+ * wiring. Pass the fully-fetched `rows` (a STABLE reference — a filtered query's
+ * data, not a fresh array each render, or the pager resets to page 1) and a
+ * `renderRow` that returns the `<tr>` for one row (own its own `key`). Only the
+ * current page's rows render; the pager appears below when there is more than
+ * one page. Filter/search-driven changes arrive as a new `rows` reference, which
+ * resets to page 1 via the hook.
+ */
+export function PaginatedTable<T>({
+    head,
+    rows,
+    renderRow,
+    pageSize = 25,
+    ariaLabel = 'Table pages',
+}: {
+    head: ReactNode;
+    rows: T[];
+    renderRow: (row: T) => ReactNode;
+    pageSize?: number;
+    ariaLabel?: string;
+}): JSX.Element {
+    const paged = usePagination(rows, pageSize);
+    return (
+        <div className="flex flex-col gap-3">
+            <Table head={head}>{paged.pageItems.map(renderRow)}</Table>
+            {paged.pageCount > 1 ? (
+                <div className="flex justify-end">
+                    <Pagination
+                        page={paged.page}
+                        pageCount={paged.pageCount}
+                        onPageChange={paged.setPage}
+                        ariaLabel={ariaLabel}
+                    />
+                </div>
+            ) : null}
+        </div>
+    );
 }
 
 export function Td({children}: {children: ReactNode}): JSX.Element {

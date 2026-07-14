@@ -9,10 +9,10 @@ import {
 import {
     ErrorText,
     PageHeader,
+    PaginatedTable,
     PrimaryButton,
     SecondaryButton,
     SelectField,
-    Table,
     Td,
     TextField,
     Th,
@@ -107,7 +107,7 @@ export function AdminSubscriptions(): JSX.Element {
                 ) : subs.isError ? (
                     <p className="text-sm text-danger">Failed to load: {subs.error.message}</p>
                 ) : (
-                    <Table
+                    <PaginatedTable
                         head={
                             <>
                                 <Th>Developer</Th>
@@ -117,8 +117,9 @@ export function AdminSubscriptions(): JSX.Element {
                                 <Th>Actions</Th>
                             </>
                         }
-                    >
-                        {(subs.data ?? []).map((s) => (
+                        rows={subs.data ?? []}
+                        ariaLabel="Subscription pages"
+                        renderRow={(s) => (
                             <tr key={s.id} className="border-b border-border/60">
                                 <Td>{s.developer_name}</Td>
                                 <Td>{s.tool}</Td>
@@ -130,8 +131,8 @@ export function AdminSubscriptions(): JSX.Element {
                                     </SecondaryButton>
                                 </Td>
                             </tr>
-                        ))}
-                    </Table>
+                        )}
+                    />
                 )}
             </Card>
         </div>

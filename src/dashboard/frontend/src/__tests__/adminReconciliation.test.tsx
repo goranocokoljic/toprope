@@ -95,6 +95,41 @@ describe('AdminReconciliation page', () => {
         expect(screen.getByText('Expense, no subscription')).toBeInTheDocument();
     });
 
+    it('paginates results at 25 per page and resets to page 1 when the status filter changes', async () => {
+        results = Array.from({length: 30}, (_, i) => ({
+            id: `r-${String(i).padStart(2, '0')}`,
+            run_at: '2026-06-15T00:00:00.000Z',
+            period: '2026-06',
+            result_type: 'expense_no_subscription' as const,
+            developer_id: `dev-${i}`,
+            developer_name: `Dev ${String(i).padStart(2, '0')}`,
+            developer_email: `dev${i}@test.com`,
+            team: 'frontend',
+            tool: 'cursor',
+            expense_amount: 20,
+            registry_amount: null,
+            details: null,
+            status: 'open' as const,
+            resolution: null,
+            resolved_at: null,
+        }));
+        renderPage(<AdminReconciliation />);
+        await screen.findByText('Dev 00');
+
+        // Page 1 caps at 25 rows.
+        expect(document.querySelectorAll('tbody tr')).toHaveLength(25);
+        expect(screen.queryByText('Dev 25')).not.toBeInTheDocument();
+
+        // Go to page 2, then flip the status filter → the new query's data is a
+        // fresh reference, so the shared hook snaps back to page 1.
+        fireEvent.click(screen.getByRole('button', {name: 'Next page'}));
+        expect(screen.getByText('Dev 25')).toBeInTheDocument();
+        fireEvent.click(screen.getByRole('button', {name: 'All'}));
+        await waitFor(() => expect(screen.getByText('Dev 00')).toBeInTheDocument());
+        expect(document.querySelectorAll('tbody tr')).toHaveLength(25);
+        expect(screen.queryByText('Dev 25')).not.toBeInTheDocument();
+    });
+
     it('runs reconciliation via POST', async () => {
         renderPage(<AdminReconciliation />);
         await screen.findByText('Carol Dev');

@@ -85,6 +85,9 @@ function LeaderboardTable({team, metric}: {team: string; metric: LeaderboardMetr
             getRowKey={(r) => r.developer_id}
             initialSort={{key: 'rank', direction: 'asc'}}
             caption={`Leaderboard for ${team} by ${metric}`}
+            // One row per developer — can grow large. Client-side over the
+            // already-fetched list; 25/page.
+            pageSize={25}
         />
     );
 }

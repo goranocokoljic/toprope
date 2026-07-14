@@ -5,6 +5,7 @@ import {Badge} from '../../components/Badge';
 import {StatePanel} from '../../components/StatePanel';
 import {Modal} from '../../components/Modal';
 import {DataTable, type Column, type SortState} from '../../components/DataTable';
+import {Pagination} from '../../components/Pagination';
 import {
     useAdminDataSources,
     useAdminGitProviderRepos,
@@ -754,22 +755,21 @@ function RepoScopeModal({
                                 />
                             </div>
                             {pageCount > 1 ? (
-                                <div className="mt-2 flex items-center gap-3" data-testid="repo-pagination">
-                                    <SecondaryButton
-                                        onClick={() => setPage(safePage - 1)}
-                                        disabled={safePage === 0}
-                                    >
-                                        Previous
-                                    </SecondaryButton>
-                                    <span className="text-sm text-muted">
-                                        Page {safePage + 1} of {pageCount}
-                                    </span>
-                                    <SecondaryButton
-                                        onClick={() => setPage(safePage + 1)}
-                                        disabled={safePage === pageCount - 1}
-                                    >
-                                        Next
-                                    </SecondaryButton>
+                                <div className="mt-2" data-testid="repo-pagination">
+                                    {/* Shared pager (#222). Page state stays 0-based
+                                        here (the slice math predates the component),
+                                        so bridge to the 1-based control. The modal
+                                        keeps ownership of `page` rather than folding
+                                        into DataTable's `pageSize` because the sort
+                                        reads the LIVE selection — a checkbox tick
+                                        must regroup rows WITHOUT snapping back to
+                                        page 1, which an identity-reset would do. */}
+                                    <Pagination
+                                        page={safePage + 1}
+                                        pageCount={pageCount}
+                                        onPageChange={(p) => setPage(p - 1)}
+                                        ariaLabel="Repository pages"
+                                    />
                                 </div>
                             ) : null}
                             {emptySelection ? (

@@ -167,6 +167,23 @@ describe('Showcase gallery (Task 6.3.9 / #172)', () => {
         expect(await screen.findByText('No showcases yet')).toBeInTheDocument();
     });
 
+    it('paginates the gallery at 12 cards per page and navigates pages', async () => {
+        listShowcases = Array.from({length: 15}, (_, i) =>
+            summary({id: `s${i}`, title: `Showcase ${String(i).padStart(2, '0')}`}),
+        );
+        renderAt('/developer/showcase');
+        await screen.findByText('Showcase 00');
+
+        const list = screen.getByTestId('showcase-list');
+        expect(list.querySelectorAll('li')).toHaveLength(12);
+        expect(screen.queryByText('Showcase 12')).not.toBeInTheDocument();
+
+        fireEvent.click(screen.getByRole('button', {name: 'Next page'}));
+        expect(screen.getByTestId('showcase-list').querySelectorAll('li')).toHaveLength(3);
+        expect(screen.getByText('Showcase 12')).toBeInTheDocument();
+        expect(screen.queryByText('Showcase 00')).not.toBeInTheDocument();
+    });
+
     it('surfaces the author’s removal notices when present (author is notified)', async () => {
         removals = [
             {showcaseId: 's9', title: 'An old session', removedBy: 'lead', reason: 'off-topic', occurredAt: '2026-06-25T00:00:00.000Z'},

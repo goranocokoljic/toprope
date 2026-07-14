@@ -126,6 +126,28 @@ describe('WasteDetection page', () => {
         expect(screen.getByText(/No activity recorded in the last 14\+ days/i)).toBeInTheDocument();
     });
 
+    it('paginates the waste-alert list at 25 per page and navigates pages', async () => {
+        active = Array.from({length: 30}, (_, i) => ({
+            ...unusedSeat(),
+            id: `w-${String(i).padStart(2, '0')}`,
+            developer_id: `dev-${i}`,
+            developer_name: `Dev ${String(i).padStart(2, '0')}`,
+        }));
+        renderPage();
+        await screen.findByText('Dev 00');
+
+        // Page 1 caps the alert list at 25 rows.
+        const list = screen.getByTestId('waste-alert-list');
+        expect(within(list).getAllByRole('listitem')).toHaveLength(25);
+        expect(screen.queryByText('Dev 25')).not.toBeInTheDocument();
+
+        // Jump to page 2 → the remaining 5 alerts.
+        fireEvent.click(screen.getByRole('button', {name: 'Next page'}));
+        expect(within(screen.getByTestId('waste-alert-list')).getAllByRole('listitem')).toHaveLength(5);
+        expect(screen.getByText('Dev 25')).toBeInTheDocument();
+        expect(screen.queryByText('Dev 00')).not.toBeInTheDocument();
+    });
+
     it('computes total monthly waste and projected annual savings (12x)', async () => {
         renderPage();
         await screen.findByText('Alice Dev');

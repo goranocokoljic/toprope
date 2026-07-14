@@ -1,3 +1,4 @@
+import {useMemo} from 'react';
 import {Link} from 'react-router-dom';
 import {useTeams} from '../hooks/useTeamData';
 import {useWasteSummary} from '../hooks/useManagerData';
@@ -129,6 +130,13 @@ export function TeamsList(): JSX.Element {
     // waste column as "unknown" rather than blocking the whole list.
     const waste = useWasteSummary();
     const wasteKnown = !waste.isError;
+    // Memoized so the paginated DataTable sees a STABLE rows reference — a fresh
+    // array each render would reset the pager to page 1 (usePagination's
+    // identity-reset). It only changes when the underlying data does.
+    const rows = useMemo(
+        () => (teams ? mergeRows(teams, waste.data, wasteKnown) : []),
+        [teams, waste.data, wasteKnown],
+    );
 
     return (
         <div className="space-y-6">
@@ -165,10 +173,12 @@ export function TeamsList(): JSX.Element {
                     ) : null}
                     <DataTable
                         columns={COLUMNS}
-                        rows={mergeRows(teams, waste.data, wasteKnown)}
+                        rows={rows}
                         getRowKey={(r) => r.name}
                         initialSort={{key: 'name', direction: 'asc'}}
                         caption="Teams by adoption, cost, and waste — sortable by every column"
+                        // One row per team; client-side over the fully-fetched list, 25/page.
+                        pageSize={25}
                     />
                 </>
             ) : null}

@@ -5,6 +5,8 @@ import {Badge} from '../components/Badge';
 import {SkeletonStatCard, SkeletonText} from '../components/Skeleton';
 import {ErrorState} from '../components/ErrorState';
 import {EmptyState} from '../components/EmptyState';
+import {Pagination} from '../components/Pagination';
+import {usePagination} from '../components/usePagination';
 import {toolLabel} from '../components/toolLabels';
 import {wasteTypeLabel} from '../components/utilization';
 import {formatCurrency} from '../components/format';
@@ -268,9 +270,19 @@ function PlanRoiCard({alert}: {alert: WasteAlert}): JSX.Element {
     );
 }
 
+/** Client-side page size for the main waste-alert list (#224). */
+const WASTE_PAGE_SIZE = 25;
+
 function ActiveAlerts({alerts}: {alerts: WasteAlert[]}): JSX.Element {
-    const planRoi = alerts.filter((a) => a.alert_type === 'plan_roi');
-    const others = alerts.filter((a) => a.alert_type !== 'plan_roi');
+    // Memoized so the paginated `others` list keeps a STABLE reference across a
+    // pager click (which re-renders this component) — a fresh filter() each
+    // render would reset usePagination to page 1. They only change when the
+    // underlying alert set does (a resolve, a refetch), which SHOULD reset.
+    const planRoi = useMemo(() => alerts.filter((a) => a.alert_type === 'plan_roi'), [alerts]);
+    const others = useMemo(() => alerts.filter((a) => a.alert_type !== 'plan_roi'), [alerts]);
+    // The Plan-ROI reviews are a small curated subset; the generic waste alerts
+    // are the list that grows, so that is the one we page.
+    const paged = usePagination(others, WASTE_PAGE_SIZE);
 
     if (alerts.length === 0) {
         return (
@@ -300,11 +312,21 @@ function ActiveAlerts({alerts}: {alerts: WasteAlert[]}): JSX.Element {
 
             {others.length > 0 ? (
                 <Card title="Waste alerts">
-                    <ul className="space-y-3">
-                        {others.map((a) => (
+                    <ul className="space-y-3" data-testid="waste-alert-list">
+                        {paged.pageItems.map((a) => (
                             <GenericAlertCard key={a.id} alert={a} />
                         ))}
                     </ul>
+                    {paged.pageCount > 1 ? (
+                        <div className="mt-4 flex justify-end">
+                            <Pagination
+                                page={paged.page}
+                                pageCount={paged.pageCount}
+                                onPageChange={paged.setPage}
+                                ariaLabel="Waste alert pages"
+                            />
+                        </div>
+                    ) : null}
                 </Card>
             ) : null}
         </div>
