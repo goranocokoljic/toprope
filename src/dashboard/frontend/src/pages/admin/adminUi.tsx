@@ -1,7 +1,7 @@
 import type {ReactNode} from 'react';
 
 import {Pagination} from '../../components/Pagination';
-import {usePagination} from '../../components/usePagination';
+import {usePagination, type PageSizeOption} from '../../components/usePagination';
 
 /**
  * Small presentational primitives shared by the Admin Management screens
@@ -169,27 +169,35 @@ export function PaginatedTable<T>({
     renderRow,
     pageSize = 25,
     ariaLabel = 'Table pages',
+    pageSizeOptions,
+    storageKey,
 }: {
     head: ReactNode;
     rows: T[];
     renderRow: (row: T) => ReactNode;
+    /** Initial rows-per-page; the footer selector lets the user change it. */
     pageSize?: number;
     ariaLabel?: string;
+    pageSizeOptions?: readonly PageSizeOption[];
+    /** `localStorage` key to persist the chosen page size for this table. */
+    storageKey?: string;
 }): JSX.Element {
-    const paged = usePagination(rows, pageSize);
+    const paged = usePagination(rows, pageSize, {pageSizeOptions, storageKey});
     return (
         <div className="flex flex-col gap-3">
             <Table head={head}>{paged.pageItems.map(renderRow)}</Table>
-            {paged.pageCount > 1 ? (
-                <div className="flex justify-end">
-                    <Pagination
-                        page={paged.page}
-                        pageCount={paged.pageCount}
-                        onPageChange={paged.setPage}
-                        ariaLabel={ariaLabel}
-                    />
-                </div>
-            ) : null}
+            {/* Self-gating (renders nothing when there is neither a second page
+                nor enough rows for the size selector to matter). */}
+            <Pagination
+                page={paged.page}
+                pageCount={paged.pageCount}
+                onPageChange={paged.setPage}
+                pageSize={paged.pageSize}
+                pageSizeOptions={paged.pageSizeOptions}
+                onPageSizeChange={paged.setPageSize}
+                totalItems={rows.length}
+                ariaLabel={ariaLabel}
+            />
         </div>
     );
 }

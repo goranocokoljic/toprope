@@ -7,6 +7,13 @@ import {Modal} from '../../components/Modal';
 import {DataTable, type Column, type SortState} from '../../components/DataTable';
 import {Pagination} from '../../components/Pagination';
 import {
+    DEFAULT_PAGE_SIZE_OPTIONS,
+    isPaginationVisible,
+    loadPageSize,
+    savePageSize,
+    type PageSizeOption,
+} from '../../components/usePagination';
+import {
     useAdminDataSources,
     useAdminGitProviderRepos,
     useAdminGitProviders,
@@ -459,8 +466,10 @@ function ProviderForm({
     );
 }
 
-/** Client-side page size for the repo table (#213). */
-const REPO_PAGE_SIZE = 25;
+/** Default client-side page size for the repo table (#213); adjustable via the
+ *  footer selector (#227), persisted per-surface under this key. */
+const REPO_PAGE_SIZE_DEFAULT = 10;
+const REPO_PAGE_SIZE_STORAGE_KEY = 'toprope.rowsPerPage.repoScope';
 
 /**
  * Per-provider repo-scope MODAL (GC1.9 / #201, redesigned in #213). Two modes:
@@ -493,6 +502,13 @@ function RepoScopeModal({
     const [edited, setEdited] = useState<Set<string> | null>(null);
     const [filter, setFilter] = useState('');
     const [page, setPage] = useState(0);
+    // Rows-per-page (#227). This modal owns its own page/size state (rather than
+    // usePagination) because the sort reads the LIVE selection — a checkbox tick
+    // must regroup rows WITHOUT snapping to page 1, which the hook's identity
+    // reset would do. Seed from storage, fail-closed to the default.
+    const [pageSize, setPageSizeState] = useState<PageSizeOption>(() =>
+        loadPageSize(REPO_PAGE_SIZE_STORAGE_KEY, DEFAULT_PAGE_SIZE_OPTIONS, REPO_PAGE_SIZE_DEFAULT),
+    );
     // Default ordering is selection-first (#215): reopening a narrowed scope
     // shows the stored selection on page 1, immediately amendable. On a fresh
     // monitor-all provider the seed selects everything, so this degrades to a
@@ -552,9 +568,23 @@ function RepoScopeModal({
         return sort.direction === 'asc' ? cmp : -cmp;
     });
 
-    const pageCount = Math.max(1, Math.ceil(sortedFiltered.length / REPO_PAGE_SIZE));
+    // 'All' collapses the whole (filtered) list onto a single page.
+    const effectivePageSize =
+        pageSize === 'all' ? Math.max(1, sortedFiltered.length) : pageSize;
+    const pageCount = Math.max(1, Math.ceil(sortedFiltered.length / effectivePageSize));
     const safePage = Math.min(page, pageCount - 1);
-    const visibleRows = sortedFiltered.slice(safePage * REPO_PAGE_SIZE, (safePage + 1) * REPO_PAGE_SIZE);
+    const visibleRows = sortedFiltered.slice(
+        safePage * effectivePageSize,
+        (safePage + 1) * effectivePageSize,
+    );
+
+    // A size change reshuffles every page boundary, so restart from page 1 (the
+    // same restart a filter/sort applies here), and persist the choice.
+    function changePageSize(next: PageSizeOption): void {
+        setPageSizeState(next);
+        setPage(0);
+        savePageSize(REPO_PAGE_SIZE_STORAGE_KEY, next);
+    }
 
     function toggleRepo(slug: string, checked: boolean): void {
         const next = new Set(selected);
@@ -754,20 +784,30 @@ function RepoScopeModal({
                                     }}
                                 />
                             </div>
-                            {pageCount > 1 ? (
+                            {isPaginationVisible(
+                                sortedFiltered.length,
+                                pageCount,
+                                true,
+                                DEFAULT_PAGE_SIZE_OPTIONS,
+                            ) ? (
                                 <div className="mt-2" data-testid="repo-pagination">
-                                    {/* Shared pager (#222). Page state stays 0-based
-                                        here (the slice math predates the component),
-                                        so bridge to the 1-based control. The modal
-                                        keeps ownership of `page` rather than folding
-                                        into DataTable's `pageSize` because the sort
-                                        reads the LIVE selection — a checkbox tick
-                                        must regroup rows WITHOUT snapping back to
-                                        page 1, which an identity-reset would do. */}
+                                    {/* Shared pager (#222) + rows-per-page selector
+                                        (#227). Page state stays 0-based here (the
+                                        slice math predates the component), so bridge
+                                        to the 1-based control. The modal keeps
+                                        ownership of `page`/`pageSize` rather than
+                                        folding into DataTable's `pageSize` because
+                                        the sort reads the LIVE selection — a checkbox
+                                        tick must regroup rows WITHOUT snapping back
+                                        to page 1, which an identity-reset would do. */}
                                     <Pagination
                                         page={safePage + 1}
                                         pageCount={pageCount}
                                         onPageChange={(p) => setPage(p - 1)}
+                                        pageSize={pageSize}
+                                        pageSizeOptions={DEFAULT_PAGE_SIZE_OPTIONS}
+                                        onPageSizeChange={changePageSize}
+                                        totalItems={sortedFiltered.length}
                                         ariaLabel="Repository pages"
                                     />
                                 </div>

@@ -177,8 +177,10 @@ export function TeamsList(): JSX.Element {
                         getRowKey={(r) => r.name}
                         initialSort={{key: 'name', direction: 'asc'}}
                         caption="Teams by adoption, cost, and waste — sortable by every column"
-                        // One row per team; client-side over the fully-fetched list, 25/page.
+                        // One row per team; client-side over the fully-fetched list,
+                        // 25/page by default, adjustable via the footer.
                         pageSize={25}
+                        pageSizeStorageKey="toprope.rowsPerPage.teams"
                     />
                 </>
             ) : null}

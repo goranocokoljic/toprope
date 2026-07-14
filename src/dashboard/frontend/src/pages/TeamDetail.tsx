@@ -186,8 +186,10 @@ function DeveloperList({team}: {team: TeamDetailData}): JSX.Element {
                 emptyMessage="No developers in this team yet."
                 caption="Developers with aggregate activity, tools, and cost — not ranked against each other"
                 // Developers within a team; paginate above one page (a large team
-                // would otherwise render an unbounded list). 25/page.
+                // would otherwise render an unbounded list). 25/page by default,
+                // adjustable via the footer.
                 pageSize={25}
+                pageSizeStorageKey="toprope.rowsPerPage.teamDetail"
             />
         </Card>
     );

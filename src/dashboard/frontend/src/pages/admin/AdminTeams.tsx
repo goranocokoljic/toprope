@@ -152,6 +152,7 @@ export function AdminTeams(): JSX.Element {
                         }
                         rows={teams.data ?? []}
                         ariaLabel="Team pages"
+                        storageKey="toprope.rowsPerPage.adminTeams"
                         renderRow={(t) => <TeamRow key={t.name} team={t} />}
                     />
                 )}

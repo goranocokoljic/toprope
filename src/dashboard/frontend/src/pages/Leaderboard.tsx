@@ -95,8 +95,9 @@ function LeaderboardTable({team, metric}: {team: string; metric: LeaderboardMetr
             initialSort={{key: 'rank', direction: 'asc'}}
             caption={`Leaderboard for ${team} by ${metric}`}
             // One row per developer — can grow large. Client-side over the
-            // already-fetched list; 25/page.
+            // already-fetched list; 25/page by default, adjustable via the footer.
             pageSize={25}
+            pageSizeStorageKey="toprope.rowsPerPage.leaderboard"
         />
     );
 }

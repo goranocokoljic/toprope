@@ -282,7 +282,9 @@ function ActiveAlerts({alerts}: {alerts: WasteAlert[]}): JSX.Element {
     const others = useMemo(() => alerts.filter((a) => a.alert_type !== 'plan_roi'), [alerts]);
     // The Plan-ROI reviews are a small curated subset; the generic waste alerts
     // are the list that grows, so that is the one we page.
-    const paged = usePagination(others, WASTE_PAGE_SIZE);
+    const paged = usePagination(others, WASTE_PAGE_SIZE, {
+        storageKey: 'toprope.rowsPerPage.waste',
+    });
 
     if (alerts.length === 0) {
         return (
@@ -317,16 +319,17 @@ function ActiveAlerts({alerts}: {alerts: WasteAlert[]}): JSX.Element {
                             <GenericAlertCard key={a.id} alert={a} />
                         ))}
                     </ul>
-                    {paged.pageCount > 1 ? (
-                        <div className="mt-4 flex justify-end">
-                            <Pagination
-                                page={paged.page}
-                                pageCount={paged.pageCount}
-                                onPageChange={paged.setPage}
-                                ariaLabel="Waste alert pages"
-                            />
-                        </div>
-                    ) : null}
+                    <Pagination
+                        page={paged.page}
+                        pageCount={paged.pageCount}
+                        onPageChange={paged.setPage}
+                        pageSize={paged.pageSize}
+                        pageSizeOptions={paged.pageSizeOptions}
+                        onPageSizeChange={paged.setPageSize}
+                        totalItems={others.length}
+                        ariaLabel="Waste alert pages"
+                        className="mt-4"
+                    />
                 </Card>
             ) : null}
         </div>

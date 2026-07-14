@@ -178,6 +178,7 @@ export function AdminUsers(): JSX.Element {
                         }
                         rows={users.data ?? []}
                         ariaLabel="User pages"
+                        storageKey="toprope.rowsPerPage.adminUsers"
                         renderRow={(u) => <UserRow key={u.id} user={u} />}
                     />
                 )}

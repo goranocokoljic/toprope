@@ -167,20 +167,20 @@ describe('Showcase gallery (Task 6.3.9 / #172)', () => {
         expect(await screen.findByText('No showcases yet')).toBeInTheDocument();
     });
 
-    it('paginates the gallery at 12 cards per page and navigates pages', async () => {
-        listShowcases = Array.from({length: 15}, (_, i) =>
+    it('paginates the gallery at 25 cards per page and navigates pages', async () => {
+        listShowcases = Array.from({length: 30}, (_, i) =>
             summary({id: `s${i}`, title: `Showcase ${String(i).padStart(2, '0')}`}),
         );
         renderAt('/developer/showcase');
         await screen.findByText('Showcase 00');
 
         const list = screen.getByTestId('showcase-list');
-        expect(list.querySelectorAll('li')).toHaveLength(12);
-        expect(screen.queryByText('Showcase 12')).not.toBeInTheDocument();
+        expect(list.querySelectorAll('li')).toHaveLength(25);
+        expect(screen.queryByText('Showcase 25')).not.toBeInTheDocument();
 
         fireEvent.click(screen.getByRole('button', {name: 'Next page'}));
-        expect(screen.getByTestId('showcase-list').querySelectorAll('li')).toHaveLength(3);
-        expect(screen.getByText('Showcase 12')).toBeInTheDocument();
+        expect(screen.getByTestId('showcase-list').querySelectorAll('li')).toHaveLength(5);
+        expect(screen.getByText('Showcase 25')).toBeInTheDocument();
         expect(screen.queryByText('Showcase 00')).not.toBeInTheDocument();
     });
 

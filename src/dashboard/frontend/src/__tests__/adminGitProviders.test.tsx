@@ -106,6 +106,8 @@ function makeClient(): QueryClient {
 }
 
 beforeEach(() => {
+    // The repo-scope pager persists its rows-per-page choice; isolate per test.
+    localStorage.clear();
     createCount = 0;
     providers = [structuredClone(DB_GITHUB), structuredClone(CONFIG_GITLAB)];
     repos = [
@@ -1273,7 +1275,7 @@ describe('AdminGitProviders — repo-scope modal (#213)', () => {
         expect(screen.getAllByRole('checkbox')).toHaveLength(3);
     });
 
-    it('paginates at 25 rows per page; selection survives paging and filtering and saves the full set', async () => {
+    it('paginates at 10 rows per page; selection survives paging and filtering and saves the full set', async () => {
         providers = [structuredClone(DB_MONITOR_ALL)];
         repos = Array.from({length: 30}, (_, i) => ({
             slug: `repo-${i}`,
@@ -1286,8 +1288,9 @@ describe('AdminGitProviders — repo-scope modal (#213)', () => {
         fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
         await screen.findByRole('checkbox', {name: 'repo-0'});
 
-        // Page 1 shows 25 of 30 rows; Previous is inert at the lower bound.
-        expect(screen.getAllByRole('checkbox')).toHaveLength(25);
+        // Page 1 shows 10 of 30 rows (the new default); Previous is inert at the
+        // lower bound, and the last-page repo is off page 1.
+        expect(screen.getAllByRole('checkbox')).toHaveLength(10);
         expect(screen.getByRole('button', {name: 'Page 1'})).toHaveAttribute('aria-current', 'page');
         expect(screen.getByRole('button', {name: 'Previous page'})).toBeDisabled();
         expect(screen.queryByRole('checkbox', {name: 'repo-29'})).not.toBeInTheDocument();
@@ -1297,11 +1300,11 @@ describe('AdminGitProviders — repo-scope modal (#213)', () => {
         expect(screen.getByTestId('selected-count')).toHaveTextContent('0 of 30 selected');
         fireEvent.click(screen.getByRole('checkbox', {name: 'repo-0'}));
 
-        // …one on page 2 (Next is inert at the upper bound)…
-        fireEvent.click(screen.getByRole('button', {name: 'Next page'}));
-        expect(screen.getByRole('button', {name: 'Page 2'})).toHaveAttribute('aria-current', 'page');
+        // …one on the last page (Next is inert at the upper bound)…
+        fireEvent.click(screen.getByRole('button', {name: 'Last page'}));
+        expect(screen.getByRole('button', {name: 'Page 3'})).toHaveAttribute('aria-current', 'page');
         expect(screen.getByRole('button', {name: 'Next page'})).toBeDisabled();
-        expect(screen.getAllByRole('checkbox')).toHaveLength(5);
+        expect(screen.getAllByRole('checkbox')).toHaveLength(10);
         fireEvent.click(screen.getByRole('checkbox', {name: 'repo-29'}));
 
         // …and one found via the filter (which resets to page 1 of the result;
@@ -1336,9 +1339,9 @@ describe('AdminGitProviders — repo-scope modal (#213)', () => {
         expect(screen.queryByTestId('repo-pagination')).not.toBeInTheDocument();
     });
 
-    it('exactly 25 repos is still a single page (boundary)', async () => {
+    it('exactly 10 repos is still a single page (boundary)', async () => {
         providers = [structuredClone(DB_MONITOR_ALL)];
-        repos = Array.from({length: 25}, (_, i) => ({
+        repos = Array.from({length: 10}, (_, i) => ({
             slug: `repo-${i}`,
             name: `Repo ${i}`,
             archived: false,
@@ -1348,13 +1351,15 @@ describe('AdminGitProviders — repo-scope modal (#213)', () => {
         fireEvent.click(await screen.findByRole('button', {name: 'Repos'}));
         fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
         await screen.findByRole('checkbox', {name: 'repo-0'});
-        expect(screen.getAllByRole('checkbox')).toHaveLength(25);
+        // 10 rows == the smallest offered size, so no pager and no size selector:
+        // nothing any size could do would split one page.
+        expect(screen.getAllByRole('checkbox')).toHaveLength(10);
         expect(screen.queryByTestId('repo-pagination')).not.toBeInTheDocument();
     });
 
     it('jumps directly to a numbered page (the old prev/next-only pager could not)', async () => {
         providers = [structuredClone(DB_MONITOR_ALL)];
-        // 60 repos / 25 per page = 3 pages, so page 3 exists as a numbered target.
+        // 60 repos / 10 per page = 6 pages, so page 6 exists as a numbered target.
         repos = Array.from({length: 60}, (_, i) => ({
             slug: `repo-${String(i).padStart(2, '0')}`,
             name: `Repo ${i}`,
@@ -1368,13 +1373,67 @@ describe('AdminGitProviders — repo-scope modal (#213)', () => {
 
         // Sort by slug so page order is deterministic (repo-00 … repo-59).
         fireEvent.click(screen.getByRole('button', {name: /Slug/}));
-        // A single numbered click leaps straight to page 3 — the last 10 rows.
-        fireEvent.click(screen.getByRole('button', {name: 'Page 3'}));
-        expect(screen.getByRole('button', {name: 'Page 3'})).toHaveAttribute('aria-current', 'page');
+        // A single numbered click leaps straight to page 6 — the last 10 rows.
+        fireEvent.click(screen.getByRole('button', {name: 'Page 6'}));
+        expect(screen.getByRole('button', {name: 'Page 6'})).toHaveAttribute('aria-current', 'page');
         expect(screen.getAllByRole('checkbox')).toHaveLength(10);
         expect(screen.getByRole('checkbox', {name: 'repo-50'})).toBeInTheDocument();
         expect(screen.getByRole('checkbox', {name: 'repo-59'})).toBeInTheDocument();
         expect(screen.queryByRole('checkbox', {name: 'repo-00'})).not.toBeInTheDocument();
+    });
+
+    it('rows-per-page selector defaults to 10, re-slices the list, and persists the choice (#227)', async () => {
+        providers = [structuredClone(DB_MONITOR_ALL)];
+        repos = Array.from({length: 30}, (_, i) => ({
+            slug: `repo-${i}`,
+            name: `Repo ${i}`,
+            archived: false,
+            defaultBranch: 'main',
+        }));
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', {name: 'Repos'}));
+        fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
+        await screen.findByRole('checkbox', {name: 'repo-0'});
+
+        // Default 10/page.
+        const select = screen.getByRole('combobox', {name: 'Rows per page'});
+        expect(select).toHaveValue('10');
+        expect(screen.getAllByRole('checkbox')).toHaveLength(10);
+
+        // Bump to 25/page and confirm the slice grows + the choice is persisted.
+        fireEvent.change(select, {target: {value: '25'}});
+        expect(screen.getAllByRole('checkbox')).toHaveLength(25);
+        expect(localStorage.getItem('toprope.rowsPerPage.repoScope')).toBe('25');
+
+        // "All" shows every repo on one page and drops the numbered pager (the
+        // selector itself stays, so the choice is reversible).
+        fireEvent.change(screen.getByRole('combobox', {name: 'Rows per page'}), {
+            target: {value: 'all'},
+        });
+        expect(screen.getAllByRole('checkbox')).toHaveLength(30);
+        expect(
+            screen.queryByRole('navigation', {name: 'Repository pages'}),
+        ).not.toBeInTheDocument();
+        expect(screen.getByRole('combobox', {name: 'Rows per page'})).toBeInTheDocument();
+    });
+
+    it('seeds the repo pager from a persisted rows-per-page choice (#227)', async () => {
+        localStorage.setItem('toprope.rowsPerPage.repoScope', '25');
+        providers = [structuredClone(DB_MONITOR_ALL)];
+        repos = Array.from({length: 30}, (_, i) => ({
+            slug: `repo-${i}`,
+            name: `Repo ${i}`,
+            archived: false,
+            defaultBranch: 'main',
+        }));
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', {name: 'Repos'}));
+        fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
+        await screen.findByRole('checkbox', {name: 'repo-0'});
+
+        // Opens straight at the stored 25/page, not the 10 default.
+        expect(screen.getByRole('combobox', {name: 'Rows per page'})).toHaveValue('25');
+        expect(screen.getAllByRole('checkbox')).toHaveLength(25);
     });
 
     it('footnotes stored slugs missing from the listing instead of blending them into the count', async () => {

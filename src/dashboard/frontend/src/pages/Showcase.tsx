@@ -11,8 +11,9 @@ import {Pagination} from '../components/Pagination';
 import {usePagination} from '../components/usePagination';
 import {formatDateTick} from '../components/format';
 
-/** Client-side page size for the showcase gallery (#226). */
-const SHOWCASE_PAGE_SIZE = 12;
+/** Initial client-side page size for the showcase gallery (#226); the footer
+ *  selector lets the user change it (#227). */
+const SHOWCASE_PAGE_SIZE = 25;
 
 /**
  * Showcase gallery (Task 6.3.9 / #172) — the browsable, searchable library of
@@ -46,7 +47,9 @@ export function Showcase(): JSX.Element {
     // A new search/filter refetches → fresh reference → page resets to 1; stable
     // across a pager click (same `data` reference), so paging holds. The loading
     // `?? []` case is safe: usePagination treats two empty arrays as one identity.
-    const paged = usePagination(showcases, SHOWCASE_PAGE_SIZE);
+    const paged = usePagination(showcases, SHOWCASE_PAGE_SIZE, {
+        storageKey: 'toprope.rowsPerPage.showcase',
+    });
 
     return (
         <div className="space-y-6">
@@ -145,16 +148,16 @@ export function Showcase(): JSX.Element {
                             <ShowcaseRow key={showcase.id} showcase={showcase} />
                         ))}
                     </ul>
-                    {paged.pageCount > 1 ? (
-                        <div className="flex justify-end">
-                            <Pagination
-                                page={paged.page}
-                                pageCount={paged.pageCount}
-                                onPageChange={paged.setPage}
-                                ariaLabel="Showcase pages"
-                            />
-                        </div>
-                    ) : null}
+                    <Pagination
+                        page={paged.page}
+                        pageCount={paged.pageCount}
+                        onPageChange={paged.setPage}
+                        pageSize={paged.pageSize}
+                        pageSizeOptions={paged.pageSizeOptions}
+                        onPageSizeChange={paged.setPageSize}
+                        totalItems={showcases.length}
+                        ariaLabel="Showcase pages"
+                    />
                 </>
             ) : null}
         </div>

@@ -205,21 +205,21 @@ describe('Best-practice browse list (Task 6.2.8 / #163)', () => {
         expect(await screen.findByText('No best practices yet')).toBeInTheDocument();
     });
 
-    it('paginates the practice list at 12 cards per page and navigates pages', async () => {
-        listPractices = Array.from({length: 15}, (_, i) =>
+    it('paginates the practice list at 25 cards per page and navigates pages', async () => {
+        listPractices = Array.from({length: 30}, (_, i) =>
             summary({id: `p${i}`, title: `Practice ${String(i).padStart(2, '0')}`}),
         );
         renderAt('/developer/practices');
         await screen.findByText('Practice 00');
 
-        // Page 1 caps at 12 cards; the 13th is off-page.
+        // Page 1 caps at 25 cards; the 26th is off-page.
         const list = screen.getByTestId('practice-list');
-        expect(list.querySelectorAll('li')).toHaveLength(12);
-        expect(screen.queryByText('Practice 12')).not.toBeInTheDocument();
+        expect(list.querySelectorAll('li')).toHaveLength(25);
+        expect(screen.queryByText('Practice 25')).not.toBeInTheDocument();
 
         fireEvent.click(screen.getByRole('button', {name: 'Next page'}));
-        expect(screen.getByTestId('practice-list').querySelectorAll('li')).toHaveLength(3);
-        expect(screen.getByText('Practice 12')).toBeInTheDocument();
+        expect(screen.getByTestId('practice-list').querySelectorAll('li')).toHaveLength(5);
+        expect(screen.getByText('Practice 25')).toBeInTheDocument();
         expect(screen.queryByText('Practice 00')).not.toBeInTheDocument();
     });
 

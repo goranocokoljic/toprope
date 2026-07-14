@@ -119,6 +119,7 @@ export function AdminSubscriptions(): JSX.Element {
                         }
                         rows={subs.data ?? []}
                         ariaLabel="Subscription pages"
+                        storageKey="toprope.rowsPerPage.adminSubscriptions"
                         renderRow={(s) => (
                             <tr key={s.id} className="border-b border-border/60">
                                 <Td>{s.developer_name}</Td>

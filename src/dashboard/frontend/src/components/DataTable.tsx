@@ -1,7 +1,7 @@
 import {useEffect, useMemo, useState, type ReactNode} from 'react';
 
 import {Pagination} from './Pagination';
-import {usePagination} from './usePagination';
+import {isPaginationVisible, usePagination, type PageSizeOption} from './usePagination';
 
 export type SortDirection = 'asc' | 'desc';
 
@@ -64,11 +64,23 @@ export interface DataTableProps<T> {
      * footer; sorting still reorders the whole list first, and a sort change
      * resets to page 1 (the sorted array's identity changes). Omitting
      * `pageSize` leaves every existing consumer byte-for-byte unchanged: all
-     * rows render, no footer. Page size per view is the caller's choice.
+     * rows render, no footer. This is the INITIAL rows-per-page — the footer's
+     * "rows per page" selector lets the user change it (see `pageSizeOptions`).
      */
     pageSize?: number;
     /** Accessible label for the pager's `<nav>` when `pageSize` is set. */
     paginationLabel?: string;
+    /**
+     * Selectable rows-per-page sizes for the footer selector. Default
+     * `[10, 25, 50, 'all']`. Only used when `pageSize` is set.
+     */
+    pageSizeOptions?: readonly PageSizeOption[];
+    /**
+     * `localStorage` key to persist the chosen page size for this table across
+     * mounts (per-surface). Only used when `pageSize` is set; omit for no
+     * persistence.
+     */
+    pageSizeStorageKey?: string;
 }
 
 const ALIGN_CLASS: Record<'left' | 'right' | 'center', string> = {
@@ -111,6 +123,8 @@ export function DataTable<T>({
     onSortChange,
     pageSize,
     paginationLabel,
+    pageSizeOptions,
+    pageSizeStorageKey,
 }: DataTableProps<T>): JSX.Element {
     const controlled = onSortChange !== undefined;
     const [internalSort, setInternalSort] = useState<SortState | null>(initialSort ?? null);
@@ -163,13 +177,19 @@ export function DataTable<T>({
     // called unconditionally (rules of hooks); when `pageSize` is omitted we feed
     // it a page big enough to hold everything, so it yields a single page and the
     // pager renders nothing — `displayRows` then stays the untouched sorted list.
-    const paged = usePagination(sortedRows, pageSize && pageSize > 0 ? pageSize : Number.MAX_SAFE_INTEGER);
     const paginated = pageSize !== undefined && pageSize > 0;
+    const paged = usePagination(sortedRows, paginated ? pageSize : Number.MAX_SAFE_INTEGER, {
+        pageSizeOptions,
+        // Only persist a real, paginated table's choice.
+        storageKey: paginated ? pageSizeStorageKey : undefined,
+    });
     const displayRows = paginated ? paged.pageItems : sortedRows;
-    // Only wrap + render the footer when there is more than one page — a
-    // single-page paginated table renders exactly like an unpaginated one (no
-    // empty pager wrapper), matching the card-list / PaginatedTable adopters.
-    const showPager = paginated && paged.pageCount > 1;
+    // Only wrap + render the footer when the pager bar has something to show — a
+    // single-page paginated table with too few rows for the size selector renders
+    // exactly like an unpaginated one (no empty pager wrapper), matching the
+    // card-list / PaginatedTable adopters.
+    const showPager =
+        paginated && isPaginationVisible(sortedRows.length, paged.pageCount, true, paged.pageSizeOptions);
 
     function toggleSort(key: string): void {
         const next = (current: SortState | null): SortState => {
@@ -260,14 +280,16 @@ export function DataTable<T>({
     return (
         <div className="flex flex-col gap-3">
             {table}
-            <div className="flex justify-end">
-                <Pagination
-                    page={paged.page}
-                    pageCount={paged.pageCount}
-                    onPageChange={paged.setPage}
-                    ariaLabel={paginationLabel ?? (typeof caption === 'string' ? caption : 'Pagination')}
-                />
-            </div>
+            <Pagination
+                page={paged.page}
+                pageCount={paged.pageCount}
+                onPageChange={paged.setPage}
+                pageSize={paged.pageSize}
+                pageSizeOptions={paged.pageSizeOptions}
+                onPageSizeChange={paged.setPageSize}
+                totalItems={sortedRows.length}
+                ariaLabel={paginationLabel ?? (typeof caption === 'string' ? caption : 'Pagination')}
+            />
         </div>
     );
 }

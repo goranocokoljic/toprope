@@ -193,6 +193,7 @@ export function AdminReconciliation(): JSX.Element {
                         }
                         rows={results.data ?? []}
                         ariaLabel="Reconciliation pages"
+                        storageKey="toprope.rowsPerPage.adminReconciliation"
                         renderRow={(r) => (
                             <tr key={r.id} className="border-b border-border/60 align-top">
                                 <Td>{r.period}</Td>

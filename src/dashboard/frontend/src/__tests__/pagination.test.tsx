@@ -1,14 +1,26 @@
 // @vitest-environment jsdom
 import '../test/setup';
 import '@testing-library/jest-dom/vitest';
-import {afterEach, describe, expect, it, vi} from 'vitest';
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {useState} from 'react';
 import {act, cleanup, fireEvent, render, renderHook, screen} from '@testing-library/react';
 
 import {paginationRange} from '../components/paginationRange';
 import {Pagination} from '../components/Pagination';
-import {usePagination} from '../components/usePagination';
+import {
+    DEFAULT_PAGE_SIZE_OPTIONS,
+    isPaginationVisible,
+    usePagination,
+    type PageSizeOption,
+} from '../components/usePagination';
 import {DataTable, type Column} from '../components/DataTable';
+
+const SIZE_OPTIONS: readonly PageSizeOption[] = [10, 25, 50, 'all'];
+
+beforeEach(() => {
+    // Persisted rows-per-page choices must not leak between tests.
+    localStorage.clear();
+});
 
 afterEach(() => {
     cleanup();
@@ -201,6 +213,99 @@ describe('Pagination', () => {
     });
 });
 
+// --- Pagination rows-per-page selector (#227) ------------------------------
+
+describe('Pagination — rows-per-page selector', () => {
+    it('renders the selector, routes numeric changes, and maps "All" to the sentinel', () => {
+        const onPageSizeChange = vi.fn();
+        render(
+            <Pagination
+                page={1}
+                pageCount={3}
+                onPageChange={vi.fn()}
+                pageSize={10}
+                pageSizeOptions={SIZE_OPTIONS}
+                onPageSizeChange={onPageSizeChange}
+                totalItems={30}
+            />,
+        );
+        const select = screen.getByRole('combobox', {name: 'Rows per page'});
+        expect(select).toHaveValue('10');
+        // The pager and the selector coexist.
+        expect(screen.getByRole('navigation')).toBeInTheDocument();
+
+        fireEvent.change(select, {target: {value: '50'}});
+        expect(onPageSizeChange).toHaveBeenCalledWith(50);
+        fireEvent.change(select, {target: {value: 'all'}});
+        expect(onPageSizeChange).toHaveBeenLastCalledWith('all');
+    });
+
+    it('stays visible on a single page so a user can still switch to a smaller size', () => {
+        // 15 items at 25/page is one page: no numbered pager, but the selector
+        // must remain so the user can drop to 10/page (or off "All").
+        render(
+            <Pagination
+                page={1}
+                pageCount={1}
+                onPageChange={vi.fn()}
+                pageSize={25}
+                pageSizeOptions={SIZE_OPTIONS}
+                onPageSizeChange={vi.fn()}
+                totalItems={15}
+            />,
+        );
+        expect(screen.getByRole('combobox', {name: 'Rows per page'})).toBeInTheDocument();
+        expect(screen.queryByRole('navigation')).not.toBeInTheDocument();
+    });
+
+    it('renders "All" as the selected label for the all sentinel', () => {
+        render(
+            <Pagination
+                page={1}
+                pageCount={1}
+                onPageChange={vi.fn()}
+                pageSize="all"
+                pageSizeOptions={SIZE_OPTIONS}
+                onPageSizeChange={vi.fn()}
+                totalItems={30}
+            />,
+        );
+        expect(screen.getByRole('combobox', {name: 'Rows per page'})).toHaveValue('all');
+        expect(screen.getByRole('option', {name: 'All'})).toBeInTheDocument();
+    });
+
+    it('hides the whole bar when there are fewer items than the smallest size', () => {
+        const {container} = render(
+            <Pagination
+                page={1}
+                pageCount={1}
+                onPageChange={vi.fn()}
+                pageSize={25}
+                pageSizeOptions={SIZE_OPTIONS}
+                onPageSizeChange={vi.fn()}
+                totalItems={8}
+            />,
+        );
+        expect(container.firstChild).toBeNull();
+    });
+});
+
+describe('isPaginationVisible', () => {
+    it('is true whenever there is more than one page, selector or not', () => {
+        expect(isPaginationVisible(0, 2, false, SIZE_OPTIONS)).toBe(true);
+        expect(isPaginationVisible(0, 2, true, SIZE_OPTIONS)).toBe(true);
+    });
+
+    it('is false on a single page with no selector', () => {
+        expect(isPaginationVisible(1000, 1, false, SIZE_OPTIONS)).toBe(false);
+    });
+
+    it('on a single page with a selector, shows only above the smallest size', () => {
+        expect(isPaginationVisible(10, 1, true, SIZE_OPTIONS)).toBe(false); // 10 is not > 10
+        expect(isPaginationVisible(11, 1, true, SIZE_OPTIONS)).toBe(true);
+    });
+});
+
 // --- usePagination (state hygiene) -----------------------------------------
 
 describe('usePagination', () => {
@@ -285,6 +390,51 @@ describe('usePagination', () => {
         rerender();
         expect(result.current.page).toBe(2);
     });
+
+    // --- rows-per-page (#227) ---
+
+    it('exposes the default option list and the initial size', () => {
+        const {result} = renderHook(() => usePagination([1, 2, 3], 25));
+        expect(result.current.pageSize).toBe(25);
+        expect(result.current.pageSizeOptions).toEqual(DEFAULT_PAGE_SIZE_OPTIONS);
+    });
+
+    it('changing the size recomputes pages and restarts from page 1', () => {
+        const items = Array.from({length: 30}, (_, i) => i);
+        const {result} = renderHook(() => usePagination(items, 10));
+        expect(result.current.pageCount).toBe(3);
+        act(() => result.current.setPage(3));
+        expect(result.current.page).toBe(3);
+        act(() => result.current.setPageSize(25));
+        expect(result.current.pageSize).toBe(25);
+        expect(result.current.pageCount).toBe(2);
+        expect(result.current.page).toBe(1);
+    });
+
+    it("'all' collapses every item onto a single page", () => {
+        const items = Array.from({length: 30}, (_, i) => i);
+        const {result} = renderHook(() => usePagination(items, 10));
+        act(() => result.current.setPageSize('all'));
+        expect(result.current.pageCount).toBe(1);
+        expect(result.current.pageItems).toHaveLength(30);
+    });
+
+    it('persists the chosen size and seeds a fresh mount from it', () => {
+        const items = Array.from({length: 30}, (_, i) => i);
+        const {result, unmount} = renderHook(() => usePagination(items, 10, {storageKey: 'k'}));
+        act(() => result.current.setPageSize(50));
+        expect(localStorage.getItem('k')).toBe('50');
+        unmount();
+        const {result: remounted} = renderHook(() => usePagination(items, 10, {storageKey: 'k'}));
+        expect(remounted.current.pageSize).toBe(50);
+    });
+
+    it('fail-closed: a stored value outside the allowlist falls back to the initial size', () => {
+        localStorage.setItem('k', '999'); // not one of [10,25,50,'all']
+        const items = Array.from({length: 5}, (_, i) => i);
+        const {result} = renderHook(() => usePagination(items, 10, {storageKey: 'k'}));
+        expect(result.current.pageSize).toBe(10);
+    });
 });
 
 // --- DataTable pageSize integration ----------------------------------------
@@ -361,5 +511,25 @@ describe('DataTable pageSize', () => {
         fireEvent.click(screen.getByRole('button', {name: 'N'}));
         expect(bodyNames()[0]).toBe('row-029');
         expect(bodyNames()).toHaveLength(10);
+    });
+
+    it('exposes a rows-per-page selector that re-slices the whole table (#227)', () => {
+        render(<DataTable columns={COLUMNS} rows={makeRows(30)} getRowKey={(r) => r.name} pageSize={10} />);
+        expect(bodyNames()).toHaveLength(10);
+        const select = screen.getByRole('combobox', {name: 'Rows per page'});
+        expect(select).toHaveValue('10');
+        // Bump to 50/page: all 30 rows fit on one page → no numbered pager, but
+        // the selector remains.
+        fireEvent.change(select, {target: {value: '50'}});
+        expect(bodyNames()).toHaveLength(30);
+        expect(screen.queryByRole('navigation')).not.toBeInTheDocument();
+        expect(screen.getByRole('combobox', {name: 'Rows per page'})).toBeInTheDocument();
+    });
+
+    it('renders no footer at all when a paginated table has fewer rows than the smallest size', () => {
+        render(<DataTable columns={COLUMNS} rows={makeRows(8)} getRowKey={(r) => r.name} pageSize={10} />);
+        expect(bodyNames()).toHaveLength(8);
+        expect(screen.queryByRole('navigation')).not.toBeInTheDocument();
+        expect(screen.queryByRole('combobox', {name: 'Rows per page'})).not.toBeInTheDocument();
     });
 });

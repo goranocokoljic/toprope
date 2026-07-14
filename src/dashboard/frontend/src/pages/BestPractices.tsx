@@ -12,8 +12,9 @@ import {usePagination} from '../components/usePagination';
 import {formatPercent, formatDateTick} from '../components/format';
 import {contributionModelExplainer, contributionModelLabel} from '../components/practiceModel';
 
-/** Client-side page size for the practice browse list (#226). */
-const PRACTICE_PAGE_SIZE = 12;
+/** Initial client-side page size for the practice browse list (#226); the
+ *  footer selector lets the user change it (#227). */
+const PRACTICE_PAGE_SIZE = 25;
 
 /**
  * Best-practice browse UI (Task 6.2.8 / #163) — the browsable, searchable library.
@@ -47,7 +48,9 @@ export function BestPractices(): JSX.Element {
     // hook resets to page 1; the clamp guards a shrink. Stable across a pager
     // click (same `data` reference), so paging holds. The loading `?? []` case is
     // safe: usePagination treats two empty arrays as one identity (no reset loop).
-    const paged = usePagination(practices, PRACTICE_PAGE_SIZE);
+    const paged = usePagination(practices, PRACTICE_PAGE_SIZE, {
+        storageKey: 'toprope.rowsPerPage.bestPractices',
+    });
 
     return (
         <div className="space-y-6">
@@ -146,16 +149,16 @@ export function BestPractices(): JSX.Element {
                             <PracticeRow key={practice.id} practice={practice} />
                         ))}
                     </ul>
-                    {paged.pageCount > 1 ? (
-                        <div className="flex justify-end">
-                            <Pagination
-                                page={paged.page}
-                                pageCount={paged.pageCount}
-                                onPageChange={paged.setPage}
-                                ariaLabel="Practice pages"
-                            />
-                        </div>
-                    ) : null}
+                    <Pagination
+                        page={paged.page}
+                        pageCount={paged.pageCount}
+                        onPageChange={paged.setPage}
+                        pageSize={paged.pageSize}
+                        pageSizeOptions={paged.pageSizeOptions}
+                        onPageSizeChange={paged.setPageSize}
+                        totalItems={practices.length}
+                        ariaLabel="Practice pages"
+                    />
                 </>
             ) : null}
         </div>
