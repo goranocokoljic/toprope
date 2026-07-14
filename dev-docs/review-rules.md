@@ -32,6 +32,8 @@
 
 - **Test every failure path, mode, edge, and budget that can actually trip.** Size perf assertions to a realistic org, cover documented edges/boundaries and >=2-item degenerate cases (not just the single-item happy path), exercise both branches of dual-mode components and every exposed query filter, add a failing-hook rollback test for each distinct transaction shape, and assert server DTO mapping by seeding real data and reading it back through the API rather than a frontend fixture.
   - _Why:_ Recurred in #108/#105/#106 (the <2s perf test ran on ~5 developers and edge/boundary cases had zero coverage), #152 (rollback was tested only for publish() not the submit() auto-publish path), #162 (the DTO test asserted only four fields), and #163 (the editor's edit path and the browse 'team' filter were untested).
+- **Assertions must be able to fail against the real leak vector.** Every negative/privacy assertion must match a string or shape the code actually emits, with a seeded positive control that produces the signal; decode BLOB columns to strings before scanning for forbidden plaintext (JSON.stringify serializes Buffers as integer arrays), and drive sanitizers/security controls through the real execution path (e.g. the actual MATCH query), not just their returned string.
+  - _Why:_ Recurred in #133 (assertions checked capital-Y 'You were active', an id substring with no carrying field, and BLOB markers invisible because Buffers serialized to integer arrays), #155 (FTS-injection safety was asserted only on the builder's returned string), and #162 (the test relied on a hand-built frontend fixture that cannot catch a server mapping error).
 
 ## data-integrity
 
