@@ -530,13 +530,36 @@ describe('admin git-provider sync-now API (#199)', () => {
             expect((await readProvider(id))?.last_sync_status).toBeNull();
         });
 
-        it('treats an explicit null months (and a non-object body) as the default, not a 400', async () => {
+        it('treats an explicit null months as the default, not a 400', async () => {
             const id = await createGithub();
             const getCommits = await armGetCommits();
 
             // Explicit null → absent → default window (still a first sync, so clamps).
             const before = Date.now();
             const res = await triggerSyncBody(id, {months: null as unknown as number});
+            expect(res.statusCode).toBe(202);
+            await waitForSyncStatus(id, 'ok');
+            const since = getCommits.mock.calls[0][1] as string;
+            expect(since).not.toBe('');
+            const expected = new Date(before);
+            expected.setUTCMonth(expected.getUTCMonth() - 6);
+            expect(Math.abs(Date.parse(since) - expected.getTime())).toBeLessThan(60_000);
+        });
+
+        it('treats a NON-object body (array) as the default, not a 400 (the !body branch)', async () => {
+            // asObject() returns null for a non-object JSON body → default window,
+            // NOT a 400. `{months: null}` above hits the `body.months == null` path;
+            // this hits the distinct `!body` path.
+            const id = await createGithub();
+            const getCommits = await armGetCommits();
+
+            const before = Date.now();
+            const res = await app.inject({
+                method: 'POST',
+                url: `/api/admin/git/providers/${id}/sync`,
+                headers: authHeaders(adminToken),
+                payload: [1, 2, 3],
+            });
             expect(res.statusCode).toBe(202);
             await waitForSyncStatus(id, 'ok');
             const since = getCommits.mock.calls[0][1] as string;
