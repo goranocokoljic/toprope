@@ -20,6 +20,7 @@ import {
     useCreateAdminGitProvider,
     useDeleteAdminGitProvider,
     useSyncAdminGitProvider,
+    useSyncOlderHistoryGitProvider,
     useTestAdminGitProvider,
     useTestDraftGitProvider,
     useUpdateAdminGitProvider,
@@ -102,14 +103,21 @@ const FIRST_SYNC_WINDOW_MIN_MONTHS = 1;
 const FIRST_SYNC_WINDOW_MAX_MONTHS = 60;
 const FIRST_SYNC_WINDOW_DEFAULT_MONTHS = 6;
 
+// Default for the "Sync older history" input (#229): an ABSOLUTE "months of history
+// to keep". Seeded larger than the first-sync default so the control starts at a
+// value that actually extends the window (pressing it at 6 would just no-op against
+// the common 6-month first sync). Same hard bounds (1..60); the server re-validates.
+const SYNC_HISTORY_DEFAULT_MONTHS = 12;
+
 /**
  * Clamp a raw months input to the valid integer window; a blank/non-numeric entry
- * falls back to the default so the control can never emit an out-of-range value the
- * server would reject.
+ * falls back to `fallback` (the relevant default) so the control can never emit an
+ * out-of-range value the server would reject. Shared by the first-sync window and
+ * the "sync older history" input (#229) — same bounds, different blank-fallback.
  */
-function clampWindowMonths(raw: string): number {
+function clampWindowMonths(raw: string, fallback: number = FIRST_SYNC_WINDOW_DEFAULT_MONTHS): number {
     const parsed = Number.parseInt(raw, 10);
-    if (Number.isNaN(parsed)) return FIRST_SYNC_WINDOW_DEFAULT_MONTHS;
+    if (Number.isNaN(parsed)) return fallback;
     return Math.min(FIRST_SYNC_WINDOW_MAX_MONTHS, Math.max(FIRST_SYNC_WINDOW_MIN_MONTHS, parsed));
 }
 
@@ -883,6 +891,7 @@ function ProviderRow({
     const update = useUpdateAdminGitProvider();
     const remove = useDeleteAdminGitProvider();
     const sync = useSyncAdminGitProvider();
+    const syncOlder = useSyncOlderHistoryGitProvider();
     const test = useTestAdminGitProvider();
     const [scopeOpen, setScopeOpen] = useState(false);
     // First-sync history window (months). Only meaningful — and only surfaced —
@@ -892,6 +901,10 @@ function ProviderRow({
     // `last_sync_at`: the latter only tracks sync-now runs, so it would keep showing
     // the (server-ignored) input after a scheduled/CLI first sync.
     const [windowMonths, setWindowMonths] = useState(FIRST_SYNC_WINDOW_DEFAULT_MONTHS);
+    // "Sync older history" window (#229), in ABSOLUTE months to keep. Only surfaced
+    // AFTER the first sync (there is no history to extend before it) — a first-sync
+    // provider uses the window input above instead.
+    const [olderHistoryMonths, setOlderHistoryMonths] = useState(SYNC_HISTORY_DEFAULT_MONTHS);
     const isFirstSync = provider.first_sync_pending;
     // Derived (not mount-time-seeded): the create flow's hook-level invalidation
     // is awaited BEFORE the created callback runs, so this row mounts from the
@@ -910,9 +923,12 @@ function ProviderRow({
 
     const isConfig = provider.source === 'config';
     const meta = PROVIDER_META[provider.type];
-    // A run is in flight server-side (from the polled list) OR the trigger POST
-    // is still pending — either way the button stays down and shows progress.
-    const syncRunning = provider.active_sync !== null || sync.isPending;
+    // A run is in flight server-side (from the polled list) OR either trigger POST
+    // (sync-now / sync-older-history) is still pending — either way the sync
+    // controls stay down and show progress. Both triggers share the server's
+    // in-flight registry, so only one can actually be running at a time.
+    const syncRunning =
+        provider.active_sync !== null || sync.isPending || syncOlder.isPending;
 
     function toggleEnabled(): void {
         // A PATCH must carry the full provider identity (the server re-validates);
@@ -1015,6 +1031,54 @@ function ProviderRow({
                                 >
                                     {syncRunning ? 'Syncing…' : 'Sync now'}
                                 </AccentButton>
+                                {/* "Sync older history" (#229): extend the synced
+                                    window BACKWARD by an absolute months value. Only
+                                    meaningful after the first sync — before it, the
+                                    first-sync window input above already controls how
+                                    far back run #1 reaches. */}
+                                {!isFirstSync ? (
+                                    <>
+                                        <label className="flex items-center gap-1 text-xs text-muted">
+                                            <span>Keep</span>
+                                            <input
+                                                type="number"
+                                                min={FIRST_SYNC_WINDOW_MIN_MONTHS}
+                                                max={FIRST_SYNC_WINDOW_MAX_MONTHS}
+                                                step={1}
+                                                value={olderHistoryMonths}
+                                                onChange={(e) =>
+                                                    setOlderHistoryMonths(
+                                                        clampWindowMonths(
+                                                            e.target.value,
+                                                            SYNC_HISTORY_DEFAULT_MONTHS,
+                                                        ),
+                                                    )
+                                                }
+                                                disabled={syncRunning || !provider.enabled}
+                                                aria-label="Older-history window in months"
+                                                title="How many months of history to keep, total — extends the synced window further back"
+                                                className="w-14 rounded border border-border bg-surface px-1.5 py-0.5 text-xs text-foreground disabled:opacity-50"
+                                            />
+                                            <span>months</span>
+                                        </label>
+                                        <AccentButton
+                                            onClick={() =>
+                                                syncOlder.mutate({
+                                                    id: provider.id,
+                                                    months: olderHistoryMonths,
+                                                })
+                                            }
+                                            disabled={syncRunning || !provider.enabled}
+                                            title={
+                                                provider.enabled
+                                                    ? 'Fetch never-synced older history for this provider'
+                                                    : 'Enable the provider to sync'
+                                            }
+                                        >
+                                            Sync older history
+                                        </AccentButton>
+                                    </>
+                                ) : null}
                                 <AccentButton
                                     onClick={() => setScopeOpen(true)}
                                     title="Choose which repositories to analyze"
@@ -1060,6 +1124,13 @@ function ProviderRow({
                 <tr>
                     <td colSpan={7} className="px-3 pb-3">
                         <ErrorText error={sync.error} />
+                    </td>
+                </tr>
+            ) : null}
+            {syncOlder.isError ? (
+                <tr>
+                    <td colSpan={7} className="px-3 pb-3">
+                        <ErrorText error={syncOlder.error} />
                     </td>
                 </tr>
             ) : null}

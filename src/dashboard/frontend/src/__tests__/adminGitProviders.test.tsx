@@ -144,6 +144,11 @@ beforeEach(() => {
         if (/\/git\/providers\/[^/]+\/test$/.test(u) && method === 'POST') {
             return json({ok: true});
         }
+        // Sync older history — POST /:id/sync-older-history (#229). Checked before
+        // the generic /sync route (the anchors differ, but keep it explicit).
+        if (/\/git\/providers\/[^/]+\/sync-older-history$/.test(u) && method === 'POST') {
+            return json({data: {provider_id: 'p-gh', status: 'running', started_at: '2026-07-07T00:00:00.000Z'}}, 202);
+        }
         // Sync — POST /:id/sync.
         if (/\/git\/providers\/[^/]+\/sync$/.test(u) && method === 'POST') {
             return json({data: {provider_id: 'p-gh', status: 'running', started_at: '2026-07-07T00:00:00.000Z'}}, 202);
@@ -532,6 +537,85 @@ describe('AdminGitProviders — list + row actions', () => {
         // A blank/non-numeric entry falls back to the default.
         fireEvent.change(input, {target: {value: ''}});
         expect(input.value).toBe('6');
+    });
+});
+
+describe('AdminGitProviders — sync older history (#229)', () => {
+    it('an already-synced row shows the older-history control (default 12) and posts the months', async () => {
+        renderPage();
+        const ghCell = await screen.findByText('acme-org'); // DB_GITHUB: first_sync_pending false
+        const row = ghCell.closest('tr') as HTMLElement;
+        const input = within(row).getByLabelText('Older-history window in months') as HTMLInputElement;
+        // Defaults to 12 months (larger than the 6-month first-sync default so the
+        // control starts at a value that actually extends the window).
+        expect(input.value).toBe('12');
+
+        fireEvent.click(within(row).getByRole('button', {name: 'Sync older history'}));
+        await waitFor(() => {
+            const call = lastCall(/\/git\/providers\/p-gh\/sync-older-history$/, 'POST');
+            expect(call).toBeTruthy();
+            const body = JSON.parse(String(call?.[1]?.body)) as Record<string, unknown>;
+            expect(body.months).toBe(12);
+        });
+
+        // Change the window → the next press carries the new absolute value.
+        await waitFor(() => expect(input).toBeEnabled());
+        fireEvent.change(input, {target: {value: '24'}});
+        expect(input.value).toBe('24');
+        fireEvent.click(within(row).getByRole('button', {name: 'Sync older history'}));
+        await waitFor(() => {
+            const call = lastCall(/\/git\/providers\/p-gh\/sync-older-history$/, 'POST');
+            const body = JSON.parse(String(call?.[1]?.body)) as Record<string, unknown>;
+            expect(body.months).toBe(24);
+        });
+    });
+
+    it('clamps the older-history entry to the valid bounds, falling back to 12 when blank', async () => {
+        renderPage();
+        const ghCell = await screen.findByText('acme-org');
+        const row = ghCell.closest('tr') as HTMLElement;
+        const input = within(row).getByLabelText('Older-history window in months') as HTMLInputElement;
+
+        fireEvent.change(input, {target: {value: '999'}});
+        expect(input.value).toBe('60');
+        fireEvent.change(input, {target: {value: '0'}});
+        expect(input.value).toBe('1');
+        // Blank falls back to THIS control's default (12), not the first-sync 6.
+        fireEvent.change(input, {target: {value: ''}});
+        expect(input.value).toBe('12');
+    });
+
+    it('a first-sync row hides the older-history control (there is no history to extend yet)', async () => {
+        providers.push({
+            ...structuredClone(DB_GITHUB),
+            id: 'p-fresh-oh',
+            container: 'fresh-oh',
+            last_sync_at: null,
+            last_sync_status: null,
+            first_sync_pending: true,
+        });
+        renderPage();
+        const cell = await screen.findByText('fresh-oh');
+        const row = cell.closest('tr') as HTMLElement;
+        expect(
+            within(row).queryByRole('button', {name: 'Sync older history'}),
+        ).not.toBeInTheDocument();
+        expect(
+            within(row).queryByLabelText('Older-history window in months'),
+        ).not.toBeInTheDocument();
+        // …but the first-sync window input IS offered instead.
+        expect(
+            within(row).getByLabelText('First-sync history window in months'),
+        ).toBeInTheDocument();
+    });
+
+    it('config rows offer no older-history control', async () => {
+        renderPage();
+        const configCell = await screen.findByText('team');
+        const row = configCell.closest('tr') as HTMLElement;
+        expect(
+            within(row).queryByRole('button', {name: 'Sync older history'}),
+        ).not.toBeInTheDocument();
     });
 });
 
