@@ -391,7 +391,10 @@ function ProviderFormModal({
     // re-entered token, the admin uses the row's "Test" button instead.
     const canTest = token.trim() !== '' && container.trim() !== '' && hasUsername;
     const canSave = container.trim() !== '' && hasUsername && (isEdit || token.trim() !== '');
-    const pending = create.isPending || update.isPending;
+    // `isEdit` picks the path, so exactly one of the two mutations is ever in
+    // play — select it once rather than testing both at each use.
+    const write = isEdit ? update : create;
+    const pending = write.isPending;
 
     function submit(): void {
         const input = buildInput();
@@ -415,10 +418,9 @@ function ProviderFormModal({
             submitLabel={isEdit ? 'Save changes' : 'Add provider'}
             pending={pending}
             submitDisabled={!canSave}
-            // The write's error — only ONE of the two mutations can ever be in
-            // play (isEdit picks the path). The draft test's error is NOT
-            // surfaced here; it belongs beside the Test button that produced it.
-            error={isEdit ? (update.isError ? update.error : null) : create.isError ? create.error : null}
+            // The write's error. The draft test's error is NOT surfaced here —
+            // it belongs beside the Test button that produced it.
+            error={write.isError ? write.error : null}
             testId="git-provider-modal"
         >
             <div className="flex flex-col gap-4">
