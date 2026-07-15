@@ -108,6 +108,22 @@ function renderPage(node: JSX.Element): void {
     );
 }
 
+/** Open the create-user dialog from the header's primary affordance. */
+function openCreateUserModal(): void {
+    fireEvent.click(screen.getByRole('button', {name: '＋ New user'}));
+}
+
+/**
+ * Drive the whole create flow: open the modal, fill the email, submit. The modal
+ * closes on success, so a second create must open it again — the fields no
+ * longer survive a create (they unmount with the dialog).
+ */
+function createUser(email: string): void {
+    openCreateUserModal();
+    fireEvent.change(screen.getByLabelText('Email'), {target: {value: email}});
+    fireEvent.click(screen.getByRole('button', {name: 'Create user'}));
+}
+
 describe('AdminUsers page', () => {
     it('lists users from the API', async () => {
         renderPage(<AdminUsers />);
@@ -139,22 +155,180 @@ describe('AdminUsers page', () => {
         expect(screen.queryByText('user00@test.com')).not.toBeInTheDocument();
     });
 
-    it('creating a user surfaces the one-time temporary password', async () => {
+    it('renders NO create form until the admin asks for one, and the opener announces the dialog', async () => {
         renderPage(<AdminUsers />);
-        const email = await screen.findByPlaceholderText('user@company.com');
-        fireEvent.change(email, {target: {value: 'new@test.com'}});
-        fireEvent.click(screen.getByRole('button', {name: /create user/i}));
+        await screen.findByText('admin@test.com');
+        // The page is the table, not a form pinned above it.
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+        expect(screen.queryByLabelText('Email')).not.toBeInTheDocument();
 
-        // The temp password banner appears once the POST resolves.
-        expect(await screen.findByText('temp-secret-xyz')).toBeInTheDocument();
-        await waitFor(() => {
-            const posted = fetchMock.mock.calls.some(
+        const opener = screen.getByRole('button', {name: '＋ New user'});
+        expect(opener).toHaveAttribute('aria-haspopup', 'dialog');
+        fireEvent.click(opener);
+        expect(screen.getByRole('dialog', {name: 'Create user'})).toBeInTheDocument();
+        expect(screen.getByLabelText('Email')).toBeInTheDocument();
+    });
+
+    it('submitting posts the inline form’s shape, closes the modal, and the new row reads back', async () => {
+        renderPage(<AdminUsers />);
+        await screen.findByText('admin@test.com');
+
+        openCreateUserModal();
+        fireEvent.change(screen.getByLabelText('Email'), {target: {value: 'new@test.com'}});
+        fireEvent.change(screen.getByLabelText('Role'), {target: {value: 'admin'}});
+        // Wait for the developer options to load before selecting (a select
+        // rejects a value with no matching option).
+        await screen.findByRole('option', {name: 'Alice Dev'});
+        fireEvent.change(screen.getByLabelText('Linked developer'), {target: {value: 'dev-1'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Create user'}));
+
+        // A successful write closes the dialog…
+        await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+        // …and the list refreshes: the created user reads back through the real
+        // hook → API → row path, not a hand-built fixture.
+        expect(await screen.findByText('new@test.com')).toBeInTheDocument();
+
+        const post = [...fetchMock.mock.calls]
+            .reverse()
+            .find(
                 (c) =>
                     String(c[0]).includes('/api/admin/users') &&
                     (c[1]?.method ?? 'GET').toUpperCase() === 'POST',
             );
-            expect(posted).toBe(true);
+        expect(post).toBeTruthy();
+        const sent = JSON.parse(String(post?.[1]?.body)) as Record<string, unknown>;
+        expect(sent).toEqual({email: 'new@test.com', role: 'admin', developer_id: 'dev-1'});
+    });
+
+    it('trims the email and sends a null developer link when none is chosen', async () => {
+        renderPage(<AdminUsers />);
+        await screen.findByText('admin@test.com');
+        createUser('  padded@test.com  ');
+
+        await waitFor(() => {
+            const post = [...fetchMock.mock.calls]
+                .reverse()
+                .find(
+                    (c) =>
+                        String(c[0]).includes('/api/admin/users') &&
+                        (c[1]?.method ?? 'GET').toUpperCase() === 'POST',
+                );
+            expect(post).toBeTruthy();
+            const sent = JSON.parse(String(post?.[1]?.body)) as Record<string, unknown>;
+            expect(sent).toEqual({email: 'padded@test.com', role: 'developer', developer_id: null});
         });
+    });
+
+    it('the one-time temp password survives the modal closing, shows once, and is dismissible', async () => {
+        renderPage(<AdminUsers />);
+        await screen.findByText('admin@test.com');
+        createUser('new@test.com');
+
+        // The reveal outlives the dialog: it is on the page, not inside a
+        // dismissed modal — and it is rendered exactly once.
+        expect(await screen.findByText('temp-secret-xyz')).toBeInTheDocument();
+        await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+        expect(screen.getAllByText('temp-secret-xyz')).toHaveLength(1);
+        expect(screen.getByText(/shown once/i)).toBeInTheDocument();
+
+        // Reopening the create modal must not re-render or duplicate the reveal.
+        openCreateUserModal();
+        expect(screen.getAllByText('temp-secret-xyz')).toHaveLength(1);
+        fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
+
+        fireEvent.click(screen.getByRole('button', {name: 'Dismiss'}));
+        expect(screen.queryByText('temp-secret-xyz')).not.toBeInTheDocument();
+    });
+
+    it('Save is gated on an email, Cancel closes with no write, and reopening starts empty', async () => {
+        renderPage(<AdminUsers />);
+        await screen.findByText('admin@test.com');
+
+        openCreateUserModal();
+        // An empty (or whitespace-only) email cannot be submitted.
+        expect(screen.getByRole('button', {name: 'Create user'})).toBeDisabled();
+        fireEvent.change(screen.getByLabelText('Email'), {target: {value: '   '}});
+        expect(screen.getByRole('button', {name: 'Create user'})).toBeDisabled();
+
+        fireEvent.change(screen.getByLabelText('Email'), {target: {value: 'typed-then-abandoned@test.com'}});
+        expect(screen.getByRole('button', {name: 'Create user'})).toBeEnabled();
+        fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
+
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+        const posted = fetchMock.mock.calls.some(
+            (c) =>
+                String(c[0]).includes('/api/admin/users') &&
+                (c[1]?.method ?? 'GET').toUpperCase() === 'POST',
+        );
+        expect(posted).toBe(false);
+        // Reopening remounts clean — the abandoned draft is gone (criterion 3).
+        openCreateUserModal();
+        expect((screen.getByLabelText('Email') as HTMLInputElement).value).toBe('');
+    });
+
+    it('no close affordance works while the create is in flight — the POST cannot land invisibly', async () => {
+        let releasePost: (() => void) | undefined;
+        const gate = new Promise<void>((resolve) => {
+            releasePost = resolve;
+        });
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const u = String(url);
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (u.includes('/api/admin/users') && method === 'POST') await gate;
+            return base!(url, init);
+        });
+
+        renderPage(<AdminUsers />);
+        await screen.findByText('admin@test.com');
+        createUser('new@test.com');
+        expect(await screen.findByRole('button', {name: 'Creating…'})).toBeInTheDocument();
+
+        // Cancel, Esc, ×, and a genuine backdrop click are all inert mid-write.
+        expect(screen.getByRole('button', {name: 'Cancel'})).toBeDisabled();
+        fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
+        expect(screen.getByRole('dialog', {name: 'Create user'})).toBeInTheDocument();
+        fireEvent.keyDown(screen.getByRole('dialog'), {key: 'Escape'});
+        expect(screen.getByRole('dialog', {name: 'Create user'})).toBeInTheDocument();
+        fireEvent.click(screen.getByRole('button', {name: 'Close dialog'}));
+        expect(screen.getByRole('dialog', {name: 'Create user'})).toBeInTheDocument();
+        const backdrop = screen.getByTestId('create-user-modal-backdrop');
+        fireEvent.mouseDown(backdrop);
+        fireEvent.mouseUp(backdrop);
+        fireEvent.click(backdrop);
+        expect(screen.getByRole('dialog', {name: 'Create user'})).toBeInTheDocument();
+        // The reveal has not leaked out early either — it lands on success only.
+        expect(screen.queryByText('temp-secret-xyz')).not.toBeInTheDocument();
+
+        // Once the write settles the modal closes through the success path.
+        releasePost?.();
+        await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+        expect(await screen.findByText('temp-secret-xyz')).toBeInTheDocument();
+    });
+
+    it('surfaces a failed create inside the modal and keeps it open with the draft intact', async () => {
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const u = String(url);
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (u.includes('/api/admin/users') && method === 'POST') {
+                // The client surfaces a 4xx body's `message` (see apiClient).
+                return json({message: 'Email already registered'}, 409);
+            }
+            return base!(url, init);
+        });
+
+        renderPage(<AdminUsers />);
+        await screen.findByText('admin@test.com');
+        createUser('dupe@test.com');
+
+        expect(await screen.findByText(/Email already registered/)).toBeInTheDocument();
+        // The dialog stays open with the admin's values — a failed write must not
+        // discard the draft or leave the failure invisible behind a closed modal.
+        expect(screen.getByRole('dialog', {name: 'Create user'})).toBeInTheDocument();
+        expect((screen.getByLabelText('Email') as HTMLInputElement).value).toBe('dupe@test.com');
+        // No password is revealed for a user that was never created.
+        expect(screen.queryByText('temp-secret-xyz')).not.toBeInTheDocument();
     });
 });
 

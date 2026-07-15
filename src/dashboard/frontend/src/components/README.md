@@ -242,10 +242,18 @@ footer, or a close-guard.
 
 **Adoption.** #237 landed the foundation; `AdminGitProviders` is the first
 consumer (#238) — its add/edit form is a `FormModal` opened from the header's
-"＋ Add git provider" button or a row's "Edit". The remaining admin screens are
+"＋ Add git provider" button or a row's "Edit". `AdminUsers` followed (#239):
+create-only, opened from "＋ New user", with per-row role / deactivate /
+reset-password left inline as single actions. The remaining admin screens are
 migrated onto it in the rest of the epic. `RepoScopeModal` stays on the raw
 `Modal`: it is a scope picker with its own "Save scope" footer, not a create/edit
 form.
+
+A create-only screen (`AdminUsers`) needs no `key` on the `FormModal`: with no
+edit mode there is no row to switch between, and the open-gated render already
+remounts clean fields on every reopen. Side effects that must OUTLIVE the dialog
+(the users temp-password reveal) belong to the page's state, not the modal's —
+hand them up in `onSuccess` before closing.
 
 The screen's primary affordance goes in `PageHeader`'s optional `actions` slot,
 as a `PrimaryButton` with `ariaHasPopup="dialog"`.
