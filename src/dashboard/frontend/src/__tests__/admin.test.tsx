@@ -124,6 +124,30 @@ function createUser(email: string): void {
     fireEvent.click(screen.getByRole('button', {name: 'Create user'}));
 }
 
+/** Wait for a page's table query to settle, so nothing below races the spinner. */
+async function waitForTableLoaded(): Promise<void> {
+    await waitFor(() => expect(screen.queryByText('Loading…')).not.toBeInTheDocument());
+}
+
+/**
+ * Open the assign-subscription dialog from the header's primary affordance, and
+ * wait for the developer options to arrive — they load WITH the dialog now, and a
+ * select rejects a value with no matching option.
+ */
+async function openAssignModal(): Promise<void> {
+    fireEvent.click(screen.getByRole('button', {name: '＋ Assign subscription'}));
+    await screen.findByRole('option', {name: 'Alice Dev'});
+}
+
+/** The assign POST, if the page sent one. */
+function assignPost(): [unknown, RequestInit?] | undefined {
+    return fetchMock.mock.calls.find(
+        (c) =>
+            String(c[0]).includes('/api/admin/subscriptions') &&
+            (c[1]?.method ?? 'GET').toUpperCase() === 'POST',
+    ) as [unknown, RequestInit?] | undefined;
+}
+
 describe('AdminUsers page', () => {
     it('lists users from the API', async () => {
         renderPage(<AdminUsers />);
@@ -387,26 +411,177 @@ describe('AdminSubscriptions page', () => {
         expect(screen.queryByText('Dev 00')).not.toBeInTheDocument();
     });
 
-    it('assigns a subscription via POST', async () => {
+    it('assigns only via the modal: the button opens it, the POST keeps the inline form shape, and success closes it and refreshes the list', async () => {
         renderPage(<AdminSubscriptions />);
-        // The developer select is labelled "Developer"; wait for its option to
-        // load before selecting (a select rejects a value with no matching option).
-        const devSelect = (await screen.findByRole('combobox', {name: 'Developer'})) as HTMLSelectElement;
-        await screen.findByRole('option', {name: 'Alice Dev'});
-        fireEvent.change(devSelect, {target: {value: 'dev-1'}});
-        fireEvent.click(screen.getByRole('button', {name: /^assign$/i}));
+        await waitForTableLoaded();
+        // Nothing renders over the table until the admin asks for it (criterion 1).
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+        expect(screen.queryByLabelText('Developer')).not.toBeInTheDocument();
+        // The opener announces that it opens a dialog (epic criterion 2).
+        expect(screen.getByRole('button', {name: '＋ Assign subscription'})).toHaveAttribute(
+            'aria-haspopup',
+            'dialog',
+        );
 
-        await waitFor(() => {
-            const post = fetchMock.mock.calls.find(
-                (c) =>
-                    String(c[0]).includes('/api/admin/subscriptions') &&
-                    (c[1]?.method ?? 'GET').toUpperCase() === 'POST',
-            );
-            expect(post).toBeTruthy();
-            const sent = JSON.parse(String(post?.[1]?.body)) as Record<string, unknown>;
-            expect(sent.developer_id).toBe('dev-1');
-            expect(sent.tool).toBe('copilot');
+        await openAssignModal();
+        expect(screen.getByRole('dialog', {name: 'Assign or change subscription'})).toBeInTheDocument();
+
+        fireEvent.change(screen.getByLabelText('Developer'), {target: {value: 'dev-1'}});
+        fireEvent.change(screen.getByLabelText('Plan'), {target: {value: '  business  '}});
+        fireEvent.change(screen.getByLabelText('Monthly cost ($)'), {target: {value: '19'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Assign'}));
+
+        await waitFor(() => expect(assignPost()).toBeTruthy());
+        // Same request shape the inline form sent (criterion 2): trimmed plan,
+        // numeric cost — not the raw strings.
+        const sent = JSON.parse(String(assignPost()?.[1]?.body)) as Record<string, unknown>;
+        expect(sent).toEqual({developer_id: 'dev-1', tool: 'copilot', plan: 'business', monthly_cost: 19});
+
+        // Success closes the dialog and the list refreshes — the row is read back
+        // through the real hook (seed → API → row), not a hand-built fixture.
+        await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+        expect(await screen.findByText('Alice Dev')).toBeInTheDocument();
+        expect(screen.getByText('$19')).toBeInTheDocument();
+    });
+
+    it('sends an empty plan and cost as null, matching the inline form', async () => {
+        renderPage(<AdminSubscriptions />);
+        await waitForTableLoaded();
+        await openAssignModal();
+
+        fireEvent.change(screen.getByLabelText('Developer'), {target: {value: 'dev-1'}});
+        fireEvent.change(screen.getByLabelText('Tool'), {target: {value: 'windsurf'}});
+        // Plan and cost left blank (whitespace-only plan is still "blank").
+        fireEvent.change(screen.getByLabelText('Plan'), {target: {value: '   '}});
+        fireEvent.click(screen.getByRole('button', {name: 'Assign'}));
+
+        await waitFor(() => expect(assignPost()).toBeTruthy());
+        const sent = JSON.parse(String(assignPost()?.[1]?.body)) as Record<string, unknown>;
+        expect(sent).toEqual({developer_id: 'dev-1', tool: 'windsurf', plan: null, monthly_cost: null});
+    });
+
+    it('gates Assign on a developer and a non-negative cost, and Cancel closes with no write', async () => {
+        renderPage(<AdminSubscriptions />);
+        await waitForTableLoaded();
+        await openAssignModal();
+
+        // No developer picked yet — the write the backend would reject can't be sent.
+        expect(screen.getByRole('button', {name: 'Assign'})).toBeDisabled();
+        fireEvent.change(screen.getByLabelText('Developer'), {target: {value: 'dev-1'}});
+        expect(screen.getByRole('button', {name: 'Assign'})).toBeEnabled();
+
+        fireEvent.change(screen.getByLabelText('Monthly cost ($)'), {target: {value: '-5'}});
+        expect(screen.getByRole('button', {name: 'Assign'})).toBeDisabled();
+        expect(screen.getByText('Monthly cost must be a non-negative number.')).toBeInTheDocument();
+
+        // Zero is a legitimate cost (a free seat) — the gate is on negatives, not
+        // on falsiness. (Non-numeric text isn't asserted here: a number input
+        // sanitizes it to '', so the isFinite guard is unreachable through the
+        // real control.)
+        fireEvent.change(screen.getByLabelText('Monthly cost ($)'), {target: {value: '0'}});
+        expect(screen.getByRole('button', {name: 'Assign'})).toBeEnabled();
+        expect(screen.queryByText('Monthly cost must be a non-negative number.')).not.toBeInTheDocument();
+
+        fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+        expect(assignPost()).toBeFalsy();
+
+        // Reopening remounts clean — the abandoned draft is gone (criterion 3).
+        await openAssignModal();
+        expect((screen.getByLabelText('Developer') as HTMLSelectElement).value).toBe('');
+        expect((screen.getByLabelText('Monthly cost ($)') as HTMLInputElement).value).toBe('');
+    });
+
+    it('gates the developer select until its options load — an empty select must not read as "no developers"', async () => {
+        let releaseDevelopers: (() => void) | undefined;
+        const gate = new Promise<void>((resolve) => {
+            releaseDevelopers = resolve;
         });
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            if (String(url).includes('/api/admin/developers')) await gate;
+            return base!(url, init);
+        });
+
+        renderPage(<AdminSubscriptions />);
+        await waitForTableLoaded();
+        fireEvent.click(screen.getByRole('button', {name: '＋ Assign subscription'}));
+
+        const select = screen.getByLabelText('Developer');
+        expect(select).toBeDisabled();
+        expect(screen.getByRole('option', {name: 'Loading developers…'})).toBeInTheDocument();
+
+        releaseDevelopers?.();
+        await screen.findByRole('option', {name: 'Alice Dev'});
+        expect(select).toBeEnabled();
+        expect(screen.getByRole('option', {name: 'Select…'})).toBeInTheDocument();
+    });
+
+    it('no close affordance works while the assign is in flight — the POST cannot land invisibly', async () => {
+        let releasePost: (() => void) | undefined;
+        const gate = new Promise<void>((resolve) => {
+            releasePost = resolve;
+        });
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const u = String(url);
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (u.includes('/api/admin/subscriptions') && method === 'POST') await gate;
+            return base!(url, init);
+        });
+
+        renderPage(<AdminSubscriptions />);
+        await waitForTableLoaded();
+        await openAssignModal();
+        fireEvent.change(screen.getByLabelText('Developer'), {target: {value: 'dev-1'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Assign'}));
+        expect(await screen.findByRole('button', {name: 'Saving…'})).toBeInTheDocument();
+
+        // Cancel, Esc, ×, and a genuine backdrop click are all inert mid-write.
+        const dialogName = 'Assign or change subscription';
+        expect(screen.getByRole('button', {name: 'Cancel'})).toBeDisabled();
+        fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
+        expect(screen.getByRole('dialog', {name: dialogName})).toBeInTheDocument();
+        fireEvent.keyDown(screen.getByRole('dialog'), {key: 'Escape'});
+        expect(screen.getByRole('dialog', {name: dialogName})).toBeInTheDocument();
+        fireEvent.click(screen.getByRole('button', {name: 'Close dialog'}));
+        expect(screen.getByRole('dialog', {name: dialogName})).toBeInTheDocument();
+        const backdrop = screen.getByTestId('assign-subscription-modal-backdrop');
+        fireEvent.mouseDown(backdrop);
+        fireEvent.mouseUp(backdrop);
+        fireEvent.click(backdrop);
+        expect(screen.getByRole('dialog', {name: dialogName})).toBeInTheDocument();
+
+        // Once the write settles the modal closes through the success path.
+        releasePost?.();
+        await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+        expect(await screen.findByText('Alice Dev')).toBeInTheDocument();
+    });
+
+    it('surfaces a failed assign inside the modal and keeps it open with the draft intact', async () => {
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const u = String(url);
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (u.includes('/api/admin/subscriptions') && method === 'POST') {
+                // The client surfaces a 4xx body's `message` (see apiClient).
+                return json({message: 'Seat limit reached'}, 409);
+            }
+            return base!(url, init);
+        });
+
+        renderPage(<AdminSubscriptions />);
+        await waitForTableLoaded();
+        await openAssignModal();
+        fireEvent.change(screen.getByLabelText('Developer'), {target: {value: 'dev-1'}});
+        fireEvent.change(screen.getByLabelText('Plan'), {target: {value: 'business'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Assign'}));
+
+        expect(await screen.findByText(/Seat limit reached/)).toBeInTheDocument();
+        // The dialog stays open with the admin's values — a failed write must not
+        // discard the draft or leave the failure invisible behind a closed modal.
+        expect(screen.getByRole('dialog', {name: 'Assign or change subscription'})).toBeInTheDocument();
+        expect((screen.getByLabelText('Plan') as HTMLInputElement).value).toBe('business');
     });
 });
 
