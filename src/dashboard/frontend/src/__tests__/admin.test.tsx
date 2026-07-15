@@ -536,6 +536,12 @@ describe('AdminUsers page', () => {
         expect(screen.getAllByText('temp-secret-xyz')).toHaveLength(1);
         expect(screen.getByText(/shown once/i)).toBeInTheDocument();
 
+        // …and it ANNOUNCES itself. The dialog just unmounted and Modal restored
+        // focus to the header button, so the reveal lands nowhere near focus. It
+        // is shown once and cannot be recovered, so a silent reveal is a lost
+        // password — role="status" is what makes it reach a screen reader.
+        expect(screen.getByRole('status')).toHaveTextContent('temp-secret-xyz');
+
         // Reopening the create modal must not re-render or duplicate the reveal.
         openCreateUserModal();
         expect(screen.getAllByText('temp-secret-xyz')).toHaveLength(1);
@@ -1590,6 +1596,38 @@ describe('AdminIdentities page', () => {
         releaseTeams?.();
         await screen.findByRole('option', {name: 'platform'});
         expect(select).toBeEnabled();
+        expect(select.value).toBe('frontend');
+    });
+
+    it('does not duplicate the real team option when a REFETCH fails over cached teams', async () => {
+        renderPage(<AdminIdentities />);
+        await waitForTableLoaded();
+
+        // First open primes the teams cache.
+        fireEvent.click(within(developerRow('Alice Dev')).getByRole('button', {name: 'Edit'}));
+        await screen.findByRole('option', {name: 'platform'});
+        fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
+
+        // Now break the roster and reopen: the editor remounts, so the query
+        // refetches — and react-query KEEPS the cached teams while flipping to
+        // isError. That is the state the placeholder must stay out of: it would
+        // render a second <option value="frontend">, and the select displays the
+        // FIRST match, so Alice's team would read as "Couldn't load teams".
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (String(url).includes('/api/admin/teams') && method === 'GET') {
+                return json({message: 'boom'}, 500);
+            }
+            return base!(url, init);
+        });
+        fireEvent.click(within(developerRow('Alice Dev')).getByRole('button', {name: 'Edit'}));
+
+        const select = (await screen.findByLabelText('Team')) as HTMLSelectElement;
+        await waitFor(() => expect(select).toBeDisabled());
+        // The cached options survived, and there is exactly one 'frontend'.
+        expect(screen.getAllByRole('option', {name: 'frontend'})).toHaveLength(1);
+        expect(screen.queryByRole('option', {name: 'Couldn’t load teams'})).not.toBeInTheDocument();
         expect(select.value).toBe('frontend');
     });
 

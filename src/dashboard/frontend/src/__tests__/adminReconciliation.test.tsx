@@ -178,9 +178,13 @@ describe('AdminReconciliation page', () => {
         });
 
         // Success closes the dialog, but the run summary outlives it — it is the
-        // outcome of the run and has to stay readable beside the rows.
+        // outcome of the run and has to stay readable beside the rows. It also
+        // announces: the dialog just unmounted and focus went back to the header
+        // button, so the summary appears away from where the user is.
         await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
-        expect(screen.getByText('Reconciled 2026-06: 1 new, 0 already tracked.')).toBeInTheDocument();
+        expect(screen.getByRole('status')).toHaveTextContent(
+            'Reconciled 2026-06: 1 new, 0 already tracked.',
+        );
     });
 
     it('omits blank run parameters, as the inline form did', async () => {
