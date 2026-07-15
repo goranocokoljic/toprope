@@ -68,6 +68,37 @@ toprope <command> [subcommand] [options]
 
 Each prints `N written, M skipped`; non-zero exit if any connector reported errors.
 
+## Git history maintenance
+
+| Command | Description |
+|---|---|
+| `toprope git set-history-floor --provider <github\|bitbucket\|gitlab> --container <name> --at <iso> [--force]` | Declare how far back a **legacy** git provider has already synced. |
+
+Only needed for providers first synced before Toprope recorded a history floor. Those
+providers have no record of how far back their first sync reached, and it cannot be
+recovered from stored data — so **"Sync older history" refuses them** (HTTP 409) rather
+than guess. Guessing is not a safe fallback in either direction: too recent and the
+backfill re-imports activity you already have (permanently inflating commit counts, since
+the merge is additive); too old and the span in between becomes un-importable forever.
+
+`--at` is the earliest instant that provider has already imported — normally
+`(the time of its first sync) − (the history window that sync used)`. It must be a
+canonical UTC ISO instant in the past, e.g. `2025-01-01T00:00:00.000Z`.
+
+```bash
+toprope git set-history-floor --provider github --container acme --at 2025-01-01T00:00:00.000Z
+```
+
+**Get this value right.** It is an assertion, not a guess: declare a floor *newer* than
+the truth and the next backfill double-counts the overlap; declare one *older* and the
+span in between is stranded. The command echoes what it armed — read it back.
+
+`--force` replaces a floor that is already recorded. Use it to correct a mis-typed `--at`
+**before** running a backfill. It does *not* apply to a provider that has never synced
+(that refusal means the `--provider`/`--container` spelling doesn't match a connected
+provider — fix the spelling, don't force it), and forcing over a floor that a real sync
+earned will corrupt the backfill's disjointness.
+
 ## Expenses
 
 | Command | Description |

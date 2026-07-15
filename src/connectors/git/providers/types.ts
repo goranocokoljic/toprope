@@ -1,5 +1,22 @@
 export type GitProviderType = 'github' | 'bitbucket' | 'gitlab';
 
+/**
+ * The runtime allowlist for {@link GitProviderType} — what a trust boundary must check a
+ * caller-supplied string against, since the compile-time union proves nothing about a
+ * value that arrives as arbitrary CLI/HTTP input.
+ *
+ * Derived from a Record keyed by the union, so this list cannot silently drift from it:
+ * adding a member to GitProviderType without adding it here is a BUILD error (the Record
+ * is missing a key), not a provider that quietly fails every runtime check.
+ */
+const GIT_PROVIDER_TYPE_SET: Record<GitProviderType, true> = {
+    github: true,
+    bitbucket: true,
+    gitlab: true,
+};
+
+export const GIT_PROVIDER_TYPES = Object.keys(GIT_PROVIDER_TYPE_SET) as readonly GitProviderType[];
+
 export interface GitAuthor {
     name: string;
     email: string;
