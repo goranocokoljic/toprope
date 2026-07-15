@@ -72,6 +72,14 @@ export const FIRST_SYNC_WINDOW_MIN_MONTHS = 1;
 export const FIRST_SYNC_WINDOW_MAX_MONTHS = 60;
 export const FIRST_SYNC_WINDOW_DEFAULT_MONTHS = 6;
 
+// The earliest-synced watermark sentinel meaning "history synced back to the repo's
+// first commit" (#229). A walk-all first sync (no window clamp → `since === ''`)
+// imported everything, so nothing older exists to backfill; we record this epoch
+// instant as the floor rather than '' (which the watermark accessor would read as
+// "unset" and fall through to the lazy default). The overlap guard then rejects any
+// backfill against such a provider, because every real target is `>=` the epoch.
+export const EARLIEST_SYNC_EPOCH = new Date(0).toISOString();
+
 /** Knobs a sync run accepts beyond the provider set. */
 export interface SyncRunOptions {
     /**
@@ -263,18 +271,20 @@ function setProviderEarliestSyncTime(
  * enforce the overlap guard (`new_target < watermark`) and set the fetch's upper
  * bound.
  *
- * LAZY DEFAULT: the watermark is written ONLY by a backfill run — the forward path
- * doesn't record how far back the first sync reached — so a provider that has
- * never been backfilled has no stored value. There we default to the initial-sync
- * start (`now` − the #228 default window).
+ * The watermark is now recorded at FIRST-SYNC time (runSync writes the real floor
+ * the first forward sync reached — the clamped window start, or {@link
+ * EARLIEST_SYNC_EPOCH} for a walk-all sync) and lowered by every backfill, so for
+ * any provider synced by this build it is EXACT — the overlap guard never overlaps
+ * an already-imported span.
  *
- * ACCEPTED CAVEAT: if that provider's first sync actually used a NON-default
- * window (a custom months value, or the scheduled/CLI walk-all path), this default
- * can be too recent, so the very FIRST backfill's [new_target, default] slice may
- * overlap an already-imported span and additively double-count it. #228's 6-month
- * default is the common "Sync now" case where it is exact; the walk-all exposure is
- * the same family as #228's residual scheduled/CLI gap. Once any backfill runs, the
- * watermark is recorded and every later backfill is exact by construction.
+ * LEGACY LAZY DEFAULT: a provider whose first sync predates this change has no
+ * stored watermark. Only there do we fall back to the initial-sync start (`now` −
+ * the #228 default window). This is best-effort: if that legacy provider's first
+ * sync used a non-default window (a custom months value, or the scheduled/CLI
+ * walk-all path), the default can be too recent and the very FIRST backfill may
+ * overlap and double-count. It is unavoidable without a data migration and shrinks
+ * to nothing as legacy providers get their first post-change forward sync (which
+ * records the real floor). New providers are never exposed to it.
  */
 export function getEarliestSyncedWatermark(
     db: Database.Database,
@@ -580,6 +590,16 @@ interface ProviderFetchResult {
     /** The provider's container id — the second half of its sync-state keys, so
      *  runSync can lower the earliest watermark (#229) without re-deriving it. */
     identifier: string;
+    /**
+     * The floor a FIRST forward sync actually reached (#229) — the clamped window
+     * start (`since`), or {@link EARLIEST_SYNC_EPOCH} for a walk-all sync — so
+     * runSync can record the true earliest-synced watermark and the "sync older
+     * history" backfill's default is exact rather than guessed. `null` on every
+     * non-first-sync path (a backfill, an incremental run, or a first sync that
+     * failed before any repo was processed), where the watermark must not be
+     * (re)written from the forward path.
+     */
+    firstSyncFloor: string | null;
 }
 
 async function fetchProviderData(
@@ -611,6 +631,11 @@ async function fetchProviderData(
     //     SyncRunOptions).
     const storedCursor = getProviderLastSyncTime(db, stateKey);
     const since = backfill ? backfill.since : (storedCursor ?? firstSyncSince(now, firstSyncWindowMonths));
+    // This run is a FIRST forward sync when it is not a backfill and no cursor exists
+    // yet. Only then does runSync record the earliest-synced watermark (#229): the
+    // real floor `since` reached, mapped to the epoch sentinel for a walk-all ('').
+    const isFirstSync = !backfill && storedCursor === null;
+    const firstSyncFloor = isFirstSync ? (since === '' ? EARLIEST_SYNC_EPOCH : since) : null;
     // Commit fetch upper bound: the backfill's watermark, else `now`. PRs are fetched
     // by `since` only (the provider interface has no PR `until`); in backfill that
     // re-delivers recent PRs, which the max()-based cross-run merge folds in
@@ -645,6 +670,9 @@ async function fetchProviderData(
             errors,
             stateKey,
             identifier,
+            // listRepos failed before any repo was processed — nothing was imported,
+            // so don't claim a synced-back-to floor even on a first sync.
+            firstSyncFloor: null,
         };
     }
 
@@ -791,6 +819,7 @@ async function fetchProviderData(
         errors,
         stateKey,
         identifier,
+        firstSyncFloor,
     };
 }
 
@@ -1071,6 +1100,18 @@ export class GitSync implements ConnectorInterface {
                 if (options?.backfill) {
                     setProviderEarliestSyncTime(db, providerType, identifier, options.backfill.since);
                 } else {
+                    // On the FIRST forward sync, ALSO record the true earliest-synced
+                    // floor (#229) so the "sync older history" backfill's default is
+                    // exact, not the too-recent lazy guess. Guard on an unset
+                    // watermark: a first sync should never clobber a lower value a
+                    // prior direct-API backfill may have written (the UI can't reach
+                    // that ordering, but the route doesn't forbid it).
+                    if (
+                        result.firstSyncFloor !== null &&
+                        getProviderEarliestSyncTime(db, providerType, identifier) === null
+                    ) {
+                        setProviderEarliestSyncTime(db, providerType, identifier, result.firstSyncFloor);
+                    }
                     setProviderLastSyncTime(db, stateKey, now);
                 }
             };

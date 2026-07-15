@@ -730,5 +730,41 @@ describe('admin git-provider sync-now API (#199)', () => {
             // No run started — status untouched.
             expect((await readProvider(id))?.last_sync_status).toBeNull();
         });
+
+        // The route's own in-flight guard (shared activeSyncs registry) serializes the
+        // read-watermark → lower-watermark sequence so two backfills can't race on the
+        // same edge and both write. Distinct from the overlap guard (which needs a
+        // settled run) — this must reject while a run is still executing.
+        it('rejects a second backfill while one is in flight (409, starts no second run)', async () => {
+            const id = await createGithub();
+            // Gate listRepos so the first backfill stays in flight until released.
+            let release!: () => void;
+            const gate = new Promise<void>((r) => {
+                release = r;
+            });
+            const getCommits = vi.fn().mockResolvedValue([]);
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockImplementation(async () => {
+                        await gate;
+                        return [makeRepo('repo1')];
+                    }),
+                    getCommits,
+                }),
+            );
+
+            const first = await triggerOlder(id, {months: 12});
+            expect(first.statusCode).toBe(202);
+
+            // Second trigger while the first is still running → rejected, no new run.
+            const second = await triggerOlder(id, {months: 24});
+            expect(second.statusCode).toBe(409);
+            expect(second.json().message).toMatch(/in progress/);
+            expect(getCommits).not.toHaveBeenCalled();
+
+            release();
+            await waitForSyncStatus(id, 'ok');
+        });
     });
 });

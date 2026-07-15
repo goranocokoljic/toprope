@@ -10,6 +10,7 @@ import {
     subtractUtcMonths,
     earliestSyncStateKey,
     getEarliestSyncedWatermark,
+    EARLIEST_SYNC_EPOCH,
     FIRST_SYNC_WINDOW_MIN_MONTHS,
     FIRST_SYNC_WINDOW_MAX_MONTHS,
     FIRST_SYNC_WINDOW_DEFAULT_MONTHS,
@@ -1726,5 +1727,140 @@ describe('GitSync.syncProviders — sync-older-history backfill plumbing (#229)'
             .prepare(`SELECT commits FROM git_snapshots WHERE developer_id = ? AND date = '2025-06-15'`)
             .get(devId) as {commits: number};
         expect(recent.commits).toBe(5);
+    });
+
+    // TST-1 / SO-4: the commit slice is disjoint, but PRs are re-fetched by `since`
+    // only (no `until`), so a backfill re-delivers already-counted recent PRs. The
+    // feature's no-double-count claim rests entirely on remergeStoredSnapshot folding
+    // PR counts via max(). Drive that vector directly: a backfill that re-delivers a
+    // recent, already-counted PR must NOT inflate the recent row's prs_opened.
+    it('re-delivered recent PRs do not double-count on backfill (max()-merge)', async () => {
+        const devId = seedDev(db, 'alice');
+        // A recent snapshot as if the first sync already counted alice's PR that day.
+        db.prepare(
+            `INSERT INTO git_snapshots
+             (id, developer_id, date, commits, lines_added, lines_removed, files_changed,
+              prs_opened, prs_merged, review_comments_given, avg_time_to_merge_hours,
+              code_churn_rate, ai_signature_score, avg_commit_size, commit_burst_count, data_source)
+             VALUES ('s-pr', ?, '2024-01-15', 0, 0, 0, 0, 1, 1, 0, 24, 0, 0, 0, 0, 'github')`,
+        ).run(devId);
+
+        // Backfill an OLDER slice; getPullRequests (fetched by `since` only) re-delivers
+        // the same recent merged PR dated 2024-01-15/16.
+        const createGitProvider = await getCreateGitProvider();
+        createGitProvider.mockReturnValue(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                getCommits: vi.fn().mockResolvedValue([]),
+                getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+                getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs('repo1/')),
+            }),
+        );
+        await new GitSync({enabled: false}).syncProviders(db, [CONFIG], undefined, {
+            backfill: {since: '2023-07-01T00:00:00.000Z', until: '2024-01-01T00:00:00.000Z'},
+        });
+
+        // max()-merge keeps the recent row at 1 — not 2 — despite the re-delivery.
+        const recent = db
+            .prepare(`SELECT prs_opened, prs_merged FROM git_snapshots WHERE developer_id = ? AND date = '2024-01-15'`)
+            .get(devId) as {prs_opened: number; prs_merged: number};
+        expect(recent.prs_opened).toBe(1);
+        expect(recent.prs_merged).toBe(1);
+    });
+});
+
+describe('GitSync.syncProviders — first-sync earliest-watermark recording (#229)', () => {
+    let db: Database.Database;
+
+    beforeEach(() => {
+        db = makeDb();
+        vi.resetAllMocks();
+    });
+
+    afterEach(() => {
+        db.close();
+        vi.restoreAllMocks();
+    });
+
+    const CONFIG: GitProviderConfig = {
+        type: 'github',
+        org: 'test-org',
+        auth: {type: 'token', api_token: 'test-token'},
+    };
+    const FORWARD_KEY = 'git_last_sync:github:test-org';
+    const EARLIEST_KEY = 'git_earliest_sync:github:test-org';
+
+    function readState(key: string): string | undefined {
+        return (db.prepare('SELECT value FROM sync_state WHERE key = ?').get(key) as
+            | {value: string}
+            | undefined)?.value;
+    }
+
+    async function firstSync(options?: {firstSyncWindowMonths?: number}): Promise<string> {
+        const createGitProvider = await getCreateGitProvider();
+        const getCommits = vi.fn().mockResolvedValue([]);
+        createGitProvider.mockReturnValue(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                getCommits,
+            }),
+        );
+        await new GitSync({enabled: false}).syncProviders(db, [CONFIG], undefined, options);
+        return getCommits.mock.calls[0][1] as string;
+    }
+
+    it('records the earliest watermark = the clamped window start on a first sync', async () => {
+        // This is what makes the backfill default EXACT rather than a lazy guess:
+        // the watermark must equal the `since` the first sync actually reached.
+        const since = await firstSync({firstSyncWindowMonths: 6});
+        expect(since).not.toBe('');
+        expect(readState(EARLIEST_KEY)).toBe(since);
+    });
+
+    it('records the EPOCH sentinel when the first sync walks all history ("")', async () => {
+        // Scheduled/CLI path passes no window → since === '' (walk all). The floor is
+        // the beginning of time, stored as the epoch sentinel so a later backfill's
+        // overlap guard rejects (nothing older exists) instead of re-covering.
+        const since = await firstSync(undefined);
+        expect(since).toBe('');
+        expect(readState(EARLIEST_KEY)).toBe(EARLIEST_SYNC_EPOCH);
+        // And the guard sees "everything already synced" for any real target.
+        const target = '2020-01-01T00:00:00.000Z';
+        expect(target >= getEarliestSyncedWatermark(db, 'github', 'test-org', '2026-03-15T12:00:00.000Z')).toBe(
+            true,
+        );
+    });
+
+    it('does NOT re-write the watermark on an incremental (non-first) sync', async () => {
+        // Seed a forward cursor so the next run is incremental, and a watermark that
+        // must survive untouched.
+        db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+            FORWARD_KEY,
+            '2026-06-01T00:00:00.000Z',
+        );
+        db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+            EARLIEST_KEY,
+            '2024-01-01T00:00:00.000Z',
+        );
+        await firstSync({firstSyncWindowMonths: 6});
+        // The incremental run advances the forward cursor but leaves the watermark.
+        expect(readState(EARLIEST_KEY)).toBe('2024-01-01T00:00:00.000Z');
+    });
+
+    it('does NOT record a watermark when the first sync fails to list repos', async () => {
+        // listRepos throws before any repo is processed — nothing imported, so no
+        // synced-back-to floor may be claimed even though the forward cursor advances.
+        const createGitProvider = await getCreateGitProvider();
+        createGitProvider.mockReturnValue(
+            makeMockProvider({
+                listRepos: vi.fn().mockRejectedValue(new Error('boom')),
+            }),
+        );
+        await new GitSync({enabled: false}).syncProviders(db, [CONFIG], undefined, {
+            firstSyncWindowMonths: 6,
+        });
+        expect(readState(EARLIEST_KEY)).toBeUndefined();
+        // Forward cursor still advances (existing accepted behavior).
+        expect(readState(FORWARD_KEY)).toBeDefined();
     });
 });
