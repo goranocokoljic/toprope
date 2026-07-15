@@ -122,16 +122,20 @@ export function SecondaryButton({
     children,
     onClick,
     disabled,
+    ariaHasPopup,
 }: {
     children: ReactNode;
     onClick?: () => void;
     disabled?: boolean;
+    /** Set to 'dialog' on a button that opens a modal (announced to AT). */
+    ariaHasPopup?: 'dialog';
 }): JSX.Element {
     return (
         <button
             type="button"
             onClick={onClick}
             disabled={disabled}
+            aria-haspopup={ariaHasPopup}
             className="rounded-md border border-border bg-surface px-3 py-1.5 text-sm font-medium text-foreground disabled:opacity-50"
         >
             {children}

@@ -2,7 +2,7 @@
 import '../test/setup';
 import '@testing-library/jest-dom/vitest';
 import {afterEach, beforeEach, describe, expect, it, vi, type Mock} from 'vitest';
-import {cleanup, fireEvent, render, screen, waitFor} from '@testing-library/react';
+import {cleanup, fireEvent, render, screen, waitFor, within} from '@testing-library/react';
 import {QueryClient, QueryClientProvider} from '@tanstack/react-query';
 import {MemoryRouter} from 'react-router-dom';
 import {AdminUsers} from '../pages/admin/AdminUsers';
@@ -16,6 +16,7 @@ const DEVELOPERS: AdminDeveloper[] = [
 
 let users: AdminUser[];
 let subscriptions: AdminSubscription[];
+let teams: AdminTeam[];
 let fetchMock: Mock;
 
 function json(body: unknown, status = 200): Response {
@@ -41,6 +42,26 @@ beforeEach(() => {
         },
     ];
     subscriptions = [];
+    // Two teams that differ in EVERY editable field — one fully populated, one
+    // with nulls — so a cross-row pre-fill leak has a visible signal to catch.
+    teams = [
+        {
+            name: 'frontend',
+            department: 'Engineering',
+            manager: 'mae@test.com',
+            created_at: '2026-01-01T00:00:00.000Z',
+            archived_at: null,
+            developer_count: 3,
+        },
+        {
+            name: 'platform',
+            department: null,
+            manager: null,
+            created_at: '2026-01-02T00:00:00.000Z',
+            archived_at: null,
+            developer_count: 1,
+        },
+    ];
 
     fetchMock = vi.fn(async (url: unknown, init?: RequestInit) => {
         const u = String(url);
@@ -89,6 +110,39 @@ beforeEach(() => {
         }
         if (u.includes('/api/admin/subscriptions')) {
             return json({data: subscriptions});
+        }
+        // Teams: create appends, PATCH merges into the addressed row, so every
+        // assertion below reads the row back through the real hook (seed → API →
+        // row) rather than a hand-built fixture.
+        if (u.includes('/api/admin/teams') && method === 'POST') {
+            const created: AdminTeam = {
+                name: String(body.name),
+                department: (body.department as string) ?? null,
+                manager: (body.manager as string) ?? null,
+                created_at: '2026-02-01T00:00:00.000Z',
+                archived_at: null,
+                developer_count: 0,
+            };
+            teams = [...teams, created];
+            return json({data: created}, 201);
+        }
+        if (u.includes('/api/admin/teams/') && method === 'PATCH') {
+            const name = decodeURIComponent(u.split('/api/admin/teams/')[1]);
+            const target = teams.find((t) => t.name === name);
+            if (!target) return json({message: 'No such team'}, 404);
+            const updated: AdminTeam = {
+                ...target,
+                ...('department' in body ? {department: (body.department as string) ?? null} : {}),
+                ...('manager' in body ? {manager: (body.manager as string) ?? null} : {}),
+                ...('archived' in body
+                    ? {archived_at: body.archived ? '2026-03-01T00:00:00.000Z' : null}
+                    : {}),
+            };
+            teams = teams.map((t) => (t.name === name ? updated : t));
+            return json({data: updated});
+        }
+        if (u.includes('/api/admin/teams')) {
+            return json({data: teams});
         }
         return json({error: 'not found'}, 404);
     });
@@ -146,6 +200,46 @@ function assignPost(): [unknown, RequestInit?] | undefined {
             String(c[0]).includes('/api/admin/subscriptions') &&
             (c[1]?.method ?? 'GET').toUpperCase() === 'POST',
     ) as [unknown, RequestInit?] | undefined;
+}
+
+/** The `<tr>` for a team, so a row's own controls can be addressed unambiguously. */
+function teamRow(name: string): HTMLElement {
+    const cell = screen.getByText(name).closest('tr');
+    if (!cell) throw new Error(`No row for team ${name}`);
+    return cell;
+}
+
+/** Open the create-team dialog from the header's primary affordance. */
+function openCreateTeamModal(): void {
+    fireEvent.click(screen.getByRole('button', {name: '＋ New team'}));
+}
+
+/** Open a specific team row's edit dialog. */
+function openEditTeamModal(name: string): void {
+    fireEvent.click(within(teamRow(name)).getByRole('button', {name: 'Edit'}));
+}
+
+/** The team-create POST, if the page sent one. */
+function teamPost(): [unknown, RequestInit?] | undefined {
+    return fetchMock.mock.calls.find(
+        (c) =>
+            String(c[0]).endsWith('/api/admin/teams') &&
+            (c[1]?.method ?? 'GET').toUpperCase() === 'POST',
+    ) as [unknown, RequestInit?] | undefined;
+}
+
+/** Every PATCH sent to a given team, in order. */
+function teamPatches(name: string): [unknown, RequestInit?][] {
+    return fetchMock.mock.calls.filter(
+        (c) =>
+            String(c[0]).includes(`/api/admin/teams/${encodeURIComponent(name)}`) &&
+            (c[1]?.method ?? 'GET').toUpperCase() === 'PATCH',
+    ) as [unknown, RequestInit?][];
+}
+
+/** The parsed body of a recorded request. */
+function sentBody(call: [unknown, RequestInit?] | undefined): Record<string, unknown> {
+    return JSON.parse(String(call?.[1]?.body)) as Record<string, unknown>;
 }
 
 describe('AdminUsers page', () => {
@@ -587,7 +681,7 @@ describe('AdminSubscriptions page', () => {
 
 describe('AdminTeams page', () => {
     it('paginates the team table at 25 rows per page', async () => {
-        const teams: AdminTeam[] = Array.from({length: 30}, (_, i) => ({
+        teams = Array.from({length: 30}, (_, i) => ({
             name: `team-${String(i).padStart(2, '0')}`,
             department: 'Engineering',
             manager: 'Mae',
@@ -595,10 +689,6 @@ describe('AdminTeams page', () => {
             archived_at: null,
             developer_count: 3,
         }));
-        fetchMock.mockImplementation(async (url: unknown) => {
-            if (String(url).includes('/api/admin/teams')) return json({data: teams});
-            return json({error: 'not found'}, 404);
-        });
         renderPage(<AdminTeams />);
         await screen.findByText('team-00');
 
@@ -609,5 +699,300 @@ describe('AdminTeams page', () => {
         expect(document.querySelectorAll('tbody tr')).toHaveLength(5);
         expect(screen.getByText('team-29')).toBeInTheDocument();
         expect(screen.queryByText('team-00')).not.toBeInTheDocument();
+    });
+
+    it('renders no form until asked and leaves NO editable inputs in the row — both openers announce the dialog', async () => {
+        renderPage(<AdminTeams />);
+        await waitForTableLoaded();
+
+        // The page is the table, not a create card pinned above it (criterion 1).
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+        expect(screen.queryByLabelText('Name')).not.toBeInTheDocument();
+        // The inline row inputs are gone: the row renders its values as text, so
+        // the ONLY editable control anywhere on the page is inside a dialog.
+        expect(within(teamRow('frontend')).queryByRole('textbox')).not.toBeInTheDocument();
+        expect(within(teamRow('frontend')).getByText('Engineering')).toBeInTheDocument();
+        // ...and a row's Save button went with them — editing now commits from
+        // the dialog's own Save.
+        expect(within(teamRow('frontend')).queryByRole('button', {name: 'Save'})).not.toBeInTheDocument();
+
+        // Both affordances announce that they open a dialog (epic criterion 2).
+        expect(screen.getByRole('button', {name: '＋ New team'})).toHaveAttribute(
+            'aria-haspopup',
+            'dialog',
+        );
+        expect(within(teamRow('frontend')).getByRole('button', {name: 'Edit'})).toHaveAttribute(
+            'aria-haspopup',
+            'dialog',
+        );
+    });
+
+    it('creates only via the modal: the POST keeps the inline form’s shape, and success closes it and refreshes the list', async () => {
+        renderPage(<AdminTeams />);
+        await waitForTableLoaded();
+        openCreateTeamModal();
+        expect(screen.getByRole('dialog', {name: 'Create team'})).toBeInTheDocument();
+
+        fireEvent.change(screen.getByLabelText('Name'), {target: {value: '  growth  '}});
+        fireEvent.change(screen.getByLabelText('Department'), {target: {value: '  sales  '}});
+        // Manager left blank — the inline form sent null, not ''.
+        fireEvent.click(screen.getByRole('button', {name: 'Create team'}));
+
+        await waitFor(() => expect(teamPost()).toBeTruthy());
+        expect(sentBody(teamPost())).toEqual({name: 'growth', department: 'sales', manager: null});
+
+        // Success closes the dialog and the new row reads back through the real
+        // hook (seed → API → row), not a hand-built fixture.
+        await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+        expect(await screen.findByText('growth')).toBeInTheDocument();
+        expect(within(teamRow('growth')).getByText('sales')).toBeInTheDocument();
+    });
+
+    it('edits only via the row’s modal: pre-filled, PATCHes the inline row’s shape, and the row reads back', async () => {
+        renderPage(<AdminTeams />);
+        await waitForTableLoaded();
+        openEditTeamModal('frontend');
+
+        // Pre-filled from the row (criterion 2) — and the name is not editable
+        // here: it is the key the PATCH addresses.
+        expect(screen.getByRole('dialog', {name: 'Edit team — frontend'})).toBeInTheDocument();
+        expect((screen.getByLabelText('Department') as HTMLInputElement).value).toBe('Engineering');
+        expect((screen.getByLabelText('Manager') as HTMLInputElement).value).toBe('mae@test.com');
+        expect(screen.queryByLabelText('Name')).not.toBeInTheDocument();
+
+        fireEvent.change(screen.getByLabelText('Department'), {target: {value: '  Platform Eng  '}});
+        fireEvent.change(screen.getByLabelText('Manager'), {target: {value: '   '}});
+        fireEvent.click(screen.getByRole('button', {name: 'Save changes'}));
+
+        await waitFor(() => expect(teamPatches('frontend')).toHaveLength(1));
+        // Exactly the patch the inline row inputs sent: trimmed, blank → null,
+        // and addressed to THIS team only.
+        expect(sentBody(teamPatches('frontend')[0])).toEqual({
+            department: 'Platform Eng',
+            manager: null,
+        });
+        expect(teamPatches('platform')).toHaveLength(0);
+
+        await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+        await waitFor(() =>
+            expect(within(teamRow('frontend')).getByText('Platform Eng')).toBeInTheDocument(),
+        );
+        expect(screen.queryByText('mae@test.com')).not.toBeInTheDocument();
+    });
+
+    it('pre-fills each row independently — switching rows remounts clean fields', async () => {
+        renderPage(<AdminTeams />);
+        await waitForTableLoaded();
+
+        // Edit one row, type something, abandon it.
+        openEditTeamModal('frontend');
+        fireEvent.change(screen.getByLabelText('Department'), {target: {value: 'Typed but abandoned'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
+
+        // The other row must show ITS OWN values — a leaked draft here would mean
+        // the fields survived the close. (The conditional render unmounts the body
+        // on every close, so this passes on that alone; the key={editing?.name}
+        // remount is defence-in-depth for a row⇄row swap with no close between.)
+        openEditTeamModal('platform');
+        expect(screen.getByRole('dialog', {name: 'Edit team — platform'})).toBeInTheDocument();
+        expect((screen.getByLabelText('Department') as HTMLInputElement).value).toBe('');
+        expect((screen.getByLabelText('Manager') as HTMLInputElement).value).toBe('');
+        fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
+
+        // Back to the first row: the abandoned draft is gone, re-seeded from the row.
+        openEditTeamModal('frontend');
+        expect((screen.getByLabelText('Department') as HTMLInputElement).value).toBe('Engineering');
+
+        // And create starts empty rather than carrying the last edited row.
+        fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
+        openCreateTeamModal();
+        expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('');
+        expect((screen.getByLabelText('Department') as HTMLInputElement).value).toBe('');
+
+        expect(teamPatches('frontend')).toHaveLength(0);
+        expect(teamPost()).toBeFalsy();
+    });
+
+    it('gates each Save on real input — a name to create, an actual change to edit', async () => {
+        renderPage(<AdminTeams />);
+        await waitForTableLoaded();
+
+        openCreateTeamModal();
+        expect(screen.getByRole('button', {name: 'Create team'})).toBeDisabled();
+        fireEvent.change(screen.getByLabelText('Name'), {target: {value: '   '}});
+        expect(screen.getByRole('button', {name: 'Create team'})).toBeDisabled();
+        fireEvent.change(screen.getByLabelText('Name'), {target: {value: 'growth'}});
+        expect(screen.getByRole('button', {name: 'Create team'})).toBeEnabled();
+        fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
+
+        // The inline row's dirty gate is preserved: an untouched edit can't send
+        // a no-op PATCH.
+        openEditTeamModal('frontend');
+        expect(screen.getByRole('button', {name: 'Save changes'})).toBeDisabled();
+        fireEvent.change(screen.getByLabelText('Manager'), {target: {value: 'new@test.com'}});
+        expect(screen.getByRole('button', {name: 'Save changes'})).toBeEnabled();
+        // Typing back to the original value is no longer a change.
+        fireEvent.change(screen.getByLabelText('Manager'), {target: {value: 'mae@test.com'}});
+        expect(screen.getByRole('button', {name: 'Save changes'})).toBeDisabled();
+
+        fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+        expect(teamPatches('frontend')).toHaveLength(0);
+    });
+
+    it('no close affordance works while the edit is in flight — the PATCH cannot land invisibly', async () => {
+        let releasePatch: (() => void) | undefined;
+        const gate = new Promise<void>((resolve) => {
+            releasePatch = resolve;
+        });
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (String(url).includes('/api/admin/teams/') && method === 'PATCH') await gate;
+            return base!(url, init);
+        });
+
+        renderPage(<AdminTeams />);
+        await waitForTableLoaded();
+        openEditTeamModal('frontend');
+        fireEvent.change(screen.getByLabelText('Department'), {target: {value: 'Platform Eng'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Save changes'}));
+        expect(await screen.findByRole('button', {name: 'Saving…'})).toBeInTheDocument();
+
+        // Cancel, Esc, ×, and a genuine backdrop click are all inert mid-write.
+        const dialogName = 'Edit team — frontend';
+        expect(screen.getByRole('button', {name: 'Cancel'})).toBeDisabled();
+        fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
+        expect(screen.getByRole('dialog', {name: dialogName})).toBeInTheDocument();
+        fireEvent.keyDown(screen.getByRole('dialog'), {key: 'Escape'});
+        expect(screen.getByRole('dialog', {name: dialogName})).toBeInTheDocument();
+        fireEvent.click(screen.getByRole('button', {name: 'Close dialog'}));
+        expect(screen.getByRole('dialog', {name: dialogName})).toBeInTheDocument();
+        const backdrop = screen.getByTestId('team-modal-backdrop');
+        fireEvent.mouseDown(backdrop);
+        fireEvent.mouseUp(backdrop);
+        fireEvent.click(backdrop);
+        expect(screen.getByRole('dialog', {name: dialogName})).toBeInTheDocument();
+
+        // Once the write settles the modal closes through the success path.
+        releasePatch?.();
+        await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+        await waitFor(() =>
+            expect(within(teamRow('frontend')).getByText('Platform Eng')).toBeInTheDocument(),
+        );
+    });
+
+    it('no close affordance works while the create is in flight — the POST cannot land invisibly', async () => {
+        let releasePost: (() => void) | undefined;
+        const gate = new Promise<void>((resolve) => {
+            releasePost = resolve;
+        });
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (String(url).endsWith('/api/admin/teams') && method === 'POST') await gate;
+            return base!(url, init);
+        });
+
+        renderPage(<AdminTeams />);
+        await waitForTableLoaded();
+        openCreateTeamModal();
+        fireEvent.change(screen.getByLabelText('Name'), {target: {value: 'growth'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Create team'}));
+        // The create path has its OWN pending wiring: assert it here rather than
+        // trusting the edit path's guard to speak for both modes.
+        expect(await screen.findByRole('button', {name: 'Creating…'})).toBeInTheDocument();
+
+        const dialogName = 'Create team';
+        expect(screen.getByRole('button', {name: 'Cancel'})).toBeDisabled();
+        fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
+        expect(screen.getByRole('dialog', {name: dialogName})).toBeInTheDocument();
+        fireEvent.keyDown(screen.getByRole('dialog'), {key: 'Escape'});
+        expect(screen.getByRole('dialog', {name: dialogName})).toBeInTheDocument();
+        fireEvent.click(screen.getByRole('button', {name: 'Close dialog'}));
+        expect(screen.getByRole('dialog', {name: dialogName})).toBeInTheDocument();
+        const backdrop = screen.getByTestId('team-modal-backdrop');
+        fireEvent.mouseDown(backdrop);
+        fireEvent.mouseUp(backdrop);
+        fireEvent.click(backdrop);
+        expect(screen.getByRole('dialog', {name: dialogName})).toBeInTheDocument();
+
+        // A second click while pending must not fire a duplicate POST.
+        fireEvent.click(screen.getByRole('button', {name: 'Creating…'}));
+
+        releasePost?.();
+        await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+        expect(
+            fetchMock.mock.calls.filter(
+                (c) =>
+                    String(c[0]).endsWith('/api/admin/teams') &&
+                    (c[1]?.method ?? 'GET').toUpperCase() === 'POST',
+            ),
+        ).toHaveLength(1);
+        expect(await screen.findByText('growth')).toBeInTheDocument();
+    });
+
+    it('surfaces a failed create inside the modal and keeps it open with the draft intact', async () => {
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (String(url).endsWith('/api/admin/teams') && method === 'POST') {
+                return json({message: 'Team already exists'}, 409);
+            }
+            return base!(url, init);
+        });
+
+        renderPage(<AdminTeams />);
+        await waitForTableLoaded();
+        openCreateTeamModal();
+        fireEvent.change(screen.getByLabelText('Name'), {target: {value: 'frontend'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Create team'}));
+
+        // The inline create card surfaced its write error; the modal must too.
+        expect(await screen.findByText(/Team already exists/)).toBeInTheDocument();
+        expect(screen.getByRole('dialog', {name: 'Create team'})).toBeInTheDocument();
+        expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('frontend');
+    });
+
+    it('surfaces a failed edit inside the modal and keeps it open with the draft intact', async () => {
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (String(url).includes('/api/admin/teams/') && method === 'PATCH') {
+                return json({message: 'Team is archived'}, 409);
+            }
+            return base!(url, init);
+        });
+
+        renderPage(<AdminTeams />);
+        await waitForTableLoaded();
+        openEditTeamModal('frontend');
+        fireEvent.change(screen.getByLabelText('Department'), {target: {value: 'Platform Eng'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Save changes'}));
+
+        expect(await screen.findByText(/Team is archived/)).toBeInTheDocument();
+        // The dialog stays open with the admin's values — a failed write must not
+        // discard the draft or leave the failure invisible behind a closed modal.
+        expect(screen.getByRole('dialog', {name: 'Edit team — frontend'})).toBeInTheDocument();
+        expect((screen.getByLabelText('Department') as HTMLInputElement).value).toBe('Platform Eng');
+    });
+
+    it('archive and restore stay inline — a single action, not a form', async () => {
+        renderPage(<AdminTeams />);
+        await waitForTableLoaded();
+
+        fireEvent.click(within(teamRow('platform')).getByRole('button', {name: 'Archive'}));
+        await waitFor(() => expect(teamPatches('platform')).toHaveLength(1));
+        expect(sentBody(teamPatches('platform')[0])).toEqual({archived: true});
+        // No dialog was involved, and the row reflects the new state.
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+        expect(await within(teamRow('platform')).findByText('Archived')).toBeInTheDocument();
+
+        fireEvent.click(within(teamRow('platform')).getByRole('button', {name: 'Restore'}));
+        await waitFor(() => expect(teamPatches('platform')).toHaveLength(2));
+        expect(sentBody(teamPatches('platform')[1])).toEqual({archived: false});
+        await waitFor(() =>
+            expect(within(teamRow('platform')).queryByText('Archived')).not.toBeInTheDocument(),
+        );
     });
 });
