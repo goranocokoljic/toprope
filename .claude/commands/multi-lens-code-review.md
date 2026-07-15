@@ -1,12 +1,14 @@
 ---
 description: >-
   Multi-lens code review of the current branch's changes for Toprope.
-  The parent captures the diff once and dispatches four independent
+  The parent captures the diff once and dispatches five independent
   reviewer subagents in parallel — Senior Overlord, Security/Correctness,
-  Occam's Razor, Test Adequacy — each with an isolated, diff-only context,
-  then concatenates their sections into a single file in /reviews. With
-  --post, it also publishes a summary + inline findings to the branch's
-  GitHub PR. Diff scope is merge-base against a configurable base branch.
+  Occam's Razor, Test Adequacy, and Reuse/Component-Duplication — each with
+  an isolated context (diff-only, except the Reuse lens which also reads the
+  frontend component index), then concatenates their sections into a single
+  file in /reviews. With --post, it also publishes a summary + inline
+  findings to the branch's GitHub PR. Diff scope is merge-base against a
+  configurable base branch.
 argument-hint: "[anchor: what this change does and why — the bug/issue/feature being addressed] [--base <branch> (default: develop)] [--post (publish to the GitHub PR)]"
 ---
 
@@ -15,7 +17,7 @@ argument-hint: "[anchor: what this change does and why — the bug/issue/feature
 ## How this command works
 
 Parallel, isolated review. The parent orchestrator captures the diff
-once, dispatches four independent subagents — one per lens — and
+once, dispatches five independent subagents — one per lens — and
 concatenates their returned sections into a single file. Toprope is a
 single Node/TypeScript repo on GitHub, so there is one diff to review
 and (optionally) one PR to post to.
@@ -26,11 +28,13 @@ Phases:
    the branch, resolve merge-base, capture the diff once to a gitignored
    temp file, decide the output filename. The parent does **not** read
    the diff into its own context.
-2. **Four lens subagents (parallel)** — dispatch SO, SEC, OR, TST as four
-   independent subagents in one message. Each gets only the diff file
-   path and its lens prompt, reads the diff itself, and returns its
-   composed markdown section.
-3. **Single Write** — concatenate the four returned sections and write
+2. **Five lens subagents (parallel)** — dispatch SO, SEC, OR, TST, DUP as
+   five independent subagents in one message. Each gets the diff file path
+   and its lens prompt, reads the diff itself, and returns its composed
+   markdown section. DUP additionally gets the component index (PureContext,
+   with a grep fallback) because reuse/duplication is a whole-repo question
+   the diff alone can't answer.
+3. **Single Write** — concatenate the five returned sections and write
    the entire review file in one tool call.
 4. **Post (only if `--post`)** — publish one GitHub review: a summary
    body plus one inline comment per finding that maps to a diff line.
@@ -38,8 +42,9 @@ Phases:
    posted).
 
 **Cross-lens isolation is real, not approximated.** Each lens runs in
-its own subagent with a fresh context containing only the diff and its
-disposition — no subagent can see another's findings. Independent reads
+its own subagent with a fresh context containing the diff and its
+disposition (plus, for the DUP lens only, read-only access to the existing
+component library) — no subagent can see another's findings. Independent reads
 converging on the same line is real triangulation signal. The parent
 never holds the diff text; it only assembles the sections the subagents
 return.
@@ -55,14 +60,14 @@ These keep cost predictable. They are operational, not editorial.
    protocol when a diff exceeds the Read cap.
 2. **The parent never reads the diff into its own context.** It captures
    to disk via a Bash redirect and hands subagents the path only. The
-   parent context holds only the four returned sections.
-3. **One Write at the end.** Concatenate the four returned sections and
+   parent context holds only the five returned sections.
+3. **One Write at the end.** Concatenate the five returned sections and
    write in one tool call in Phase 3. No header-first pattern, no `Edit`
    ceremony per lens.
 4. **No task-list plumbing.** A short pipeline does not need
    `TaskCreate`/`TaskUpdate`. Track progress in your reasoning.
 5. **Batch independent tool calls.** In Phase 1 the git commands are
-   independent — fire them in a single message. In Phase 2 the four
+   independent — fire them in a single message. In Phase 2 the five
    subagents are independent — dispatch them in a single message.
 6. **Use the Bash tool for git/gh.** The snippets below are bash (the
    Bash tool runs git-bash on this Windows host, so `$(...)` and standard
@@ -157,14 +162,22 @@ path); the diff content stays on disk until the subagents read it.
 **Do not write the review file yet, and do not read the diff.** Phase 2
 subagents read the diff and return sections; Phase 3 writes once.
 
-## Phase 2 — Four lens subagents (parallel, isolated)
+## Phase 2 — Five lens subagents (parallel, isolated)
 
-Dispatch four independent subagents — one per lens — in a **single
+Dispatch five independent subagents — one per lens — in a **single
 message** (one `Agent` call each, `subagent_type: general-purpose` so
 each has Read + Bash + Grep for the investigation policy). They run in
 parallel with fully isolated contexts; no subagent can see another's
 findings, so isolation is structural — there is no "approach the diff
 fresh" instruction to give.
+
+**The DUP lens gets one extra capability.** Reuse/duplication cannot be
+judged from the diff alone — it needs the whole existing component library.
+So the DUP subagent's prompt must instruct it to use PureContext MCP tools
+(`search_similar`, `search_symbols`, `get_blast_radius`, `find_references`)
+against the working tree, with a grep/glob + Read fallback if the index is
+unavailable (the exact protocol is in the Lens 5 definition). The other four
+lenses remain strictly diff-only.
 
 Each subagent prompt must be self-contained. Build it by including,
 verbatim:
@@ -182,14 +195,14 @@ verbatim:
   working tree).
 - **The lens prompt** for that subagent's lens, copied verbatim from the
   lens definitions below — Lens 1 → SO subagent, Lens 2 → SEC subagent,
-  Lens 3 → OR subagent, Lens 4 → TST subagent.
+  Lens 3 → OR subagent, Lens 4 → TST subagent, Lens 5 → DUP subagent.
 - **The investigation policy** (the *Investigation policy* section
   above), copied in so the subagent reads surrounding files when a
   finding genuinely depends on them, verifies the anchor holistically,
   and does not speculatively read everything `grep` surfaces.
 - **The chunking protocol** from *Reading large diffs* at the bottom.
 - **The common output structure** (below), with the correct prefix
-  (`SO`/`SEC`/`OR`) and stable IDs.
+  (`SO`/`SEC`/`OR`/`TST`/`DUP`) and stable IDs.
 - **The output instruction:** "Return ONLY your lens section as
   markdown, in the exact structure given. Do not write any file. No
   preamble — your entire final message is the section."
@@ -224,7 +237,7 @@ Anchor: <one-line restatement of $ARGUMENTS or "no anchor provided">
 ---
 ```
 
-Stable IDs (`SO-1`, `SEC-1`, `OR-1`, `TST-1`, …) are required so the
+Stable IDs (`SO-1`, `SEC-1`, `OR-1`, `TST-1`, `DUP-1`, …) are required so the
 reader can cross-reference and so Phase 4 can attach each finding to a
 PR line.
 
@@ -358,10 +371,65 @@ cover. Don't demand tests for trivial glue, pure type declarations, or
 generated code. If the tests are genuinely thorough, say so plainly — a
 clean TST pass is real signal, not a reason to manufacture findings.
 
+### Lens 5: [DUP] Reuse & Component Duplication
+
+You are the guardian of the frontend component library. Your job is to catch
+the two things the diff-only lenses structurally **cannot**: (A) a **new**
+component or hook that duplicates one already in the library, and (B) a
+**modification** to a shared component that breaks its existing consumers.
+
+**Scope — read this first.** You only review changes under
+`src/dashboard/frontend/src/**` (components, charts, hooks, pages). If this
+diff adds or changes no React component or hook (most Toprope diffs are
+backend), return `_None._` under every bucket with a one-line net assessment
+that the diff has no frontend component surface, and stop — a fast clean pass
+is the correct outcome, do not go looking for backend findings (that is the
+other lenses' job).
+
+**You are NOT limited to the diff — use whole-repo access.** This is the one
+lens with the existing library in view. Prefer PureContext MCP; fall back to
+grep/glob if the index is unavailable:
+- Confirm indexed: `list_repos` (if missing → skip MCP, use the grep fallback).
+- **New** component/hook symbol in the diff: `search_similar` / `search_semantic`
+  scoped to `src/dashboard/frontend/src/**` for near-duplicates, plus
+  `search_symbols` by name for obvious siblings (a new `StatusBadge` next to
+  the existing `Badge`/`CoverageBadge`).
+- **Modified shared** component: `find_references` / `get_blast_radius` on the
+  symbol to enumerate every call site before judging backward-compatibility.
+- **Grep fallback** (index unavailable): `ls src/dashboard/frontend/src/{components,charts,hooks,pages}`
+  for the inventory, `grep -rn "<ComponentName>" src/dashboard/frontend/src`
+  for call sites, and read the candidate files directly.
+
+**Axis A — new duplicates existing.** For each new component/hook, ask: does
+something already do this, or do it with a small prop addition? Name the
+existing component and the concrete reuse path — "reuse `<Card>`", or "add an
+optional `icon` prop to `<EmptyState>` instead of adding a new panel". A
+genuine near-duplicate is **High** (it feeds the auto-fix loop). Trivial
+overlap, or a specialization that legitimately should stay separate, is
+Low/Medium — say which and why. The library today already has crowded families
+(non-exhaustive): `Badge`/`CoverageBadge`, `Card`/`StatCard`/`SummaryCard`/`MaturityTrendCard`,
+`EmptyState`/`ErrorState`/`StatePanel`/`ColdStartPanel`, `CoveragePanel`/`PartialCoverage`.
+If the diff adds another member to a family like these, scrutinize whether it
+earns its place.
+
+**Axis B — modification breaks consumers.** A prop change to an existing shared
+component is safe only if it is **additive and defaulted**: a new **optional**
+prop whose default preserves current render behavior. Flag as **High/Critical**
+any change that removes or renames a prop, makes an optional prop required,
+changes a prop's type or a default value, or alters the default rendered output
+— and name the call sites (`file:line` from `find_references`) that would break
+or silently change. A backward-compatible extension is fine — say so.
+
+**Don't manufacture findings.** A new component with no library analog, or a
+purely additive prop, is a clean pass — `_None._`. Cite concrete `file:line`
+(and the existing component's path for Axis A). Rank by real blast radius: a
+duplicate of a widely-used primitive, or a breaking change to a component with
+many consumers, outranks a one-off.
+
 ## Phase 3 — Single Write
 
-Concatenate the four sections returned by the subagents — **SO, then
-SEC, then OR, then TST** — under the header below. Assembly is mechanical:
+Concatenate the five sections returned by the subagents — **SO, then
+SEC, then OR, then TST, then DUP** — under the header below. Assembly is mechanical:
 do not edit, dedup, re-rank, or merge findings across sections. If a
 subagent failed to return a usable section, note that inline under that
 lens's heading rather than dropping the lens silently. Full file content:
@@ -384,6 +452,8 @@ lens's heading rather than dropping the lens silently. Full file content:
 <OR section>
 
 <TST section>
+
+<DUP section>
 ```
 
 Then call `Write` **once** with that content to `$OUTPUT`.

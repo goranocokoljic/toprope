@@ -94,7 +94,7 @@ Build one child on the epic branch. Deltas from the default flow, by phase:
   `DEVCYCLE_PHASE: review | fast SEC`. Dispatch a **single** Security/Correctness
   reviewer subagent over this child's diff
   (`git diff $(git merge-base "$EPIC_BRANCH" HEAD)..HEAD`) using the `[SEC]` lens prompt
-  from `/multi-lens-code-review` — **one pass only, no cycles, not the full four lenses.**
+  from `/multi-lens-code-review` — **one pass only, no cycles, not the full five lenses.**
   Fix only **Critical/High** findings here (you hold the implementation intent — "fix
   while hot"), then re-run the gate. Medium/Low are deferred to the epic review. Keep
   this deliberately cheap; it is a safety net, not the real review.
@@ -154,7 +154,7 @@ Every child is already stacked on `<name>`. Review the whole epic and land it.
   EOF
   )"
   ```
-- **Phase 6 (review):** the **full four-lens loop**, exactly as the default Phase 6, but
+- **Phase 6 (review):** the **full five-lens loop**, exactly as the default Phase 6, but
   the diff under review is the entire stack (`merge-base develop..$EPIC_BRANCH`). Run up
   to `MAX_CYCLES`, fix blockers on the epic branch, and emit the same
   `DEVCYCLE_METRIC:` lines. Anchor on the combined epic + children intent.
@@ -222,7 +222,7 @@ DEVCYCLE_METRIC: dispositions | review_cycle=N | fixed=F rejected_intentional=RI
 - `review_done` — print **once per cycle**, right after you have read the review
   file and bucketed its findings (Phase 6 step 2). Use the actual counts from the
   review (0 is fine for any bucket). `N` is the current review cycle number. The
-  counts are **across all four lenses** (SO, SEC, OR, TST) — a Test-Adequacy
+  counts are **across all five lenses** (SO, SEC, OR, TST, DUP) — a Test-Adequacy
   finding ranked High folds into `high=`, and so on.
 - `fix_start` — print right before you begin editing files to fix findings.
 - `fix_done` — print right after the cycle's `git push` succeeds.
@@ -356,6 +356,35 @@ relevant; proceed. (Graduated rules are already in your context via `CLAUDE.md`'
 import of `dev-docs/review-rules.md`, so this step only surfaces the *area-specific*
 active lessons that haven't graduated.)
 
+### Component reuse pre-check (REQUIRED before creating any frontend component)
+
+This gate applies **only if this issue adds or changes React components or hooks
+under `src/dashboard/frontend/src/**`**. Skip it entirely for backend-only issues.
+
+Before authoring a **new** component or hook, check whether the library already
+covers it — a second component that does what an existing one does becomes a
+second source of truth that drifts (this is the graduated "reuse the canonical
+helper instead of cloning shared logic" rule, applied to the frontend). Prefer
+PureContext MCP, fall back to grep:
+- `search_similar` / `search_semantic` scoped to `src/dashboard/frontend/src/**`,
+  and `search_symbols` by the name you're about to use, to find near-duplicates
+  (e.g. spot the existing `Badge`/`CoverageBadge` before adding another badge).
+- Fallback if the index is unavailable: `ls src/dashboard/frontend/src/{components,charts,hooks,pages}`
+  and grep for the concept.
+- **Match exists** → reuse it. **Near-match exists** → extend it rather than clone,
+  but only **backward-compatibly** (a new **optional** prop with a default that
+  preserves current behavior). **Create new only** when neither applies.
+
+Before **modifying a shared** component, run `get_blast_radius` / `find_references`
+on it first and treat every call site as something you must not break: prop changes
+must be additive and defaulted. Removing/renaming a prop, making one required, or
+changing a default is a breaking change — do it only with the affected call sites
+updated in the same diff.
+
+The [DUP] lens in Phase 6 re-checks both of these against the whole library, so a
+duplicate or breaking change you miss here surfaces as a Blocker there — cheaper to
+get right now.
+
 If resuming an interrupted run (Phase 2 found existing work), first determine
 what is already complete — read the PR, inspect the diff, run the gate — and
 continue from the first unfinished step instead of restarting. Commits already
@@ -474,9 +503,10 @@ prompt specified a maximum number of review cycles, use that value instead.
 
 At the start of **each iteration**, emit `DEVCYCLE_PHASE: review | cycle {REVIEW_CYCLE}/{MAX_CYCLES}`.
 
-Uses `/multi-lens-code-review`, which dispatches **four** isolated reviewer
-subagents (Senior Overlord, Security/Correctness, Occam's Razor, and **Test
-Adequacy**) and writes the full review to a file under `reviews/` (gitignored).
+Uses `/multi-lens-code-review`, which dispatches **five** isolated reviewer
+subagents (Senior Overlord, Security/Correctness, Occam's Razor, **Test
+Adequacy**, and **Reuse/Component-Duplication**) and writes the full review to a
+file under `reviews/` (gitignored).
 Because the heavy diff-reading and investigation happen inside those subagents,
 running it keeps *this* dev-cycle context lean — only the findings come back here,
 where the implementation intent lives to fix them.
@@ -496,14 +526,16 @@ Initialize `REVIEW_CYCLE=1`. Repeat up to `MAX_CYCLES` times:
 2. Read that review file and collect all findings. The lenses bucket each
    as Critical / High / Medium / Low / Style — map to dev-cycle severity:
    - **Blocker** = Critical or High — correctness bugs, security/privacy issues,
-     broken acceptance criteria, **and an untested acceptance criterion or untested
-     invariant-critical path flagged High by the [TST] lens**
+     broken acceptance criteria, **an untested acceptance criterion or untested
+     invariant-critical path flagged High by the [TST] lens**, **and a [DUP]
+     near-duplicate component or backward-incompatible shared-component change
+     flagged High/Critical**
    - **Medium** = Medium — real issues worth fixing (including missing edge-case tests)
    - **Low / Style** = discretionary polish
 
-   The four lenses don't dedup, so one underlying issue may appear under
-   more than one prefix (e.g. `SO-2`, `SEC-1`, and `TST-1`). Treat it as a single
-   finding and fix the root cause once.
+   The five lenses don't dedup, so one underlying issue may appear under
+   more than one prefix (e.g. `SO-2`, `SEC-1`, `TST-1`, and `DUP-1`). Treat it as a
+   single finding and fix the root cause once.
 
    Then emit the analytics line with the **deduped** counts (0 is fine for any bucket):
    ```
