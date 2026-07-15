@@ -8,15 +8,13 @@ import {MemoryRouter} from 'react-router-dom';
 import {AdminUsers} from '../pages/admin/AdminUsers';
 import {AdminSubscriptions} from '../pages/admin/AdminSubscriptions';
 import {AdminTeams} from '../pages/admin/AdminTeams';
+import {AdminIdentities} from '../pages/admin/AdminIdentities';
 import type {AdminDeveloper, AdminSubscription, AdminTeam, AdminUser} from '../api/types';
-
-const DEVELOPERS: AdminDeveloper[] = [
-    {id: 'dev-1', name: 'Alice Dev', email: 'alice@test.com', team: 'frontend', external_ids: {}, created_at: '2026-01-01T00:00:00.000Z'},
-];
 
 let users: AdminUser[];
 let subscriptions: AdminSubscription[];
 let teams: AdminTeam[];
+let developers: AdminDeveloper[];
 let fetchMock: Mock;
 
 function json(body: unknown, status = 200): Response {
@@ -42,6 +40,37 @@ beforeEach(() => {
         },
     ];
     subscriptions = [];
+    // Two developers that differ in EVERY editable field — one with a fully
+    // populated identity map, one with none — so a cross-row pre-fill leak has a
+    // visible signal to catch. Their teams differ too, and both are real teams
+    // below (the move select only offers teams that exist).
+    developers = [
+        {
+            id: 'dev-1',
+            name: 'Alice Dev',
+            email: 'alice@test.com',
+            team: 'frontend',
+            external_ids: {
+                github: 'alice-gh',
+                copilot: 'alice-cp',
+                claude: 'alice@claude.test',
+                windsurf: 'alice@windsurf.test',
+                cursor: 'alice@cursor.test',
+                bitbucket: 'alice-bb',
+                gitlab: 'alice-gl',
+                git_emails: 'alice@work.com, alice@home.com',
+            },
+            created_at: '2026-01-01T00:00:00.000Z',
+        },
+        {
+            id: 'dev-2',
+            name: 'Bob Dev',
+            email: null,
+            team: 'platform',
+            external_ids: {},
+            created_at: '2026-01-02T00:00:00.000Z',
+        },
+    ];
     // Two teams that differ in EVERY editable field — one fully populated, one
     // with nulls — so a cross-row pre-fill leak has a visible signal to catch.
     teams = [
@@ -68,8 +97,37 @@ beforeEach(() => {
         const method = (init?.method ?? 'GET').toUpperCase();
         const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
 
+        // Developers: both writes merge into the addressed row, so every
+        // assertion below reads the row back through the real hook (seed → API →
+        // row) rather than a hand-built fixture. Order matters — the two PATCH
+        // routes share the GET's path prefix.
+        if (u.includes('/api/admin/developers/') && u.endsWith('/identities') && method === 'PATCH') {
+            const id = decodeURIComponent(u.split('/api/admin/developers/')[1].replace(/\/identities$/, ''));
+            const target = developers.find((d) => d.id === id);
+            if (!target) return json({message: 'No such developer'}, 404);
+            // Mirrors the backend: git_emails arrives as an array and reads back
+            // as the joined string the editor re-seeds from.
+            const {git_emails: emails, ...ids} = body as Record<string, unknown>;
+            const updated: AdminDeveloper = {
+                ...target,
+                external_ids: {
+                    ...(ids as Record<string, string>),
+                    ...(Array.isArray(emails) ? {git_emails: emails.join(', ')} : {}),
+                },
+            };
+            developers = developers.map((d) => (d.id === id ? updated : d));
+            return json({data: updated});
+        }
+        if (u.includes('/api/admin/developers/') && method === 'PATCH') {
+            const id = decodeURIComponent(u.split('/api/admin/developers/')[1]);
+            const target = developers.find((d) => d.id === id);
+            if (!target) return json({message: 'No such developer'}, 404);
+            const updated: AdminDeveloper = {...target, team: String(body.team)};
+            developers = developers.map((d) => (d.id === id ? updated : d));
+            return json({data: updated});
+        }
         if (u.includes('/api/admin/developers')) {
-            return json({data: DEVELOPERS});
+            return json({data: developers});
         }
         if (u.includes('/api/admin/users') && method === 'POST') {
             const created: AdminUser & {temp_password: string} = {
@@ -240,6 +298,39 @@ function teamPatches(name: string): [unknown, RequestInit?][] {
 /** The parsed body of a recorded request. */
 function sentBody(call: [unknown, RequestInit?] | undefined): Record<string, unknown> {
     return JSON.parse(String(call?.[1]?.body)) as Record<string, unknown>;
+}
+
+/** The `<tr>` for a developer, so a row's own controls can be addressed unambiguously. */
+function developerRow(name: string): HTMLElement {
+    const cell = screen.getByText(name).closest('tr');
+    if (!cell) throw new Error(`No row for developer ${name}`);
+    return cell;
+}
+
+/** Open a specific developer row's identity dialog, and wait for the team options. */
+async function openEditIdentityModal(name: string): Promise<void> {
+    fireEvent.click(within(developerRow(name)).getByRole('button', {name: 'Edit'}));
+    // The teams load WITH the dialog, and a select can't hold a value with no
+    // matching option — wait for them before driving the move control.
+    await screen.findByRole('option', {name: 'frontend'});
+}
+
+/** Every identity PATCH sent for a developer, in order. */
+function identityPatches(id: string): [unknown, RequestInit?][] {
+    return fetchMock.mock.calls.filter(
+        (c) =>
+            String(c[0]).endsWith(`/api/admin/developers/${id}/identities`) &&
+            (c[1]?.method ?? 'GET').toUpperCase() === 'PATCH',
+    ) as [unknown, RequestInit?][];
+}
+
+/** Every team-move PATCH sent for a developer, in order. */
+function movePatches(id: string): [unknown, RequestInit?][] {
+    return fetchMock.mock.calls.filter(
+        (c) =>
+            String(c[0]).endsWith(`/api/admin/developers/${id}`) &&
+            (c[1]?.method ?? 'GET').toUpperCase() === 'PATCH',
+    ) as [unknown, RequestInit?][];
 }
 
 describe('AdminUsers page', () => {
@@ -994,5 +1085,395 @@ describe('AdminTeams page', () => {
         await waitFor(() =>
             expect(within(teamRow('platform')).queryByText('Archived')).not.toBeInTheDocument(),
         );
+    });
+});
+
+describe('AdminIdentities page', () => {
+    it('paginates the developer table at 25 rows per page', async () => {
+        developers = Array.from({length: 30}, (_, i) => ({
+            id: `dev-${String(i).padStart(2, '0')}`,
+            name: `Dev ${String(i).padStart(2, '0')}`,
+            email: `dev${i}@test.com`,
+            team: 'frontend',
+            external_ids: {},
+            created_at: '2026-01-01T00:00:00.000Z',
+        }));
+        renderPage(<AdminIdentities />);
+        await screen.findByText('Dev 00');
+
+        expect(document.querySelectorAll('tbody tr')).toHaveLength(25);
+        expect(screen.queryByText('Dev 25')).not.toBeInTheDocument();
+
+        fireEvent.click(screen.getByRole('button', {name: 'Next page'}));
+        expect(document.querySelectorAll('tbody tr')).toHaveLength(5);
+        expect(screen.getByText('Dev 29')).toBeInTheDocument();
+        expect(screen.queryByText('Dev 00')).not.toBeInTheDocument();
+    });
+
+    it('renders the developer list — not an editor card — and no editor until a row asks for one', async () => {
+        renderPage(<AdminIdentities />);
+        await waitForTableLoaded();
+
+        // The page is the table (criterion 1). The old "Select a developer" box
+        // whose only job was to reveal the editor is gone...
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+        expect(screen.queryByLabelText('Developer')).not.toBeInTheDocument();
+        // ...and so is every field it revealed: the ONLY editable control
+        // anywhere on the page is inside a dialog.
+        expect(screen.queryByLabelText('GitHub username')).not.toBeInTheDocument();
+        expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+        expect(screen.queryByRole('button', {name: 'Save identities'})).not.toBeInTheDocument();
+        expect(screen.queryByRole('button', {name: 'Move developer'})).not.toBeInTheDocument();
+
+        // Both developers are listed, with their link counts read off the row.
+        expect(within(developerRow('Alice Dev')).getByText('frontend')).toBeInTheDocument();
+        expect(within(developerRow('Alice Dev')).getByText('8 linked')).toBeInTheDocument();
+        expect(within(developerRow('Bob Dev')).getByText('None')).toBeInTheDocument();
+
+        // The row's edit affordance announces that it opens a dialog (epic criterion 2).
+        expect(within(developerRow('Alice Dev')).getByRole('button', {name: 'Edit'})).toHaveAttribute(
+            'aria-haspopup',
+            'dialog',
+        );
+    });
+
+    it('edits only via the row modal: pre-filled, PATCHes the card shape, and success closes it and refreshes the row', async () => {
+        renderPage(<AdminIdentities />);
+        await waitForTableLoaded();
+        await openEditIdentityModal('Alice Dev');
+
+        // Every field the card carried is pre-filled from the row (criterion 2).
+        expect(screen.getByRole('dialog', {name: 'Identities — Alice Dev'})).toBeInTheDocument();
+        expect((screen.getByLabelText('Copilot username') as HTMLInputElement).value).toBe('alice-cp');
+        expect((screen.getByLabelText('Claude Code email') as HTMLInputElement).value).toBe('alice@claude.test');
+        expect((screen.getByLabelText('Windsurf email') as HTMLInputElement).value).toBe('alice@windsurf.test');
+        expect((screen.getByLabelText('Cursor email') as HTMLInputElement).value).toBe('alice@cursor.test');
+        expect((screen.getByLabelText('GitHub username') as HTMLInputElement).value).toBe('alice-gh');
+        expect((screen.getByLabelText('Bitbucket username') as HTMLInputElement).value).toBe('alice-bb');
+        expect((screen.getByLabelText('GitLab username') as HTMLInputElement).value).toBe('alice-gl');
+        expect((screen.getByLabelText('Git commit emails (comma-separated)') as HTMLInputElement).value).toBe(
+            'alice@work.com, alice@home.com',
+        );
+        expect((screen.getByLabelText('Team') as HTMLSelectElement).value).toBe('frontend');
+
+        fireEvent.change(screen.getByLabelText('GitHub username'), {target: {value: 'alice-renamed'}});
+        fireEvent.change(screen.getByLabelText('Git commit emails (comma-separated)'), {
+            target: {value: 'a@x.com,  b@y.com   c@z.com'},
+        });
+        fireEvent.click(screen.getByRole('button', {name: 'Save identities'}));
+
+        await waitFor(() => expect(identityPatches('dev-1')).toHaveLength(1));
+        // Exactly the shape the card's Save sent: every id field, and the email
+        // box split on commas AND whitespace into individual addresses.
+        expect(sentBody(identityPatches('dev-1')[0])).toEqual({
+            github: 'alice-renamed',
+            copilot: 'alice-cp',
+            claude: 'alice@claude.test',
+            windsurf: 'alice@windsurf.test',
+            cursor: 'alice@cursor.test',
+            bitbucket: 'alice-bb',
+            gitlab: 'alice-gl',
+            git_emails: ['a@x.com', 'b@y.com', 'c@z.com'],
+        });
+        // Addressed to THIS developer only, and not through the move route.
+        expect(identityPatches('dev-2')).toHaveLength(0);
+        expect(movePatches('dev-1')).toHaveLength(0);
+
+        // Success closes the dialog and the row reads back through the real hook
+        // (seed → API → row): 3 emails + 7 ids = 8 populated fields still.
+        await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+        await waitFor(() =>
+            expect(within(developerRow('Alice Dev')).getByText('8 linked')).toBeInTheDocument(),
+        );
+    });
+
+    it('every field writes to its own identity key — no crossed wiring', async () => {
+        renderPage(<AdminIdentities />);
+        await waitForTableLoaded();
+        await openEditIdentityModal('Bob Dev');
+
+        // Bob starts with nothing linked, so each key's value can only have come
+        // from the box typed into it. Pre-fill assertions prove the READ side;
+        // this proves the WRITE side, where a copy-pasted onChange would send
+        // e.g. the Cursor box's value as `windsurf` and go unnoticed.
+        const typed: [string, string][] = [
+            ['Copilot username', 'v-copilot'],
+            ['Claude Code email', 'v-claude'],
+            ['Windsurf email', 'v-windsurf'],
+            ['Cursor email', 'v-cursor'],
+            ['GitHub username', 'v-github'],
+            ['Bitbucket username', 'v-bitbucket'],
+            ['GitLab username', 'v-gitlab'],
+            ['Git commit emails (comma-separated)', 'v-email@x.com'],
+        ];
+        for (const [label, value] of typed) {
+            fireEvent.change(screen.getByLabelText(label), {target: {value}});
+        }
+        fireEvent.click(screen.getByRole('button', {name: 'Save identities'}));
+
+        await waitFor(() => expect(identityPatches('dev-2')).toHaveLength(1));
+        expect(sentBody(identityPatches('dev-2')[0])).toEqual({
+            copilot: 'v-copilot',
+            claude: 'v-claude',
+            windsurf: 'v-windsurf',
+            cursor: 'v-cursor',
+            github: 'v-github',
+            bitbucket: 'v-bitbucket',
+            gitlab: 'v-gitlab',
+            git_emails: ['v-email@x.com'],
+        });
+        // All 8 now read back on the row that had none.
+        await waitFor(() =>
+            expect(within(developerRow('Bob Dev')).getByText('8 linked')).toBeInTheDocument(),
+        );
+    });
+
+    it('clearing the email box sends an empty set and the row reflects the lost link', async () => {
+        renderPage(<AdminIdentities />);
+        await waitForTableLoaded();
+        await openEditIdentityModal('Alice Dev');
+
+        fireEvent.change(screen.getByLabelText('Git commit emails (comma-separated)'), {target: {value: '   '}});
+        fireEvent.click(screen.getByRole('button', {name: 'Save identities'}));
+
+        await waitFor(() => expect(identityPatches('dev-1')).toHaveLength(1));
+        // An empty box clears the set — not a [''] with one blank member.
+        expect(sentBody(identityPatches('dev-1')[0]).git_emails).toEqual([]);
+        await waitFor(() =>
+            expect(within(developerRow('Alice Dev')).getByText('7 linked')).toBeInTheDocument(),
+        );
+    });
+
+    it('pre-fills each row independently — switching developers remounts clean fields', async () => {
+        renderPage(<AdminIdentities />);
+        await waitForTableLoaded();
+
+        // Edit one row, type something, abandon it.
+        await openEditIdentityModal('Alice Dev');
+        fireEvent.change(screen.getByLabelText('GitHub username'), {target: {value: 'typed but abandoned'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
+
+        // The other developer must show THEIR OWN values — a leaked draft here
+        // would mean the fields survived the close.
+        await openEditIdentityModal('Bob Dev');
+        expect(screen.getByRole('dialog', {name: 'Identities — Bob Dev'})).toBeInTheDocument();
+        expect((screen.getByLabelText('GitHub username') as HTMLInputElement).value).toBe('');
+        expect((screen.getByLabelText('Copilot username') as HTMLInputElement).value).toBe('');
+        expect((screen.getByLabelText('Git commit emails (comma-separated)') as HTMLInputElement).value).toBe('');
+        // ...including the team, which is Bob's, not Alice's.
+        expect((screen.getByLabelText('Team') as HTMLSelectElement).value).toBe('platform');
+        fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
+
+        // Back to the first row: the abandoned draft is gone, re-seeded from the row.
+        await openEditIdentityModal('Alice Dev');
+        expect((screen.getByLabelText('GitHub username') as HTMLInputElement).value).toBe('alice-gh');
+
+        // Abandoning a draft never wrote anything.
+        expect(identityPatches('dev-1')).toHaveLength(0);
+        expect(identityPatches('dev-2')).toHaveLength(0);
+    });
+
+    it('moves a developer as its own request — gated until the team actually changes', async () => {
+        renderPage(<AdminIdentities />);
+        await waitForTableLoaded();
+        await openEditIdentityModal('Alice Dev');
+
+        // Preserved from the card: an unchanged team can't send a no-op move.
+        expect(screen.getByRole('button', {name: 'Move developer'})).toBeDisabled();
+        fireEvent.change(screen.getByLabelText('Team'), {target: {value: 'platform'}});
+        expect(screen.getByRole('button', {name: 'Move developer'})).toBeEnabled();
+        // Selecting the original team back is no longer a change.
+        fireEvent.change(screen.getByLabelText('Team'), {target: {value: 'frontend'}});
+        expect(screen.getByRole('button', {name: 'Move developer'})).toBeDisabled();
+
+        fireEvent.change(screen.getByLabelText('Team'), {target: {value: 'platform'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Move developer'}));
+
+        await waitFor(() => expect(movePatches('dev-1')).toHaveLength(1));
+        // The move is its own PATCH — it never rides along with the identity map.
+        expect(sentBody(movePatches('dev-1')[0])).toEqual({team: 'platform'});
+        expect(identityPatches('dev-1')).toHaveLength(0);
+
+        // A successful write closes the modal and the row reads back (epic criterion 5).
+        await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+        await waitFor(() =>
+            expect(within(developerRow('Alice Dev')).getByText('platform')).toBeInTheDocument(),
+        );
+    });
+
+    it('offers only active teams as move targets, plus the developer own archived team', async () => {
+        teams = [
+            ...teams,
+            {
+                name: 'legacy',
+                department: null,
+                manager: null,
+                created_at: '2026-01-01T00:00:00.000Z',
+                archived_at: '2026-02-01T00:00:00.000Z',
+                developer_count: 1,
+            },
+        ];
+        developers = developers.map((d) => (d.id === 'dev-2' ? {...d, team: 'legacy'} : d));
+
+        renderPage(<AdminIdentities />);
+        await waitForTableLoaded();
+
+        // An archived team is not a move target for someone else...
+        await openEditIdentityModal('Alice Dev');
+        expect(screen.queryByRole('option', {name: 'legacy'})).not.toBeInTheDocument();
+        fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
+
+        // ...but it stays listed for the developer who is IN it, or the select
+        // would render their own team as no selection at all.
+        await openEditIdentityModal('Bob Dev');
+        expect(screen.getByRole('option', {name: 'legacy'})).toBeInTheDocument();
+        expect((screen.getByLabelText('Team') as HTMLSelectElement).value).toBe('legacy');
+    });
+
+    it('no close affordance works while the identity save is in flight — the PATCH cannot land invisibly', async () => {
+        let releasePatch: (() => void) | undefined;
+        const gate = new Promise<void>((resolve) => {
+            releasePatch = resolve;
+        });
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (String(url).endsWith('/identities') && method === 'PATCH') await gate;
+            return base!(url, init);
+        });
+
+        renderPage(<AdminIdentities />);
+        await waitForTableLoaded();
+        await openEditIdentityModal('Alice Dev');
+        fireEvent.change(screen.getByLabelText('GitHub username'), {target: {value: 'alice-renamed'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Save identities'}));
+        expect(await screen.findByRole('button', {name: 'Saving…'})).toBeInTheDocument();
+
+        // Cancel, Esc, ×, and a genuine backdrop click are all inert mid-write.
+        const dialogName = 'Identities — Alice Dev';
+        expect(screen.getByRole('button', {name: 'Cancel'})).toBeDisabled();
+        fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
+        expect(screen.getByRole('dialog', {name: dialogName})).toBeInTheDocument();
+        fireEvent.keyDown(screen.getByRole('dialog'), {key: 'Escape'});
+        expect(screen.getByRole('dialog', {name: dialogName})).toBeInTheDocument();
+        fireEvent.click(screen.getByRole('button', {name: 'Close dialog'}));
+        expect(screen.getByRole('dialog', {name: dialogName})).toBeInTheDocument();
+        const backdrop = screen.getByTestId('identity-modal-backdrop');
+        fireEvent.mouseDown(backdrop);
+        fireEvent.mouseUp(backdrop);
+        fireEvent.click(backdrop);
+        expect(screen.getByRole('dialog', {name: dialogName})).toBeInTheDocument();
+
+        // A second click while pending must not fire a duplicate PATCH.
+        fireEvent.click(screen.getByRole('button', {name: 'Saving…'}));
+
+        releasePatch?.();
+        await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+        expect(identityPatches('dev-1')).toHaveLength(1);
+    });
+
+    it('no close affordance works while the MOVE is in flight — the move has its own pending guard', async () => {
+        let releasePatch: (() => void) | undefined;
+        const gate = new Promise<void>((resolve) => {
+            releasePatch = resolve;
+        });
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (String(url).endsWith('/api/admin/developers/dev-1') && method === 'PATCH') await gate;
+            return base!(url, init);
+        });
+
+        renderPage(<AdminIdentities />);
+        await waitForTableLoaded();
+        await openEditIdentityModal('Alice Dev');
+        fireEvent.change(screen.getByLabelText('Team'), {target: {value: 'platform'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Move developer'}));
+
+        // The move is the OTHER write path: assert its own pending wiring rather
+        // than trusting Save's guard to speak for it.
+        expect(await screen.findByRole('button', {name: 'Moving…'})).toBeInTheDocument();
+        const dialogName = 'Identities — Alice Dev';
+        expect(screen.getByRole('button', {name: 'Cancel'})).toBeDisabled();
+        fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
+        expect(screen.getByRole('dialog', {name: dialogName})).toBeInTheDocument();
+        fireEvent.keyDown(screen.getByRole('dialog'), {key: 'Escape'});
+        expect(screen.getByRole('dialog', {name: dialogName})).toBeInTheDocument();
+        const backdrop = screen.getByTestId('identity-modal-backdrop');
+        fireEvent.mouseDown(backdrop);
+        fireEvent.mouseUp(backdrop);
+        fireEvent.click(backdrop);
+        expect(screen.getByRole('dialog', {name: dialogName})).toBeInTheDocument();
+        // Save is inert too — an in-flight move must not let the other write start.
+        expect(screen.getByRole('button', {name: 'Save identities'})).toBeDisabled();
+        fireEvent.click(screen.getByRole('button', {name: 'Save identities'}));
+        expect(identityPatches('dev-1')).toHaveLength(0);
+
+        releasePatch?.();
+        await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+        expect(movePatches('dev-1')).toHaveLength(1);
+    });
+
+    it('surfaces a failed save inside the modal and keeps it open with the draft intact', async () => {
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (String(url).endsWith('/identities') && method === 'PATCH') {
+                return json({message: 'Identity already mapped to another developer'}, 409);
+            }
+            return base!(url, init);
+        });
+
+        renderPage(<AdminIdentities />);
+        await waitForTableLoaded();
+        await openEditIdentityModal('Alice Dev');
+        fireEvent.change(screen.getByLabelText('GitHub username'), {target: {value: 'taken-by-bob'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Save identities'}));
+
+        // The card surfaced its write error; the modal must too — the backend
+        // rejecting a duplicate git identity is the whole point of this screen.
+        expect(await screen.findByText(/Identity already mapped to another developer/)).toBeInTheDocument();
+        // The dialog stays open with the admin's values.
+        expect(screen.getByRole('dialog', {name: 'Identities — Alice Dev'})).toBeInTheDocument();
+        expect((screen.getByLabelText('GitHub username') as HTMLInputElement).value).toBe('taken-by-bob');
+    });
+
+    it('surfaces a failed move inside the modal without discarding the identity draft', async () => {
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (String(url).endsWith('/api/admin/developers/dev-1') && method === 'PATCH') {
+                return json({message: 'Team is archived'}, 409);
+            }
+            return base!(url, init);
+        });
+
+        renderPage(<AdminIdentities />);
+        await waitForTableLoaded();
+        await openEditIdentityModal('Alice Dev');
+        fireEvent.change(screen.getByLabelText('GitHub username'), {target: {value: 'alice-renamed'}});
+        fireEvent.change(screen.getByLabelText('Team'), {target: {value: 'platform'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Move developer'}));
+
+        expect(await screen.findByText(/Team is archived/)).toBeInTheDocument();
+        expect(screen.getByRole('dialog', {name: 'Identities — Alice Dev'})).toBeInTheDocument();
+        // A failed move must not throw away the identity edits typed alongside it.
+        expect((screen.getByLabelText('GitHub username') as HTMLInputElement).value).toBe('alice-renamed');
+    });
+
+    it('surfaces a failed developer load instead of an empty table', async () => {
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (String(url).endsWith('/api/admin/developers') && method === 'GET') {
+                return json({message: 'boom'}, 500);
+            }
+            return base!(url, init);
+        });
+
+        renderPage(<AdminIdentities />);
+
+        expect(await screen.findByText(/Failed to load/)).toBeInTheDocument();
+        expect(screen.queryByRole('table')).not.toBeInTheDocument();
     });
 });
