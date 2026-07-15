@@ -107,14 +107,28 @@ export const EARLIEST_SYNC_EPOCH = new Date(0).toISOString();
  *   - BOUNDED everywhere: the commit walk's `[since, until]` span, and with it the
  *     per-commit `getCommitDiff` fan-out (one API call PER COMMIT — usually the
  *     largest single cost of a catch-up).
- *   - NOT bounded: the PR listing. `getPullRequests(repo, state, since)` takes no
- *     `until` (see GitProvider), so a run still lists every PR touched since the
- *     cursor and fans out to getReviewComments + getPRReviews per PR. While a
- *     provider is stalled `since` is pinned and `now` marches on, so THAT half of the
- *     cost still grows every run. Correctness is unaffected — those fields are
- *     max()-merged idempotently (see remergeStoredSnapshot), so re-delivery is extra
- *     fetch, never inflation. Bounding it needs an `until` on the provider PR
- *     interface: follow-up #247, deliberately not #235.
+ *   - NOT bounded, and made WORSE on recovery: the PR listing.
+ *     `getPullRequests(repo, state, since)` takes no `until` (see GitProvider), so a
+ *     run still lists every PR touched since the cursor and fans out to
+ *     getReviewComments + getPRReviews per PR. Two distinct consequences, and the
+ *     second is a real cost this cap ADDS — stated plainly rather than buried:
+ *       · While STALLED: `since` is pinned and `now` marches on, so that half of the
+ *         cost grows every run, exactly as it did before this cap existed.
+ *       · While RECOVERING: chunking multiplies the PR half's TOTAL cost. Catching up
+ *         200 days used to be one run listing 200 days of PRs; it is now 7 runs
+ *         listing 200+170+140+110+80+50+20 = 770 PR-days, because each chunk re-lists
+ *         everything from its (advancing) `since` to `now`. The amplification is
+ *         ~lag/(2·cap) — ~4x for a 200-day recovery, ~12x for a two-year one. The
+ *         commit half is unaffected (its chunks are disjoint), so what the cap really
+ *         buys is a bounded PEAK per run, paid for with a higher TOTAL on the PR side.
+ *         For a rare, one-off recovery that is the right trade — a single run walking
+ *         200 days of commits with a getCommitDiff per commit is what actually
+ *         exhausts a rate limit — but it is a trade, not a free win.
+ *     Correctness is unaffected either way: those fields are max()-merged idempotently
+ *     (see remergeStoredSnapshot), so re-delivery is extra fetch, never inflation.
+ *     Bounding it properly needs an `until` on the provider PR interface — GitPR does
+ *     not even carry the `updated_at` the delivery is keyed on, so a filter here could
+ *     not be proven lossless: follow-up #247, deliberately not #235.
  *   - PROVIDER-DEPENDENT: github/gitlab push `since`+`until` to the server, so the
  *     cap really does shrink what is listed. Bitbucket's getCommits pages from HEAD
  *     newest-first and breaks only when it crosses `since`, filtering `until` in
@@ -380,8 +394,15 @@ export function getProviderStall(
  * open a streak at 1, or extend the open one, preserving its original `since`.
  *
  * Read-modify-write — MUST run inside the sync write transaction (see the
- * `stallUpdates` push in {@link GitSync.syncProviders}) so two concurrent runs
- * cannot both read `runs: 2` and both write `runs: 3`, losing a run.
+ * `stallUpdates` push in {@link GitSync.syncProviders}), which is also what makes it
+ * atomic with the cursor decision it mirrors.
+ *
+ * On concurrency, precisely: better-sqlite3's `db.transaction()` issues a DEFERRED
+ * BEGIN, so it does NOT serialize two concurrent runs — both can read `runs: 2`. What
+ * it guarantees is that the second one to WRITE fails fast (SQLITE_BUSY) and rolls
+ * back whole, so the outcome is "one run's accounting, or none" rather than a lost
+ * update. Correct, but by fail-fast, not by mutual exclusion — don't read this as a
+ * lock.
  */
 function recordProviderStallRun(
     db: Database.Database,
@@ -437,14 +458,20 @@ export interface LaggingProvider {
  * present. The companion signal to {@link loadStalledProviders}, and the reason
  * `doctor` cannot answer "is git data current?" from the stall counter alone.
  *
- * STALLED providers are excluded, keeping the two sets disjoint: a held cursor falls
- * behind by definition, so every stall would otherwise be reported twice under two
- * headings, and the stall is the strictly more specific, more actionable signal.
+ * Providers with ANY open stall streak are excluded, keeping the two sets disjoint.
+ * Note the exclusion is on an OPEN streak (>= 1 held run), NOT on the >= 3 reporting
+ * threshold: a provider held for one or two runs is below the stall alert, but its
+ * cursor IS being held, so reporting it here as "advancing" would state the opposite
+ * of the truth for exactly as long as it takes to become a reported stall. A held
+ * cursor also falls behind by definition, so without this every stall would surface
+ * twice under two headings — and the stall is the more specific, more actionable one.
  *
  * Cursors and stall rows are each resolved in ONE query and membership-tested in
  * memory against the caller's already-resolved provider set — never a query per
- * provider. Total by construction: an unparseable or future-dated cursor is not
- * lagging. Order follows `providerConfigs`, so output is deterministic.
+ * provider, and never by re-running {@link loadStalledProviders} (which every caller
+ * of this already calls itself, and which would apply the wrong threshold anyway).
+ * Total by construction: an unparseable or future-dated cursor is not lagging. Order
+ * follows `providerConfigs`, so output is deterministic.
  */
 export function loadLaggingProviders(
     db: Database.Database,
@@ -454,21 +481,27 @@ export function loadLaggingProviders(
     const nowMs = Date.parse(now);
     if (Number.isNaN(nowMs)) return [];
 
-    const cursorRows = db
-        .prepare("SELECT key, value FROM sync_state WHERE key LIKE 'git_last_sync:%'")
-        .all() as Array<{key: string; value: string}>;
-    if (cursorRows.length === 0) return [];
-    const cursorByKey = new Map(cursorRows.map((r) => [r.key, r.value]));
-
-    const stalledKeys = new Set(
-        loadStalledProviders(db, providerConfigs).map((s) => stallStateKey(s.type, s.identifier)),
+    const cursorByKey = new Map(
+        (
+            db
+                .prepare("SELECT key, value FROM sync_state WHERE key LIKE 'git_last_sync:%'")
+                .all() as Array<{key: string; value: string}>
+        ).map((r) => [r.key, r.value]),
+    );
+    const stallByKey = new Map(
+        (
+            db
+                .prepare("SELECT key, value FROM sync_state WHERE key LIKE 'git_stall:%'")
+                .all() as Array<{key: string; value: string}>
+        ).map((r) => [r.key, r.value]),
     );
 
     const capMs = GIT_CATCHUP_WINDOW_MAX_DAYS * 86_400_000;
     const lagging: LaggingProvider[] = [];
     for (const pc of providerConfigs) {
         const identifier = providerIdentifier(pc);
-        if (stalledKeys.has(stallStateKey(pc.type, identifier))) continue;
+        // Any open streak — not just a reportable one. See the note above.
+        if (parseStall(stallByKey.get(stallStateKey(pc.type, identifier)) ?? null)) continue;
         const cursor = cursorByKey.get(syncStateKey(pc.type, identifier));
         if (!cursor) continue; // Never synced — not lagging, just pending its first run.
         const cursorMs = Date.parse(cursor);
@@ -1463,6 +1496,18 @@ export class GitSync implements ConnectorInterface {
         return CONNECTOR_NAME;
     }
 
+    /**
+     * The newest forward CURSOR across this connector's providers — the instant git
+     * data has been synced UP TO, not the instant a run last happened.
+     *
+     * Those were the same thing until #235: a complete run always advanced the cursor
+     * to `now`. With the catch-up cap they diverge — a provider recovering from a long
+     * stall syncs successfully every night while this still reports an instant weeks
+     * back, because that is genuinely how far the data reaches. That is the honest
+     * answer for a freshness/staleness question and the wrong one for "did the sync
+     * run?"; a caller wanting the latter must not use this. No production caller reads
+     * it today (see #246).
+     */
     getLastSyncTime(db: Database.Database): string | null {
         const providers = this.getProviderConfigs(db);
         let latest: string | null = null;

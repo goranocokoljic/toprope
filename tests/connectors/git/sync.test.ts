@@ -2881,6 +2881,22 @@ describe('GitSync — stalled-provider detection (#235)', () => {
             expect(loadLaggingProviders(db, [CONFIG], NOW)).toEqual([]);
         });
 
+        it('excludes a provider held BELOW the stall threshold — it is not advancing', async () => {
+            writeState(FORWARD_KEY, at(200));
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(brokenProvider());
+
+            await new GitSync({enabled: false}).syncProviders(db, [CONFIG]);
+
+            // One held run: below GIT_STALL_ALERT_RUNS, so it is not a reportable stall
+            // yet — but the cursor IS held, so calling it "catching up — advancing"
+            // would state the exact opposite of the truth. The exclusion keys on an OPEN
+            // streak, not on the reporting threshold.
+            expect(getProviderStall(db, 'github', 'test-org')?.runs).toBe(1);
+            expect(loadStalledProviders(db, [CONFIG])).toEqual([]);
+            expect(loadLaggingProviders(db, [CONFIG], NOW)).toEqual([]);
+        });
+
         it('excludes a STALLED provider — the stall is the more specific signal', async () => {
             writeState(FORWARD_KEY, at(200));
             const createGitProvider = await getCreateGitProvider();
@@ -3116,6 +3132,54 @@ describe('GitSync — stalled-provider detection (#235)', () => {
             expect(windows).toHaveLength(2);
             expect(windows[1]).toEqual(windows[0]);
             expect(Date.parse(windows[0][1]) - Date.parse(windows[0][0])).toBe(CAP_MS);
+        });
+
+        it('sums a UTC day split across a chunk boundary — no gap, no double-count', async () => {
+            // The cap makes chunk boundaries routine, and a boundary lands at an
+            // arbitrary time-of-day — so it SPLITS a UTC calendar day: run N writes
+            // (dev, D) with the morning's commits, run N+1 writes (dev, D) again with
+            // the afternoon's. git_snapshots merges `commits` ADDITIVELY across runs
+            // (remergeStoredSnapshot), and the project rule from #205 is that an
+            // additive merge may only sum genuinely-disjoint deltas. The window tests
+            // above prove the boundary ARITHMETIC; this proves the DATA lands exactly
+            // once — the invariant the arithmetic exists to protect.
+            const devId = seedDev(db, 'alice');
+            // Cursor 45d back → run 1 covers [c, c+30d], run 2 covers [c+30d, now].
+            const cursor = new Date(Date.now() - 45 * DAY_MS).toISOString();
+            writeState(FORWARD_KEY, cursor);
+            const boundary = new Date(Date.parse(cursor) + CAP_MS);
+            const splitDay = boundary.toISOString().slice(0, 10);
+            const morning = new Date(boundary.getTime() - 3_600_000).toISOString();
+            const afternoon = new Date(boundary.getTime() + 3_600_000).toISOString();
+
+            const createGitProvider = await getCreateGitProvider();
+            // Each run returns only the commits inside ITS window — what a correctly
+            // server-side-bounded provider does, so the assertion measures the merge,
+            // not the mock.
+            createGitProvider.mockImplementation(() =>
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits: vi.fn(async (_repo: string, since: string, until: string) =>
+                        [
+                            makeProviderCommit('alice', morning, 'c-morning'),
+                            makeProviderCommit('alice', afternoon, 'c-afternoon'),
+                        ].filter((c) => c.date >= since && c.date <= until),
+                    ),
+                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+                }),
+            );
+
+            const sync = new GitSync({enabled: false});
+            await sync.syncProviders(db, [CONFIG]);
+            await sync.syncProviders(db, [CONFIG]);
+
+            // Exactly 2: 1 would mean the second chunk clobbered the first half of the
+            // day (a REPLACE, not a merge — a permanent gap); 3+ would mean a commit was
+            // delivered in both windows and additively re-counted.
+            const row = db
+                .prepare('SELECT commits FROM git_snapshots WHERE developer_id = ? AND date = ?')
+                .get(devId, splitDay) as {commits: number} | undefined;
+            expect(row?.commits).toBe(2);
         });
 
         it('does NOT cap a backfill — its window is the validated slice the caller passed', async () => {

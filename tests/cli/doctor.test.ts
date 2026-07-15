@@ -385,7 +385,33 @@ describe('runDoctor', () => {
             const result = await runDoctor(db, await reachableGitConfig(), tmpConfigPath, MIGRATIONS_DIR);
 
             expect(result).toBe(true);
-            expect(output.join('\n')).toContain('All 1 provider(s) current');
+            expect(output.join('\n')).toContain('1 of 1 provider(s) current');
+        });
+
+        it('does NOT claim a never-synced provider is current', async () => {
+            // No cursor seeded at all. The control above must depend on its seeded
+            // cursor — if this printed the same "current" line, that control could not
+            // fail for the right reason, and a fresh install would be told git data is
+            // current before a single sync had ever run.
+            const result = await runDoctor(db, await reachableGitConfig(), tmpConfigPath, MIGRATIONS_DIR);
+
+            expect(result).toBe(true);
+            const allOutput = [...output, ...errors].join('\n');
+            expect(allOutput).toContain('No provider has synced yet');
+            expect(allOutput).not.toContain('provider(s) current');
+        });
+
+        it('counts the never-synced separately from the current ones', async () => {
+            seedCursor('acme', 1);
+
+            await runDoctor(
+                db,
+                await reachableGitConfig(['acme', 'beta']),
+                tmpConfigPath,
+                MIGRATIONS_DIR,
+            );
+
+            expect(output.join('\n')).toContain('1 of 2 provider(s) current; 1 not synced yet');
         });
 
         it('reports EVERY stalled provider, with a count matching the detail list', async () => {
@@ -421,7 +447,7 @@ describe('runDoctor', () => {
             expect(allOutput).toContain('Git sync progress');
             expect(allOutput).toContain('catching up — advancing, but not yet current');
             expect(allOutput).toContain('github:acme (170 days behind');
-            expect(allOutput).not.toContain('advancing, but not yet current: 0');
+            expect(allOutput).not.toContain('0 provider(s) catching up');
             // A bounded catch-up is working as designed and self-resolves, so it is a
             // pass — it just must not claim the data is current.
             expect(result).toBe(true);
@@ -438,6 +464,30 @@ describe('runDoctor', () => {
             const allOutput = [...output, ...errors].join('\n');
             expect(allOutput).toContain('1 provider(s) stalled');
             expect(allOutput).not.toContain('catching up');
+        });
+
+        it('still reports a LAGGING provider when a DIFFERENT provider is stalled', async () => {
+            // Doctor is the command the operator runs *after* seeing a stall, so it is
+            // exactly then that it can least afford to go quiet about everything else.
+            // A single early-returning check would print acme's stall and silently drop
+            // beta's 170-day lag.
+            seedStall(5, 'acme');
+            seedCursor('acme', 200);
+            seedCursor('beta', 170);
+
+            const result = await runDoctor(
+                db,
+                await reachableGitConfig(['acme', 'beta']),
+                tmpConfigPath,
+                MIGRATIONS_DIR,
+            );
+
+            expect(result).toBe(false);
+            const allOutput = [...output, ...errors].join('\n');
+            expect(allOutput).toContain('1 provider(s) stalled');
+            expect(allOutput).toContain('github:acme (5 runs');
+            expect(allOutput).toContain('1 provider(s) catching up');
+            expect(allOutput).toContain('github:beta (170 days behind');
         });
 
         it('names BOTH stall causes in the remedy, not just the bad-repo one', async () => {
@@ -461,7 +511,7 @@ describe('runDoctor', () => {
             // One held run is transient and self-healing; failing doctor on it would
             // train the reader to ignore the check.
             expect(result).toBe(true);
-            expect(output.join('\n')).toContain('All 1 provider(s) current');
+            expect(output.join('\n')).toContain('1 of 1 provider(s) current');
         });
 
         it('skips the stall check entirely when the git connector is disabled', async () => {
