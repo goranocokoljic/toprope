@@ -327,8 +327,8 @@ describe('runDoctor', () => {
     // run and #231 holds the whole provider's cursor rather than leave a silent gap,
     // so checkAccess() passes while nothing at all is being imported.
     describe('stalled git providers (#235)', () => {
-        /** A config with one reachable github provider (no network — factory stubbed). */
-        async function reachableGitConfig(): Promise<TopropeConfig> {
+        /** A config with reachable github providers (no network — factory stubbed). */
+        async function reachableGitConfig(orgs: string[] = ['acme']): Promise<TopropeConfig> {
             const {createGitProvider} = await import('../../src/connectors/git/providers/factory');
             (createGitProvider as ReturnType<typeof vi.fn>).mockReturnValue({
                 name: 'github',
@@ -343,16 +343,23 @@ describe('runDoctor', () => {
 
             const config = disabledConfig();
             (config.connectors.git as {enabled: boolean; providers: unknown[]}).enabled = true;
-            (config.connectors.git as {enabled: boolean; providers: unknown[]}).providers = [
-                {type: 'github', org: 'acme', auth: {type: 'token', api_token: 't'}},
-            ];
+            (config.connectors.git as {enabled: boolean; providers: unknown[]}).providers = orgs.map(
+                (org) => ({type: 'github', org, auth: {type: 'token', api_token: 't'}}),
+            );
             return config;
         }
 
-        function seedStall(runs: number): void {
+        function seedStall(runs: number, org = 'acme'): void {
             db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
-                'git_stall:github:acme',
+                `git_stall:github:${org}`,
                 JSON.stringify({runs, since: '2026-07-01T00:00:00.000Z'}),
+            );
+        }
+
+        function seedCursor(org: string, daysAgoN: number): void {
+            db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+                `git_last_sync:github:${org}`,
+                new Date(Date.now() - daysAgoN * 86_400_000).toISOString(),
             );
         }
 
@@ -372,22 +379,89 @@ describe('runDoctor', () => {
             expect(allOutput).toContain('exclude_repos');
         });
 
-        it('passes when no provider is stalled (negative control)', async () => {
+        it('passes when every provider is current (negative control)', async () => {
+            seedCursor('acme', 1);
+
             const result = await runDoctor(db, await reachableGitConfig(), tmpConfigPath, MIGRATIONS_DIR);
 
             expect(result).toBe(true);
-            expect(output.join('\n')).toContain('All 1 provider(s) advancing');
+            expect(output.join('\n')).toContain('All 1 provider(s) current');
+        });
+
+        it('reports EVERY stalled provider, with a count matching the detail list', async () => {
+            seedStall(4, 'acme');
+            seedStall(6, 'beta');
+
+            const result = await runDoctor(
+                db,
+                await reachableGitConfig(['acme', 'beta', 'healthy']),
+                tmpConfigPath,
+                MIGRATIONS_DIR,
+            );
+
+            expect(result).toBe(false);
+            const allOutput = [...output, ...errors].join('\n');
+            // >= 2 stalled, so a join that drops entries or a count that disagrees with
+            // the rendered list cannot ship green.
+            expect(allOutput).toContain('2 provider(s) stalled');
+            expect(allOutput).toContain('github:acme (4 runs');
+            expect(allOutput).toContain('github:beta (6 runs');
+            expect(allOutput).not.toContain('github:healthy (');
+        });
+
+        it('does NOT call a months-behind provider "advancing" — reports the catch-up instead', async () => {
+            // The false all-clear this guards: after excluding the repo that caused a
+            // stall, the streak clears and the run completes, but the cursor is still
+            // ~170 days back. Doctor must not declare victory.
+            seedCursor('acme', 170);
+
+            const result = await runDoctor(db, await reachableGitConfig(), tmpConfigPath, MIGRATIONS_DIR);
+
+            const allOutput = [...output, ...errors].join('\n');
+            expect(allOutput).toContain('Git sync progress');
+            expect(allOutput).toContain('catching up — advancing, but not yet current');
+            expect(allOutput).toContain('github:acme (170 days behind');
+            expect(allOutput).not.toContain('advancing, but not yet current: 0');
+            // A bounded catch-up is working as designed and self-resolves, so it is a
+            // pass — it just must not claim the data is current.
+            expect(result).toBe(true);
+            expect(allOutput).not.toContain('provider(s) current');
+        });
+
+        it('reports a stalled provider as stalled only — never also as catching up', async () => {
+            seedStall(5, 'acme');
+            seedCursor('acme', 200);
+
+            const result = await runDoctor(db, await reachableGitConfig(), tmpConfigPath, MIGRATIONS_DIR);
+
+            expect(result).toBe(false);
+            const allOutput = [...output, ...errors].join('\n');
+            expect(allOutput).toContain('1 provider(s) stalled');
+            expect(allOutput).not.toContain('catching up');
+        });
+
+        it('names BOTH stall causes in the remedy, not just the bad-repo one', async () => {
+            seedStall(6);
+
+            await runDoctor(db, await reachableGitConfig(), tmpConfigPath, MIGRATIONS_DIR);
+
+            // A provider-level listRepos failure also opens a streak, and exclude_repos
+            // cannot fix that — a remedy naming only the bad-repo case misdirects.
+            const allOutput = [...output, ...errors].join('\n');
+            expect(allOutput).toContain('repo listing');
+            expect(allOutput).toContain('exclude_repos');
         });
 
         it('passes below the alert threshold', async () => {
             seedStall(1);
+            seedCursor('acme', 1);
 
             const result = await runDoctor(db, await reachableGitConfig(), tmpConfigPath, MIGRATIONS_DIR);
 
             // One held run is transient and self-healing; failing doctor on it would
             // train the reader to ignore the check.
             expect(result).toBe(true);
-            expect(output.join('\n')).toContain('advancing');
+            expect(output.join('\n')).toContain('All 1 provider(s) current');
         });
 
         it('skips the stall check entirely when the git connector is disabled', async () => {

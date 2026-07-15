@@ -19,6 +19,7 @@ import {
     catchUpUntil,
     getProviderStall,
     loadStalledProviders,
+    loadLaggingProviders,
     GIT_STALL_ALERT_RUNS,
     GIT_CATCHUP_WINDOW_MAX_DAYS,
     type GitSyncProgress,
@@ -2476,6 +2477,10 @@ describe('GitSync — stalled-provider detection (#235)', () => {
     });
 
     afterEach(() => {
+        // Unconditional: a test that froze the clock must not leak it into a sibling
+        // (vitest keeps fake timers installed across tests otherwise). Safe when no
+        // test in this block installed them.
+        vi.useRealTimers();
         db.close();
         vi.restoreAllMocks();
     });
@@ -2533,8 +2538,17 @@ describe('GitSync — stalled-provider detection (#235)', () => {
             createGitProvider.mockReturnValue(brokenProvider());
             const sync = new GitSync({enabled: false});
 
+            // The clock is frozen and stepped explicitly: on the real clock three
+            // back-to-back runs can share a millisecond, which makes `first` and `third`
+            // identical and silently turns the "does not creep" assertion below into a
+            // tautology that passes for the wrong reason (and fails at random when the
+            // runs straddle a tick). Distinct instants by construction.
+            vi.useFakeTimers();
+            vi.setSystemTime(new Date('2026-07-01T00:00:00.000Z'));
             const first = await sync.syncProviders(db, [CONFIG]);
+            vi.setSystemTime(new Date('2026-07-02T00:00:00.000Z'));
             await sync.syncProviders(db, [CONFIG]);
+            vi.setSystemTime(new Date('2026-07-03T00:00:00.000Z'));
             const third = await sync.syncProviders(db, [CONFIG]);
 
             const stall = getProviderStall(db, 'github', 'test-org');
@@ -2542,6 +2556,7 @@ describe('GitSync — stalled-provider detection (#235)', () => {
             // "Stalled SINCE" must anchor to the streak's start, not creep forward to the
             // latest run — a creeping `since` would report an ancient stall as brand new.
             expect(stall?.since).toBe(first.lastSyncTime);
+            expect(first.lastSyncTime).not.toBe(third.lastSyncTime);
             expect(stall?.since).not.toBe(third.lastSyncTime);
         });
 
@@ -2709,6 +2724,40 @@ describe('GitSync — stalled-provider detection (#235)', () => {
             expect(readState('git_last_sync:github:myorg')).toBeUndefined();
         });
 
+        it('does NOT clear an existing streak when the write transaction rolls back', async () => {
+            // The mirror of the test above, and the arm that would silently regress: if
+            // clearProviderStall were ever hoisted out of the deferred stallUpdates and
+            // called eagerly in the fetch loop, every other test here still passes (the
+            // record-direction rollback test uses a broken provider that never clears,
+            // and every clear test commits successfully). A rolled-back run wiping a live
+            // streak would reset the alert to zero and hide a permanent stall for good.
+            seedDev(db, 'alice');
+            writeState(STALL_KEY, JSON.stringify({runs: 5, since: '2026-07-01T00:00:00.000Z'}));
+
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits: vi.fn().mockResolvedValue([makeProviderCommit('alice')]),
+                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+                }),
+            );
+            // This provider's fetch is COMPLETE, so the run wants to clear the streak —
+            // but the snapshot write it commits with will fail.
+            db.exec('DROP TABLE git_snapshots');
+
+            const result = await new GitSync({enabled: false}).syncProviders(db, [CONFIG]);
+
+            expect(result.errors.some((e) => /transaction rolled back/.test(e))).toBe(true);
+            // Nothing persisted, so the streak stands — the provider has still imported
+            // nothing, and the cursor did not move either.
+            expect(getProviderStall(db, 'github', 'test-org')).toEqual({
+                runs: 5,
+                since: '2026-07-01T00:00:00.000Z',
+            });
+            expect(readState(FORWARD_KEY)).toBeUndefined();
+        });
+
         it('treats a corrupt stall row as no streak and self-heals on the next held run', async () => {
             writeState(STALL_KEY, 'not json at all');
             expect(getProviderStall(db, 'github', 'test-org')).toBeNull();
@@ -2802,6 +2851,87 @@ describe('GitSync — stalled-provider detection (#235)', () => {
 
         it('returns [] when nothing is stalled', () => {
             expect(loadStalledProviders(db, [CONFIG])).toEqual([]);
+        });
+    });
+
+    // The cap CREATES this state: before it, a complete run always reached `now`, so
+    // "the run completed" and "the data is current" were one statement. They are no
+    // longer, and a bare "no stall → advancing" would be a false all-clear.
+    describe('loadLaggingProviders', () => {
+        const DAY_MS = 86_400_000;
+        const NOW = '2026-07-15T00:00:00.000Z';
+        const at = (daysBefore: number): string =>
+            new Date(Date.parse(NOW) - daysBefore * DAY_MS).toISOString();
+
+        it('reports a provider whose cursor is more than one cap-width behind', () => {
+            writeState(FORWARD_KEY, at(170));
+
+            expect(loadLaggingProviders(db, [CONFIG], NOW)).toEqual([
+                {type: 'github', identifier: 'test-org', cursor: at(170), daysBehind: 170},
+            ]);
+        });
+
+        it('says nothing about a current provider, or one exactly at the cap boundary', () => {
+            writeState(FORWARD_KEY, at(1));
+            expect(loadLaggingProviders(db, [CONFIG], NOW)).toEqual([]);
+
+            // At the cap the next run is NOT capped (catchUpUntil returns `now`), so the
+            // provider will reach the present — not lagging. Same boundary as the cap.
+            writeState(FORWARD_KEY, at(GIT_CATCHUP_WINDOW_MAX_DAYS));
+            expect(loadLaggingProviders(db, [CONFIG], NOW)).toEqual([]);
+        });
+
+        it('excludes a STALLED provider — the stall is the more specific signal', async () => {
+            writeState(FORWARD_KEY, at(200));
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(brokenProvider());
+            const sync = new GitSync({enabled: false});
+            for (let run = 0; run < GIT_STALL_ALERT_RUNS; run++) {
+                await sync.syncProviders(db, [CONFIG]);
+            }
+
+            // Precondition: it IS stalled, and its cursor IS far behind — so without the
+            // exclusion it would be reported twice under two different headings.
+            expect(loadStalledProviders(db, [CONFIG])).toHaveLength(1);
+            expect(loadLaggingProviders(db, [CONFIG], NOW)).toEqual([]);
+        });
+
+        it('does not treat a never-synced provider as lagging', () => {
+            // No cursor at all is a pending first sync, not a provider falling behind.
+            expect(loadLaggingProviders(db, [CONFIG], NOW)).toEqual([]);
+        });
+
+        it.each([
+            ['an unparseable cursor', 'not-a-date'],
+            ['a future-dated cursor', '2027-01-01T00:00:00.000Z'],
+        ])('is total: %s is not reported as lagging', (_label, cursor) => {
+            writeState(FORWARD_KEY, cursor);
+            expect(loadLaggingProviders(db, [CONFIG], NOW)).toEqual([]);
+        });
+
+        it('returns [] on an unparseable now', () => {
+            writeState(FORWARD_KEY, at(200));
+            expect(loadLaggingProviders(db, [CONFIG], 'not-a-date')).toEqual([]);
+        });
+
+        it('reports every lagging provider in config order, ignoring orphaned cursors', () => {
+            writeState('git_last_sync:bitbucket:ws-a', at(90));
+            writeState('git_last_sync:github:org-b', at(60));
+            writeState('git_last_sync:github:healthy-org', at(2));
+            writeState('git_last_sync:github:deleted-org', at(400));
+
+            const configs: GitProviderConfig[] = [
+                {type: 'bitbucket', workspace: 'ws-a', auth: {type: 'app_password', username: 'u', app_password: 'p'}},
+                {type: 'github', org: 'org-b', auth: {type: 'token', api_token: 't'}},
+                {type: 'github', org: 'healthy-org', auth: {type: 'token', api_token: 't'}},
+            ];
+
+            // >= 2 lagging, so a single-item happy path can't hide an accumulation or
+            // ordering bug; the un-configured deleted-org cursor must not surface.
+            expect(loadLaggingProviders(db, configs, NOW)).toEqual([
+                {type: 'bitbucket', identifier: 'ws-a', cursor: at(90), daysBehind: 90},
+                {type: 'github', identifier: 'org-b', cursor: at(60), daysBehind: 60},
+            ]);
         });
     });
 
@@ -2953,7 +3083,7 @@ describe('GitSync — stalled-provider detection (#235)', () => {
             }
         });
 
-        it('holds a STALLED provider to a constant window rather than an ever-growing one', async () => {
+        it('holds a STALLED provider to a constant COMMIT window rather than an ever-growing one', async () => {
             const cursor = new Date(Date.now() - 200 * DAY_MS).toISOString();
             writeState(FORWARD_KEY, cursor);
 
@@ -2973,10 +3103,16 @@ describe('GitSync — stalled-provider detection (#235)', () => {
             await sync.syncProviders(db, [CONFIG]);
             await sync.syncProviders(db, [CONFIG]);
 
-            // The headline #235 acceptance: while stalled the cursor is held, so `since`
-            // is pinned — and with `until` capped the re-fetch span no longer widens by
-            // a run's worth of wall-clock every run. Two identical windows prove the
-            // stalled cost is constant.
+            // While stalled the cursor is held, so `since` is pinned — and with `until`
+            // capped the COMMIT re-fetch span no longer widens by a run's worth of
+            // wall-clock every run. Two identical windows prove the commit walk (and its
+            // per-commit diff fan-out) is constant per run.
+            //
+            // Scope, deliberately not asserted here because it is NOT true: the PR
+            // listing takes no `until`, so that half of the fetch does still grow every
+            // run. See GIT_CATCHUP_WINDOW_MAX_DAYS and follow-up #247 — this test proves
+            // the bounded half, and must not be read as "a stalled run costs a constant
+            // amount".
             expect(windows).toHaveLength(2);
             expect(windows[1]).toEqual(windows[0]);
             expect(Date.parse(windows[0][1]) - Date.parse(windows[0][0])).toBe(CAP_MS);
