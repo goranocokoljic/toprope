@@ -15,6 +15,7 @@ import {ClaudeCodeSync} from './connectors/claude-code/sync';
 import {WindsurfSync} from './connectors/windsurf/sync';
 import {CursorSync} from './connectors/cursor/sync';
 import {GitSync} from './connectors/git/sync';
+import {setHistoryFloor} from './cli/git-history-floor';
 import {runPipeline} from './scheduler/sync-pipeline';
 import {importCsv} from './expenses/importer';
 import {listUnmatchedCharges, resolveCharge, findUnmatchedIdByPrefix} from './expenses/resolution-queue';
@@ -715,6 +716,42 @@ syncCommand
             db.close();
         }
         if (hasErrors) process.exit(1);
+    });
+
+const gitCommand = program.command('git').description('Git provider history maintenance');
+
+gitCommand
+    .command('set-history-floor')
+    .description(
+        'Declare how far back a LEGACY git provider has already synced (#233). Only ' +
+            'needed for providers first synced before history-window tracking existed: ' +
+            'their true floor was never recorded, so "sync older history" refuses to run ' +
+            'rather than risk double-counting. Pass the instant that provider first ' +
+            'reached — normally (first sync time − the window that run used).',
+    )
+    .requiredOption('--provider <type>', 'Provider type (github, bitbucket, gitlab)')
+    .requiredOption('--container <name>', 'Provider container: org (github) / workspace (bitbucket) / group (gitlab)')
+    .requiredOption('--at <iso>', 'The earliest instant already synced, as UTC ISO (e.g. 2025-01-01T00:00:00.000Z)')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
+    .action((options: {provider: string; container: string; at: string; config: string}) => {
+        const configPath = path.resolve(process.cwd(), options.config);
+        const config = loadConfig(configPath);
+        const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
+        const db = openDb(dbPath);
+        let failed = false;
+        try {
+            runMigrations(db, MIGRATIONS_DIR);
+            const result = setHistoryFloor(db, options, new Date().toISOString());
+            if (result.ok) {
+                console.log(`[git] ${result.message}`);
+            } else {
+                console.error(`[git] ${result.message}`);
+                failed = true;
+            }
+        } finally {
+            db.close();
+        }
+        if (failed) process.exit(1);
     });
 
 const expensesCommand = program.command('expenses').description('Manage expense and subscription data');

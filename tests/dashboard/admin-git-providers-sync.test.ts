@@ -12,6 +12,7 @@ import {SESSION_COOKIE} from '../../src/auth/cookies';
 import type {GitConnectorConfig} from '../../src/config/types';
 import type {GitProvider, GitRepo, GitCommit} from '../../src/connectors/git/providers/types';
 import type {GitSyncProgress} from '../../src/connectors/git/sync';
+import {declareEarliestSyncedFloor} from '../../src/connectors/git/sync';
 
 // Stub createGitProvider so no test hits the network, but keep the rest of the
 // factory (validateGitProviderConfig) real so the store/codec seeding + decrypt
@@ -597,6 +598,7 @@ describe('admin git-provider sync-now API (#199)', () => {
     describe('POST /:id/sync-older-history — backward extension (#229)', () => {
         const FORWARD_KEY = 'git_last_sync:github:db-org';
         const EARLIEST_KEY = 'git_earliest_sync:github:db-org';
+        const UNKNOWN_KEY = 'git_earliest_unknown:github:db-org';
 
         // Arm getCommits so the run resolves fast AND we can read the [since, until]
         // slice the backfill window computed. Returns [] → no snapshot bookkeeping.
@@ -702,6 +704,56 @@ describe('admin git-provider sync-now API (#199)', () => {
             const res = await triggerOlder(id, {months: 12});
             expect(res.statusCode).toBe(409);
             expect(res.json().message).toMatch(/disabled/);
+        });
+
+        // #233: a LEGACY provider (first synced before #229 recorded the floor) has no
+        // watermark and no recoverable one. The route must refuse rather than fall back
+        // to the old `now − 6mo` guess, which is too RECENT and silently double-counts.
+        it('fails closed with 409 for a legacy provider whose floor is unknown, and starts no run', async () => {
+            const id = await createGithub();
+            const getCommits = await armGetCommits();
+            db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+                UNKNOWN_KEY,
+                '1',
+            );
+
+            // months=60 targets 5y back — far older than the old lazy guess, so this
+            // request WOULD have been accepted (and double-counted) before #233.
+            const res = await triggerOlder(id, {months: 60});
+
+            expect(res.statusCode).toBe(409);
+            expect(res.json().message).toMatch(/set-history-floor/);
+            // No fetch, no watermark write — a refusal, not a partial run.
+            expect(getCommits).not.toHaveBeenCalled();
+            expect(readState(EARLIEST_KEY)).toBeUndefined();
+            expect((await readProvider(id))?.last_sync_status).toBeNull();
+        });
+
+        it('accepts the backfill once an admin declares the legacy floor', async () => {
+            const id = await createGithub();
+            const getCommits = await armGetCommits();
+            db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(UNKNOWN_KEY, '1');
+            expect((await triggerOlder(id, {months: 60})).statusCode).toBe(409);
+
+            // The recovery path: the admin asserts the real floor.
+            const declaredFloor = '2025-01-01T00:00:00.000Z';
+            expect(
+                declareEarliestSyncedFloor(
+                    db,
+                    'github',
+                    'db-org',
+                    declaredFloor,
+                    new Date().toISOString(),
+                ),
+            ).toEqual({ok: true});
+
+            const res = await triggerOlder(id, {months: 60});
+            expect(res.statusCode).toBe(202);
+            await waitForSyncStatus(id, 'ok');
+            // The declared floor became the slice's upper bound — the backfill extends
+            // strictly BELOW what the admin said was already imported.
+            expect(getCommits.mock.calls[0][2]).toBe(declaredFloor);
+            expect(readState(UNKNOWN_KEY)).toBeUndefined();
         });
 
         it('rejects a read-only config-file provider id (409)', async () => {

@@ -898,7 +898,20 @@ export function registerAdminGitProviderRoutes(
 
             // Compute the disjoint older slice from the CURRENT earliest watermark.
             const now = new Date().toISOString();
-            const currentEarliest = getEarliestSyncedWatermark(db, record.type, record.container, now);
+            const earliest = getEarliestSyncedWatermark(db, record.type, record.container, now);
+            // Fail closed on a LEGACY provider whose floor is unknown (#233). The
+            // additive merge is only correct over a slice proven disjoint from what is
+            // already imported, and the watermark is that proof — without it we cannot
+            // establish disjointness, and the old lazy guess (`now − 6mo`) was
+            // systematically too recent, silently double-counting the overlap. Refuse
+            // with the recovery path rather than guess.
+            if (earliest.kind === 'unknown') {
+                return conflict(
+                    reply,
+                    'This provider was first synced before history-window tracking existed, so how far back it already reaches is unknown — extending it now could double-count existing activity. Declare the known floor with `toprope git set-history-floor` to enable this.',
+                );
+            }
+            const currentEarliest = earliest.watermark;
             const newTarget = subtractUtcMonths(now, months);
             // subtractUtcMonths returns null only for an unparseable `now`, which we
             // just produced — defensive, should never trip.

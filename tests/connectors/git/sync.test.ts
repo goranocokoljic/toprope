@@ -9,6 +9,8 @@ import {
     firstSyncSince,
     subtractUtcMonths,
     earliestSyncStateKey,
+    earliestUnknownStateKey,
+    declareEarliestSyncedFloor,
     getEarliestSyncedWatermark,
     EARLIEST_SYNC_EPOCH,
     FIRST_SYNC_WINDOW_MIN_MONTHS,
@@ -1593,7 +1595,7 @@ describe('subtractUtcMonths — shared month arithmetic (#229)', () => {
     });
 });
 
-describe('getEarliestSyncedWatermark — lazy default (#229)', () => {
+describe('getEarliestSyncedWatermark — never-synced default (#229) / legacy unknown (#233)', () => {
     let db: Database.Database;
 
     beforeEach(() => {
@@ -1604,11 +1606,14 @@ describe('getEarliestSyncedWatermark — lazy default (#229)', () => {
         db.close();
     });
 
-    it('defaults to now − default window when no watermark is stored', () => {
+    it('defaults to now − default window for a NEVER-synced provider (no cursor, no marker)', () => {
+        // Not a guess: nothing is imported, so the window its first sync will use is
+        // the honest floor and any backfill below it stays disjoint.
         const now = '2026-03-15T12:00:00.000Z';
-        expect(getEarliestSyncedWatermark(db, 'github', 'test-org', now)).toBe(
-            firstSyncSince(now, FIRST_SYNC_WINDOW_DEFAULT_MONTHS),
-        );
+        expect(getEarliestSyncedWatermark(db, 'github', 'test-org', now)).toEqual({
+            kind: 'exact',
+            watermark: firstSyncSince(now, FIRST_SYNC_WINDOW_DEFAULT_MONTHS),
+        });
     });
 
     it('returns the stored watermark verbatim once set', () => {
@@ -1618,11 +1623,125 @@ describe('getEarliestSyncedWatermark — lazy default (#229)', () => {
         );
         expect(
             getEarliestSyncedWatermark(db, 'github', 'test-org', '2026-03-15T12:00:00.000Z'),
-        ).toBe('2024-01-01T00:00:00.000Z');
+        ).toEqual({kind: 'exact', watermark: '2024-01-01T00:00:00.000Z'});
     });
 
     it('falls back to now (a zero-width window the guard rejects) when now is unparseable and unset', () => {
-        expect(getEarliestSyncedWatermark(db, 'github', 'test-org', 'not-a-date')).toBe('not-a-date');
+        expect(getEarliestSyncedWatermark(db, 'github', 'test-org', 'not-a-date')).toEqual({
+            kind: 'exact',
+            watermark: 'not-a-date',
+        });
+    });
+
+    it('returns `unknown` for a LEGACY provider (#233) rather than the too-recent guess', () => {
+        // The regression this closes: before #233 this returned `now − 6mo`, which is
+        // NEWER than the true floor, so the first backfill re-covered the overlap and
+        // additively double-counted it.
+        db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+            earliestUnknownStateKey('github', 'test-org'),
+            '1',
+        );
+        expect(
+            getEarliestSyncedWatermark(db, 'github', 'test-org', '2026-03-15T12:00:00.000Z'),
+        ).toEqual({kind: 'unknown'});
+    });
+
+    it('prefers a real watermark over a stale marker (exact wins)', () => {
+        // Defence in depth: if both somehow coexist, the recorded floor is the truth.
+        db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+            earliestUnknownStateKey('github', 'test-org'),
+            '1',
+        );
+        db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+            earliestSyncStateKey('github', 'test-org'),
+            '2024-01-01T00:00:00.000Z',
+        );
+        expect(
+            getEarliestSyncedWatermark(db, 'github', 'test-org', '2026-03-15T12:00:00.000Z'),
+        ).toEqual({kind: 'exact', watermark: '2024-01-01T00:00:00.000Z'});
+    });
+});
+
+describe('declareEarliestSyncedFloor — the admin half of migration 040 (#233)', () => {
+    let db: Database.Database;
+    const NOW = '2026-03-15T12:00:00.000Z';
+
+    beforeEach(() => {
+        db = makeDb();
+    });
+
+    afterEach(() => {
+        db.close();
+    });
+
+    const markLegacy = (): void => {
+        db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+            earliestUnknownStateKey('github', 'test-org'),
+            '1',
+        );
+    };
+    const readState = (key: string): string | null =>
+        (db.prepare('SELECT value FROM sync_state WHERE key = ?').get(key) as
+            | {value: string}
+            | undefined)?.value ?? null;
+
+    it('records the declared floor and retires the marker, restoring backfill', () => {
+        markLegacy();
+        const floor = '2025-01-01T00:00:00.000Z';
+        expect(declareEarliestSyncedFloor(db, 'github', 'test-org', floor, NOW)).toEqual({ok: true});
+        expect(readState(earliestSyncStateKey('github', 'test-org'))).toBe(floor);
+        // Marker gone → the provider is no longer legacy → the route stops refusing.
+        expect(readState(earliestUnknownStateKey('github', 'test-org'))).toBeNull();
+        expect(getEarliestSyncedWatermark(db, 'github', 'test-org', NOW)).toEqual({
+            kind: 'exact',
+            watermark: floor,
+        });
+    });
+
+    it('refuses a non-legacy provider rather than overwrite a recorded floor', () => {
+        db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+            earliestSyncStateKey('github', 'test-org'),
+            '2024-01-01T00:00:00.000Z',
+        );
+        expect(declareEarliestSyncedFloor(db, 'github', 'test-org', '2025-06-01T00:00:00.000Z', NOW)).toEqual(
+            {ok: false, reason: 'not_legacy'},
+        );
+        // The exact floor is untouched — overwriting it is the corruption we guard.
+        expect(readState(earliestSyncStateKey('github', 'test-org'))).toBe('2024-01-01T00:00:00.000Z');
+    });
+
+    it('refuses a never-synced provider (nothing to declare)', () => {
+        expect(declareEarliestSyncedFloor(db, 'github', 'test-org', '2025-06-01T00:00:00.000Z', NOW)).toEqual(
+            {ok: false, reason: 'not_legacy'},
+        );
+        expect(readState(earliestSyncStateKey('github', 'test-org'))).toBeNull();
+    });
+
+    it.each([
+        ['a non-date', 'yesterday'],
+        ['a date-only string', '2025-01-01'],
+        ['a non-UTC offset instant', '2025-01-01T00:00:00+02:00'],
+    ])('refuses %s as a floor (must be a canonical UTC ISO instant)', (_label, floor) => {
+        markLegacy();
+        expect(declareEarliestSyncedFloor(db, 'github', 'test-org', floor, NOW)).toEqual({
+            ok: false,
+            reason: 'invalid_floor',
+        });
+        // Marker survives a rejected declare — the provider is still legacy.
+        expect(readState(earliestUnknownStateKey('github', 'test-org'))).toBe('1');
+        expect(readState(earliestSyncStateKey('github', 'test-org'))).toBeNull();
+    });
+
+    it.each([
+        ['at now', NOW],
+        ['in the future', '2027-01-01T00:00:00.000Z'],
+    ])('refuses a floor %s (upper bound)', (_label, floor) => {
+        markLegacy();
+        expect(declareEarliestSyncedFloor(db, 'github', 'test-org', floor, NOW)).toEqual({
+            ok: false,
+            reason: 'future_floor',
+        });
+        expect(readState(earliestSyncStateKey('github', 'test-org'))).toBeNull();
     });
 });
 
@@ -1782,6 +1901,126 @@ describe('GitSync.syncProviders — sync-older-history backfill plumbing (#229)'
     });
 });
 
+// The two atomicity paths #233 set out to close. Both are enforced by #231's design
+// (a provider whose commit fetch is incomplete is skipped whole; every cursor/watermark
+// advance is a deferred closure applied INSIDE the snapshot transaction) — these lock
+// that in from the BACKFILL direction specifically, where the failure mode is not a
+// re-fetch but a permanently orphaned older slice: the absolute-months overlap guard
+// turns the admin's retry into a 409 no-op, so a watermark lowered over data that was
+// never written can never be recovered through the UI.
+describe('GitSync.syncProviders — backfill atomicity (#233)', () => {
+    let db: Database.Database;
+
+    beforeEach(() => {
+        db = makeDb();
+        vi.resetAllMocks();
+    });
+
+    afterEach(() => {
+        db.close();
+        vi.restoreAllMocks();
+    });
+
+    const CONFIG: GitProviderConfig = {
+        type: 'github',
+        org: 'test-org',
+        auth: {type: 'token', api_token: 'test-token'},
+    };
+    const EARLIEST_KEY = 'git_earliest_sync:github:test-org';
+    const BACKFILL = {since: '2024-01-01T00:00:00.000Z', until: '2024-07-01T00:00:00.000Z'};
+
+    const readState = (key: string): string | undefined =>
+        (db.prepare('SELECT value FROM sync_state WHERE key = ?').get(key) as
+            | {value: string}
+            | undefined)?.value;
+    const countSnapshots = (devId: string): number =>
+        (db
+            .prepare('SELECT COUNT(*) AS n FROM git_snapshots WHERE developer_id = ?')
+            .get(devId) as {n: number}).n;
+
+    it('does NOT lower the watermark — or write ANY snapshot — when a repo commit fetch fails', async () => {
+        // Positive control: repo1 succeeds and DOES produce commits, so a passing
+        // assertion below can only mean the run discarded real, fetched data.
+        const devId = seedDev(db, 'alice');
+        const createGitProvider = await getCreateGitProvider();
+        createGitProvider.mockReturnValue(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo1'), makeRepo('repo2')]),
+                getCommits: vi.fn(async (repo: string) => {
+                    if (repo === 'repo2') throw new Error('boom: 500 from provider');
+                    return [makeProviderCommit('alice', '2024-03-10T10:00:00Z', 'sha-old')];
+                }),
+                getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs('repo1/')),
+            }),
+        );
+
+        const result = await new GitSync({enabled: false}).syncProviders(db, [CONFIG], undefined, {
+            backfill: BACKFILL,
+        });
+
+        // The watermark must NOT move: repo2's [since, until] slice was never covered,
+        // and the overlap guard would reject the retry that should re-cover it.
+        expect(readState(EARLIEST_KEY)).toBeUndefined();
+        // repo1's fetched commits are discarded rather than half-written: they are
+        // ADDITIVE, so persisting them now and re-fetching the same slice on retry
+        // would double-count. Whole-window re-cover is the only gap-free option.
+        expect(countSnapshots(devId)).toBe(0);
+        expect(result.snapshotsWritten).toBe(0);
+        // …and the failure is loud, not a silent skip.
+        expect(result.errors.some((e) => e.includes('repo2') && e.includes('boom'))).toBe(true);
+    });
+
+    it('does NOT lower the watermark when the snapshot write throws (single transaction)', async () => {
+        seedDev(db, 'alice');
+        const createGitProvider = await getCreateGitProvider();
+        createGitProvider.mockReturnValue(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                getCommits: vi
+                    .fn()
+                    .mockResolvedValue([makeProviderCommit('alice', '2024-03-10T10:00:00Z', 'sha-old')]),
+                getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs('repo1/')),
+            }),
+        );
+        // Break the snapshot write at the storage layer, mid-transaction. The watermark
+        // advance is queued INSIDE that same tx, so the rollback must take it too.
+        db.exec('DROP TABLE git_snapshots');
+
+        const result = await new GitSync({enabled: false}).syncProviders(db, [CONFIG], undefined, {
+            backfill: BACKFILL,
+        });
+
+        // Watermark rolled back with the data. Were it written outside the tx, the
+        // provider's older slice would be marked "synced" while holding nothing.
+        expect(readState(EARLIEST_KEY)).toBeUndefined();
+        expect(result.snapshotsWritten).toBe(0);
+        expect(result.errors.some((e) => e.includes('transaction rolled back'))).toBe(true);
+    });
+
+    it('lowers the watermark when every repo succeeds (control — the guard is not vacuous)', async () => {
+        // Without this, both assertions above would pass on a build that never lowers
+        // the watermark at all.
+        const devId = seedDev(db, 'alice');
+        const createGitProvider = await getCreateGitProvider();
+        createGitProvider.mockReturnValue(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo1'), makeRepo('repo2')]),
+                getCommits: vi
+                    .fn()
+                    .mockResolvedValue([makeProviderCommit('alice', '2024-03-10T10:00:00Z', 'sha-old')]),
+                getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs('repo1/')),
+            }),
+        );
+
+        await new GitSync({enabled: false}).syncProviders(db, [CONFIG], undefined, {
+            backfill: BACKFILL,
+        });
+
+        expect(readState(EARLIEST_KEY)).toBe(BACKFILL.since);
+        expect(countSnapshots(devId)).toBe(1);
+    });
+});
+
 describe('GitSync.syncProviders — first-sync earliest-watermark recording (#229)', () => {
     let db: Database.Database;
 
@@ -1839,9 +2078,9 @@ describe('GitSync.syncProviders — first-sync earliest-watermark recording (#22
         expect(readState(EARLIEST_KEY)).toBe(EARLIEST_SYNC_EPOCH);
         // And the guard sees "everything already synced" for any real target.
         const target = '2020-01-01T00:00:00.000Z';
-        expect(target >= getEarliestSyncedWatermark(db, 'github', 'test-org', '2026-03-15T12:00:00.000Z')).toBe(
-            true,
-        );
+        const earliest = getEarliestSyncedWatermark(db, 'github', 'test-org', '2026-03-15T12:00:00.000Z');
+        expect(earliest.kind).toBe('exact');
+        expect(earliest.kind === 'exact' && target >= earliest.watermark).toBe(true);
     });
 
     it('does NOT re-write the watermark on an incremental (non-first) sync', async () => {
