@@ -9,11 +9,28 @@ import {usePagination, type PageSizeOption} from '../../components/usePagination
  * matches the dashboard aesthetic (token-driven colors, desktop layout).
  */
 
-export function PageHeader({title, description}: {title: string; description: string}): JSX.Element {
+/**
+ * A screen's title block, with an optional `actions` slot on the trailing edge
+ * for the screen's primary affordance — epic #236's "＋ New …" button that opens
+ * the create `FormModal`. Omitting `actions` renders exactly the title block
+ * every existing admin screen already shows.
+ */
+export function PageHeader({
+    title,
+    description,
+    actions,
+}: {
+    title: string;
+    description: string;
+    actions?: ReactNode;
+}): JSX.Element {
     return (
-        <div>
-            <h1 className="text-2xl font-semibold text-foreground">{title}</h1>
-            <p className="mt-1 text-sm text-muted">{description}</p>
+        <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+                <h1 className="text-2xl font-semibold text-foreground">{title}</h1>
+                <p className="mt-1 text-sm text-muted">{description}</p>
+            </div>
+            {actions ? <div className="flex items-center gap-2">{actions}</div> : null}
         </div>
     );
 }
@@ -50,11 +67,14 @@ export function SelectField({
     value,
     onChange,
     children,
+    disabled = false,
 }: {
     label: string;
     value: string;
     onChange: (next: string) => void;
     children: ReactNode;
+    /** Gate the control, e.g. while its options are still loading. */
+    disabled?: boolean;
 }): JSX.Element {
     return (
         <label className="flex flex-col gap-1">
@@ -62,7 +82,8 @@ export function SelectField({
             <select
                 value={value}
                 onChange={(e) => onChange(e.target.value)}
-                className="rounded-md border border-border bg-surface px-3 py-1.5 text-sm text-foreground"
+                disabled={disabled}
+                className="rounded-md border border-border bg-surface px-3 py-1.5 text-sm text-foreground disabled:opacity-50"
             >
                 {children}
             </select>
@@ -75,17 +96,21 @@ export function PrimaryButton({
     onClick,
     disabled,
     type = 'button',
+    ariaHasPopup,
 }: {
     children: ReactNode;
     onClick?: () => void;
     disabled?: boolean;
     type?: 'button' | 'submit';
+    /** Set to 'dialog' on a button that opens a modal (announced to AT). */
+    ariaHasPopup?: 'dialog';
 }): JSX.Element {
     return (
         <button
             type={type}
             onClick={onClick}
             disabled={disabled}
+            aria-haspopup={ariaHasPopup}
             className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-primary/90 disabled:opacity-60"
         >
             {children}
@@ -97,16 +122,20 @@ export function SecondaryButton({
     children,
     onClick,
     disabled,
+    ariaHasPopup,
 }: {
     children: ReactNode;
     onClick?: () => void;
     disabled?: boolean;
+    /** Set to 'dialog' on a button that opens a modal (announced to AT). */
+    ariaHasPopup?: 'dialog';
 }): JSX.Element {
     return (
         <button
             type="button"
             onClick={onClick}
             disabled={disabled}
+            aria-haspopup={ariaHasPopup}
             className="rounded-md border border-border bg-surface px-3 py-1.5 text-sm font-medium text-foreground disabled:opacity-50"
         >
             {children}
@@ -119,10 +148,43 @@ export function ErrorText({error}: {error: Error | null}): JSX.Element | null {
     return <span className="text-sm text-danger">{error.message}</span>;
 }
 
-/** A one-time temporary-password banner shown after create / reset. */
+/**
+ * Whether a select whose options come from a query must stay disabled, and the
+ * placeholder to show while it is.
+ *
+ * A select fed by an unresolved query must never be enabled-and-empty: it reads
+ * as "there are none" and invites a write against a roster that never loaded.
+ * Gating on `isPending` alone only covers half of it — a FAILED query settles to
+ * `isPending === false` with no data, so the control would flip from a disabled
+ * "Loading…" to an enabled list holding nothing but the placeholder, with the
+ * failure surfaced nowhere. Both non-ready states gate.
+ */
+export function optionsGate(
+    query: {isPending: boolean; isError: boolean},
+    labels: {loading: string; failed: string},
+): {disabled: boolean; label: string | null} {
+    if (query.isPending) return {disabled: true, label: labels.loading};
+    if (query.isError) return {disabled: true, label: labels.failed};
+    // `null`, not a caller-supplied "ready" label: a screen that renders its
+    // placeholder only while gated has no ready label to give, and forcing one
+    // means passing a dummy string that is never read.
+    return {disabled: false, label: null};
+}
+
+/**
+ * A one-time temporary-password banner shown after create / reset.
+ *
+ * `role="status"` is load-bearing since #239: the reveal now appears on the PAGE
+ * after the create dialog unmounts and `Modal` restores focus to the header
+ * button — so it lands nowhere near the user's focus. It is shown exactly once
+ * and cannot be recovered, so an unannounced reveal is a lost password.
+ */
 export function TempPasswordBanner({password, onDismiss}: {password: string; onDismiss: () => void}): JSX.Element {
     return (
-        <div className="flex items-center justify-between gap-4 rounded-md border border-accent/40 bg-accent-soft px-4 py-3">
+        <div
+            role="status"
+            className="flex items-center justify-between gap-4 rounded-md border border-accent/40 bg-accent-soft px-4 py-3"
+        >
             <div className="text-sm text-foreground">
                 Temporary password (shown once — copy it now):{' '}
                 <code className="font-mono font-semibold">{password}</code>

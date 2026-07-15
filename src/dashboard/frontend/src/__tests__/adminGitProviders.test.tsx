@@ -217,6 +217,32 @@ function renderPage(): void {
     );
 }
 
+/**
+ * Open the add-provider modal from the page header's primary affordance (#238).
+ * Nothing renders a form until this runs — every form assertion goes through it.
+ */
+function openAddModal(): void {
+    fireEvent.click(screen.getByRole('button', {name: '＋ Add git provider'}));
+}
+
+/** Open a row's edit modal from its "Edit" action (#238). */
+function openEditModal(container: string): void {
+    const row = screen.getByText(container).closest('tr') as HTMLElement;
+    fireEvent.click(within(row).getByRole('button', {name: 'Edit'}));
+}
+
+/**
+ * Drive the whole add flow: open the modal, fill a GitHub org + token, submit.
+ * The modal closes on success, so a second create must open it again — the
+ * fields no longer survive a create (they unmount with the dialog).
+ */
+function createGithubProvider(container: string, token = 'ghp_secret'): void {
+    openAddModal();
+    fireEvent.change(screen.getByLabelText('Organization'), {target: {value: container}});
+    fireEvent.change(screen.getByLabelText('Token'), {target: {value: token}});
+    fireEvent.click(screen.getByRole('button', {name: 'Add provider'}));
+}
+
 function lastCall(pattern: RegExp, method: string): [unknown, RequestInit | undefined] | undefined {
     return [...fetchMock.mock.calls]
         .reverse()
@@ -248,9 +274,139 @@ describe('parseReposList', () => {
     });
 });
 
+describe('AdminGitProviders — modal add/edit (#238)', () => {
+    it('renders NO form until the admin asks for one, and the opener announces the dialog', async () => {
+        renderPage();
+        await screen.findByText('acme-org');
+        // The page is the table, not a form pinned above it.
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+        expect(screen.queryByLabelText('Organization')).not.toBeInTheDocument();
+        expect(screen.queryByRole('button', {name: 'Test connection'})).not.toBeInTheDocument();
+
+        const opener = screen.getByRole('button', {name: '＋ Add git provider'});
+        expect(opener).toHaveAttribute('aria-haspopup', 'dialog');
+        fireEvent.click(opener);
+        expect(screen.getByRole('dialog', {name: 'Add git provider'})).toBeInTheDocument();
+        expect(screen.getByLabelText('Organization')).toBeInTheDocument();
+    });
+
+    it('Cancel closes the add modal with no write, and reopening starts empty', async () => {
+        renderPage();
+        await screen.findByText('acme-org');
+        openAddModal();
+        fireEvent.change(screen.getByLabelText('Organization'), {target: {value: 'typed-then-abandoned'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
+
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+        expect(lastCall(/\/git\/providers$/, 'POST')).toBeUndefined();
+        // Reopening remounts clean — the abandoned draft is gone (criterion 3).
+        openAddModal();
+        expect((screen.getByLabelText('Organization') as HTMLInputElement).value).toBe('');
+    });
+
+    it("a row's Edit opens the same form pre-filled, titled for that provider", async () => {
+        renderPage();
+        await screen.findByText('acme-org');
+        const row = screen.getByText('acme-org').closest('tr') as HTMLElement;
+        const editButton = within(row).getByRole('button', {name: 'Edit'});
+        expect(editButton).toHaveAttribute('aria-haspopup', 'dialog');
+        fireEvent.click(editButton);
+
+        expect(screen.getByRole('dialog', {name: 'Edit GitHub provider'})).toBeInTheDocument();
+        expect((screen.getByLabelText('Organization') as HTMLInputElement).value).toBe('acme-org');
+        // The token stays blank — write-only, with the stored mask as the hint.
+        expect((screen.getByLabelText('Token') as HTMLInputElement).value).toBe('');
+        expect(screen.getByPlaceholderText(/Leave blank to keep ••••cdef/)).toBeInTheDocument();
+        expect(screen.getByRole('button', {name: 'Save changes'})).toBeInTheDocument();
+    });
+
+    it('remounts clean when switching between rows, and from a row back to add', async () => {
+        providers = [
+            structuredClone(DB_GITHUB),
+            {...structuredClone(DB_GITHUB), id: 'p-two', container: 'other-org'},
+        ];
+        renderPage();
+        await screen.findByText('acme-org');
+
+        openEditModal('acme-org');
+        expect((screen.getByLabelText('Organization') as HTMLInputElement).value).toBe('acme-org');
+        fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
+
+        // A different row must not carry the previous row's fields.
+        openEditModal('other-org');
+        expect((screen.getByLabelText('Organization') as HTMLInputElement).value).toBe('other-org');
+        fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
+
+        // …and add starts empty, not pre-filled from the last edit.
+        openAddModal();
+        expect(screen.getByRole('dialog', {name: 'Add git provider'})).toBeInTheDocument();
+        expect((screen.getByLabelText('Organization') as HTMLInputElement).value).toBe('');
+    });
+
+    it('no close affordance works while the create is in flight — the POST cannot land invisibly', async () => {
+        let releasePost: (() => void) | undefined;
+        const gate = new Promise<void>((resolve) => {
+            releasePost = resolve;
+        });
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const u = String(url);
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (/\/git\/providers$/.test(u) && method === 'POST') await gate;
+            return base!(url, init);
+        });
+        renderPage();
+        createGithubProvider('new-org');
+        expect(await screen.findByRole('button', {name: 'Saving…'})).toBeInTheDocument();
+
+        // Cancel, Esc, ×, and a genuine backdrop click are all inert mid-write.
+        expect(screen.getByRole('button', {name: 'Cancel'})).toBeDisabled();
+        fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
+        expect(screen.getByRole('dialog', {name: 'Add git provider'})).toBeInTheDocument();
+        fireEvent.keyDown(screen.getByRole('dialog'), {key: 'Escape'});
+        expect(screen.getByRole('dialog', {name: 'Add git provider'})).toBeInTheDocument();
+        fireEvent.click(screen.getByRole('button', {name: 'Close dialog'}));
+        expect(screen.getByRole('dialog', {name: 'Add git provider'})).toBeInTheDocument();
+        const backdrop = screen.getByTestId('git-provider-modal-backdrop');
+        fireEvent.mouseDown(backdrop);
+        fireEvent.mouseUp(backdrop);
+        fireEvent.click(backdrop);
+        expect(screen.getByRole('dialog', {name: 'Add git provider'})).toBeInTheDocument();
+
+        // Once the write settles the modal closes through the success path.
+        releasePost?.();
+        await waitFor(() =>
+            expect(screen.queryByRole('dialog', {name: 'Add git provider'})).not.toBeInTheDocument(),
+        );
+    });
+
+    it('surfaces a failed write inside the modal and keeps it open with the draft intact', async () => {
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const u = String(url);
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (/\/git\/providers$/.test(u) && method === 'POST') {
+                // The client surfaces a 4xx body's `message` (see apiClient).
+                return json({message: 'Container already connected'}, 409);
+            }
+            return base!(url, init);
+        });
+        renderPage();
+        createGithubProvider('dupe-org');
+
+        expect(await screen.findByText(/Container already connected/)).toBeInTheDocument();
+        // The dialog stays open with the admin's values — a failed write must not
+        // discard the draft or leave the failure invisible behind a closed modal.
+        expect(screen.getByRole('dialog', {name: 'Add git provider'})).toBeInTheDocument();
+        expect((screen.getByLabelText('Organization') as HTMLInputElement).value).toBe('dupe-org');
+        expect(screen.queryByTestId('scope-prompt')).not.toBeInTheDocument();
+    });
+});
+
 describe('AdminGitProviders — dynamic form', () => {
     it('renders GitHub fields by default (single auth method, no selector)', () => {
         renderPage();
+        openAddModal();
         expect(screen.getByLabelText('Organization')).toBeInTheDocument();
         expect(screen.getByLabelText('Token')).toBeInTheDocument();
         // GitHub has one auth method → no auth-method selector.
@@ -259,6 +415,7 @@ describe('AdminGitProviders — dynamic form', () => {
 
     it('renders the Bitbucket app_password two-field case, and drops the username on other methods', () => {
         renderPage();
+        openAddModal();
         fireEvent.change(screen.getByRole('combobox', {name: 'Provider type'}), {target: {value: 'bitbucket'}});
         // Container label switches to Workspace.
         expect(screen.getByLabelText('Workspace')).toBeInTheDocument();
@@ -276,6 +433,7 @@ describe('AdminGitProviders — dynamic form', () => {
 
     it('renders GitLab self-hosted url + include-subgroups toggle', () => {
         renderPage();
+        openAddModal();
         fireEvent.change(screen.getByRole('combobox', {name: 'Provider type'}), {target: {value: 'gitlab'}});
         expect(screen.getByLabelText('Group')).toBeInTheDocument();
         expect(screen.getByLabelText('Self-hosted URL (optional)')).toBeInTheDocument();
@@ -285,9 +443,13 @@ describe('AdminGitProviders — dynamic form', () => {
 });
 
 describe('AdminGitProviders — color system', () => {
-    it('Save is the orange primary CTA and Test connection is indigo (accent)', () => {
+    it('the add opener and the modal Save are the orange primary CTA; Test connection is indigo (accent)', () => {
         renderPage();
-        expect(screen.getByRole('button', {name: 'Save'}).className).toContain('bg-primary');
+        expect(screen.getByRole('button', {name: '＋ Add git provider'}).className).toContain(
+            'bg-primary',
+        );
+        openAddModal();
+        expect(screen.getByRole('button', {name: 'Add provider'}).className).toContain('bg-primary');
         expect(screen.getByRole('button', {name: 'Test connection'}).className).toContain('accent');
     });
 });
@@ -295,9 +457,7 @@ describe('AdminGitProviders — color system', () => {
 describe('AdminGitProviders — create + test', () => {
     it('creates a provider via POST with the form values', async () => {
         renderPage();
-        fireEvent.change(screen.getByLabelText('Organization'), {target: {value: 'new-org'}});
-        fireEvent.change(screen.getByLabelText('Token'), {target: {value: 'ghp_secret'}});
-        fireEvent.click(screen.getByRole('button', {name: 'Save'}));
+        createGithubProvider('new-org');
 
         await waitFor(() => {
             const post = lastCall(/\/git\/providers$/, 'POST');
@@ -314,11 +474,12 @@ describe('AdminGitProviders — create + test', () => {
         // `app_password` and the Atlassian email is still sent in the `username`
         // field, so the server's Basic-auth path is unchanged.
         renderPage();
+        openAddModal();
         fireEvent.change(screen.getByRole('combobox', {name: 'Provider type'}), {target: {value: 'bitbucket'}});
         fireEvent.change(screen.getByLabelText('Workspace'), {target: {value: 'my-workspace'}});
         fireEvent.change(screen.getByLabelText('Atlassian account email'), {target: {value: 'jane@company.com'}});
         fireEvent.change(screen.getByLabelText('API token'), {target: {value: 'atl_token'}});
-        fireEvent.click(screen.getByRole('button', {name: 'Save'}));
+        fireEvent.click(screen.getByRole('button', {name: 'Add provider'}));
 
         await waitFor(() => {
             const post = lastCall(/\/git\/providers$/, 'POST');
@@ -333,7 +494,8 @@ describe('AdminGitProviders — create + test', () => {
 
     it('shows an inline success then an error+hint from the draft test', async () => {
         renderPage();
-        // Success path.
+        openAddModal();
+        // Success path — inside the modal (criterion 3).
         fireEvent.change(screen.getByLabelText('Organization'), {target: {value: 'good-org'}});
         fireEvent.change(screen.getByLabelText('Token'), {target: {value: 'tok'}});
         fireEvent.click(screen.getByRole('button', {name: 'Test connection'}));
@@ -348,6 +510,7 @@ describe('AdminGitProviders — create + test', () => {
 
     it('disables Test connection until a token is entered', () => {
         renderPage();
+        openAddModal();
         fireEvent.change(screen.getByLabelText('Organization'), {target: {value: 'org'}});
         expect(screen.getByRole('button', {name: 'Test connection'})).toBeDisabled();
         fireEvent.change(screen.getByLabelText('Token'), {target: {value: 'tok'}});
@@ -356,15 +519,27 @@ describe('AdminGitProviders — create + test', () => {
 
     it('requires the account email before Save/Test for Bitbucket app_password', () => {
         renderPage();
+        openAddModal();
         fireEvent.change(screen.getByRole('combobox', {name: 'Provider type'}), {target: {value: 'bitbucket'}});
         fireEvent.change(screen.getByLabelText('Workspace'), {target: {value: 'ws'}});
         fireEvent.change(screen.getByLabelText('API token'), {target: {value: 'pw'}});
         // Email still blank → both CTAs stay disabled (server would 400).
-        expect(screen.getByRole('button', {name: 'Save'})).toBeDisabled();
+        expect(screen.getByRole('button', {name: 'Add provider'})).toBeDisabled();
         expect(screen.getByRole('button', {name: 'Test connection'})).toBeDisabled();
         fireEvent.change(screen.getByLabelText('Atlassian account email'), {target: {value: 'bob@company.com'}});
-        expect(screen.getByRole('button', {name: 'Save'})).toBeEnabled();
+        expect(screen.getByRole('button', {name: 'Add provider'})).toBeEnabled();
         expect(screen.getByRole('button', {name: 'Test connection'})).toBeEnabled();
+    });
+
+    it('the disabled Save cannot be bypassed — a click on it sends no POST', () => {
+        renderPage();
+        openAddModal();
+        // Container filled, token blank → create is gated (server requires one).
+        fireEvent.change(screen.getByLabelText('Organization'), {target: {value: 'org'}});
+        const save = screen.getByRole('button', {name: 'Add provider'});
+        expect(save).toBeDisabled();
+        fireEvent.click(save);
+        expect(lastCall(/\/git\/providers$/, 'POST')).toBeUndefined();
     });
 });
 
@@ -392,14 +567,13 @@ describe('AdminGitProviders — list + row actions', () => {
 
     it('editing a DB row keeps the token when left blank (PATCH omits token)', async () => {
         renderPage();
-        const ghCell = await screen.findByText('acme-org');
-        const row = ghCell.closest('tr') as HTMLElement;
-        fireEvent.click(within(row).getByRole('button', {name: 'Edit'}));
+        await screen.findByText('acme-org');
+        openEditModal('acme-org');
 
         // The form prefills the container and shows a "keep existing" masked hint.
         expect(screen.getByPlaceholderText(/Leave blank to keep ••••cdef/)).toBeInTheDocument();
         // Save without touching the token → PATCH with no token field.
-        fireEvent.click(screen.getByRole('button', {name: 'Save'}));
+        fireEvent.click(screen.getByRole('button', {name: 'Save changes'}));
         await waitFor(() => {
             const patch = lastCall(/\/git\/providers\/p-gh$/, 'PATCH');
             expect(patch).toBeTruthy();
@@ -410,6 +584,49 @@ describe('AdminGitProviders — list + row actions', () => {
             // isn't silently wiped back to "monitor all".
             expect(sent.repos).toEqual(['api', 'web', 'infra']);
             expect(sent.exclude_repos).toEqual(['legacy']);
+        });
+        // A successful edit closes the modal — and never triggers the create-only
+        // scope prompt (#211).
+        await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+        expect(screen.queryByTestId('scope-prompt')).not.toBeInTheDocument();
+    });
+
+    it('an edit submits the changed fields, and a GitLab edit keeps url + subgroups', async () => {
+        providers = [
+            {
+                ...structuredClone(DB_GITHUB),
+                id: 'p-gl',
+                type: 'gitlab',
+                container: 'my-group',
+                auth_method: 'personal_access_token',
+                url: 'https://gitlab.example.com',
+                include_subgroups: true,
+                repos_include: null,
+                repos_exclude: null,
+            },
+        ];
+        renderPage();
+        await screen.findByText('my-group');
+        openEditModal('my-group');
+
+        // The GitLab-only fields pre-fill from the row…
+        expect((screen.getByLabelText('Self-hosted URL (optional)') as HTMLInputElement).value).toBe(
+            'https://gitlab.example.com',
+        );
+        expect(screen.getByRole('checkbox', {name: 'Include subgroups'})).toBeChecked();
+        // …and an edited container + re-entered token go out on the PATCH.
+        fireEvent.change(screen.getByLabelText('Group'), {target: {value: 'renamed-group'}});
+        fireEvent.change(screen.getByLabelText('Token'), {target: {value: 'glpat_new'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Save changes'}));
+
+        await waitFor(() => {
+            const patch = lastCall(/\/git\/providers\/p-gl$/, 'PATCH');
+            expect(patch).toBeTruthy();
+            const sent = JSON.parse(String(patch?.[1]?.body)) as Record<string, unknown>;
+            expect(sent.container).toBe('renamed-group');
+            expect(sent.token).toBe('glpat_new');
+            expect(sent.url).toBe('https://gitlab.example.com');
+            expect(sent.include_subgroups).toBe(true);
         });
     });
 
@@ -953,9 +1170,7 @@ describe('AdminGitProviders — live sync progress (#209)', () => {
 describe('AdminGitProviders — add-flow repo selection (#211)', () => {
     it('auto-opens the repo-scope editor for the just-created provider, with the pre-sync prompt', async () => {
         renderPage();
-        fireEvent.change(screen.getByLabelText('Organization'), {target: {value: 'new-org'}});
-        fireEvent.change(screen.getByLabelText('Token'), {target: {value: 'ghp_secret'}});
-        fireEvent.click(screen.getByRole('button', {name: 'Save'}));
+        createGithubProvider('new-org');
 
         // After the create + list refetch, the NEW provider's row carries an
         // open scope editor with the prompt — announced as a status live region
@@ -963,6 +1178,11 @@ describe('AdminGitProviders — add-flow repo selection (#211)', () => {
         const prompt = await screen.findByTestId('scope-prompt');
         expect(prompt).toHaveTextContent(/Choose which repositories to analyze before the first sync/);
         expect(screen.getByRole('status')).toBe(prompt);
+        // The create modal handed off cleanly: it closed, and the ONLY dialog now
+        // on screen is the new row's scope editor (#238 criterion 4).
+        expect(screen.queryByRole('dialog', {name: 'Add git provider'})).not.toBeInTheDocument();
+        expect(screen.getAllByRole('dialog')).toHaveLength(1);
+        expect(screen.getByRole('dialog', {name: 'Repository scope — new-org'})).toBeInTheDocument();
         // It targets the just-created provider (its radio group), not another row.
         expect(document.querySelector('input[name="scope-p-new"]')).not.toBeNull();
         expect(document.querySelector('input[name="scope-p-gh"]')).toBeNull();
@@ -972,9 +1192,7 @@ describe('AdminGitProviders — add-flow repo selection (#211)', () => {
 
     it('closing the auto-opened editor dismisses the prompt without saving a scope', async () => {
         renderPage();
-        fireEvent.change(screen.getByLabelText('Organization'), {target: {value: 'new-org'}});
-        fireEvent.change(screen.getByLabelText('Token'), {target: {value: 'ghp_secret'}});
-        fireEvent.click(screen.getByRole('button', {name: 'Save'}));
+        createGithubProvider('new-org');
         await screen.findByTestId('scope-prompt');
 
         fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
@@ -986,9 +1204,7 @@ describe('AdminGitProviders — add-flow repo selection (#211)', () => {
 
     it('completes the canonical journey: create → prompt → select repos → save → prompt gone and stays gone', async () => {
         renderPage();
-        fireEvent.change(screen.getByLabelText('Organization'), {target: {value: 'new-org'}});
-        fireEvent.change(screen.getByLabelText('Token'), {target: {value: 'ghp_secret'}});
-        fireEvent.click(screen.getByRole('button', {name: 'Save'}));
+        createGithubProvider('new-org');
         await screen.findByTestId('scope-prompt');
 
         // Narrow the auto-opened editor to a single active repo and save.
@@ -1017,9 +1233,7 @@ describe('AdminGitProviders — add-flow repo selection (#211)', () => {
 
     it('closing ANOTHER row\'s scope editor does not dismiss the just-created provider\'s prompt', async () => {
         renderPage();
-        fireEvent.change(screen.getByLabelText('Organization'), {target: {value: 'new-org'}});
-        fireEvent.change(screen.getByLabelText('Token'), {target: {value: 'ghp_secret'}});
-        fireEvent.click(screen.getByRole('button', {name: 'Save'}));
+        createGithubProvider('new-org');
         await screen.findByTestId('scope-prompt');
 
         // Open the pre-existing provider's modal from ITS row's Repos action,
@@ -1040,15 +1254,13 @@ describe('AdminGitProviders — add-flow repo selection (#211)', () => {
 
     it('creating a second provider moves the one-shot prompt to it', async () => {
         renderPage();
-        fireEvent.change(screen.getByLabelText('Organization'), {target: {value: 'org-a'}});
-        fireEvent.change(screen.getByLabelText('Token'), {target: {value: 'tok-a'}});
-        fireEvent.click(screen.getByRole('button', {name: 'Save'}));
+        createGithubProvider('org-a', 'tok-a');
         await screen.findByTestId('scope-prompt');
         expect(document.querySelector('input[name="scope-p-new"]')).not.toBeNull();
 
-        // Second create (the form keeps its values; change the container).
-        fireEvent.change(screen.getByLabelText('Organization'), {target: {value: 'org-b'}});
-        fireEvent.click(screen.getByRole('button', {name: 'Save'}));
+        // Second create. The modal closed on the first success, so this reopens
+        // it and refills — the add form no longer persists the previous values.
+        createGithubProvider('org-b', 'tok-b');
         // Exactly ONE prompt remains and it now targets the second provider.
         await waitFor(() => {
             expect(document.querySelector('input[name="scope-p-new-2"]')).not.toBeNull();
@@ -1059,9 +1271,7 @@ describe('AdminGitProviders — add-flow repo selection (#211)', () => {
 
     it("the modal's close button dismisses the auto-opened editor and the prompt", async () => {
         renderPage();
-        fireEvent.change(screen.getByLabelText('Organization'), {target: {value: 'new-org'}});
-        fireEvent.change(screen.getByLabelText('Token'), {target: {value: 'ghp_secret'}});
-        fireEvent.click(screen.getByRole('button', {name: 'Save'}));
+        createGithubProvider('new-org');
         await screen.findByTestId('scope-prompt');
 
         fireEvent.click(screen.getByRole('button', {name: 'Close dialog'}));
@@ -1096,16 +1306,17 @@ describe('AdminGitProviders — add-flow repo selection (#211)', () => {
 
     it('does NOT auto-open the editor after editing an existing provider', async () => {
         renderPage();
-        const ghCell = await screen.findByText('acme-org');
-        const row = ghCell.closest('tr') as HTMLElement;
-        fireEvent.click(within(row).getByRole('button', {name: 'Edit'}));
-        fireEvent.click(screen.getByRole('button', {name: 'Save'}));
-        // Anchor on the form reverting to add mode — that proves the mutation's
-        // whole onSuccess chain (invalidation → callbacks → onDone) settled, so
-        // the negative assertions below cannot pass by racing it.
-        expect(await screen.findByText('Add git provider')).toBeInTheDocument();
+        await screen.findByText('acme-org');
+        openEditModal('acme-org');
+        expect(screen.getByRole('dialog', {name: 'Edit GitHub provider'})).toBeInTheDocument();
+        fireEvent.click(screen.getByRole('button', {name: 'Save changes'}));
+
+        // Anchor on the edit dialog closing — only onDone closes it, so reaching
+        // this proves the mutation's whole onSuccess chain (invalidation →
+        // callbacks → onDone) settled; the prompt assertion can't race it. If a
+        // scope modal HAD auto-opened, a dialog would still be on screen.
+        await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
         expect(screen.queryByTestId('scope-prompt')).not.toBeInTheDocument();
-        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     });
 
     it('shows the keep-history data-policy note in the manually opened editor, without the add-flow prompt', async () => {
@@ -1212,9 +1423,7 @@ describe('AdminGitProviders — add-flow repo selection (#211)', () => {
             return base!(url, init);
         });
         renderPage();
-        fireEvent.change(screen.getByLabelText('Organization'), {target: {value: 'new-org'}});
-        fireEvent.change(screen.getByLabelText('Token'), {target: {value: 'ghp_secret'}});
-        fireEvent.click(screen.getByRole('button', {name: 'Save'}));
+        createGithubProvider('new-org');
         await screen.findByTestId('scope-prompt');
 
         fireEvent.click(screen.getByRole('radio', {name: 'Select repositories'}));
@@ -1398,9 +1607,7 @@ describe('AdminGitProviders — repo-scope modal (#213)', () => {
 
     it('Escape in one stacked dialog closes only that dialog (the prompt survives)', async () => {
         renderPage();
-        fireEvent.change(screen.getByLabelText('Organization'), {target: {value: 'new-org'}});
-        fireEvent.change(screen.getByLabelText('Token'), {target: {value: 'ghp_secret'}});
-        fireEvent.click(screen.getByRole('button', {name: 'Save'}));
+        createGithubProvider('new-org');
         await screen.findByTestId('scope-prompt');
 
         const ghRow = screen.getByText('acme-org').closest('tr') as HTMLElement;
