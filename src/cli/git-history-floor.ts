@@ -1,9 +1,10 @@
 import type Database from 'better-sqlite3';
 import {declareEarliestSyncedFloor} from '../connectors/git/sync';
-import type {GitProviderType} from '../connectors/git/providers/types.js';
+import {GIT_PROVIDER_TYPES} from '../connectors/git/providers/types';
 
 /**
- * `toprope git set-history-floor` — the admin half of migration 040 (#233).
+ * `toprope git set-history-floor` — the admin recovery path for a LEGACY git provider's
+ * unknown history floor (#233).
  *
  * A provider first synced before #229 has a forward cursor but no record of how far
  * back that first sync actually reached, and that floor is unrecoverable from stored
@@ -14,12 +15,6 @@ import type {GitProviderType} from '../connectors/git/providers/types.js';
  * Lives here (not inline in cli.ts) so the trust-boundary parsing and the outcome
  * messaging are unit-testable, matching {@link ../cli/doctor}'s split.
  */
-
-// Runtime allowlist for --provider. The compile-time GitProviderType union proves
-// nothing here: the value arrives as an arbitrary CLI string, and an unrecognized one
-// would otherwise be written into a sync_state key matching no provider — a write that
-// "succeeds" while doing nothing.
-export const GIT_PROVIDER_TYPES: readonly GitProviderType[] = ['github', 'bitbucket', 'gitlab'];
 
 export interface SetHistoryFloorInput {
     provider: string;
@@ -42,6 +37,10 @@ export function setHistoryFloor(
     input: SetHistoryFloorInput,
     now: string,
 ): SetHistoryFloorResult {
+    // Runtime allowlist: the value arrives as an arbitrary CLI string, so the
+    // compile-time union proves nothing at this trust boundary. An unrecognized one
+    // would otherwise key a sync_state row matching no provider — a write that
+    // "succeeds" while doing nothing.
     const providerType = GIT_PROVIDER_TYPES.find((t) => t === input.provider);
     if (!providerType) {
         return {
@@ -73,11 +72,15 @@ export function setHistoryFloor(
                 `double-counted — re-run with --force to correct the floor BEFORE backfilling.`,
         };
     }
-    // Each refusal names the correction: these are admin mistakes, not internal errors.
+    // Each refusal names ITS OWN correction. Splitting never_synced from not_legacy
+    // matters: one message covering both would end in "re-run with --force", which is
+    // right for a recorded floor and precisely wrong for a mistyped container — it would
+    // walk the admin into inventing a floor for a provider that doesn't exist.
     const reasons: Record<typeof result.reason, string> = {
         invalid_floor: `invalid --at value: ${input.at} (expected a UTC ISO instant, e.g. 2025-01-01T00:00:00.000Z)`,
         future_floor: `--at must be in the past: ${input.at} is at or after now`,
-        not_legacy: `${providerType}:${container} has no unknown history floor to declare — it already has an exact floor recorded, or it has never synced (check the type/container spelling). Re-run with --force to overwrite a recorded floor.`,
+        never_synced: `${providerType}:${container} has never synced — there is no history floor to describe. Check the --provider/--container spelling (it must match a connected provider exactly), then sync it once.`,
+        not_legacy: `${providerType}:${container} already has an exact history floor recorded, so there is nothing to declare. Re-run with --force ONLY to replace it — overwriting a floor a real sync earned will corrupt the backfill's disjointness.`,
     };
     return {ok: false, message: reasons[result.reason]};
 }

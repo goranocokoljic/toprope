@@ -207,8 +207,12 @@ function isEarliestFloorUnknown(
     providerType: GitProviderType,
     identifier: string,
 ): boolean {
+    // Falsy, not just null: a blank-valued floor row is no floor at all, and treating it
+    // as present here (while getEarliestSyncedWatermark's `if (stored)` treats it as
+    // absent) would disagree with that reader and fail OPEN — back to the too-recent
+    // guess for a provider that has a cursor, the exact defect this exists to close.
     return (
-        getProviderLastSyncTime(db, earliestSyncStateKey(providerType, identifier)) === null &&
+        !getProviderLastSyncTime(db, earliestSyncStateKey(providerType, identifier)) &&
         getProviderLastSyncTime(db, syncStateKey(providerType, identifier)) !== null
     );
 }
@@ -332,13 +336,16 @@ export type EarliestSyncedWatermark =
  * real floor declare it ({@link declareEarliestSyncedFloor}, `toprope git
  * set-history-floor`).
  *
- * A provider with NO cursor and no floor is ASSUMED never-synced — nothing is imported,
- * so the default window its first sync will use is not a guess and any backfill below it
- * is disjoint by construction. That stays `exact`. Caveat: renaming a provider's
- * container (a supported PATCH) re-keys both its cursor and its floor, so the renamed
- * provider reads as never-synced here. That is a pre-existing #228-era hole — the next
- * forward sync already re-imports its window as a "first" sync — not one this guard
- * introduces or can close.
+ * A provider with NO cursor and no floor is ASSUMED never-synced, and returns the window
+ * its first sync would use. Two caveats on that assumption, neither introduced here:
+ *  - It is the DEFAULT window. The first sync's window is caller-supplied (1–60 months),
+ *    so a backfill run BEFORE that first sync (API-only — the UI hides the control until
+ *    a provider has synced) can leave a gap or an overlap against whatever window the
+ *    later first sync actually uses. Pre-existing from #229.
+ *  - Renaming a provider's container (a supported PATCH) ORPHANS its cursor and floor
+ *    rows rather than re-keying them, so the renamed provider reads as never-synced here
+ *    while its old activity is still stored. Pre-existing #228-era: the next forward sync
+ *    already re-imports its window as a "first" sync.
  */
 export function getEarliestSyncedWatermark(
     db: Database.Database,
@@ -378,6 +385,15 @@ export function getEarliestSyncedWatermark(
  * ran. `force` is the escape hatch: it says "I know a floor is recorded and I am
  * replacing it", which is correctable-by-design for a declared floor and a loaded gun for
  * an earned one. That is why it is opt-in per call and never the default.
+ *
+ * `force` overrides ONLY that refusal. It never waives the existence requirement: a
+ * provider with neither a cursor nor a floor has synced nothing, so there is no floor to
+ * describe and the identifier is far more likely a typo than a real target. Writing one
+ * anyway would invent an `exact` floor out of thin air — and a first sync will not
+ * correct it (it only records a floor when none is stored), so the span between the
+ * invented floor and the window that sync actually reached would be permanently
+ * un-importable: the backfill only ever walks BELOW the floor. Hence `never_synced` is
+ * unconditional.
  */
 export function declareEarliestSyncedFloor(
     db: Database.Database,
@@ -386,23 +402,34 @@ export function declareEarliestSyncedFloor(
     floor: string,
     now: string,
     options?: {force?: boolean},
-): {ok: true} | {ok: false; reason: 'not_legacy' | 'invalid_floor' | 'future_floor'} {
+): {
+    ok: true;
+} | {
+    ok: false;
+    reason: 'not_legacy' | 'never_synced' | 'invalid_floor' | 'future_floor';
+} {
     // Must be a real UTC ISO instant: this value is compared as an ISO string by the
     // overlap guard, so a loosely-parsed date would corrupt every later comparison.
     if (!isUtcIsoInstant(floor)) return {ok: false, reason: 'invalid_floor'};
     // Bound the upper edge: a floor at/after `now` claims the provider imported nothing
     // (or imported the future). Both make every later backfill target look "older than
     // the floor" and pass the overlap guard onto already-synced spans. Compared as
-    // INSTANTS, not strings — an expanded-year form ('+010000-…') sorts below '2' and
-    // would slip through a lexical compare while being chronologically absurd.
+    // INSTANTS so the guard is total for anything isUtcIsoInstant admits; `now` is
+    // rejected outright if unparseable rather than letting NaN compare false and pass.
+    if (Number.isNaN(Date.parse(now))) return {ok: false, reason: 'future_floor'};
     if (Date.parse(floor) >= Date.parse(now)) return {ok: false, reason: 'future_floor'};
-    // Check-then-act: read the floor and write it in ONE transaction so a concurrent
-    // declare/first-sync can't land between them and clobber a real floor.
+    // Check-then-act: read the state and write the floor in ONE transaction so a
+    // concurrent declare/first-sync can't land between them and clobber a real floor.
     return db.transaction(
-        (): {ok: true} | {ok: false; reason: 'not_legacy'} => {
-            if (!options?.force && !isEarliestFloorUnknown(db, providerType, identifier)) {
-                return {ok: false, reason: 'not_legacy'};
-            }
+        (): {ok: true} | {ok: false; reason: 'not_legacy' | 'never_synced'} => {
+            // Falsy, matching isEarliestFloorUnknown: a blank row is not a floor.
+            const hasFloor = Boolean(getProviderEarliestSyncTime(db, providerType, identifier));
+            const hasCursor =
+                getProviderLastSyncTime(db, syncStateKey(providerType, identifier)) !== null;
+            // Nothing synced under this key — refuse even under force (see above).
+            if (!hasFloor && !hasCursor) return {ok: false, reason: 'never_synced'};
+            // A floor is recorded: only an explicit force may replace it.
+            if (hasFloor && !options?.force) return {ok: false, reason: 'not_legacy'};
             setProviderEarliestSyncTime(db, providerType, identifier, floor);
             return {ok: true};
         },
@@ -411,9 +438,13 @@ export function declareEarliestSyncedFloor(
 
 /**
  * True iff `value` is a canonical UTC ISO instant (what every stored timestamp is).
- * The shape is pinned by regex, not just by a `toISOString()` round-trip: ISO 8601
- * expanded years ('+010000-01-01T00:00:00.000Z') and negative years round-trip cleanly
- * too, and they break the ISO-string ordering every watermark comparison relies on.
+ * Both checks earn their place, and each catches what the other cannot:
+ *  - the REGEX pins the shape to exactly 4 digits + millis + 'Z', excluding ISO 8601
+ *    expanded/negative years ('+010000-01-01T00:00:00.000Z'), which parse and round-trip
+ *    cleanly yet break the ISO-string ordering every watermark comparison relies on;
+ *  - the ROUND-TRIP rejects values that match the shape but are not the instant they
+ *    spell — '2025-02-30T00:00:00.000Z' parses and normalizes to 2025-03-02;
+ *  - the NaN check guards `toISOString()`, which throws RangeError on an Invalid Date.
  */
 function isUtcIsoInstant(value: string): boolean {
     if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) return false;

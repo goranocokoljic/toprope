@@ -8,6 +8,7 @@ import {
     earliestSyncStateKey,
     syncStateKey,
 } from '../../src/connectors/git/sync';
+import type {GitProviderType} from '../../src/connectors/git/providers/types';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../src/storage/migrations');
 const NOW = '2026-03-15T12:00:00.000Z';
@@ -21,9 +22,9 @@ describe('toprope git set-history-floor (#233)', () => {
             | {value: string}
             | undefined)?.value ?? null;
     // Legacy = a pre-#229 first sync's leftovers: a forward cursor, no recorded floor.
-    const markLegacy = (type = 'github', container = 'acme'): void => {
+    const markLegacy = (type: GitProviderType = 'github', container = 'acme'): void => {
         db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
-            `git_last_sync:${type}:${container}`,
+            syncStateKey(type, container),
             '2026-03-01T00:00:00.000Z',
         );
     };
@@ -31,7 +32,6 @@ describe('toprope git set-history-floor (#233)', () => {
     beforeEach(() => {
         db = new Database(':memory:');
         runMigrations(db, MIGRATIONS_DIR);
-        db.prepare("DELETE FROM sync_state WHERE key LIKE 'git_%'").run();
     });
 
     afterEach(() => {
@@ -152,6 +152,22 @@ describe('toprope git set-history-floor (#233)', () => {
         expect(readState(earliestSyncStateKey('github', 'acme'))).toBeNull();
     });
 
+    it('refuses --force on a never-synced provider, and does not point the typo at --force', () => {
+        // A mistyped --container lands in never_synced. The message must send the admin
+        // to the spelling, NOT to --force: forcing here would invent a floor for a
+        // provider that has synced nothing, stranding history permanently.
+        const result = setHistoryFloor(
+            db,
+            {provider: 'github', container: 'acmee', at: FLOOR, force: true},
+            NOW,
+        );
+        expect(result.ok).toBe(false);
+        expect(result.message).toContain('never synced');
+        expect(result.message).toContain('spelling');
+        expect(result.message).not.toContain('--force');
+        expect(readState(earliestSyncStateKey('github', 'acmee'))).toBeNull();
+    });
+
     it('rejects a non-legacy provider, naming why there is nothing to declare', () => {
         db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
             earliestSyncStateKey('github', 'acme'),
@@ -160,7 +176,9 @@ describe('toprope git set-history-floor (#233)', () => {
         const result = setHistoryFloor(db, {provider: 'github', container: 'acme', at: FLOOR}, NOW);
 
         expect(result.ok).toBe(false);
-        expect(result.message).toContain('no unknown history floor to declare');
+        expect(result.message).toContain('already has an exact history floor recorded');
+        // …and this state — unlike never_synced — is a legitimate --force target.
+        expect(result.message).toContain('--force');
         // The recorded floor is intact — overwriting one takes an explicit --force.
         expect(readState(earliestSyncStateKey('github', 'acme'))).toBe('2024-06-01T00:00:00.000Z');
     });

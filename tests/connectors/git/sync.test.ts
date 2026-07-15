@@ -1729,9 +1729,43 @@ describe('declareEarliestSyncedFloor — the admin recovery path (#233)', () => 
 
     it('refuses a never-synced provider (nothing to declare)', () => {
         expect(declareEarliestSyncedFloor(db, 'github', 'test-org', '2025-06-01T00:00:00.000Z', NOW)).toEqual(
-            {ok: false, reason: 'not_legacy'},
+            {ok: false, reason: 'never_synced'},
         );
         expect(readState(earliestSyncStateKey('github', 'test-org'))).toBeNull();
+    });
+
+    // The dangerous cell: force must relax "a floor is recorded", NOT "this provider
+    // exists". An invented floor is never corrected (a first sync only records one when
+    // none is stored) and the backfill only walks BELOW it — so the span between the
+    // invented floor and the window the first sync actually reached is stranded forever.
+    // A mistyped --container lands here, which is exactly why force must not pass.
+    it('force does NOT waive the existence check — a never-synced provider is still refused', () => {
+        expect(
+            declareEarliestSyncedFloor(db, 'github', 'ghost-org', '2025-06-01T00:00:00.000Z', NOW, {
+                force: true,
+            }),
+        ).toEqual({ok: false, reason: 'never_synced'});
+        // No floor conjured for a provider that has synced nothing.
+        expect(readState(earliestSyncStateKey('github', 'ghost-org'))).toBeNull();
+        expect(getEarliestSyncedWatermark(db, 'github', 'ghost-org', NOW)).toEqual({
+            kind: 'exact',
+            watermark: firstSyncSince(NOW, FIRST_SYNC_WINDOW_DEFAULT_MONTHS),
+        });
+    });
+
+    it('force applies to a floor-without-cursor provider (backfilled before its first sync)', () => {
+        // This state DID sync something (a direct-API backfill), so it is a real target
+        // for a correction — the existence check passes on the floor alone.
+        db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+            earliestSyncStateKey('github', 'test-org'),
+            '2024-01-01T00:00:00.000Z',
+        );
+        expect(
+            declareEarliestSyncedFloor(db, 'github', 'test-org', '2023-01-01T00:00:00.000Z', NOW, {
+                force: true,
+            }),
+        ).toEqual({ok: true});
+        expect(readState(earliestSyncStateKey('github', 'test-org'))).toBe('2023-01-01T00:00:00.000Z');
     });
 
     // The declare path takes a hand-typed instant, so a typo is the EXPECTED failure —
