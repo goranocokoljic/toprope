@@ -9,11 +9,28 @@ import {usePagination, type PageSizeOption} from '../../components/usePagination
  * matches the dashboard aesthetic (token-driven colors, desktop layout).
  */
 
-export function PageHeader({title, description}: {title: string; description: string}): JSX.Element {
+/**
+ * A screen's title block, with an optional `actions` slot on the trailing edge
+ * for the screen's primary affordance — epic #236's "＋ New …" button that opens
+ * the create `FormModal`. Omitting `actions` renders exactly the title block
+ * every existing admin screen already shows.
+ */
+export function PageHeader({
+    title,
+    description,
+    actions,
+}: {
+    title: string;
+    description: string;
+    actions?: ReactNode;
+}): JSX.Element {
     return (
-        <div>
-            <h1 className="text-2xl font-semibold text-foreground">{title}</h1>
-            <p className="mt-1 text-sm text-muted">{description}</p>
+        <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+                <h1 className="text-2xl font-semibold text-foreground">{title}</h1>
+                <p className="mt-1 text-sm text-muted">{description}</p>
+            </div>
+            {actions ? <div className="flex items-center gap-2">{actions}</div> : null}
         </div>
     );
 }
@@ -75,17 +92,21 @@ export function PrimaryButton({
     onClick,
     disabled,
     type = 'button',
+    ariaHasPopup,
 }: {
     children: ReactNode;
     onClick?: () => void;
     disabled?: boolean;
     type?: 'button' | 'submit';
+    /** Set to 'dialog' on a button that opens a modal (announced to AT). */
+    ariaHasPopup?: 'dialog';
 }): JSX.Element {
     return (
         <button
             type={type}
             onClick={onClick}
             disabled={disabled}
+            aria-haspopup={ariaHasPopup}
             className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-primary/90 disabled:opacity-60"
         >
             {children}
