@@ -229,3 +229,78 @@ changes (a new array from a filter/sort/search). Returns
 lists with `useMemo`) so an unrelated re-render doesn't reset the page. Non-table
 card/gallery lists use this hook + `<Pagination>`; every `DataTable` consumer gets
 it for free via `pageSize`.
+
+---
+
+## Modals (`Modal`, `FormModal`, `useModalState`)
+
+One shared dialog pattern. **Target state for epic #236:** every admin
+create/edit form becomes a `FormModal` opened from an explicit affordance — a
+primary "＋ New …" button in the screen header (`aria-haspopup="dialog"`) for
+create, a per-row "Edit" action for edit — so no screen hand-rolls a dialog, a
+footer, or a close-guard.
+
+**No consumers yet.** #237 lands the foundation only; the admin screens are
+migrated onto it in follow-ups, and `AdminGitProviders` still hand-rolls its own
+footer and close-guard until then.
+
+### `<Modal>`
+The accessible primitive: portal-rendered, focus moved in on open and restored
+to the opener on close, Tab trapped behind `aria-modal`, Escape closing the
+topmost dialog only, ref-counted body scroll-lock, and a backdrop click that
+closes only when press AND release both land on the backdrop (a drag that
+crosses the dialog edge never discards unsaved state). Props: `title`,
+`onClose`, `children`, `testId?`. The caller owns open state — render it only
+while open. Use it directly only for a non-form dialog; forms use `FormModal`.
+
+### `<FormModal>`
+`Modal` + the footer every admin form repeats: primary Save, Cancel, inline
+`ErrorText`.
+```tsx
+{modal.mode !== 'closed' ? (
+  <FormModal
+    key={modal.editing?.id ?? 'new'}      // remount clean between rows
+    title={modal.mode === 'edit' ? 'Edit provider' : 'Add git provider'}
+    // Reset the mutation too: it outlives the unmounted modal, so a reopen
+    // would otherwise render the last failed attempt's error on a clean form.
+    onClose={() => {
+      mutation.reset();
+      modal.close();
+    }}
+    onSubmit={save}
+    submitLabel={modal.mode === 'edit' ? 'Save changes' : 'Add provider'}
+    pendingLabel="Saving…"
+    pending={mutation.isPending}
+    submitDisabled={!container}
+    error={mutation.isError ? mutation.error : null}
+    testId="git-provider-modal"
+  >
+    {/* fields only — the footer is the modal's */}
+  </FormModal>
+) : null}
+```
+| Prop | Type | Notes |
+|------|------|-------|
+| `title` | `string` | Dialog header + accessible name |
+| `onClose` | `() => void` | Called only when no write is in flight |
+| `onSubmit` | `() => void` | Called only when Save is actually enabled |
+| `submitLabel?` | `string` | Save's label (default `'Save'`) |
+| `pendingLabel?` | `string` | Save's label while `pending` (default `'Saving…'`) |
+| `pending?` | `boolean` | Write in flight: disables Save, inhibits every close |
+| `submitDisabled?` | `boolean` | Caller's validation gate on Save |
+| `error?` | `Error \| null` | Rendered inline via `ErrorText` |
+| `testId?` | `string` | Also ids the backdrop as `${testId}-backdrop` |
+
+**The close guard is the point.** While `pending`, Cancel / Esc / × / backdrop
+are all inert (the `RepoScopeModal.requestClose` lesson) — a dismiss mid-write
+can't let the mutation land, or fail, invisibly. Save is likewise gated in the
+handler as well as by `disabled`, so no future affordance bypasses the caller's
+validation. Don't re-implement either in a screen.
+
+### `useModalState<T>()`
+Open / which-row / reset state for a create-or-edit `FormModal`. Returns
+`{mode: 'closed' | 'create' | 'edit', editing: T | null, openCreate(), openEdit(row), close()}`.
+`mode` and `editing` live in one state object, so they can never disagree — a
+`'create'` never carries the last edited row. Render the modal while
+`mode !== 'closed'`, and remount its body on `key={editing?.id ?? 'new'}` so
+fields reset between different rows. Callbacks are stable across renders.
