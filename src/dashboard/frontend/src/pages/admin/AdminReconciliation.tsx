@@ -77,7 +77,7 @@ function RunReconciliationModal({
     onRan,
 }: {
     onDone: () => void;
-    onRan: (summary: ReconciliationRunSummary) => void;
+    onRan: (summary: ReconciliationRunSummary | null) => void;
 }): JSX.Element {
     const run = useRunReconciliation();
     const [period, setPeriod] = useState('');
@@ -88,6 +88,10 @@ function RunReconciliationModal({
         tolerance.trim() !== '' && (!Number.isFinite(Number(tolerance)) || Number(tolerance) < 0);
 
     function submit(): void {
+        // Retract the previous run's summary as this one starts: it describes a
+        // run that is no longer the latest, and if this attempt fails it would
+        // otherwise sit there claiming a success beside the error.
+        onRan(null);
         const tol = tolerance.trim() === '' ? undefined : Number(tolerance);
         run.mutate(
             {

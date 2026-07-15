@@ -209,9 +209,39 @@ describe('AdminReconciliation page', () => {
         expect(screen.getByText('Tolerance must be a non-negative number.')).toBeInTheDocument();
         expect(screen.getByRole('button', {name: /^run$/i})).toBeDisabled();
 
-        // The gate is real, not just cosmetic: clicking sends nothing.
+        // The disabled Run sends nothing. (FormModal also re-checks the gate in
+        // requestSubmit; that backstop is covered in formModal.test.tsx.)
         fireEvent.click(screen.getByRole('button', {name: /^run$/i}));
         expect(runBody()).toBeUndefined();
+    });
+
+    it('retracts the previous run summary when a later run fails', async () => {
+        // Succeed once, then fail — the inline form's summary was gated on the
+        // mutation's own isSuccess, so it vanished the moment a rerun started.
+        // The page owns that state now, so it must retract it explicitly.
+        let runs = 0;
+        const inner = fetchMock;
+        fetchMock = vi.fn(async (url: unknown, init?: RequestInit) => {
+            if (String(url).includes('/reconciliation/run') && ++runs > 1) {
+                return json({error: 'boom'}, 500);
+            }
+            return inner(url, init) as Promise<Response>;
+        });
+        vi.stubGlobal('fetch', fetchMock);
+
+        renderPage(<AdminReconciliation />);
+        await screen.findByText('Carol Dev');
+
+        openRunModal();
+        fireEvent.click(screen.getByRole('button', {name: /^run$/i}));
+        expect(await screen.findByText('Reconciled 2026-06: 1 new, 0 already tracked.')).toBeInTheDocument();
+
+        openRunModal();
+        fireEvent.click(screen.getByRole('button', {name: /^run$/i}));
+
+        // The failed rerun must not leave the old success standing beside its error.
+        await screen.findByText(/reconciliation\/run failed with 500/i);
+        expect(screen.queryByText(/already tracked/)).not.toBeInTheDocument();
     });
 
     it('reopens the run modal with clean fields', async () => {
