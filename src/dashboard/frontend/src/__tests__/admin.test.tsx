@@ -417,6 +417,11 @@ describe('AdminSubscriptions page', () => {
         // Nothing renders over the table until the admin asks for it (criterion 1).
         expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
         expect(screen.queryByLabelText('Developer')).not.toBeInTheDocument();
+        // The opener announces that it opens a dialog (epic criterion 2).
+        expect(screen.getByRole('button', {name: '＋ Assign subscription'})).toHaveAttribute(
+            'aria-haspopup',
+            'dialog',
+        );
 
         await openAssignModal();
         expect(screen.getByRole('dialog', {name: 'Assign or change subscription'})).toBeInTheDocument();
