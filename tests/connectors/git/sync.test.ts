@@ -1877,9 +1877,11 @@ describe('GitSync.syncProviders — first-sync earliest-watermark recording (#22
         expect(readState(FORWARD_KEY)).toBeDefined();
     });
 
-    it('does NOT record a watermark when the first sync fails to list repos', async () => {
-        // listRepos throws before any repo is processed — nothing imported, so no
-        // synced-back-to floor may be claimed even though the forward cursor advances.
+    it('advances NEITHER the watermark NOR the forward cursor when the first sync fails to list repos (#231)', async () => {
+        // listRepos throws before any repo is processed — nothing imported, so the
+        // provider's fetch is incomplete: neither the synced-back-to floor NOR the
+        // forward cursor may advance, or the un-covered window would be silently
+        // skipped next run (#231). Both stay unset so the whole window retries.
         const createGitProvider = await getCreateGitProvider();
         createGitProvider.mockReturnValue(
             makeMockProvider({
@@ -1890,7 +1892,104 @@ describe('GitSync.syncProviders — first-sync earliest-watermark recording (#22
             firstSyncWindowMonths: 6,
         });
         expect(readState(EARLIEST_KEY)).toBeUndefined();
-        // Forward cursor still advances (existing accepted behavior).
-        expect(readState(FORWARD_KEY)).toBeDefined();
+        // Forward cursor must NOT advance on a failed listRepos (was the #231 bug).
+        expect(readState(FORWARD_KEY)).toBeUndefined();
+    });
+
+    // #231: the cursor advance must be ATOMIC with, and CONDITIONAL on, the data
+    // write. A cursor that moves past a window whose snapshots were never persisted is
+    // a silent, permanent gap (commit counts are additive → never re-fetched, never
+    // safely reset). These drive the two failure vectors the issue names.
+    describe('atomic cursor advance (#231)', () => {
+        it('does NOT advance the forward cursor and writes nothing when the data-write transaction fails', async () => {
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits: vi.fn().mockResolvedValue([makeProviderCommit('alice')]),
+                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+                }),
+            );
+
+            // Force the write transaction to throw: drop the target table so the
+            // snapshot upsert (inside the tx) fails and the whole tx — cursor advance
+            // included — rolls back. This models any DB-level write failure.
+            db.exec('DROP TABLE git_snapshots');
+
+            const result = await new GitSync({enabled: false}).syncProviders(db, [CONFIG]);
+
+            // Hard failure surfaced (not swallowed into a "successful" result)…
+            expect(result.errors.some((e) => /transaction rolled back/.test(e))).toBe(true);
+            // …no phantom write count…
+            expect(result.snapshotsWritten).toBe(0);
+            // …and CRUCIALLY the cursor did not move, so the window re-fetches next run.
+            expect(readState(FORWARD_KEY)).toBeUndefined();
+        });
+
+        it('does NOT advance the cursor and persists NO snapshots when a single repo commit fetch throws', async () => {
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('bad-repo'), makeRepo('good-repo')]),
+                    getCommits: vi.fn().mockImplementation(async (repo: string) => {
+                        if (repo === 'bad-repo') throw new Error('GitHub API error 500');
+                        return [makeProviderCommit('alice')];
+                    }),
+                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+                }),
+            );
+
+            const result = await new GitSync({enabled: false}).syncProviders(db, [CONFIG]);
+
+            // The per-repo failure is surfaced loudly…
+            expect(result.errors.some((e) => /bad-repo.*Failed to fetch commits/.test(e))).toBe(true);
+            // …the provider is held all-or-nothing: even the GOOD repo's commit is NOT
+            // written (writing it now + re-fetching the whole window next run would
+            // double-count the additive commit)…
+            expect(countSnapshots(db)).toBe(0);
+            expect(result.snapshotsWritten).toBe(0);
+            // …and the cursor stays put so the whole window is re-covered next run.
+            expect(readState(FORWARD_KEY)).toBeUndefined();
+        });
+
+        it('DOES advance the cursor and persist snapshots on a fully-successful sync (positive control)', async () => {
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits: vi.fn().mockResolvedValue([makeProviderCommit('alice')]),
+                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+                }),
+            );
+
+            const result = await new GitSync({enabled: false}).syncProviders(db, [CONFIG]);
+
+            expect(result.snapshotsWritten).toBeGreaterThan(0);
+            expect(countSnapshots(db)).toBeGreaterThan(0);
+            // The cursor advanced to the run's `now`, committed atomically with the data.
+            expect(readState(FORWARD_KEY)).toBe(result.lastSyncTime);
+        });
+
+        it('does NOT lower the earliest watermark when a backfill repo commit fetch throws', async () => {
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits: vi.fn().mockRejectedValue(new Error('GitHub API error 500')),
+                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+                }),
+            );
+
+            const backfill = {since: '2024-01-01T00:00:00.000Z', until: '2024-07-01T00:00:00.000Z'};
+            await new GitSync({enabled: false}).syncProviders(db, [CONFIG], undefined, {backfill});
+
+            // The older slice was not fully fetched, so the watermark must NOT drop to
+            // `since` — else the un-fetched span below the old watermark is lost.
+            expect(readState(EARLIEST_KEY)).toBeUndefined();
+        });
     });
 });
