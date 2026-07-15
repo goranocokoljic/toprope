@@ -10,6 +10,7 @@ import {
 } from '../../hooks/useAdmin';
 import type {AdminSubscription} from '../../api/types';
 import {
+    optionsGate,
     PageHeader,
     PaginatedTable,
     PrimaryButton,
@@ -41,6 +42,11 @@ function AssignSubscriptionModal({onDone}: {onDone: () => void}): JSX.Element {
     const [tool, setTool] = useState('copilot');
     const [plan, setPlan] = useState('');
     const [cost, setCost] = useState('');
+    const developerGate = optionsGate(developers, {
+        loading: 'Loading developers…',
+        failed: 'Couldn’t load developers',
+        ready: 'Select…',
+    });
 
     function submit(): void {
         const monthlyCost = cost.trim() === '' ? null : Number(cost);
@@ -85,9 +91,9 @@ function AssignSubscriptionModal({onDone}: {onDone: () => void}): JSX.Element {
                     label="Developer"
                     value={developerId}
                     onChange={setDeveloperId}
-                    disabled={developers.isPending}
+                    disabled={developerGate.disabled}
                 >
-                    <option value="">{developers.isPending ? 'Loading developers…' : 'Select…'}</option>
+                    <option value="">{developerGate.label}</option>
                     {(developers.data ?? []).map((d) => (
                         <option key={d.id} value={d.id}>
                             {d.name}

@@ -3,7 +3,6 @@ import {Link} from 'react-router-dom';
 import {Card} from '../../components/Card';
 import {Badge} from '../../components/Badge';
 import {StatePanel} from '../../components/StatePanel';
-import {Modal} from '../../components/Modal';
 import {FormModal} from '../../components/FormModal';
 import {useModalState} from '../../components/useModalState';
 import {DataTable, type Column, type SortState} from '../../components/DataTable';
@@ -35,7 +34,7 @@ import type {
     GitProviderRepo,
     GitProviderType,
 } from '../../api/types';
-import {ErrorText, PageHeader, PrimaryButton, SecondaryButton, SelectField, Table, Td, TextField, Th} from './adminUi';
+import {ErrorText, PageHeader, PrimaryButton, SelectField, Table, Td, TextField, Th} from './adminUi';
 
 /**
  * Admin → Connectors → Git (GC1.8 / #200). Lets an admin connect, test, edit,
@@ -688,20 +687,12 @@ function RepoScopeModal({
     // no longer returns (extras) — blending them could read "4 of 3 selected".
     const listedSelectedCount = repoList.filter((r) => selected.has(r.slug)).length;
     const unlistedSelectedCount = selected.size - listedSelectedCount;
-    const canSave =
-        !update.isPending && (mode === 'all' || (selectSourceReady && !emptySelection));
-
-    // Every close affordance (Cancel, Esc, ×, backdrop) funnels through this
-    // guard: dismissing mid-save would let the PATCH land (or fail) invisibly —
-    // the exact state the disabled Cancel exists to prevent.
-    function requestClose(): void {
-        if (!update.isPending) onClose();
-    }
+    // Validation only — `FormModal` folds the in-flight state into Save's
+    // disabled state and into the close guard, so `update.isPending` must NOT
+    // be mixed in here.
+    const canSave = mode === 'all' || (selectSourceReady && !emptySelection);
 
     function save(): void {
-        // Self-enforcing mirror of the button's disabled state: no future caller
-        // (keyboard wiring, form submit) may bypass the empty-selection guard.
-        if (!canSave) return;
         const patch = providerIdentityInput(provider);
         preserveExcludeRepos(provider, patch);
         if (mode === 'select') {
@@ -716,9 +707,14 @@ function RepoScopeModal({
     }
 
     return (
-        <Modal
+        <FormModal
             title={`Repository scope — ${provider.container}`}
-            onClose={requestClose}
+            onClose={onClose}
+            onSubmit={save}
+            submitLabel="Save scope"
+            pending={update.isPending}
+            submitDisabled={!canSave}
+            error={update.isError ? update.error : null}
             // Provider-scoped so stacked modals (#211 prompt + another row's)
             // never render duplicate test ids.
             testId={`repo-scope-modal-${provider.id}`}
@@ -871,17 +867,7 @@ function RepoScopeModal({
                 Changing the scope only affects future syncs — data already collected from
                 deselected repositories is kept.
             </p>
-
-            <div className="mt-4 flex items-center gap-3">
-                <PrimaryButton type="button" onClick={save} disabled={!canSave}>
-                    {update.isPending ? 'Saving…' : 'Save scope'}
-                </PrimaryButton>
-                <SecondaryButton onClick={requestClose} disabled={update.isPending}>
-                    Cancel
-                </SecondaryButton>
-                <ErrorText error={update.isError ? update.error : null} />
-            </div>
-        </Modal>
+        </FormModal>
     );
 }
 

@@ -11,6 +11,7 @@ import {
 import type {AdminDeveloper} from '../../api/types';
 import {
     ErrorText,
+    optionsGate,
     PageHeader,
     PaginatedTable,
     SecondaryButton,
@@ -102,6 +103,11 @@ function IdentityFormModal({dev, onDone}: {dev: AdminDeveloper; onDone: () => vo
     // stays listed even if archived — otherwise the select would render their
     // own team as no selection at all.
     const activeTeams = (teams.data ?? []).filter((t) => !t.archived_at || t.name === dev.team);
+    const teamGate = optionsGate(teams, {
+        loading: 'Loading teams…',
+        failed: 'Couldn’t load teams',
+        ready: '',
+    });
 
     function set<K extends keyof IdentityDraft>(key: K, value: string): void {
         setDraft((d) => ({...d, [key]: value}));
@@ -162,7 +168,12 @@ function IdentityFormModal({dev, onDone}: {dev: AdminDeveloper; onDone: () => vo
                 <div className="border-t border-border pt-4">
                     <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted">Team</p>
                     <div className="flex items-end gap-3">
-                        <SelectField label="Team" value={team} onChange={setTeam} disabled={teams.isPending}>
+                        <SelectField label="Team" value={team} onChange={setTeam} disabled={teamGate.disabled}>
+                            {/* Until the roster resolves, the placeholder carries the
+                                developer's CURRENT team as its value: an enabled empty
+                                select would read as "this developer has no team", and a
+                                blank value would mis-seed the Move below. */}
+                            {teamGate.disabled ? <option value={dev.team}>{teamGate.label}</option> : null}
                             {activeTeams.map((t) => (
                                 <option key={t.name} value={t.name}>
                                     {t.name}

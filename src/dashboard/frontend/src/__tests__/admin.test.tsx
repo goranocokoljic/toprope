@@ -455,6 +455,32 @@ describe('AdminUsers page', () => {
         expect(screen.getByRole('option', {name: '— none —'})).toBeInTheDocument();
     });
 
+    it('keeps the developer link gated when the roster FAILS to load — not an enabled "— none —"', async () => {
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (String(url).endsWith('/api/admin/developers') && method === 'GET') {
+                return json({message: 'boom'}, 500);
+            }
+            return base!(url, init);
+        });
+
+        renderPage(<AdminUsers />);
+        await screen.findByText('admin@test.com');
+        openCreateUserModal();
+
+        // A failed query settles to isPending === false with no data. Gating on
+        // isPending alone would flip the select to an ENABLED list whose only
+        // option is "— none —" — indistinguishable from "there are no
+        // developers", which is what invites the unintended unlinked create.
+        const select = await screen.findByLabelText('Linked developer');
+        expect(await screen.findByRole('option', {name: 'Couldn’t load developers'})).toBeInTheDocument();
+        expect(select).toBeDisabled();
+        expect(screen.queryByRole('option', {name: '— none —'})).not.toBeInTheDocument();
+        // Positive control: the roster really did fail, so nothing loaded.
+        expect(screen.queryByRole('option', {name: 'Alice Dev'})).not.toBeInTheDocument();
+    });
+
     it('the one-time temp password survives the modal closing, shows once, and is dismissible', async () => {
         renderPage(<AdminUsers />);
         await screen.findByText('admin@test.com');
@@ -700,6 +726,27 @@ describe('AdminSubscriptions page', () => {
         await screen.findByRole('option', {name: 'Alice Dev'});
         expect(select).toBeEnabled();
         expect(screen.getByRole('option', {name: 'Select…'})).toBeInTheDocument();
+    });
+
+    it('keeps the developer select gated when the roster FAILS to load — not an enabled "Select…"', async () => {
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (String(url).endsWith('/api/admin/developers') && method === 'GET') {
+                return json({message: 'boom'}, 500);
+            }
+            return base!(url, init);
+        });
+
+        renderPage(<AdminSubscriptions />);
+        await waitForTableLoaded();
+        fireEvent.click(screen.getByRole('button', {name: '＋ Assign subscription'}));
+
+        const select = await screen.findByLabelText('Developer');
+        expect(await screen.findByRole('option', {name: 'Couldn’t load developers'})).toBeInTheDocument();
+        expect(select).toBeDisabled();
+        expect(screen.queryByRole('option', {name: 'Select…'})).not.toBeInTheDocument();
+        expect(screen.queryByRole('option', {name: 'Alice Dev'})).not.toBeInTheDocument();
     });
 
     it('no close affordance works while the assign is in flight — the POST cannot land invisibly', async () => {
@@ -1463,6 +1510,61 @@ describe('AdminIdentities page', () => {
         expect(screen.getByRole('dialog', {name: 'Identities — Alice Dev'})).toBeInTheDocument();
         // A failed move must not throw away the identity edits typed alongside it.
         expect((screen.getByLabelText('GitHub username') as HTMLInputElement).value).toBe('alice-renamed');
+    });
+
+    it('gates the Team select while the roster loads, and keeps it gated when the roster FAILS', async () => {
+        let releaseTeams: (() => void) | undefined;
+        const gate = new Promise<void>((resolve) => {
+            releaseTeams = resolve;
+        });
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            if (String(url).includes('/api/admin/teams')) await gate;
+            return base!(url, init);
+        });
+
+        renderPage(<AdminIdentities />);
+        await waitForTableLoaded();
+        // Deliberately NOT openEditIdentityModal: that helper awaits the options
+        // and would step straight past the window this test exists to check.
+        fireEvent.click(within(developerRow('Alice Dev')).getByRole('button', {name: 'Edit'}));
+
+        // While the teams load the control is inert, and its placeholder still
+        // carries Alice's CURRENT team as the value — an enabled empty select
+        // would read as "Alice has no team", and a blank value would mis-seed
+        // the Move below.
+        const select = (await screen.findByLabelText('Team')) as HTMLSelectElement;
+        expect(select).toBeDisabled();
+        expect(screen.getByRole('option', {name: 'Loading teams…'})).toBeInTheDocument();
+        expect(select.value).toBe('frontend');
+        expect(screen.getByRole('button', {name: 'Move developer'})).toBeDisabled();
+
+        releaseTeams?.();
+        await screen.findByRole('option', {name: 'platform'});
+        expect(select).toBeEnabled();
+        expect(select.value).toBe('frontend');
+    });
+
+    it('keeps the Team select gated when the team roster FAILS to load', async () => {
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (String(url).includes('/api/admin/teams') && method === 'GET') {
+                return json({message: 'boom'}, 500);
+            }
+            return base!(url, init);
+        });
+
+        renderPage(<AdminIdentities />);
+        await waitForTableLoaded();
+        fireEvent.click(within(developerRow('Alice Dev')).getByRole('button', {name: 'Edit'}));
+
+        const select = (await screen.findByLabelText('Team')) as HTMLSelectElement;
+        expect(await screen.findByRole('option', {name: 'Couldn’t load teams'})).toBeInTheDocument();
+        expect(select).toBeDisabled();
+        expect(select.value).toBe('frontend');
+        // Positive control: the roster really did fail, so no real team loaded.
+        expect(screen.queryByRole('option', {name: 'platform'})).not.toBeInTheDocument();
     });
 
     it('surfaces a failed developer load instead of an empty table', async () => {

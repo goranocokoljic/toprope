@@ -13,6 +13,7 @@ import {
 import type {AdminUser} from '../../api/types';
 import {
     ErrorText,
+    optionsGate,
     PageHeader,
     PaginatedTable,
     PrimaryButton,
@@ -53,6 +54,11 @@ function CreateUserModal({
     const [email, setEmail] = useState('');
     const [role, setRole] = useState('developer');
     const [developerId, setDeveloperId] = useState('');
+    const developerGate = optionsGate(developers, {
+        loading: 'Loading developers…',
+        failed: 'Couldn’t load developers',
+        ready: '— none —',
+    });
 
     function submit(): void {
         create.mutate(
@@ -95,9 +101,9 @@ function CreateUserModal({
                     label="Linked developer"
                     value={developerId}
                     onChange={setDeveloperId}
-                    disabled={developers.isPending}
+                    disabled={developerGate.disabled}
                 >
-                    <option value="">{developers.isPending ? 'Loading developers…' : '— none —'}</option>
+                    <option value="">{developerGate.label}</option>
                     {(developers.data ?? []).map((d) => (
                         <option key={d.id} value={d.id}>
                             {d.name}

@@ -240,15 +240,27 @@ primary "＋ New …" button in the screen header (`aria-haspopup="dialog"`) for
 create, a per-row "Edit" action for edit — so no screen hand-rolls a dialog, a
 footer, or a close-guard.
 
-**Adoption.** #237 landed the foundation; `AdminGitProviders` is the first
-consumer (#238) — its add/edit form is a `FormModal` opened from the header's
-"＋ Add git provider" button or a row's "Edit". `AdminUsers` followed (#239):
-create-only, opened from "＋ New user", with per-row role / deactivate /
-reset-password left inline as single actions. `AdminSubscriptions` (#240) is also
-create-only — opened from "＋ Assign subscription", with the per-row "End" left
-inline. The remaining admin screens are migrated onto it in the rest of the epic.
-`RepoScopeModal` stays on the raw `Modal`: it is a scope picker with its own
-"Save scope" footer, not a create/edit form.
+**Adoption — epic #236 is complete; every admin form is on `FormModal`.**
+#237 landed the foundation. `AdminGitProviders` is the motivating consumer
+(#238) — its add/edit form opens from the header's "＋ Add git provider" button
+or a row's "Edit". `AdminUsers` (#239) is create-only, opened from "＋ New user",
+with per-row role / deactivate / reset-password left inline as single actions.
+`AdminSubscriptions` (#240) is create-only from "＋ Assign subscription", the
+per-row "End" left inline. `AdminTeams` (#241) is the one screen with both modes:
+a create modal plus a per-row Edit modal — team `name` is the key, so it is
+create-only within the form and read-only when editing. `AdminIdentities` (#242)
+opens the editor from a per-row "Edit"; its `pending` is `save.isPending ||
+move.isPending`, because the dialog drives TWO writes and a dismiss must be inert
+for both. `AdminReconciliation` (#243) proves the wrapper is not create/edit-only
+— it triggers a job with `submitLabel="Run"`, and the page (not the dialog) owns
+the run summary so the result outlives the modal; its per-row resolve stays inline.
+
+`RepoScopeModal` is also a `FormModal` (`submitLabel="Save scope"`). It was the
+donor of the close-guard, and for one epic it kept a private copy of it — which
+is exactly the drift this component exists to prevent. There is now **no**
+raw-`<Modal>` consumer in product code outside `FormModal` itself: if you reach
+for `<Modal>` directly, you are almost certainly re-implementing a footer and a
+guard that already exist.
 
 A create-only screen (`AdminUsers`, `AdminSubscriptions`) needs no `key` on the
 `FormModal`: with no edit mode there is no row to switch between, and the
@@ -262,9 +274,14 @@ backend revokes the old seat and opens a new one). A screen only needs edit mode
 when a row's existing values must pre-fill the fields.
 
 A screen whose options come from a second query (the developer list on
-`AdminUsers` / `AdminSubscriptions`) loads them when the DIALOG opens, not with the
-page. Gate that control on `isPending`: an enabled, empty select reads as "there
-are none" rather than "not loaded yet".
+`AdminUsers` / `AdminSubscriptions`, the team list on `AdminIdentities`) loads
+them when the DIALOG opens, not with the page. Gate that control with
+`optionsGate(query, labels)` from `pages/admin/adminUi` — **not** a hand-rolled
+`isPending` check. Gating on `isPending` alone covers only half of it: a FAILED
+query settles to `isPending === false` with no data, so the select would flip
+from a disabled "Loading…" to an enabled list holding nothing but its
+placeholder, which reads as "there are none" rather than "this never loaded".
+Both non-ready states must keep the control inert and say which one it is.
 
 The screen's primary affordance goes in `PageHeader`'s optional `actions` slot,
 as a `PrimaryButton` with `ariaHasPopup="dialog"`.
@@ -282,16 +299,12 @@ while open. Use it directly only for a non-form dialog; forms use `FormModal`.
 `Modal` + the footer every admin form repeats: primary Save, Cancel, inline
 `ErrorText`.
 ```tsx
+// The mutation hook is called INSIDE this component, not on the page — see below.
 {modal.mode !== 'closed' ? (
   <FormModal
     key={modal.editing?.id ?? 'new'}      // remount clean between rows
     title={modal.mode === 'edit' ? 'Edit provider' : 'Add git provider'}
-    // Reset the mutation too: it outlives the unmounted modal, so a reopen
-    // would otherwise render the last failed attempt's error on a clean form.
-    onClose={() => {
-      mutation.reset();
-      modal.close();
-    }}
+    onClose={modal.close}
     onSubmit={save}
     submitLabel={modal.mode === 'edit' ? 'Save changes' : 'Add provider'}
     pendingLabel="Saving…"
@@ -316,11 +329,20 @@ while open. Use it directly only for a non-form dialog; forms use `FormModal`.
 | `error?` | `Error \| null` | Rendered inline via `ErrorText` |
 | `testId?` | `string` | Also ids the backdrop as `${testId}-backdrop` |
 
+**Own the mutation inside the modal component**, as every screen does: call
+`useCreateX()` / `useUpdateX()` in the body that `FormModal` wraps, so closing
+the dialog unmounts it and its error/pending state dies with it. That is why no
+consumer needs a `mutation.reset()` on close. Hoisting the mutation to the page
+is the mistake this note exists to prevent: its last failed error would then
+outlive the dialog and render on the next clean open.
+
 **The close guard is the point.** While `pending`, Cancel / Esc / × / backdrop
 are all inert (the `RepoScopeModal.requestClose` lesson) — a dismiss mid-write
-can't let the mutation land, or fail, invisibly. Save is likewise gated in the
-handler as well as by `disabled`, so no future affordance bypasses the caller's
-validation. Don't re-implement either in a screen.
+can't let the mutation land, or fail, invisibly. Don't re-implement it in a
+screen. `pending` must cover EVERY write the dialog can start, not just the
+primary one (see `AdminIdentities`: `save.isPending || move.isPending`), and
+`submitDisabled` is validation ONLY — never mix the in-flight state into it, as
+`FormModal` already folds `pending` into Save's disabled state.
 
 ### `useModalState<T>()`
 Open / which-row / reset state for a create-or-edit `FormModal`. Returns

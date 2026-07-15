@@ -148,6 +148,26 @@ export function ErrorText({error}: {error: Error | null}): JSX.Element | null {
     return <span className="text-sm text-danger">{error.message}</span>;
 }
 
+/**
+ * Whether a select whose options come from a query must stay disabled, and the
+ * placeholder to show while it is.
+ *
+ * A select fed by an unresolved query must never be enabled-and-empty: it reads
+ * as "there are none" and invites a write against a roster that never loaded.
+ * Gating on `isPending` alone only covers half of it — a FAILED query settles to
+ * `isPending === false` with no data, so the control would flip from a disabled
+ * "Loading…" to an enabled list holding nothing but the placeholder, with the
+ * failure surfaced nowhere. Both non-ready states gate.
+ */
+export function optionsGate(
+    query: {isPending: boolean; isError: boolean},
+    labels: {loading: string; failed: string; ready: string},
+): {disabled: boolean; label: string} {
+    if (query.isPending) return {disabled: true, label: labels.loading};
+    if (query.isError) return {disabled: true, label: labels.failed};
+    return {disabled: false, label: labels.ready};
+}
+
 /** A one-time temporary-password banner shown after create / reset. */
 export function TempPasswordBanner({password, onDismiss}: {password: string; onDismiss: () => void}): JSX.Element {
     return (
