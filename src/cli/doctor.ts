@@ -6,6 +6,7 @@ import {getMigrationStatus} from '../storage/migrator';
 import {resolveAllGitProviders} from '../connectors/git/providers/resolve';
 import {loadServerKey} from '../connectors/git/providers/secret';
 import {createGitProvider} from '../connectors/git/providers/factory';
+import {loadStalledProviders} from '../connectors/git/sync';
 import type {GitProvider, GitProviderConfig} from '../connectors/git/providers/types';
 import {trimTrailingSlash} from '../summaries/model-client';
 
@@ -501,6 +502,37 @@ function noGitProvidersDiagnostic(git: TopropeConfig['connectors']['git']): Chec
     );
 }
 
+/**
+ * Whether any configured provider's sync cursor has been stuck for the
+ * alert threshold of consecutive runs (`GIT_STALL_ALERT_RUNS`, owned by the sync
+ * module and applied inside `loadStalledProviders`, #235).
+ *
+ * Distinct from the reachability probes above, and NOT redundant with them: a
+ * stalled provider is usually perfectly reachable — one repo inside it fails every
+ * run (oversized, permission drift, deleted-but-still-listed) and #231 holds the
+ * whole provider's cursor rather than leave a silent snapshot gap. `checkAccess()`
+ * passes, the org is fine, and yet no developer on ANY of that provider's repos has
+ * had a new snapshot since the streak began. This is the only check that says so.
+ *
+ * Takes the ALREADY-resolved provider set rather than re-resolving: resolution
+ * decrypts each DB-connected provider's token, and this is one DB read, not a probe.
+ */
+function checkGitStalls(db: Database.Database, providerConfigs: GitProviderConfig[]): CheckResult {
+    const label = 'Git sync progress';
+    const stalled = loadStalledProviders(db, providerConfigs);
+    if (stalled.length === 0) {
+        return pass(label, `All ${providerConfigs.length} provider(s) advancing`);
+    }
+    const detail = stalled
+        .map((s) => `${s.type}:${s.identifier} (${s.runs} runs, since ${s.since})`)
+        .join(', ');
+    return fail(
+        label,
+        `${stalled.length} provider(s) stalled — cursor held, importing nothing: ${detail}`,
+        'A repo in each provider above fails every run, holding the whole provider back. Run "toprope sync all" and read the [provider/repo] errors to find it, then fix access or drop it via connectors.git.providers[].exclude_repos.',
+    );
+}
+
 async function checkGitProviders(
     db: Database.Database,
     config: TopropeConfig,
@@ -522,6 +554,7 @@ async function checkGitProviders(
     for (const pc of providerConfigs) {
         results.push(await checkOneGitProvider(pc));
     }
+    results.push(checkGitStalls(db, providerConfigs));
     return results;
 }
 

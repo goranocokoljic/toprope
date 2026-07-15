@@ -218,4 +218,61 @@ describe('printStatus', () => {
         expect(combined).toContain('2 repos');
         expect(combined).not.toContain('1 repos');
     });
+
+    // #235: a stalled provider is invisible on the connector line — `git_last_sync` is
+    // the NEWEST cursor across all providers, so a healthy sibling keeps the Git line
+    // reading "✓ connected" while a stalled one has imported nothing for weeks.
+    describe('stalled git providers (#235)', () => {
+        function gitConfig(): TopropeConfig {
+            const config = baseConfig();
+            (config.connectors.git as {enabled: boolean; providers: unknown[]}).providers = [
+                {type: 'github', org: 'acme', auth: {type: 'token', api_token: 't'}},
+            ];
+            return config;
+        }
+
+        function seedStall(key: string, runs: number, since: string): void {
+            db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+                key,
+                JSON.stringify({runs, since}),
+            );
+        }
+
+        it('warns, naming the provider and the streak, once a provider is stalled', () => {
+            seedStall('git_stall:github:acme', 7, new Date(Date.now() - 3 * 86_400_000).toISOString());
+
+            printStatus(db, gitConfig());
+
+            const combined = output.join('\n');
+            expect(combined).toContain('github:acme stalled');
+            expect(combined).toContain('7 consecutive runs');
+            expect(combined).toContain('3d ago');
+            expect(combined).toContain('toprope doctor');
+        });
+
+        it('says nothing when no provider is stalled (negative control)', () => {
+            printStatus(db, gitConfig());
+
+            expect(output.join('\n')).not.toContain('stalled');
+        });
+
+        it('stays silent below the alert threshold', () => {
+            seedStall('git_stall:github:acme', 1, new Date().toISOString());
+
+            printStatus(db, gitConfig());
+
+            // One held run is the ordinary self-healing case, not a stall.
+            expect(output.join('\n')).not.toContain('stalled');
+        });
+
+        it('does not report stalls when the git connector is disabled', () => {
+            seedStall('git_stall:github:acme', 9, new Date().toISOString());
+            const config = gitConfig();
+            (config.connectors.git as {enabled: boolean}).enabled = false;
+
+            printStatus(db, config);
+
+            expect(output.join('\n')).not.toContain('stalled');
+        });
+    });
 });

@@ -321,6 +321,84 @@ describe('runDoctor', () => {
         const result = await runDoctor(db, disabledConfig(), tmpConfigPath, MIGRATIONS_DIR);
         expect(result).toBe(true);
     });
+
+    // #235: the stall check is NOT redundant with the reachability probes above — a
+    // stalled provider is usually perfectly reachable. One repo inside it fails every
+    // run and #231 holds the whole provider's cursor rather than leave a silent gap,
+    // so checkAccess() passes while nothing at all is being imported.
+    describe('stalled git providers (#235)', () => {
+        /** A config with one reachable github provider (no network — factory stubbed). */
+        async function reachableGitConfig(): Promise<TopropeConfig> {
+            const {createGitProvider} = await import('../../src/connectors/git/providers/factory');
+            (createGitProvider as ReturnType<typeof vi.fn>).mockReturnValue({
+                name: 'github',
+                checkAccess: vi.fn().mockResolvedValue(undefined),
+                listRepos: vi.fn().mockResolvedValue([]),
+                getCommits: vi.fn(),
+                getPullRequests: vi.fn(),
+                getReviewComments: vi.fn(),
+                getPRReviews: vi.fn(),
+                getCommitDiff: vi.fn(),
+            } as unknown as GitProvider);
+
+            const config = disabledConfig();
+            (config.connectors.git as {enabled: boolean; providers: unknown[]}).enabled = true;
+            (config.connectors.git as {enabled: boolean; providers: unknown[]}).providers = [
+                {type: 'github', org: 'acme', auth: {type: 'token', api_token: 't'}},
+            ];
+            return config;
+        }
+
+        function seedStall(runs: number): void {
+            db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+                'git_stall:github:acme',
+                JSON.stringify({runs, since: '2026-07-01T00:00:00.000Z'}),
+            );
+        }
+
+        it('FAILS doctor and names the stalled provider, streak, and remedy', async () => {
+            seedStall(6);
+
+            const result = await runDoctor(db, await reachableGitConfig(), tmpConfigPath, MIGRATIONS_DIR);
+
+            expect(result).toBe(false);
+            const allOutput = [...output, ...errors].join('\n');
+            // The provider is reachable — this is the ONLY check that catches the stall.
+            expect(allOutput).toContain('org "acme" reachable');
+            expect(allOutput).toContain('Git sync progress');
+            expect(allOutput).toContain('github:acme');
+            expect(allOutput).toContain('6 runs');
+            expect(allOutput).toContain('2026-07-01T00:00:00.000Z');
+            expect(allOutput).toContain('exclude_repos');
+        });
+
+        it('passes when no provider is stalled (negative control)', async () => {
+            const result = await runDoctor(db, await reachableGitConfig(), tmpConfigPath, MIGRATIONS_DIR);
+
+            expect(result).toBe(true);
+            expect(output.join('\n')).toContain('All 1 provider(s) advancing');
+        });
+
+        it('passes below the alert threshold', async () => {
+            seedStall(1);
+
+            const result = await runDoctor(db, await reachableGitConfig(), tmpConfigPath, MIGRATIONS_DIR);
+
+            // One held run is transient and self-healing; failing doctor on it would
+            // train the reader to ignore the check.
+            expect(result).toBe(true);
+            expect(output.join('\n')).toContain('advancing');
+        });
+
+        it('skips the stall check entirely when the git connector is disabled', async () => {
+            seedStall(9);
+
+            const result = await runDoctor(db, disabledConfig(), tmpConfigPath, MIGRATIONS_DIR);
+
+            expect(result).toBe(true);
+            expect([...output, ...errors].join('\n')).not.toContain('Git sync progress');
+        });
+    });
 });
 
 describe('configured repo verification helpers', () => {

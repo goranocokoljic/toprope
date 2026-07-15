@@ -1,5 +1,8 @@
 import type Database from 'better-sqlite3';
 import type {TopropeConfig} from '../config/types';
+import {resolveAllGitProviders} from '../connectors/git/providers/resolve';
+import {loadServerKey} from '../connectors/git/providers/secret';
+import {loadStalledProviders, type StalledProvider} from '../connectors/git/sync';
 
 interface ConnectorStatus {
     name: string;
@@ -14,11 +17,30 @@ interface StatusData {
     activeDevelopers: number;
     teamCount: number;
     connectors: ConnectorStatus[];
+    /**
+     * Git providers whose cursor has been held for GIT_STALL_ALERT_RUNS+ consecutive
+     * runs (#235). Empty when the git connector is disabled. The `Git` connector line
+     * alone cannot show this: `last_sync` is the newest cursor across ALL providers,
+     * so one healthy provider keeps the line reading "✓ connected, 2h ago" while a
+     * stalled sibling has imported nothing for weeks.
+     */
+    gitStalls: StalledProvider[];
     activeSubscriptions: number;
     totalMonthlyCost: number;
     wasteAlertCount: number;
     monthlyWaste: number;
     dataQuality: {high: number; medium: number; low: number};
+}
+
+/**
+ * The stalled-provider set for the status report (#235), or [] when git is off.
+ * Resolves providers the same way `doctor` does — DB-connected ∪ config-file — so
+ * both commands report on the identical set.
+ */
+function collectGitStalls(db: Database.Database, config: TopropeConfig): StalledProvider[] {
+    const {git} = config.connectors;
+    if (!git.enabled) return [];
+    return loadStalledProviders(db, resolveAllGitProviders(db, loadServerKey(), git));
 }
 
 function getLastSync(db: Database.Database, key: string): string | null {
@@ -134,6 +156,7 @@ function collectStatus(db: Database.Database, config: TopropeConfig): StatusData
         activeDevelopers: activeDevs,
         teamCount,
         connectors,
+        gitStalls: collectGitStalls(db, config),
         activeSubscriptions: subRow.cnt,
         totalMonthlyCost: subRow.total,
         wasteAlertCount: wasteRow.cnt,
@@ -171,6 +194,17 @@ export function printStatus(db: Database.Database, config: TopropeConfig): void 
         const status = c.lastSync ? `✓ connected` : `○ not synced`;
         const detail = c.lastSync ? ` (last sync: ${syncInfo}, ${tracked})` : '';
         console.log(`  ${c.name.padEnd(14)}${status}${detail}`);
+    }
+
+    // Printed under the connector block rather than folded into the Git line: a stall
+    // is per-PROVIDER, and the Git line is per-CONNECTOR (see StatusData.gitStalls).
+    for (const s of data.gitStalls) {
+        console.log(
+            `  ${''.padEnd(14)}⚠ ${s.type}:${s.identifier} stalled — cursor held for ${s.runs} consecutive runs since ${formatTimeAgo(s.since)}; importing nothing`,
+        );
+    }
+    if (data.gitStalls.length > 0) {
+        console.log(`  ${''.padEnd(14)}  Run "toprope doctor" for the fix.`);
     }
 
     const cost = `$${data.totalMonthlyCost.toFixed(0)}/mo`;
