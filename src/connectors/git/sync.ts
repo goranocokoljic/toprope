@@ -603,6 +603,22 @@ interface ProviderFetchResult {
      * (re)written from the forward path.
      */
     firstSyncFloor: string | null;
+    /**
+     * True iff every fetch feeding the ADDITIVE commit-derived snapshot succeeded
+     * for this provider — `listRepos` AND every repo's `getCommits`. When false the
+     * run must NOT advance this provider's cursor/watermark AND must NOT write its
+     * snapshots (#231): commit counts are ADDED across runs (see
+     * {@link remergeStoredSnapshot}), so persisting the partially-fetched window now
+     * and re-fetching it next run would double-count. The only gap-free option is to
+     * discard this provider's partial data and re-cover the whole window next run —
+     * loud (errors surface every run) rather than a silent, permanent snapshot gap.
+     *
+     * Best-effort fetches that are idempotent under re-delivery (PRs/review comments
+     * are max()-merged; commit diffs fall back to empty) do NOT clear this flag:
+     * holding the cursor for them would force an additive commit re-fetch, which is
+     * strictly worse than the bounded, self-healing undercount they already accept.
+     */
+    complete: boolean;
 }
 
 async function fetchProviderData(
@@ -676,6 +692,8 @@ async function fetchProviderData(
             // listRepos failed before any repo was processed — nothing was imported,
             // so don't claim a synced-back-to floor even on a first sync.
             firstSyncFloor: null,
+            // The window was not covered at all — hold the cursor so it retries (#231).
+            complete: false,
         };
     }
 
@@ -695,6 +713,10 @@ async function fetchProviderData(
         p.repos_total = (p.repos_total ?? 0) + reposToSync.length;
     });
 
+    // Cleared the moment any repo's commit fetch throws: a single failed repo leaves
+    // the provider's [since, until] window incompletely covered, so runSync must hold
+    // the whole provider's cursor and drop its partial snapshots (#231).
+    let commitsComplete = true;
     for (const repoName of reposToSync) {
         report?.((p) => {
             p.current_repo = repoName;
@@ -706,6 +728,9 @@ async function fetchProviderData(
             errors.push(
                 `[${providerType}/${repoName}] Failed to fetch commits: ${err instanceof Error ? err.message : String(err)}`,
             );
+            // This repo's commit window is now un-covered — hold the provider's cursor
+            // back so the whole window is re-fetched next run rather than skipped (#231).
+            commitsComplete = false;
             // A failed repo still counts as processed so the N/M counter reaches M.
             report?.((p) => {
                 p.repos_processed += 1;
@@ -823,6 +848,7 @@ async function fetchProviderData(
         stateKey,
         identifier,
         firstSyncFloor,
+        complete: commitsComplete,
     };
 }
 
@@ -1088,18 +1114,37 @@ export class GitSync implements ConnectorInterface {
         // snapshot pass. Keyed naturally by (provider, repo, pr_id), so no
         // cross-provider merging is needed.
         const resolvedPRRecords: Array<{record: PRRecordInput; developerId: string}> = [];
+        // Deferred sync-state advances (#231). Each entry is applied INSIDE the write
+        // transaction below, so a provider's cursor/watermark commits atomically with
+        // — and only if — its data is persisted. Populated only for providers whose
+        // fetch was complete; an incomplete provider contributes nothing this run.
+        const cursorAdvances: Array<() => void> = [];
 
         for (const {result, providerType} of fetchResults) {
             const {commits, prs, reviewComments, prRecords, stateKey, identifier} = result;
 
-            // Record this provider's sync progress. Backfill (#229) LOWERS the
-            // earliest watermark to the (older) slice it just imported and leaves
-            // the forward cursor untouched, so normal "Sync now" keeps resuming from
-            // now; every other run advances the forward cursor to `now`. Mirrors the
-            // forward cursor's existing semantics: written per-provider even on an
-            // empty/partial fetch (a failed repo is skipped, same accepted trade-off),
-            // so a backfill can only ever widen backward and never re-covers a slice.
-            const recordProgress = (): void => {
+            // A provider whose commit fetch was incomplete (listRepos or any repo's
+            // getCommits threw) must not advance its cursor OR write its additive
+            // snapshots (#231). Commit counts are ADDED across runs, so writing this
+            // run's partial data and re-fetching the same window next run would
+            // double-count; discarding the partial data and re-covering the whole
+            // window next run is the only gap-free option. Skip the provider entirely
+            // — its errors are already surfaced, so the failure is loud, not silent.
+            // (Trade-off: a permanently-failing repo stalls the provider until it is
+            // fixed or excluded via config — a visible stall, preferred over a silent,
+            // permanent snapshot gap.)
+            if (!result.complete) {
+                continue;
+            }
+
+            // Defer this provider's sync-state advance into the write transaction.
+            // Backfill (#229) LOWERS the earliest watermark to the (older) slice it
+            // just imported and leaves the forward cursor untouched, so normal "Sync
+            // now" keeps resuming from now; every other run advances the forward cursor
+            // to `now`. Written per-provider even on an empty fetch (a complete run
+            // that found nothing legitimately covered its window), so a backfill can
+            // only ever widen backward and never re-covers a slice.
+            cursorAdvances.push(() => {
                 if (options?.backfill) {
                     setProviderEarliestSyncTime(db, providerType, identifier, options.backfill.since);
                 } else {
@@ -1108,7 +1153,8 @@ export class GitSync implements ConnectorInterface {
                     // exact, not the too-recent lazy guess. Guard on an unset
                     // watermark: a first sync should never clobber a lower value a
                     // prior direct-API backfill may have written (the UI can't reach
-                    // that ordering, but the route doesn't forbid it).
+                    // that ordering, but the route doesn't forbid it). The read runs
+                    // inside the write transaction, so this check-then-set is atomic.
                     if (
                         result.firstSyncFloor !== null &&
                         getProviderEarliestSyncTime(db, providerType, identifier) === null
@@ -1117,7 +1163,7 @@ export class GitSync implements ConnectorInterface {
                     }
                     setProviderLastSyncTime(db, stateKey, now);
                 }
-            };
+            });
 
             for (const record of prRecords) {
                 const developerId = resolveDeveloperId(
@@ -1133,7 +1179,7 @@ export class GitSync implements ConnectorInterface {
             }
 
             if (commits.length === 0 && prs.length === 0 && reviewComments.length === 0) {
-                recordProgress();
+                // Cursor advance was already queued above for this complete provider.
                 continue;
             }
 
@@ -1178,8 +1224,6 @@ export class GitSync implements ConnectorInterface {
                     globalSnapshots.set(key, existing ? mergeSnapshots(existing, snap) : snap);
                 }
             }
-
-            recordProgress();
         }
 
         report?.((p) => {
@@ -1187,23 +1231,43 @@ export class GitSync implements ConnectorInterface {
             p.developers_matched = matchedDevelopers.size;
         });
 
-        // Upsert all merged snapshots + per-PR records in a single transaction
+        // Upsert all merged snapshots + per-PR records AND advance every complete
+        // provider's cursor/watermark in a SINGLE transaction (#231). The cursor
+        // advances live inside the same tx as the data write, so on any write failure
+        // the whole transaction rolls back — no cursor moves past a window whose data
+        // was never persisted, and the next run re-covers it. `snapshotsWritten` /
+        // `snapshotsSkipped` are staged locally and only committed to the run counters
+        // after the tx succeeds, so a rolled-back run never reports phantom writes.
         const insertMany = db.transaction(() => {
+            let written = 0;
+            let skipped = 0;
             for (const snap of globalSnapshots.values()) {
                 const outcome = upsertSnapshot(db, snap);
-                if (outcome === 'written') snapshotsWritten++;
-                else snapshotsSkipped++;
+                if (outcome === 'written') written++;
+                else skipped++;
             }
             for (const {record, developerId} of resolvedPRRecords) {
                 upsertPRRecord(db, record, developerId, now);
             }
+            // Advance cursors LAST, still inside the tx: they persist iff every write
+            // above committed. Collected only for complete providers (see the loop).
+            for (const advance of cursorAdvances) {
+                advance();
+            }
+            snapshotsWritten = written;
+            snapshotsSkipped = skipped;
         });
 
         try {
             insertMany();
         } catch (err) {
+            // Hard failure: the tx rolled back, so NO snapshots were written and NO
+            // cursor advanced — the window is intact and will be re-fetched next run.
+            // Surface it clearly rather than swallowing it into a "successful" result.
+            snapshotsWritten = 0;
+            snapshotsSkipped = 0;
             errors.push(
-                `Failed to write snapshots: ${err instanceof Error ? err.message : String(err)}`,
+                `Failed to write sync data (transaction rolled back — no cursor advanced, window will be re-fetched next run): ${err instanceof Error ? err.message : String(err)}`,
             );
         }
 
