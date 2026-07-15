@@ -4,6 +4,8 @@ import {Card} from '../../components/Card';
 import {Badge} from '../../components/Badge';
 import {StatePanel} from '../../components/StatePanel';
 import {Modal} from '../../components/Modal';
+import {FormModal} from '../../components/FormModal';
+import {useModalState} from '../../components/useModalState';
 import {DataTable, type Column, type SortState} from '../../components/DataTable';
 import {Pagination} from '../../components/Pagination';
 import {
@@ -39,6 +41,10 @@ import {ErrorText, PageHeader, PrimaryButton, SecondaryButton, SelectField, Tabl
  * Admin → Connectors → Git (GC1.8 / #200). Lets an admin connect, test, edit,
  * remove, enable/disable, and sync git providers (GitHub, Bitbucket, GitLab incl.
  * self-hosted) entirely from the dashboard — no config-file edit, no CLI.
+ *
+ * The add/edit form lives in a `FormModal` (#238) opened from the header's
+ * "＋ Add git provider" button or a row's "Edit" — the connected-providers table is
+ * the page's primary content, and nothing renders over it unasked.
  *
  * The form is PROVIDER-DRIVEN: choosing a type renders the right container label,
  * auth-method selector, and token field(s) (Bitbucket `app_password` is the only
@@ -307,15 +313,22 @@ function ProbeResultView({result}: {result: GitProviderProbeResult}): JSX.Elemen
 }
 
 /**
- * The add/edit form. `editing` pre-fills the fields for an existing DB provider
- * (token stays blank → keep the stored secret); `null` is the add form (token
- * required). Keyed by the caller so switching add ⇄ edit remounts a clean state.
+ * The add/edit form, rendered as the shared create/edit dialog (#236/#238).
+ * `editing` pre-fills the fields for an existing DB provider (token stays blank →
+ * keep the stored secret); `null` is the add form (token required). The caller
+ * renders it only while its modal is open and keys it on `editing?.id ?? 'new'`,
+ * so switching add ⇄ edit ⇄ another row remounts a clean state.
+ *
+ * `FormModal` owns Save / Cancel / the write error and the close-guard-while-
+ * pending contract — this component supplies only the fields plus the draft
+ * "Test connection" affordance, which belongs to the body because it acts on the
+ * unsaved draft rather than committing it.
  *
  * `onCreated` (#211) fires with the server's created provider on the CREATE path
  * only — the page uses it to auto-open the new row's repo-scope editor so the
  * admin narrows the scope before the first sync. Edits never fire it.
  */
-function ProviderForm({
+function ProviderFormModal({
     editing,
     onDone,
     onCreated,
@@ -378,7 +391,10 @@ function ProviderForm({
     // re-entered token, the admin uses the row's "Test" button instead.
     const canTest = token.trim() !== '' && container.trim() !== '' && hasUsername;
     const canSave = container.trim() !== '' && hasUsername && (isEdit || token.trim() !== '');
-    const pending = create.isPending || update.isPending;
+    // `isEdit` picks the path, so exactly one of the two mutations is ever in
+    // play — select it once rather than testing both at each use.
+    const write = isEdit ? update : create;
+    const pending = write.isPending;
 
     function submit(): void {
         const input = buildInput();
@@ -395,7 +411,18 @@ function ProviderForm({
     }
 
     return (
-        <Card title={isEdit ? `Edit ${meta.label} provider` : 'Add git provider'}>
+        <FormModal
+            title={isEdit ? `Edit ${meta.label} provider` : 'Add git provider'}
+            onClose={onDone}
+            onSubmit={submit}
+            submitLabel={isEdit ? 'Save changes' : 'Add provider'}
+            pending={pending}
+            submitDisabled={!canSave}
+            // The write's error. The draft test's error is NOT surfaced here —
+            // it belongs beside the Test button that produced it.
+            error={write.isError ? write.error : null}
+            testId="git-provider-modal"
+        >
             <div className="flex flex-col gap-4">
                 <div className="flex flex-wrap items-end gap-4">
                     <SelectField label="Provider type" value={type} onChange={changeType}>
@@ -463,33 +490,22 @@ function ProviderForm({
                     ) : null}
                 </div>
 
+                {/* The draft test acts on the UNSAVED form, so it lives with the
+                    fields — the modal's footer is reserved for the write (Save)
+                    and the close affordance (Cancel). */}
                 <div className="flex flex-wrap items-center gap-3">
-                    <PrimaryButton type="button" onClick={submit} disabled={!canSave || pending}>
-                        {pending ? 'Saving…' : 'Save'}
-                    </PrimaryButton>
                     <AccentButton
                         onClick={() => testDraft.mutate(buildInput())}
-                        disabled={!canTest || testDraft.isPending}
+                        disabled={!canTest || testDraft.isPending || pending}
                         title={canTest ? undefined : 'Enter a token to test the connection'}
                     >
                         {testDraft.isPending ? 'Testing…' : 'Test connection'}
                     </AccentButton>
-                    {isEdit ? (
-                        <button
-                            type="button"
-                            onClick={onDone}
-                            className="text-sm font-medium text-muted hover:text-foreground"
-                        >
-                            Cancel
-                        </button>
-                    ) : null}
                     {testDraft.data ? <ProbeResultView result={testDraft.data} /> : null}
                     <ErrorText error={testDraft.isError ? testDraft.error : null} />
-                    <ErrorText error={create.isError ? create.error : null} />
-                    <ErrorText error={update.isError ? update.error : null} />
                 </div>
             </div>
-        </Card>
+        </FormModal>
     );
 }
 
@@ -1089,6 +1105,7 @@ function ProviderRow({
                                 <button
                                     type="button"
                                     onClick={() => onEdit(provider)}
+                                    aria-haspopup="dialog"
                                     className="text-sm font-medium text-accent hover:underline"
                                 >
                                     Edit
@@ -1167,8 +1184,9 @@ function IdentityMappingLink(): JSX.Element {
 /**
  * Cold-start onboarding (GC1.9 / #201): shown only when there is genuinely nothing
  * yet — no providers connected AND no git snapshots collected. Fixes the previous
- * empty-dropdown confusion (finding #3) by pointing the admin at the add form and
- * flagging the identity-mapping caveat up front.
+ * empty-dropdown confusion (finding #3) by pointing the admin at the add
+ * affordance — the header's "＋ Add git provider" button since #238 — and flagging
+ * the identity-mapping caveat up front.
  */
 function GitEmptyState(): JSX.Element {
     return (
@@ -1177,7 +1195,7 @@ function GitEmptyState(): JSX.Element {
             testId="git-empty-state"
             icon={<span aria-hidden>🔌</span>}
             title="Connect your first git provider"
-            description="No git providers are connected and no activity has been collected yet. Add a provider below to start analyzing commits, PRs, and churn."
+            description="No git providers are connected and no activity has been collected yet. Use “＋ Add git provider” above to start analyzing commits, PRs, and churn."
         >
             <p className="text-sm text-muted">
                 After connecting, only developers whose git identities are mapped will appear in the
@@ -1188,14 +1206,16 @@ function GitEmptyState(): JSX.Element {
 }
 
 /**
- * Admin → Connectors → Git. Connected-provider list + provider-driven add/edit
- * form + per-provider repo-scope editor + cold-start onboarding. Reached only by
- * admins (route + API both gate it).
+ * Admin → Connectors → Git. Connected-provider list (the page's primary content)
+ * + the provider-driven add/edit form in a modal opened from the header's
+ * "＋ Add git provider" button or a row's "Edit" (#236/#238) + per-provider
+ * repo-scope editor + cold-start onboarding. Reached only by admins (route + API
+ * both gate it).
  */
 export function AdminGitProviders(): JSX.Element {
     const providers = useAdminGitProviders();
     const dataSources = useAdminDataSources();
-    const [editing, setEditing] = useState<AdminGitProvider | null>(null);
+    const formModal = useModalState<AdminGitProvider>();
     // The provider the admin JUST connected (#211): its row mounts with the
     // repo-scope editor open, prompting a selection before the first sync.
     // Cleared when that editor closes (save or cancel) so it never re-prompts.
@@ -1218,16 +1238,25 @@ export function AdminGitProviders(): JSX.Element {
             <PageHeader
                 title="Git providers"
                 description="Connect GitHub, Bitbucket, and GitLab repositories for analysis."
+                actions={
+                    <PrimaryButton onClick={formModal.openCreate} ariaHasPopup="dialog">
+                        ＋ Add git provider
+                    </PrimaryButton>
+                }
             />
             {showEmptyState ? <GitEmptyState /> : null}
-            <ProviderForm
-                key={editing?.id ?? 'new'}
-                editing={editing}
-                onDone={() => setEditing(null)}
-                // Creating a second provider deliberately moves the one-shot
-                // prompt to it — the previous provider's prompt is dismissed.
-                onCreated={(created) => setJustCreatedId(created.id)}
-            />
+            {/* No form renders until the admin asks for one. Keyed so add ⇄ edit
+                ⇄ another row always remounts clean fields (#236 criterion 3). */}
+            {formModal.mode !== 'closed' ? (
+                <ProviderFormModal
+                    key={formModal.editing?.id ?? 'new'}
+                    editing={formModal.editing}
+                    onDone={formModal.close}
+                    // Creating a second provider deliberately moves the one-shot
+                    // prompt to it — the previous provider's prompt is dismissed.
+                    onCreated={(created) => setJustCreatedId(created.id)}
+                />
+            ) : null}
             {hasProviders ? (
                 <p className="text-sm text-muted" data-testid="identity-mapping-note">
                     Only developers whose git identities are mapped produce activity data — unmatched
@@ -1241,7 +1270,8 @@ export function AdminGitProviders(): JSX.Element {
                     <p className="text-sm text-danger">Failed to load: {providers.error.message}</p>
                 ) : !hasProviders ? (
                     <p className="text-sm text-muted">
-                        No providers connected yet. Add one above to start analyzing git activity.
+                        No providers connected yet. Use “＋ Add git provider” above to start
+                        analyzing git activity.
                     </p>
                 ) : (
                     <Table
@@ -1261,7 +1291,7 @@ export function AdminGitProviders(): JSX.Element {
                             <ProviderRow
                                 key={p.id}
                                 provider={p}
-                                onEdit={setEditing}
+                                onEdit={formModal.openEdit}
                                 promptScope={p.id === justCreatedId}
                                 onScopeClose={() => setJustCreatedId(null)}
                             />

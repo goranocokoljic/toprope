@@ -240,9 +240,15 @@ primary "＋ New …" button in the screen header (`aria-haspopup="dialog"`) for
 create, a per-row "Edit" action for edit — so no screen hand-rolls a dialog, a
 footer, or a close-guard.
 
-**No consumers yet.** #237 lands the foundation only; the admin screens are
-migrated onto it in follow-ups, and `AdminGitProviders` still hand-rolls its own
-footer and close-guard until then.
+**Adoption.** #237 landed the foundation; `AdminGitProviders` is the first
+consumer (#238) — its add/edit form is a `FormModal` opened from the header's
+"＋ Add git provider" button or a row's "Edit". The remaining admin screens are
+migrated onto it in the rest of the epic. `RepoScopeModal` stays on the raw
+`Modal`: it is a scope picker with its own "Save scope" footer, not a create/edit
+form.
+
+The screen's primary affordance goes in `PageHeader`'s optional `actions` slot,
+as a `PrimaryButton` with `ariaHasPopup="dialog"`.
 
 ### `<Modal>`
 The accessible primitive: portal-rendered, focus moved in on open and restored
