@@ -1811,6 +1811,15 @@ describe('declareEarliestSyncedFloor — the admin recovery path (#233)', () => 
         ['a non-UTC offset instant', '2025-01-01T00:00:00+02:00'],
         ['a second-precision instant (no millis)', '2025-01-01T00:00:00Z'],
         ['an expanded-year instant', '+010000-01-01T00:00:00.000Z'],
+        // The two below pass the shape regex — they exist so the validator's other two
+        // checks are not free to be deleted silently:
+        //  - only the ROUND-TRIP rejects this; without it the floor would be stored as
+        //    2025-03-02, two days NEWER than declared, which is the double-count
+        //    direction — written by the very command meant to prevent it.
+        ['a shape-valid non-existent date', '2025-02-30T00:00:00.000Z'],
+        //  - only the NaN guard rejects this; without it toISOString() throws RangeError
+        //    out of the typed result and the CLI dies with a stack trace.
+        ['a shape-valid out-of-range month', '2025-13-01T00:00:00.000Z'],
     ])('refuses %s as a floor (must be a canonical UTC ISO instant)', (_label, floor) => {
         markLegacy();
         expect(declareEarliestSyncedFloor(db, 'github', 'test-org', floor, NOW)).toEqual({
