@@ -219,6 +219,33 @@ describe('AdminUsers page', () => {
         });
     });
 
+    it('gates the developer link until its options have loaded', async () => {
+        let releaseDevelopers: (() => void) | undefined;
+        const gate = new Promise<void>((resolve) => {
+            releaseDevelopers = resolve;
+        });
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            if (String(url).includes('/api/admin/developers')) await gate;
+            return base!(url, init);
+        });
+
+        renderPage(<AdminUsers />);
+        await screen.findByText('admin@test.com');
+        openCreateUserModal();
+
+        // While the options are in flight the select is inert and says so — an
+        // enabled "— none —"-only list would read as "there are no developers".
+        const select = screen.getByLabelText('Linked developer') as HTMLSelectElement;
+        expect(select).toBeDisabled();
+        expect(screen.getByRole('option', {name: 'Loading developers…'})).toBeInTheDocument();
+
+        releaseDevelopers?.();
+        await screen.findByRole('option', {name: 'Alice Dev'});
+        expect(select).toBeEnabled();
+        expect(screen.getByRole('option', {name: '— none —'})).toBeInTheDocument();
+    });
+
     it('the one-time temp password survives the modal closing, shows once, and is dismissible', async () => {
         renderPage(<AdminUsers />);
         await screen.findByText('admin@test.com');

@@ -86,8 +86,18 @@ function CreateUserModal({
                     <option value="developer">Developer</option>
                     <option value="admin">Admin</option>
                 </SelectField>
-                <SelectField label="Linked developer" value={developerId} onChange={setDeveloperId}>
-                    <option value="">— none —</option>
+                {/* The developer list now loads when the dialog opens rather than
+                    with the page, so on a cold cache the options arrive after the
+                    first open. Gate the control until then: an enabled select
+                    offering only "— none —" reads as "there are no developers"
+                    and invites an unintended unlinked create. */}
+                <SelectField
+                    label="Linked developer"
+                    value={developerId}
+                    onChange={setDeveloperId}
+                    disabled={developers.isPending}
+                >
+                    <option value="">{developers.isPending ? 'Loading developers…' : '— none —'}</option>
                     {(developers.data ?? []).map((d) => (
                         <option key={d.id} value={d.id}>
                             {d.name}

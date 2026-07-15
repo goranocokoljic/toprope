@@ -67,11 +67,14 @@ export function SelectField({
     value,
     onChange,
     children,
+    disabled = false,
 }: {
     label: string;
     value: string;
     onChange: (next: string) => void;
     children: ReactNode;
+    /** Gate the control, e.g. while its options are still loading. */
+    disabled?: boolean;
 }): JSX.Element {
     return (
         <label className="flex flex-col gap-1">
@@ -79,7 +82,8 @@ export function SelectField({
             <select
                 value={value}
                 onChange={(e) => onChange(e.target.value)}
-                className="rounded-md border border-border bg-surface px-3 py-1.5 text-sm text-foreground"
+                disabled={disabled}
+                className="rounded-md border border-border bg-surface px-3 py-1.5 text-sm text-foreground disabled:opacity-50"
             >
                 {children}
             </select>
