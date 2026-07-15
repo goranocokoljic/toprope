@@ -57,7 +57,6 @@ function CreateUserModal({
     const developerGate = optionsGate(developers, {
         loading: 'Loading developers…',
         failed: 'Couldn’t load developers',
-        ready: '— none —',
     });
 
     function submit(): void {
@@ -82,7 +81,14 @@ function CreateUserModal({
             submitLabel="Create user"
             pendingLabel="Creating…"
             pending={create.isPending}
-            submitDisabled={!email.trim()}
+            // Also gate Save while the roster is in flight: `developerId` is ''
+            // until it arrives, and '' is ALSO the legitimate "— none —" value,
+            // so the gate on the select alone has nothing to bite on. Creating
+            // during that race silently lands developer_id: null, and the link
+            // is create-time-only — no row control can set it afterwards.
+            // A FAILED roster stays submittable: an admin who is told the list
+            // couldn't load and proceeds is making a deliberate unlinked create.
+            submitDisabled={!email.trim() || developers.isPending}
             error={create.isError ? create.error : null}
             testId="create-user-modal"
         >
@@ -103,7 +109,7 @@ function CreateUserModal({
                     onChange={setDeveloperId}
                     disabled={developerGate.disabled}
                 >
-                    <option value="">{developerGate.label}</option>
+                    <option value="">{developerGate.label ?? '— none —'}</option>
                     {(developers.data ?? []).map((d) => (
                         <option key={d.id} value={d.id}>
                             {d.name}

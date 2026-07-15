@@ -220,8 +220,11 @@ export function AdminReconciliation(): JSX.Element {
             {runModal.mode !== 'closed' ? (
                 <RunReconciliationModal onDone={runModal.close} onRan={setLastRun} />
             ) : null}
+            {/* role="status": the summary appears here AFTER the dialog unmounts and
+                focus returns to the header button, so it lands away from the user's
+                focus — the same reason the #211 scope prompt announces itself. */}
             {lastRun ? (
-                <p className="text-sm text-muted">
+                <p role="status" className="text-sm text-muted">
                     Reconciled {lastRun.period}: {lastRun.created} new, {lastRun.skipped} already tracked.
                 </p>
             ) : null}

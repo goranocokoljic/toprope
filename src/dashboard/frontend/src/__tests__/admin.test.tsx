@@ -226,12 +226,18 @@ function openCreateUserModal(): void {
 }
 
 /**
- * Drive the whole create flow: open the modal, fill the email, submit. The modal
- * closes on success, so a second create must open it again — the fields no
- * longer survive a create (they unmount with the dialog).
+ * Drive the whole create flow: open the modal, wait for the roster, fill the
+ * email, submit. The modal closes on success, so a second create must open it
+ * again — the fields no longer survive a create (they unmount with the dialog).
+ *
+ * The roster await is not ceremony: Save is gated until the developer list
+ * lands, because `developerId` is '' until then and '' is also the legitimate
+ * "— none —", so an early submit would silently create an unlinked user. Tests
+ * that intend to drive the GATE itself call `openCreateUserModal` directly.
  */
-function createUser(email: string): void {
+async function createUser(email: string): Promise<void> {
     openCreateUserModal();
+    await screen.findByRole('option', {name: 'Alice Dev'});
     fireEvent.change(screen.getByLabelText('Email'), {target: {value: email}});
     fireEvent.click(screen.getByRole('button', {name: 'Create user'}));
 }
@@ -249,6 +255,14 @@ async function waitForTableLoaded(): Promise<void> {
 async function openAssignModal(): Promise<void> {
     fireEvent.click(screen.getByRole('button', {name: '＋ Assign subscription'}));
     await screen.findByRole('option', {name: 'Alice Dev'});
+}
+
+/** Every create-user POST the page sent, in order. */
+function userPosts(): [unknown, RequestInit?][] {
+    return fetchMock.mock.calls.filter(
+        (c) =>
+            String(c[0]).includes('/api/admin/users') && (c[1]?.method ?? 'GET').toUpperCase() === 'POST',
+    ) as [unknown, RequestInit?][];
 }
 
 /** The assign POST, if the page sent one. */
@@ -412,7 +426,7 @@ describe('AdminUsers page', () => {
     it('trims the email and sends a null developer link when none is chosen', async () => {
         renderPage(<AdminUsers />);
         await screen.findByText('admin@test.com');
-        createUser('  padded@test.com  ');
+        await createUser('  padded@test.com  ');
 
         await waitFor(() => {
             const post = [...fetchMock.mock.calls]
@@ -455,6 +469,35 @@ describe('AdminUsers page', () => {
         expect(screen.getByRole('option', {name: '— none —'})).toBeInTheDocument();
     });
 
+    it('cannot create while the roster is still loading — the link is create-time-only', async () => {
+        let releaseDevelopers: (() => void) | undefined;
+        const gate = new Promise<void>((resolve) => {
+            releaseDevelopers = resolve;
+        });
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            if (String(url).includes('/api/admin/developers')) await gate;
+            return base!(url, init);
+        });
+
+        renderPage(<AdminUsers />);
+        await screen.findByText('admin@test.com');
+        openCreateUserModal();
+        fireEvent.change(screen.getByLabelText('Email'), {target: {value: 'racer@test.com'}});
+
+        // developerId is '' until the roster lands, and '' is ALSO "— none —" —
+        // so submitting here would silently create an unlinked user, and no row
+        // control can link one afterwards. Save must wait for the roster.
+        const save = screen.getByRole('button', {name: 'Create user'});
+        expect(save).toBeDisabled();
+        fireEvent.click(save);
+        expect(userPosts()).toHaveLength(0);
+
+        releaseDevelopers?.();
+        await screen.findByRole('option', {name: 'Alice Dev'});
+        expect(save).toBeEnabled();
+    });
+
     it('keeps the developer link gated when the roster FAILS to load — not an enabled "— none —"', async () => {
         const base = fetchMock.getMockImplementation();
         fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
@@ -484,7 +527,7 @@ describe('AdminUsers page', () => {
     it('the one-time temp password survives the modal closing, shows once, and is dismissible', async () => {
         renderPage(<AdminUsers />);
         await screen.findByText('admin@test.com');
-        createUser('new@test.com');
+        await createUser('new@test.com');
 
         // The reveal outlives the dialog: it is on the page, not inside a
         // dismissed modal — and it is rendered exactly once.
@@ -507,6 +550,11 @@ describe('AdminUsers page', () => {
         await screen.findByText('admin@test.com');
 
         openCreateUserModal();
+        // Settle the roster first, so this test isolates the EMAIL gate — Save is
+        // independently gated while the developer list is in flight (see the
+        // create-time-only link test above).
+        await screen.findByRole('option', {name: 'Alice Dev'});
+
         // An empty (or whitespace-only) email cannot be submitted.
         expect(screen.getByRole('button', {name: 'Create user'})).toBeDisabled();
         fireEvent.change(screen.getByLabelText('Email'), {target: {value: '   '}});
@@ -543,7 +591,7 @@ describe('AdminUsers page', () => {
 
         renderPage(<AdminUsers />);
         await screen.findByText('admin@test.com');
-        createUser('new@test.com');
+        await createUser('new@test.com');
         expect(await screen.findByRole('button', {name: 'Creating…'})).toBeInTheDocument();
 
         // Cancel, Esc, ×, and a genuine backdrop click are all inert mid-write.
@@ -582,7 +630,7 @@ describe('AdminUsers page', () => {
 
         renderPage(<AdminUsers />);
         await screen.findByText('admin@test.com');
-        createUser('dupe@test.com');
+        await createUser('dupe@test.com');
 
         expect(await screen.findByText(/Email already registered/)).toBeInTheDocument();
         // The dialog stays open with the admin's values — a failed write must not
@@ -1512,7 +1560,7 @@ describe('AdminIdentities page', () => {
         expect((screen.getByLabelText('GitHub username') as HTMLInputElement).value).toBe('alice-renamed');
     });
 
-    it('gates the Team select while the roster loads, and keeps it gated when the roster FAILS', async () => {
+    it('gates the Team select while the roster loads, keeping the developer’s current team', async () => {
         let releaseTeams: (() => void) | undefined;
         const gate = new Promise<void>((resolve) => {
             releaseTeams = resolve;

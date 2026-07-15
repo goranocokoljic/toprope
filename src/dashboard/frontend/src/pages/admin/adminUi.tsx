@@ -161,17 +161,30 @@ export function ErrorText({error}: {error: Error | null}): JSX.Element | null {
  */
 export function optionsGate(
     query: {isPending: boolean; isError: boolean},
-    labels: {loading: string; failed: string; ready: string},
-): {disabled: boolean; label: string} {
+    labels: {loading: string; failed: string},
+): {disabled: boolean; label: string | null} {
     if (query.isPending) return {disabled: true, label: labels.loading};
     if (query.isError) return {disabled: true, label: labels.failed};
-    return {disabled: false, label: labels.ready};
+    // `null`, not a caller-supplied "ready" label: a screen that renders its
+    // placeholder only while gated has no ready label to give, and forcing one
+    // means passing a dummy string that is never read.
+    return {disabled: false, label: null};
 }
 
-/** A one-time temporary-password banner shown after create / reset. */
+/**
+ * A one-time temporary-password banner shown after create / reset.
+ *
+ * `role="status"` is load-bearing since #239: the reveal now appears on the PAGE
+ * after the create dialog unmounts and `Modal` restores focus to the header
+ * button — so it lands nowhere near the user's focus. It is shown exactly once
+ * and cannot be recovered, so an unannounced reveal is a lost password.
+ */
 export function TempPasswordBanner({password, onDismiss}: {password: string; onDismiss: () => void}): JSX.Element {
     return (
-        <div className="flex items-center justify-between gap-4 rounded-md border border-accent/40 bg-accent-soft px-4 py-3">
+        <div
+            role="status"
+            className="flex items-center justify-between gap-4 rounded-md border border-accent/40 bg-accent-soft px-4 py-3"
+        >
             <div className="text-sm text-foreground">
                 Temporary password (shown once — copy it now):{' '}
                 <code className="font-mono font-semibold">{password}</code>

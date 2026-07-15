@@ -45,7 +45,6 @@ function AssignSubscriptionModal({onDone}: {onDone: () => void}): JSX.Element {
     const developerGate = optionsGate(developers, {
         loading: 'Loading developers…',
         failed: 'Couldn’t load developers',
-        ready: 'Select…',
     });
 
     function submit(): void {
@@ -93,7 +92,7 @@ function AssignSubscriptionModal({onDone}: {onDone: () => void}): JSX.Element {
                     onChange={setDeveloperId}
                     disabled={developerGate.disabled}
                 >
-                    <option value="">{developerGate.label}</option>
+                    <option value="">{developerGate.label ?? 'Select…'}</option>
                     {(developers.data ?? []).map((d) => (
                         <option key={d.id} value={d.id}>
                             {d.name}

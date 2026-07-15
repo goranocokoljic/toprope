@@ -106,7 +106,6 @@ function IdentityFormModal({dev, onDone}: {dev: AdminDeveloper; onDone: () => vo
     const teamGate = optionsGate(teams, {
         loading: 'Loading teams…',
         failed: 'Couldn’t load teams',
-        ready: '',
     });
 
     function set<K extends keyof IdentityDraft>(key: K, value: string): void {
@@ -172,8 +171,13 @@ function IdentityFormModal({dev, onDone}: {dev: AdminDeveloper; onDone: () => vo
                             {/* Until the roster resolves, the placeholder carries the
                                 developer's CURRENT team as its value: an enabled empty
                                 select would read as "this developer has no team", and a
-                                blank value would mis-seed the Move below. */}
-                            {teamGate.disabled ? <option value={dev.team}>{teamGate.label}</option> : null}
+                                blank value would mis-seed the Move below. Only when the
+                                list is genuinely empty — a failed REFETCH keeps the
+                                cached teams, and the placeholder would then duplicate
+                                the real option's value. */}
+                            {teamGate.disabled && activeTeams.length === 0 ? (
+                                <option value={dev.team}>{teamGate.label}</option>
+                            ) : null}
                             {activeTeams.map((t) => (
                                 <option key={t.name} value={t.name}>
                                     {t.name}
@@ -237,7 +241,15 @@ export function AdminIdentities(): JSX.Element {
             />
             {/* No editor renders until the admin asks for one. Keyed on the
                 developer's id so switching rows always remounts clean fields
-                (#236 criterion 3). */}
+                (#236 criterion 3).
+
+                This is the one screen that gates on `editing` rather than
+                `mode !== 'closed'` like its five siblings: it is EDIT-ONLY (a
+                developer arrives from discovery, never from a "＋ New" button),
+                and `editing` is what narrows the non-null `dev` prop below. The
+                consequence is deliberate: wiring an `openCreate()` here would
+                open nothing. If this screen ever grows a create mode, switch the
+                gate to `mode` rather than adding a null-check to the editor. */}
             {formModal.editing ? (
                 <IdentityFormModal
                     key={formModal.editing.id}
