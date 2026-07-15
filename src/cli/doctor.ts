@@ -551,9 +551,16 @@ function countNeverSyncedProviders(
  *    bounded catch-up is working as designed and self-resolves; it is reported because
  *    "working" and "current" are not the same claim.
  *
- * The all-clear is only claimed for providers that have actually synced — a provider
- * with no cursor is neither stalled nor lagging, and calling it "current" would be the
- * same category of unearned claim.
+ * The all-clear deliberately reports what was MEASURED — "no stalled or lagging
+ * providers" — rather than asserting the data is current, because it is reached by
+ * INFERENCE (both readers came back empty), and that inference has holes. A provider
+ * with an open streak of 1-2 held runs is below the stall threshold and is excluded
+ * from lagging (its cursor is held, so it is not "advancing"), so it falls through
+ * both readers while its data may be months old; a provider whose `listRepos` returns
+ * an empty list advances its cursor forever while importing nothing. "Current" is a
+ * claim about the DATA and neither reader establishes it. A positive currency check
+ * would — see the follow-up in #248. Never-synced providers are counted out for the
+ * same reason: no cursor is not evidence of health.
  *
  * Takes the ALREADY-resolved provider set rather than re-resolving: resolution
  * decrypts each DB-connected provider's token, and this is a DB read, not a probe.
@@ -597,14 +604,10 @@ function checkGitStalls(
         const synced = providerConfigs.length - countNeverSyncedProviders(db, providerConfigs);
         results.push(
             synced === 0
-                ? pass(label, `No provider has synced yet — nothing to report`)
+                ? pass(label, 'No provider has synced yet — nothing to report')
                 : pass(
                       label,
-                      `${synced} of ${providerConfigs.length} provider(s) current${
-                          synced < providerConfigs.length
-                              ? `; ${providerConfigs.length - synced} not synced yet`
-                              : ''
-                      }`,
+                      `No stalled or lagging providers (${synced} of ${providerConfigs.length} synced)`,
                   ),
         );
     }

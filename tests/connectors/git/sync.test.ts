@@ -3144,6 +3144,14 @@ describe('GitSync — stalled-provider detection (#235)', () => {
             // above prove the boundary ARITHMETIC; this proves the DATA lands exactly
             // once — the invariant the arithmetic exists to protect.
             const devId = seedDev(db, 'alice');
+            // Clock frozen at midday: the day offsets below are exact multiples of 24h,
+            // so `boundary` inherits the WALL-CLOCK TIME-OF-DAY of the run. On the real
+            // clock, a suite running within an hour of UTC midnight pushes `morning` or
+            // `afternoon` onto an adjacent UTC day and the split never happens — the
+            // test then fails for a reason that has nothing to do with the merge. Midday
+            // keeps both commits on the same UTC day by construction.
+            vi.useFakeTimers();
+            vi.setSystemTime(new Date('2026-07-15T12:00:00.000Z'));
             // Cursor 45d back → run 1 covers [c, c+30d], run 2 covers [c+30d, now].
             const cursor = new Date(Date.now() - 45 * DAY_MS).toISOString();
             writeState(FORWARD_KEY, cursor);

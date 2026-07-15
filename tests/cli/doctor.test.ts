@@ -379,29 +379,36 @@ describe('runDoctor', () => {
             expect(allOutput).toContain('exclude_repos');
         });
 
-        it('passes when every provider is current (negative control)', async () => {
+        it('reports the all-clear as what was measured, not as a currency claim', async () => {
             seedCursor('acme', 1);
 
             const result = await runDoctor(db, await reachableGitConfig(), tmpConfigPath, MIGRATIONS_DIR);
 
             expect(result).toBe(true);
-            expect(output.join('\n')).toContain('1 of 1 provider(s) current');
+            const allOutput = [...output, ...errors].join('\n');
+            expect(allOutput).toContain('No stalled or lagging providers (1 of 1 synced)');
+            // The all-clear is reached by INFERENCE (both readers empty), and that
+            // inference has holes — a streak of 1-2 held runs is below the stall
+            // threshold yet excluded from lagging, so it falls through both while its
+            // data may be months old. Reporting what was measured is earned; "current"
+            // is not. See #248.
+            expect(allOutput).not.toContain('provider(s) current');
         });
 
-        it('does NOT claim a never-synced provider is current', async () => {
+        it('does NOT claim anything about a never-synced provider', async () => {
             // No cursor seeded at all. The control above must depend on its seeded
-            // cursor — if this printed the same "current" line, that control could not
-            // fail for the right reason, and a fresh install would be told git data is
-            // current before a single sync had ever run.
+            // cursor — if this printed the same all-clear line, that control could not
+            // fail for the right reason, and a fresh install would get a green line
+            // before a single sync had ever run.
             const result = await runDoctor(db, await reachableGitConfig(), tmpConfigPath, MIGRATIONS_DIR);
 
             expect(result).toBe(true);
             const allOutput = [...output, ...errors].join('\n');
             expect(allOutput).toContain('No provider has synced yet');
-            expect(allOutput).not.toContain('provider(s) current');
+            expect(allOutput).not.toContain('No stalled or lagging providers');
         });
 
-        it('counts the never-synced separately from the current ones', async () => {
+        it('counts the never-synced out of the synced total', async () => {
             seedCursor('acme', 1);
 
             await runDoctor(
@@ -411,7 +418,7 @@ describe('runDoctor', () => {
                 MIGRATIONS_DIR,
             );
 
-            expect(output.join('\n')).toContain('1 of 2 provider(s) current; 1 not synced yet');
+            expect(output.join('\n')).toContain('No stalled or lagging providers (1 of 2 synced)');
         });
 
         it('reports EVERY stalled provider, with a count matching the detail list', async () => {
@@ -451,7 +458,7 @@ describe('runDoctor', () => {
             // A bounded catch-up is working as designed and self-resolves, so it is a
             // pass — it just must not claim the data is current.
             expect(result).toBe(true);
-            expect(allOutput).not.toContain('provider(s) current');
+            expect(allOutput).not.toContain('No stalled or lagging providers');
         });
 
         it('reports a stalled provider as stalled only — never also as catching up', async () => {
@@ -511,7 +518,7 @@ describe('runDoctor', () => {
             // One held run is transient and self-healing; failing doctor on it would
             // train the reader to ignore the check.
             expect(result).toBe(true);
-            expect(output.join('\n')).toContain('1 of 1 provider(s) current');
+            expect(output.join('\n')).toContain('No stalled or lagging providers');
         });
 
         it('skips the stall check entirely when the git connector is disabled', async () => {
