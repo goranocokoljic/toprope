@@ -1991,5 +1991,95 @@ describe('GitSync.syncProviders — first-sync earliest-watermark recording (#22
             // `since` — else the un-fetched span below the old watermark is lost.
             expect(readState(EARLIEST_KEY)).toBeUndefined();
         });
+
+        it('re-covers the window on the NEXT run after a held cursor — no gap AND no double-count (#231 acceptance)', async () => {
+            // The headline acceptance criterion: a run whose fetch was incomplete
+            // persists nothing and holds the cursor, so the NEXT (successful) run
+            // re-fetches the whole [since, now] window and lands the data exactly once.
+            // This is the end-to-end proof — the hold is worthless if recovery doesn't
+            // actually fill the gap, and dangerous if it double-counts the additive commit.
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+
+            // Run 1: bad-repo throws, good-repo returns alice's commit c-good. Provider
+            // incomplete → NOTHING written, cursor held.
+            createGitProvider.mockReturnValueOnce(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('bad-repo'), makeRepo('good-repo')]),
+                    getCommits: vi.fn().mockImplementation(async (repo: string) => {
+                        if (repo === 'bad-repo') throw new Error('GitHub API error 500');
+                        return [makeProviderCommit('alice', '2024-01-15T10:00:00Z', 'c-good')];
+                    }),
+                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+                }),
+            );
+            await new GitSync({enabled: false}).syncProviders(db, [CONFIG]);
+            expect(countSnapshots(db)).toBe(0);
+            expect(readState(FORWARD_KEY)).toBeUndefined();
+
+            // Run 2: both repos succeed. Because the cursor was held, this run re-fetches
+            // the WHOLE window — both repos' commits (c-good re-delivered by good-repo,
+            // plus c-bad now available from bad-repo) for alice on 01-15.
+            createGitProvider.mockReturnValueOnce(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('bad-repo'), makeRepo('good-repo')]),
+                    getCommits: vi.fn().mockImplementation(async (repo: string) => {
+                        if (repo === 'bad-repo') {
+                            return [makeProviderCommit('alice', '2024-01-15T11:00:00Z', 'c-bad')];
+                        }
+                        return [makeProviderCommit('alice', '2024-01-15T10:00:00Z', 'c-good')];
+                    }),
+                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+                }),
+            );
+            await new GitSync({enabled: false}).syncProviders(db, [CONFIG]);
+
+            // Exactly the two distinct commits, once each: 3 would mean run 1's partial
+            // c-good was persisted and additively re-counted (the double-count the hold
+            // exists to prevent); <2 would mean a gap. Neither.
+            const row = db
+                .prepare(`SELECT commits FROM git_snapshots WHERE date = '2024-01-15'`)
+                .get() as {commits: number} | undefined;
+            expect(row?.commits).toBe(2);
+            // And the cursor now advanced, since run 2 fully covered the window.
+            expect(readState(FORWARD_KEY)).toBeDefined();
+        });
+
+        it('isolates providers: a complete sibling still writes + advances while an incomplete provider is held', async () => {
+            // The all-or-nothing skip is per-provider inside a loop feeding one shared
+            // write transaction. A healthy provider must NOT be poisoned by a sibling's
+            // incomplete fetch — it still persists its data and advances its own cursor,
+            // while the incomplete sibling writes nothing and holds its cursor.
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+
+            const githubProvider = makeMockProvider({
+                name: 'github',
+                listRepos: vi.fn().mockResolvedValue([makeRepo('gh-repo')]),
+                getCommits: vi.fn().mockResolvedValue([makeProviderCommit('alice', '2024-01-15T10:00:00Z', 'gh-1')]),
+                getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+            });
+            const bitbucketProvider = makeMockProvider({
+                name: 'bitbucket',
+                listRepos: vi.fn().mockResolvedValue([makeRepo('bb-repo')]),
+                getCommits: vi.fn().mockRejectedValue(new Error('Bitbucket API error 500')),
+            });
+            createGitProvider
+                .mockReturnValueOnce(githubProvider)
+                .mockReturnValueOnce(bitbucketProvider);
+
+            const result = await new GitSync({enabled: true}).syncProviders(db, [
+                {type: 'github', org: 'myorg', auth: {type: 'token', api_token: 'token'}},
+                {type: 'bitbucket', workspace: 'myws', auth: {type: 'app_password', username: 'u', app_password: 'p'}},
+            ]);
+
+            // The healthy GitHub provider committed its data and advanced its cursor…
+            expect(result.snapshotsWritten).toBeGreaterThan(0);
+            expect(countSnapshots(db)).toBe(1);
+            expect(readState('git_last_sync:github:myorg')).toBe(result.lastSyncTime);
+            // …while the incomplete Bitbucket provider wrote nothing and held its cursor.
+            expect(readState('git_last_sync:bitbucket:myws')).toBeUndefined();
+            expect(result.errors.some((e) => /bb-repo.*Failed to fetch commits/.test(e))).toBe(true);
+        });
     });
 });
