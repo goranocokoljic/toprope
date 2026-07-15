@@ -1736,13 +1736,23 @@ describe('GitSync.syncProviders — sync-older-history backfill plumbing (#229)'
     // recent, already-counted PR must NOT inflate the recent row's prs_opened.
     it('re-delivered recent PRs do not double-count on backfill (max()-merge)', async () => {
         const devId = seedDev(db, 'alice');
-        // A recent snapshot as if the first sync already counted alice's PR that day.
+        // makeProviderPR attributes prs_opened→createdAt (2024-01-15) and
+        // prs_merged→mergedAt (2024-01-16), so seed BOTH day-rows as if the first
+        // sync already counted them — each on the row the re-delivery lands on, so
+        // both assertions are discriminating (additive would push either to 2).
         db.prepare(
             `INSERT INTO git_snapshots
              (id, developer_id, date, commits, lines_added, lines_removed, files_changed,
               prs_opened, prs_merged, review_comments_given, avg_time_to_merge_hours,
               code_churn_rate, ai_signature_score, avg_commit_size, commit_burst_count, data_source)
-             VALUES ('s-pr', ?, '2024-01-15', 0, 0, 0, 0, 1, 1, 0, 24, 0, 0, 0, 0, 'github')`,
+             VALUES ('s-pr-open', ?, '2024-01-15', 0, 0, 0, 0, 1, 0, 0, NULL, 0, 0, 0, 0, 'github')`,
+        ).run(devId);
+        db.prepare(
+            `INSERT INTO git_snapshots
+             (id, developer_id, date, commits, lines_added, lines_removed, files_changed,
+              prs_opened, prs_merged, review_comments_given, avg_time_to_merge_hours,
+              code_churn_rate, ai_signature_score, avg_commit_size, commit_burst_count, data_source)
+             VALUES ('s-pr-merge', ?, '2024-01-16', 0, 0, 0, 0, 0, 1, 0, 24, 0, 0, 0, 0, 'github')`,
         ).run(devId);
 
         // Backfill an OLDER slice; getPullRequests (fetched by `since` only) re-delivers
@@ -1760,12 +1770,15 @@ describe('GitSync.syncProviders — sync-older-history backfill plumbing (#229)'
             backfill: {since: '2023-07-01T00:00:00.000Z', until: '2024-01-01T00:00:00.000Z'},
         });
 
-        // max()-merge keeps the recent row at 1 — not 2 — despite the re-delivery.
-        const recent = db
-            .prepare(`SELECT prs_opened, prs_merged FROM git_snapshots WHERE developer_id = ? AND date = '2024-01-15'`)
-            .get(devId) as {prs_opened: number; prs_merged: number};
-        expect(recent.prs_opened).toBe(1);
-        expect(recent.prs_merged).toBe(1);
+        // max()-merge keeps each recent row at 1 — not 2 — despite the re-delivery.
+        const opened = db
+            .prepare(`SELECT prs_opened FROM git_snapshots WHERE developer_id = ? AND date = '2024-01-15'`)
+            .get(devId) as {prs_opened: number};
+        const merged = db
+            .prepare(`SELECT prs_merged FROM git_snapshots WHERE developer_id = ? AND date = '2024-01-16'`)
+            .get(devId) as {prs_merged: number};
+        expect(opened.prs_opened).toBe(1);
+        expect(merged.prs_merged).toBe(1);
     });
 });
 
@@ -1845,6 +1858,23 @@ describe('GitSync.syncProviders — first-sync earliest-watermark recording (#22
         await firstSync({firstSyncWindowMonths: 6});
         // The incremental run advances the forward cursor but leaves the watermark.
         expect(readState(EARLIEST_KEY)).toBe('2024-01-01T00:00:00.000Z');
+    });
+
+    it('does NOT raise a lower watermark a prior backfill wrote (first-sync clobber guard)', async () => {
+        // Route-reachable ordering (the UI hides the control pre-first-sync, but the
+        // backfill route does not require a cursor): a direct-API "sync older history"
+        // lowers the earliest watermark WITHOUT minting a forward cursor. The later
+        // FIRST forward sync then has a non-null firstSyncFloor (≈ now − window, which
+        // is NEWER than the backfilled floor) — it must not raise the watermark and
+        // reopen the double-count the guard exists to prevent.
+        const backfilled = '2020-01-01T00:00:00.000Z';
+        db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(EARLIEST_KEY, backfilled);
+        // No FORWARD_KEY → this is a genuine first forward sync.
+        await firstSync({firstSyncWindowMonths: 6});
+        // Watermark stays at the older backfilled floor, not raised to now − 6mo.
+        expect(readState(EARLIEST_KEY)).toBe(backfilled);
+        // The first sync did mint the forward cursor.
+        expect(readState(FORWARD_KEY)).toBeDefined();
     });
 
     it('does NOT record a watermark when the first sync fails to list repos', async () => {

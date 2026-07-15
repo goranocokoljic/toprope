@@ -278,13 +278,16 @@ function setProviderEarliestSyncTime(
  * an already-imported span.
  *
  * LEGACY LAZY DEFAULT: a provider whose first sync predates this change has no
- * stored watermark. Only there do we fall back to the initial-sync start (`now` −
- * the #228 default window). This is best-effort: if that legacy provider's first
- * sync used a non-default window (a custom months value, or the scheduled/CLI
- * walk-all path), the default can be too recent and the very FIRST backfill may
- * overlap and double-count. It is unavoidable without a data migration and shrinks
- * to nothing as legacy providers get their first post-change forward sync (which
- * records the real floor). New providers are never exposed to it.
+ * stored watermark. Only there do we fall back to `now` − the #228 default window.
+ * This is best-effort and PERMANENT for that provider: the forward path only records
+ * the floor on a genuine first sync (`storedCursor === null`), and a legacy provider
+ * already has a cursor, so its watermark is never back-recorded — the fallback does
+ * NOT self-heal on later forward syncs. It is also systematically too-recent: the
+ * true floor is `first_sync_time − window`, older than `now − window` by however
+ * long ago the provider first synced, so a legacy provider's FIRST backfill can
+ * re-cover and additively double-count that overlap (bounded by elapsed time since
+ * first sync). Correcting it needs a data migration (or a cursor reset that forces a
+ * true first sync). New providers — synced by this build — are never exposed to it.
  */
 export function getEarliestSyncedWatermark(
     db: Database.Database,
