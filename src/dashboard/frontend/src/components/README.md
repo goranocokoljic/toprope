@@ -234,10 +234,15 @@ it for free via `pageSize`.
 
 ## Modals (`Modal`, `FormModal`, `useModalState`)
 
-One shared dialog pattern. Every admin create/edit form is a `FormModal` opened
-from an explicit affordance — a primary "＋ New …" button in the screen header
-(`aria-haspopup="dialog"`) for create, a per-row "Edit" action for edit. No
-screen hand-rolls a dialog, a footer, or a close-guard.
+One shared dialog pattern. **Target state for epic #236:** every admin
+create/edit form becomes a `FormModal` opened from an explicit affordance — a
+primary "＋ New …" button in the screen header (`aria-haspopup="dialog"`) for
+create, a per-row "Edit" action for edit — so no screen hand-rolls a dialog, a
+footer, or a close-guard.
+
+**No consumers yet.** #237 lands the foundation only; the admin screens are
+migrated onto it in follow-ups, and `AdminGitProviders` still hand-rolls its own
+footer and close-guard until then.
 
 ### `<Modal>`
 The accessible primitive: portal-rendered, focus moved in on open and restored
@@ -256,7 +261,12 @@ while open. Use it directly only for a non-form dialog; forms use `FormModal`.
   <FormModal
     key={modal.editing?.id ?? 'new'}      // remount clean between rows
     title={modal.mode === 'edit' ? 'Edit provider' : 'Add git provider'}
-    onClose={modal.close}
+    // Reset the mutation too: it outlives the unmounted modal, so a reopen
+    // would otherwise render the last failed attempt's error on a clean form.
+    onClose={() => {
+      mutation.reset();
+      modal.close();
+    }}
     onSubmit={save}
     submitLabel={modal.mode === 'edit' ? 'Save changes' : 'Add provider'}
     pendingLabel="Saving…"
