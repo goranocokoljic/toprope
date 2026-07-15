@@ -45,6 +45,8 @@
   - _Why:_ Recurred in #157 (endorsePractice/orderPracticePool acted on draft/removed rows and surfaced a raw SQLITE_CONSTRAINT), #126 (recovery/complete logged unconditionally without a matching open initiate), and #151/#154 (audit actor/author ids had no FK and a mis-cased team recorded a hide that hid nothing yet 'succeeded').
 - **Wrap read-modify-write and multi-statement writes in a transaction.** Any read-then-write that preserves omitted fields, or any check-then-act/multi-statement mutation (including MAX(version)+1), must run inside a single db.transaction; a UNIQUE backstop turns a race into a fail-fast error, it does not serialize.
   - _Why:_ Recurred in #156 (setPracticeDetails did a non-atomic read-merge-UPSERT) and #151 (addContributionVersion computed MAX(version)+1 in a deferred tx with a doc overstating collision safety).
+- **A scoped/single-source write into a multi-source-aggregated row must merge, not replace.** When a row aggregates contributions from multiple sources under one key (e.g. git_snapshots keyed (developer, day) merging all providers), any write that runs over a SUBSET of sources must additively merge against the stored row; a full-column REPLACE upsert from a scoped run silently drops the other sources' same-day contribution. Prefer merge-on-conflict, or document the caveat and forbid the scoped path in multi-source deployments.
+  - _Why:_ #192: per-provider Sync-now (and CLI sync git --provider) ran runSync over one provider and the ON CONFLICT DO UPDATE SET ... = excluded.* rewrote the merged multi-provider day-row from just that provider's data; incremental cursors meant the loss persisted until a state reset.
 
 ## determinism
 
