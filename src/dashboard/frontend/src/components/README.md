@@ -340,9 +340,16 @@ outlive the dialog and render on the next clean open.
 are all inert (the `RepoScopeModal.requestClose` lesson) — a dismiss mid-write
 can't let the mutation land, or fail, invisibly. Don't re-implement it in a
 screen. `pending` must cover EVERY write the dialog can start, not just the
-primary one (see `AdminIdentities`: `save.isPending || move.isPending`), and
-`submitDisabled` is validation ONLY — never mix the in-flight state into it, as
-`FormModal` already folds `pending` into Save's disabled state.
+primary one (see `AdminIdentities`: `save.isPending || move.isPending`).
+
+`submitDisabled` is validation only: never fold the WRITE's own in-flight state
+into it, since `FormModal` already folds `pending` into Save's disabled state.
+A **read** query the form depends on is different — that is validity, not
+in-flight-ness, and it belongs in `submitDisabled`. `AdminUsers` gates Save on
+`developers.isPending` because `developerId` is `''` until the roster lands and
+`''` is also the legitimate "— none —", so an early submit silently creates an
+unlinked user and the link is create-time-only. Gate a read the form's validity
+depends on; don't gate the write twice.
 
 ### `useModalState<T>()`
 Open / which-row / reset state for a create-or-edit `FormModal`. Returns
