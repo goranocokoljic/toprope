@@ -1,12 +1,19 @@
 import {useState} from 'react';
 import {Card} from '../../components/Card';
+import {FormModal} from '../../components/FormModal';
+import {useModalState} from '../../components/useModalState';
 import {
     useIgnoreReconciliation,
     useReconciliation,
     useResolveReconciliation,
     useRunReconciliation,
 } from '../../hooks/useAdmin';
-import type {ReconciliationResult, ReconciliationResultType, ReconciliationStatus} from '../../api/types';
+import type {
+    ReconciliationResult,
+    ReconciliationResultType,
+    ReconciliationRunSummary,
+    ReconciliationStatus,
+} from '../../api/types';
 import {
     ErrorText,
     PageHeader,
@@ -49,28 +56,74 @@ function detailMessage(details: string | null): string | null {
     }
 }
 
-function RunForm(): JSX.Element {
+/**
+ * The run-parameters form, rendered as the shared dialog (#236/#243) — opened
+ * from the header's "Run reconciliation" button, so the results table is the
+ * page's primary content and no form renders unasked. `FormModal` owns Run /
+ * Cancel / the write error and the close-guard-while-pending contract; this
+ * supplies only the fields.
+ *
+ * `onRan` hands the run summary up to the PAGE before `onDone` closes the
+ * dialog: the "Reconciled 2026-06: 1 new…" line is the outcome of the run and
+ * has to stay readable next to the rows it produced, so it cannot live in a
+ * dismissed dialog.
+ *
+ * The caller renders this only while its modal is open, so a reopen always
+ * remounts clean fields (and a fresh mutation). There is no edit mode — this
+ * triggers a job rather than persisting an entity.
+ */
+function RunReconciliationModal({
+    onDone,
+    onRan,
+}: {
+    onDone: () => void;
+    onRan: (summary: ReconciliationRunSummary) => void;
+}): JSX.Element {
     const run = useRunReconciliation();
     const [period, setPeriod] = useState('');
     const [tolerance, setTolerance] = useState('');
-
-    function submit(): void {
-        const tol = tolerance.trim() === '' ? undefined : Number(tolerance);
-        run.mutate({
-            period: period.trim() || undefined,
-            tolerance: tol,
-        });
-    }
 
     const periodInvalid = period.trim() !== '' && !/^\d{4}-(0[1-9]|1[0-2])$/.test(period.trim());
     const tolInvalid =
         tolerance.trim() !== '' && (!Number.isFinite(Number(tolerance)) || Number(tolerance) < 0);
 
+    function submit(): void {
+        const tol = tolerance.trim() === '' ? undefined : Number(tolerance);
+        run.mutate(
+            {
+                period: period.trim() || undefined,
+                tolerance: tol,
+            },
+            // Close only on success: a failed run keeps the dialog open with the
+            // parameters intact, so the error can't hide behind a dismissed
+            // modal. Surface the summary on the page FIRST — it must survive this
+            // unmount. The hook invalidates the list, so the table refreshes
+            // behind us.
+            {
+                onSuccess: (summary) => {
+                    onRan(summary);
+                    onDone();
+                },
+            },
+        );
+    }
+
     return (
-        <Card title="Run reconciliation">
+        <FormModal
+            title="Run reconciliation"
+            onClose={onDone}
+            onSubmit={submit}
+            submitLabel="Run"
+            pendingLabel="Running…"
+            pending={run.isPending}
+            submitDisabled={periodInvalid || tolInvalid}
+            error={run.isError ? run.error : null}
+            testId="run-reconciliation-modal"
+        >
             <p className="mb-4 text-xs text-muted">
                 Matches imported expenses against the subscription registry for a period and queues
-                any mismatches below. Leave the period blank to reconcile the latest imported period.
+                any mismatches in the results table. Leave the period blank to reconcile the latest
+                imported period.
             </p>
             <div className="flex flex-wrap items-end gap-4">
                 <TextField label="Period (YYYY-MM)" value={period} onChange={setPeriod} placeholder="2026-06" />
@@ -81,10 +134,6 @@ function RunForm(): JSX.Element {
                     placeholder="1"
                     type="number"
                 />
-                <PrimaryButton onClick={submit} disabled={run.isPending || periodInvalid || tolInvalid}>
-                    {run.isPending ? 'Running…' : 'Run'}
-                </PrimaryButton>
-                <ErrorText error={run.isError ? run.error : null} />
             </div>
             {periodInvalid ? (
                 <p className="mt-2 text-sm text-danger">Period must be in YYYY-MM format.</p>
@@ -92,12 +141,7 @@ function RunForm(): JSX.Element {
             {tolInvalid ? (
                 <p className="mt-2 text-sm text-danger">Tolerance must be a non-negative number.</p>
             ) : null}
-            {run.isSuccess ? (
-                <p className="mt-3 text-sm text-muted">
-                    Reconciled {run.data.period}: {run.data.created} new, {run.data.skipped} already tracked.
-                </p>
-            ) : null}
-        </Card>
+        </FormModal>
     );
 }
 
@@ -142,18 +186,41 @@ function ResultActions({result}: {result: ReconciliationResult}): JSX.Element {
  * reconciliation, review the resulting mismatches, and resolve (with a note) or
  * ignore each one. Resolving records the note; ignoring suppresses the condition
  * so a later re-run won't re-raise it.
+ *
+ * The run-parameters form lives in a `FormModal` (#243) opened from the header's
+ * "Run reconciliation" button — the results table is the page's primary content.
+ * The per-row resolve/ignore stays INLINE: it is a small, contextual action on
+ * the row you are already reading, and a dialog per row would hide that context.
  */
 export function AdminReconciliation(): JSX.Element {
     const [status, setStatus] = useState<ReconciliationStatus | 'all'>('open');
     const results = useReconciliation(status);
+    const runModal = useModalState<never>();
+    // Owned by the PAGE, not the modal, so the run's outcome survives the dialog
+    // closing on success and stays readable beside the rows it produced.
+    const [lastRun, setLastRun] = useState<ReconciliationRunSummary | null>(null);
 
     return (
         <div className="space-y-6">
             <PageHeader
                 title="Reconciliation"
                 description="Match imported expenses against the subscription registry and resolve mismatches."
+                actions={
+                    <PrimaryButton onClick={runModal.openCreate} ariaHasPopup="dialog">
+                        Run reconciliation
+                    </PrimaryButton>
+                }
             />
-            <RunForm />
+            {/* No form renders until the admin asks for one; closing unmounts it,
+                so a reopen always starts empty (#236 criterion 3). */}
+            {runModal.mode !== 'closed' ? (
+                <RunReconciliationModal onDone={runModal.close} onRan={setLastRun} />
+            ) : null}
+            {lastRun ? (
+                <p className="text-sm text-muted">
+                    Reconciled {lastRun.period}: {lastRun.created} new, {lastRun.skipped} already tracked.
+                </p>
+            ) : null}
             <Card title="Reconciliation results">
                 <div className="mb-4 flex gap-2">
                     {STATUS_FILTERS.map((f) => (

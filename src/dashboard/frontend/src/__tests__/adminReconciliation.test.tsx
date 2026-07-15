@@ -88,6 +88,23 @@ function renderPage(node: JSX.Element): void {
     );
 }
 
+/** Open the run dialog from the header's primary affordance. */
+function openRunModal(): void {
+    fireEvent.click(screen.getByRole('button', {name: 'Run reconciliation'}));
+    expect(screen.getByRole('dialog', {name: 'Run reconciliation'})).toBeInTheDocument();
+}
+
+/** The body of the run POST the dialog fired, or undefined if it never fired. */
+function runBody(): Record<string, unknown> | undefined {
+    const call = fetchMock.mock.calls.find(
+        (c) =>
+            String(c[0]).includes('/api/admin/reconciliation/run') &&
+            (c[1]?.method ?? 'GET').toUpperCase() === 'POST',
+    ) as [unknown, RequestInit | undefined] | undefined;
+    if (!call) return undefined;
+    return JSON.parse(String(call[1]?.body)) as Record<string, unknown>;
+}
+
 describe('AdminReconciliation page', () => {
     it('lists open reconciliation results from the API', async () => {
         renderPage(<AdminReconciliation />);
@@ -130,18 +147,126 @@ describe('AdminReconciliation page', () => {
         expect(screen.queryByText('Dev 25')).not.toBeInTheDocument();
     });
 
-    it('runs reconciliation via POST', async () => {
+    it('renders NO run form until the admin asks for one, and the opener announces the dialog', async () => {
         renderPage(<AdminReconciliation />);
         await screen.findByText('Carol Dev');
+
+        // The form-above-table is gone: the results table is the primary content.
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+        expect(screen.queryByPlaceholderText('2026-06')).not.toBeInTheDocument();
+
+        const opener = screen.getByRole('button', {name: 'Run reconciliation'});
+        expect(opener).toHaveAttribute('aria-haspopup', 'dialog');
+        fireEvent.click(opener);
+        expect(screen.getByRole('dialog', {name: 'Run reconciliation'})).toBeInTheDocument();
+    });
+
+    it('runs reconciliation from the modal, sending the period and tolerance', async () => {
+        renderPage(<AdminReconciliation />);
+        await screen.findByText('Carol Dev');
+        openRunModal();
+
+        fireEvent.change(screen.getByPlaceholderText('2026-06'), {target: {value: '2026-06'}});
+        fireEvent.change(screen.getByPlaceholderText('1'), {target: {value: '2.5'}});
         fireEvent.click(screen.getByRole('button', {name: /^run$/i}));
+
         await waitFor(() => {
-            const post = fetchMock.mock.calls.find(
-                (c) =>
-                    String(c[0]).includes('/api/admin/reconciliation/run') &&
-                    (c[1]?.method ?? 'GET').toUpperCase() === 'POST',
-            );
-            expect(post).toBeTruthy();
+            const sent = runBody();
+            expect(sent).toBeTruthy();
+            expect(sent?.period).toBe('2026-06');
+            expect(sent?.tolerance).toBe(2.5);
         });
+
+        // Success closes the dialog, but the run summary outlives it — it is the
+        // outcome of the run and has to stay readable beside the rows.
+        await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+        expect(screen.getByText('Reconciled 2026-06: 1 new, 0 already tracked.')).toBeInTheDocument();
+    });
+
+    it('omits blank run parameters, as the inline form did', async () => {
+        renderPage(<AdminReconciliation />);
+        await screen.findByText('Carol Dev');
+        openRunModal();
+        fireEvent.click(screen.getByRole('button', {name: /^run$/i}));
+
+        await waitFor(() => expect(runBody()).toBeTruthy());
+        const sent = runBody();
+        expect(sent?.period).toBeUndefined();
+        expect(sent?.tolerance).toBeUndefined();
+    });
+
+    it('blocks Run on an invalid period or tolerance', async () => {
+        renderPage(<AdminReconciliation />);
+        await screen.findByText('Carol Dev');
+        openRunModal();
+
+        fireEvent.change(screen.getByPlaceholderText('2026-06'), {target: {value: '2026-13'}});
+        expect(screen.getByText('Period must be in YYYY-MM format.')).toBeInTheDocument();
+        expect(screen.getByRole('button', {name: /^run$/i})).toBeDisabled();
+
+        fireEvent.change(screen.getByPlaceholderText('2026-06'), {target: {value: '2026-06'}});
+        fireEvent.change(screen.getByPlaceholderText('1'), {target: {value: '-1'}});
+        expect(screen.getByText('Tolerance must be a non-negative number.')).toBeInTheDocument();
+        expect(screen.getByRole('button', {name: /^run$/i})).toBeDisabled();
+
+        // The gate is real, not just cosmetic: clicking sends nothing.
+        fireEvent.click(screen.getByRole('button', {name: /^run$/i}));
+        expect(runBody()).toBeUndefined();
+    });
+
+    it('reopens the run modal with clean fields', async () => {
+        renderPage(<AdminReconciliation />);
+        await screen.findByText('Carol Dev');
+
+        openRunModal();
+        fireEvent.change(screen.getByPlaceholderText('2026-06'), {target: {value: '2026-01'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+
+        openRunModal();
+        expect(screen.getByPlaceholderText('2026-06')).toHaveValue('');
+    });
+
+    it('cannot be dismissed while the run is in flight, and stays open on failure', async () => {
+        // Hold the run open so the dialog is observably pending.
+        let release: (() => void) | undefined;
+        const gate = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        const inner = fetchMock;
+        fetchMock = vi.fn(async (url: unknown, init?: RequestInit) => {
+            if (String(url).includes('/reconciliation/run')) {
+                await gate;
+                return json({error: 'reconcile failed'}, 500);
+            }
+            return inner(url, init) as Promise<Response>;
+        });
+        vi.stubGlobal('fetch', fetchMock);
+
+        renderPage(<AdminReconciliation />);
+        await screen.findByText('Carol Dev');
+        openRunModal();
+        fireEvent.click(screen.getByRole('button', {name: /^run$/i}));
+
+        // In flight: every close affordance is inert (#236 criterion 4).
+        await screen.findByRole('button', {name: 'Running…'});
+        fireEvent.keyDown(screen.getByRole('dialog'), {key: 'Escape'});
+        expect(screen.getByRole('dialog', {name: 'Run reconciliation'})).toBeInTheDocument();
+        fireEvent.click(screen.getByRole('button', {name: 'Close dialog'}));
+        expect(screen.getByRole('dialog', {name: 'Run reconciliation'})).toBeInTheDocument();
+        fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
+        expect(screen.getByRole('dialog', {name: 'Run reconciliation'})).toBeInTheDocument();
+
+        release?.();
+
+        // A failed run keeps the dialog open with the error, and reports no summary.
+        await screen.findByText(/reconciliation\/run failed with 500/i);
+        expect(screen.getByRole('dialog', {name: 'Run reconciliation'})).toBeInTheDocument();
+        expect(screen.queryByText(/already tracked/)).not.toBeInTheDocument();
+
+        // Once settled, the guard lifts.
+        fireEvent.keyDown(screen.getByRole('dialog'), {key: 'Escape'});
+        await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
     });
 
     it('resolves a result with a note', async () => {
