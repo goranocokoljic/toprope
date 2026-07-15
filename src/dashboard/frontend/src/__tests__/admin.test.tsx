@@ -1160,6 +1160,10 @@ describe('AdminIdentities page', () => {
         fireEvent.change(screen.getByLabelText('Git commit emails (comma-separated)'), {
             target: {value: 'a@x.com,  b@y.com   c@z.com'},
         });
+        // Also drop a link, so the row's count MUST change if the save landed —
+        // an edit that leaves all 8 populated would read the same before and
+        // after, and the read-back assertion below could not fail.
+        fireEvent.change(screen.getByLabelText('Bitbucket username'), {target: {value: ''}});
         fireEvent.click(screen.getByRole('button', {name: 'Save identities'}));
 
         await waitFor(() => expect(identityPatches('dev-1')).toHaveLength(1));
@@ -1171,7 +1175,7 @@ describe('AdminIdentities page', () => {
             claude: 'alice@claude.test',
             windsurf: 'alice@windsurf.test',
             cursor: 'alice@cursor.test',
-            bitbucket: 'alice-bb',
+            bitbucket: '',
             gitlab: 'alice-gl',
             git_emails: ['a@x.com', 'b@y.com', 'c@z.com'],
         });
@@ -1180,10 +1184,10 @@ describe('AdminIdentities page', () => {
         expect(movePatches('dev-1')).toHaveLength(0);
 
         // Success closes the dialog and the row reads back through the real hook
-        // (seed → API → row): 3 emails + 7 ids = 8 populated fields still.
+        // (seed → API → row): the cleared bitbucket drops 8 links to 7.
         await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
         await waitFor(() =>
-            expect(within(developerRow('Alice Dev')).getByText('8 linked')).toBeInTheDocument(),
+            expect(within(developerRow('Alice Dev')).getByText('7 linked')).toBeInTheDocument(),
         );
     });
 
