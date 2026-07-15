@@ -15,6 +15,8 @@
 
 - **Docs, config keys, and parity claims must match the code.** Verify every documented config key against the actual loader (loaders silently ignore unknown keys), and never justify a change by claiming it 'mirrors' another module unless that module actually does the same thing; note deliberately out-of-scope alignments.
   - _Why:_ Recurred in #108 (docs said dashboard_base_url but the key is dashboard_url, yielding Slack alerts with no deep link and no error) and #145 (docstrings claimed parity with Pillar 3 cohort resolution, which actually filters by per-developer opt-in, not team-level exclusion).
+- **Bound and clamp ranges driven by external timestamps.** Any loop or window filter whose extent derives from stored/client timestamps must be bounded on both ends: clamp the upper edge to now, cap window length, and never let a single future-dated or skewed row explode the series or inflate counts past a privacy floor.
+  - _Why:_ Recurred in #106 (buildTrajectory walked week-by-week to max(lastActivity, now), emitting thousands of zero-weeks from one future-dated snapshot) and #132 (loop/nudge aggregates filtered detected_at >= cutoff with no upper bound).
 
 ## over-abstraction
 
@@ -46,3 +48,8 @@
 
 - **Make ordering correct, total, and deterministic.** Order semantic enums by an explicit numeric rank (CASE/rank map) not lexically; make comparators total (never NaN, sort missing rows to a stable extreme rather than coalescing to a real value); and break ties on a monotonic insertion key (rowid), never a random UUID.
   - _Why:_ Recurred in #102 (ORDER BY severity DESC on a text column sorted lexically, burying the highest severity last), #105 (metrics coalesced to NEGATIVE_INFINITY made two no-data rows compare as NaN), and #160 (a same-millisecond pin tiebreak on a random UUID resolved nondeterministically).
+
+## api-contract
+
+- **Keep the client/server wire contract in sync.** Type a wire field with the same breadth the source guarantees (narrow an unconstrained TEXT column with a safe default rather than asserting a closed union the data doesn't enforce), and when a response shape changes, update every consumer to narrow on the new field before dereferencing, plus its test mock.
+  - _Why:_ Recurred in #105 (an unconstrained TEXT ai_maturity_basis was cast to a closed union on the frontend) and #131 (the backend wrapped pr-coaching in {enabled,...} but the client still dereferenced data.all_pr and the stale mock masked the TypeError).
