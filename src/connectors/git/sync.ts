@@ -185,19 +185,32 @@ export function earliestSyncStateKey(providerType: GitProviderType, identifier: 
 }
 
 /**
- * The sync_state key marking a provider whose earliest-synced floor is UNKNOWN and
- * unrecoverable (#233) — a LEGACY provider that already had a forward cursor when
- * migration 040 ran, i.e. whose first sync predates the #229 watermark recording.
+ * Whether a provider's earliest-synced floor is UNKNOWN and unrecoverable (#233) —
+ * i.e. it is LEGACY, first synced before #229 began recording the floor.
  *
- * A separate key namespace, deliberately: the watermark value must only ever hold a
- * real instant. Encoding "unknown" as a magic value under {@link earliestSyncStateKey}
- * would let a future reader compare a sentinel as if it were an ISO date.
+ * DERIVED, not stored. `cursor present ∧ watermark absent` ⟺ legacy, because a
+ * post-#229 first sync writes BOTH inside the same deferred closure, applied in the
+ * same snapshot transaction (see the `cursorAdvances` push in {@link GitSync.syncProviders});
+ * and that closure is the ONLY writer of a `git_last_sync:` cursor. So for any provider
+ * synced by this build the two keys can never be out of step — only a provider whose
+ * first sync predates that build can hold a cursor with no floor.
+ *
+ * Deriving beats seeding a marker row at upgrade time: a marker freezes the legacy set
+ * at one instant and then needs reconciling whenever a real floor is recorded, which is
+ * a second source of truth that can drift. The predicate is true at EVERY instant, so it
+ * also fails closed on a cursor-without-floor that appears later (a partial restore, a
+ * hand-edited row, a future code path) — states a migration-seeded marker would miss and
+ * silently fall back to the too-recent guess for.
  */
-export function earliestUnknownStateKey(
+function isEarliestFloorUnknown(
+    db: Database.Database,
     providerType: GitProviderType,
     identifier: string,
-): string {
-    return `git_earliest_unknown:${providerType}:${identifier}`;
+): boolean {
+    return (
+        getProviderLastSyncTime(db, earliestSyncStateKey(providerType, identifier)) === null &&
+        getProviderLastSyncTime(db, syncStateKey(providerType, identifier)) !== null
+    );
 }
 
 /**
@@ -276,34 +289,17 @@ function setProviderEarliestSyncTime(
     time: string,
 ): void {
     setProviderLastSyncTime(db, earliestSyncStateKey(providerType, identifier), time);
-    // Recording a real floor retires the legacy "floor unknown" marker (#233): the
-    // watermark is now exact, so the backfill's disjointness is provable again. A
-    // no-op for the overwhelmingly common case of a provider that was never legacy.
-    db.prepare('DELETE FROM sync_state WHERE key = ?').run(
-        earliestUnknownStateKey(providerType, identifier),
-    );
 }
 
 /**
- * Whether a provider's earliest-synced floor is known (#233). `unknown` is the
- * LEGACY case seeded by migration 040 — a provider that already had a forward cursor
- * before #229 started recording the floor at first sync. Callers must branch on
- * `kind` rather than treat a missing watermark as "guess a default": the guess is
- * systematically too recent, which is the additive double-count direction.
+ * Whether a provider's earliest-synced floor is known (#233). `unknown` is the LEGACY
+ * case — a provider whose first sync predates #229's floor recording. Callers must
+ * branch on `kind` rather than treat a missing watermark as "guess a default": the
+ * guess is systematically too recent, which is the additive double-count direction.
  */
 export type EarliestSyncedWatermark =
     | {kind: 'exact'; watermark: string}
     | {kind: 'unknown'};
-
-function isEarliestFloorUnknown(
-    db: Database.Database,
-    providerType: GitProviderType,
-    identifier: string,
-): boolean {
-    return (
-        getProviderLastSyncTime(db, earliestUnknownStateKey(providerType, identifier)) !== null
-    );
-}
 
 /**
  * The current earliest-synced watermark for a provider — the oldest instant whose
@@ -320,25 +316,29 @@ function isEarliestFloorUnknown(
  * any provider synced by this build it is EXACT — the overlap guard never overlaps
  * an already-imported span. That is the `exact` result.
  *
- * LEGACY PROVIDERS return `unknown` (#233). A provider whose first sync predates #229
- * has a cursor but no watermark, and its true floor (`first_sync_time − window`) is
+ * LEGACY PROVIDERS return `unknown` (#233) — see {@link isEarliestFloorUnknown} for how
+ * they are identified. Such a provider's true floor (`first_sync_time − window`) is
  * unrecoverable: sync_state stores neither the first-sync instant nor the window it
  * used, and git_snapshots merges every provider into UNIQUE(developer_id, date) rows,
- * so the earliest activity date can't be attributed back to one provider. Migration
- * 040 marks those providers; this returns `unknown` for them rather than guessing.
+ * so the earliest activity date can't be attributed back to one provider.
  *
- * The previous lazy default (`now` − the #228 window) was such a guess, and it is
- * systematically TOO RECENT — the true floor is older by however long ago the provider
- * first synced. Too-recent is precisely the direction that makes the backfill slice
- * OVERLAP already-imported activity, which the additive merge then double-counts,
- * permanently and silently. Guessing too-old is no better (it makes the span between
- * the guess and the true floor un-importable forever), so there is no safe guess:
- * we fail closed and let an admin who knows the real floor declare it (`toprope git
- * set-history-floor`), which writes an exact watermark and retires the marker.
+ * THIS IS THE RATIONALE THE REST OF THE FEATURE POINTS AT. The previous lazy default
+ * (`now` − the #228 window) was a guess, and it is systematically TOO RECENT — the true
+ * floor is older by however long ago the provider first synced. Too-recent is precisely
+ * the direction that makes the backfill slice OVERLAP already-imported activity, which
+ * the additive merge then double-counts, permanently and silently. Guessing too-old is
+ * no better (it makes the span between the guess and the true floor un-importable
+ * forever), so there is no safe guess: we fail closed and let an admin who knows the
+ * real floor declare it ({@link declareEarliestSyncedFloor}, `toprope git
+ * set-history-floor`).
  *
- * A provider with NO cursor and NO marker has never synced at all — nothing is
- * imported, so the default window its first sync will use is not a guess and any
- * backfill below it is disjoint by construction. That stays `exact`.
+ * A provider with NO cursor and no floor is ASSUMED never-synced — nothing is imported,
+ * so the default window its first sync will use is not a guess and any backfill below it
+ * is disjoint by construction. That stays `exact`. Caveat: renaming a provider's
+ * container (a supported PATCH) re-keys both its cursor and its floor, so the renamed
+ * provider reads as never-synced here. That is a pre-existing #228-era hole — the next
+ * forward sync already re-imports its window as a "first" sync — not one this guard
+ * introduces or can close.
  */
 export function getEarliestSyncedWatermark(
     db: Database.Database,
@@ -362,16 +362,22 @@ export function getEarliestSyncedWatermark(
 
 /**
  * Declare a LEGACY provider's true earliest-synced floor (#233) — the admin-supplied
- * half of migration 040. Writes the exact watermark and retires the "unknown" marker,
- * restoring the provider's ability to back-extend its window.
+ * recovery path for a floor {@link getEarliestSyncedWatermark} refuses to guess. Writes
+ * the exact watermark, restoring the provider's ability to back-extend its window.
  *
  * Only ever call this with a floor the admin actually knows (when the provider first
- * synced, minus the window that run used). Declaring a floor NEWER than the truth
- * makes the next backfill re-cover already-imported activity and double-count it;
- * declaring one OLDER silently strands the span in between. Hence: no default, no
- * inference — an explicit human assertion, refused for a provider whose floor is
- * already exact (there is nothing to declare, and overwriting a recorded floor is
- * exactly the corruption this guards).
+ * synced, minus the window that run used). Declaring a floor NEWER than the truth makes
+ * the next backfill re-cover already-imported activity and double-count it; declaring
+ * one OLDER silently strands the span in between. Hence: no default and no inference —
+ * an explicit human assertion.
+ *
+ * By default this refuses a provider whose floor is already recorded, because clobbering
+ * a floor EARNED by a real sync is exactly the corruption the feature guards. But a
+ * hand-typed floor is fallible, and refusing every overwrite would make the admin's own
+ * typo permanent — the mistake would only surface as inflated counts after the backfill
+ * ran. `force` is the escape hatch: it says "I know a floor is recorded and I am
+ * replacing it", which is correctable-by-design for a declared floor and a loaded gun for
+ * an earned one. That is why it is opt-in per call and never the default.
  */
 export function declareEarliestSyncedFloor(
     db: Database.Database,
@@ -379,19 +385,22 @@ export function declareEarliestSyncedFloor(
     identifier: string,
     floor: string,
     now: string,
+    options?: {force?: boolean},
 ): {ok: true} | {ok: false; reason: 'not_legacy' | 'invalid_floor' | 'future_floor'} {
     // Must be a real UTC ISO instant: this value is compared as an ISO string by the
     // overlap guard, so a loosely-parsed date would corrupt every later comparison.
     if (!isUtcIsoInstant(floor)) return {ok: false, reason: 'invalid_floor'};
-    // Bound the upper edge: a floor at/after `now` claims the provider imported
-    // nothing (or imported the future). Both make every later backfill target look
-    // "older than the floor" and pass the overlap guard onto already-synced spans.
-    if (floor >= now) return {ok: false, reason: 'future_floor'};
-    // Check-then-act: read the marker and write the watermark in ONE transaction so a
-    // concurrent declare/first-sync can't land between them and clobber a real floor.
+    // Bound the upper edge: a floor at/after `now` claims the provider imported nothing
+    // (or imported the future). Both make every later backfill target look "older than
+    // the floor" and pass the overlap guard onto already-synced spans. Compared as
+    // INSTANTS, not strings — an expanded-year form ('+010000-…') sorts below '2' and
+    // would slip through a lexical compare while being chronologically absurd.
+    if (Date.parse(floor) >= Date.parse(now)) return {ok: false, reason: 'future_floor'};
+    // Check-then-act: read the floor and write it in ONE transaction so a concurrent
+    // declare/first-sync can't land between them and clobber a real floor.
     return db.transaction(
         (): {ok: true} | {ok: false; reason: 'not_legacy'} => {
-            if (!isEarliestFloorUnknown(db, providerType, identifier)) {
+            if (!options?.force && !isEarliestFloorUnknown(db, providerType, identifier)) {
                 return {ok: false, reason: 'not_legacy'};
             }
             setProviderEarliestSyncTime(db, providerType, identifier, floor);
@@ -400,8 +409,14 @@ export function declareEarliestSyncedFloor(
     )();
 }
 
-/** True iff `value` is a canonical UTC ISO instant (what every stored timestamp is). */
+/**
+ * True iff `value` is a canonical UTC ISO instant (what every stored timestamp is).
+ * The shape is pinned by regex, not just by a `toISOString()` round-trip: ISO 8601
+ * expanded years ('+010000-01-01T00:00:00.000Z') and negative years round-trip cleanly
+ * too, and they break the ISO-string ordering every watermark comparison relies on.
+ */
 function isUtcIsoInstant(value: string): boolean {
+    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) return false;
     const parsed = new Date(value);
     return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
 }

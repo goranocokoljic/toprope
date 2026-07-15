@@ -2,11 +2,11 @@ import {describe, it, expect, beforeEach, afterEach} from 'vitest';
 import Database from 'better-sqlite3';
 import path from 'path';
 import {runMigrations} from '../../src/storage/migrator';
-import {setHistoryFloor, GIT_PROVIDER_TYPES} from '../../src/cli/git-history-floor';
+import {setHistoryFloor} from '../../src/cli/git-history-floor';
 import {
     getEarliestSyncedWatermark,
     earliestSyncStateKey,
-    earliestUnknownStateKey,
+    syncStateKey,
 } from '../../src/connectors/git/sync';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../src/storage/migrations');
@@ -20,10 +20,11 @@ describe('toprope git set-history-floor (#233)', () => {
         (db.prepare('SELECT value FROM sync_state WHERE key = ?').get(key) as
             | {value: string}
             | undefined)?.value ?? null;
+    // Legacy = a pre-#229 first sync's leftovers: a forward cursor, no recorded floor.
     const markLegacy = (type = 'github', container = 'acme'): void => {
         db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
-            `git_earliest_unknown:${type}:${container}`,
-            '1',
+            `git_last_sync:${type}:${container}`,
+            '2026-03-01T00:00:00.000Z',
         );
     };
 
@@ -44,7 +45,6 @@ describe('toprope git set-history-floor (#233)', () => {
         expect(result.ok).toBe(true);
         expect(result.message).toContain(FLOOR);
         expect(readState(earliestSyncStateKey('github', 'acme'))).toBe(FLOOR);
-        expect(readState(earliestUnknownStateKey('github', 'acme'))).toBeNull();
         // The observable point of the command: backfill is unblocked.
         expect(getEarliestSyncedWatermark(db, 'github', 'acme', NOW)).toEqual({
             kind: 'exact',
@@ -52,7 +52,23 @@ describe('toprope git set-history-floor (#233)', () => {
         });
     });
 
-    it.each(GIT_PROVIDER_TYPES)('accepts the allowlisted provider type %s', (type) => {
+    it('states the consequence of the declared floor, not just that it was written', () => {
+        // The admin typed this instant from memory and it silently decides whether the
+        // next backfill double-counts — the echo is their only chance to catch a typo.
+        markLegacy();
+        const result = setHistoryFloor(db, {provider: 'github', container: 'acme', at: FLOOR}, NOW);
+
+        expect(result.ok).toBe(true);
+        expect(result.message).toMatch(/older/i);
+        expect(result.message).toMatch(/double-count/i);
+        expect(result.message).toContain('--force');
+    });
+
+    // Hardcoded, NOT derived from the GIT_PROVIDER_TYPES constant under test: driving
+    // this from the allowlist itself would assert "every member of X is accepted by a
+    // gate whose accept-set is X" — true by construction, and silently green if a new
+    // GitProviderType is added and this hand-maintained copy is not updated.
+    it.each(['github', 'bitbucket', 'gitlab'] as const)('accepts provider type %s', (type) => {
         markLegacy(type);
         const result = setHistoryFloor(db, {provider: type, container: 'acme', at: FLOOR}, NOW);
         expect(result.ok).toBe(true);
@@ -91,7 +107,37 @@ describe('toprope git set-history-floor (#233)', () => {
         const result = setHistoryFloor(db, {provider: 'github', container: 'acme', at: '2025-01-01'}, NOW);
         expect(result.ok).toBe(false);
         expect(result.message).toContain('invalid --at value');
-        expect(readState(earliestUnknownStateKey('github', 'acme'))).toBe('1');
+        // Still legacy after the rejection — nothing was written.
+        expect(getEarliestSyncedWatermark(db, 'github', 'acme', NOW)).toEqual({kind: 'unknown'});
+    });
+
+    it('trims --container so a padded value is not misreported as a state fact', () => {
+        // '--container " acme "' would key a provider that cannot exist; without the
+        // trim the miss surfaces as "no unknown floor to declare", sending the admin
+        // hunting for a watermark rather than for their typo.
+        markLegacy();
+        const result = setHistoryFloor(db, {provider: 'github', container: '  acme  ', at: FLOOR}, NOW);
+        expect(result.ok).toBe(true);
+        expect(readState(earliestSyncStateKey('github', 'acme'))).toBe(FLOOR);
+    });
+
+    it('--force corrects a floor that was already declared', () => {
+        markLegacy();
+        const typo = '2025-06-01T00:00:00.000Z';
+        expect(setHistoryFloor(db, {provider: 'github', container: 'acme', at: typo}, NOW).ok).toBe(true);
+        // Refused without --force…
+        const refused = setHistoryFloor(db, {provider: 'github', container: 'acme', at: FLOOR}, NOW);
+        expect(refused.ok).toBe(false);
+        expect(refused.message).toContain('--force');
+        expect(readState(earliestSyncStateKey('github', 'acme'))).toBe(typo);
+        // …and applied with it.
+        const forced = setHistoryFloor(
+            db,
+            {provider: 'github', container: 'acme', at: FLOOR, force: true},
+            NOW,
+        );
+        expect(forced.ok).toBe(true);
+        expect(readState(earliestSyncStateKey('github', 'acme'))).toBe(FLOOR);
     });
 
     it('rejects a future --at', () => {
@@ -114,8 +160,8 @@ describe('toprope git set-history-floor (#233)', () => {
         const result = setHistoryFloor(db, {provider: 'github', container: 'acme', at: FLOOR}, NOW);
 
         expect(result.ok).toBe(false);
-        expect(result.message).toContain('not a legacy provider');
-        // The recorded floor is intact — this command must never overwrite one.
+        expect(result.message).toContain('no unknown history floor to declare');
+        // The recorded floor is intact — overwriting one takes an explicit --force.
         expect(readState(earliestSyncStateKey('github', 'acme'))).toBe('2024-06-01T00:00:00.000Z');
     });
 });

@@ -732,8 +732,14 @@ gitCommand
     .requiredOption('--provider <type>', 'Provider type (github, bitbucket, gitlab)')
     .requiredOption('--container <name>', 'Provider container: org (github) / workspace (bitbucket) / group (gitlab)')
     .requiredOption('--at <iso>', 'The earliest instant already synced, as UTC ISO (e.g. 2025-01-01T00:00:00.000Z)')
+    .option(
+        '--force',
+        'Overwrite a floor that is already recorded. Needed to correct a mis-typed --at ' +
+            'before backfilling; declaring a floor NEWER than the truth makes the next ' +
+            'backfill double-count the overlap.',
+    )
     .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
-    .action((options: {provider: string; container: string; at: string; config: string}) => {
+    .action((options: {provider: string; container: string; at: string; force?: boolean; config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const config = loadConfig(configPath);
         const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);

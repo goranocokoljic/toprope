@@ -598,7 +598,6 @@ describe('admin git-provider sync-now API (#199)', () => {
     describe('POST /:id/sync-older-history — backward extension (#229)', () => {
         const FORWARD_KEY = 'git_last_sync:github:db-org';
         const EARLIEST_KEY = 'git_earliest_sync:github:db-org';
-        const UNKNOWN_KEY = 'git_earliest_unknown:github:db-org';
 
         // Arm getCommits so the run resolves fast AND we can read the [since, until]
         // slice the backfill window computed. Returns [] → no snapshot bookkeeping.
@@ -635,10 +634,18 @@ describe('admin git-provider sync-now API (#199)', () => {
 
         it('fetches [now − months, watermark], lowers the watermark, leaves the forward cursor untouched', async () => {
             const id = await createGithub();
-            // A forward cursor is present — backfill must neither read nor move it.
+            // A synced provider: a forward cursor AND the floor its first sync recorded.
+            // Backfill must read neither cursor nor move it — it walks below the floor.
+            // (Both keys, because since #233 a cursor with NO floor is the LEGACY state
+            // and is refused outright rather than backfilled — see the 409 test below.)
             db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
                 FORWARD_KEY,
                 '2026-06-01T00:00:00.000Z',
+            );
+            const recordedFloor = '2025-09-15T12:00:00.000Z';
+            db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+                EARLIEST_KEY,
+                recordedFloor,
             );
             const getCommits = await armGetCommits();
 
@@ -653,10 +660,8 @@ describe('admin git-provider sync-now API (#199)', () => {
             const expSince = new Date(before);
             expSince.setUTCMonth(expSince.getUTCMonth() - 12);
             expect(Math.abs(Date.parse(since) - expSince.getTime())).toBeLessThan(60_000);
-            // until ≈ the lazy watermark = now − 6mo (the #228 default).
-            const expUntil = new Date(before);
-            expUntil.setUTCMonth(expUntil.getUTCMonth() - 6);
-            expect(Math.abs(Date.parse(until) - expUntil.getTime())).toBeLessThan(60_000);
+            // until = the recorded floor, exactly — the slice is disjoint by construction.
+            expect(until).toBe(recordedFloor);
 
             // Watermark lowered to exactly `since`; forward cursor untouched.
             expect(readState(EARLIEST_KEY)).toBe(since);
@@ -712,9 +717,10 @@ describe('admin git-provider sync-now API (#199)', () => {
         it('fails closed with 409 for a legacy provider whose floor is unknown, and starts no run', async () => {
             const id = await createGithub();
             const getCommits = await armGetCommits();
+            // Legacy = what a pre-#229 first sync left: a forward cursor, no floor.
             db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
-                UNKNOWN_KEY,
-                '1',
+                FORWARD_KEY,
+                '2026-06-01T00:00:00.000Z',
             );
 
             // months=60 targets 5y back — far older than the old lazy guess, so this
@@ -732,11 +738,15 @@ describe('admin git-provider sync-now API (#199)', () => {
         it('accepts the backfill once an admin declares the legacy floor', async () => {
             const id = await createGithub();
             const getCommits = await armGetCommits();
-            db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(UNKNOWN_KEY, '1');
+            db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+                FORWARD_KEY,
+                '2026-06-01T00:00:00.000Z',
+            );
             expect((await triggerOlder(id, {months: 60})).statusCode).toBe(409);
 
             // The recovery path: the admin asserts the real floor.
             const declaredFloor = '2025-01-01T00:00:00.000Z';
+            const before = Date.now();
             expect(
                 declareEarliestSyncedFloor(
                     db,
@@ -751,9 +761,17 @@ describe('admin git-provider sync-now API (#199)', () => {
             expect(res.statusCode).toBe(202);
             await waitForSyncStatus(id, 'ok');
             // The declared floor became the slice's upper bound — the backfill extends
-            // strictly BELOW what the admin said was already imported.
+            // strictly BELOW what the admin said was already imported…
             expect(getCommits.mock.calls[0][2]).toBe(declaredFloor);
-            expect(readState(UNKNOWN_KEY)).toBeUndefined();
+            // …from the requested 60-month target…
+            const expSince = new Date(before);
+            expSince.setUTCMonth(expSince.getUTCMonth() - 60);
+            const since = getCommits.mock.calls[0][1] as string;
+            expect(Math.abs(Date.parse(since) - expSince.getTime())).toBeLessThan(60_000);
+            // …and the run lowered the floor to it, closing the recovery loop: the
+            // forward cursor that made the provider legacy is untouched throughout.
+            expect(readState(EARLIEST_KEY)).toBe(since);
+            expect(readState(FORWARD_KEY)).toBe('2026-06-01T00:00:00.000Z');
         });
 
         it('rejects a read-only config-file provider id (409)', async () => {
