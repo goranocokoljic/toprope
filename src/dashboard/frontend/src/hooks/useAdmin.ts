@@ -253,6 +253,25 @@ export function useSyncAdminGitProvider(): UseMutationResult<
 }
 
 /**
+ * "Sync older history" (#229): extend a provider's synced window backward by an
+ * ABSOLUTE months value. Like {@link useSyncAdminGitProvider}, invalidation runs
+ * on SETTLED so a 409 (nothing older to sync / already in progress) or 503 still
+ * refreshes the row — otherwise the UI would contradict its own error.
+ */
+export function useSyncOlderHistoryGitProvider(): UseMutationResult<
+    GitProviderSyncHandle,
+    Error,
+    {id: string; months: number}
+> {
+    const invalidate = useInvalidateGitProviders();
+    return useMutation({
+        mutationFn: ({id, months}: {id: string; months: number}) =>
+            api.syncOlderHistoryAdminGitProvider(id, months),
+        onSettled: invalidate,
+    });
+}
+
+/**
  * List a saved provider's repositories for the repo-scope picker (GC1.9 / #201).
  * `enabled` gates the fetch so the (potentially slow, network-bound) `/repos`
  * probe only runs once the admin opens "Select repositories" for this provider.

@@ -72,6 +72,14 @@ export const FIRST_SYNC_WINDOW_MIN_MONTHS = 1;
 export const FIRST_SYNC_WINDOW_MAX_MONTHS = 60;
 export const FIRST_SYNC_WINDOW_DEFAULT_MONTHS = 6;
 
+// The earliest-synced watermark sentinel meaning "history synced back to the repo's
+// first commit" (#229). A walk-all first sync (no window clamp → `since === ''`)
+// imported everything, so nothing older exists to backfill; we record this epoch
+// instant as the floor rather than '' (which the watermark accessor would read as
+// "unset" and fall through to the lazy default). The overlap guard then rejects any
+// backfill against such a provider, because every real target is `>=` the epoch.
+export const EARLIEST_SYNC_EPOCH = new Date(0).toISOString();
+
 /** Knobs a sync run accepts beyond the provider set. */
 export interface SyncRunOptions {
     /**
@@ -90,6 +98,21 @@ export interface SyncRunOptions {
      * the automated path is a follow-up, not this issue.
      */
     firstSyncWindowMonths?: number;
+    /**
+     * "Sync older history" backfill (#229): extend a provider's synced window
+     * BACKWARD by fetching the fixed, strictly-older commit slice [since, until]
+     * and additively merging it. `until` is the provider's current earliest
+     * watermark and `since` the new (older) target; the caller (the backfill route)
+     * computes both and enforces `since < until` (the overlap guard) BEFORE
+     * dispatching, so the slice is always disjoint from already-stored activity and
+     * the additive snapshot merge stays correct — no double-count.
+     *
+     * In this mode the run does NOT advance the forward cursor (normal "Sync now"
+     * must keep resuming from now); instead it LOWERS the earliest watermark to
+     * `since`. `firstSyncWindowMonths` is IGNORED. Omitted on every non-backfill
+     * path (first/incremental/scheduled sync), which is unchanged.
+     */
+    backfill?: {since: string; until: string};
 }
 
 /**
@@ -114,14 +137,29 @@ export function firstSyncSince(now: string, months: number | undefined): string 
     ) {
         return '';
     }
+    // '' when `now` is unparseable (an out-of-range/bad value degrades to walk-all,
+    // matching the pre-refactor behavior).
+    return subtractUtcMonths(now, months) ?? '';
+}
+
+/**
+ * `now` minus `months` whole months, in UTC ISO — or null if `now` is unparseable.
+ * The single home for this arithmetic, shared by the first-sync window
+ * ({@link firstSyncSince}) and the "sync older history" backfill target (#229,
+ * {@link getEarliestSyncedWatermark} and the backfill route). `months` must be a
+ * validated non-negative integer; callers own range-validation.
+ *
+ * UTC month arithmetic (all toprope timestamps are UTC); JS handles the year
+ * rollover when the subtraction crosses January. Day-of-month is preserved, so a
+ * long-month `now` (e.g. Mar 31) minus 1 lands on the normalized short-month date
+ * (Mar 3), making the window a few days SHORTER than a strict calendar month —
+ * never longer. That direction is safe (it can only under-import, never re-drain
+ * quota / re-cover an already-synced span), and the window edge is inherently
+ * coarse, so we accept the drift.
+ */
+export function subtractUtcMonths(now: string, months: number): string | null {
     const start = new Date(now);
-    if (Number.isNaN(start.getTime())) return '';
-    // UTC month arithmetic (all toprope timestamps are UTC); JS handles the year
-    // rollover when the subtraction crosses January. Day-of-month is preserved, so a
-    // long-month `now` (e.g. Mar 31) minus 1 lands on the normalized short-month date
-    // (Mar 3), making the window a few days SHORTER than a strict calendar month —
-    // never longer. That direction is safe (it can only under-import, never re-drain
-    // quota), and the window start is inherently coarse, so we accept the drift.
+    if (Number.isNaN(start.getTime())) return null;
     start.setUTCMonth(start.getUTCMonth() - months);
     return start.toISOString();
 }
@@ -134,6 +172,16 @@ type ProgressReporter = (mutate: (progress: GitSyncProgress) => void) => void;
 
 export function syncStateKey(providerType: GitProviderType, identifier: string): string {
     return `git_last_sync:${providerType}:${identifier}`;
+}
+
+/**
+ * The sync_state key for a provider's EARLIEST-synced watermark (#229) — the
+ * oldest instant whose activity has been imported. Parallel to the forward cursor
+ * {@link syncStateKey} (`git_last_sync:…`); only the "sync older history" backfill
+ * reads/writes it. Disjoint namespace so it can never be confused with the cursor.
+ */
+export function earliestSyncStateKey(providerType: GitProviderType, identifier: string): string {
+    return `git_earliest_sync:${providerType}:${identifier}`;
 }
 
 /**
@@ -191,6 +239,68 @@ function setProviderLastSyncTime(db: Database.Database, key: string, time: strin
     db.prepare(
         'INSERT INTO sync_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
     ).run(key, time);
+}
+
+// Read/write the per-provider earliest-synced watermark (#229). Thin semantic
+// wrappers over the generic sync_state accessors above so the "earliest" intent
+// is explicit at call sites and the key derivation lives in exactly one place
+// ({@link earliestSyncStateKey}) rather than being spelled out per call.
+function getProviderEarliestSyncTime(
+    db: Database.Database,
+    providerType: GitProviderType,
+    identifier: string,
+): string | null {
+    return getProviderLastSyncTime(db, earliestSyncStateKey(providerType, identifier));
+}
+
+function setProviderEarliestSyncTime(
+    db: Database.Database,
+    providerType: GitProviderType,
+    identifier: string,
+    time: string,
+): void {
+    setProviderLastSyncTime(db, earliestSyncStateKey(providerType, identifier), time);
+}
+
+/**
+ * The current earliest-synced watermark for a provider — the oldest instant whose
+ * activity has already been imported — as UTC ISO. The "sync older history"
+ * backfill (#229) extends BELOW this edge: it fetches the strictly-older slice
+ * [new_target, watermark], disjoint from everything already stored, so the
+ * additive snapshot merge stays correct. The backfill route calls this to both
+ * enforce the overlap guard (`new_target < watermark`) and set the fetch's upper
+ * bound.
+ *
+ * The watermark is now recorded at FIRST-SYNC time (runSync writes the real floor
+ * the first forward sync reached — the clamped window start, or {@link
+ * EARLIEST_SYNC_EPOCH} for a walk-all sync) and lowered by every backfill, so for
+ * any provider synced by this build it is EXACT — the overlap guard never overlaps
+ * an already-imported span.
+ *
+ * LEGACY LAZY DEFAULT: a provider whose first sync predates this change has no
+ * stored watermark. Only there do we fall back to `now` − the #228 default window.
+ * This is best-effort and PERMANENT for that provider: the forward path only records
+ * the floor on a genuine first sync (`storedCursor === null`), and a legacy provider
+ * already has a cursor, so its watermark is never back-recorded — the fallback does
+ * NOT self-heal on later forward syncs. It is also systematically too-recent: the
+ * true floor is `first_sync_time − window`, older than `now − window` by however
+ * long ago the provider first synced, so a legacy provider's FIRST backfill can
+ * re-cover and additively double-count that overlap (bounded by elapsed time since
+ * first sync). Correcting it needs a data migration (or a cursor reset that forces a
+ * true first sync). New providers — synced by this build — are never exposed to it.
+ */
+export function getEarliestSyncedWatermark(
+    db: Database.Database,
+    providerType: GitProviderType,
+    identifier: string,
+    now: string,
+): string {
+    const stored = getProviderEarliestSyncTime(db, providerType, identifier);
+    if (stored) return stored;
+    // firstSyncSince returns '' only when `now` is unparseable; fall back to `now`
+    // (a zero-width window the caller's overlap guard rejects) rather than '',
+    // which downstream would read as "walk all history".
+    return firstSyncSince(now, FIRST_SYNC_WINDOW_DEFAULT_MONTHS) || now;
 }
 
 // Build a map from identifier → developer_id, covering:
@@ -480,6 +590,19 @@ interface ProviderFetchResult {
     prRecords: PRRecordInput[];
     errors: string[];
     stateKey: string;
+    /** The provider's container id — the second half of its sync-state keys, so
+     *  runSync can lower the earliest watermark (#229) without re-deriving it. */
+    identifier: string;
+    /**
+     * The floor a FIRST forward sync actually reached (#229) — the clamped window
+     * start (`since`), or {@link EARLIEST_SYNC_EPOCH} for a walk-all sync — so
+     * runSync can record the true earliest-synced watermark and the "sync older
+     * history" backfill's default is exact rather than guessed. `null` on every
+     * non-first-sync path (a backfill, an incremental run, or a first sync that
+     * failed before any repo was processed), where the watermark must not be
+     * (re)written from the forward path.
+     */
+    firstSyncFloor: string | null;
 }
 
 async function fetchProviderData(
@@ -488,6 +611,7 @@ async function fetchProviderData(
     db: Database.Database,
     report?: ProgressReporter,
     firstSyncWindowMonths?: number,
+    backfill?: {since: string; until: string},
 ): Promise<ProviderFetchResult> {
     const errors: string[] = [];
     const allCommits: AnalysisCommit[] = [];
@@ -499,12 +623,27 @@ async function fetchProviderData(
     const providerType = provider.name;
     const identifier = providerIdentifier(providerConfig);
     const stateKey = syncStateKey(providerType, identifier);
-    // First sync (no stored cursor): optionally clamp the window to the last N
-    // months so run #1 doesn't walk the whole history. Once a cursor exists it is
-    // the source of truth and firstSyncWindowMonths is IGNORED — re-widening `since`
-    // against additive snapshots would double-count (see SyncRunOptions).
+    // Window selection:
+    //   - Backfill (#229): a fixed, strictly-older slice [since, until] the caller
+    //     already validated as disjoint from stored activity. It ignores the forward
+    //     cursor entirely (it walks BELOW the earliest watermark, not above `now`).
+    //   - Otherwise: first sync (no stored cursor) optionally clamps the window to
+    //     the last N months so run #1 doesn't walk the whole history; once a cursor
+    //     exists it is the source of truth and firstSyncWindowMonths is IGNORED —
+    //     re-widening `since` against additive snapshots would double-count (see
+    //     SyncRunOptions).
     const storedCursor = getProviderLastSyncTime(db, stateKey);
-    const since = storedCursor ?? firstSyncSince(now, firstSyncWindowMonths);
+    const since = backfill ? backfill.since : (storedCursor ?? firstSyncSince(now, firstSyncWindowMonths));
+    // This run is a FIRST forward sync when it is not a backfill and no cursor exists
+    // yet. Only then does runSync record the earliest-synced watermark (#229): the
+    // real floor `since` reached, mapped to the epoch sentinel for a walk-all ('').
+    const isFirstSync = !backfill && storedCursor === null;
+    const firstSyncFloor = isFirstSync ? (since === '' ? EARLIEST_SYNC_EPOCH : since) : null;
+    // Commit fetch upper bound: the backfill's watermark, else `now`. PRs are fetched
+    // by `since` only (the provider interface has no PR `until`); in backfill that
+    // re-delivers recent PRs, which the max()-based cross-run merge folds in
+    // idempotently (see remergeStoredSnapshot) — no inflation, just extra fetch.
+    const until = backfill ? backfill.until : now;
 
     const rawRepos = 'repos' in providerConfig ? providerConfig.repos : undefined;
     const excludeRepos =
@@ -533,6 +672,10 @@ async function fetchProviderData(
             prRecords: allPRRecords,
             errors,
             stateKey,
+            identifier,
+            // listRepos failed before any repo was processed — nothing was imported,
+            // so don't claim a synced-back-to floor even on a first sync.
+            firstSyncFloor: null,
         };
     }
 
@@ -558,7 +701,7 @@ async function fetchProviderData(
         });
         let rawCommits: GitCommit[] = [];
         try {
-            rawCommits = await provider.getCommits(repoName, since, now);
+            rawCommits = await provider.getCommits(repoName, since, until);
         } catch (err) {
             errors.push(
                 `[${providerType}/${repoName}] Failed to fetch commits: ${err instanceof Error ? err.message : String(err)}`,
@@ -678,6 +821,8 @@ async function fetchProviderData(
         prRecords: allPRRecords,
         errors,
         stateKey,
+        identifier,
+        firstSyncFloor,
     };
 }
 
@@ -919,7 +1064,14 @@ export class GitSync implements ConnectorInterface {
         const fetchResults: Array<{result: ProviderFetchResult; providerType: GitProviderType}> = [];
 
         for (const pc of providerConfigs) {
-            const result = await fetchProviderData(pc, now, db, report, options?.firstSyncWindowMonths);
+            const result = await fetchProviderData(
+                pc,
+                now,
+                db,
+                report,
+                options?.firstSyncWindowMonths,
+                options?.backfill,
+            );
             errors.push(...result.errors);
             fetchResults.push({result, providerType: pc.type});
         }
@@ -938,7 +1090,34 @@ export class GitSync implements ConnectorInterface {
         const resolvedPRRecords: Array<{record: PRRecordInput; developerId: string}> = [];
 
         for (const {result, providerType} of fetchResults) {
-            const {commits, prs, reviewComments, prRecords, stateKey} = result;
+            const {commits, prs, reviewComments, prRecords, stateKey, identifier} = result;
+
+            // Record this provider's sync progress. Backfill (#229) LOWERS the
+            // earliest watermark to the (older) slice it just imported and leaves
+            // the forward cursor untouched, so normal "Sync now" keeps resuming from
+            // now; every other run advances the forward cursor to `now`. Mirrors the
+            // forward cursor's existing semantics: written per-provider even on an
+            // empty/partial fetch (a failed repo is skipped, same accepted trade-off),
+            // so a backfill can only ever widen backward and never re-covers a slice.
+            const recordProgress = (): void => {
+                if (options?.backfill) {
+                    setProviderEarliestSyncTime(db, providerType, identifier, options.backfill.since);
+                } else {
+                    // On the FIRST forward sync, ALSO record the true earliest-synced
+                    // floor (#229) so the "sync older history" backfill's default is
+                    // exact, not the too-recent lazy guess. Guard on an unset
+                    // watermark: a first sync should never clobber a lower value a
+                    // prior direct-API backfill may have written (the UI can't reach
+                    // that ordering, but the route doesn't forbid it).
+                    if (
+                        result.firstSyncFloor !== null &&
+                        getProviderEarliestSyncTime(db, providerType, identifier) === null
+                    ) {
+                        setProviderEarliestSyncTime(db, providerType, identifier, result.firstSyncFloor);
+                    }
+                    setProviderLastSyncTime(db, stateKey, now);
+                }
+            };
 
             for (const record of prRecords) {
                 const developerId = resolveDeveloperId(
@@ -954,7 +1133,7 @@ export class GitSync implements ConnectorInterface {
             }
 
             if (commits.length === 0 && prs.length === 0 && reviewComments.length === 0) {
-                setProviderLastSyncTime(db, stateKey, now);
+                recordProgress();
                 continue;
             }
 
@@ -1000,7 +1179,7 @@ export class GitSync implements ConnectorInterface {
                 }
             }
 
-            setProviderLastSyncTime(db, stateKey, now);
+            recordProgress();
         }
 
         report?.((p) => {

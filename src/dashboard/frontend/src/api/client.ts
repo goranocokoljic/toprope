@@ -611,6 +611,22 @@ export const api = {
         return body.data;
     },
 
+    /**
+     * Extend one saved provider's synced window BACKWARD (#229) — "Sync older
+     * history". `months` is the ABSOLUTE amount of history to keep (e.g. 12 = "show
+     * me 12 months"), not a relative delta. Fire-and-forget like the normal sync;
+     * the outcome lands on the row. The server additively fetches only the
+     * never-synced older slice and rejects (409) when the window wouldn't extend
+     * further back than already synced.
+     */
+    async syncOlderHistoryAdminGitProvider(id: string, months: number): Promise<GitProviderSyncHandle> {
+        const body = await postJson<ApiEnvelope<GitProviderSyncHandle>>(
+            `/api/admin/git/providers/${encodeURIComponent(id)}/sync-older-history`,
+            {months},
+        );
+        return body.data;
+    },
+
     // --- Admin: expense reconciliation (Task 4.4 / #99) ---
     async getReconciliation(status: ReconciliationStatus | 'all'): Promise<ReconciliationResult[]> {
         const body = await request<ApiEnvelope<ReconciliationResult[]>>(

@@ -593,4 +593,178 @@ describe('admin git-provider sync-now API (#199)', () => {
             expect(row?.last_sync_at).toBeNull();
         });
     });
+
+    describe('POST /:id/sync-older-history — backward extension (#229)', () => {
+        const FORWARD_KEY = 'git_last_sync:github:db-org';
+        const EARLIEST_KEY = 'git_earliest_sync:github:db-org';
+
+        // Arm getCommits so the run resolves fast AND we can read the [since, until]
+        // slice the backfill window computed. Returns [] → no snapshot bookkeeping.
+        async function armGetCommits(): Promise<ReturnType<typeof vi.fn>> {
+            const getCommits = vi.fn().mockResolvedValue([]);
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits,
+                }),
+            );
+            return getCommits;
+        }
+
+        async function triggerOlder(
+            id: string,
+            payload: Record<string, unknown>,
+            token = adminToken,
+        ): ReturnType<FastifyInstance['inject']> {
+            return app.inject({
+                method: 'POST',
+                url: `/api/admin/git/providers/${id}/sync-older-history`,
+                headers: authHeaders(token),
+                payload,
+            });
+        }
+
+        function readState(key: string): string | undefined {
+            return (db.prepare('SELECT value FROM sync_state WHERE key = ?').get(key) as
+                | {value: string}
+                | undefined)?.value;
+        }
+
+        it('fetches [now − months, watermark], lowers the watermark, leaves the forward cursor untouched', async () => {
+            const id = await createGithub();
+            // A forward cursor is present — backfill must neither read nor move it.
+            db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+                FORWARD_KEY,
+                '2026-06-01T00:00:00.000Z',
+            );
+            const getCommits = await armGetCommits();
+
+            const before = Date.now();
+            const res = await triggerOlder(id, {months: 12});
+            expect(res.statusCode).toBe(202);
+            await waitForSyncStatus(id, 'ok');
+
+            const since = getCommits.mock.calls[0][1] as string;
+            const until = getCommits.mock.calls[0][2] as string;
+            // since ≈ now − 12mo (the requested target).
+            const expSince = new Date(before);
+            expSince.setUTCMonth(expSince.getUTCMonth() - 12);
+            expect(Math.abs(Date.parse(since) - expSince.getTime())).toBeLessThan(60_000);
+            // until ≈ the lazy watermark = now − 6mo (the #228 default).
+            const expUntil = new Date(before);
+            expUntil.setUTCMonth(expUntil.getUTCMonth() - 6);
+            expect(Math.abs(Date.parse(until) - expUntil.getTime())).toBeLessThan(60_000);
+
+            // Watermark lowered to exactly `since`; forward cursor untouched.
+            expect(readState(EARLIEST_KEY)).toBe(since);
+            expect(readState(FORWARD_KEY)).toBe('2026-06-01T00:00:00.000Z');
+        });
+
+        it('rejects an overlapping window (nothing older to sync) with 409 and starts no run', async () => {
+            const id = await createGithub();
+            const getCommits = await armGetCommits();
+            // Default watermark = now − 6mo; months=3 targets now − 3mo, which is
+            // NEWER than the watermark → nothing to extend backward.
+            const res = await triggerOlder(id, {months: 3});
+            expect(res.statusCode).toBe(409);
+            expect(res.json().message).toMatch(/already synced/i);
+            expect(getCommits).not.toHaveBeenCalled();
+            expect((await readProvider(id))?.last_sync_status).toBeNull();
+        });
+
+        it('is idempotent: re-issuing the same window after a successful run no-ops (409)', async () => {
+            const id = await createGithub();
+            await armGetCommits();
+            expect((await triggerOlder(id, {months: 12})).statusCode).toBe(202);
+            await waitForSyncStatus(id, 'ok');
+            // Watermark is now ≈ now − 12mo; the same absolute request can't reach
+            // further back, so it is a no-op reject — never a re-fetch/double-count.
+            const again = await triggerOlder(id, {months: 12});
+            expect(again.statusCode).toBe(409);
+        });
+
+        it('rejects an out-of-range or non-integer months with 400 and starts no run', async () => {
+            const id = await createGithub();
+            const getCommits = await armGetCommits();
+            for (const bad of [0, -1, 1000, 3.5, 'six', true]) {
+                const res = await triggerOlder(id, {months: bad});
+                expect(res.statusCode).toBe(400);
+                expect(res.json().message).toMatch(/months must be an integer/);
+            }
+            expect(getCommits).not.toHaveBeenCalled();
+            expect((await readProvider(id))?.last_sync_status).toBeNull();
+        });
+
+        it('rejects a disabled provider (409, not a silent no-op)', async () => {
+            const id = await createGithub();
+            db.prepare('UPDATE git_providers SET enabled = 0 WHERE id = ?').run(id);
+            const res = await triggerOlder(id, {months: 12});
+            expect(res.statusCode).toBe(409);
+            expect(res.json().message).toMatch(/disabled/);
+        });
+
+        it('rejects a read-only config-file provider id (409)', async () => {
+            const res = await triggerOlder(CONFIG_PROVIDER_ID, {months: 12});
+            expect(res.statusCode).toBe(409);
+            expect(res.json().message).toMatch(/read-only/);
+        });
+
+        it('returns a typed 404 for an unknown id', async () => {
+            const res = await triggerOlder('does-not-exist', {months: 12});
+            expect(res.statusCode).toBe(404);
+            expect(res.json().message).toMatch(/not found/);
+        });
+
+        it('rejects a developer session (403)', async () => {
+            const res = await triggerOlder('some-id', {months: 12}, devToken);
+            expect(res.statusCode).toBe(403);
+        });
+
+        it('fails closed with 503 (not 500) when the server key is unconfigured', async () => {
+            const id = await createGithub();
+            delete process.env.TOPROPE_SECRET_KEY;
+            const res = await triggerOlder(id, {months: 12});
+            expect(res.statusCode).toBe(503);
+            expect(res.json().message).toMatch(/TOPROPE_SECRET_KEY is not set/);
+            // No run started — status untouched.
+            expect((await readProvider(id))?.last_sync_status).toBeNull();
+        });
+
+        // The route's own in-flight guard (shared activeSyncs registry) serializes the
+        // read-watermark → lower-watermark sequence so two backfills can't race on the
+        // same edge and both write. Distinct from the overlap guard (which needs a
+        // settled run) — this must reject while a run is still executing.
+        it('rejects a second backfill while one is in flight (409, starts no second run)', async () => {
+            const id = await createGithub();
+            // Gate listRepos so the first backfill stays in flight until released.
+            let release!: () => void;
+            const gate = new Promise<void>((r) => {
+                release = r;
+            });
+            const getCommits = vi.fn().mockResolvedValue([]);
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockImplementation(async () => {
+                        await gate;
+                        return [makeRepo('repo1')];
+                    }),
+                    getCommits,
+                }),
+            );
+
+            const first = await triggerOlder(id, {months: 12});
+            expect(first.statusCode).toBe(202);
+
+            // Second trigger while the first is still running → rejected, no new run.
+            const second = await triggerOlder(id, {months: 24});
+            expect(second.statusCode).toBe(409);
+            expect(second.json().message).toMatch(/in progress/);
+            expect(getCommits).not.toHaveBeenCalled();
+
+            release();
+            await waitForSyncStatus(id, 'ok');
+        });
+    });
 });

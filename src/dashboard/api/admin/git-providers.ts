@@ -1,4 +1,4 @@
-import type {FastifyInstance} from 'fastify';
+import type {FastifyInstance, FastifyRequest} from 'fastify';
 import type Database from 'better-sqlite3';
 import {
     asObject,
@@ -32,7 +32,10 @@ import {
     FIRST_SYNC_WINDOW_DEFAULT_MONTHS,
     syncStateKey,
     loadProviderCursorKeys,
+    getEarliestSyncedWatermark,
+    subtractUtcMonths,
     type GitSyncProgress,
+    type SyncRunOptions,
 } from '../../../connectors/git/sync';
 import {gitProviderFixHint} from '../../../cli/doctor';
 import type {GitConnectorConfig} from '../../../config/types';
@@ -490,6 +493,87 @@ export function registerAdminGitProviderRoutes(
     // fallback carries `enabled: false` only to satisfy the base-config shape.
     const gitSync = new GitSync(gitConfig ?? {enabled: false});
 
+    // Kick off a scoped, fire-and-forget sync run for ONE provider and wire its
+    // terminal outcome to the row's last_sync_* columns + the in-flight registry.
+    // Shared by "Sync now" (#199) and "Sync older history" (#229): the ONLY
+    // difference between those two is the SyncRunOptions handed in (a first-sync
+    // window vs a backfill slice). Everything else — the in-flight entry, the
+    // progress listener, the unmatched-authors-aware error classification, the
+    // outcome recording, and the registry cleanup — is identical, so it lives here
+    // once rather than being cloned per route. Caller must have already set the
+    // overlap guard's preconditions (not in flight, enabled, config resolved).
+    //
+    // Scoping note (shared model): like the scheduled sync this is incremental — a
+    // "Sync now" run advances the per-provider forward cursor; a backfill run lowers
+    // the earliest watermark over a disjoint older slice. The snapshot upsert is
+    // keyed on (developer_id, date) and merges additively, so cross-provider same-day
+    // accuracy is a property of that shared pipeline (owned by the git-sync design),
+    // not of this per-provider trigger.
+    function startScopedSync(
+        request: FastifyRequest,
+        id: string,
+        config: GitProviderConfig,
+        options: SyncRunOptions,
+    ): SyncTriggerHandle {
+        const startedAt = new Date().toISOString();
+        // The registry entry is mutated in place by the progress listener below;
+        // the GET list serves whatever snapshot it holds right now.
+        const active: ActiveSyncDto = {started_at: startedAt, progress: null};
+        activeSyncs.set(id, active);
+
+        void gitSync
+            .syncProviders(
+                db,
+                [config],
+                (progress) => {
+                    active.progress = progress;
+                },
+                options,
+            )
+            .then((result) => {
+                // A sync that ran but collected per-repo/provider errors is an error
+                // outcome with a surfaced message — never swallowed. But the
+                // "unmatched authors" advisory is NOT a failure (CI bots and external
+                // contributors are unmapped in nearly every real repo), so it must
+                // not flip a provider that synced fine to red. Classify and surface
+                // only genuine errors.
+                const genuineErrors = result.errors.filter(
+                    (e) => !e.startsWith(UNMATCHED_AUTHORS_PREFIX),
+                );
+                if (genuineErrors.length > 0) {
+                    recordSyncOutcome(db, id, {
+                        status: 'error',
+                        at: new Date().toISOString(),
+                        error: genuineErrors.join('; '),
+                    });
+                } else {
+                    recordSyncOutcome(db, id, {status: 'ok', at: new Date().toISOString()});
+                }
+            })
+            .catch((err: unknown) => {
+                // A thrown failure (e.g. an unexpected pipeline crash) is still
+                // recorded as a status=error outcome, not lost.
+                const message = err instanceof Error ? err.message : String(err);
+                try {
+                    recordSyncOutcome(db, id, {
+                        status: 'error',
+                        at: new Date().toISOString(),
+                        error: message,
+                    });
+                } catch (recordErr) {
+                    request.log.error(
+                        {err: recordErr, providerId: id},
+                        'failed to record git sync error outcome',
+                    );
+                }
+            })
+            .finally(() => {
+                activeSyncs.delete(id);
+            });
+
+        return {provider_id: id, status: 'running', started_at: startedAt};
+    }
+
     app.get('/api/admin/git/providers', async (request, reply) => {
         if (!isAdmin(request)) return forbidden(reply);
         // DB providers first (store's deterministic created_at, id order), then
@@ -751,75 +835,108 @@ export function registerAdminGitProviderRoutes(
                 throw err;
             }
 
-            const startedAt = new Date().toISOString();
-            // The registry entry is mutated in place by the progress listener
-            // below; the GET list serves whatever snapshot it holds right now.
-            const active: ActiveSyncDto = {started_at: startedAt, progress: null};
-            activeSyncs.set(id, active);
-
-            // Kick off the run without awaiting it. syncProviders reuses the exact
-            // fetch→merge→upsert pipeline, scoped to just this provider. Whatever
-            // the outcome, we persist it to the row and clear the in-flight flag.
-            //
-            // Scoping note: like the scheduled sync, this is incremental (per-provider
-            // `since` sync-state) and the snapshot upsert is keyed on (developer_id,
-            // date). A run with no new commits in its window writes no snapshot; a run
-            // WITH new commits behaves exactly as a full scheduled sync does when only
-            // this provider has new commits in the window. Cross-provider same-day
-            // merge accuracy is a property of that shared pipeline model (owned by the
-            // git-sync design), not of this per-provider trigger — see the epic review.
-            void gitSync
-                .syncProviders(
-                    db,
-                    [config],
-                    (progress) => {
-                        active.progress = progress;
-                    },
-                    {firstSyncWindowMonths},
-                )
-                .then((result) => {
-                    // A sync that ran but collected per-repo/provider errors is an
-                    // error outcome with a surfaced message — never swallowed. But
-                    // the "unmatched authors" advisory is NOT a failure (CI bots and
-                    // external contributors are unmapped in nearly every real repo),
-                    // so it must not flip a provider that synced fine to red. Classify
-                    // and surface only genuine errors.
-                    const genuineErrors = result.errors.filter(
-                        (e) => !e.startsWith(UNMATCHED_AUTHORS_PREFIX),
-                    );
-                    if (genuineErrors.length > 0) {
-                        recordSyncOutcome(db, id, {
-                            status: 'error',
-                            at: new Date().toISOString(),
-                            error: genuineErrors.join('; '),
-                        });
-                    } else {
-                        recordSyncOutcome(db, id, {status: 'ok', at: new Date().toISOString()});
-                    }
-                })
-                .catch((err: unknown) => {
-                    // A thrown failure (e.g. an unexpected pipeline crash) is still
-                    // recorded as a status=error outcome, not lost.
-                    const message = err instanceof Error ? err.message : String(err);
-                    try {
-                        recordSyncOutcome(db, id, {
-                            status: 'error',
-                            at: new Date().toISOString(),
-                            error: message,
-                        });
-                    } catch (recordErr) {
-                        request.log.error(
-                            {err: recordErr, providerId: id},
-                            'failed to record git sync error outcome',
-                        );
-                    }
-                })
-                .finally(() => {
-                    activeSyncs.delete(id);
-                });
-
+            // Kick off the run without awaiting it (fire-and-forget, shared with
+            // "Sync older history"). The first-sync window applies only on the
+            // provider's first sync; the pipeline ignores it once a cursor exists.
+            const handle = startScopedSync(request, id, config, {firstSyncWindowMonths});
             reply.status(202);
-            const handle: SyncTriggerHandle = {provider_id: id, status: 'running', started_at: startedAt};
+            return {data: handle};
+        },
+    );
+
+    // POST /:id/sync-older-history — extend a provider's synced window BACKWARD
+    // (#229). Additive-only: it fetches the strictly-older commit slice
+    // [now − months, current_earliest_watermark] and merges it, never re-covering
+    // an already-synced span (the additive merge would double-count). `months` is
+    // ABSOLUTE ("keep this many months of history"), so re-pressing with the same
+    // value is idempotent by construction — the overlap guard turns it into a no-op.
+    // Fire-and-forget like "Sync now"; the terminal outcome lands on the row.
+    // Crucially, this LOWERS the earliest watermark and does NOT advance the forward
+    // cursor, so normal "Sync now" keeps resuming from now.
+    app.post<{Params: {id: string}; Body: unknown}>(
+        '/api/admin/git/providers/:id/sync-older-history',
+        async (request, reply) => {
+            if (!isAdmin(request)) return forbidden(reply);
+            const {id} = request.params;
+
+            // Absolute "months of history to keep": validated fail-closed (integer
+            // within the hard bounds) at this trust boundary before any work.
+            // Reuses the first-sync window parser — identical bounds, and the
+            // pipeline turns the value into an older target rather than a first-sync
+            // start.
+            let months: number;
+            try {
+                months = parseFirstSyncWindowMonths(request.body);
+            } catch (err) {
+                if (err instanceof BadProviderRequestError) return badRequest(reply, err.message);
+                throw err;
+            }
+
+            // Config-file providers have no row to update and are read-only in the UI.
+            if (configProviders().some((c) => configProviderId(c) === id)) {
+                return conflict(
+                    reply,
+                    'Config-file providers are read-only and sync via the scheduled pipeline, not individually',
+                );
+            }
+
+            const record = getProvider(db, id);
+            if (record === undefined) {
+                return notFound(reply, `Git provider not found: ${id}`);
+            }
+            // A disabled provider is intentionally excluded from syncs — typed 409.
+            if (record.enabled !== 1) {
+                return conflict(reply, 'Provider is disabled; enable it before syncing');
+            }
+            // Overlap guard vs any in-flight run (backfill OR sync-now): they share
+            // the activeSyncs registry, so two runs never write the same provider's
+            // snapshots concurrently. This also serializes the read-watermark →
+            // lower-watermark sequence so no two backfills race on the same edge.
+            if (activeSyncs.has(id)) {
+                return conflict(reply, 'A sync is already in progress for this provider');
+            }
+
+            // Compute the disjoint older slice from the CURRENT earliest watermark.
+            const now = new Date().toISOString();
+            const currentEarliest = getEarliestSyncedWatermark(db, record.type, record.container, now);
+            const newTarget = subtractUtcMonths(now, months);
+            // subtractUtcMonths returns null only for an unparseable `now`, which we
+            // just produced — defensive, should never trip.
+            if (newTarget === null) {
+                return serviceUnavailable(reply, 'Could not compute the history window');
+            }
+            // Overlap guard: the target must be STRICTLY older than what is already
+            // synced. Otherwise there is nothing to extend and any fetch would
+            // re-cover an already-counted span — a typed 409 no-op, not a silent
+            // success or a double-count.
+            if (newTarget >= currentEarliest) {
+                return conflict(
+                    reply,
+                    `Already synced at least ${months} months of history; choose a larger window to extend further back`,
+                );
+            }
+
+            // Resolve the plaintext config (fail-closed on the server key) BEFORE
+            // marking the run in-flight, so a key-config error is a clean 503 and
+            // never leaves a stuck in-flight entry.
+            let config: GitProviderConfig;
+            try {
+                const decrypted = getDecryptedConfig(db, loadServerKey(), id);
+                if (decrypted === undefined) {
+                    return notFound(reply, `Git provider not found: ${id}`);
+                }
+                config = decrypted;
+            } catch (err) {
+                if (err instanceof GitProviderStoreError && err.code === 'secret_key_unconfigured') {
+                    return serviceUnavailable(reply, err.message);
+                }
+                throw err;
+            }
+
+            const handle = startScopedSync(request, id, config, {
+                backfill: {since: newTarget, until: currentEarliest},
+            });
+            reply.status(202);
             return {data: handle};
         },
     );
