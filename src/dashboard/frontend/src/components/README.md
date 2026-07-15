@@ -244,16 +244,27 @@ footer, or a close-guard.
 consumer (#238) — its add/edit form is a `FormModal` opened from the header's
 "＋ Add git provider" button or a row's "Edit". `AdminUsers` followed (#239):
 create-only, opened from "＋ New user", with per-row role / deactivate /
-reset-password left inline as single actions. The remaining admin screens are
-migrated onto it in the rest of the epic. `RepoScopeModal` stays on the raw
-`Modal`: it is a scope picker with its own "Save scope" footer, not a create/edit
-form.
+reset-password left inline as single actions. `AdminSubscriptions` (#240) is also
+create-only — opened from "＋ Assign subscription", with the per-row "End" left
+inline. The remaining admin screens are migrated onto it in the rest of the epic.
+`RepoScopeModal` stays on the raw `Modal`: it is a scope picker with its own
+"Save scope" footer, not a create/edit form.
 
-A create-only screen (`AdminUsers`) needs no `key` on the `FormModal`: with no
-edit mode there is no row to switch between, and the open-gated render already
-remounts clean fields on every reopen. Side effects that must OUTLIVE the dialog
-(the users temp-password reveal) belong to the page's state, not the modal's —
-hand them up in `onSuccess` before closing.
+A create-only screen (`AdminUsers`, `AdminSubscriptions`) needs no `key` on the
+`FormModal`: with no edit mode there is no row to switch between, and the
+open-gated render already remounts clean fields on every reopen. Side effects that
+must OUTLIVE the dialog (the users temp-password reveal) belong to the page's
+state, not the modal's — hand them up in `onSuccess` before closing.
+
+"Create-only" is about the FORM, not the write: `AdminSubscriptions` assigns *and
+changes* a subscription through one dialog, because a change IS an assign (the
+backend revokes the old seat and opens a new one). A screen only needs edit mode
+when a row's existing values must pre-fill the fields.
+
+A screen whose options come from a second query (the developer list on
+`AdminUsers` / `AdminSubscriptions`) loads them when the DIALOG opens, not with the
+page. Gate that control on `isPending`: an enabled, empty select reads as "there
+are none" rather than "not loaded yet".
 
 The screen's primary affordance goes in `PageHeader`'s optional `actions` slot,
 as a `PrimaryButton` with `ariaHasPopup="dialog"`.
