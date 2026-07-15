@@ -80,6 +80,82 @@ export const FIRST_SYNC_WINDOW_DEFAULT_MONTHS = 6;
 // backfill against such a provider, because every real target is `>=` the epoch.
 export const EARLIEST_SYNC_EPOCH = new Date(0).toISOString();
 
+/**
+ * Hard cap (in whole days) on the span a SINGLE run re-fetches when a provider's
+ * cursor has been held back (#235).
+ *
+ * #231 holds a provider's cursor whenever its window was not fully covered, so the
+ * span still to re-cover is `[storedCursor, now]` — which GROWS every run the
+ * provider stays broken. Left uncapped, a provider stalled for months eventually
+ * asks each run to walk a months-long commit window across every repo (and one
+ * `getCommitDiff` call PER commit), so the cost of a stall compounds into the very
+ * rate-limit drain the first-sync window cap exists to prevent.
+ *
+ * Capping `until` (never `since`) is what keeps this gap-free: the window is
+ * CHUNKED, not skipped. A held cursor advances at most one cap-width per complete
+ * run and the next run resumes exactly where this one stopped, so a recovering
+ * provider catches up over consecutive runs. Clamping `since` forward instead would
+ * bound the cost by silently dropping `[storedCursor, now - cap]` — the permanent
+ * snapshot gap #231 exists to prevent.
+ *
+ * 30 days: wide enough that a healthy daily/weekly sync NEVER hits it (an
+ * uncapped `until === now` is the unchanged normal path), narrow enough that one
+ * catch-up run stays a bounded fetch.
+ *
+ * WHAT THIS DOES AND DOES NOT BOUND — the honest scope, because "a stalled run costs
+ * a constant amount" is NOT true in general:
+ *   - BOUNDED everywhere: the commit walk's `[since, until]` span, and with it the
+ *     per-commit `getCommitDiff` fan-out (one API call PER COMMIT — usually the
+ *     largest single cost of a catch-up).
+ *   - NOT bounded, and made WORSE on recovery: the PR listing.
+ *     `getPullRequests(repo, state, since)` takes no `until` (see GitProvider), so a
+ *     run still lists every PR touched since the cursor and fans out to
+ *     getReviewComments + getPRReviews per PR. Two distinct consequences, and the
+ *     second is a real cost this cap ADDS — stated plainly rather than buried:
+ *       · While STALLED: `since` is pinned and `now` marches on, so that half of the
+ *         cost grows every run, exactly as it did before this cap existed.
+ *       · While RECOVERING: chunking multiplies the PR half's TOTAL cost. Catching up
+ *         200 days used to be one run listing 200 days of PRs; it is now 7 runs
+ *         listing 200+170+140+110+80+50+20 = 770 PR-days, because each chunk re-lists
+ *         everything from its (advancing) `since` to `now`. The amplification is
+ *         ~lag/(2·cap) — ~4x for a 200-day recovery, ~12x for a two-year one. The
+ *         commit half is unaffected (its chunks are disjoint), so what the cap really
+ *         buys is a bounded PEAK per run, paid for with a higher TOTAL on the PR side.
+ *         For a rare, one-off recovery that is the right trade — a single run walking
+ *         200 days of commits with a getCommitDiff per commit is what actually
+ *         exhausts a rate limit — but it is a trade, not a free win.
+ *     Correctness is unaffected either way: those fields are max()-merged idempotently
+ *     (see remergeStoredSnapshot), so re-delivery is extra fetch, never inflation.
+ *     Bounding it properly needs an `until` on the provider PR interface — GitPR does
+ *     not even carry the `updated_at` the delivery is keyed on, so a filter here could
+ *     not be proven lossless: follow-up #247, deliberately not #235.
+ *   - PROVIDER-DEPENDENT: github/gitlab push `since`+`until` to the server, so the
+ *     cap really does shrink what is listed. Bitbucket's getCommits pages from HEAD
+ *     newest-first and breaks only when it crosses `since`, filtering `until` in
+ *     memory — so for Bitbucket the cap bounds the diff fan-out but NOT the commit
+ *     paging, and a chunked recovery re-pages HEAD→since once per chunk.
+ */
+export const GIT_CATCHUP_WINDOW_MAX_DAYS = 30;
+
+/**
+ * The upper bound a forward run should actually fetch to, given the cursor it is
+ * resuming from (#235): `now` normally, or `since + GIT_CATCHUP_WINDOW_MAX_DAYS`
+ * when a held cursor left a wider span to re-cover.
+ *
+ * Total by construction — an unparseable bound, or a `since` at/after `now` (a
+ * clock skew or a hand-edited cursor), degrades to `now`, i.e. the uncapped
+ * behavior this replaced. Never returns an instant after `now`, so a future-dated
+ * cursor can't push the window past the present. Exported for tests.
+ */
+export function catchUpUntil(since: string, now: string): string {
+    const sinceMs = Date.parse(since);
+    const nowMs = Date.parse(now);
+    if (Number.isNaN(sinceMs) || Number.isNaN(nowMs)) return now;
+    const capMs = GIT_CATCHUP_WINDOW_MAX_DAYS * 86_400_000;
+    if (nowMs - sinceMs <= capMs) return now;
+    return new Date(sinceMs + capMs).toISOString();
+}
+
 /** Knobs a sync run accepts beyond the provider set. */
 export interface SyncRunOptions {
     /**
@@ -212,8 +288,8 @@ function isEarliestFloorUnknown(
     // absent) would disagree with that reader and fail OPEN — back to the too-recent
     // guess for a provider that has a cursor, the exact defect this exists to close.
     return (
-        !getProviderLastSyncTime(db, earliestSyncStateKey(providerType, identifier)) &&
-        getProviderLastSyncTime(db, syncStateKey(providerType, identifier)) !== null
+        !getSyncStateValue(db, earliestSyncStateKey(providerType, identifier)) &&
+        getSyncStateValue(db, syncStateKey(providerType, identifier)) !== null
     );
 }
 
@@ -231,6 +307,258 @@ export function loadProviderCursorKeys(db: Database.Database): Set<string> {
         .prepare("SELECT key FROM sync_state WHERE key LIKE 'git_last_sync:%'")
         .all() as Array<{key: string}>;
     return new Set(rows.map((r) => r.key));
+}
+
+// ─── Stalled-provider detection (#235) ────────────────────────────────────────
+//
+// #231 made a provider's cursor advance atomic with — and conditional on — a
+// COMPLETE fetch: any `listRepos`/`getCommits` failure holds the WHOLE provider's
+// cursor so its window re-covers next run rather than leaving a silent snapshot
+// gap. That is the right correctness trade-off, but it has an operational cost this
+// tracks: one repo that fails permanently (oversized, permission drift,
+// deleted-but-still-listed) holds the cursor forever, so no developer on ANY of
+// that provider's other repos gets a new snapshot until a human excludes it.
+//
+// `errors[]` alone cannot say that. In a multi-provider run a healthy sibling still
+// writes, so a permanent stall is shaped exactly like a transient per-repo hiccup —
+// the run "succeeded". The counter below is the missing distinct signal: it makes
+// "provider X's cursor has not advanced for N consecutive runs" queryable, which is
+// what `toprope status` / `toprope doctor` report.
+
+/**
+ * Consecutive held-cursor runs before a provider is REPORTED as stalled.
+ *
+ * Not 1: a single held run is the common, self-healing case (a rate-limit blip, a
+ * flaky 502) and alerting on it would train the reader to ignore the signal. Three
+ * consecutive runs cannot be explained away — whatever the repo is doing, it is not
+ * transient, and every run since the first has imported nothing.
+ */
+export const GIT_STALL_ALERT_RUNS = 3;
+
+/**
+ * The sync_state key for a provider's consecutive-stalled-runs counter (#235).
+ * A THIRD namespace, disjoint from both the forward cursor {@link syncStateKey}
+ * (`git_last_sync:…`) and the earliest watermark {@link earliestSyncStateKey}
+ * (`git_earliest_sync:…`), so a stall row can never be read as either.
+ */
+export function stallStateKey(providerType: GitProviderType, identifier: string): string {
+    return `git_stall:${providerType}:${identifier}`;
+}
+
+/** A provider's current consecutive-stall streak (#235). */
+export interface GitProviderStall {
+    /** Consecutive runs that held this provider's cursor. Always >= 1. */
+    runs: number;
+    /** UTC ISO instant of the FIRST run in the current streak — "stalled since". */
+    since: string;
+}
+
+/**
+ * Decode a stored stall row, or null when there is no usable streak.
+ *
+ * `sync_state.value` is an unconstrained TEXT column, so the stored JSON is parsed
+ * and RANGE-VALIDATED rather than cast: a row that is absent, unparseable, or
+ * carries a non-positive/non-integer `runs` or an unparseable `since` is treated as
+ * "no streak". That is deliberately self-healing rather than fail-closed — this is
+ * a diagnostic counter, not an authorization gate, and the alternative (reporting a
+ * corrupt row as a stall of `NaN` runs) is a false alarm that no remedy clears. The
+ * next incomplete run rewrites the row from scratch; the next complete run deletes
+ * it.
+ */
+function parseStall(value: string | null): GitProviderStall | null {
+    if (!value) return null;
+    let raw: unknown;
+    try {
+        raw = JSON.parse(value);
+    } catch {
+        return null;
+    }
+    if (typeof raw !== 'object' || raw === null) return null;
+    const {runs, since} = raw as {runs?: unknown; since?: unknown};
+    if (!Number.isInteger(runs) || (runs as number) < 1) return null;
+    if (typeof since !== 'string' || Number.isNaN(Date.parse(since))) return null;
+    return {runs: runs as number, since};
+}
+
+/** The current stall streak for one provider (#235), or null if it is not stalled. */
+export function getProviderStall(
+    db: Database.Database,
+    providerType: GitProviderType,
+    identifier: string,
+): GitProviderStall | null {
+    return parseStall(getSyncStateValue(db, stallStateKey(providerType, identifier)));
+}
+
+/**
+ * Record that this run HELD this provider's cursor (#231's incomplete-fetch path):
+ * open a streak at 1, or extend the open one, preserving its original `since`.
+ *
+ * Read-modify-write — MUST run inside the sync write transaction (see the
+ * `stallUpdates` push in {@link GitSync.syncProviders}), which is also what makes it
+ * atomic with the cursor decision it mirrors.
+ *
+ * On concurrency, precisely: better-sqlite3's `db.transaction()` issues a DEFERRED
+ * BEGIN, so it does NOT serialize two concurrent runs — both can read `runs: 2`. What
+ * it guarantees is that the second one to WRITE fails fast (SQLITE_BUSY) and rolls
+ * back whole, so the outcome is "one run's accounting, or none" rather than a lost
+ * update. Correct, but by fail-fast, not by mutual exclusion — don't read this as a
+ * lock.
+ */
+function recordProviderStallRun(
+    db: Database.Database,
+    providerType: GitProviderType,
+    identifier: string,
+    now: string,
+): void {
+    const open = getProviderStall(db, providerType, identifier);
+    const next: GitProviderStall = open
+        ? {runs: open.runs + 1, since: open.since}
+        : {runs: 1, since: now};
+    setSyncStateValue(db, stallStateKey(providerType, identifier), JSON.stringify(next));
+}
+
+/**
+ * Clear a provider's stall streak — its window was covered completely, so the
+ * cursor is advancing again. A no-op DELETE when it was never stalled, which is the
+ * overwhelmingly common case and cheaper than reading first to decide.
+ */
+function clearProviderStall(
+    db: Database.Database,
+    providerType: GitProviderType,
+    identifier: string,
+): void {
+    db.prepare('DELETE FROM sync_state WHERE key = ?').run(stallStateKey(providerType, identifier));
+}
+
+/**
+ * A provider that is ADVANCING but is still more than one cap-width behind the
+ * present (#235) — a bounded catch-up in progress.
+ *
+ * This state is CREATED by {@link GIT_CATCHUP_WINDOW_MAX_DAYS}. Before the cap, a
+ * complete run always reached `now`, so "the run completed" and "the data is
+ * current" were the same statement. They no longer are: a provider recovering from
+ * a 200-day stall completes every run and clears its stall streak while its cursor
+ * is still ~170 days back, and needs ~6 more runs to catch up. Reporting only the
+ * stall streak would call that provider healthy and print "advancing" — technically
+ * true, and exactly the false all-clear an operator would act on right after
+ * excluding the broken repo that caused the stall.
+ */
+export interface LaggingProvider {
+    type: GitProviderType;
+    identifier: string;
+    /** The provider's current forward cursor (UTC ISO) — the instant it has synced to. */
+    cursor: string;
+    /** Whole days between {@link cursor} and now. Always > GIT_CATCHUP_WINDOW_MAX_DAYS. */
+    daysBehind: number;
+}
+
+/**
+ * Every CONFIGURED provider whose forward cursor is more than one cap-width behind
+ * `now` (#235) — i.e. whose next run WILL be capped and so will not reach the
+ * present. The companion signal to {@link loadStalledProviders}, and the reason
+ * `doctor` cannot answer "is git data current?" from the stall counter alone.
+ *
+ * Providers with ANY open stall streak are excluded, keeping the two sets disjoint.
+ * Note the exclusion is on an OPEN streak (>= 1 held run), NOT on the >= 3 reporting
+ * threshold: a provider held for one or two runs is below the stall alert, but its
+ * cursor IS being held, so reporting it here as "advancing" would state the opposite
+ * of the truth for exactly as long as it takes to become a reported stall. A held
+ * cursor also falls behind by definition, so without this every stall would surface
+ * twice under two headings — and the stall is the more specific, more actionable one.
+ *
+ * Cursors and stall rows are each resolved in ONE query and membership-tested in
+ * memory against the caller's already-resolved provider set — never a query per
+ * provider, and never by re-running {@link loadStalledProviders} (which every caller
+ * of this already calls itself, and which would apply the wrong threshold anyway).
+ * Total by construction: an unparseable or future-dated cursor is not lagging. Order
+ * follows `providerConfigs`, so output is deterministic.
+ */
+export function loadLaggingProviders(
+    db: Database.Database,
+    providerConfigs: GitProviderConfig[],
+    now: string,
+): LaggingProvider[] {
+    const nowMs = Date.parse(now);
+    if (Number.isNaN(nowMs)) return [];
+
+    const cursorByKey = new Map(
+        (
+            db
+                .prepare("SELECT key, value FROM sync_state WHERE key LIKE 'git_last_sync:%'")
+                .all() as Array<{key: string; value: string}>
+        ).map((r) => [r.key, r.value]),
+    );
+    const stallByKey = new Map(
+        (
+            db
+                .prepare("SELECT key, value FROM sync_state WHERE key LIKE 'git_stall:%'")
+                .all() as Array<{key: string; value: string}>
+        ).map((r) => [r.key, r.value]),
+    );
+
+    const capMs = GIT_CATCHUP_WINDOW_MAX_DAYS * 86_400_000;
+    const lagging: LaggingProvider[] = [];
+    for (const pc of providerConfigs) {
+        const identifier = providerIdentifier(pc);
+        // Any open streak — not just a reportable one. See the note above.
+        if (parseStall(stallByKey.get(stallStateKey(pc.type, identifier)) ?? null)) continue;
+        const cursor = cursorByKey.get(syncStateKey(pc.type, identifier));
+        if (!cursor) continue; // Never synced — not lagging, just pending its first run.
+        const cursorMs = Date.parse(cursor);
+        if (Number.isNaN(cursorMs)) continue;
+        const behindMs = nowMs - cursorMs;
+        if (behindMs <= capMs) continue;
+        lagging.push({
+            type: pc.type,
+            identifier,
+            cursor,
+            daysBehind: Math.floor(behindMs / 86_400_000),
+        });
+    }
+    return lagging;
+}
+
+/** A provider whose cursor has been stuck long enough to report (#235). */
+export interface StalledProvider {
+    type: GitProviderType;
+    identifier: string;
+    /** Consecutive runs that held the cursor — always >= {@link GIT_STALL_ALERT_RUNS}. */
+    runs: number;
+    /** UTC ISO instant this streak began. */
+    since: string;
+}
+
+/**
+ * Every CONFIGURED provider currently stalled for >= {@link GIT_STALL_ALERT_RUNS}
+ * consecutive runs (#235) — the one canonical reader, shared by `toprope status`
+ * and `toprope doctor` so both report the identical set on the identical threshold.
+ *
+ * All stall rows are resolved in ONE query and membership-tested in memory against
+ * the caller's already-resolved provider set — never a query per provider. Filtering
+ * to that set (rather than returning every stored row) is what stops a stall row
+ * orphaned by a deleted or renamed provider from being reported forever against a
+ * target that no longer exists. Order follows `providerConfigs`, so output is
+ * deterministic.
+ */
+export function loadStalledProviders(
+    db: Database.Database,
+    providerConfigs: GitProviderConfig[],
+): StalledProvider[] {
+    const rows = db
+        .prepare("SELECT key, value FROM sync_state WHERE key LIKE 'git_stall:%'")
+        .all() as Array<{key: string; value: string}>;
+    if (rows.length === 0) return [];
+    const byKey = new Map(rows.map((r) => [r.key, r.value]));
+
+    const stalled: StalledProvider[] = [];
+    for (const pc of providerConfigs) {
+        const identifier = providerIdentifier(pc);
+        const stall = parseStall(byKey.get(stallStateKey(pc.type, identifier)) ?? null);
+        if (stall && stall.runs >= GIT_STALL_ALERT_RUNS) {
+            stalled.push({type: pc.type, identifier, runs: stall.runs, since: stall.since});
+        }
+    }
+    return stalled;
 }
 
 interface SyncStateRow {
@@ -261,17 +589,22 @@ interface GitSnapshotRow {
     data_source: string;
 }
 
-function getProviderLastSyncTime(db: Database.Database, key: string): string | null {
+// The single read/write pair for every `sync_state` row this module owns — the
+// forward cursor, the earliest-synced watermark, and the stall counter. Named for
+// the VALUE they move rather than for any one caller's meaning: not every row here
+// holds a timestamp (the stall counter is JSON), and a `…LastSyncTime` name on the
+// generic accessor would make those call sites read as a lie.
+function getSyncStateValue(db: Database.Database, key: string): string | null {
     const row = db
         .prepare('SELECT value FROM sync_state WHERE key = ?')
         .get(key) as SyncStateRow | undefined;
     return row?.value ?? null;
 }
 
-function setProviderLastSyncTime(db: Database.Database, key: string, time: string): void {
+function setSyncStateValue(db: Database.Database, key: string, value: string): void {
     db.prepare(
         'INSERT INTO sync_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
-    ).run(key, time);
+    ).run(key, value);
 }
 
 // Read/write the per-provider earliest-synced watermark (#229). Thin semantic
@@ -283,7 +616,7 @@ function getProviderEarliestSyncTime(
     providerType: GitProviderType,
     identifier: string,
 ): string | null {
-    return getProviderLastSyncTime(db, earliestSyncStateKey(providerType, identifier));
+    return getSyncStateValue(db, earliestSyncStateKey(providerType, identifier));
 }
 
 function setProviderEarliestSyncTime(
@@ -292,7 +625,7 @@ function setProviderEarliestSyncTime(
     identifier: string,
     time: string,
 ): void {
-    setProviderLastSyncTime(db, earliestSyncStateKey(providerType, identifier), time);
+    setSyncStateValue(db, earliestSyncStateKey(providerType, identifier), time);
 }
 
 /**
@@ -425,7 +758,7 @@ export function declareEarliestSyncedFloor(
             // Falsy, matching isEarliestFloorUnknown: a blank row is not a floor.
             const hasFloor = Boolean(getProviderEarliestSyncTime(db, providerType, identifier));
             const hasCursor =
-                getProviderLastSyncTime(db, syncStateKey(providerType, identifier)) !== null;
+                getSyncStateValue(db, syncStateKey(providerType, identifier)) !== null;
             // Nothing synced under this key — refuse even under force (see above).
             if (!hasFloor && !hasCursor) return {ok: false, reason: 'never_synced'};
             // A floor is recorded: only an explicit force may replace it.
@@ -753,6 +1086,21 @@ interface ProviderFetchResult {
      */
     firstSyncFloor: string | null;
     /**
+     * The instant this provider's forward cursor advances to on a COMPLETE run —
+     * the effective `until` the fetch actually covered.
+     *
+     * `now` on every normal run (first sync, or a cursor within
+     * {@link GIT_CATCHUP_WINDOW_MAX_DAYS} of now), and an EARLIER, capped instant
+     * when a held cursor left a wider span to re-cover (#235). Threaded out rather
+     * than re-deriving `now` at the advance: a capped run covered `[since, until]`
+     * only, so advancing to `now` would skip `[until, now]` entirely — the silent
+     * permanent snapshot gap #231 exists to prevent, reintroduced by the very cap
+     * meant to bound the stall.
+     *
+     * Ignored on the backfill path, which never advances the forward cursor.
+     */
+    forwardCursorTarget: string;
+    /**
      * True iff every fetch feeding the ADDITIVE commit-derived snapshot succeeded
      * for this provider — `listRepos` AND every repo's `getCommits`. When false the
      * run must NOT advance this provider's cursor/watermark AND must NOT write its
@@ -797,18 +1145,32 @@ async function fetchProviderData(
     //     exists it is the source of truth and firstSyncWindowMonths is IGNORED —
     //     re-widening `since` against additive snapshots would double-count (see
     //     SyncRunOptions).
-    const storedCursor = getProviderLastSyncTime(db, stateKey);
+    const storedCursor = getSyncStateValue(db, stateKey);
     const since = backfill ? backfill.since : (storedCursor ?? firstSyncSince(now, firstSyncWindowMonths));
     // This run is a FIRST forward sync when it is not a backfill and no cursor exists
     // yet. Only then does runSync record the earliest-synced watermark (#229): the
     // real floor `since` reached, mapped to the epoch sentinel for a walk-all ('').
     const isFirstSync = !backfill && storedCursor === null;
     const firstSyncFloor = isFirstSync ? (since === '' ? EARLIEST_SYNC_EPOCH : since) : null;
-    // Commit fetch upper bound: the backfill's watermark, else `now`. PRs are fetched
-    // by `since` only (the provider interface has no PR `until`); in backfill that
-    // re-delivers recent PRs, which the max()-based cross-run merge folds in
-    // idempotently (see remergeStoredSnapshot) — no inflation, just extra fetch.
-    const until = backfill ? backfill.until : now;
+    // Commit fetch upper bound:
+    //   - Backfill (#229): the caller's watermark.
+    //   - Resuming a stored cursor: `now`, CAPPED to GIT_CATCHUP_WINDOW_MAX_DAYS past
+    //     the cursor (#235) so a long-held cursor re-fetches a bounded span per run
+    //     instead of an ever-widening one. Chunked, never skipped — the run advances
+    //     the cursor to this `until` (see forwardCursorTarget), so the next run
+    //     resumes exactly here and no span is lost.
+    //   - First sync (no cursor): `now`. The cap deliberately does NOT apply — the
+    //     window is already bounded by firstSyncWindowMonths, and capping it would
+    //     silently turn a requested 6-month import into a 30-day one.
+    // The cap bounds the COMMIT walk and its per-commit getCommitDiff fan-out only —
+    // the PR listing below is fetched by `since` with no upper bound, so its cost still
+    // grows while a cursor is held. See GIT_CATCHUP_WINDOW_MAX_DAYS for the full scope
+    // of what is and is not bounded (and follow-up #247).
+    const until = backfill
+        ? backfill.until
+        : storedCursor !== null
+          ? catchUpUntil(storedCursor, now)
+          : now;
 
     const rawRepos = 'repos' in providerConfig ? providerConfig.repos : undefined;
     const excludeRepos =
@@ -841,6 +1203,9 @@ async function fetchProviderData(
             // listRepos failed before any repo was processed — nothing was imported,
             // so don't claim a synced-back-to floor even on a first sync.
             firstSyncFloor: null,
+            // Unused on this path (`complete: false` means no cursor advances), but the
+            // window this run would have covered is still the honest value to report.
+            forwardCursorTarget: until,
             // The window was not covered at all — hold the cursor so it retries (#231).
             complete: false,
         };
@@ -997,6 +1362,7 @@ async function fetchProviderData(
         stateKey,
         identifier,
         firstSyncFloor,
+        forwardCursorTarget: until,
         complete: commitsComplete,
     };
 }
@@ -1130,6 +1496,18 @@ export class GitSync implements ConnectorInterface {
         return CONNECTOR_NAME;
     }
 
+    /**
+     * The newest forward CURSOR across this connector's providers — the instant git
+     * data has been synced UP TO, not the instant a run last happened.
+     *
+     * Those were the same thing until #235: a complete run always advanced the cursor
+     * to `now`. With the catch-up cap they diverge — a provider recovering from a long
+     * stall syncs successfully every night while this still reports an instant weeks
+     * back, because that is genuinely how far the data reaches. That is the honest
+     * answer for a freshness/staleness question and the wrong one for "did the sync
+     * run?"; a caller wanting the latter must not use this. No production caller reads
+     * it today (see #246).
+     */
     getLastSyncTime(db: Database.Database): string | null {
         const providers = this.getProviderConfigs(db);
         let latest: string | null = null;
@@ -1268,9 +1646,28 @@ export class GitSync implements ConnectorInterface {
         // — and only if — its data is persisted. Populated only for providers whose
         // fetch was complete; an incomplete provider contributes nothing this run.
         const cursorAdvances: Array<() => void> = [];
+        // Deferred stall-counter updates (#235), applied in the SAME transaction as
+        // the cursor advances so the counter and the cursor can never disagree about
+        // whether this run moved the provider forward. Unlike `cursorAdvances` this
+        // covers EVERY provider in the run — a complete one clears its streak, an
+        // incomplete one extends it.
+        const stallUpdates: Array<() => void> = [];
 
         for (const {result, providerType} of fetchResults) {
             const {commits, prs, reviewComments, prRecords, stateKey, identifier} = result;
+
+            // Stall accounting (#235) — FORWARD runs only. A backfill deliberately
+            // leaves the forward cursor untouched (it walks older history), so its
+            // outcome says nothing about whether the cursor is stuck; counting a failed
+            // backfill would raise a stall alert for a provider syncing perfectly, and
+            // a successful one would clear a real stall that is still stuck.
+            if (!options?.backfill) {
+                if (result.complete) {
+                    stallUpdates.push(() => clearProviderStall(db, providerType, identifier));
+                } else {
+                    stallUpdates.push(() => recordProviderStallRun(db, providerType, identifier, now));
+                }
+            }
 
             // A provider whose commit fetch was incomplete (listRepos or any repo's
             // getCommits threw) must not advance its cursor OR write its additive
@@ -1310,7 +1707,11 @@ export class GitSync implements ConnectorInterface {
                     ) {
                         setProviderEarliestSyncTime(db, providerType, identifier, result.firstSyncFloor);
                     }
-                    setProviderLastSyncTime(db, stateKey, now);
+                    // The instant actually COVERED, not `now`: a catch-up run capped by
+                    // GIT_CATCHUP_WINDOW_MAX_DAYS (#235) fetched only [since, until], so
+                    // advancing to `now` would silently skip the rest. Equal to `now` on
+                    // every uncapped run, which is all of them for a healthy provider.
+                    setSyncStateValue(db, stateKey, result.forwardCursorTarget);
                 }
             });
 
@@ -1402,6 +1803,14 @@ export class GitSync implements ConnectorInterface {
             // above committed. Collected only for complete providers (see the loop).
             for (const advance of cursorAdvances) {
                 advance();
+            }
+            // Stall counters move with the cursors, in the same tx and on the same
+            // all-or-nothing terms (#235). A rolled-back run therefore records no stall
+            // either — correct, because nothing about it persisted: no cursor moved, and
+            // the next run re-covers the window and accounts for itself. Its failure is
+            // still loud via the rollback error pushed below.
+            for (const update of stallUpdates) {
+                update();
             }
             snapshotsWritten = written;
             snapshotsSkipped = skipped;

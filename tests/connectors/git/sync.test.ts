@@ -16,6 +16,12 @@ import {
     FIRST_SYNC_WINDOW_MIN_MONTHS,
     FIRST_SYNC_WINDOW_MAX_MONTHS,
     FIRST_SYNC_WINDOW_DEFAULT_MONTHS,
+    catchUpUntil,
+    getProviderStall,
+    loadStalledProviders,
+    loadLaggingProviders,
+    GIT_STALL_ALERT_RUNS,
+    GIT_CATCHUP_WINDOW_MAX_DAYS,
     type GitSyncProgress,
     type GitSyncStage,
 } from '../../../src/connectors/git/sync';
@@ -2452,6 +2458,756 @@ describe('GitSync.syncProviders — first-sync earliest-watermark recording (#22
             // …while the incomplete Bitbucket provider wrote nothing and held its cursor.
             expect(readState('git_last_sync:bitbucket:myws')).toBeUndefined();
             expect(result.errors.some((e) => /bb-repo.*Failed to fetch commits/.test(e))).toBe(true);
+        });
+    });
+});
+
+// #235 — the operational follow-up to #231. #231 holds a broken provider's cursor
+// (correct: a silent gap is worse than a loud retry), but that left two untracked
+// problems: the stall is INVISIBLE (a healthy sibling still writes, so the run
+// "succeeds" and looks like a transient hiccup), and the held re-fetch window GROWS
+// without bound. These lock in the counter that makes the stall queryable and the
+// cap that bounds the catch-up.
+describe('GitSync — stalled-provider detection (#235)', () => {
+    let db: Database.Database;
+
+    beforeEach(() => {
+        db = makeDb();
+        vi.resetAllMocks();
+    });
+
+    afterEach(() => {
+        // Unconditional: a test that froze the clock must not leak it into a sibling
+        // (vitest keeps fake timers installed across tests otherwise). Safe when no
+        // test in this block installed them.
+        vi.useRealTimers();
+        db.close();
+        vi.restoreAllMocks();
+    });
+
+    const CONFIG: GitProviderConfig = {
+        type: 'github',
+        org: 'test-org',
+        auth: {type: 'token', api_token: 'test-token'},
+    };
+    const FORWARD_KEY = 'git_last_sync:github:test-org';
+    const STALL_KEY = 'git_stall:github:test-org';
+
+    const readState = (key: string): string | undefined =>
+        (db.prepare('SELECT value FROM sync_state WHERE key = ?').get(key) as
+            | {value: string}
+            | undefined)?.value;
+    const writeState = (key: string, value: string): void => {
+        db.prepare(
+            'INSERT INTO sync_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+        ).run(key, value);
+    };
+
+    /** A provider whose only repo always fails its commit fetch — a permanent stall. */
+    const brokenProvider = (): GitProvider =>
+        makeMockProvider({
+            listRepos: vi.fn().mockResolvedValue([makeRepo('broken-repo')]),
+            getCommits: vi.fn().mockRejectedValue(new Error('GitHub API error 500')),
+        });
+
+    /** A provider whose repos all succeed. */
+    const healthyProvider = (): GitProvider =>
+        makeMockProvider({
+            listRepos: vi.fn().mockResolvedValue([makeRepo('good-repo')]),
+            getCommits: vi.fn().mockResolvedValue([]),
+            getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+        });
+
+    describe('stall counter', () => {
+        it('opens a streak at 1 on the first held run, stamped with that run instant', async () => {
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(brokenProvider());
+
+            const result = await new GitSync({enabled: false}).syncProviders(db, [CONFIG]);
+
+            // Precondition: this run really was held (else the assertion below is vacuous).
+            expect(readState(FORWARD_KEY)).toBeUndefined();
+            expect(getProviderStall(db, 'github', 'test-org')).toEqual({
+                runs: 1,
+                since: result.lastSyncTime,
+            });
+        });
+
+        it('extends the streak across consecutive held runs, PRESERVING the original since', async () => {
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(brokenProvider());
+            const sync = new GitSync({enabled: false});
+
+            // The clock is frozen and stepped explicitly: on the real clock three
+            // back-to-back runs can share a millisecond, which makes `first` and `third`
+            // identical and silently turns the "does not creep" assertion below into a
+            // tautology that passes for the wrong reason (and fails at random when the
+            // runs straddle a tick). Distinct instants by construction.
+            vi.useFakeTimers();
+            vi.setSystemTime(new Date('2026-07-01T00:00:00.000Z'));
+            const first = await sync.syncProviders(db, [CONFIG]);
+            vi.setSystemTime(new Date('2026-07-02T00:00:00.000Z'));
+            await sync.syncProviders(db, [CONFIG]);
+            vi.setSystemTime(new Date('2026-07-03T00:00:00.000Z'));
+            const third = await sync.syncProviders(db, [CONFIG]);
+
+            const stall = getProviderStall(db, 'github', 'test-org');
+            expect(stall?.runs).toBe(3);
+            // "Stalled SINCE" must anchor to the streak's start, not creep forward to the
+            // latest run — a creeping `since` would report an ancient stall as brand new.
+            expect(stall?.since).toBe(first.lastSyncTime);
+            expect(first.lastSyncTime).not.toBe(third.lastSyncTime);
+            expect(stall?.since).not.toBe(third.lastSyncTime);
+        });
+
+        it('clears the streak the moment a run completes the window', async () => {
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider
+                .mockReturnValueOnce(brokenProvider())
+                .mockReturnValueOnce(brokenProvider())
+                .mockReturnValueOnce(healthyProvider());
+            const sync = new GitSync({enabled: false});
+
+            await sync.syncProviders(db, [CONFIG]);
+            await sync.syncProviders(db, [CONFIG]);
+            expect(getProviderStall(db, 'github', 'test-org')?.runs).toBe(2);
+
+            await sync.syncProviders(db, [CONFIG]);
+
+            expect(getProviderStall(db, 'github', 'test-org')).toBeNull();
+            expect(readState(STALL_KEY)).toBeUndefined();
+            // Positive control: the recovery run really did advance the cursor.
+            expect(readState(FORWARD_KEY)).toBeDefined();
+        });
+
+        it('restarts the streak after a recovery rather than resuming the old count', async () => {
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider
+                .mockReturnValueOnce(brokenProvider())
+                .mockReturnValueOnce(brokenProvider())
+                .mockReturnValueOnce(healthyProvider())
+                .mockReturnValueOnce(brokenProvider());
+            const sync = new GitSync({enabled: false});
+
+            await sync.syncProviders(db, [CONFIG]);
+            await sync.syncProviders(db, [CONFIG]);
+            await sync.syncProviders(db, [CONFIG]);
+            const fourth = await sync.syncProviders(db, [CONFIG]);
+
+            // CONSECUTIVE, not cumulative: the recovery reset the count, so the new
+            // failure is run 1 of a new streak — not run 3 of the old one.
+            expect(getProviderStall(db, 'github', 'test-org')).toEqual({
+                runs: 1,
+                since: fourth.lastSyncTime,
+            });
+        });
+
+        it('counts a listRepos failure, not just a per-repo commit failure', async () => {
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockRejectedValue(new Error('GitHub API error 403')),
+                }),
+            );
+
+            await new GitSync({enabled: false}).syncProviders(db, [CONFIG]);
+
+            // fetchProviderData early-returns on this path; a held cursor there must
+            // still reach the same counter.
+            expect(getProviderStall(db, 'github', 'test-org')?.runs).toBe(1);
+        });
+
+        it('tracks each provider independently — a healthy sibling is never marked stalled', async () => {
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider
+                .mockReturnValueOnce(
+                    makeMockProvider({
+                        name: 'github',
+                        listRepos: vi.fn().mockResolvedValue([makeRepo('gh-repo')]),
+                        getCommits: vi.fn().mockResolvedValue([makeProviderCommit('alice')]),
+                        getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+                    }),
+                )
+                .mockReturnValueOnce(
+                    makeMockProvider({
+                        name: 'bitbucket',
+                        listRepos: vi.fn().mockResolvedValue([makeRepo('bb-repo')]),
+                        getCommits: vi.fn().mockRejectedValue(new Error('Bitbucket API error 500')),
+                    }),
+                );
+
+            const result = await new GitSync({enabled: true}).syncProviders(db, [
+                {type: 'github', org: 'myorg', auth: {type: 'token', api_token: 'token'}},
+                {type: 'bitbucket', workspace: 'myws', auth: {type: 'app_password', username: 'u', app_password: 'p'}},
+            ]);
+
+            // This is the exact shape the counter exists to disambiguate: the run wrote
+            // real data and looks healthy, yet one provider imported nothing at all.
+            expect(result.snapshotsWritten).toBeGreaterThan(0);
+            expect(getProviderStall(db, 'github', 'myorg')).toBeNull();
+            expect(getProviderStall(db, 'bitbucket', 'myws')?.runs).toBe(1);
+        });
+
+        it('does NOT count a failed BACKFILL run — a backfill never advances the forward cursor', async () => {
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(brokenProvider());
+
+            await new GitSync({enabled: false}).syncProviders(db, [CONFIG], undefined, {
+                backfill: {since: '2024-01-01T00:00:00.000Z', until: '2024-07-01T00:00:00.000Z'},
+            });
+
+            // A backfill walks OLDER history and leaves the forward cursor alone, so its
+            // failure is not evidence the cursor is stuck. Counting it would raise a
+            // stall alert against a provider syncing perfectly.
+            expect(getProviderStall(db, 'github', 'test-org')).toBeNull();
+        });
+
+        it('does NOT let a successful BACKFILL clear a real forward stall', async () => {
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider
+                .mockReturnValueOnce(brokenProvider())
+                .mockReturnValueOnce(brokenProvider())
+                .mockReturnValueOnce(brokenProvider())
+                .mockReturnValueOnce(healthyProvider());
+            const sync = new GitSync({enabled: false});
+
+            await sync.syncProviders(db, [CONFIG]);
+            await sync.syncProviders(db, [CONFIG]);
+            await sync.syncProviders(db, [CONFIG]);
+            expect(getProviderStall(db, 'github', 'test-org')?.runs).toBe(3);
+
+            await sync.syncProviders(db, [CONFIG], undefined, {
+                backfill: {since: '2024-01-01T00:00:00.000Z', until: '2024-07-01T00:00:00.000Z'},
+            });
+
+            // The forward cursor is still stuck — a backfill succeeding says nothing
+            // about that, so it must not silence a live alert.
+            expect(getProviderStall(db, 'github', 'test-org')?.runs).toBe(3);
+        });
+
+        it('records NO stall when the write transaction rolls back', async () => {
+            // A broken provider alone writes no snapshots, so the tx would never touch
+            // git_snapshots and never throw. Pair it with a HEALTHY provider that does
+            // write: that write is what trips the dropped table and rolls back the whole
+            // tx — including the broken sibling's stall update.
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider
+                .mockReturnValueOnce(
+                    makeMockProvider({
+                        name: 'github',
+                        listRepos: vi.fn().mockResolvedValue([makeRepo('gh-repo')]),
+                        getCommits: vi.fn().mockResolvedValue([makeProviderCommit('alice')]),
+                        getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+                    }),
+                )
+                .mockReturnValueOnce(
+                    makeMockProvider({
+                        name: 'bitbucket',
+                        listRepos: vi.fn().mockResolvedValue([makeRepo('bb-repo')]),
+                        getCommits: vi.fn().mockRejectedValue(new Error('Bitbucket API error 500')),
+                    }),
+                );
+            db.exec('DROP TABLE git_snapshots');
+
+            const result = await new GitSync({enabled: true}).syncProviders(db, [
+                {type: 'github', org: 'myorg', auth: {type: 'token', api_token: 'token'}},
+                {type: 'bitbucket', workspace: 'myws', auth: {type: 'app_password', username: 'u', app_password: 'p'}},
+            ]);
+
+            expect(result.errors.some((e) => /transaction rolled back/.test(e))).toBe(true);
+            // The counter moves with the cursor on the same all-or-nothing terms: a run
+            // that persisted nothing must not persist a stall either. The next run
+            // re-covers the window and accounts for itself.
+            expect(readState('git_stall:bitbucket:myws')).toBeUndefined();
+            expect(readState('git_last_sync:github:myorg')).toBeUndefined();
+        });
+
+        it('does NOT clear an existing streak when the write transaction rolls back', async () => {
+            // The mirror of the test above, and the arm that would silently regress: if
+            // clearProviderStall were ever hoisted out of the deferred stallUpdates and
+            // called eagerly in the fetch loop, every other test here still passes (the
+            // record-direction rollback test uses a broken provider that never clears,
+            // and every clear test commits successfully). A rolled-back run wiping a live
+            // streak would reset the alert to zero and hide a permanent stall for good.
+            seedDev(db, 'alice');
+            writeState(STALL_KEY, JSON.stringify({runs: 5, since: '2026-07-01T00:00:00.000Z'}));
+
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits: vi.fn().mockResolvedValue([makeProviderCommit('alice')]),
+                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+                }),
+            );
+            // This provider's fetch is COMPLETE, so the run wants to clear the streak —
+            // but the snapshot write it commits with will fail.
+            db.exec('DROP TABLE git_snapshots');
+
+            const result = await new GitSync({enabled: false}).syncProviders(db, [CONFIG]);
+
+            expect(result.errors.some((e) => /transaction rolled back/.test(e))).toBe(true);
+            // Nothing persisted, so the streak stands — the provider has still imported
+            // nothing, and the cursor did not move either.
+            expect(getProviderStall(db, 'github', 'test-org')).toEqual({
+                runs: 5,
+                since: '2026-07-01T00:00:00.000Z',
+            });
+            expect(readState(FORWARD_KEY)).toBeUndefined();
+        });
+
+        it('treats a corrupt stall row as no streak and self-heals on the next held run', async () => {
+            writeState(STALL_KEY, 'not json at all');
+            expect(getProviderStall(db, 'github', 'test-org')).toBeNull();
+
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(brokenProvider());
+            const result = await new GitSync({enabled: false}).syncProviders(db, [CONFIG]);
+
+            // Rewritten from scratch rather than incremented into NaN.
+            expect(getProviderStall(db, 'github', 'test-org')).toEqual({
+                runs: 1,
+                since: result.lastSyncTime,
+            });
+        });
+
+        it.each([
+            ['non-integer runs', JSON.stringify({runs: 2.5, since: '2026-01-01T00:00:00.000Z'})],
+            ['zero runs', JSON.stringify({runs: 0, since: '2026-01-01T00:00:00.000Z'})],
+            ['negative runs', JSON.stringify({runs: -3, since: '2026-01-01T00:00:00.000Z'})],
+            ['non-numeric runs', JSON.stringify({runs: '4', since: '2026-01-01T00:00:00.000Z'})],
+            ['missing since', JSON.stringify({runs: 4})],
+            ['unparseable since', JSON.stringify({runs: 4, since: 'yesterday-ish'})],
+            ['a JSON array', JSON.stringify([1, 2])],
+            ['a JSON scalar', JSON.stringify(7)],
+            ['JSON null', 'null'],
+            ['an empty value', ''],
+        ])('range-validates the stored row: %s reads as no streak', (_label, stored) => {
+            writeState(STALL_KEY, stored);
+            // sync_state.value is unconstrained TEXT, so every field is validated on read
+            // rather than cast — a corrupt row must never surface as a stall of NaN runs.
+            expect(getProviderStall(db, 'github', 'test-org')).toBeNull();
+        });
+    });
+
+    describe('loadStalledProviders', () => {
+        it('reports nothing below the alert threshold, and the provider once it is reached', async () => {
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(brokenProvider());
+            const sync = new GitSync({enabled: false});
+
+            for (let run = 1; run < GIT_STALL_ALERT_RUNS; run++) {
+                await sync.syncProviders(db, [CONFIG]);
+                // Below the threshold a held run is the ordinary self-healing case —
+                // alerting here would train the reader to ignore the signal.
+                expect(loadStalledProviders(db, [CONFIG])).toEqual([]);
+            }
+            // Precondition for the boundary: we are exactly one run short.
+            expect(getProviderStall(db, 'github', 'test-org')?.runs).toBe(GIT_STALL_ALERT_RUNS - 1);
+
+            await sync.syncProviders(db, [CONFIG]);
+
+            expect(loadStalledProviders(db, [CONFIG])).toEqual([
+                {
+                    type: 'github',
+                    identifier: 'test-org',
+                    runs: GIT_STALL_ALERT_RUNS,
+                    since: expect.any(String),
+                },
+            ]);
+        });
+
+        it('ignores a stall row orphaned by a provider that is no longer configured', () => {
+            writeState(
+                'git_stall:github:deleted-org',
+                JSON.stringify({runs: 99, since: '2026-01-01T00:00:00.000Z'}),
+            );
+
+            // Filtering to the CONFIGURED set is what stops a row left behind by a
+            // deleted/renamed provider being reported forever against a dead target.
+            expect(loadStalledProviders(db, [CONFIG])).toEqual([]);
+        });
+
+        it('returns every stalled provider, in the provider-config order', () => {
+            const stalled = JSON.stringify({runs: 5, since: '2026-01-01T00:00:00.000Z'});
+            writeState('git_stall:github:org-b', stalled);
+            writeState('git_stall:bitbucket:ws-a', stalled);
+
+            const configs: GitProviderConfig[] = [
+                {type: 'bitbucket', workspace: 'ws-a', auth: {type: 'app_password', username: 'u', app_password: 'p'}},
+                {type: 'github', org: 'org-b', auth: {type: 'token', api_token: 't'}},
+                {type: 'github', org: 'healthy-org', auth: {type: 'token', api_token: 't'}},
+            ];
+
+            // >= 2 stalled providers, so a single-item happy path can't hide an ordering
+            // or accumulation bug. Order follows providerConfigs — deterministic output.
+            expect(loadStalledProviders(db, configs).map((s) => `${s.type}:${s.identifier}`)).toEqual([
+                'bitbucket:ws-a',
+                'github:org-b',
+            ]);
+        });
+
+        it('returns [] when nothing is stalled', () => {
+            expect(loadStalledProviders(db, [CONFIG])).toEqual([]);
+        });
+    });
+
+    // The cap CREATES this state: before it, a complete run always reached `now`, so
+    // "the run completed" and "the data is current" were one statement. They are no
+    // longer, and a bare "no stall → advancing" would be a false all-clear.
+    describe('loadLaggingProviders', () => {
+        const DAY_MS = 86_400_000;
+        const NOW = '2026-07-15T00:00:00.000Z';
+        const at = (daysBefore: number): string =>
+            new Date(Date.parse(NOW) - daysBefore * DAY_MS).toISOString();
+
+        it('reports a provider whose cursor is more than one cap-width behind', () => {
+            writeState(FORWARD_KEY, at(170));
+
+            expect(loadLaggingProviders(db, [CONFIG], NOW)).toEqual([
+                {type: 'github', identifier: 'test-org', cursor: at(170), daysBehind: 170},
+            ]);
+        });
+
+        it('says nothing about a current provider, or one exactly at the cap boundary', () => {
+            writeState(FORWARD_KEY, at(1));
+            expect(loadLaggingProviders(db, [CONFIG], NOW)).toEqual([]);
+
+            // At the cap the next run is NOT capped (catchUpUntil returns `now`), so the
+            // provider will reach the present — not lagging. Same boundary as the cap.
+            writeState(FORWARD_KEY, at(GIT_CATCHUP_WINDOW_MAX_DAYS));
+            expect(loadLaggingProviders(db, [CONFIG], NOW)).toEqual([]);
+        });
+
+        it('excludes a provider held BELOW the stall threshold — it is not advancing', async () => {
+            writeState(FORWARD_KEY, at(200));
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(brokenProvider());
+
+            await new GitSync({enabled: false}).syncProviders(db, [CONFIG]);
+
+            // One held run: below GIT_STALL_ALERT_RUNS, so it is not a reportable stall
+            // yet — but the cursor IS held, so calling it "catching up — advancing"
+            // would state the exact opposite of the truth. The exclusion keys on an OPEN
+            // streak, not on the reporting threshold.
+            expect(getProviderStall(db, 'github', 'test-org')?.runs).toBe(1);
+            expect(loadStalledProviders(db, [CONFIG])).toEqual([]);
+            expect(loadLaggingProviders(db, [CONFIG], NOW)).toEqual([]);
+        });
+
+        it('excludes a STALLED provider — the stall is the more specific signal', async () => {
+            writeState(FORWARD_KEY, at(200));
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(brokenProvider());
+            const sync = new GitSync({enabled: false});
+            for (let run = 0; run < GIT_STALL_ALERT_RUNS; run++) {
+                await sync.syncProviders(db, [CONFIG]);
+            }
+
+            // Precondition: it IS stalled, and its cursor IS far behind — so without the
+            // exclusion it would be reported twice under two different headings.
+            expect(loadStalledProviders(db, [CONFIG])).toHaveLength(1);
+            expect(loadLaggingProviders(db, [CONFIG], NOW)).toEqual([]);
+        });
+
+        it('does not treat a never-synced provider as lagging', () => {
+            // No cursor at all is a pending first sync, not a provider falling behind.
+            expect(loadLaggingProviders(db, [CONFIG], NOW)).toEqual([]);
+        });
+
+        it.each([
+            ['an unparseable cursor', 'not-a-date'],
+            ['a future-dated cursor', '2027-01-01T00:00:00.000Z'],
+        ])('is total: %s is not reported as lagging', (_label, cursor) => {
+            writeState(FORWARD_KEY, cursor);
+            expect(loadLaggingProviders(db, [CONFIG], NOW)).toEqual([]);
+        });
+
+        it('returns [] on an unparseable now', () => {
+            writeState(FORWARD_KEY, at(200));
+            expect(loadLaggingProviders(db, [CONFIG], 'not-a-date')).toEqual([]);
+        });
+
+        it('reports every lagging provider in config order, ignoring orphaned cursors', () => {
+            writeState('git_last_sync:bitbucket:ws-a', at(90));
+            writeState('git_last_sync:github:org-b', at(60));
+            writeState('git_last_sync:github:healthy-org', at(2));
+            writeState('git_last_sync:github:deleted-org', at(400));
+
+            const configs: GitProviderConfig[] = [
+                {type: 'bitbucket', workspace: 'ws-a', auth: {type: 'app_password', username: 'u', app_password: 'p'}},
+                {type: 'github', org: 'org-b', auth: {type: 'token', api_token: 't'}},
+                {type: 'github', org: 'healthy-org', auth: {type: 'token', api_token: 't'}},
+            ];
+
+            // >= 2 lagging, so a single-item happy path can't hide an accumulation or
+            // ordering bug; the un-configured deleted-org cursor must not surface.
+            expect(loadLaggingProviders(db, configs, NOW)).toEqual([
+                {type: 'bitbucket', identifier: 'ws-a', cursor: at(90), daysBehind: 90},
+                {type: 'github', identifier: 'org-b', cursor: at(60), daysBehind: 60},
+            ]);
+        });
+    });
+
+    describe('catch-up window cap', () => {
+        const DAY_MS = 86_400_000;
+        const CAP_MS = GIT_CATCHUP_WINDOW_MAX_DAYS * DAY_MS;
+
+        it('returns `now` when the cursor is within the cap', () => {
+            const now = '2026-07-15T00:00:00.000Z';
+            const since = new Date(Date.parse(now) - 5 * DAY_MS).toISOString();
+            expect(catchUpUntil(since, now)).toBe(now);
+        });
+
+        it('returns `now` exactly AT the cap boundary, and caps one ms past it', () => {
+            const now = '2026-07-15T00:00:00.000Z';
+            const atCap = new Date(Date.parse(now) - CAP_MS).toISOString();
+            const pastCap = new Date(Date.parse(now) - CAP_MS - 1).toISOString();
+
+            expect(catchUpUntil(atCap, now)).toBe(now);
+            expect(catchUpUntil(pastCap, now)).toBe(
+                new Date(Date.parse(pastCap) + CAP_MS).toISOString(),
+            );
+        });
+
+        it('caps to since + cap when the cursor is far behind', () => {
+            expect(catchUpUntil('2026-01-01T00:00:00.000Z', '2026-07-15T00:00:00.000Z')).toBe(
+                '2026-01-31T00:00:00.000Z',
+            );
+        });
+
+        it.each([
+            ['unparseable since', 'not-a-date', '2026-07-15T00:00:00.000Z'],
+            ['unparseable now', '2026-01-01T00:00:00.000Z', 'not-a-date'],
+            ['an empty since', '', '2026-07-15T00:00:00.000Z'],
+        ])('degrades to `now` on %s', (_label, since, now) => {
+            expect(catchUpUntil(since, now)).toBe(now);
+        });
+
+        it('never returns an instant after `now` for a future-dated cursor', () => {
+            // A skewed or hand-edited cursor must not push the window past the present.
+            expect(catchUpUntil('2027-01-01T00:00:00.000Z', '2026-07-15T00:00:00.000Z')).toBe(
+                '2026-07-15T00:00:00.000Z',
+            );
+        });
+
+        it('caps the fetch window AND the cursor advance when the cursor is far behind', async () => {
+            seedDev(db, 'alice');
+            const cursor = new Date(Date.now() - 90 * DAY_MS).toISOString();
+            writeState(FORWARD_KEY, cursor);
+            const expectedUntil = new Date(Date.parse(cursor) + CAP_MS).toISOString();
+
+            const getCommits = vi.fn().mockResolvedValue([makeProviderCommit('alice')]);
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits,
+                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+                }),
+            );
+
+            const result = await new GitSync({enabled: false}).syncProviders(db, [CONFIG]);
+
+            // The commit walk (and its per-commit diff fetches) is bounded to one cap
+            // width instead of the full 90 days — the point of the cap.
+            expect(getCommits).toHaveBeenCalledWith('repo1', cursor, expectedUntil);
+            // …and CRUCIALLY the cursor advances only to what was actually covered.
+            // Advancing to `now` here would silently skip the remaining 60 days — the
+            // permanent gap #231 exists to prevent, reintroduced by the cap itself.
+            expect(readState(FORWARD_KEY)).toBe(expectedUntil);
+            expect(readState(FORWARD_KEY)).not.toBe(result.lastSyncTime);
+        });
+
+        it('leaves a healthy provider completely uncapped (cursor advances to now)', async () => {
+            seedDev(db, 'alice');
+            const cursor = new Date(Date.now() - DAY_MS).toISOString();
+            writeState(FORWARD_KEY, cursor);
+
+            const getCommits = vi.fn().mockResolvedValue([makeProviderCommit('alice')]);
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits,
+                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+                }),
+            );
+
+            const result = await new GitSync({enabled: false}).syncProviders(db, [CONFIG]);
+
+            // The normal daily path must be exactly what it was before the cap existed.
+            expect(getCommits).toHaveBeenCalledWith('repo1', cursor, result.lastSyncTime);
+            expect(readState(FORWARD_KEY)).toBe(result.lastSyncTime);
+        });
+
+        it('does NOT cap a FIRST sync — its window is bounded by firstSyncWindowMonths instead', async () => {
+            seedDev(db, 'alice');
+            const getCommits = vi.fn().mockResolvedValue([makeProviderCommit('alice')]);
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits,
+                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+                }),
+            );
+
+            const result = await new GitSync({enabled: false}).syncProviders(db, [CONFIG], undefined, {
+                firstSyncWindowMonths: 6,
+            });
+
+            // A 6-month first sync must import 6 months. Capping `until` here would
+            // silently turn the admin's requested window into a 30-day one.
+            const [, since, until] = getCommits.mock.calls[0] as [string, string, string];
+            expect(since).toBe(subtractUtcMonths(result.lastSyncTime as string, 6));
+            expect(until).toBe(result.lastSyncTime);
+            expect(readState(FORWARD_KEY)).toBe(result.lastSyncTime);
+        });
+
+        it('chunks a long catch-up into contiguous, gap-free windows across runs', async () => {
+            const cursor = new Date(Date.now() - 90 * DAY_MS).toISOString();
+            writeState(FORWARD_KEY, cursor);
+
+            const windows: Array<[string, string]> = [];
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockImplementation(() =>
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits: vi.fn(async (_repo: string, since: string, until: string) => {
+                        windows.push([since, until]);
+                        return [];
+                    }),
+                }),
+            );
+
+            const sync = new GitSync({enabled: false});
+            await sync.syncProviders(db, [CONFIG]);
+            await sync.syncProviders(db, [CONFIG]);
+            await sync.syncProviders(db, [CONFIG]);
+
+            // Each run resumes EXACTLY where the previous stopped: chunked, never skipped.
+            // A gap between two windows is a permanently lost span of history.
+            expect(windows[0][0]).toBe(cursor);
+            expect(windows[1][0]).toBe(windows[0][1]);
+            expect(windows[2][0]).toBe(windows[1][1]);
+            // Each chunk is one cap wide, so the per-run cost is constant, not growing.
+            for (const [since, until] of windows) {
+                expect(Date.parse(until) - Date.parse(since)).toBe(CAP_MS);
+            }
+        });
+
+        it('holds a STALLED provider to a constant COMMIT window rather than an ever-growing one', async () => {
+            const cursor = new Date(Date.now() - 200 * DAY_MS).toISOString();
+            writeState(FORWARD_KEY, cursor);
+
+            const windows: Array<[string, string]> = [];
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockImplementation(() =>
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('broken-repo')]),
+                    getCommits: vi.fn(async (_repo: string, since: string, until: string) => {
+                        windows.push([since, until]);
+                        throw new Error('GitHub API error 500');
+                    }),
+                }),
+            );
+
+            const sync = new GitSync({enabled: false});
+            await sync.syncProviders(db, [CONFIG]);
+            await sync.syncProviders(db, [CONFIG]);
+
+            // While stalled the cursor is held, so `since` is pinned — and with `until`
+            // capped the COMMIT re-fetch span no longer widens by a run's worth of
+            // wall-clock every run. Two identical windows prove the commit walk (and its
+            // per-commit diff fan-out) is constant per run.
+            //
+            // Scope, deliberately not asserted here because it is NOT true: the PR
+            // listing takes no `until`, so that half of the fetch does still grow every
+            // run. See GIT_CATCHUP_WINDOW_MAX_DAYS and follow-up #247 — this test proves
+            // the bounded half, and must not be read as "a stalled run costs a constant
+            // amount".
+            expect(windows).toHaveLength(2);
+            expect(windows[1]).toEqual(windows[0]);
+            expect(Date.parse(windows[0][1]) - Date.parse(windows[0][0])).toBe(CAP_MS);
+        });
+
+        it('sums a UTC day split across a chunk boundary — no gap, no double-count', async () => {
+            // The cap makes chunk boundaries routine, and a boundary lands at an
+            // arbitrary time-of-day — so it SPLITS a UTC calendar day: run N writes
+            // (dev, D) with the morning's commits, run N+1 writes (dev, D) again with
+            // the afternoon's. git_snapshots merges `commits` ADDITIVELY across runs
+            // (remergeStoredSnapshot), and the project rule from #205 is that an
+            // additive merge may only sum genuinely-disjoint deltas. The window tests
+            // above prove the boundary ARITHMETIC; this proves the DATA lands exactly
+            // once — the invariant the arithmetic exists to protect.
+            const devId = seedDev(db, 'alice');
+            // Clock frozen at midday: the day offsets below are exact multiples of 24h,
+            // so `boundary` inherits the WALL-CLOCK TIME-OF-DAY of the run. On the real
+            // clock, a suite running within an hour of UTC midnight pushes `morning` or
+            // `afternoon` onto an adjacent UTC day and the split never happens — the
+            // test then fails for a reason that has nothing to do with the merge. Midday
+            // keeps both commits on the same UTC day by construction.
+            vi.useFakeTimers();
+            vi.setSystemTime(new Date('2026-07-15T12:00:00.000Z'));
+            // Cursor 45d back → run 1 covers [c, c+30d], run 2 covers [c+30d, now].
+            const cursor = new Date(Date.now() - 45 * DAY_MS).toISOString();
+            writeState(FORWARD_KEY, cursor);
+            const boundary = new Date(Date.parse(cursor) + CAP_MS);
+            const splitDay = boundary.toISOString().slice(0, 10);
+            const morning = new Date(boundary.getTime() - 3_600_000).toISOString();
+            const afternoon = new Date(boundary.getTime() + 3_600_000).toISOString();
+
+            const createGitProvider = await getCreateGitProvider();
+            // Each run returns only the commits inside ITS window — what a correctly
+            // server-side-bounded provider does, so the assertion measures the merge,
+            // not the mock.
+            createGitProvider.mockImplementation(() =>
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits: vi.fn(async (_repo: string, since: string, until: string) =>
+                        [
+                            makeProviderCommit('alice', morning, 'c-morning'),
+                            makeProviderCommit('alice', afternoon, 'c-afternoon'),
+                        ].filter((c) => c.date >= since && c.date <= until),
+                    ),
+                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+                }),
+            );
+
+            const sync = new GitSync({enabled: false});
+            await sync.syncProviders(db, [CONFIG]);
+            await sync.syncProviders(db, [CONFIG]);
+
+            // Exactly 2: 1 would mean the second chunk clobbered the first half of the
+            // day (a REPLACE, not a merge — a permanent gap); 3+ would mean a commit was
+            // delivered in both windows and additively re-counted.
+            const row = db
+                .prepare('SELECT commits FROM git_snapshots WHERE developer_id = ? AND date = ?')
+                .get(devId, splitDay) as {commits: number} | undefined;
+            expect(row?.commits).toBe(2);
+        });
+
+        it('does NOT cap a backfill — its window is the validated slice the caller passed', async () => {
+            writeState(FORWARD_KEY, new Date(Date.now() - 90 * DAY_MS).toISOString());
+            const backfill = {since: '2024-01-01T00:00:00.000Z', until: '2024-07-01T00:00:00.000Z'};
+
+            const getCommits = vi.fn().mockResolvedValue([]);
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits,
+                }),
+            );
+
+            await new GitSync({enabled: false}).syncProviders(db, [CONFIG], undefined, {backfill});
+
+            // The backfill route already computed and overlap-guarded this exact slice;
+            // narrowing it here would silently import less than the guard cleared.
+            expect(getCommits).toHaveBeenCalledWith('repo1', backfill.since, backfill.until);
         });
     });
 });

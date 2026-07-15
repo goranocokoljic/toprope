@@ -218,4 +218,132 @@ describe('printStatus', () => {
         expect(combined).toContain('2 repos');
         expect(combined).not.toContain('1 repos');
     });
+
+    // #235: neither a stalled nor a catching-up provider is visible on the Git
+    // connector line — that line is per-CONNECTOR, and these states are per-PROVIDER.
+    describe('stalled and lagging git providers (#235)', () => {
+        function gitConfig(orgs: string[] = ['acme']): TopropeConfig {
+            const config = baseConfig();
+            (config.connectors.git as {enabled: boolean; providers: unknown[]}).providers = orgs.map(
+                (org) => ({type: 'github', org, auth: {type: 'token', api_token: 't'}}),
+            );
+            return config;
+        }
+
+        function seedStall(key: string, runs: number, since: string): void {
+            db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+                key,
+                JSON.stringify({runs, since}),
+            );
+        }
+
+        function seedCursor(key: string, daysAgoN: number): void {
+            db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+                key,
+                new Date(Date.now() - daysAgoN * 86_400_000).toISOString(),
+            );
+        }
+
+        it('warns, naming the provider and the streak, once a provider is stalled', () => {
+            seedStall('git_stall:github:acme', 7, new Date(Date.now() - 3 * 86_400_000).toISOString());
+
+            printStatus(db, gitConfig());
+
+            const combined = output.join('\n');
+            expect(combined).toContain('github:acme stalled');
+            expect(combined).toContain('7 consecutive runs');
+            expect(combined).toContain('3d ago');
+            expect(combined).toContain('toprope doctor');
+        });
+
+        it('says nothing when no provider is stalled (negative control)', () => {
+            printStatus(db, gitConfig());
+
+            expect(output.join('\n')).not.toContain('stalled');
+        });
+
+        it('stays silent below the alert threshold', () => {
+            seedStall('git_stall:github:acme', 1, new Date().toISOString());
+
+            printStatus(db, gitConfig());
+
+            // One held run is the ordinary self-healing case, not a stall.
+            expect(output.join('\n')).not.toContain('stalled');
+        });
+
+        it('does not report stalls when the git connector is disabled', () => {
+            seedStall('git_stall:github:acme', 9, new Date().toISOString());
+            const config = gitConfig();
+            (config.connectors.git as {enabled: boolean}).enabled = false;
+
+            printStatus(db, config);
+
+            expect(output.join('\n')).not.toContain('stalled');
+        });
+
+        it('reports EVERY stalled provider, and the doctor hint exactly once', () => {
+            seedStall('git_stall:github:acme', 4, new Date().toISOString());
+            seedStall('git_stall:github:beta', 6, new Date().toISOString());
+
+            printStatus(db, gitConfig(['acme', 'beta', 'healthy']));
+
+            const combined = output.join('\n');
+            // >= 2 stalled, so an accumulation bug (printing only gitStalls[0]) or a
+            // per-item hint line cannot ship green.
+            expect(combined).toContain('github:acme stalled');
+            expect(combined).toContain('github:beta stalled');
+            expect(combined).not.toContain('github:healthy stalled');
+            expect(combined.match(/Run "toprope doctor" for the fix\./g)).toHaveLength(1);
+        });
+
+        it('reports a provider that is advancing but months behind — without calling it stalled', () => {
+            // The state the catch-up cap creates: nothing is held, the streak is clear,
+            // and yet the data is 170 days old. Reporting nothing here would read as
+            // "current" — the false all-clear right after fixing a stall.
+            seedCursor('git_last_sync:github:acme', 170);
+
+            printStatus(db, gitConfig());
+
+            const combined = output.join('\n');
+            expect(combined).toContain('github:acme catching up');
+            expect(combined).toContain('170 days behind');
+            expect(combined).not.toContain('stalled');
+        });
+
+        it('reports every lagging provider, and says nothing about a current one', () => {
+            seedCursor('git_last_sync:github:acme', 90);
+            seedCursor('git_last_sync:github:beta', 60);
+            seedCursor('git_last_sync:github:healthy', 1);
+
+            printStatus(db, gitConfig(['acme', 'beta', 'healthy']));
+
+            const combined = output.join('\n');
+            expect(combined).toContain('github:acme catching up');
+            expect(combined).toContain('github:beta catching up');
+            expect(combined).not.toContain('github:healthy catching up');
+        });
+
+        it('reports a stalled provider as stalled only — never also as catching up', () => {
+            seedStall('git_stall:github:acme', 5, new Date().toISOString());
+            seedCursor('git_last_sync:github:acme', 200);
+
+            printStatus(db, gitConfig());
+
+            const combined = output.join('\n');
+            // A held cursor falls behind by definition; reporting both would be noise
+            // under two headings for one problem.
+            expect(combined).toContain('github:acme stalled');
+            expect(combined).not.toContain('catching up');
+        });
+
+        it('says nothing when every provider is current (negative control)', () => {
+            seedCursor('git_last_sync:github:acme', 1);
+
+            printStatus(db, gitConfig());
+
+            const combined = output.join('\n');
+            expect(combined).not.toContain('stalled');
+            expect(combined).not.toContain('catching up');
+        });
+    });
 });

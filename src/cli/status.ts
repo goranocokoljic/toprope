@@ -1,5 +1,14 @@
 import type Database from 'better-sqlite3';
 import type {TopropeConfig} from '../config/types';
+import {resolveAllGitProviders} from '../connectors/git/providers/resolve';
+import {loadServerKey} from '../connectors/git/providers/secret';
+import {
+    GIT_CATCHUP_WINDOW_MAX_DAYS,
+    loadLaggingProviders,
+    loadStalledProviders,
+    type LaggingProvider,
+    type StalledProvider,
+} from '../connectors/git/sync';
 
 interface ConnectorStatus {
     name: string;
@@ -14,11 +23,46 @@ interface StatusData {
     activeDevelopers: number;
     teamCount: number;
     connectors: ConnectorStatus[];
+    /**
+     * Git providers whose cursor has been held for GIT_STALL_ALERT_RUNS+ consecutive
+     * runs (#235), and those advancing but still more than one catch-up cap-width
+     * behind. Both empty when the git connector is disabled; the two sets are disjoint.
+     *
+     * Reported per PROVIDER, on their own lines, because the `Git` connector line is
+     * per CONNECTOR and cannot express either state: a provider is what stalls, and
+     * one line cannot say "reachable, advancing, and 170 days behind" for one of three
+     * providers. (The connector line is also, today, unable to say anything at all —
+     * it reads the bare `git_last_sync` key, which no code in `src/` writes; the
+     * pipeline writes per-provider `git_last_sync:<type>:<container>` keys. So it
+     * renders "never" for everyone regardless of sync state. That is a pre-existing
+     * bug, not something these lines introduce or fix — see #246.)
+     */
+    gitStalls: StalledProvider[];
+    gitLagging: LaggingProvider[];
     activeSubscriptions: number;
     totalMonthlyCost: number;
     wasteAlertCount: number;
     monthlyWaste: number;
     dataQuality: {high: number; medium: number; low: number};
+}
+
+/**
+ * The stalled + lagging provider sets for the status report (#235), or empty when
+ * git is off. Resolves providers ONCE, the same way `doctor` does — DB-connected ∪
+ * config-file — so both commands report on the identical set.
+ */
+function collectGitHealth(
+    db: Database.Database,
+    config: TopropeConfig,
+    now: string,
+): {stalls: StalledProvider[]; lagging: LaggingProvider[]} {
+    const {git} = config.connectors;
+    if (!git.enabled) return {stalls: [], lagging: []};
+    const providerConfigs = resolveAllGitProviders(db, loadServerKey(), git);
+    return {
+        stalls: loadStalledProviders(db, providerConfigs),
+        lagging: loadLaggingProviders(db, providerConfigs, now),
+    };
 }
 
 function getLastSync(db: Database.Database, key: string): string | null {
@@ -43,6 +87,7 @@ function collectStatus(db: Database.Database, config: TopropeConfig): StatusData
     const cutoff = new Date();
     cutoff.setDate(cutoff.getDate() - 30);
     const cutoffDate = cutoff.toISOString().slice(0, 10);
+    const gitHealth = collectGitHealth(db, config, new Date().toISOString());
 
     const totalDevs = (
         db.prepare('SELECT COUNT(*) as cnt FROM developers').get() as {cnt: number}
@@ -134,6 +179,8 @@ function collectStatus(db: Database.Database, config: TopropeConfig): StatusData
         activeDevelopers: activeDevs,
         teamCount,
         connectors,
+        gitStalls: gitHealth.stalls,
+        gitLagging: gitHealth.lagging,
         activeSubscriptions: subRow.cnt,
         totalMonthlyCost: subRow.total,
         wasteAlertCount: wasteRow.cnt,
@@ -171,6 +218,26 @@ export function printStatus(db: Database.Database, config: TopropeConfig): void 
         const status = c.lastSync ? `✓ connected` : `○ not synced`;
         const detail = c.lastSync ? ` (last sync: ${syncInfo}, ${tracked})` : '';
         console.log(`  ${c.name.padEnd(14)}${status}${detail}`);
+    }
+
+    // Printed under the connector block rather than folded into the Git line: both
+    // states are per-PROVIDER, and the Git line is per-CONNECTOR (see StatusData.gitStalls).
+    const pad = ''.padEnd(14);
+    for (const s of data.gitStalls) {
+        console.log(
+            `  ${pad}⚠ ${s.type}:${s.identifier} stalled — cursor held for ${s.runs} consecutive runs since ${formatTimeAgo(s.since)}; importing nothing`,
+        );
+    }
+    // Advancing but behind: reported separately and NOT as a warning, because a
+    // bounded catch-up is working as designed. Saying nothing here is what would
+    // mislead — "no stall" would read as "data is current" when it is months old.
+    for (const l of data.gitLagging) {
+        console.log(
+            `  ${pad}⋯ ${l.type}:${l.identifier} catching up — ${l.daysBehind} days behind; advancing up to ${GIT_CATCHUP_WINDOW_MAX_DAYS} days per run`,
+        );
+    }
+    if (data.gitStalls.length > 0) {
+        console.log(`  ${pad}  Run "toprope doctor" for the fix.`);
     }
 
     const cost = `$${data.totalMonthlyCost.toFixed(0)}/mo`;
