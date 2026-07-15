@@ -789,8 +789,10 @@ describe('AdminTeams page', () => {
         fireEvent.change(screen.getByLabelText('Department'), {target: {value: 'Typed but abandoned'}});
         fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
 
-        // The other row must show ITS OWN values — a shared mount would leak the
-        // previous row's draft (the key={editing?.name ?? 'new'} remount lesson).
+        // The other row must show ITS OWN values — a leaked draft here would mean
+        // the fields survived the close. (The conditional render unmounts the body
+        // on every close, so this passes on that alone; the key={editing?.name}
+        // remount is defence-in-depth for a row⇄row swap with no close between.)
         openEditTeamModal('platform');
         expect(screen.getByRole('dialog', {name: 'Edit team — platform'})).toBeInTheDocument();
         expect((screen.getByLabelText('Department') as HTMLInputElement).value).toBe('');
@@ -878,6 +880,78 @@ describe('AdminTeams page', () => {
         await waitFor(() =>
             expect(within(teamRow('frontend')).getByText('Platform Eng')).toBeInTheDocument(),
         );
+    });
+
+    it('no close affordance works while the create is in flight — the POST cannot land invisibly', async () => {
+        let releasePost: (() => void) | undefined;
+        const gate = new Promise<void>((resolve) => {
+            releasePost = resolve;
+        });
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (String(url).endsWith('/api/admin/teams') && method === 'POST') await gate;
+            return base!(url, init);
+        });
+
+        renderPage(<AdminTeams />);
+        await waitForTableLoaded();
+        openCreateTeamModal();
+        fireEvent.change(screen.getByLabelText('Name'), {target: {value: 'growth'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Create team'}));
+        // The create path has its OWN pending wiring: assert it here rather than
+        // trusting the edit path's guard to speak for both modes.
+        expect(await screen.findByRole('button', {name: 'Creating…'})).toBeInTheDocument();
+
+        const dialogName = 'Create team';
+        expect(screen.getByRole('button', {name: 'Cancel'})).toBeDisabled();
+        fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
+        expect(screen.getByRole('dialog', {name: dialogName})).toBeInTheDocument();
+        fireEvent.keyDown(screen.getByRole('dialog'), {key: 'Escape'});
+        expect(screen.getByRole('dialog', {name: dialogName})).toBeInTheDocument();
+        fireEvent.click(screen.getByRole('button', {name: 'Close dialog'}));
+        expect(screen.getByRole('dialog', {name: dialogName})).toBeInTheDocument();
+        const backdrop = screen.getByTestId('team-modal-backdrop');
+        fireEvent.mouseDown(backdrop);
+        fireEvent.mouseUp(backdrop);
+        fireEvent.click(backdrop);
+        expect(screen.getByRole('dialog', {name: dialogName})).toBeInTheDocument();
+
+        // A second click while pending must not fire a duplicate POST.
+        fireEvent.click(screen.getByRole('button', {name: 'Creating…'}));
+
+        releasePost?.();
+        await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+        expect(
+            fetchMock.mock.calls.filter(
+                (c) =>
+                    String(c[0]).endsWith('/api/admin/teams') &&
+                    (c[1]?.method ?? 'GET').toUpperCase() === 'POST',
+            ),
+        ).toHaveLength(1);
+        expect(await screen.findByText('growth')).toBeInTheDocument();
+    });
+
+    it('surfaces a failed create inside the modal and keeps it open with the draft intact', async () => {
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (String(url).endsWith('/api/admin/teams') && method === 'POST') {
+                return json({message: 'Team already exists'}, 409);
+            }
+            return base!(url, init);
+        });
+
+        renderPage(<AdminTeams />);
+        await waitForTableLoaded();
+        openCreateTeamModal();
+        fireEvent.change(screen.getByLabelText('Name'), {target: {value: 'frontend'}});
+        fireEvent.click(screen.getByRole('button', {name: 'Create team'}));
+
+        // The inline create card surfaced its write error; the modal must too.
+        expect(await screen.findByText(/Team already exists/)).toBeInTheDocument();
+        expect(screen.getByRole('dialog', {name: 'Create team'})).toBeInTheDocument();
+        expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('frontend');
     });
 
     it('surfaces a failed edit inside the modal and keeps it open with the draft intact', async () => {
