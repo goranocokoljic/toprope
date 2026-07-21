@@ -5,8 +5,7 @@ import {loadServerKey} from '../connectors/git/providers/secret';
 import {
     GIT_CATCHUP_WINDOW_MAX_DAYS,
     latestProviderCursor,
-    loadLaggingProviders,
-    loadStalledProviders,
+    loadGitSyncHealth,
     type LaggingProvider,
     type StalledProvider,
 } from '../connectors/git/sync';
@@ -50,7 +49,10 @@ interface StatusData {
 /**
  * The stalled + lagging provider sets for the status report (#235), or empty when
  * git is off. Resolves providers ONCE, the same way `doctor` does — DB-connected ∪
- * config-file — so both commands report on the identical set.
+ * config-file — so both commands report on the identical set. The stall/lagging
+ * classification comes from the shared {@link loadGitSyncHealth} (#248), so status and
+ * doctor cannot drift; status renders only the two per-provider lists (the `current` /
+ * `neverSynced` counts are doctor's currency line, not shown here).
  */
 function collectGitHealth(
     db: Database.Database,
@@ -59,12 +61,13 @@ function collectGitHealth(
 ): {stalls: StalledProvider[]; lagging: LaggingProvider[]; lastSync: string | null} {
     const {git} = config.connectors;
     if (!git.enabled) return {stalls: [], lagging: [], lastSync: null};
-    // Resolve providers ONCE for all three git-health reads — the newest cursor,
-    // the stalls, and the lagging set all derive from the same resolved set.
+    // Resolve providers ONCE for both git-health reads — the newest cursor and the
+    // health classification both derive from the same resolved set.
     const providerConfigs = resolveAllGitProviders(db, loadServerKey(), git);
+    const health = loadGitSyncHealth(db, providerConfigs, now);
     return {
-        stalls: loadStalledProviders(db, providerConfigs),
-        lagging: loadLaggingProviders(db, providerConfigs, now),
+        stalls: health.stalled,
+        lagging: health.lagging,
         lastSync: latestProviderCursor(db, providerConfigs),
     };
 }
