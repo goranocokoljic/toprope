@@ -19,12 +19,14 @@ makes all three safe to run at any time.
 > Practically: it does not matter whether you add someone before their first sync or six
 > months after. They arrive with their history.
 >
-> **Two limits to know.** Retention begins with the first sync on a version that has it —
+> **One limit to know.** Retention begins with the first sync on a version that has it —
 > days synced by an older build were never retained, so a long-running deployment can only
-> replay history from its first sync after upgrading. And the guarantee covers **creating**
-> a developer; adding an identity to one who already exists does not back-fill (see below).
-> In both cases the way to recover older history is to re-fetch that window — **Admin → Git
-> Providers → Sync older history**.
+> replay history from its first sync after upgrading. The way to recover older history is
+> to re-fetch that window — **Admin → Git Providers → Sync older history**.
+>
+> The guarantee covers **editing** identities as well as creating them: adding, correcting
+> or removing an identity on an existing developer re-projects their retained history in
+> the same write, in both directions (see below).
 
 ---
 
@@ -61,18 +63,17 @@ developer.** A duplicate is refused (the dialog keeps your draft so you can corr
 the CLI exits non-zero), because a shared identity would make commit attribution
 ambiguous.
 
-Adding identities to an **existing** developer is a different operation —
-`toprope dev link --id <dev-id> --github <u> …`, or the **Edit** action on the identities
-page — and it is the one case the replay guarantee does **not** cover. Linking updates the
-identity map only. A subsequent sync attributes the new identity's commits inside the
-window that sync actually fetched, so it picks up recent activity and leaves everything
-older unattributed; nothing re-projects the developer's whole retained history the way a
-create does.
+Adding identities to an **existing** developer — `toprope dev link --id <dev-id> --github
+<u> …`, or the **Edit** action on the identities page — carries the same guarantee. The
+edit re-projects that developer's retained history in the same write, so the new
+identity's whole past attributes immediately; both surfaces report how many days they
+covered. No follow-up re-fetch is needed.
 
-If the identity you are adding has meaningful history behind it, re-fetch that window
-afterwards: **Admin → Git Providers → Sync older history**. Getting the identities right
-when the developer is *created* avoids the problem entirely, which is why the review queue
-pre-fills them.
+Removals and corrections are covered too, and this is the direction that matters most.
+Taking an identity off a developer **retracts** the history it was attributing to them,
+and moving it to someone else attributes it there — so a mis-mapped identity does not
+leave one person permanently holding another's commits in their dashboard and team
+aggregates. Correcting the mistake is enough; there is nothing else to clean up.
 
 ---
 
@@ -247,10 +248,11 @@ Their history is attributed on promotion.
 the create reported. If it was `0`, the identities did not match any retained author —
 compare what you entered against the review queue's **Login / email** column. A commit
 email you did not add is the usual cause. Add it via **Edit** on the identities page or
-`toprope dev link --id <dev-id> --git-email <address>` — but note that this does **not**
-back-fill: linking attributes only what a later sync re-fetches. To recover the history
-behind that address, follow the link with **Admin → Git Providers → Sync older history**
-over the window you care about.
+`toprope dev link --id <dev-id> --git-email <address>`; the edit re-projects that
+address's retained history straight away and reports the number of days it attributed. If
+that count is `0`, the address matched nothing retained — which usually means the activity
+predates retention on this deployment, and **Admin → Git Providers → Sync older history**
+over that window is what recovers it.
 
 **"The same person shows up twice."** They commit under two identities. Do not create two
 records — put both on one developer (`--git-email` is repeatable, and the GitHub /

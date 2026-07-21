@@ -105,6 +105,47 @@ describe('projectSnapshots — git_snapshots as a projection of raw_author_daily
         expect(cell.is_projected).toBe(1);
     });
 
+    it('never consults the provider-LOGIN namespace for an email-keyed author (SEC-1)', () => {
+        // `toAnalysisCommit` fills authorLogin as `username || email`, so an author with
+        // no linked provider account carries their self-asserted `git config user.email`
+        // in the login position — and git accepts ANY string there, including a bare word
+        // that happens to be someone else's GitHub username.
+        //
+        // Alice is registered by her github login. Mallory can push to a scanned repo and
+        // sets user.email to the bare word 'alice'. Retention keys her row
+        // `github:email:alice` (the EMAIL form — no provider username was reported), and
+        // both identity columns carry 'alice'. If the resolver probed
+        // `github:${login}` for this row it would hand Mallory's commits to Alice — and
+        // because the row is now RETAINED, every later whole-day rebuild would re-apply
+        // it, while the review queue stayed silent because the row "resolves".
+        const alice = addDeveloper(db, 'Alice', 'eng', 'alice@example.com', 'alice');
+        upsertRawAuthorDaily(
+            db,
+            rawRow({
+                raw_author_key: 'github:email:alice',
+                author_login: 'alice',
+                author_email: 'alice',
+                commits: 7,
+            }),
+        );
+
+        projectSnapshots(db, {dates: ['2024-01-15']});
+
+        // Nothing is attributed to Alice: the login branch is not consulted for an
+        // email-keyed row, and `email:alice` matches no registered address.
+        expect(readCell(db, alice.id, '2024-01-15')).toBeUndefined();
+        expect(readSnapshots(db)).toEqual([]);
+
+        // Positive control: the SAME login still resolves when the provider genuinely
+        // reported it, so the guard blocks the forged case rather than everything.
+        upsertRawAuthorDaily(
+            db,
+            rawRow({raw_author_key: 'github:login:alice', author_login: 'alice', commits: 3}),
+        );
+        projectSnapshots(db, {dates: ['2024-01-15']});
+        expect(readCell(db, alice.id, '2024-01-15')!.commits).toBe(3);
+    });
+
     it('RETAINS but does not project an author with no developer record', () => {
         upsertRawAuthorDaily(db, rawRow({raw_author_key: 'github:login:ghost', author_login: 'ghost'}));
 

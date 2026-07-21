@@ -38,6 +38,7 @@ import {
     readRawDailyForDates,
     readRawDailyForKeys,
     READ_CHUNK_SIZE,
+    isLoginKey,
     type DailyGitMetrics,
     type RawAuthorDailyRecord,
 } from './raw-author-daily.js';
@@ -191,6 +192,39 @@ export function resolveDeveloperId(
 }
 
 /**
+ * Resolve a RETAINED raw author to a developer, consulting the provider-login namespace
+ * only when the provider actually reported a login.
+ *
+ * This is the form every attribution path must use, because `login` is not trustworthy on
+ * its own: `toAnalysisCommit` fills `authorLogin` as `username || email`, so for an author
+ * with no linked provider account the "login" is their self-asserted `git config
+ * user.email` — and git accepts any string there, including a bare word.
+ *
+ * Without this guard, `resolveDeveloperId` probes `${provider}:${login}` FIRST, so anyone
+ * who can push one commit to a scanned repo could set `user.email` to a colleague's
+ * provider username and have their commits attributed to that colleague. Since #253 the
+ * row is RETAINED, so it re-projects onto the victim on every later whole-day rebuild
+ * instead of being a single-run blip, and it never surfaces in the review queue because it
+ * resolves. Cross-developer attribution is a privacy boundary in this product, not just a
+ * counting error.
+ *
+ * `raw_author_key` is the authoritative record of which identity the provider actually
+ * supplied — `rawAuthorKeyFor` builds the `:login:` form only from a non-blank username —
+ * so keying the guard on it is a positive check, not a guess about what an email looks
+ * like. An email-keyed author still resolves by the email branch, which is namespaced
+ * (`email:`) and therefore cannot collide with a provider username.
+ */
+export function resolveRawAuthor(
+    lookup: Map<string, string>,
+    provider: GitProviderType,
+    rawAuthorKey: string,
+    login: string | null,
+    email: string | null,
+): string | null {
+    return resolveDeveloperId(lookup, provider, isLoginKey(provider, rawAuthorKey) ? login : null, email);
+}
+
+/**
  * Merge two contributions to the SAME (developer_id, date) cell that come from
  * DIFFERENT raw authors — distinct providers, or distinct identities of one person
  * (a github login plus a bitbucket login, or a login plus an email-keyed identity).
@@ -257,7 +291,7 @@ function foldRawRows(
 ): Map<string, GitSnapshotRow> {
     const projected = new Map<string, GitSnapshotRow>();
     for (const row of rows) {
-        const developerId = resolveDeveloperId(lookup, row.provider, row.author_login, row.author_email);
+        const developerId = resolveRawAuthor(lookup, row.provider, row.raw_author_key, row.author_login, row.author_email);
         if (!developerId) continue;
 
         const snap = rawRowToSnapshot(row, developerId);
@@ -482,7 +516,7 @@ export function replayDevelopers(db: Database.Database, developerIds: readonly s
     // per-author grain rule `listAuthorCandidates` folds by.
     const keysByDeveloper = new Map<string, Set<string>>();
     for (const variant of distinctRawAuthorIdentities(db)) {
-        const owner = resolveDeveloperId(lookup, variant.provider, variant.login, variant.email);
+        const owner = resolveRawAuthor(lookup, variant.provider, variant.raw_author_key, variant.login, variant.email);
         if (!owner || !wanted.has(owner)) continue;
         const keys = keysByDeveloper.get(owner) ?? new Set<string>();
         keys.add(variant.raw_author_key);

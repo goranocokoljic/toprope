@@ -13,6 +13,7 @@ import {
     buildDevLookupMap,
     projectSnapshots,
     resolveDeveloperId,
+    resolveRawAuthor,
     type SnapshotCell,
 } from './projection.js';
 import {createGitProvider} from './providers/factory.js';
@@ -90,6 +91,18 @@ const ADVISORY_PREFIXES: readonly string[] = [
  */
 export function isAdvisoryError(error: string): boolean {
     return ADVISORY_PREFIXES.some((prefix) => error.startsWith(prefix));
+}
+
+/**
+ * The line auto-create emits when it could NOT onboard some candidates.
+ *
+ * Extracted so the classification test can assert against the string the code actually
+ * produces rather than a copy of it. The distinction it carries — this line is a genuine
+ * failure, the summary beside it is an advisory — is enforced only by wording, so a test
+ * holding its own literal would keep passing through exactly the reword that breaks it.
+ */
+export function autoCreateFailureLine(failed: number, detail: string): string {
+    return `Auto-create could not onboard ${failed} author(s): ${detail}`;
 }
 
 /**
@@ -1817,7 +1830,13 @@ export class GitSync implements ConnectorInterface {
                 // who goes in the unmatched advisory) happens inside the write transaction
                 // below against a freshly-read map, because minutes of network fetch sit
                 // between the two and a developer created in that gap must not be missed.
-                const developerId = resolveDeveloperId(devLookup, providerType, login, emailForLogin);
+                const developerId = resolveRawAuthor(
+                    devLookup,
+                    providerType,
+                    rawAuthorKey,
+                    login,
+                    emailForLogin,
+                );
                 if (developerId) matchedDevelopers.add(developerId);
             }
         }
@@ -1859,9 +1878,10 @@ export class GitSync implements ConnectorInterface {
             // before minutes of network fetch, during which a developer may have been added.)
             const writeLookup = buildDevLookupMap(db);
             for (const row of rawWrites.values()) {
-                const developerId = resolveDeveloperId(
+                const developerId = resolveRawAuthor(
                     writeLookup,
                     row.provider,
+                    row.raw_author_key,
                     row.author_login,
                     row.author_email,
                 );
@@ -2025,7 +2045,7 @@ export class GitSync implements ConnectorInterface {
                 .filter((e): e is Extract<typeof e, {status: 'failed'}> => e.status === 'failed')
                 .map((e) => `${e.candidate.raw_author_key} (${e.reason}: ${e.message})`)
                 .join('; ');
-            lines.push(`Auto-create could not onboard ${result.failed} author(s): ${detail}`);
+            lines.push(autoCreateFailureLine(result.failed, detail));
         }
         return lines;
     }

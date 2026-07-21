@@ -5,6 +5,7 @@ import {runMigrations} from '../../src/storage/migrator';
 import {runPipeline} from '../../src/scheduler/sync-pipeline';
 import {getRecentSyncLogs} from '../../src/scheduler/sync-log';
 import type {ConnectorInterface, SyncResult} from '../../src/connectors/types';
+import {UNMATCHED_AUTHORS_PREFIX} from '../../src/connectors/git/sync';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../src/storage/migrations');
 
@@ -152,6 +153,73 @@ describe('runPipeline', () => {
         expect(results[0].retried).toBe(true);
         expect(results[0].result.errors).toHaveLength(0);
         expect(results[0].result.snapshotsWritten).toBe(2);
+    });
+
+    it('does NOT retry, and logs SUCCESS, when the only errors are advisories (TST-2)', async () => {
+        // `SyncResult.errors` carries advisories as well as failures. Unmatched CI bots and
+        // external contributors are the steady state of a healthy repo, so keying either
+        // the retry or the log status off `errors.length` meant every scheduled sync of
+        // essentially every real deployment did a SECOND complete network fetch and was
+        // recorded red — forever, with nothing wrong.
+        let calls = 0;
+        const connector: ConnectorInterface = {
+            getName: () => 'git',
+            getLastSyncTime: () => null,
+            sync: async () => {
+                calls++;
+                return {
+                    connector: 'git',
+                    snapshotsWritten: 3,
+                    snapshotsSkipped: 0,
+                    errors: [`${UNMATCHED_AUTHORS_PREFIX} github:dependabot[bot]`],
+                    lastSyncTime: new Date().toISOString(),
+                } satisfies SyncResult;
+            },
+        };
+
+        const promise = runPipeline(db, [connector], 100);
+        await vi.runAllTimersAsync();
+        const results = await promise;
+
+        // Fetched once, not twice.
+        expect(calls).toBe(1);
+        expect(results[0].retried).toBe(false);
+        // The advisory is still RECORDED — it is information, not noise…
+        expect(results[0].result.errors).toHaveLength(1);
+        // …but the run is green, and its snapshots counted.
+        const logs = getRecentSyncLogs(db);
+        expect(logs[0].status).toBe('success');
+        expect(logs[0].records_written).toBe(3);
+    });
+
+    it('still retries and logs error when a genuine failure accompanies an advisory (TST-2)', async () => {
+        // The other direction: an advisory must not mask a real failure sitting beside it.
+        let calls = 0;
+        const connector: ConnectorInterface = {
+            getName: () => 'git',
+            getLastSyncTime: () => null,
+            sync: async () => {
+                calls++;
+                return {
+                    connector: 'git',
+                    snapshotsWritten: 0,
+                    snapshotsSkipped: 0,
+                    errors: [
+                        `${UNMATCHED_AUTHORS_PREFIX} github:dependabot[bot]`,
+                        'GitHub API error 401: bad token',
+                    ],
+                    lastSyncTime: new Date().toISOString(),
+                } satisfies SyncResult;
+            },
+        };
+
+        const promise = runPipeline(db, [connector], 100);
+        await vi.runAllTimersAsync();
+        const results = await promise;
+
+        expect(calls).toBe(2);
+        expect(results[0].retried).toBe(true);
+        expect(getRecentSyncLogs(db)[0].status).toBe('error');
     });
 
     it('logs sync run to database', async () => {

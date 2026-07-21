@@ -12,7 +12,13 @@ import {
     runPromoteCandidate,
 } from './cli/discover-repo';
 import {addTeam, listTeams, teamExists} from './registry/teams';
-import {listDevelopers, linkDeveloper, findByExternalId, findByEmail} from './registry/developers';
+import {
+    listDevelopers,
+    linkDeveloper,
+    findByExternalId,
+    findByEmail,
+    tokenizeGitEmails,
+} from './registry/developers';
 import {createDeveloperWithReplay} from './connectors/git/onboarding';
 import {discoverOrgMembers} from './registry/discovery';
 import {seedTeamsFromConfig} from './registry/config-seeder';
@@ -407,7 +413,14 @@ devCommand
                         process.exit(1);
                     }
                 }
-                for (const email of options.gitEmail) {
+                // Tokenize BEFORE checking. `joinGitEmails` splits on ',' when it stores and
+                // `buildDevLookupMap`/`findByEmail` split when they read, so a composite
+                // entry like 'mine@x.com,victim@corp.com' checked whole matches nobody and
+                // is then registered as a live claim on victim@corp.com — re-pointing that
+                // person's attribution. Checking each address individually is what closes
+                // it; the storage-side split alone would only make the theft tidier.
+                const gitEmails = tokenizeGitEmails(options.gitEmail);
+                for (const email of gitEmails) {
                     const conflict = findByEmail(db, email);
                     if (conflict && conflict.id !== options.id) {
                         console.error(
@@ -416,28 +429,37 @@ devCommand
                         process.exit(1);
                     }
                 }
-                const dev = linkDeveloper(db, options.id, {
-                    copilot: options.copilot,
-                    claude: options.claude,
-                    windsurf: options.windsurf,
-                    cursor: options.cursor,
-                    github: options.github,
-                    bitbucket: options.bitbucket,
-                    gitlab: options.gitlab,
-                    slack,
-                    gitEmails: options.gitEmail,
-                });
-                if (!dev) {
+                // Write and re-project in ONE transaction, the same shape as the admin
+                // identities PATCH this mirrors. Not cosmetic parity: if the replay threw
+                // after a committed write, the identity map would have changed while
+                // `git_snapshots` had not — leaving the developer holding cells no raw row
+                // resolves to, which is the exact state the replay exists to prevent.
+                //
+                // Re-projection is required because `git_snapshots` is a pure function of
+                // (raw store, identity map). A REMOVED or corrected identity otherwise
+                // leaves stale cells behind (sync's `cells`-mode projection never
+                // retracts), and an ADDED one attributes nothing until some unrelated
+                // whole-day rebuild happens by.
+                const linked = db.transaction(() => {
+                    const updated = linkDeveloper(db, options.id, {
+                        copilot: options.copilot,
+                        claude: options.claude,
+                        windsurf: options.windsurf,
+                        cursor: options.cursor,
+                        github: options.github,
+                        bitbucket: options.bitbucket,
+                        gitlab: options.gitlab,
+                        slack,
+                        gitEmails,
+                    });
+                    if (!updated) return null;
+                    return {dev: updated, replay: replayDeveloper(db, updated.id)};
+                })();
+                if (!linked) {
                     console.error(`Error: developer with id '${options.id}' not found.`);
                     process.exit(1);
                 }
-                // Re-project: the identity map just changed, and `git_snapshots` is a
-                // pure function of (raw store, identity map). Same reason the admin
-                // identities PATCH replays — without this, a REMOVED or corrected
-                // identity leaves this developer holding cells no raw row resolves to
-                // (sync's `cells`-mode projection never retracts), and an ADDED one
-                // attributes nothing until some unrelated whole-day rebuild happens by.
-                const replay = replayDeveloper(db, dev.id);
+                const {dev, replay} = linked;
                 console.log(`Developer '${dev.name}' (${dev.id}) updated.`);
                 console.log('External IDs:', JSON.stringify(dev.external_ids, null, 2));
                 console.log(`Re-attributed ${replay.datesCovered} snapshot date(s).`);

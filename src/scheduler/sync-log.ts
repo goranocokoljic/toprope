@@ -1,5 +1,6 @@
 import type Database from 'better-sqlite3';
 import {randomUUID} from 'crypto';
+import {isAdvisoryError} from '../connectors/git/sync';
 
 export interface SyncLog {
     id: string;
@@ -41,7 +42,12 @@ export function finishSyncLog(
     opts: {records_written: number; records_skipped: number; errors: string[]},
 ): void {
     const finished_at = new Date().toISOString();
-    const status = opts.errors.length > 0 ? 'error' : 'success';
+    // Advisories are recorded but do NOT make the run red. `errors` carries both advisories
+    // and failures; unmatched CI bots and external contributors are the steady state of a
+    // healthy repo, so keying status off the raw length reported every scheduled sync of
+    // essentially every real deployment as an error, forever. Same classifier the retry
+    // gate and the provider red/green surface use, so the three cannot disagree.
+    const status = opts.errors.some((e) => !isAdvisoryError(e)) ? 'error' : 'success';
     db.prepare(
         `UPDATE sync_logs
          SET finished_at = ?, records_written = ?, records_skipped = ?, error_count = ?, errors = ?, status = ?

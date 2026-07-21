@@ -32,7 +32,7 @@ import {
     type DistinctRawAuthor,
     type RawAuthorIdentityVariant,
 } from './raw-author-daily.js';
-import {buildDevLookupMap, resolveDeveloperId} from './projection.js';
+import {buildDevLookupMap, resolveRawAuthor} from './projection.js';
 
 /** What {@link classifyAuthor} is handed — the raw identity fields, both optional. */
 export interface AuthorIdentityInput {
@@ -363,7 +363,8 @@ export function listAuthorCandidates(
 
     const unattributed = new Map<string, DistinctRawAuthor>();
     for (const variant of distinctRawAuthorIdentities(db)) {
-        if (resolveDeveloperId(lookup, variant.provider, variant.login, variant.email) !== null) continue;
+        if (resolveRawAuthor(lookup, variant.provider, variant.raw_author_key, variant.login, variant.email) !== null)
+            continue;
         const kept = unattributed.get(variant.raw_author_key);
         unattributed.set(variant.raw_author_key, kept ? foldVariant(kept, variant) : variant);
     }

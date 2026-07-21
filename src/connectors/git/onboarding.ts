@@ -23,7 +23,7 @@
  */
 
 import type Database from 'better-sqlite3';
-import {addDeveloper} from '../../registry/developers';
+import {addDeveloper, tokenizeGitEmails} from '../../registry/developers';
 import type {Developer} from '../../registry/types';
 import {getTeam} from '../../registry/teams';
 import {findIdentityConflict} from '../../registry/identity-guard';
@@ -99,12 +99,7 @@ export function createDeveloperWithReplay(
     // Tokenizing at the WRITE boundary is what closes it for every caller; the
     // admin route's own `gitEmailsField` is now a redundant second line, not the
     // only one.
-    const gitEmails = (input.gitEmails ?? []).flatMap((entry) =>
-        entry
-            .split(/[,\s]+/)
-            .map((part) => part.trim())
-            .filter(Boolean),
-    );
+    const gitEmails = tokenizeGitEmails(input.gitEmails ?? []);
 
     return db.transaction((): CreateDeveloperOutcome => {
         const target = getTeam(db, team);

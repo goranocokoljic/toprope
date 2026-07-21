@@ -20,6 +20,7 @@ import {
     UNMATCHED_AUTHORS_PREFIX,
     LEGACY_CELLS_SKIPPED_PREFIX,
     isAdvisoryError,
+    autoCreateFailureLine,
 } from '../../../src/connectors/git/sync';
 import {listAuthorCandidates} from '../../../src/connectors/git/author-candidates';
 import {createDeveloperWithReplay} from '../../../src/connectors/git/onboarding';
@@ -520,7 +521,9 @@ describe('auto-create developers during sync (#256)', () => {
             // asserts that distinction, so it is pinned here against the ONE classifier
             // every consumer now shares.
             expect(isAdvisoryError(`${AUTO_CREATE_SUMMARY_PREFIX} 3 developers (1 bot authors skipped) into team 'discovered'`)).toBe(true);
-            expect(isAdvisoryError('Auto-create could not onboard 2 author(s): github:login:jane (conflict: ...)')).toBe(false);
+            // Built by the SOURCE, not copied here — a reword of the emitted line changes
+            // this input too, so the assertion tracks the code instead of a stale copy.
+            expect(isAdvisoryError(autoCreateFailureLine(2, 'github:login:jane (conflict: ...)'))).toBe(false);
 
             // The other advisories, and a real failure, on the same rule.
             expect(isAdvisoryError(`${UNMATCHED_AUTHORS_PREFIX} github:dependabot[bot]`)).toBe(true);
