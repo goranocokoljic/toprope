@@ -185,7 +185,11 @@ export function catchUpUntil(since: string, now: string): string {
  * (multi-chunk catch-up with same-day cross-PR comment activity), and the same class of
  * conservative undercount git_snapshots already accepts for lacking a provider/PR
  * dimension (#192 SEC-2). prs_opened/prs_merged are NOT affected — they come from the
- * always-complete `allPRs` list, whose widest first chunk captures the full set.
+ * always-complete `allPRs` list, whose widest first chunk captures the full set. The
+ * per-PR `pr_records` review fields do NOT durably undercount either: each PR is fanned
+ * out in exactly one chunk (writing its full counts then), a deferred PR carries prior
+ * counts forward via upsertPRRecord, and a first-seen deferred PR's transient zeros
+ * converge on the re-fan next chunk.
  *
  * Compared as PARSED INSTANTS, never as strings: provider `updatedAt` values are raw API
  * timestamps (github `...:00Z`, no millis) while `until` is a `toISOString()` value

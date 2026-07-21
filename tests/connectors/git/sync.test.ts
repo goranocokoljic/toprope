@@ -1098,6 +1098,68 @@ describe('GitSync', () => {
             expect(records[0].review_rounds).toBe(2);
         });
 
+        it('a window-deferred PR on a capped catch-up preserves prior review counts (no clobber, no fetch) (#247)', async () => {
+            // The fix routes a window-deferral through the SAME "not observed" channel a
+            // fetch FAILURE uses (commentsOk/reviewsOk=false). Prove the defer→carry-forward
+            // integration directly: a PR fully observed once, then deferred on a capped
+            // run, must keep its stored counts AND trigger no fan-out call.
+            const FWD = 'git_last_sync:github:test-org';
+            const DAY = 86_400_000;
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+
+            // First sync fully observes PR #1: two comments + one send-back.
+            const good = makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+                getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+                getReviewComments: vi.fn().mockResolvedValue([
+                    makeProviderReviewComment('bob'),
+                    makeProviderReviewComment('bob'),
+                ]),
+                getPRReviews: vi.fn().mockResolvedValue([
+                    {author: {name: '', email: '', username: 'bob'}, state: 'changes_requested', submittedAt: '2024-01-15T12:00:00Z', prId: '1'},
+                ]),
+            });
+            createGitProvider.mockReturnValue(good);
+            await new GitSync(makeGithubConfig()).sync(db);
+            expect(getPRRecords()[0].review_comment_count).toBe(2);
+            expect(getPRRecords()[0].review_rounds).toBe(2);
+            expect(getPRRecords()[0].changes_requested_count).toBe(1);
+
+            // Hold the cursor 90d back → next run is capped (until = cursor+30d ≈ 60d ago).
+            // PR #1 was updated 10d ago, so updatedAt > until → its fan-out is DEFERRED.
+            db.prepare(
+                'INSERT INTO sync_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+            ).run(FWD, new Date(Date.now() - 90 * DAY).toISOString());
+            const recentPr = {
+                ...makeProviderPR('alice'),
+                id: '1',
+                updatedAt: new Date(Date.now() - 10 * DAY).toISOString(),
+            };
+            const getReviewComments = vi.fn().mockResolvedValue([]);
+            const getPRReviews = vi.fn().mockResolvedValue([]);
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+                    getCommits: vi.fn().mockResolvedValue([]),
+                    getPullRequests: vi.fn().mockResolvedValue([recentPr]),
+                    getReviewComments,
+                    getPRReviews,
+                }),
+            );
+            await new GitSync(makeGithubConfig()).sync(db);
+
+            // Deferred = not observed this run: no fan-out attempted, and the prior counts
+            // survive rather than being clobbered with the zeros a deferred PR produces.
+            expect(getReviewComments).not.toHaveBeenCalled();
+            expect(getPRReviews).not.toHaveBeenCalled();
+            const rec = getPRRecords();
+            expect(rec).toHaveLength(1);
+            expect(rec[0].review_comment_count).toBe(2);
+            expect(rec[0].review_rounds).toBe(2);
+            expect(rec[0].changes_requested_count).toBe(1);
+        });
+
         it('restores the prior review_rounds verdict when only the verdict fetch fails (no stale/fresh blend)', async () => {
             seedDev(db, 'alice');
             const createGitProvider = await getCreateGitProvider();
