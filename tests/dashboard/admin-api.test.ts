@@ -395,6 +395,21 @@ describe('admin API', () => {
             expect(res.statusCode).toBe(409);
         });
 
+        // Same tokenization hole as the create route (#251 SEC-1) — the shared
+        // gitEmailsField closes it for both.
+        it('rejects a comma-packed git_emails element already owned by another developer (409)', async () => {
+            const res = await app.inject({
+                method: 'PATCH',
+                url: '/api/admin/developers/dev-2/identities',
+                headers: authHeaders(adminToken),
+                payload: {git_emails: ['bob@work.com, alice@test.com']},
+            });
+            expect(res.statusCode).toBe(409);
+            expect(res.json().message).toBe(
+                "git email 'alice@test.com' is already mapped to Alice Dev",
+            );
+        });
+
         it('moves a developer to another team', async () => {
             const res = await app.inject({
                 method: 'PATCH',
@@ -627,6 +642,38 @@ describe('admin API', () => {
             expect(res.json().message).toBe(
                 "git email 'shared@work.com' is already mapped to Bob Dev",
             );
+        });
+
+        // The store joins git_emails with ',' and BOTH findByEmail and sync's
+        // buildDevLookupMap split on ',' to read them back. An element carrying
+        // its own comma therefore stores as two emails, so it must be checked as
+        // two — otherwise it passes the guard and then re-points the second
+        // email's owner's commits at the new developer.
+        it('rejects a comma-packed git_emails element whose second address is already owned (409)', async () => {
+            const res = await create({
+                name: 'Mallory Dev',
+                team: 'backend',
+                git_emails: ['mallory@corp.com, alice@test.com'],
+            });
+            expect(res.statusCode).toBe(409);
+            expect(res.json().message).toBe(
+                "git email 'alice@test.com' is already mapped to Alice Dev",
+            );
+        });
+
+        it('splits a comma-packed git_emails element into individually-resolvable emails', async () => {
+            const created = (
+                await create({
+                    name: 'Dana Dev',
+                    team: 'backend',
+                    git_emails: ['dana@work.com, dana@home.com'],
+                })
+            ).json().data;
+            expect(created.external_ids.git_emails).toBe('dana@work.com,dana@home.com');
+            // Positive control: each half resolves on its own, which is exactly
+            // what the guard above had to have checked.
+            expect(findByEmail(db, 'dana@work.com')?.id).toBe(created.id);
+            expect(findByEmail(db, 'dana@home.com')?.id).toBe(created.id);
         });
 
         it('writes nothing when the identity check rejects (check + insert are one transaction)', async () => {

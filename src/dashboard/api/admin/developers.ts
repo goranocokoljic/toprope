@@ -118,9 +118,19 @@ function requiredTeamField(
 }
 
 /**
- * Parse an optional `git_emails` array of strings from a request body.
- * Returns undefined when absent, FIELD_INVALID (after sending a 400) when it is
- * present but not an array of strings.
+ * Parse an optional `git_emails` array of strings from a request body into
+ * INDIVIDUAL emails. Returns undefined when absent, FIELD_INVALID (after sending
+ * a 400) when it is present but not an array of strings.
+ *
+ * Each element is split on commas/whitespace rather than taken whole, because
+ * the store and the reader disagree about what one element is: `joinGitEmails`
+ * persists the set as a comma-joined string, and both `findByEmail` and sync's
+ * `buildDevLookupMap` split that string on ',' to get back individual emails.
+ * An element that itself contains a comma therefore stores as two emails but
+ * would be uniqueness-checked as one opaque string that matches nothing — so
+ * 'mine@corp.com, jane@corp.com' passes the guard and then silently re-points
+ * Jane's commit attribution at the new developer. Normalizing here keeps
+ * validation, storage, and lookup tokenizing identically.
  */
 function gitEmailsField(
     value: unknown,
@@ -131,7 +141,12 @@ function gitEmailsField(
         badRequest(reply, 'git_emails must be an array of strings');
         return FIELD_INVALID;
     }
-    return value as string[];
+    return (value as string[]).flatMap((e) =>
+        e
+            .split(/[,\s]+/)
+            .map((part) => part.trim())
+            .filter(Boolean),
+    );
 }
 
 export function registerAdminDeveloperRoutes(app: FastifyInstance, db: Database.Database): void {
