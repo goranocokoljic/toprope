@@ -42,8 +42,10 @@ unattributed.
 **Workaround:** map identities (`dev add --git-email/--copilot/...` or the Admin
 identity-mapping UI). Unmatched git authors are retained and listed by
 `dev discover-repo` / **Admin → Developer identities → Unmatched authors**;
-promoting one attributes its retained history immediately, with no re-sync. Adding
-identities to an *existing* developer still needs a re-sync.
+promoting one attributes its retained history immediately, with no re-sync. Adding an
+identity to an *existing* developer does **not** back-fill — a later sync attributes only
+the window it re-fetches, so recovering older history needs **Admin → Git Providers →
+Sync older history**.
 
 ### K-5. Cold-start: charts look sparse on day one
 **Impact:** low (expected by design). With only a few days of history, time-series

@@ -134,6 +134,23 @@ describe('OnboardingEmptyState visibility rule', () => {
         expect(screen.queryByTestId('onboarding-empty-state')).not.toBeInTheDocument();
     });
 
+    it('excludes likely bots from the count, and hides when every author is one', async () => {
+        const bot = {...candidate('github:login:dependabot[bot]'), likely_bot: true, bot_reason: 'known bot'};
+        // First: a mixed queue counts only the human.
+        candidates = [bot, candidate('github:login:jane-gh')];
+        renderPanel({role: 'admin', totalDevelopers: 0});
+        const panel = await screen.findByTestId('onboarding-empty-state');
+        expect(panel).toHaveTextContent('1 git author');
+        expect(panel).not.toHaveTextContent('2 git authors');
+
+        // Then: an all-bot queue is not something to onboard, so no panel at all.
+        cleanup();
+        candidates = [bot];
+        renderPanel({role: 'admin', totalDevelopers: 0});
+        await waitFor(() => expect(candidatesFetched()).toBe(true));
+        expect(screen.queryByTestId('onboarding-empty-state')).not.toBeInTheDocument();
+    });
+
     it('hides from a non-admin viewer, who could not act on it anyway', async () => {
         renderPanel({role: 'developer', totalDevelopers: 0});
 

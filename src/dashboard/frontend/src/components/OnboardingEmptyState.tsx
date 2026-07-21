@@ -54,7 +54,14 @@ export function OnboardingEmptyState({
     const eligible = isAdmin && totalDevelopers === 0;
 
     const candidates = useAdminDeveloperCandidates({enabled: eligible});
-    const count = candidates.data?.length ?? 0;
+    // Likely bots are excluded from the COUNT (the review queue itself flags them
+    // and shows them, because the classifier is conservative and an admin may want
+    // to promote one it misread). Here the count is the whole argument for acting:
+    // a repo whose only retained authors are `dependabot[bot]` and `renovate` has
+    // nobody to onboard, and a panel urging an admin to "add developers to see
+    // activity" would be pointing them at two bots. With no humans waiting this
+    // falls through to the page's ordinary cold-start copy, which is the honest state.
+    const count = (candidates.data ?? []).filter((c) => !c.likely_bot).length;
 
     // A failed or in-flight candidates fetch renders nothing rather than a
     // guessed-at panel: this is an advisory signpost, and the page's own error

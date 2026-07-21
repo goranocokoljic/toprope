@@ -18,6 +18,13 @@ makes all three safe to run at any time.
 >
 > Practically: it does not matter whether you add someone before their first sync or six
 > months after. They arrive with their history.
+>
+> **Two limits to know.** Retention begins with the first sync on a version that has it —
+> days synced by an older build were never retained, so a long-running deployment can only
+> replay history from its first sync after upgrading. And the guarantee covers **creating**
+> a developer; adding an identity to one who already exists does not back-fill (see below).
+> In both cases the way to recover older history is to re-fetch that window — **Admin → Git
+> Providers → Sync older history**.
 
 ---
 
@@ -56,9 +63,16 @@ ambiguous.
 
 Adding identities to an **existing** developer is a different operation —
 `toprope dev link --id <dev-id> --github <u> …`, or the **Edit** action on the identities
-page. Note that linking does **not** currently trigger a replay: it updates the identity
-map, and the newly-resolvable history is attributed on the next sync rather than
-immediately.
+page — and it is the one case the replay guarantee does **not** cover. Linking updates the
+identity map only. A subsequent sync attributes the new identity's commits inside the
+window that sync actually fetched, so it picks up recent activity and leaves everything
+older unattributed; nothing re-projects the developer's whole retained history the way a
+create does.
+
+If the identity you are adding has meaningful history behind it, re-fetch that window
+afterwards: **Admin → Git Providers → Sync older history**. Getting the identities right
+when the developer is *created* avoids the problem entirely, which is why the review queue
+pre-fills them.
 
 ---
 
@@ -232,8 +246,11 @@ Their history is attributed on promotion.
 **"I added a developer but their history is missing."** Check the attributed-dates count
 the create reported. If it was `0`, the identities did not match any retained author —
 compare what you entered against the review queue's **Login / email** column. A commit
-email you did not add is the usual cause; add it via **Edit** on the identities page or
-`toprope dev link --id <dev-id> --git-email <address>`, then re-sync.
+email you did not add is the usual cause. Add it via **Edit** on the identities page or
+`toprope dev link --id <dev-id> --git-email <address>` — but note that this does **not**
+back-fill: linking attributes only what a later sync re-fetches. To recover the history
+behind that address, follow the link with **Admin → Git Providers → Sync older history**
+over the window you care about.
 
 **"The same person shows up twice."** They commit under two identities. Do not create two
 records — put both on one developer (`--git-email` is repeatable, and the GitHub /
