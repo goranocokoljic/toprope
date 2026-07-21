@@ -384,8 +384,10 @@ describe('printStatus', () => {
         it('renders "connected" and the newest cursor across providers', () => {
             const threeHoursAgo = new Date(Date.now() - 3 * 3_600_000).toISOString();
             const oneHourAgo = new Date(Date.now() - 1 * 3_600_000).toISOString();
-            seedCursorIso('git_last_sync:github:acme', threeHoursAgo);
-            seedCursorIso('git_last_sync:github:beta', oneHourAgo);
+            // Newest cursor listed FIRST in provider order so a "take-last" bug would
+            // pick the older 3h one — the max comparison, not iteration order, must win.
+            seedCursorIso('git_last_sync:github:acme', oneHourAgo);
+            seedCursorIso('git_last_sync:github:beta', threeHoursAgo);
 
             printStatus(db, gitConfig(['acme', 'beta']));
 
@@ -394,6 +396,21 @@ describe('printStatus', () => {
             expect(line).toContain('✓ connected');
             // Newest of the two cursors (1h ago), not the older 3h one.
             expect(line).toContain('1h ago');
+            expect(line).not.toContain('3h ago');
+        });
+
+        it('picks the one synced provider when a sibling has never synced (mixed present/absent)', () => {
+            const twoHoursAgo = new Date(Date.now() - 2 * 3_600_000).toISOString();
+            // acme has a cursor; beta never synced — the null arm must be skipped, not
+            // treated as the newest, so the line reflects acme's real cursor.
+            seedCursorIso('git_last_sync:github:acme', twoHoursAgo);
+
+            printStatus(db, gitConfig(['acme', 'beta']));
+
+            const line = gitLine();
+            expect(line).toBeDefined();
+            expect(line).toContain('✓ connected');
+            expect(line).toContain('2h ago');
         });
 
         it('renders "not synced" when the bare git_last_sync key is set but no per-provider cursor is (regression)', () => {

@@ -1498,13 +1498,23 @@ export function latestProviderCursor(
     providerConfigs: GitProviderConfig[],
 ): string | null {
     let latest: string | null = null;
+    let latestMs = -Infinity;
     for (const pc of providerConfigs) {
         const key = syncStateKey(pc.type, providerIdentifier(pc));
         const row = db
             .prepare('SELECT value FROM sync_state WHERE key = ?')
             .get(key) as SyncStateRow | undefined;
         const t = row?.value ?? null;
-        if (t && (!latest || t > latest)) latest = t;
+        if (!t) continue;
+        // Compare by parsed instant, not lexically, and drop an unparseable value —
+        // matching loadLaggingProviders' totality. A garbage row must not sort high,
+        // win the max, and render as "connected (just now)" via formatTimeAgo(NaN).
+        const ms = Date.parse(t);
+        if (Number.isNaN(ms)) continue;
+        if (ms > latestMs) {
+            latestMs = ms;
+            latest = t;
+        }
     }
     return latest;
 }
@@ -1529,8 +1539,10 @@ export class GitSync implements ConnectorInterface {
      * stall syncs successfully every night while this still reports an instant weeks
      * back, because that is genuinely how far the data reaches. That is the honest
      * answer for a freshness/staleness question and the wrong one for "did the sync
-     * run?"; a caller wanting the latter must not use this. `toprope status` reads it
-     * for the Git connector's "last sync" line (#246).
+     * run?"; a caller wanting the latter must not use this. This method has no direct
+     * caller in `src/` (it satisfies ConnectorInterface); the shared scan it delegates
+     * to, {@link latestProviderCursor}, is what `toprope status` calls to render the
+     * Git connector's "last sync" line (#246).
      */
     getLastSyncTime(db: Database.Database): string | null {
         return latestProviderCursor(db, this.getProviderConfigs(db));
