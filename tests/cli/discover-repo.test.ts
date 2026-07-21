@@ -236,7 +236,8 @@ describe('runPromoteAllCandidates', () => {
         expect(runPromoteAllCandidates(db, 'eng')).toBe(0);
 
         const text = stdout();
-        expect(text).toContain('Promoted 1 developer(s), attributing 2 snapshot date(s)');
+        expect(text).toContain('Promoted 1 developer(s);');
+        expect(text).toContain('2 date(s) attributed');
         expect(text).toContain('skipped 1 likely bot(s)');
         expect(text).toContain('--include-bots');
         expect(db.prepare('SELECT COUNT(*) AS n FROM developers').get()).toEqual({n: 1});

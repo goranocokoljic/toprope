@@ -155,14 +155,16 @@ export function registerAdminDeveloperRoutes(app: FastifyInstance, db: Database.
         }
 
         // `replay` rides alongside `data` rather than inside it: `data` is the
-        // developer row (same shape as the GET list), while the counts describe
-        // what the create DID, and the UI reads them for its confirmation.
+        // developer row (same shape as the GET list), while the count describes
+        // what the create DID, and the UI reads it for its confirmation.
+        //
+        // Only `datesCovered` is exposed. The projection's `cellsWritten` counts
+        // every cell its whole-day rebuild rewrote — across ALL developers active
+        // on those days — so shipping it as part of THIS developer's create result
+        // would report org-wide rebuild volume under a per-developer label.
         return reply.status(201).send({
             data: outcome.developer,
-            replay: {
-                dates_attributed: outcome.replay.datesCovered,
-                cells_written: outcome.replay.cellsWritten,
-            },
+            replay: {dates_attributed: outcome.replay.datesCovered},
         });
     });
 

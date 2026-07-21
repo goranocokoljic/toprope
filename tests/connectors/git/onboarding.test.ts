@@ -195,6 +195,74 @@ describe('createDeveloperWithReplay — create + attribute retained history atom
         });
     });
 
+    it('tokenizes a comma-bearing git email so it cannot smuggle a claim past the guard (SEC)', () => {
+        // A provider-supplied author email is unvalidated and lands verbatim in
+        // the raw store, so a crafted commit author can carry a comma. Storage
+        // joins git emails with ',' and the lookup SPLITS on ',' — so an entry
+        // checked as one opaque string but stored as two would silently re-point
+        // an existing developer's commits at whoever submitted it.
+        addDeveloper(db, 'Jane', 'eng', 'jane@corp.com');
+        seedGithubLogin('jane', ['2026-07-01', '2026-07-02']);
+
+        const outcome = createDeveloperWithReplay(db, {
+            name: 'Evil',
+            team: 'eng',
+            email: 'evil@x.com',
+            gitEmails: ['other@x.com,jane@corp.com'],
+        });
+
+        expect(outcome.ok).toBe(false);
+        if (outcome.ok) return;
+        expect(outcome.reason).toBe('conflict');
+        expect(outcome.message).toContain("git email 'jane@corp.com' is already mapped to Jane");
+        expect(db.prepare("SELECT COUNT(*) AS n FROM developers WHERE name = 'Evil'").get()).toEqual({
+            n: 0,
+        });
+    });
+
+    it('splits a multi-address git email into individually-resolvable identities', () => {
+        // Positive control for the tokenization above: when nothing is taken, both
+        // halves must become REAL lookup keys, not one dead composite string.
+        upsertRawAuthorDaily(
+            db,
+            rawRow({
+                raw_author_key: 'github:email:second@x.com',
+                author_email: 'second@x.com',
+                date: '2026-07-03',
+                commits: 2,
+            }),
+        );
+
+        const outcome = createDeveloperWithReplay(db, {
+            name: 'Multi',
+            team: 'eng',
+            email: 'primary@x.com',
+            gitEmails: ['first@x.com, second@x.com'],
+        });
+
+        expect(outcome.ok).toBe(true);
+        if (!outcome.ok) return;
+        expect(outcome.developer.external_ids.git_emails).toBe('first@x.com,second@x.com');
+        // The second address really resolves — the retained day attributed.
+        expect(snapshotsFor(outcome.developer.id)).toEqual([{date: '2026-07-03', commits: 2}]);
+    });
+
+    it('stores the same provider id it uniqueness-checked, trimmed (SEC)', () => {
+        seedGithubLogin('jane', ['2026-07-01']);
+
+        const outcome = createDeveloperWithReplay(db, {name: 'Jane', team: 'eng', github: '  jane  '});
+
+        expect(outcome.ok).toBe(true);
+        if (!outcome.ok) return;
+        // Untrimmed, this would store ' jane ', resolve nothing forever, and leave
+        // a later honest claim of 'jane' looking free.
+        expect(outcome.developer.external_ids.github).toBe('jane');
+        expect(outcome.replay.datesCovered).toBe(1);
+
+        const second = createDeveloperWithReplay(db, {name: 'Impostor', team: 'eng', github: 'jane'});
+        expect(second.ok).toBe(false);
+    });
+
     it('fails closed on a team that does not exist', () => {
         const outcome = createDeveloperWithReplay(db, {name: 'Jane', team: 'ghost-team'});
 

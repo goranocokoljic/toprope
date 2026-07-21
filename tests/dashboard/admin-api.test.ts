@@ -891,7 +891,7 @@ describe('admin API', () => {
 
             expect(created.statusCode).toBe(201);
             // The confirmation count the UI renders — both days, attributed.
-            expect(created.json().replay).toEqual({dates_attributed: 2, cells_written: 2});
+            expect(created.json().replay).toEqual({dates_attributed: 2});
             // Derived: the promoted author is gone, the other one remains.
             const remaining = (await getCandidates(adminToken)).json().data as {
                 raw_author_key: string;

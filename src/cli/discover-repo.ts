@@ -89,10 +89,11 @@ export function runPromoteCandidate(
 
     const {developer, replay} = outcome;
     console.log(`Developer '${developer.name}' created with id: ${developer.id} (team: ${developer.team})`);
-    console.log(
-        `Attributed ${replay.datesCovered} snapshot date(s) of retained history ` +
-            `(${replay.cellsWritten} cell(s) written).`,
-    );
+    // `datesCovered` only. `cellsWritten` counts every cell the whole-day rebuild
+    // rewrote — across ALL developers active on those days — so printing it beside
+    // this developer's name would read as "their recovered history" while actually
+    // reporting org-wide rebuild volume.
+    console.log(`Attributed ${replay.datesCovered} snapshot date(s) of retained history.`);
     if (replay.datesCovered === 0) {
         console.log(
             'Note: no retained authorship resolved to these identities — check the login/email spelling.',
@@ -118,11 +119,9 @@ export function runPromoteAllCandidates(
         return 0;
     }
 
-    let attributedDates = 0;
     for (const entry of result.entries) {
         const label = candidateLabel(entry.candidate);
         if (entry.status === 'promoted') {
-            attributedDates += entry.replay.datesCovered;
             console.log(
                 `  + ${label} -> ${entry.developer.name} (${entry.developer.id}) — ` +
                     `${entry.replay.datesCovered} date(s) attributed`,
@@ -134,8 +133,12 @@ export function runPromoteAllCandidates(
         }
     }
 
+    // Deliberately no aggregate date total: the promoted developers' attributed
+    // date sets overlap heavily (they worked the same days), so a sum would report
+    // a number far larger than the distinct history actually recovered. The
+    // per-developer counts above are the honest figures.
     console.log(
-        `Promoted ${result.promoted} developer(s), attributing ${attributedDates} snapshot date(s); ` +
+        `Promoted ${result.promoted} developer(s); ` +
             `skipped ${result.skippedBots} likely bot(s); ${result.failed} failed.`,
     );
     return result.failed > 0 ? 1 : 0;

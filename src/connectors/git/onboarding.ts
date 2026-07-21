@@ -76,7 +76,33 @@ export function createDeveloperWithReplay(
     const name = input.name.trim();
     const team = input.team.trim();
     const email = input.email?.trim() || undefined;
-    const gitEmails = (input.gitEmails ?? []).map((e) => e.trim()).filter(Boolean);
+    // Provider ids are trimmed HERE, not just where they are checked: the guard
+    // trims before `findByExternalId`, so storing an untrimmed value means the
+    // string that was checked is not the string that was stored. ' alice' would
+    // pass a lookup for 'alice', persist with the space, resolve nothing forever
+    // (silent zero attribution), and still leave a later honest claim of 'alice'
+    // looking free — two developers nominally owning one GitHub identity.
+    const github = input.github?.trim() || undefined;
+    const bitbucket = input.bitbucket?.trim() || undefined;
+    const gitlab = input.gitlab?.trim() || undefined;
+    // Split each entry into INDIVIDUAL addresses before it is either checked or
+    // stored. Storage and lookup disagree about what one entry is: `joinGitEmails`
+    // persists the set comma-joined WITHOUT splitting, while `buildDevLookupMap`
+    // and `findByEmail` split the stored value on ',' and register each part as
+    // its own lookup key. So 'evil@x.com,jane@corp.com' is uniqueness-checked as
+    // one opaque string that matches nothing, then stored and split into a live
+    // claim on jane@corp.com — silently re-pointing Jane's commit attribution at
+    // whoever submitted it. A raw author's email column is provider-supplied and
+    // unvalidated, so this reaches here from a crafted commit via promotion.
+    // Tokenizing at the WRITE boundary is what closes it for every caller; the
+    // admin route's own `gitEmailsField` is now a redundant second line, not the
+    // only one.
+    const gitEmails = (input.gitEmails ?? []).flatMap((entry) =>
+        entry
+            .split(/[,\s]+/)
+            .map((part) => part.trim())
+            .filter(Boolean),
+    );
 
     return db.transaction((): CreateDeveloperOutcome => {
         const target = getTeam(db, team);
@@ -90,9 +116,9 @@ export function createDeveloperWithReplay(
         const conflict = findIdentityConflict(
             db,
             {
-                github: input.github,
-                bitbucket: input.bitbucket,
-                gitlab: input.gitlab,
+                github,
+                bitbucket,
+                gitlab,
                 emails: [
                     ...(email ? [{value: email, label: 'email'}] : []),
                     ...gitEmails.map((value) => ({value, label: 'git email'})),
@@ -102,9 +128,9 @@ export function createDeveloperWithReplay(
         );
         if (conflict) return {ok: false, reason: 'conflict', message: conflict};
 
-        const developer = addDeveloper(db, name, team, email, input.github, {
-            bitbucket: input.bitbucket,
-            gitlab: input.gitlab,
+        const developer = addDeveloper(db, name, team, email, github, {
+            bitbucket,
+            gitlab,
             gitEmails: gitEmails.length > 0 ? gitEmails : undefined,
         });
 
