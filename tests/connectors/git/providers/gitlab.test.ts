@@ -71,6 +71,9 @@ function makeMRFixture(overrides: Record<string, unknown> = {}): Record<string, 
         author: {username: 'alice', name: 'Alice', email: 'alice@example.com'},
         state: 'opened',
         created_at: '2024-01-15T09:00:00.000Z',
+        // Distinct from created_at so the mapping assertion pins updatedAt to
+        // `updated_at`, not `created_at`/`merged_at` (#247 review TST-1).
+        updated_at: '2024-01-16T09:00:00.000Z',
         merged_at: null,
         closed_at: null,
         reviewers: [{username: 'bob', name: 'Bob', email: 'bob@example.com'}],
@@ -588,6 +591,7 @@ describe('GitLabProvider', () => {
                 createdAt: '2024-01-15T09:00:00.000Z',
                 mergedAt: null,
                 closedAt: null,
+                updatedAt: '2024-01-16T09:00:00.000Z',
                 reviewers: [{name: 'Bob', email: 'bob@example.com', username: 'bob'}],
                 additions: 0,
                 deletions: 0,

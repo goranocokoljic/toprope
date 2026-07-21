@@ -107,33 +107,32 @@ export const EARLIEST_SYNC_EPOCH = new Date(0).toISOString();
  *   - BOUNDED everywhere: the commit walk's `[since, until]` span, and with it the
  *     per-commit `getCommitDiff` fan-out (one API call PER COMMIT — usually the
  *     largest single cost of a catch-up).
- *   - NOT bounded, and made WORSE on recovery: the PR listing.
- *     `getPullRequests(repo, state, since)` takes no `until` (see GitProvider), so a
- *     run still lists every PR touched since the cursor and fans out to
- *     getReviewComments + getPRReviews per PR. Two distinct consequences, and the
- *     second is a real cost this cap ADDS — stated plainly rather than buried:
- *       · While STALLED: `since` is pinned and `now` marches on, so that half of the
- *         cost grows every run, exactly as it did before this cap existed.
- *       · While RECOVERING: chunking multiplies the PR half's TOTAL cost. Catching up
- *         200 days used to be one run listing 200 days of PRs; it is now 7 runs
- *         listing 200+170+140+110+80+50+20 = 770 PR-days, because each chunk re-lists
- *         everything from its (advancing) `since` to `now`. The amplification is
- *         ~lag/(2·cap) — ~4x for a 200-day recovery, ~12x for a two-year one. The
- *         commit half is unaffected (its chunks are disjoint), so what the cap really
- *         buys is a bounded PEAK per run, paid for with a higher TOTAL on the PR side.
- *         For a rare, one-off recovery that is the right trade — a single run walking
- *         200 days of commits with a getCommitDiff per commit is what actually
- *         exhausts a rate limit — but it is a trade, not a free win.
- *     Correctness is unaffected either way: those fields are max()-merged idempotently
- *     (see remergeStoredSnapshot), so re-delivery is extra fetch, never inflation.
- *     Bounding it properly needs an `until` on the provider PR interface — GitPR does
- *     not even carry the `updated_at` the delivery is keyed on, so a filter here could
- *     not be proven lossless: follow-up #247, deliberately not #235.
- *   - PROVIDER-DEPENDENT: github/gitlab push `since`+`until` to the server, so the
- *     cap really does shrink what is listed. Bitbucket's getCommits pages from HEAD
- *     newest-first and breaks only when it crosses `since`, filtering `until` in
- *     memory — so for Bitbucket the cap bounds the diff fan-out but NOT the commit
- *     paging, and a chunked recovery re-pages HEAD→since once per chunk.
+ *   - BOUNDED since #247: the per-PR review FAN-OUT. `getPullRequests(repo, state,
+ *     since)` still takes no `until` (see GitProvider), so a run lists every PR touched
+ *     since the cursor — the list rows all still feed the snapshot (prs_opened/prs_merged
+ *     stay whole) — but the fan-out that dominates its cost (getReviewComments +
+ *     getPRReviews, 2 API calls PER PR) is filtered to the same `[since, until]` window as
+ *     the commit walk (prWithinFetchWindow, keyed on the `updatedAt` #247 added to GitPR).
+ *     This collapses the recovery amplification the cap used to ADD — a 200-day recovery
+ *     no longer re-fans 200+170+…+20 = 770 PR-days of reviews across 7 chunks, only the
+ *     ~1x disjoint total (each PR is fanned out in exactly one chunk) — and bounds the
+ *     stalled case. Lossless for the fan-out: a PR deferred for `updatedAt > until` is
+ *     re-listed and fanned out on the next chunk (whose `since` IS this `until`). The one
+ *     residual, on the multi-chunk recovery/backfill path only: `review_comments_given` is
+ *     a per-day aggregate built from the fetched comments and max()-merged, so same-day
+ *     comments on PRs whose `updatedAt` straddles a chunk boundary can undercount that day
+ *     — a bounded, conservative error of the same class git_snapshots already accepts for
+ *     lacking a provider/PR dimension (#192 SEC-2). See prWithinFetchWindow.
+ *   - STILL UNBOUNDED: the PR LIST paging itself. github/bitbucket page PRs by
+ *     `updated_at` DESC, so the out-of-window (newest) PRs sort FIRST and must be paged
+ *     through to reach `[since, until]` — an upper bound on the list call cannot skip
+ *     them. That paging is one list request per ~50–100 PRs though, far cheaper than the
+ *     2-per-PR fan-out #247 bounds; the dominant cost is handled.
+ *   - PROVIDER-DEPENDENT (commit walk): github/gitlab push `since`+`until` to the server,
+ *     so the cap really does shrink what is listed. Bitbucket's getCommits pages from HEAD
+ *     newest-first and breaks only when it crosses `since`, filtering `until` in memory —
+ *     so for Bitbucket the cap bounds the diff fan-out but NOT the commit paging, and a
+ *     chunked recovery re-pages HEAD→since once per chunk.
  */
 export const GIT_CATCHUP_WINDOW_MAX_DAYS = 30;
 
@@ -154,6 +153,56 @@ export function catchUpUntil(since: string, now: string): string {
     const capMs = GIT_CATCHUP_WINDOW_MAX_DAYS * 86_400_000;
     if (nowMs - sinceMs <= capMs) return now;
     return new Date(sinceMs + capMs).toISOString();
+}
+
+/**
+ * Whether a PR's expensive review FAN-OUT (getReviewComments + getPRReviews) should run
+ * this run (#247) — i.e. its last activity is at or before the run's upper bound `until`.
+ *
+ * This gates the FAN-OUT ONLY, never whether the PR feeds the snapshot. The list row is
+ * already in hand and cheap, so the caller pushes EVERY listed PR into `allPRs`
+ * (keeping prs_opened/prs_merged whole — see the SO-1 note at the call site); this
+ * predicate only decides whether to spend the two per-PR review API calls now.
+ *
+ * `getPullRequests(repo, state, since)` takes no upper bound (see GitProvider), so a run
+ * lists every PR touched since the cursor and — before this gate — fanned out two API
+ * calls PER PR over the whole `[since, now]` span, unbounded while a cursor is held and
+ * AMPLIFIED chunk-by-chunk on a capped recovery. Gating on `updatedAt <= until` fans each
+ * PR out in EXACTLY ONE chunk (its `updatedAt` lands in exactly one contiguous
+ * `[since, until]`), collapsing the amplification to ~1x.
+ *
+ * LOSSLESS for the fan-out: a PR touched in `(until, now]` has `updatedAt > until`, and a
+ * capped run advances the cursor to exactly `until` (see forwardCursorTarget), so the next
+ * run's `since` IS this run's `until` and re-lists it (`getPullRequests` fetches
+ * `updatedAt >= since`); it is fanned out then. The final uncapped chunk (`until === now`)
+ * defers nothing. On backfill, `until` is the earliest watermark, so a PR updated after it
+ * is already covered by the forward window.
+ *
+ * KNOWN RESIDUAL (recovery/backfill only): `review_comments_given` is a per-day aggregate
+ * built from the fetched comments and max()-merged across runs. Because each PR is fanned
+ * out in only one chunk, two same-day comments on PRs whose `updatedAt` straddles a chunk
+ * boundary are seen in different runs, so max() can undercount that day. Bounded, rare
+ * (multi-chunk catch-up with same-day cross-PR comment activity), and the same class of
+ * conservative undercount git_snapshots already accepts for lacking a provider/PR
+ * dimension (#192 SEC-2). prs_opened/prs_merged are NOT affected — they come from the
+ * always-complete `allPRs` list, whose widest first chunk captures the full set. The
+ * per-PR `pr_records` review fields do NOT durably undercount either: each PR is fanned
+ * out in exactly one chunk (writing its full counts then), a deferred PR carries prior
+ * counts forward via upsertPRRecord, and a first-seen deferred PR's transient zeros
+ * converge on the re-fan next chunk.
+ *
+ * Compared as PARSED INSTANTS, never as strings: provider `updatedAt` values are raw API
+ * timestamps (github `...:00Z`, no millis) while `until` is a `toISOString()` value
+ * (`...:00.000Z`), so a lexical `<=` would mis-order equal instants. Total and FAIL-OPEN:
+ * an unparseable `until` (no usable bound) or an unparseable `updatedAt` (can't place the
+ * PR) runs the fan-out — a bounded extra fetch, never a silent drop.
+ */
+export function prWithinFetchWindow(updatedAt: string, until: string): boolean {
+    const untilMs = Date.parse(until);
+    if (Number.isNaN(untilMs)) return true;
+    const updatedMs = Date.parse(updatedAt);
+    if (Number.isNaN(updatedMs)) return true;
+    return updatedMs <= untilMs;
 }
 
 /** Knobs a sync run accepts beyond the provider set. */
@@ -1162,10 +1211,10 @@ async function fetchProviderData(
     //   - First sync (no cursor): `now`. The cap deliberately does NOT apply — the
     //     window is already bounded by firstSyncWindowMonths, and capping it would
     //     silently turn a requested 6-month import into a 30-day one.
-    // The cap bounds the COMMIT walk and its per-commit getCommitDiff fan-out only —
-    // the PR listing below is fetched by `since` with no upper bound, so its cost still
-    // grows while a cursor is held. See GIT_CATCHUP_WINDOW_MAX_DAYS for the full scope
-    // of what is and is not bounded (and follow-up #247).
+    // `until` bounds BOTH the commit walk (with its per-commit getCommitDiff fan-out)
+    // and — since #247 — the per-PR review fan-out below, which is filtered to
+    // `updatedAt <= until` (prWithinFetchWindow). See GIT_CATCHUP_WINDOW_MAX_DAYS for the
+    // full scope of what is and is not bounded.
     const until = backfill
         ? backfill.until
         : storedCursor !== null
@@ -1283,36 +1332,62 @@ async function fetchProviderData(
         let commentFetchFailures = 0;
         let reviewFetchFailures = 0;
         for (const pr of rawPRs) {
+            // EVERY listed PR feeds allPRs / prRecords unconditionally — the list row is
+            // already in hand and cheap, and the per-day open/merge aggregate is combined
+            // across runs with max() (remergeStoredSnapshot), which is only idempotent if
+            // each run delivers the FULL per-day set. Dropping list rows here would
+            // partition a single day's PRs across catch-up chunks and make max(partial,
+            // partial) silently undercount prs_opened/prs_merged (#247 review SO-1; the
+            // additive/idempotent-merge rule from #205/#192).
             allPRs.push(toAnalysisPR(pr));
+
+            // Bound ONLY the expensive per-PR review fan-out (getReviewComments +
+            // getPRReviews, 2 API calls each) to the run's [since, until] window (#247).
+            // getPullRequests takes no upper bound, so a held cursor would otherwise
+            // re-fan an ever-widening span; gating the fan-out on `updatedAt <= until`
+            // fans each PR out in exactly one chunk (its updatedAt lands in exactly one
+            // contiguous [since, until]) — collapsing the recovery amplification to ~1x.
+            // Lossless: a deferred PR re-lists next chunk (since' === until) and is fanned
+            // out then. On a normal uncapped run (until === now) nothing is deferred.
+            const fanOut = prWithinFetchWindow(pr.updatedAt, until);
+
+            // A deferred fan-out is "not observed this run" — exactly like a failed fetch,
+            // so commentsOk/reviewsOk are false and upsertPRRecord carries forward the
+            // previously-observed review counts instead of clobbering them with zeros. It
+            // is NOT a fetch FAILURE, so it is not counted toward the error advisories.
             let prCommentCount = 0;
-            let commentsOk = true;
-            try {
-                const comments = await provider.getReviewComments(repoName, pr.id);
-                prCommentCount = comments.length;
-                for (const c of comments) {
-                    allReviewComments.push(toAnalysisReviewComment(c));
+            let commentsOk = fanOut;
+            if (fanOut) {
+                try {
+                    const comments = await provider.getReviewComments(repoName, pr.id);
+                    prCommentCount = comments.length;
+                    for (const c of comments) {
+                        allReviewComments.push(toAnalysisReviewComment(c));
+                    }
+                } catch {
+                    // Review comment fetch failed — counted and surfaced below
+                    commentsOk = false;
+                    commentFetchFailures++;
                 }
-            } catch {
-                // Review comment fetch failed — counted and surfaced below
-                commentsOk = false;
-                commentFetchFailures++;
             }
 
             // Review verdict events (Task 5.2). Best-effort like comments: a
-            // failed fetch still records the PR, flagged so the upsert
+            // failed (or deferred) fetch still records the PR, flagged so the upsert
             // preserves previously-observed verdict data.
             let changesRequestedCount = 0;
             let reviewEventCount = 0;
-            let reviewsOk = true;
-            try {
-                const reviews = await provider.getPRReviews(repoName, pr.id);
-                reviewEventCount = reviews.length;
-                changesRequestedCount = reviews.filter(
-                    (r) => r.state === 'changes_requested',
-                ).length;
-            } catch {
-                reviewsOk = false;
-                reviewFetchFailures++;
+            let reviewsOk = fanOut;
+            if (fanOut) {
+                try {
+                    const reviews = await provider.getPRReviews(repoName, pr.id);
+                    reviewEventCount = reviews.length;
+                    changesRequestedCount = reviews.filter(
+                        (r) => r.state === 'changes_requested',
+                    ).length;
+                } catch {
+                    reviewsOk = false;
+                    reviewFetchFailures++;
+                }
             }
 
             allPRRecords.push({

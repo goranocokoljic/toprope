@@ -55,7 +55,9 @@ function makePRFixture(overrides: Record<string, unknown> = {}): Record<string, 
         user: {login: 'alice'},
         state: 'open',
         created_at: '2024-01-15T09:00:00Z',
-        updated_at: '2024-01-15T09:00:00Z',
+        // Distinct from created_at so the mapping assertion pins updatedAt to
+        // `updated_at`, not `created_at`/`merged_at` (#247 review TST-1).
+        updated_at: '2024-01-16T09:00:00Z',
         merged_at: null,
         closed_at: null,
         requested_reviewers: [{login: 'bob'}],
@@ -419,6 +421,7 @@ describe('GitHubProvider', () => {
                 createdAt: '2024-01-15T09:00:00Z',
                 mergedAt: null,
                 closedAt: null,
+                updatedAt: '2024-01-16T09:00:00Z',
                 reviewers: [{name: '', email: '', username: 'bob'}],
                 // additions/deletions are not returned by the PR list endpoint
                 additions: 0,

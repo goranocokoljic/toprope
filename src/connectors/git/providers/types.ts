@@ -63,6 +63,15 @@ export interface GitPR {
     createdAt: string;
     mergedAt: string | null;
     closedAt: string | null;
+    /**
+     * The instant this PR was last touched (github `updated_at`, bitbucket
+     * `updated_on`, gitlab `updated_at`) — the field all three providers list and
+     * page PRs by. Required: every provider's list payload always carries it, so this
+     * is guaranteed, not best-effort. `fetchProviderData` keys the catch-up-window
+     * bound off it to defer the per-PR review fan-out for PRs updated after the run's
+     * `until` (#247); see `prWithinFetchWindow` for the losslessness argument.
+     */
+    updatedAt: string;
     reviewers: GitAuthor[];
     additions: number;
     deletions: number;
