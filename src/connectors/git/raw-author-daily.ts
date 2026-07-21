@@ -48,7 +48,7 @@ const UTC_ISO_INSTANT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
  * under SQLite's variable limit, so a large key/date set costs a handful of
  * statements — never a per-row round trip.
  */
-const READ_CHUNK_SIZE = 500;
+export const READ_CHUNK_SIZE = 500;
 
 /** Why a raw-author write refused. Typed so callers map it instead of leaking a raw DB error. */
 export type RawAuthorDailyErrorCode =
@@ -392,8 +392,13 @@ export function upsertRawAuthorDaily(
     })();
 }
 
-/** Split `items` into fixed-size chunks so one batched read never exceeds SQLite's bind limit. */
-function chunk<T>(items: T[], size: number): T[][] {
+/**
+ * Split `items` into fixed-size chunks so one batched statement never exceeds SQLite's
+ * bind limit. Exported (with {@link READ_CHUNK_SIZE}) so the projection (#253) batches
+ * its own `IN (…)` scans by the same rule instead of cloning this — one splitter, one
+ * chunk size, no chance of the two drifting apart.
+ */
+export function chunk<T>(items: T[], size: number): T[][] {
     const out: T[][] = [];
     for (let i = 0; i < items.length; i += size) {
         out.push(items.slice(i, i + size));

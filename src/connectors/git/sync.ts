@@ -3,7 +3,13 @@ import {randomUUID} from 'crypto';
 import {aggregateDailyMetrics} from './analyzer.js';
 import {toAnalysisCommit, toAnalysisPR, toAnalysisReviewComment} from './analysis-types.js';
 import type {AnalysisCommit, AnalysisPR, AnalysisReviewComment} from './analysis-types.js';
-import {commitWeightedAvg, mergeDailyAcrossRuns, type DailyGitMetrics} from './raw-author-daily.js';
+import {rawAuthorKeyFor, upsertRawAuthorDaily, type RawAuthorDailyInput} from './raw-author-daily.js';
+import {
+    buildDevLookupMap,
+    projectSnapshots,
+    resolveDeveloperId,
+    type SnapshotCell,
+} from './projection.js';
 import {createGitProvider} from './providers/factory.js';
 import {providerContainer} from './providers/config.js';
 import {resolveAllGitProviders} from './providers/resolve.js';
@@ -647,21 +653,6 @@ interface SyncStateRow {
     value: string;
 }
 
-interface DeveloperRow {
-    id: string;
-    email: string | null;
-    external_ids: string | null;
-}
-
-// A git_snapshots row: the shared daily metric set (DailyGitMetrics, #252) plus the
-// columns specific to this table. Declared by EXTENSION rather than by restating the
-// metric fields, so the shape can never drift from what mergeDailyAcrossRuns merges.
-interface GitSnapshotRow extends DailyGitMetrics {
-    developer_id: string;
-    date: string;
-    data_source: string;
-}
-
 // The single read/write pair for every `sync_state` row this module owns — the
 // forward cursor, the earliest-synced watermark, and the stall counter. Named for
 // the VALUE they move rather than for any one caller's meaning: not every row here
@@ -858,190 +849,28 @@ function isUtcIsoInstant(value: string): boolean {
     return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
 }
 
-// Build a map from identifier → developer_id, covering:
-//   - email (from developers.email)
-//   - github:<login>, bitbucket:<login>, gitlab:<login> (from external_ids JSON)
-function buildDevLookupMap(db: Database.Database): Map<string, string> {
-    const rows = db.prepare('SELECT id, email, external_ids FROM developers').all() as DeveloperRow[];
-    const map = new Map<string, string>();
-
-    for (const row of rows) {
-        if (row.email) {
-            map.set(`email:${row.email.toLowerCase()}`, row.id);
-        }
-        if (!row.external_ids) continue;
-        try {
-            const ext = JSON.parse(row.external_ids) as Record<string, string | undefined>;
-            for (const [key, value] of Object.entries(ext)) {
-                if (!value) continue;
-                // git_emails holds a comma-separated list of additional commit
-                // emails; register each as an email-lookup rather than a username.
-                if (key === 'git_emails') {
-                    for (const raw of value.split(',')) {
-                        const email = raw.trim().toLowerCase();
-                        if (email) map.set(`email:${email}`, row.id);
-                    }
-                    continue;
-                }
-                map.set(`${key}:${value}`, row.id);
-            }
-        } catch {
-            // malformed external_ids — skip
-        }
-    }
-
-    return map;
-}
-
-function resolveDeveloperId(
-    lookup: Map<string, string>,
+/**
+ * Derive the immutable raw-author key a day's metrics are RETAINED under (#253).
+ *
+ * `aggregateDailyMetrics` groups by `AnalysisCommit.authorLogin`, which
+ * `toAnalysisCommit` fills as `username || email` — so a "login" that is byte-equal to
+ * the author's email means the commit carried NO provider username. Passing it through
+ * as a login would key an email-only author as `${provider}:login:alice@example.com`,
+ * an identity shape nothing else in the system produces. Detect that case and let
+ * {@link rawAuthorKeyFor} take its email branch, so the stored key matches the identity
+ * the resolver actually looks the author up by.
+ *
+ * Returns null only for a truly anonymous author (no login, no email), whose day is
+ * skipped: there is no stable key to retain it under, and bucketing every such commit
+ * together would attribute unrelated people to one identity.
+ */
+function retentionKeyFor(
     providerType: GitProviderType,
-    login: string | null,
+    analysisLogin: string,
     email: string | null,
 ): string | null {
-    if (login) {
-        const byLogin = lookup.get(`${providerType}:${login}`);
-        if (byLogin) return byLogin;
-    }
-    if (email) {
-        const byEmail = lookup.get(`email:${email.toLowerCase()}`);
-        if (byEmail) return byEmail;
-    }
-    return null;
-}
-
-// Merge two snapshots for the same (developer_id, date) from DIFFERENT providers
-// WITHIN a single sync run. Every field is additive/combinable because the two sides
-// are genuinely disjoint (distinct providers, distinct PRs). This is NOT the right
-// rule for combining against a previously-stored row across runs — see
-// remergeStoredSnapshot for why PR/review fields must not be summed there.
-function mergeSnapshots(a: GitSnapshotRow, b: GitSnapshotRow): GitSnapshotRow {
-    const totalCommits = a.commits + b.commits;
-    const totalPrs = a.prs_merged + b.prs_merged;
-
-    let avgTTM: number | null = null;
-    if (a.avg_time_to_merge_hours !== null && b.avg_time_to_merge_hours !== null && totalPrs > 0) {
-        avgTTM = (a.avg_time_to_merge_hours * a.prs_merged + b.avg_time_to_merge_hours * b.prs_merged) / totalPrs;
-    } else {
-        avgTTM = a.avg_time_to_merge_hours ?? b.avg_time_to_merge_hours;
-    }
-
-    // Cross-provider churn cannot be recomputed without the full commit set; simple average is an approximation.
-    const avgChurn = (a.code_churn_rate + b.code_churn_rate) / 2;
-
-    return {
-        developer_id: a.developer_id,
-        date: a.date,
-        commits: totalCommits,
-        lines_added: a.lines_added + b.lines_added,
-        lines_removed: a.lines_removed + b.lines_removed,
-        files_changed: a.files_changed + b.files_changed,
-        prs_opened: a.prs_opened + b.prs_opened,
-        prs_merged: totalPrs,
-        review_comments_given: a.review_comments_given + b.review_comments_given,
-        avg_time_to_merge_hours: avgTTM,
-        code_churn_rate: avgChurn,
-        ai_signature_score: commitWeightedAvg(a.ai_signature_score, a.commits, b.ai_signature_score, b.commits),
-        avg_commit_size: commitWeightedAvg(a.avg_commit_size, a.commits, b.avg_commit_size, b.commits),
-        commit_burst_count: a.commit_burst_count + b.commit_burst_count,
-        data_source: a.data_source === b.data_source ? a.data_source : 'multi',
-    };
-}
-
-// Re-merge an incoming per-run snapshot against the STORED (developer_id, date) row.
-// Deliberately different from mergeSnapshots (which combines DISTINCT providers within
-// one run and so may add every field): across runs the two sides are NOT disjoint, so
-// commit-derived counts ADD while re-delivered PR/review fields combine with max() and
-// rate/score fields are commit-weighted. That arithmetic lives in exactly ONE place —
-// mergeDailyAcrossRuns (raw-author-daily.ts, #252), shared with the raw authorship
-// store, which applies the identical rule keyed by the immutable raw identity instead
-// of the mutable developer_id. See its doc for WHY each field combines the way it does.
-//
-// This wrapper adds only what is specific to a git_snapshots row: the identity columns
-// are preserved from the stored side, and data_source degrades to 'multi' when the two
-// sides disagree.
-function remergeStoredSnapshot(stored: GitSnapshotRow, incoming: GitSnapshotRow): GitSnapshotRow {
-    return {
-        ...stored,
-        ...mergeDailyAcrossRuns(stored, incoming),
-        developer_id: stored.developer_id,
-        date: stored.date,
-        data_source: stored.data_source === incoming.data_source ? stored.data_source : 'multi',
-    };
-}
-
-// Re-merge the incoming snapshot against the stored (developer_id, date) row rather
-// than REPLACE-ing it, so a scoped/per-provider sync (CLI --provider, UI "Sync now")
-// no longer overwrites the merged row with just its own metrics and permanently drops
-// another provider's same-day commits (the incremental cursor never re-fetches them),
-// and a second incremental run of the same provider on the same day accumulates rather
-// than replaces. remergeStoredSnapshot ADDS the disjoint commit delta while keeping the
-// re-delivered PR/review fields idempotent (see its doc). Runs inside runSync's outer
-// db.transaction (the upsert loop), so this SELECT → merge → write is atomic — no other
-// writer can slip a row in between the read and the write.
-//
-// Known trade-off of the issue's additive-incremental design: because commit counts are
-// added, re-fetching the same commits (a manual cursor reset or a full re-sync with an
-// empty `since`) double-counts them — the rows are no longer reconstructible by re-running
-// sync from scratch. Normal incremental operation never re-fetches a committed window, so
-// this is the accepted cost; a provider-dimension snapshot (the #192 SEC-2 follow-up) is
-// the durable fix.
-function upsertSnapshot(db: Database.Database, snap: GitSnapshotRow): 'written' | 'skipped' {
-    const existing = db
-        .prepare(
-            `SELECT developer_id, date, commits, lines_added, lines_removed, files_changed,
-                    prs_opened, prs_merged, review_comments_given, avg_time_to_merge_hours,
-                    code_churn_rate, ai_signature_score, avg_commit_size, commit_burst_count, data_source
-             FROM git_snapshots WHERE developer_id = ? AND date = ?`,
-        )
-        .get(snap.developer_id, snap.date) as GitSnapshotRow | undefined;
-
-    // On conflict the stored row already contributed to `merged`, so writing the
-    // merged values is the accumulated result — not a clobber.
-    const merged = existing ? remergeStoredSnapshot(existing, snap) : snap;
-
-    const result = db
-        .prepare(
-            `INSERT INTO git_snapshots
-             (id, developer_id, date, commits, lines_added, lines_removed, files_changed,
-              prs_opened, prs_merged, review_comments_given, avg_time_to_merge_hours,
-              code_churn_rate, ai_signature_score, avg_commit_size, commit_burst_count, data_source)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(developer_id, date) DO UPDATE SET
-               commits = excluded.commits,
-               lines_added = excluded.lines_added,
-               lines_removed = excluded.lines_removed,
-               files_changed = excluded.files_changed,
-               prs_opened = excluded.prs_opened,
-               prs_merged = excluded.prs_merged,
-               review_comments_given = excluded.review_comments_given,
-               avg_time_to_merge_hours = excluded.avg_time_to_merge_hours,
-               code_churn_rate = excluded.code_churn_rate,
-               ai_signature_score = excluded.ai_signature_score,
-               avg_commit_size = excluded.avg_commit_size,
-               commit_burst_count = excluded.commit_burst_count,
-               data_source = excluded.data_source`,
-        )
-        .run(
-            randomUUID(),
-            merged.developer_id,
-            merged.date,
-            merged.commits,
-            merged.lines_added,
-            merged.lines_removed,
-            merged.files_changed,
-            merged.prs_opened,
-            merged.prs_merged,
-            merged.review_comments_given,
-            merged.avg_time_to_merge_hours,
-            merged.code_churn_rate,
-            merged.ai_signature_score,
-            merged.avg_commit_size,
-            merged.commit_burst_count,
-            merged.data_source,
-        );
-
-    return result.changes > 0 ? 'written' : 'skipped';
+    const isEmailFallback = email !== null && analysisLogin.toLowerCase() === email.toLowerCase();
+    return rawAuthorKeyFor(providerType, isEmailFallback ? null : analysisLogin, email);
 }
 
 // Raw container identifier (org/workspace/group) for a provider — the canonical
@@ -1724,9 +1553,17 @@ export class GitSync implements ConnectorInterface {
             p.current_repo = null;
         });
 
-        // Accumulate snapshots from all providers into a single map keyed by
-        // "developer_id:date" so same-day multi-provider data is merged.
-        const globalSnapshots = new Map<string, GitSnapshotRow>();
+        // Every author's daily facts this run observed, matched AND unmatched, ready to
+        // be RETAINED under their immutable raw identity (#253). This — not
+        // git_snapshots — is now the run's primary write: git_snapshots is derived from
+        // it by projection below, so an author with no developer record is no longer
+        // dropped but simply not yet projected.
+        const rawWrites: RawAuthorDailyInput[] = [];
+        // The (developer_id, date) cells this run's raw writes resolve to — exactly the
+        // cells the projection must rebuild. Deduped by composite key so a developer
+        // reached under two identities (a github login and a bitbucket login) yields one
+        // cell, not two rebuilds of the same one.
+        const touchedCells = new Map<string, SnapshotCell>();
         // Per-PR records (Task 5.2) resolved to developers, written after the
         // snapshot pass. Keyed naturally by (provider, repo, pr_id), so no
         // cross-provider merging is needed.
@@ -1825,24 +1662,24 @@ export class GitSync implements ConnectorInterface {
 
             const metricsMap = aggregateDailyMetrics(commits, prs, churnWindowHours, reviewComments);
 
-            // Check for unmatched authors
-            for (const commit of commits) {
-                const devId = resolveDeveloperId(devLookup, providerType, commit.authorLogin, commit.authorEmail);
-                if (!devId) {
-                    const label = commit.authorLogin ?? commit.authorEmail ?? 'unknown';
-                    allUnmatched.add(`${providerType}:${label}`);
-                }
-            }
-
             for (const [login, byDate] of metricsMap) {
-                const emailForLogin = commits.find((c) => c.authorLogin === login)?.authorEmail ?? null;
-                const developerId = resolveDeveloperId(devLookup, providerType, login, emailForLogin);
-                if (!developerId) continue;
-                matchedDevelopers.add(developerId);
+                // The first commit under this analysis login carries the identity fields
+                // the raw row is keyed and pre-filled by. A PR-only author has no commit,
+                // so both stay null and the row is keyed by the login alone — the same
+                // identity the resolver would have used for them before #253.
+                const sampleCommit = commits.find((c) => c.authorLogin === login);
+                const emailForLogin = sampleCommit?.authorEmail ?? null;
+                const rawAuthorKey = retentionKeyFor(providerType, login, emailForLogin);
+                // No stable identity (no login, no email) — nothing to retain it under.
+                if (!rawAuthorKey) continue;
 
                 for (const [, metrics] of byDate) {
-                    const snap: GitSnapshotRow = {
-                        developer_id: developerId,
+                    rawWrites.push({
+                        provider: providerType,
+                        raw_author_key: rawAuthorKey,
+                        author_login: login,
+                        author_email: emailForLogin,
+                        author_display_name: sampleCommit?.authorName ?? null,
                         date: metrics.date,
                         commits: metrics.commits,
                         lines_added: metrics.lines_added,
@@ -1856,13 +1693,16 @@ export class GitSync implements ConnectorInterface {
                         ai_signature_score: metrics.ai_signature_score,
                         avg_commit_size: metrics.avg_commit_size,
                         commit_burst_count: metrics.commit_burst_count,
-                        data_source: providerType,
-                    };
-
-                    const key = `${developerId}:${metrics.date}`;
-                    const existing = globalSnapshots.get(key);
-                    globalSnapshots.set(key, existing ? mergeSnapshots(existing, snap) : snap);
+                    });
                 }
+
+                // Progress counter only — a live estimate for the UI, resolved against the
+                // pre-fetch map. The AUTHORITATIVE resolution (which cells to project, and
+                // who goes in the unmatched advisory) happens inside the write transaction
+                // below against a freshly-read map, because minutes of network fetch sit
+                // between the two and a developer created in that gap must not be missed.
+                const developerId = resolveDeveloperId(devLookup, providerType, login, emailForLogin);
+                if (developerId) matchedDevelopers.add(developerId);
             }
         }
 
@@ -1871,21 +1711,49 @@ export class GitSync implements ConnectorInterface {
             p.developers_matched = matchedDevelopers.size;
         });
 
-        // Upsert all merged snapshots + per-PR records AND advance every complete
-        // provider's cursor/watermark in a SINGLE transaction (#231). The cursor
-        // advances live inside the same tx as the data write, so on any write failure
-        // the whole transaction rolls back — no cursor moves past a window whose data
-        // was never persisted, and the next run re-covers it. `snapshotsWritten` /
-        // `snapshotsSkipped` are staged locally and only committed to the run counters
-        // after the tx succeeds, so a rolled-back run never reports phantom writes.
+        // Retain every author's daily facts, PROJECT the touched cells of git_snapshots
+        // from them, write the per-PR records AND advance every complete provider's
+        // cursor/watermark in a SINGLE transaction (#231/#253). The cursor advances live
+        // inside the same tx as the data write, so on any write failure the whole
+        // transaction rolls back — no cursor moves past a window whose data was never
+        // persisted, no raw row is retained for it either, and the next run re-covers it.
+        // `snapshotsWritten` / `snapshotsSkipped` are staged locally and only committed to
+        // the run counters after the tx succeeds, so a rolled-back run never reports
+        // phantom writes.
         const insertMany = db.transaction(() => {
-            let written = 0;
-            let skipped = 0;
-            for (const snap of globalSnapshots.values()) {
-                const outcome = upsertSnapshot(db, snap);
-                if (outcome === 'written') written++;
-                else skipped++;
+            // Read the identity map INSIDE the transaction: `devLookup` was built before
+            // the network fetch, so a developer added while this run was fetching would be
+            // absent from it — their raw rows would be retained but their cells never
+            // projected, and the cursor would advance past the window that produced them.
+            const writeLookup = buildDevLookupMap(db);
+            for (const row of rawWrites) {
+                upsertRawAuthorDaily(db, row, now);
+
+                const developerId = resolveDeveloperId(
+                    writeLookup,
+                    row.provider,
+                    row.author_login,
+                    row.author_email,
+                );
+                if (developerId) {
+                    touchedCells.set(`${developerId}:${row.date}`, {developer_id: developerId, date: row.date});
+                } else {
+                    // The advisory is sourced from the RETAINED rows: exactly the authors
+                    // whose day was kept but could not be attributed — precisely the set the
+                    // onboarding review queue (DO1.4/DO1.5) will offer to promote.
+                    allUnmatched.add(`${row.provider}:${row.author_login ?? row.author_email ?? 'unknown'}`);
+                }
             }
+            // Rebuild EXACTLY the cells this run touched. Each is recomputed from every
+            // retained raw row on that day — including identities this run never fetched —
+            // so a scoped single-provider run still yields the full multi-provider total
+            // rather than dropping the other provider's same-day contribution (#192/#205).
+            const projection = projectSnapshots(db, {cells: [...touchedCells.values()]});
+            const written = projection.cellsWritten;
+            // Every touched cell is rebuilt by construction (each has at least the raw row
+            // that produced it), so nothing is skipped. Kept in the result shape because
+            // SyncResult is a cross-connector contract.
+            const skipped = 0;
             for (const {record, developerId} of resolvedPRRecords) {
                 upsertPRRecord(db, record, developerId, now);
             }
