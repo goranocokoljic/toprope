@@ -19,8 +19,7 @@ import {
     catchUpUntil,
     prWithinFetchWindow,
     getProviderStall,
-    loadStalledProviders,
-    loadLaggingProviders,
+    loadGitSyncHealth,
     GIT_STALL_ALERT_RUNS,
     GIT_CATCHUP_WINDOW_MAX_DAYS,
     type GitSyncProgress,
@@ -2856,162 +2855,259 @@ describe('GitSync — stalled-provider detection (#235)', () => {
         });
     });
 
-    describe('loadStalledProviders', () => {
-        it('reports nothing below the alert threshold, and the provider once it is reached', async () => {
-            const createGitProvider = await getCreateGitProvider();
-            createGitProvider.mockReturnValue(brokenProvider());
-            const sync = new GitSync({enabled: false});
-
-            for (let run = 1; run < GIT_STALL_ALERT_RUNS; run++) {
-                await sync.syncProviders(db, [CONFIG]);
-                // Below the threshold a held run is the ordinary self-healing case —
-                // alerting here would train the reader to ignore the signal.
-                expect(loadStalledProviders(db, [CONFIG])).toEqual([]);
-            }
-            // Precondition for the boundary: we are exactly one run short.
-            expect(getProviderStall(db, 'github', 'test-org')?.runs).toBe(GIT_STALL_ALERT_RUNS - 1);
-
-            await sync.syncProviders(db, [CONFIG]);
-
-            expect(loadStalledProviders(db, [CONFIG])).toEqual([
-                {
-                    type: 'github',
-                    identifier: 'test-org',
-                    runs: GIT_STALL_ALERT_RUNS,
-                    since: expect.any(String),
-                },
-            ]);
-        });
-
-        it('ignores a stall row orphaned by a provider that is no longer configured', () => {
-            writeState(
-                'git_stall:github:deleted-org',
-                JSON.stringify({runs: 99, since: '2026-01-01T00:00:00.000Z'}),
-            );
-
-            // Filtering to the CONFIGURED set is what stops a row left behind by a
-            // deleted/renamed provider being reported forever against a dead target.
-            expect(loadStalledProviders(db, [CONFIG])).toEqual([]);
-        });
-
-        it('returns every stalled provider, in the provider-config order', () => {
-            const stalled = JSON.stringify({runs: 5, since: '2026-01-01T00:00:00.000Z'});
-            writeState('git_stall:github:org-b', stalled);
-            writeState('git_stall:bitbucket:ws-a', stalled);
-
-            const configs: GitProviderConfig[] = [
-                {type: 'bitbucket', workspace: 'ws-a', auth: {type: 'app_password', username: 'u', app_password: 'p'}},
-                {type: 'github', org: 'org-b', auth: {type: 'token', api_token: 't'}},
-                {type: 'github', org: 'healthy-org', auth: {type: 'token', api_token: 't'}},
-            ];
-
-            // >= 2 stalled providers, so a single-item happy path can't hide an ordering
-            // or accumulation bug. Order follows providerConfigs — deterministic output.
-            expect(loadStalledProviders(db, configs).map((s) => `${s.type}:${s.identifier}`)).toEqual([
-                'bitbucket:ws-a',
-                'github:org-b',
-            ]);
-        });
-
-        it('returns [] when nothing is stalled', () => {
-            expect(loadStalledProviders(db, [CONFIG])).toEqual([]);
-        });
-    });
-
-    // The cap CREATES this state: before it, a complete run always reached `now`, so
-    // "the run completed" and "the data is current" were one statement. They are no
-    // longer, and a bare "no stall → advancing" would be a false all-clear.
-    describe('loadLaggingProviders', () => {
+    // #248: the three former readers (loadStalledProviders, loadLaggingProviders,
+    // countNeverSyncedProviders) are one classification over the same two row sets.
+    // Every configured provider lands in exactly one of four disjoint states, or in
+    // none of them (a held sub-threshold streak / garbage cursor is neither current nor
+    // reportable) — the positive `current` count is what lets doctor stop inferring
+    // health from two readers' emptiness.
+    describe('loadGitSyncHealth', () => {
         const DAY_MS = 86_400_000;
         const NOW = '2026-07-15T00:00:00.000Z';
         const at = (daysBefore: number): string =>
             new Date(Date.parse(NOW) - daysBefore * DAY_MS).toISOString();
 
-        it('reports a provider whose cursor is more than one cap-width behind', () => {
-            writeState(FORWARD_KEY, at(170));
+        describe('stalled', () => {
+            it('reports nothing below the alert threshold, and the provider once it is reached', async () => {
+                const createGitProvider = await getCreateGitProvider();
+                createGitProvider.mockReturnValue(brokenProvider());
+                const sync = new GitSync({enabled: false});
 
-            expect(loadLaggingProviders(db, [CONFIG], NOW)).toEqual([
-                {type: 'github', identifier: 'test-org', cursor: at(170), daysBehind: 170},
-            ]);
-        });
+                for (let run = 1; run < GIT_STALL_ALERT_RUNS; run++) {
+                    await sync.syncProviders(db, [CONFIG]);
+                    // Below the threshold a held run is the ordinary self-healing case —
+                    // alerting here would train the reader to ignore the signal.
+                    expect(loadGitSyncHealth(db, [CONFIG], NOW).stalled).toEqual([]);
+                }
+                // Precondition for the boundary: we are exactly one run short.
+                expect(getProviderStall(db, 'github', 'test-org')?.runs).toBe(
+                    GIT_STALL_ALERT_RUNS - 1,
+                );
 
-        it('says nothing about a current provider, or one exactly at the cap boundary', () => {
-            writeState(FORWARD_KEY, at(1));
-            expect(loadLaggingProviders(db, [CONFIG], NOW)).toEqual([]);
-
-            // At the cap the next run is NOT capped (catchUpUntil returns `now`), so the
-            // provider will reach the present — not lagging. Same boundary as the cap.
-            writeState(FORWARD_KEY, at(GIT_CATCHUP_WINDOW_MAX_DAYS));
-            expect(loadLaggingProviders(db, [CONFIG], NOW)).toEqual([]);
-        });
-
-        it('excludes a provider held BELOW the stall threshold — it is not advancing', async () => {
-            writeState(FORWARD_KEY, at(200));
-            const createGitProvider = await getCreateGitProvider();
-            createGitProvider.mockReturnValue(brokenProvider());
-
-            await new GitSync({enabled: false}).syncProviders(db, [CONFIG]);
-
-            // One held run: below GIT_STALL_ALERT_RUNS, so it is not a reportable stall
-            // yet — but the cursor IS held, so calling it "catching up — advancing"
-            // would state the exact opposite of the truth. The exclusion keys on an OPEN
-            // streak, not on the reporting threshold.
-            expect(getProviderStall(db, 'github', 'test-org')?.runs).toBe(1);
-            expect(loadStalledProviders(db, [CONFIG])).toEqual([]);
-            expect(loadLaggingProviders(db, [CONFIG], NOW)).toEqual([]);
-        });
-
-        it('excludes a STALLED provider — the stall is the more specific signal', async () => {
-            writeState(FORWARD_KEY, at(200));
-            const createGitProvider = await getCreateGitProvider();
-            createGitProvider.mockReturnValue(brokenProvider());
-            const sync = new GitSync({enabled: false});
-            for (let run = 0; run < GIT_STALL_ALERT_RUNS; run++) {
                 await sync.syncProviders(db, [CONFIG]);
-            }
 
-            // Precondition: it IS stalled, and its cursor IS far behind — so without the
-            // exclusion it would be reported twice under two different headings.
-            expect(loadStalledProviders(db, [CONFIG])).toHaveLength(1);
-            expect(loadLaggingProviders(db, [CONFIG], NOW)).toEqual([]);
+                expect(loadGitSyncHealth(db, [CONFIG], NOW).stalled).toEqual([
+                    {
+                        type: 'github',
+                        identifier: 'test-org',
+                        runs: GIT_STALL_ALERT_RUNS,
+                        since: expect.any(String),
+                    },
+                ]);
+            });
+
+            it('ignores a stall row orphaned by a provider that is no longer configured', () => {
+                writeState(
+                    'git_stall:github:deleted-org',
+                    JSON.stringify({runs: 99, since: '2026-01-01T00:00:00.000Z'}),
+                );
+
+                // Filtering to the CONFIGURED set is what stops a row left behind by a
+                // deleted/renamed provider being reported forever against a dead target.
+                expect(loadGitSyncHealth(db, [CONFIG], NOW).stalled).toEqual([]);
+            });
+
+            it('returns every stalled provider, in the provider-config order', () => {
+                const stalled = JSON.stringify({runs: 5, since: '2026-01-01T00:00:00.000Z'});
+                writeState('git_stall:github:org-b', stalled);
+                writeState('git_stall:bitbucket:ws-a', stalled);
+
+                const configs: GitProviderConfig[] = [
+                    {type: 'bitbucket', workspace: 'ws-a', auth: {type: 'app_password', username: 'u', app_password: 'p'}},
+                    {type: 'github', org: 'org-b', auth: {type: 'token', api_token: 't'}},
+                    {type: 'github', org: 'healthy-org', auth: {type: 'token', api_token: 't'}},
+                ];
+
+                // >= 2 stalled providers, so a single-item happy path can't hide an
+                // ordering or accumulation bug. Order follows providerConfigs.
+                expect(
+                    loadGitSyncHealth(db, configs, NOW).stalled.map(
+                        (s) => `${s.type}:${s.identifier}`,
+                    ),
+                ).toEqual(['bitbucket:ws-a', 'github:org-b']);
+            });
+
+            it('reports a stalled provider that has no cursor at all — the stall wins over never-synced', () => {
+                writeState(STALL_KEY, JSON.stringify({runs: 4, since: '2026-01-01T00:00:00.000Z'}));
+
+                // Every run failed from the start, so the cursor was never written, yet
+                // the streak reached the alert threshold. It is the actionable signal, so
+                // it is reported as stalled rather than counted as a pending first sync.
+                const health = loadGitSyncHealth(db, [CONFIG], NOW);
+                expect(health.stalled).toHaveLength(1);
+                expect(health.neverSynced).toBe(0);
+                expect(health.current).toBe(0);
+            });
+
+            it('returns no stalled providers when nothing is stalled', () => {
+                expect(loadGitSyncHealth(db, [CONFIG], NOW).stalled).toEqual([]);
+            });
         });
 
-        it('does not treat a never-synced provider as lagging', () => {
-            // No cursor at all is a pending first sync, not a provider falling behind.
-            expect(loadLaggingProviders(db, [CONFIG], NOW)).toEqual([]);
+        // The cap CREATES this state: before it, a complete run always reached `now`, so
+        // "the run completed" and "the data is current" were one statement. They are no
+        // longer, and a bare "no stall → advancing" would be a false all-clear.
+        describe('lagging', () => {
+            it('reports a provider whose cursor is more than one cap-width behind', () => {
+                writeState(FORWARD_KEY, at(170));
+
+                expect(loadGitSyncHealth(db, [CONFIG], NOW).lagging).toEqual([
+                    {type: 'github', identifier: 'test-org', cursor: at(170), daysBehind: 170},
+                ]);
+            });
+
+            it('says nothing about a current provider, or one exactly at the cap boundary', () => {
+                writeState(FORWARD_KEY, at(1));
+                expect(loadGitSyncHealth(db, [CONFIG], NOW).lagging).toEqual([]);
+
+                // At the cap the next run is NOT capped (catchUpUntil returns `now`), so
+                // the provider will reach the present — not lagging. Same boundary.
+                writeState(FORWARD_KEY, at(GIT_CATCHUP_WINDOW_MAX_DAYS));
+                expect(loadGitSyncHealth(db, [CONFIG], NOW).lagging).toEqual([]);
+            });
+
+            it('excludes a provider held BELOW the stall threshold — it is not advancing', async () => {
+                writeState(FORWARD_KEY, at(200));
+                const createGitProvider = await getCreateGitProvider();
+                createGitProvider.mockReturnValue(brokenProvider());
+
+                await new GitSync({enabled: false}).syncProviders(db, [CONFIG]);
+
+                // One held run: below GIT_STALL_ALERT_RUNS, so it is not a reportable
+                // stall yet — but the cursor IS held, so calling it "catching up —
+                // advancing" would state the exact opposite of the truth, and it cannot
+                // be current either. The exclusion keys on an OPEN streak, not the
+                // reporting threshold, so it falls through every bucket.
+                expect(getProviderStall(db, 'github', 'test-org')?.runs).toBe(1);
+                const health = loadGitSyncHealth(db, [CONFIG], NOW);
+                expect(health.stalled).toEqual([]);
+                expect(health.lagging).toEqual([]);
+                expect(health.current).toBe(0);
+                expect(health.neverSynced).toBe(0);
+            });
+
+            it('excludes a STALLED provider from lagging — the stall is the more specific signal', async () => {
+                writeState(FORWARD_KEY, at(200));
+                const createGitProvider = await getCreateGitProvider();
+                createGitProvider.mockReturnValue(brokenProvider());
+                const sync = new GitSync({enabled: false});
+                for (let run = 0; run < GIT_STALL_ALERT_RUNS; run++) {
+                    await sync.syncProviders(db, [CONFIG]);
+                }
+
+                // Precondition: it IS stalled, and its cursor IS far behind — so without
+                // the exclusion it would be reported twice under two different headings.
+                const health = loadGitSyncHealth(db, [CONFIG], NOW);
+                expect(health.stalled).toHaveLength(1);
+                expect(health.lagging).toEqual([]);
+            });
+
+            it('does not treat a never-synced provider as lagging', () => {
+                // No cursor at all is a pending first sync, not a provider falling behind.
+                const health = loadGitSyncHealth(db, [CONFIG], NOW);
+                expect(health.lagging).toEqual([]);
+                expect(health.neverSynced).toBe(1);
+            });
+
+            it.each([
+                ['an unparseable cursor', 'not-a-date'],
+                ['a future-dated cursor', '2027-01-01T00:00:00.000Z'],
+            ])('is total: %s is neither lagging nor current', (_label, cursor) => {
+                writeState(FORWARD_KEY, cursor);
+                const health = loadGitSyncHealth(db, [CONFIG], NOW);
+                expect(health.lagging).toEqual([]);
+                // A garbage or skewed timestamp cannot PROVE currency — it falls through.
+                expect(health.current).toBe(0);
+            });
+
+            it('reports nothing lagging and nothing current on an unparseable now', () => {
+                writeState(FORWARD_KEY, at(200));
+                const health = loadGitSyncHealth(db, [CONFIG], 'not-a-date');
+                expect(health.lagging).toEqual([]);
+                expect(health.current).toBe(0);
+            });
+
+            it('reports every lagging provider in config order, ignoring orphaned cursors', () => {
+                writeState('git_last_sync:bitbucket:ws-a', at(90));
+                writeState('git_last_sync:github:org-b', at(60));
+                writeState('git_last_sync:github:healthy-org', at(2));
+                writeState('git_last_sync:github:deleted-org', at(400));
+
+                const configs: GitProviderConfig[] = [
+                    {type: 'bitbucket', workspace: 'ws-a', auth: {type: 'app_password', username: 'u', app_password: 'p'}},
+                    {type: 'github', org: 'org-b', auth: {type: 'token', api_token: 't'}},
+                    {type: 'github', org: 'healthy-org', auth: {type: 'token', api_token: 't'}},
+                ];
+
+                // >= 2 lagging, so a single-item happy path can't hide an accumulation or
+                // ordering bug; the un-configured deleted-org cursor must not surface. The
+                // healthy-org cursor (2 days back) is counted current instead.
+                const health = loadGitSyncHealth(db, configs, NOW);
+                expect(health.lagging).toEqual([
+                    {type: 'bitbucket', identifier: 'ws-a', cursor: at(90), daysBehind: 90},
+                    {type: 'github', identifier: 'org-b', cursor: at(60), daysBehind: 60},
+                ]);
+                expect(health.current).toBe(1);
+            });
         });
 
-        it.each([
-            ['an unparseable cursor', 'not-a-date'],
-            ['a future-dated cursor', '2027-01-01T00:00:00.000Z'],
-        ])('is total: %s is not reported as lagging', (_label, cursor) => {
-            writeState(FORWARD_KEY, cursor);
-            expect(loadLaggingProviders(db, [CONFIG], NOW)).toEqual([]);
-        });
+        // #248: the positive currency check — a provider is current iff it has a cursor
+        // within one cap-width of now with no open streak. Counted, never inferred.
+        describe('current / neverSynced', () => {
+            it('counts a provider synced within one cap-width as current', () => {
+                writeState(FORWARD_KEY, at(1));
+                const health = loadGitSyncHealth(db, [CONFIG], NOW);
+                expect(health.current).toBe(1);
+                expect(health.neverSynced).toBe(0);
+                expect(health.stalled).toEqual([]);
+                expect(health.lagging).toEqual([]);
+            });
 
-        it('returns [] on an unparseable now', () => {
-            writeState(FORWARD_KEY, at(200));
-            expect(loadLaggingProviders(db, [CONFIG], 'not-a-date')).toEqual([]);
-        });
+            it('counts a provider exactly at the cap boundary as current, not lagging', () => {
+                // behindMs === capMs: the next run reaches the present, so it is current.
+                writeState(FORWARD_KEY, at(GIT_CATCHUP_WINDOW_MAX_DAYS));
+                const health = loadGitSyncHealth(db, [CONFIG], NOW);
+                expect(health.current).toBe(1);
+                expect(health.lagging).toEqual([]);
+            });
 
-        it('reports every lagging provider in config order, ignoring orphaned cursors', () => {
-            writeState('git_last_sync:bitbucket:ws-a', at(90));
-            writeState('git_last_sync:github:org-b', at(60));
-            writeState('git_last_sync:github:healthy-org', at(2));
-            writeState('git_last_sync:github:deleted-org', at(400));
+            it('counts a never-synced provider under neverSynced, not current', () => {
+                const health = loadGitSyncHealth(db, [CONFIG], NOW);
+                expect(health.neverSynced).toBe(1);
+                expect(health.current).toBe(0);
+            });
 
-            const configs: GitProviderConfig[] = [
-                {type: 'bitbucket', workspace: 'ws-a', auth: {type: 'app_password', username: 'u', app_password: 'p'}},
-                {type: 'github', org: 'org-b', auth: {type: 'token', api_token: 't'}},
-                {type: 'github', org: 'healthy-org', auth: {type: 'token', api_token: 't'}},
-            ];
+            it('classifies a mixed set — current, lagging, never-synced, and stalled all at once', () => {
+                writeState('git_last_sync:github:fresh', at(3)); // current
+                writeState('git_last_sync:github:behind', at(120)); // lagging
+                writeState(
+                    'git_stall:github:stuck',
+                    JSON.stringify({runs: 7, since: '2026-01-01T00:00:00.000Z'}),
+                ); // stalled, no cursor
+                // github:pending has neither cursor nor stall → never synced.
 
-            // >= 2 lagging, so a single-item happy path can't hide an accumulation or
-            // ordering bug; the un-configured deleted-org cursor must not surface.
-            expect(loadLaggingProviders(db, configs, NOW)).toEqual([
-                {type: 'bitbucket', identifier: 'ws-a', cursor: at(90), daysBehind: 90},
-                {type: 'github', identifier: 'org-b', cursor: at(60), daysBehind: 60},
-            ]);
+                const configs: GitProviderConfig[] = [
+                    {type: 'github', org: 'fresh', auth: {type: 'token', api_token: 't'}},
+                    {type: 'github', org: 'behind', auth: {type: 'token', api_token: 't'}},
+                    {type: 'github', org: 'stuck', auth: {type: 'token', api_token: 't'}},
+                    {type: 'github', org: 'pending', auth: {type: 'token', api_token: 't'}},
+                ];
+
+                const health = loadGitSyncHealth(db, configs, NOW);
+                expect(health.current).toBe(1);
+                expect(health.lagging.map((l) => l.identifier)).toEqual(['behind']);
+                expect(health.stalled.map((s) => s.identifier)).toEqual(['stuck']);
+                expect(health.neverSynced).toBe(1);
+            });
+
+            it('does not count a future-dated cursor as current (clock skew is not currency)', () => {
+                // Cursor ahead of now: behindMs < 0. Not lagging, not current — clamped
+                // out so a skewed row can never render a false "current".
+                writeState(FORWARD_KEY, at(-5));
+                const health = loadGitSyncHealth(db, [CONFIG], NOW);
+                expect(health.current).toBe(0);
+                expect(health.lagging).toEqual([]);
+            });
         });
     });
 

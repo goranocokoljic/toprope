@@ -501,34 +501,99 @@ export interface LaggingProvider {
     daysBehind: number;
 }
 
+/** A provider whose cursor has been stuck long enough to report (#235). */
+export interface StalledProvider {
+    type: GitProviderType;
+    identifier: string;
+    /** Consecutive runs that held the cursor — always >= {@link GIT_STALL_ALERT_RUNS}. */
+    runs: number;
+    /** UTC ISO instant this streak began. */
+    since: string;
+}
+
 /**
- * Every CONFIGURED provider whose forward cursor is more than one cap-width behind
- * `now` (#235) — i.e. whose next run WILL be capped and so will not reach the
- * present. The companion signal to {@link loadStalledProviders}, and the reason
- * `doctor` cannot answer "is git data current?" from the stall counter alone.
+ * The complete git-sync health of an already-resolved provider set (#248), as ONE
+ * classification rather than three separate readers over the same two row sets.
  *
- * Providers with ANY open stall streak are excluded, keeping the two sets disjoint.
- * Note the exclusion is on an OPEN streak (>= 1 held run), NOT on the >= 3 reporting
- * threshold: a provider held for one or two runs is below the stall alert, but its
- * cursor IS being held, so reporting it here as "advancing" would state the opposite
- * of the truth for exactly as long as it takes to become a reported stall. A held
- * cursor also falls behind by definition, so without this every stall would surface
- * twice under two headings — and the stall is the more specific, more actionable one.
+ * Every configured provider lands in exactly one of four disjoint states, decided in
+ * a single pass:
+ * - {@link stalled}: an open streak of >= {@link GIT_STALL_ALERT_RUNS} held runs —
+ *   cursor held, importing nothing. The most specific, most actionable signal, so it
+ *   wins over every other classification.
+ * - {@link lagging}: advancing (no open streak) but with a cursor still more than one
+ *   {@link GIT_CATCHUP_WINDOW_MAX_DAYS} cap-width behind `now` — a bounded catch-up.
+ * - {@link current}: the POSITIVE check — a cursor within one cap-width of now (and not
+ *   ahead of it), with no open streak. This is the only state that lets `doctor` claim
+ *   the data is actually current instead of inferring it from two readers coming back
+ *   empty (#248).
+ * - {@link neverSynced}: no stored cursor at all — a pending first sync.
  *
- * Cursors and stall rows are each resolved in ONE query and membership-tested in
- * memory against the caller's already-resolved provider set — never a query per
- * provider, and never by re-running {@link loadStalledProviders} (which every caller
- * of this already calls itself, and which would apply the wrong threshold anyway).
- * Total by construction: an unparseable or future-dated cursor is not lagging. Order
- * follows `providerConfigs`, so output is deterministic.
+ * A provider can also be NONE of these: an open sub-threshold streak (1-2 held runs)
+ * holds the cursor, so it is neither advancing (excluded from lagging) nor current,
+ * and an unreadable or future-dated cursor cannot prove currency either. Those fall
+ * through every bucket — which is exactly the point of the positive check: `current`
+ * is COUNTED, never inferred, so a held-but-not-yet-reported provider is correctly not
+ * counted as healthy. `current + lagging + neverSynced + stalled` therefore need NOT
+ * equal the provider count; the remainder is the "not yet current" set doctor names.
  */
-export function loadLaggingProviders(
+export interface GitSyncHealth {
+    stalled: StalledProvider[];
+    lagging: LaggingProvider[];
+    /** Count of providers proven current — cursor within one cap-width of now, no open streak. */
+    current: number;
+    /** Count of providers with no stored cursor — a pending first sync. */
+    neverSynced: number;
+}
+
+/**
+ * A provider that is ADVANCING but is still more than one cap-width behind the
+ * present (#235) — a bounded catch-up in progress.
+ *
+ * This state is CREATED by {@link GIT_CATCHUP_WINDOW_MAX_DAYS}. Before the cap, a
+ * complete run always reached `now`, so "the run completed" and "the data is
+ * current" were the same statement. They no longer are: a provider recovering from
+ * a 200-day stall completes every run and clears its stall streak while its cursor
+ * is still ~170 days back, and needs ~6 more runs to catch up. Reporting only the
+ * stall streak would call that provider healthy and print "advancing" — technically
+ * true, and exactly the false all-clear an operator would act on right after
+ * excluding the broken repo that caused the stall.
+ */
+export interface LaggingProvider {
+    type: GitProviderType;
+    identifier: string;
+    /** The provider's current forward cursor (UTC ISO) — the instant it has synced to. */
+    cursor: string;
+    /** Whole days between {@link cursor} and now. Always > GIT_CATCHUP_WINDOW_MAX_DAYS. */
+    daysBehind: number;
+}
+
+/**
+ * Classify every CONFIGURED provider's sync health in ONE pass (#248) — the single
+ * canonical reader shared by `toprope doctor` and `toprope status`, so both report the
+ * identical set on the identical thresholds.
+ *
+ * Collapses the former three readers (`loadStalledProviders`, `loadLaggingProviders`,
+ * `countNeverSyncedProviders`), which every production caller invoked together over the
+ * same `providerConfigs` and which read the `git_stall:%` set twice per run. The two
+ * row sets are resolved in exactly ONE query each and membership-tested in memory
+ * against the caller's already-resolved provider set — never a query per provider.
+ * Filtering to that set (rather than returning every stored row) is what stops a stall
+ * or cursor row orphaned by a deleted/renamed provider being reported forever against a
+ * target that no longer exists. Order of {@link GitSyncHealth.stalled} and
+ * {@link GitSyncHealth.lagging} follows `providerConfigs`, so output is deterministic.
+ *
+ * Total by construction: an unparseable `now`, or an unparseable/future-dated cursor,
+ * yields no lagging entry and no `current` credit for that provider — a garbage or
+ * skewed timestamp can never prove currency. See {@link GitSyncHealth} for the full
+ * state machine and why the four states need not sum to the provider count.
+ */
+export function loadGitSyncHealth(
     db: Database.Database,
     providerConfigs: GitProviderConfig[],
     now: string,
-): LaggingProvider[] {
+): GitSyncHealth {
     const nowMs = Date.parse(now);
-    if (Number.isNaN(nowMs)) return [];
+    const nowValid = !Number.isNaN(nowMs);
 
     const cursorByKey = new Map(
         (
@@ -546,68 +611,57 @@ export function loadLaggingProviders(
     );
 
     const capMs = GIT_CATCHUP_WINDOW_MAX_DAYS * 86_400_000;
-    const lagging: LaggingProvider[] = [];
-    for (const pc of providerConfigs) {
-        const identifier = providerIdentifier(pc);
-        // Any open streak — not just a reportable one. See the note above.
-        if (parseStall(stallByKey.get(stallStateKey(pc.type, identifier)) ?? null)) continue;
-        const cursor = cursorByKey.get(syncStateKey(pc.type, identifier));
-        if (!cursor) continue; // Never synced — not lagging, just pending its first run.
-        const cursorMs = Date.parse(cursor);
-        if (Number.isNaN(cursorMs)) continue;
-        const behindMs = nowMs - cursorMs;
-        if (behindMs <= capMs) continue;
-        lagging.push({
-            type: pc.type,
-            identifier,
-            cursor,
-            daysBehind: Math.floor(behindMs / 86_400_000),
-        });
-    }
-    return lagging;
-}
-
-/** A provider whose cursor has been stuck long enough to report (#235). */
-export interface StalledProvider {
-    type: GitProviderType;
-    identifier: string;
-    /** Consecutive runs that held the cursor — always >= {@link GIT_STALL_ALERT_RUNS}. */
-    runs: number;
-    /** UTC ISO instant this streak began. */
-    since: string;
-}
-
-/**
- * Every CONFIGURED provider currently stalled for >= {@link GIT_STALL_ALERT_RUNS}
- * consecutive runs (#235) — the one canonical reader, shared by `toprope status`
- * and `toprope doctor` so both report the identical set on the identical threshold.
- *
- * All stall rows are resolved in ONE query and membership-tested in memory against
- * the caller's already-resolved provider set — never a query per provider. Filtering
- * to that set (rather than returning every stored row) is what stops a stall row
- * orphaned by a deleted or renamed provider from being reported forever against a
- * target that no longer exists. Order follows `providerConfigs`, so output is
- * deterministic.
- */
-export function loadStalledProviders(
-    db: Database.Database,
-    providerConfigs: GitProviderConfig[],
-): StalledProvider[] {
-    const rows = db
-        .prepare("SELECT key, value FROM sync_state WHERE key LIKE 'git_stall:%'")
-        .all() as Array<{key: string; value: string}>;
-    if (rows.length === 0) return [];
-    const byKey = new Map(rows.map((r) => [r.key, r.value]));
-
     const stalled: StalledProvider[] = [];
+    const lagging: LaggingProvider[] = [];
+    let current = 0;
+    let neverSynced = 0;
+
     for (const pc of providerConfigs) {
         const identifier = providerIdentifier(pc);
-        const stall = parseStall(byKey.get(stallStateKey(pc.type, identifier)) ?? null);
+        const stall = parseStall(stallByKey.get(stallStateKey(pc.type, identifier)) ?? null);
+
+        // Reportable stall wins over every other state — the most specific, most
+        // actionable signal, and reported even when the provider also has no cursor.
         if (stall && stall.runs >= GIT_STALL_ALERT_RUNS) {
             stalled.push({type: pc.type, identifier, runs: stall.runs, since: stall.since});
+            continue;
         }
+
+        const cursor = cursorByKey.get(syncStateKey(pc.type, identifier));
+        if (!cursor) {
+            // No cursor at all — a pending first sync, not evidence of health.
+            neverSynced++;
+            continue;
+        }
+
+        // An OPEN sub-threshold streak (1-2 held runs) holds the cursor: not advancing
+        // (so not lagging) and not current (its data may be months old), it falls
+        // through to the "not yet current" remainder until it recovers or trips the
+        // stall alert at run GIT_STALL_ALERT_RUNS. Same exclusion the old lagging
+        // reader applied — keyed on an OPEN streak, not the reporting threshold.
+        if (stall) continue;
+
+        const cursorMs = Date.parse(cursor);
+        if (Number.isNaN(cursorMs) || !nowValid) continue; // Cannot place the cursor.
+
+        const behindMs = nowMs - cursorMs;
+        if (behindMs > capMs) {
+            lagging.push({
+                type: pc.type,
+                identifier,
+                cursor,
+                daysBehind: Math.floor(behindMs / 86_400_000),
+            });
+            continue;
+        }
+        // A future-dated cursor (behindMs < 0) is clock skew, not proof of currency —
+        // clamp it out rather than crediting it. Everything remaining is a cursor within
+        // one cap-width of now with no open streak: the positive currency check.
+        if (behindMs < 0) continue;
+        current++;
     }
-    return stalled;
+
+    return {stalled, lagging, current, neverSynced};
 }
 
 interface SyncStateRow {
@@ -1582,7 +1636,7 @@ export function latestProviderCursor(
         const t = row?.value ?? null;
         if (!t) continue;
         // Compare by parsed instant, not lexically, and drop an unparseable value —
-        // matching loadLaggingProviders' totality. A garbage row must not sort high,
+        // matching loadGitSyncHealth's totality. A garbage row must not sort high,
         // win the max, and render as "connected (just now)" via formatTimeAgo(NaN).
         const ms = Date.parse(t);
         if (Number.isNaN(ms)) continue;

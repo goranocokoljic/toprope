@@ -379,20 +379,42 @@ describe('runDoctor', () => {
             expect(allOutput).toContain('exclude_repos');
         });
 
-        it('reports the all-clear as what was measured, not as a currency claim', async () => {
+        it('reports a positive currency claim when every provider is current (#248)', async () => {
             seedCursor('acme', 1);
 
             const result = await runDoctor(db, await reachableGitConfig(), tmpConfigPath, MIGRATIONS_DIR);
 
             expect(result).toBe(true);
             const allOutput = [...output, ...errors].join('\n');
-            expect(allOutput).toContain('No stalled or lagging providers (1 of 1 synced)');
-            // The all-clear is reached by INFERENCE (both readers empty), and that
-            // inference has holes — a streak of 1-2 held runs is below the stall
-            // threshold yet excluded from lagging, so it falls through both while its
-            // data may be months old. Reporting what was measured is earned; "current"
-            // is not. See #248.
-            expect(allOutput).not.toContain('provider(s) current');
+            // #248: no longer the old "No stalled or lagging providers" inference. A
+            // cursor one day back with no open streak is PROVEN current — a claim earned
+            // from the data, not assumed from two readers coming back empty.
+            expect(allOutput).toContain('All 1 provider(s) current');
+            expect(allOutput).not.toContain('No stalled or lagging providers');
+        });
+
+        it('names the not-yet-current providers instead of a bare all-clear (#248)', async () => {
+            // acme is current (cursor 1 day back); beta HAS synced (a stored cursor) but
+            // is now held one run below the stall alert — its cursor is frozen, so it is
+            // NOT current even though it is neither stalled nor lagging. The old inference
+            // printed a green all-clear here; the positive check must count acme current
+            // and name beta as held-below-the-alert.
+            seedCursor('acme', 1);
+            seedCursor('beta', 40);
+            seedStall(1, 'beta');
+
+            const result = await runDoctor(
+                db,
+                await reachableGitConfig(['acme', 'beta']),
+                tmpConfigPath,
+                MIGRATIONS_DIR,
+            );
+
+            expect(result).toBe(true);
+            const allOutput = [...output, ...errors].join('\n');
+            expect(allOutput).toContain('1 of 2 provider(s) current');
+            expect(allOutput).toContain('1 not yet current');
+            expect(allOutput).toContain('held below the stall alert');
         });
 
         it('does NOT claim anything about a never-synced provider', async () => {
@@ -408,8 +430,8 @@ describe('runDoctor', () => {
             expect(allOutput).not.toContain('No stalled or lagging providers');
         });
 
-        it('counts the never-synced out of the synced total', async () => {
-            seedCursor('acme', 1);
+        it('counts the never-synced out of the current total (#248)', async () => {
+            seedCursor('acme', 1); // current; beta has no cursor → never synced
 
             await runDoctor(
                 db,
@@ -418,7 +440,10 @@ describe('runDoctor', () => {
                 MIGRATIONS_DIR,
             );
 
-            expect(output.join('\n')).toContain('No stalled or lagging providers (1 of 2 synced)');
+            const allOutput = output.join('\n');
+            expect(allOutput).toContain('1 of 2 provider(s) current');
+            expect(allOutput).toContain('1 not yet current');
+            expect(allOutput).toContain('1 never synced');
         });
 
         it('reports EVERY stalled provider, with a count matching the detail list', async () => {
@@ -509,16 +534,21 @@ describe('runDoctor', () => {
             expect(allOutput).toContain('exclude_repos');
         });
 
-        it('passes below the alert threshold', async () => {
+        it('passes below the alert threshold, but does not call the held provider current (#248)', async () => {
             seedStall(1);
             seedCursor('acme', 1);
 
             const result = await runDoctor(db, await reachableGitConfig(), tmpConfigPath, MIGRATIONS_DIR);
 
             // One held run is transient and self-healing; failing doctor on it would
-            // train the reader to ignore the check.
+            // train the reader to ignore the check. But its cursor IS frozen, so it is
+            // not current — the positive check must report it as not-yet-current rather
+            // than print the old false all-clear.
             expect(result).toBe(true);
-            expect(output.join('\n')).toContain('No stalled or lagging providers');
+            const allOutput = output.join('\n');
+            expect(allOutput).toContain('0 of 1 provider(s) current');
+            expect(allOutput).toContain('held below the stall alert');
+            expect(allOutput).not.toContain('No stalled or lagging providers');
         });
 
         it('skips the stall check entirely when the git connector is disabled', async () => {

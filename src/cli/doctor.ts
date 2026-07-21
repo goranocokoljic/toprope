@@ -6,13 +6,7 @@ import {getMigrationStatus} from '../storage/migrator';
 import {resolveAllGitProviders} from '../connectors/git/providers/resolve';
 import {loadServerKey} from '../connectors/git/providers/secret';
 import {createGitProvider} from '../connectors/git/providers/factory';
-import {
-    loadLaggingProviders,
-    loadProviderCursorKeys,
-    loadStalledProviders,
-    syncStateKey,
-} from '../connectors/git/sync';
-import {providerContainer} from '../connectors/git/providers/config';
+import {GIT_CATCHUP_WINDOW_MAX_DAYS, loadGitSyncHealth} from '../connectors/git/sync';
 import type {GitProvider, GitProviderConfig} from '../connectors/git/providers/types';
 import {trimTrailingSlash} from '../summaries/model-client';
 
@@ -509,23 +503,6 @@ function noGitProvidersDiagnostic(git: TopropeConfig['connectors']['git']): Chec
 }
 
 /**
- * How many configured providers have never synced (#235) — no stored cursor at all.
- *
- * Reuses the canonical `loadProviderCursorKeys` (one query, membership-tested in
- * memory) — the same "has this provider ever synced?" signal the admin provider list
- * keys its first-sync gate off, so the two cannot drift.
- */
-function countNeverSyncedProviders(
-    db: Database.Database,
-    providerConfigs: GitProviderConfig[],
-): number {
-    const cursorKeys = loadProviderCursorKeys(db);
-    return providerConfigs.filter(
-        (pc) => !cursorKeys.has(syncStateKey(pc.type, providerContainer(pc))),
-    ).length;
-}
-
-/**
  * Whether git data is actually reaching the present (#235) — the ways it can fail to.
  *
  * Returns one result PER CONDITION rather than a single verdict, because the
@@ -551,19 +528,19 @@ function countNeverSyncedProviders(
  *    bounded catch-up is working as designed and self-resolves; it is reported because
  *    "working" and "current" are not the same claim.
  *
- * The all-clear deliberately reports what was MEASURED — "no stalled or lagging
- * providers" — rather than asserting the data is current, because it is reached by
- * INFERENCE (both readers came back empty), and that inference has holes. A provider
- * with an open streak of 1-2 held runs is below the stall threshold and is excluded
- * from lagging (its cursor is held, so it is not "advancing"), so it falls through
- * both readers while its data may be months old; a provider whose `listRepos` returns
- * an empty list advances its cursor forever while importing nothing. "Current" is a
- * claim about the DATA and neither reader establishes it. A positive currency check
- * would — see the follow-up in #248. Never-synced providers are counted out for the
- * same reason: no cursor is not evidence of health.
+ * The all-clear is now a POSITIVE currency check (#248) rather than the inference it
+ * used to be. It no longer reads "no stalled or lagging providers" (true only because
+ * both readers came back empty, an inference with holes: a provider with an open streak
+ * of 1-2 held runs is below the stall threshold and excluded from lagging, so it fell
+ * through both while its data could be months old; a provider whose `listRepos` returns
+ * `[]` advances its cursor forever while importing nothing). Instead it reports the
+ * COUNTED `current` set — a cursor within one cap-width of now with no open streak — and
+ * names whatever is not yet current, so "current" is a claim earned from the data, not
+ * assumed from two absences.
  *
  * Takes the ALREADY-resolved provider set rather than re-resolving: resolution
  * decrypts each DB-connected provider's token, and this is a DB read, not a probe.
+ * One {@link loadGitSyncHealth} call classifies every provider in a single pass.
  */
 function checkGitStalls(
     db: Database.Database,
@@ -572,44 +549,60 @@ function checkGitStalls(
 ): CheckResult[] {
     const label = 'Git sync progress';
     const results: CheckResult[] = [];
+    const health = loadGitSyncHealth(db, providerConfigs, now);
 
-    const stalled = loadStalledProviders(db, providerConfigs);
-    if (stalled.length > 0) {
-        const detail = stalled
+    if (health.stalled.length > 0) {
+        const detail = health.stalled
             .map((s) => `${s.type}:${s.identifier} (${s.runs} runs, since ${s.since})`)
             .join(', ');
         results.push(
             fail(
                 label,
-                `${stalled.length} provider(s) stalled — cursor held, importing nothing: ${detail}`,
+                `${health.stalled.length} provider(s) stalled — cursor held, importing nothing: ${detail}`,
                 'Something fails on every run and holds the whole provider back — usually one bad repo (oversized, permission drift, deleted-but-still-listed), or the provider-level repo listing itself (a token/permission problem). Run "toprope sync all" and read the [provider] / [provider/repo] errors to see which. Fix the access, or if it is one repo you do not need, drop it via connectors.git.providers[].exclude_repos.',
             ),
         );
     }
 
-    const lagging = loadLaggingProviders(db, providerConfigs, now);
-    if (lagging.length > 0) {
-        const detail = lagging
+    if (health.lagging.length > 0) {
+        const detail = health.lagging
             .map((l) => `${l.type}:${l.identifier} (${l.daysBehind} days behind, at ${l.cursor})`)
             .join(', ');
         results.push(
             pass(
                 label,
-                `${lagging.length} provider(s) catching up — advancing, but not yet current: ${detail}`,
+                `${health.lagging.length} provider(s) catching up — advancing, but not yet current: ${detail}`,
             ),
         );
     }
 
     if (results.length === 0) {
-        const synced = providerConfigs.length - countNeverSyncedProviders(db, providerConfigs);
-        results.push(
-            synced === 0
-                ? pass(label, 'No provider has synced yet — nothing to report')
-                : pass(
-                      label,
-                      `No stalled or lagging providers (${synced} of ${providerConfigs.length} synced)`,
-                  ),
-        );
+        const total = providerConfigs.length;
+        if (health.current === total) {
+            results.push(
+                pass(
+                    label,
+                    `All ${total} provider(s) current — synced to within the last ${GIT_CATCHUP_WINDOW_MAX_DAYS} days`,
+                ),
+            );
+        } else if (health.current === 0 && health.neverSynced === total) {
+            results.push(pass(label, 'No provider has synced yet — nothing to report'));
+        } else {
+            // Some current, some not. With no stalled or lagging providers here, the
+            // "not yet current" remainder is the never-synced ones plus any held below
+            // the stall alert or carrying an unreadable/future-dated cursor.
+            const notCurrent = total - health.current;
+            const held = notCurrent - health.neverSynced;
+            const parts: string[] = [];
+            if (health.neverSynced > 0) parts.push(`${health.neverSynced} never synced`);
+            if (held > 0) parts.push(`${held} held below the stall alert or with an unreadable cursor`);
+            results.push(
+                pass(
+                    label,
+                    `${health.current} of ${total} provider(s) current; ${notCurrent} not yet current (${parts.join(', ')})`,
+                ),
+            );
+        }
     }
     return results;
 }
