@@ -153,6 +153,22 @@ export function rawAuthorKeyFor(
 }
 
 /**
+ * Is this key the LOGIN form — i.e. did the provider report an actual account username
+ * for the author, rather than only a commit address?
+ *
+ * The distinction is a TRUST boundary, not a formatting detail. A provider login comes
+ * from the provider's own account linkage; a commit email is whatever the committer put in
+ * `git config user.email` and is verified by nobody. Any path that acts on an author
+ * WITHOUT a human reviewing them (#256's auto-create) needs to tell the two apart, and the
+ * key shape is the authoritative record of which one was present at retention time —
+ * `author_login` alone is not, because `toAnalysisCommit` fills it as `username || email`
+ * and `listAuthorCandidates` may fold a login in from another variant of the same key.
+ */
+export function isLoginKey(provider: GitProviderType, rawAuthorKey: string): boolean {
+    return rawAuthorKey.startsWith(`${provider}:login:`);
+}
+
+/**
  * Commit-count-weighted mean of a rate/score field. When two rows' commit counts
  * add, a straight average would ignore that one side may represent far more commits
  * than the other. total===0 (no commits on either side) yields 0 — the neutral value

@@ -15,6 +15,9 @@ import {providerContainer} from './providers/config.js';
 import {resolveAllGitProviders} from './providers/resolve.js';
 import {loadServerKey} from './providers/secret.js';
 import type {GitProviderConfig, GitProviderType, GitCommit, GitFileDiff, GitPR} from './providers/types.js';
+import {promoteAllCandidates} from './onboarding.js';
+import {ensureTeam} from '../../registry/teams.js';
+import {resolveAutoCreateSettings, type AutoCreateSettings} from '../../config/git-auto-create.js';
 import type {ConnectorInterface, SyncResult} from '../types.js';
 import type {GitConnectorConfig} from '../../config/types.js';
 
@@ -30,6 +33,18 @@ const CONNECTOR_NAME = 'git';
  * sentinel rather than a matched string literal that can drift.
  */
 export const UNMATCHED_AUTHORS_PREFIX = 'Unmatched authors (no developer record found):';
+
+/**
+ * Prefix of the run summary pushed into a SyncResult's `errors` when opt-in auto-create
+ * (#256) ran. Like {@link UNMATCHED_AUTHORS_PREFIX} this is an ADVISORY, not a failure —
+ * it reports what the run onboarded — so outcome classifiers must exclude it.
+ *
+ * Auto-create FAILURES are deliberately NOT given this prefix: a promotion that could not
+ * complete is a genuine error the operator must see turn a provider red, and hiding it
+ * behind the same sentinel as the success summary is how a half-onboarded run reads as
+ * an all-clear.
+ */
+export const AUTO_CREATE_SUMMARY_PREFIX = 'auto-created';
 
 /**
  * The stages a sync run passes through, in pipeline order (GC#209). The network
@@ -1506,6 +1521,26 @@ export class GitSync implements ConnectorInterface {
         const now = new Date().toISOString();
         const allUnmatched = new Set<string>();
 
+        // Narrow + validate the auto-create config BEFORE any network work (#256). This is
+        // the second of the feature's two trust boundaries — `loadConfig` is the first, but
+        // a `GitConnectorConfig` also reaches here assembled programmatically (tests, the
+        // admin sync-now path, an embedder), and the boundary that must never be bypassed
+        // is the one next to the write. An invalid config aborts the run rather than
+        // syncing with the feature silently off: the operator asked for hands-off
+        // onboarding, and "ran fine, created nobody" is the failure mode this rejects.
+        let autoCreate: AutoCreateSettings;
+        try {
+            autoCreate = resolveAutoCreateSettings(this.config);
+        } catch (err) {
+            return {
+                connector: CONNECTOR_NAME,
+                snapshotsWritten: 0,
+                snapshotsSkipped: 0,
+                errors: [`Invalid auto-create config: ${err instanceof Error ? err.message : String(err)}`],
+                lastSyncTime: now,
+            };
+        }
+
         // One mutable progress state for the whole run; every report merges into
         // it and emits a copy, so the listener always sees cumulative counters.
         const progressState: GitSyncProgress = {
@@ -1559,20 +1594,36 @@ export class GitSync implements ConnectorInterface {
         // it by projection below, so an author with no developer record is no longer
         // dropped but simply not yet projected.
         const rawWrites: RawAuthorDailyInput[] = [];
+        // The raw author keys THIS run retained — the scope auto-create (#256) acts on.
+        // Deliberately not "every current candidate": a hands-off run onboards the
+        // authorship it just observed, and must not silently sweep up candidates an
+        // operator left unpromoted in the review queue on purpose.
+        const retainedKeys = new Set<string>();
         // The (developer_id, date) cells this run's raw writes resolve to — exactly the
         // cells the projection must rebuild. Deduped by composite key so a developer
         // reached under two identities (a github login and a bitbucket login) yields one
         // cell, not two rebuilds of the same one.
         const touchedCells = new Map<string, SnapshotCell>();
-        // Per-PR records (Task 5.2) resolved to developers, written after the
-        // snapshot pass. Keyed naturally by (provider, repo, pr_id), so no
-        // cross-provider merging is needed.
-        const resolvedPRRecords: Array<{record: PRRecordInput; developerId: string}> = [];
+        // Per-PR records (Task 5.2), written after the snapshot pass. Keyed naturally by
+        // (provider, repo, pr_id), so no cross-provider merging is needed.
+        //
+        // Collected UNRESOLVED and resolved inside the write transaction against the same
+        // post-auto-create lookup the snapshot projection uses. Resolving here would use
+        // the pre-fetch map, so a developer created during the run — by auto-create (#256),
+        // or by an admin during the minutes of network fetch — would have their PRs
+        // silently dropped. That loss is PERMANENT: providers re-fetch PRs by `updated_at`,
+        // so a PR that is already merged and never touched again is never re-delivered.
+        const fetchedPRRecords: Array<{record: PRRecordInput; providerType: GitProviderType}> = [];
         // Deferred sync-state advances (#231). Each entry is applied INSIDE the write
         // transaction below, so a provider's cursor/watermark commits atomically with
         // — and only if — its data is persisted. Populated only for providers whose
         // fetch was complete; an incomplete provider contributes nothing this run.
         const cursorAdvances: Array<() => void> = [];
+        // Auto-create's summary/failure lines (#256). Staged rather than pushed straight
+        // into `errors` because they are produced INSIDE the write transaction: on a
+        // rollback no developer was created, so reporting that any were would be a lie.
+        // Appended only after the transaction commits, and discarded on failure.
+        const autoCreateAdvisories: string[] = [];
         // Deferred stall-counter updates (#235), applied in the SAME transaction as
         // the cursor advances so the counter and the cursor can never disagree about
         // whether this run moved the provider forward. Unlike `cursorAdvances` this
@@ -1643,16 +1694,16 @@ export class GitSync implements ConnectorInterface {
             });
 
             for (const record of prRecords) {
+                fetchedPRRecords.push({record, providerType});
+                // Progress counter only — the authoritative resolution happens in the
+                // write transaction (see `fetchedPRRecords`).
                 const developerId = resolveDeveloperId(
                     devLookup,
                     providerType,
                     record.authorLogin,
                     record.authorEmail,
                 );
-                if (developerId) {
-                    resolvedPRRecords.push({record, developerId});
-                    matchedDevelopers.add(developerId);
-                }
+                if (developerId) matchedDevelopers.add(developerId);
             }
 
             if (commits.length === 0 && prs.length === 0 && reviewComments.length === 0) {
@@ -1672,6 +1723,7 @@ export class GitSync implements ConnectorInterface {
                 const rawAuthorKey = retentionKeyFor(providerType, login, emailForLogin);
                 // No stable identity (no login, no email) — nothing to retain it under.
                 if (!rawAuthorKey) continue;
+                retainedKeys.add(rawAuthorKey);
 
                 for (const [, metrics] of byDate) {
                     rawWrites.push({
@@ -1721,14 +1773,28 @@ export class GitSync implements ConnectorInterface {
         // the run counters after the tx succeeds, so a rolled-back run never reports
         // phantom writes.
         const insertMany = db.transaction(() => {
-            // Read the identity map INSIDE the transaction: `devLookup` was built before
-            // the network fetch, so a developer added while this run was fetching would be
-            // absent from it — their raw rows would be retained but their cells never
-            // projected, and the cursor would advance past the window that produced them.
-            const writeLookup = buildDevLookupMap(db);
+            // RETAIN FIRST, in a pass of its own. Auto-create below derives its candidates
+            // from `raw_author_daily`, and the replay it performs re-projects every date a
+            // new developer's retained rows touch — so every row of this run must already
+            // be in the store before either happens, or a freshly-created developer's
+            // current-window activity would be invisible to their own replay. Splitting the
+            // former single loop is exactly what buys "no second pass, no re-fetch".
             for (const row of rawWrites) {
                 upsertRawAuthorDaily(db, row, now);
+            }
 
+            // Opt-in hands-off onboarding (#256), between retention and projection.
+            if (autoCreate.enabled && autoCreate.team !== null) {
+                autoCreateAdvisories.push(...this.runAutoCreate(db, autoCreate.team, autoCreate, retainedKeys));
+            }
+
+            // Read the identity map INSIDE the transaction, and AFTER auto-create: it must
+            // see the developers this run just minted, or their rows would be retained but
+            // their cells never projected while the cursor advanced past the window that
+            // produced them. (The same reason it is re-read at all: `devLookup` was built
+            // before minutes of network fetch, during which a developer may have been added.)
+            const writeLookup = buildDevLookupMap(db);
+            for (const row of rawWrites) {
                 const developerId = resolveDeveloperId(
                     writeLookup,
                     row.provider,
@@ -1754,8 +1820,15 @@ export class GitSync implements ConnectorInterface {
             // that produced it), so nothing is skipped. Kept in the result shape because
             // SyncResult is a cross-connector contract.
             const skipped = 0;
-            for (const {record, developerId} of resolvedPRRecords) {
-                upsertPRRecord(db, record, developerId, now);
+            // Resolved HERE, against the post-auto-create map — see `fetchedPRRecords`.
+            for (const {record, providerType} of fetchedPRRecords) {
+                const developerId = resolveDeveloperId(
+                    writeLookup,
+                    providerType,
+                    record.authorLogin,
+                    record.authorEmail,
+                );
+                if (developerId) upsertPRRecord(db, record, developerId, now);
             }
             // Advance cursors LAST, still inside the tx: they persist iff every write
             // above committed. Collected only for complete providers (see the loop).
@@ -1776,12 +1849,16 @@ export class GitSync implements ConnectorInterface {
 
         try {
             insertMany();
+            // Committed — only now is the auto-create summary true.
+            errors.push(...autoCreateAdvisories);
         } catch (err) {
-            // Hard failure: the tx rolled back, so NO snapshots were written and NO
-            // cursor advanced — the window is intact and will be re-fetched next run.
-            // Surface it clearly rather than swallowing it into a "successful" result.
+            // Hard failure: the tx rolled back, so NO snapshots were written, NO developer
+            // was auto-created and NO cursor advanced — the window is intact and will be
+            // re-fetched next run. Surface it clearly rather than swallowing it into a
+            // "successful" result.
             snapshotsWritten = 0;
             snapshotsSkipped = 0;
+            autoCreateAdvisories.length = 0;
             errors.push(
                 `Failed to write sync data (transaction rolled back — no cursor advanced, window will be re-fetched next run): ${err instanceof Error ? err.message : String(err)}`,
             );
@@ -1792,6 +1869,78 @@ export class GitSync implements ConnectorInterface {
         }
 
         return {connector: CONNECTOR_NAME, snapshotsWritten, snapshotsSkipped, errors, lastSyncTime: now};
+    }
+
+    /**
+     * Opt-in auto-create (#256): turn this run's unmatched HUMAN authors into developers,
+     * attributed in the same run. Returns the lines to surface on the SyncResult.
+     *
+     * MUST be called from inside the sync write transaction, between retention and
+     * projection. That placement is what makes the epic's atomicity criterion hold —
+     * creation, projection and the cursor advance commit together, so a rolled-back run
+     * creates nobody — and what makes "no second pass, no re-fetch" true: the new
+     * developer's own replay sees this run's rows because they are already retained.
+     *
+     * Everything below the team check is DELEGATED, not re-implemented. `promoteAllCandidates`
+     * already derives candidates from the raw store, hard-skips bots via the shared
+     * classifier, and creates each developer through `createDeveloperWithReplay` — which
+     * carries the identity-uniqueness guard and the replay. Re-deriving any of that here
+     * would be a second definition of who a bot is, or of what a duplicate is, and the two
+     * would drift. Auto-create's only additions are the run scope, the operator denylist,
+     * and `unreviewed` — the flag that keeps a self-asserted commit email from becoming an
+     * attribution claim when nobody is vouching for the row — all passed as options.
+     *
+     * Cost note: each creation replays that developer's retained dates, so N new humans cost
+     * N replays. That is a one-time first-sync shape — steady state creates ~0 — and it sits
+     * inside a run already dominated by minutes of network fetch. Batching the replays into
+     * one projection would mean forking the create path away from the canonical helper every
+     * other surface uses; the drift is the more expensive problem.
+     */
+    private runAutoCreate(
+        db: Database.Database,
+        team: string,
+        settings: AutoCreateSettings,
+        retainedKeys: ReadonlySet<string>,
+    ): string[] {
+        // FAIL CLOSED on an unusable team: create it when absent (parity with GitHub-org
+        // discovery's default team), but refuse an ARCHIVED one. A developer created into
+        // an archived team is absent from every team aggregate — the write "succeeds" and
+        // the person never appears, which is the silent hole this epic exists to close.
+        // Reported as a genuine error (no advisory prefix) so it turns the provider red
+        // rather than reading as a run that simply had nobody to onboard.
+        if (!ensureTeam(db, team)) {
+            return [
+                `Auto-create is enabled but team '${team}' is archived — no developers were created. Un-archive it or change connectors.git.auto_create_team.`,
+            ];
+        }
+        if (retainedKeys.size === 0) return [];
+
+        const result = promoteAllCandidates(db, team, {
+            onlyKeys: retainedKeys,
+            exclusions: settings.exclude,
+            // No human is reviewing these rows, so only provider-verified logins are
+            // onboarded and the created developers claim no self-asserted commit email.
+            unreviewed: true,
+        });
+        // Nothing observed and nothing skipped — stay silent rather than emit a line every
+        // run reporting that a steady-state sync onboarded nobody.
+        if (result.promoted === 0 && result.skippedBots === 0 && result.failed === 0) return [];
+
+        const lines = [
+            `${AUTO_CREATE_SUMMARY_PREFIX} ${result.promoted} developers (${result.skippedBots} bot authors skipped) into team '${team}'`,
+        ];
+        if (result.failed > 0) {
+            // Deliberately NOT advisory-prefixed. A candidate that could not be promoted is
+            // authorship that stays unattributed, and the operator has to see it. The most
+            // common cause is benign-but-worth-knowing: two raw keys for one person, the
+            // second colliding with the developer the first just created.
+            const detail = result.entries
+                .filter((e): e is Extract<typeof e, {status: 'failed'}> => e.status === 'failed')
+                .map((e) => `${e.candidate.raw_author_key} (${e.reason}: ${e.message})`)
+                .join('; ');
+            lines.push(`Auto-create could not onboard ${result.failed} author(s): ${detail}`);
+        }
+        return lines;
     }
 
     // Resolve the providers this sync run should cover: DB-connected providers

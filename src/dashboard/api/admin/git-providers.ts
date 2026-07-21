@@ -27,6 +27,7 @@ import {createGitProvider} from '../../../connectors/git/providers/factory';
 import {
     GitSync,
     UNMATCHED_AUTHORS_PREFIX,
+    AUTO_CREATE_SUMMARY_PREFIX,
     FIRST_SYNC_WINDOW_MIN_MONTHS,
     FIRST_SYNC_WINDOW_MAX_MONTHS,
     FIRST_SYNC_WINDOW_DEFAULT_MONTHS,
@@ -535,10 +536,14 @@ export function registerAdminGitProviderRoutes(
                 // outcome with a surfaced message — never swallowed. But the
                 // "unmatched authors" advisory is NOT a failure (CI bots and external
                 // contributors are unmapped in nearly every real repo), so it must
-                // not flip a provider that synced fine to red. Classify and surface
-                // only genuine errors.
+                // not flip a provider that synced fine to red. The auto-create SUMMARY
+                // (#256) is advisory on the same terms — it reports what was onboarded.
+                // Auto-create FAILURE lines carry neither prefix on purpose and stay
+                // classified as genuine errors. Classify and surface only those.
                 const genuineErrors = result.errors.filter(
-                    (e) => !e.startsWith(UNMATCHED_AUTHORS_PREFIX),
+                    (e) =>
+                        !e.startsWith(UNMATCHED_AUTHORS_PREFIX) &&
+                        !e.startsWith(AUTO_CREATE_SUMMARY_PREFIX),
                 );
                 if (genuineErrors.length > 0) {
                     recordSyncOutcome(db, id, {
