@@ -29,6 +29,7 @@ import {getTeam} from '../../registry/teams';
 import {findIdentityConflict} from '../../registry/identity-guard';
 import {replayDeveloper, type ProjectionResult} from './projection';
 import {listAuthorCandidates, type AuthorCandidate} from './author-candidates';
+import {isLoginKey} from './raw-author-daily';
 import type {GitProviderType} from './providers/types';
 
 /**
@@ -258,6 +259,48 @@ export interface BulkPromoteResult {
     failed: number;
 }
 
+/**
+ * Build the create input for an UNREVIEWED promotion: the provider login identity ONLY,
+ * with the commit email deliberately dropped.
+ *
+ * A commit's `author_email` is set by whoever made the commit (`git config user.email`) and
+ * is verified by no provider. `candidateCreateInput` seeds it as the developer's primary
+ * `email`, which `buildDevLookupMap` registers as a GLOBAL attribution key — correct when an
+ * admin is looking at the row and vouching for it (DO1.5), and unsafe when nobody is
+ * (DO1.6). Without this, anyone who can push one commit to a scanned repo could set
+ * `user.email` to a colleague's address and have the hands-off path mint a developer that
+ * permanently claims it: every later unattributed row carrying that address projects onto
+ * the impostor, and the colleague's own honest registration is refused as a conflict.
+ *
+ * The provider login is a different class of assertion — it comes from the provider's
+ * account linkage, not from commit metadata — so it is the only identity auto-create
+ * claims. Attribution still works, because `resolveDeveloperId` tries `${provider}:${login}`
+ * FIRST and every row retained under a login key carries that login.
+ *
+ * The cost is deliberate: an author's login-less commits stay unattributed until a human
+ * promotes them from the review queue. Under-attributing a real person is recoverable in one
+ * click; mis-attributing one person's commits to another is a privacy breach that nothing
+ * surfaces.
+ */
+function verifiedCreateInput(candidate: AuthorCandidate, team: string): CreateDeveloperInput {
+    const login = candidate.login?.trim();
+    const identities: Record<GitProviderType, string | undefined> = {
+        github: undefined,
+        bitbucket: undefined,
+        gitlab: undefined,
+    };
+    if (login) identities[candidate.provider] = login;
+
+    return {
+        name: deriveCandidateName(candidate),
+        team,
+        // No `email`, no `gitEmails` — see above. Both are uniqueness-claiming lookup keys.
+        github: identities.github,
+        bitbucket: identities.bitbucket,
+        gitlab: identities.gitlab,
+    };
+}
+
 /** How a bulk promotion is scoped and classified. */
 export interface PromoteAllOptions {
     /** Promote authors the classifier flagged as automation too. Never set by auto-create. */
@@ -276,6 +319,16 @@ export interface PromoteAllOptions {
      * the skip decision below reads — never classified twice with two answers.
      */
     exclusions?: readonly RegExp[];
+    /**
+     * UNREVIEWED mode (#256's auto-create). Two effects, both fail-closed:
+     *   - a candidate whose retained key is the EMAIL form is skipped entirely — a
+     *     self-asserted address with no provider account behind it is not something to mint
+     *     a developer from with no human in the loop; it stays in the review queue;
+     *   - the developers that ARE created claim only their provider login, never the commit
+     *     email (see {@link verifiedCreateInput}).
+     * Left false for the admin/CLI surfaces, where a human is vouching for the row.
+     */
+    unreviewed?: boolean;
 }
 
 /**
@@ -312,7 +365,22 @@ export function promoteAllCandidates(
             });
             continue;
         }
-        const outcome = createDeveloperWithReplay(db, candidateCreateInput(candidate, team));
+        // Unreviewed mode only mints developers for provider-VERIFIED identities. An
+        // email-keyed author carries nothing but a self-asserted address, so it is held for
+        // the review queue rather than acted on. Reported under `skipped_bot` so the count
+        // is visible in the run summary — the shared "not onboarded automatically" bucket.
+        if (options.unreviewed && !isLoginKey(candidate.provider, candidate.raw_author_key)) {
+            entries.push({
+                status: 'skipped_bot',
+                candidate,
+                reason: 'no provider login — a self-asserted commit email is not auto-created; promote it from the review queue',
+            });
+            continue;
+        }
+        const input = options.unreviewed
+            ? verifiedCreateInput(candidate, team)
+            : candidateCreateInput(candidate, team);
+        const outcome = createDeveloperWithReplay(db, input);
         entries.push(
             outcome.ok
                 ? {

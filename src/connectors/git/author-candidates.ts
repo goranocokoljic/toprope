@@ -147,6 +147,13 @@ function stripBotSuffix(login: string): string {
  */
 const REASON_LOGIN_MAX = 64;
 
+/**
+ * Longest prefix of a login/email an operator exclusion pattern is matched against. See the
+ * clamp in {@link classifyAuthor} — this bounds the `n` in the pattern engine's backtracking
+ * cost, the config boundary bounds the wildcard count.
+ */
+const EXCLUSION_SUBJECT_MAX = 320;
+
 /** The login as it will appear inside a reason: bounded, with the truncation made visible. */
 function quoteLogin(login: string): string {
     return login.length <= REASON_LOGIN_MAX ? login : `${login.slice(0, REASON_LOGIN_MAX)}…`;
@@ -216,14 +223,23 @@ export function classifyAuthor(
         return {isBot: true, reason: 'empty identity (no login, no email)'};
     }
 
+    // Clamp what the patterns are matched against. Backtracking cost on a non-matching
+    // subject grows with subject LENGTH as well as wildcard count, and both of these are
+    // provider-supplied and unbounded (`upsertRawAuthorDaily` passes the identity columns
+    // through verbatim; the email is whatever the committer configured). The config
+    // boundary caps the wildcards; this caps the n. 320 is RFC 5321's maximum address
+    // length — anything longer is not an identity a denylist meaningfully matches, and
+    // truncating can only turn a match into a non-match, never a human into a bot.
+    const subjectLogin = login.slice(0, EXCLUSION_SUBJECT_MAX);
+    const subjectEmail = email.slice(0, EXCLUSION_SUBJECT_MAX);
     for (const pattern of exclusions) {
         // `pattern.test` on a shared RegExp is stateless here: the patterns are compiled
         // WITHOUT the /g flag (see compileExcludePattern), so there is no `lastIndex` to
         // carry between calls and a reused instance cannot skip a match.
-        if (login && pattern.test(login)) {
+        if (subjectLogin && pattern.test(subjectLogin)) {
             return {isBot: true, reason: `login "${quoteLogin(login)}" matches an operator exclusion pattern`};
         }
-        if (email && pattern.test(email)) {
+        if (subjectEmail && pattern.test(subjectEmail)) {
             return {isBot: true, reason: `email "${quoteLogin(email)}" matches an operator exclusion pattern`};
         }
     }

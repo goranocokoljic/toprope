@@ -16,6 +16,7 @@ import {addDeveloper, listDevelopers} from '../../../src/registry/developers';
 import type {Developer} from '../../../src/registry/types';
 import {GitSync, AUTO_CREATE_SUMMARY_PREFIX, UNMATCHED_AUTHORS_PREFIX} from '../../../src/connectors/git/sync';
 import {listAuthorCandidates} from '../../../src/connectors/git/author-candidates';
+import {createDeveloperWithReplay} from '../../../src/connectors/git/onboarding';
 import type {GitConnectorConfig} from '../../../src/config/types';
 import type {GitProvider, GitRepo, GitCommit, GitFileDiff} from '../../../src/connectors/git/providers/types';
 
@@ -364,8 +365,7 @@ describe('auto-create developers during sync (#256)', () => {
         it('never creates a duplicate when two raw keys point at one person', async () => {
             // Two commits from the same human: one carries the provider login, one does
             // not (a local `git config` with no linked account). They retain under two
-            // different raw keys but share an email, so exactly ONE developer must exist,
-            // and BOTH commits must land on them.
+            // different raw keys. Exactly ONE developer must exist afterwards.
             await installProvider([
                 commitBy('alice', 'alice@corp.example', 'sha-a'),
                 commitBy(null, 'alice@corp.example', 'sha-b'),
@@ -375,8 +375,87 @@ describe('auto-create developers during sync (#256)', () => {
 
             const devs = listDevelopers(db);
             expect(devs).toHaveLength(1);
-            expect(snapshotsFor(db, devs[0].id)).toEqual([{date: DAY, commits: 2}]);
-            expect(listAuthorCandidates(db)).toHaveLength(0);
+            expect(devs[0].external_ids.github).toBe('alice');
+            // Only the login-keyed commit is attributed. The email-only key is deliberately
+            // NOT auto-attributed: nothing proves that commit was authored by the same
+            // person, only that someone typed that address into `git config`. It stays a
+            // candidate for a human to confirm — see the spoofing test below.
+            expect(snapshotsFor(db, devs[0].id)).toEqual([{date: DAY, commits: 1}]);
+            expect(listAuthorCandidates(db).map((c) => c.raw_author_key)).toEqual([
+                'github:email:alice@corp.example',
+            ]);
+        });
+
+        it('an auto-created developer claims NO self-asserted commit email', async () => {
+            // The identity-spoofing vector: a commit's author email is set by whoever made
+            // the commit and verified by nobody. If auto-create seeded it as the primary
+            // email it would become a global attribution key, so anyone able to push one
+            // commit could permanently claim a colleague's address — capturing their future
+            // commits and blocking their own honest registration.
+            await installProvider([commitBy('mallory', 'alice@corp.example')]);
+
+            await new GitSync(config({auto_create_developers: true, auto_create_team: 'discovered'})).sync(db);
+
+            const mallory = developerNamed(db, 'mallory');
+            expect(mallory).toBeDefined();
+            // Created from the provider login ONLY.
+            expect(mallory?.external_ids.github).toBe('mallory');
+            expect(mallory?.email).toBeNull();
+            expect(mallory?.external_ids.git_emails).toBeUndefined();
+
+            // The address is therefore still free: Alice can register it later.
+            const alice = createDeveloperWithReplay(db, {
+                name: 'Alice',
+                team: 'discovered',
+                email: 'alice@corp.example',
+            });
+            expect(alice.ok).toBe(true);
+        });
+
+        it('does not auto-create an author who has no provider login at all', async () => {
+            // Nothing here is provider-verified — only a self-asserted address.
+            await installProvider([commitBy(null, 'somebody@corp.example')]);
+
+            const result = await new GitSync(
+                config({auto_create_developers: true, auto_create_team: 'discovered'}),
+            ).sync(db);
+
+            expect(listDevelopers(db)).toHaveLength(0);
+            // Held for the review queue, and counted in the run summary rather than silently.
+            expect(result.errors).toContain(
+                `${AUTO_CREATE_SUMMARY_PREFIX} 0 developers (1 bot authors skipped) into team 'discovered'`,
+            );
+            expect(listAuthorCandidates(db)).toHaveLength(1);
+        });
+
+        it('attributes an auto-created developer their PR records in the same run', async () => {
+            // PR records were previously resolved against the PRE-fetch identity map, so an
+            // auto-created developer's PRs were dropped — permanently, because providers
+            // re-fetch by updated_at and a merged, untouched PR is never re-delivered.
+            const provider = await installProvider([commitBy('alice', 'alice@corp.example')]);
+            (provider.getPullRequests as ReturnType<typeof vi.fn>).mockResolvedValue([
+                {
+                    id: '1',
+                    title: 'feat: something',
+                    author: {name: 'alice', email: 'alice@corp.example', username: 'alice'},
+                    state: 'merged',
+                    createdAt: `${DAY}T08:00:00Z`,
+                    mergedAt: `${DAY}T12:00:00Z`,
+                    closedAt: `${DAY}T12:00:00Z`,
+                    updatedAt: `${DAY}T12:00:00Z`,
+                    reviewers: [],
+                    additions: 50,
+                    deletions: 10,
+                },
+            ]);
+
+            await new GitSync(config({auto_create_developers: true, auto_create_team: 'discovered'})).sync(db);
+
+            const alice = developerNamed(db, 'alice');
+            const prs = db
+                .prepare('SELECT developer_id FROM pr_records WHERE developer_id = ?')
+                .all(alice!.id) as {developer_id: string}[];
+            expect(prs).toHaveLength(1);
         });
 
         it('does not create a developer for an author who already has one', async () => {

@@ -584,6 +584,73 @@ describe('promoteAllCandidates', () => {
             ).toMatch(/operator exclusion pattern/);
         });
 
+        describe('unreviewed mode (auto-create)', () => {
+            it('creates from the provider login only — never the self-asserted commit email', () => {
+                promoteAllCandidates(db, 'eng', {
+                    onlyKeys: new Set(['github:login:jane']),
+                    unreviewed: true,
+                });
+
+                const row = db.prepare('SELECT email, external_ids FROM developers').get() as {
+                    email: string | null;
+                    external_ids: string;
+                };
+                expect(row.email).toBeNull();
+                const ext = JSON.parse(row.external_ids) as Record<string, string>;
+                expect(ext.github).toBe('jane');
+                expect(ext.git_emails).toBeUndefined();
+            });
+
+            it('the reviewed path still seeds the email (a human vouched for the row)', () => {
+                promoteAllCandidates(db, 'eng', {onlyKeys: new Set(['github:login:jane'])});
+
+                const row = db.prepare('SELECT email FROM developers').get() as {email: string | null};
+                expect(row.email).toBe('jane@work.com');
+            });
+
+            it('skips an email-keyed candidate, and says why', () => {
+                upsertRawAuthorDaily(
+                    db,
+                    rawRow({
+                        raw_author_key: 'github:email:nolo@work.com',
+                        author_email: 'nolo@work.com',
+                        date: '2026-07-01',
+                    }),
+                );
+
+                const result = promoteAllCandidates(db, 'eng', {
+                    onlyKeys: new Set(['github:email:nolo@work.com']),
+                    unreviewed: true,
+                });
+
+                expect(result.promoted).toBe(0);
+                expect(result.skippedBots).toBe(1);
+                const skipped = result.entries[0];
+                expect(skipped.status === 'skipped_bot' && skipped.reason).toMatch(/no provider login/);
+                // Still a candidate — held for review, not discarded.
+                expect(listAuthorCandidates(db).map((c) => c.raw_author_key)).toContain(
+                    'github:email:nolo@work.com',
+                );
+            });
+
+            it('the reviewed path DOES promote an email-keyed candidate', () => {
+                upsertRawAuthorDaily(
+                    db,
+                    rawRow({
+                        raw_author_key: 'github:email:nolo@work.com',
+                        author_email: 'nolo@work.com',
+                        date: '2026-07-01',
+                    }),
+                );
+
+                const result = promoteAllCandidates(db, 'eng', {
+                    onlyKeys: new Set(['github:email:nolo@work.com']),
+                });
+
+                expect(result.promoted).toBe(1);
+            });
+        });
+
         it('combines scope and exclusions', () => {
             const result = promoteAllCandidates(db, 'eng', {
                 onlyKeys: new Set(['github:login:jane', 'github:login:bob']),

@@ -195,7 +195,9 @@ describe('resolveAutoCreateSettings', () => {
         it('rejects a pattern with too many wildcards', () => {
             const atBound = '*'.repeat(AUTO_CREATE_EXCLUDE_MAX_WILDCARDS);
             expect(compile([atBound])).toHaveLength(1);
-            expect(() => compile([`${atBound}*`])).toThrow(/'\*' wildcards; the maximum is 10/);
+            expect(() => compile([`${atBound}*`])).toThrow(
+                new RegExp(`'\\*' wildcards; the maximum is ${AUTO_CREATE_EXCLUDE_MAX_WILDCARDS}`),
+            );
         });
     });
 });

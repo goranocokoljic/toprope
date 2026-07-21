@@ -1604,10 +1604,16 @@ export class GitSync implements ConnectorInterface {
         // reached under two identities (a github login and a bitbucket login) yields one
         // cell, not two rebuilds of the same one.
         const touchedCells = new Map<string, SnapshotCell>();
-        // Per-PR records (Task 5.2) resolved to developers, written after the
-        // snapshot pass. Keyed naturally by (provider, repo, pr_id), so no
-        // cross-provider merging is needed.
-        const resolvedPRRecords: Array<{record: PRRecordInput; developerId: string}> = [];
+        // Per-PR records (Task 5.2), written after the snapshot pass. Keyed naturally by
+        // (provider, repo, pr_id), so no cross-provider merging is needed.
+        //
+        // Collected UNRESOLVED and resolved inside the write transaction against the same
+        // post-auto-create lookup the snapshot projection uses. Resolving here would use
+        // the pre-fetch map, so a developer created during the run — by auto-create (#256),
+        // or by an admin during the minutes of network fetch — would have their PRs
+        // silently dropped. That loss is PERMANENT: providers re-fetch PRs by `updated_at`,
+        // so a PR that is already merged and never touched again is never re-delivered.
+        const fetchedPRRecords: Array<{record: PRRecordInput; providerType: GitProviderType}> = [];
         // Deferred sync-state advances (#231). Each entry is applied INSIDE the write
         // transaction below, so a provider's cursor/watermark commits atomically with
         // — and only if — its data is persisted. Populated only for providers whose
@@ -1688,16 +1694,16 @@ export class GitSync implements ConnectorInterface {
             });
 
             for (const record of prRecords) {
+                fetchedPRRecords.push({record, providerType});
+                // Progress counter only — the authoritative resolution happens in the
+                // write transaction (see `fetchedPRRecords`).
                 const developerId = resolveDeveloperId(
                     devLookup,
                     providerType,
                     record.authorLogin,
                     record.authorEmail,
                 );
-                if (developerId) {
-                    resolvedPRRecords.push({record, developerId});
-                    matchedDevelopers.add(developerId);
-                }
+                if (developerId) matchedDevelopers.add(developerId);
             }
 
             if (commits.length === 0 && prs.length === 0 && reviewComments.length === 0) {
@@ -1814,8 +1820,15 @@ export class GitSync implements ConnectorInterface {
             // that produced it), so nothing is skipped. Kept in the result shape because
             // SyncResult is a cross-connector contract.
             const skipped = 0;
-            for (const {record, developerId} of resolvedPRRecords) {
-                upsertPRRecord(db, record, developerId, now);
+            // Resolved HERE, against the post-auto-create map — see `fetchedPRRecords`.
+            for (const {record, providerType} of fetchedPRRecords) {
+                const developerId = resolveDeveloperId(
+                    writeLookup,
+                    providerType,
+                    record.authorLogin,
+                    record.authorEmail,
+                );
+                if (developerId) upsertPRRecord(db, record, developerId, now);
             }
             // Advance cursors LAST, still inside the tx: they persist iff every write
             // above committed. Collected only for complete providers (see the loop).
@@ -1873,8 +1886,9 @@ export class GitSync implements ConnectorInterface {
      * classifier, and creates each developer through `createDeveloperWithReplay` — which
      * carries the identity-uniqueness guard and the replay. Re-deriving any of that here
      * would be a second definition of who a bot is, or of what a duplicate is, and the two
-     * would drift. Auto-create's only additions are the run scope and the operator denylist,
-     * both passed as options.
+     * would drift. Auto-create's only additions are the run scope, the operator denylist,
+     * and `unreviewed` — the flag that keeps a self-asserted commit email from becoming an
+     * attribution claim when nobody is vouching for the row — all passed as options.
      *
      * Cost note: each creation replays that developer's retained dates, so N new humans cost
      * N replays. That is a one-time first-sync shape — steady state creates ~0 — and it sits
@@ -1904,6 +1918,9 @@ export class GitSync implements ConnectorInterface {
         const result = promoteAllCandidates(db, team, {
             onlyKeys: retainedKeys,
             exclusions: settings.exclude,
+            // No human is reviewing these rows, so only provider-verified logins are
+            // onboarded and the created developers claim no self-asserted commit email.
+            unreviewed: true,
         });
         // Nothing observed and nothing skipped — stay silent rather than emit a line every
         // run reporting that a steady-state sync onboarded nobody.

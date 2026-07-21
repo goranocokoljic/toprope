@@ -40,13 +40,19 @@ export const AUTO_CREATE_TEAM_MAX_LENGTH = 100;
 export const AUTO_CREATE_EXCLUDE_MAX_PATTERNS = 200;
 export const AUTO_CREATE_EXCLUDE_MAX_PATTERN_LENGTH = 200;
 /**
- * Wildcards allowed in ONE pattern. `*` compiles to `.*`, and a pattern with many of them
- * (`*a*a*a*a*b`) is what turns a match into catastrophic backtracking. Patterns are
- * operator-supplied rather than request-supplied, so this is a guardrail against a typo
- * rather than a hostile input — but the input it is matched against (`author_login`,
- * `author_email`) IS provider-supplied and unbounded, so the guardrail is worth having.
+ * Wildcards allowed in ONE pattern. `*` compiles to `.*`, and backtracking cost on a
+ * NON-matching subject is superlinear in the wildcard count: `^.*a.*b.*c$` against an
+ * n-character subject explores O(n³) split points. The subject is `author_login` /
+ * `author_email` — provider-supplied, and in the email's case set by whoever made the
+ * commit — so an attacker chooses n, and the match runs inside the sync write transaction
+ * while it holds a SQLite write lock.
+ *
+ * So the bound is set by what makes the class unreachable, not by what a config might
+ * plausibly want: 2 covers every real denylist shape (`svc-*`, `*@bots.corp.example`,
+ * `*-deploy-*`) and keeps the exponent at a level the subject clamp in `classifyAuthor`
+ * finishes instantly. Raising this without also revisiting that clamp reopens the hang.
  */
-export const AUTO_CREATE_EXCLUDE_MAX_WILDCARDS = 10;
+export const AUTO_CREATE_EXCLUDE_MAX_WILDCARDS = 2;
 
 /** Thrown for any violation below. Distinct type so callers can report it as a CONFIG fault. */
 export class GitAutoCreateConfigError extends Error {
