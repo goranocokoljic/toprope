@@ -7,6 +7,7 @@ import {registerAuthRoutes} from '../../src/dashboard/api/auth-routes';
 import {registerMeRoutes} from '../../src/dashboard/api/me';
 import {registerAdminRoutes} from '../../src/dashboard/api/admin';
 import {createUser} from '../../src/auth/users';
+import {findByEmail, findByExternalId} from '../../src/registry/developers';
 import {hashPassword} from '../../src/auth/password';
 import {SESSION_COOKIE} from '../../src/auth/cookies';
 
@@ -67,6 +68,7 @@ describe('admin API', () => {
             {method: 'GET', url: '/api/admin/teams'},
             {method: 'POST', url: '/api/admin/teams'},
             {method: 'GET', url: '/api/admin/developers'},
+            {method: 'POST', url: '/api/admin/developers'},
             {method: 'PATCH', url: '/api/admin/developers/dev-1/identities'},
             {method: 'GET', url: '/api/admin/subscriptions'},
             {method: 'POST', url: '/api/admin/subscriptions'},
@@ -393,6 +395,21 @@ describe('admin API', () => {
             expect(res.statusCode).toBe(409);
         });
 
+        // Same tokenization hole as the create route (#251 SEC-1) — the shared
+        // gitEmailsField closes it for both.
+        it('rejects a comma-packed git_emails element already owned by another developer (409)', async () => {
+            const res = await app.inject({
+                method: 'PATCH',
+                url: '/api/admin/developers/dev-2/identities',
+                headers: authHeaders(adminToken),
+                payload: {git_emails: ['bob@work.com, alice@test.com']},
+            });
+            expect(res.statusCode).toBe(409);
+            expect(res.json().message).toBe(
+                "git email 'alice@test.com' is already mapped to Alice Dev",
+            );
+        });
+
         it('moves a developer to another team', async () => {
             const res = await app.inject({
                 method: 'PATCH',
@@ -435,6 +452,248 @@ describe('admin API', () => {
             });
             expect(res.statusCode).toBe(400);
             expect(res.json().message).toMatch(/archived/i);
+        });
+    });
+
+    // DO1.1 / #251 — the first UI-reachable way to get a developer into the
+    // system. Before it, a connected git provider had no developers to attribute
+    // commits to and no route to create any.
+    describe('create developer', () => {
+        function create(payload: unknown): ReturnType<typeof app.inject> {
+            return app.inject({
+                method: 'POST',
+                url: '/api/admin/developers',
+                headers: authHeaders(adminToken),
+                payload,
+            });
+        }
+
+        async function archivedTeam(name: string): Promise<void> {
+            await app.inject({
+                method: 'POST',
+                url: '/api/admin/teams',
+                headers: authHeaders(adminToken),
+                payload: {name},
+            });
+            await app.inject({
+                method: 'PATCH',
+                url: `/api/admin/teams/${name}`,
+                headers: authHeaders(adminToken),
+                payload: {archived: true},
+            });
+        }
+
+        it('creates a developer and returns 201 with the created row', async () => {
+            const res = await create({
+                name: 'Dana Dev',
+                team: 'backend',
+                email: 'dana@test.com',
+                github: 'dana-gh',
+                bitbucket: 'dana-bb',
+                gitlab: 'dana-gl',
+                git_emails: ['Dana@Work.com', 'dana@work.com'],
+            });
+            expect(res.statusCode).toBe(201);
+            const row = res.json().data;
+            expect(row.name).toBe('Dana Dev');
+            expect(row.team).toBe('backend');
+            expect(row.email).toBe('dana@test.com');
+            expect(row.id).toBeTruthy();
+            expect(row.created_at).toBeTruthy();
+            expect(row.external_ids.github).toBe('dana-gh');
+            expect(row.external_ids.bitbucket).toBe('dana-bb');
+            expect(row.external_ids.gitlab).toBe('dana-gl');
+            // Deduped + lowercased by the shared joinGitEmails helper.
+            expect(row.external_ids.git_emails).toBe('dana@work.com');
+        });
+
+        it('makes the new developer appear in the list (same shape as GET rows)', async () => {
+            const created = (await create({name: 'Dana Dev', team: 'backend'})).json().data;
+            const list = (
+                await app.inject({
+                    method: 'GET',
+                    url: '/api/admin/developers',
+                    headers: authHeaders(adminToken),
+                })
+            ).json().data as {id: string}[];
+            expect(list.map((d) => d.id)).toContain(created.id);
+            expect(list.find((d) => d.id === created.id)).toEqual(created);
+        });
+
+        // The point of the whole epic: a developer added here must be resolvable
+        // by sync, which looks authors up through exactly these two readers
+        // (they feed buildDevLookupMap).
+        it('is immediately resolvable by the sync identity lookups', async () => {
+            const created = (
+                await create({
+                    name: 'Dana Dev',
+                    team: 'backend',
+                    email: 'dana@test.com',
+                    github: 'dana-gh',
+                    bitbucket: 'dana-bb',
+                    gitlab: 'dana-gl',
+                    git_emails: ['dana@work.com'],
+                })
+            ).json().data;
+            expect(findByExternalId(db, 'github', 'dana-gh')?.id).toBe(created.id);
+            expect(findByExternalId(db, 'bitbucket', 'dana-bb')?.id).toBe(created.id);
+            expect(findByExternalId(db, 'gitlab', 'dana-gl')?.id).toBe(created.id);
+            expect(findByEmail(db, 'dana@test.com')?.id).toBe(created.id);
+            expect(findByEmail(db, 'DANA@WORK.COM')?.id).toBe(created.id);
+        });
+
+        it('rejects a missing name with 400', async () => {
+            const res = await create({team: 'backend'});
+            expect(res.statusCode).toBe(400);
+            expect(res.json().message).toMatch(/name is required/i);
+        });
+
+        it('rejects a blank/whitespace name with 400', async () => {
+            const res = await create({name: '   ', team: 'backend'});
+            expect(res.statusCode).toBe(400);
+            expect(res.json().message).toMatch(/name is required/i);
+        });
+
+        it('rejects an over-long name with 400', async () => {
+            const res = await create({name: 'x'.repeat(101), team: 'backend'});
+            expect(res.statusCode).toBe(400);
+            expect(res.json().message).toMatch(/at most 100/i);
+        });
+
+        it('rejects a non-existent team with 400', async () => {
+            const res = await create({name: 'Dana Dev', team: 'nope'});
+            expect(res.statusCode).toBe(400);
+            expect(res.json().message).toMatch(/does not exist/i);
+        });
+
+        it('rejects an archived team with 400 (server is the trust boundary)', async () => {
+            await archivedTeam('retired');
+            const res = await create({name: 'Dana Dev', team: 'retired'});
+            expect(res.statusCode).toBe(400);
+            expect(res.json().message).toMatch(/archived/i);
+        });
+
+        it('rejects a missing team with 400', async () => {
+            const res = await create({name: 'Dana Dev'});
+            expect(res.statusCode).toBe(400);
+            expect(res.json().message).toMatch(/team is required/i);
+        });
+
+        it('rejects a non-object body with 400', async () => {
+            const res = await create(['not', 'an', 'object']);
+            expect(res.statusCode).toBe(400);
+        });
+
+        it('rejects a non-string identity field with 400', async () => {
+            const res = await create({name: 'Dana Dev', team: 'backend', github: 42});
+            expect(res.statusCode).toBe(400);
+            expect(res.json().message).toMatch(/github must be a string/i);
+        });
+
+        it('rejects a git_emails value that is not an array of strings with 400', async () => {
+            const res = await create({name: 'Dana Dev', team: 'backend', git_emails: ['ok', 7]});
+            expect(res.statusCode).toBe(400);
+            expect(res.json().message).toMatch(/git_emails must be an array of strings/i);
+        });
+
+        // Each git-attribution provider gets its own 409 branch: a shared id
+        // would make commit attribution ambiguous.
+        for (const provider of ['github', 'bitbucket', 'gitlab'] as const) {
+            it(`rejects a duplicate ${provider} id with 409 naming the owner`, async () => {
+                await app.inject({
+                    method: 'PATCH',
+                    url: '/api/admin/developers/dev-1/identities',
+                    headers: authHeaders(adminToken),
+                    payload: {[provider]: 'shared-handle'},
+                });
+                const res = await create({
+                    name: 'Dana Dev',
+                    team: 'backend',
+                    [provider]: 'shared-handle',
+                });
+                expect(res.statusCode).toBe(409);
+                expect(res.json().message).toBe(
+                    `${provider} identity 'shared-handle' is already mapped to Alice Dev`,
+                );
+            });
+        }
+
+        it('rejects a duplicate primary email with 409 naming the owner', async () => {
+            const res = await create({name: 'Dana Dev', team: 'backend', email: 'ALICE@test.com'});
+            expect(res.statusCode).toBe(409);
+            expect(res.json().message).toBe(
+                "email 'ALICE@test.com' is already mapped to Alice Dev",
+            );
+        });
+
+        it('rejects a git email already owned by another developer with 409', async () => {
+            await app.inject({
+                method: 'PATCH',
+                url: '/api/admin/developers/dev-2/identities',
+                headers: authHeaders(adminToken),
+                payload: {git_emails: ['shared@work.com']},
+            });
+            const res = await create({
+                name: 'Dana Dev',
+                team: 'backend',
+                git_emails: ['shared@work.com'],
+            });
+            expect(res.statusCode).toBe(409);
+            expect(res.json().message).toBe(
+                "git email 'shared@work.com' is already mapped to Bob Dev",
+            );
+        });
+
+        // The store joins git_emails with ',' and BOTH findByEmail and sync's
+        // buildDevLookupMap split on ',' to read them back. An element carrying
+        // its own comma therefore stores as two emails, so it must be checked as
+        // two — otherwise it passes the guard and then re-points the second
+        // email's owner's commits at the new developer.
+        it('rejects a comma-packed git_emails element whose second address is already owned (409)', async () => {
+            const res = await create({
+                name: 'Mallory Dev',
+                team: 'backend',
+                git_emails: ['mallory@corp.com, alice@test.com'],
+            });
+            expect(res.statusCode).toBe(409);
+            expect(res.json().message).toBe(
+                "git email 'alice@test.com' is already mapped to Alice Dev",
+            );
+        });
+
+        it('splits a comma-packed git_emails element into individually-resolvable emails', async () => {
+            const created = (
+                await create({
+                    name: 'Dana Dev',
+                    team: 'backend',
+                    git_emails: ['dana@work.com, dana@home.com'],
+                })
+            ).json().data;
+            expect(created.external_ids.git_emails).toBe('dana@work.com,dana@home.com');
+            // Positive control: each half resolves on its own, which is exactly
+            // what the guard above had to have checked.
+            expect(findByEmail(db, 'dana@work.com')?.id).toBe(created.id);
+            expect(findByEmail(db, 'dana@home.com')?.id).toBe(created.id);
+        });
+
+        it('writes nothing when the identity check rejects (check + insert are one transaction)', async () => {
+            const before = (
+                await app.inject({
+                    method: 'GET',
+                    url: '/api/admin/developers',
+                    headers: authHeaders(adminToken),
+                })
+            ).json().data.length;
+            const res = await create({name: 'Dana Dev', team: 'backend', email: 'alice@test.com'});
+            expect(res.statusCode).toBe(409);
+            const after = (
+                await app.inject({
+                    method: 'GET',
+                    url: '/api/admin/developers',
+                    headers: authHeaders(adminToken),
+                })
+            ).json().data.length;
+            expect(after).toBe(before);
         });
     });
 

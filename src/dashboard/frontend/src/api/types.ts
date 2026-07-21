@@ -874,6 +874,21 @@ export interface AdminDeveloper {
     created_at: string;
 }
 
+/**
+ * The body of POST /api/admin/developers (DO1.1). `name` and `team` are
+ * required; every identity is optional, and the server rejects any
+ * git-attribution id or email already owned by another developer with a 409.
+ */
+export interface AdminDeveloperInput {
+    name: string;
+    team: string;
+    email?: string;
+    github?: string;
+    bitbucket?: string;
+    gitlab?: string;
+    git_emails?: string[];
+}
+
 /** A subscription as returned by the admin subscriptions API. */
 export interface AdminSubscription {
     id: string;

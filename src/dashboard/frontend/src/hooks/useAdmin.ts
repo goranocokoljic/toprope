@@ -10,6 +10,7 @@ import {queryKeys} from '../api/queryKeys';
 import type {
     AdminDataSources,
     AdminDeveloper,
+    AdminDeveloperInput,
     AdminGitProvider,
     AdminPasswordReset,
     AdminSubscription,
@@ -96,6 +97,22 @@ export function useUpdateAdminTeam(): UseMutationResult<
 // --- Developers ---
 export function useAdminDevelopers(): UseQueryResult<AdminDeveloper[], Error> {
     return useQuery({queryKey: queryKeys.adminDevelopers, queryFn: api.getAdminDevelopers});
+}
+
+/**
+ * Create a developer (DO1.1 / #251). Invalidates the developers list so the new
+ * row appears without a manual refetch.
+ */
+export function useCreateAdminDeveloper(): UseMutationResult<
+    AdminDeveloper,
+    Error,
+    AdminDeveloperInput
+> {
+    const qc = useQueryClient();
+    return useMutation({
+        mutationFn: api.createAdminDeveloper,
+        onSuccess: () => void qc.invalidateQueries({queryKey: queryKeys.adminDevelopers}),
+    });
 }
 
 export function useUpdateAdminDeveloperIdentities(): UseMutationResult<
