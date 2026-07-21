@@ -535,6 +535,33 @@ describe('operator exclusion patterns (#256)', () => {
         it('defaults to no exclusions, leaving behaviour exactly as #254 defined it', () => {
             expect(classifyAuthor({login: 'svc-deploy'})).toEqual(classifyAuthor({login: 'svc-deploy'}, []));
         });
+
+        it('CLAMPS the match subject, bounding the n in the pattern engine backtracking cost (TST-1)', () => {
+            // The config boundary caps the WILDCARD count; this clamp caps the subject
+            // length. Both factors are needed — backtracking cost grows with each — and
+            // both inputs are provider/committer-supplied and otherwise unbounded
+            // (`upsertRawAuthorDaily` passes the identity columns through verbatim). This
+            // runs inside the sync write transaction, so an unbounded subject means the
+            // SQLite write lock is held for the duration of the backtrack.
+            //
+            // The clamp is observable: a pattern anchored on a suffix beyond the 320-char
+            // cut cannot match, because the tail was truncated away.
+            const suffix = [/^.*abc$/i];
+
+            // Positive control — the SAME pattern matches when the subject is short, so a
+            // failure below means the clamp fired, not that the pattern is simply inert.
+            expect(classifyAuthor({login: 'xabc'}, suffix).isBot).toBe(true);
+            expect(classifyAuthor({login: null, email: 'xabc'}, suffix).isBot).toBe(true);
+
+            // Beyond the clamp the 'abc' tail is cut off, so neither field matches.
+            const long = `${'x'.repeat(400)}abc`;
+            expect(classifyAuthor({login: long}, suffix).isBot).toBe(false);
+            expect(classifyAuthor({login: null, email: long}, suffix).isBot).toBe(false);
+
+            // …and truncation can only turn a match into a non-match, never a human into a
+            // bot: a pattern anchored on the PREFIX still matches past the clamp.
+            expect(classifyAuthor({login: long}, [/^x.*$/i]).isBot).toBe(true);
+        });
     });
 
     describe('listAuthorCandidates', () => {

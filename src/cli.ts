@@ -21,6 +21,7 @@ import {ClaudeCodeSync} from './connectors/claude-code/sync';
 import {WindsurfSync} from './connectors/windsurf/sync';
 import {CursorSync} from './connectors/cursor/sync';
 import {GitSync} from './connectors/git/sync';
+import {replayDeveloper} from './connectors/git/projection';
 import {setHistoryFloor} from './cli/git-history-floor';
 import {runPipeline} from './scheduler/sync-pipeline';
 import {importCsv} from './expenses/importer';
@@ -430,8 +431,16 @@ devCommand
                     console.error(`Error: developer with id '${options.id}' not found.`);
                     process.exit(1);
                 }
+                // Re-project: the identity map just changed, and `git_snapshots` is a
+                // pure function of (raw store, identity map). Same reason the admin
+                // identities PATCH replays — without this, a REMOVED or corrected
+                // identity leaves this developer holding cells no raw row resolves to
+                // (sync's `cells`-mode projection never retracts), and an ADDED one
+                // attributes nothing until some unrelated whole-day rebuild happens by.
+                const replay = replayDeveloper(db, dev.id);
                 console.log(`Developer '${dev.name}' (${dev.id}) updated.`);
                 console.log('External IDs:', JSON.stringify(dev.external_ids, null, 2));
+                console.log(`Re-attributed ${replay.datesCovered} snapshot date(s).`);
             } finally {
                 db.close();
             }
@@ -460,6 +469,9 @@ devCommand
                 console.log(`Discovering members of GitHub org '${options.org}'...`);
                 const result = await discoverOrgMembers(db, options.org, token, options.team);
                 console.log(`Created ${result.created.length} developer(s).`);
+                if (result.created.length > 0) {
+                    console.log(`Attributed ${result.datesAttributed} snapshot date(s) of retained history.`);
+                }
                 if (result.skipped.length > 0) {
                     console.log(
                         `Skipped ${result.skipped.length} duplicate(s): ${result.skipped.join(', ')}`,

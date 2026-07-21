@@ -69,6 +69,7 @@ function candidateLabel(candidate: AuthorCandidate): string {
 function prefillFromCandidate(candidate: AuthorCandidate): {
     name: string;
     email: string;
+    gitEmails: string;
     github: string;
     bitbucket: string;
     gitlab: string;
@@ -78,6 +79,15 @@ function prefillFromCandidate(candidate: AuthorCandidate): {
     return {
         name: candidate.display_name ?? candidate.login ?? candidate.email ?? '',
         email: candidate.email ?? '',
+        // Seed the candidate's OWN commit address into git_emails as well, mirroring the
+        // server-side `candidateCreateInput`. The Email field is pre-filled with it and is
+        // the field an admin naturally corrects — a noreply address looks like junk next to
+        // a placeholder reading `jane@company.com`. If it only lived there, replacing it
+        // would drop the one address the retained rows actually carry, and the promotion
+        // would "succeed" while attributing nothing (the confirmation banner would say "no
+        // retained history matched"). Duplicating it here is harmless: the write boundary
+        // skips a git_email equal to the primary email.
+        gitEmails: candidate.email ?? '',
         github: provider === 'github' ? login : '',
         bitbucket: provider === 'bitbucket' ? login : '',
         gitlab: provider === 'gitlab' ? login : '',
@@ -299,7 +309,7 @@ function CreateDeveloperFormModal({
         github: seed?.github ?? '',
         bitbucket: seed?.bitbucket ?? '',
         gitlab: seed?.gitlab ?? '',
-        gitEmails: '',
+        gitEmails: seed?.gitEmails ?? '',
     });
 
     // Archived teams are not create targets (the server rejects them too).

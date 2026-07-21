@@ -3,6 +3,7 @@ import type {Developer} from './types';
 import Database from 'better-sqlite3';
 import {addDeveloper, findByGithubUsername} from './developers';
 import {ensureTeam} from './teams';
+import {replayDevelopers} from '../connectors/git/projection';
 
 interface GithubMember {
     login: string;
@@ -67,6 +68,8 @@ async function fetchUserDetail(login: string, token: string): Promise<GithubUser
 export interface DiscoveryResult {
     created: Developer[];
     skipped: string[];
+    /** Distinct UTC days the created developers' retained history was re-projected over. */
+    datesAttributed: number;
 }
 
 export async function discoverOrgMembers(
@@ -114,5 +117,20 @@ export async function discoverOrgMembers(
         created.push(dev);
     }
 
-    return {created, skipped};
+    // Attribute the retained history the new logins now resolve. Without this, org
+    // discovery would be the ONE onboarding path that silently opts out of the epic's
+    // guarantee — `dev add`, `dev discover-repo --promote` and the admin create route
+    // all replay, and the docs state the guarantee universally. It would not self-heal
+    // either: sync projects in `cells` mode, which never revisits a past day.
+    //
+    // Batched into one whole-day rebuild rather than one per developer, for the same
+    // reason `promoteAllCandidates` batches — a `dates`-mode projection's cost is driven
+    // by the day set, not by whose replay asked for it, and a freshly-discovered org
+    // shares almost all of its active days.
+    const replay =
+        created.length > 0
+            ? replayDevelopers(db, created.map((d) => d.id)).result
+            : {cellsWritten: 0, cellsRetracted: 0, cellsSkippedLegacy: 0, datesCovered: 0};
+
+    return {created, skipped, datesAttributed: replay.datesCovered};
 }

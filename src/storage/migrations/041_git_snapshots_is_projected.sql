@@ -19,12 +19,21 @@
 -- break. Default 0 = "not projection-owned", so every pre-existing row is preserved by
 -- construction, and only rows the projection itself stamps with 1 are ever retracted.
 --
--- KNOWN, BOUNDED UPGRADE CAVEAT: a legacy (is_projected = 0) cell is still OVERWRITTEN
--- — not merged with — when the projection later produces a value for that same
--- (developer, date). Because the git cursor is forward-only, the only cells that can be
--- both legacy-accumulated and re-projected are the days straddling the upgrade (the
--- partially-synced current day, or a day a backfill re-covers); every older day is
--- never re-fetched and so is never projected. See projectSnapshots in projection.ts.
+-- LEGACY CELLS ARE IMMUTABLE TO THE PROJECTION, IN BOTH DIRECTIONS. A legacy
+-- (is_projected = 0) cell holds an accumulated total that NO retained raw row can
+-- account for, because authorship was not retained before #253. So the projection
+-- neither retracts one (the DELETE is scoped to is_projected = 1) nor overwrites one
+-- (WRITE_SQL ends `WHERE git_snapshots.is_projected = 1`, making the upsert a no-op).
+-- Refusals are counted as `cellsSkippedLegacy` and surfaced on the sync result as the
+-- LEGACY_CELLS_SKIPPED_PREFIX advisory, so an operator is told rather than left with a
+-- clean-looking run over stale days.
+--
+-- The cells this can affect are the days straddling the upgrade (the partially-synced
+-- current day) and any day a backfill re-covers that predates retention. Those days
+-- keep their pre-upgrade totals; the alternative — overwriting them from a partial
+-- reconstruction — silently discarded whatever the raw store could not account for,
+-- including, on a per-provider backfill, another provider's whole contribution to the
+-- same day. See projectSnapshots in projection.ts.
 ALTER TABLE git_snapshots ADD COLUMN is_projected INTEGER NOT NULL DEFAULT 0;
 
 -- The retraction scan is "which projection-owned cells exist on these dates" — served

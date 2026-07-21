@@ -2067,6 +2067,14 @@ describe('AdminIdentities page', () => {
                 team: 'platform',
                 email: 'carol@work.com',
                 bitbucket: 'carol-bb',
+                // The candidate's own commit address is sent as a git_email as WELL as the
+                // primary email, mirroring the server-side `candidateCreateInput`. It is
+                // the address the retained rows actually carry, and the Email field is the
+                // one an admin naturally rewrites (a noreply address looks like junk) — if
+                // it lived only there, that edit would drop it and the promotion would
+                // succeed while attributing nothing. See the git_emails-survives-an-edit
+                // case below.
+                git_emails: ['carol@work.com'],
             });
 
             // The queue is derived server-side, so the promoted row leaves it via
@@ -2080,6 +2088,37 @@ describe('AdminIdentities page', () => {
             expect(screen.getByTestId('create-developer-confirmation')).toHaveTextContent(
                 'attributed 5 day(s) of retained history',
             );
+        });
+
+        it('keeps the candidate commit address as a git_email when the admin rewrites Email (DUP-1)', async () => {
+            // The failure this guards: an admin promotes an author whose retained rows
+            // carry a provider noreply address, sees it pre-filled in a field labelled
+            // "Email" next to a `jane@company.com` placeholder, and replaces it with the
+            // person's real address — the natural act. If the commit address lived only in
+            // that field, the created developer would claim only the new one, nothing in
+            // `raw_author_daily` would resolve, and the banner would report "no retained
+            // history matched" for a promotion that should have recovered everything.
+            renderPage(<AdminIdentities />);
+            await waitForTableLoaded();
+
+            fireEvent.click(
+                within(queue()).getAllByRole('button', {name: 'Add as developer'})[0],
+            );
+            await screen.findByRole('dialog');
+            await screen.findByRole('option', {name: 'platform'});
+            fireEvent.change(screen.getByLabelText('Team'), {target: {value: 'platform'}});
+            // The admin swaps the pre-filled commit address for the corporate one.
+            fireEvent.change(screen.getByLabelText('Email'), {
+                target: {value: 'carol.coder@corp.example'},
+            });
+            fireEvent.click(screen.getByRole('button', {name: 'Add developer'}));
+
+            await waitFor(() => expect(creates()).toHaveLength(1));
+            const body = sentBody(creates()[0]) as {email: string; git_emails?: string[]};
+            expect(body.email).toBe('carol.coder@corp.example');
+            // …and the address the commits actually carry still reaches the server, so the
+            // replay resolves.
+            expect(body.git_emails).toEqual(['carol@work.com']);
         });
 
         it('reports honestly when a create attributed no history', async () => {

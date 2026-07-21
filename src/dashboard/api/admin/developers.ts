@@ -14,6 +14,7 @@ import {
     createDeveloperWithReplay,
 } from '../../../connectors/git/onboarding';
 import {listAuthorCandidates} from '../../../connectors/git/author-candidates';
+import {replayDeveloper, type ProjectionResult} from '../../../connectors/git/projection';
 import {
     FIELD_INVALID,
     asObject,
@@ -212,7 +213,10 @@ export function registerAdminDeveloperRoutes(app: FastifyInstance, db: Database.
             // A git-attribution id (github/bitbucket/gitlab) or a git email
             // already owned by ANOTHER developer is rejected.
             let conflictMessage: string | null = null;
-            const updated = db.transaction((): ReturnType<typeof setDeveloperIdentities> => {
+            const outcome = db.transaction((): {
+                developer: ReturnType<typeof setDeveloperIdentities>;
+                replay: ProjectionResult | null;
+            } => {
                 conflictMessage = findIdentityConflict(
                     db,
                     {
@@ -226,12 +230,34 @@ export function registerAdminDeveloperRoutes(app: FastifyInstance, db: Database.
                     },
                     developer.id,
                 );
-                if (conflictMessage) return null;
-                return setDeveloperIdentities(db, developer.id, updates);
+                if (conflictMessage) return {developer: null, replay: null};
+                const result = setDeveloperIdentities(db, developer.id, updates);
+                // Re-project in the SAME transaction. An identity edit changes the
+                // identity map, and `git_snapshots` is a pure function of (raw store,
+                // identity map) — leaving it unreplayed is what makes the two diverge.
+                //
+                // The REMOVAL direction is why this is not optional. Sync projects in
+                // `cells` mode, which by design never retracts, so dropping or
+                // correcting an identity would leave this developer holding
+                // projection-owned cells that no raw row resolves to — another
+                // person's commits, on their dashboard and in every team aggregate
+                // they roll up into, permanently and with nothing to self-heal it.
+                //
+                // Replaying THIS developer is sufficient for a re-map in both
+                // directions: `replayDeveloper`'s scope is the union of the days its
+                // current keys touch (what it gains) and the days it already holds
+                // cells on (what it loses), and a whole-day rebuild re-derives every
+                // developer on those days — so the identity's new owner is corrected
+                // by the same pass. Idempotent, so a no-op edit costs a rebuild that
+                // writes back what was already there.
+                return {developer: result, replay: replayDeveloper(db, developer.id)};
             })();
 
             if (conflictMessage) return conflict(reply, conflictMessage);
-            return {data: updated};
+            return {
+                data: outcome.developer,
+                replay: {dates_attributed: outcome.replay?.datesCovered ?? 0},
+            };
         },
     );
 

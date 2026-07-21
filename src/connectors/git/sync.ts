@@ -52,6 +52,47 @@ export const UNMATCHED_AUTHORS_PREFIX = 'Unmatched authors (no developer record 
 export const AUTO_CREATE_SUMMARY_PREFIX = 'auto-created';
 
 /**
+ * Prefix of the advisory pushed when the projection REFUSED to write cells because their
+ * stored rows are legacy (`is_projected = 0`, pre-#253) — accumulated totals no retained
+ * raw row can reconstruct, so overwriting them would replace a real number with a partial
+ * one.
+ *
+ * An ADVISORY rather than a failure: the run itself succeeded and the refusal is the safe
+ * choice. But it must be SAID, because it is the one case where "the sync completed" stops
+ * implying "the data for those days is current" — an upgraded deployment's straddling day,
+ * or a backfill over a window that predates retention. A full distinctive sentence, not a
+ * bare word, so a future error can never collide with it.
+ */
+export const LEGACY_CELLS_SKIPPED_PREFIX = 'Legacy snapshot cells left untouched:';
+
+/** Every sentinel that marks an `errors` entry as advisory rather than a failure. */
+const ADVISORY_PREFIXES: readonly string[] = [
+    UNMATCHED_AUTHORS_PREFIX,
+    AUTO_CREATE_SUMMARY_PREFIX,
+    LEGACY_CELLS_SKIPPED_PREFIX,
+];
+
+/**
+ * Is this `SyncResult.errors` entry an ADVISORY (something the run wants to report) rather
+ * than a FAILURE (something that went wrong)?
+ *
+ * `errors` carries both, because advisories describe the steady state of a healthy sync —
+ * unmatched CI bots and external contributors exist in nearly every real repo — and a run
+ * that reports them synced perfectly well. Every consumer that classifies a run's outcome
+ * must agree on which is which, so the rule lives here, once, beside the sentinels it
+ * matches. Two consumers previously disagreed: the sync-now route excluded advisories, the
+ * scheduler did not, so a repo with one bot author had every scheduled run retried in full
+ * (a second complete network fetch) and logged as an error.
+ *
+ * Auto-create FAILURE lines deliberately match nothing here: a promotion that could not
+ * complete is authorship left unattributed, and the operator must see it turn a provider
+ * red rather than have it hidden behind the success summary's sentinel.
+ */
+export function isAdvisoryError(error: string): boolean {
+    return ADVISORY_PREFIXES.some((prefix) => error.startsWith(prefix));
+}
+
+/**
  * The stages a sync run passes through, in pipeline order (GC#209). The network
  * fetch dominates wall time, so `listing_repos`/`fetching` are what a 1s HTTP
  * poll realistically observes; `analyzing`/`writing` are synchronous and brief —
@@ -1763,7 +1804,7 @@ export class GitSync implements ConnectorInterface {
                     // twice, badly wrong for two orgs' genuinely different PRs on one day: the
                     // smaller org's count would vanish, permanently, since the cursor advances
                     // past the window. These sides ARE disjoint, so they sum.
-                    const dedupeKey = `${rawAuthorKey} ${metrics.date}`;
+                    const dedupeKey = `${rawAuthorKey}\u0000${metrics.date}`;
                     const prior = rawWrites.get(dedupeKey);
                     rawWrites.set(
                         dedupeKey,
@@ -1839,10 +1880,15 @@ export class GitSync implements ConnectorInterface {
             // rather than dropping the other provider's same-day contribution (#192/#205).
             const projection = projectSnapshots(db, {cells: [...touchedCells.values()]});
             const written = projection.cellsWritten;
-            // Every touched cell is rebuilt by construction (each has at least the raw row
-            // that produced it), so nothing is skipped. Kept in the result shape because
-            // SyncResult is a cross-connector contract.
-            const skipped = 0;
+            // A touched cell is skipped ONLY when its stored row is legacy (`is_projected
+            // = 0`, pre-#253) and the projection refuses to overwrite an accumulated total
+            // it cannot reconstruct. That is real, operator-visible data: on an upgraded
+            // deployment the day straddling the upgrade is legacy, so this run's newly
+            // retained commits for that day are NOT written while the cursor advances past
+            // them. Reporting 0 here would make an incomplete run read as a clean one —
+            // exactly the "completion signal is not a currency claim" failure. Surfaced as
+            // an advisory below as well, since `records_skipped` alone doesn't say why.
+            const skipped = projection.cellsSkippedLegacy;
             // Resolved HERE, against the post-auto-create map — see `fetchedPRRecords`.
             for (const {record, providerType} of fetchedPRRecords) {
                 const developerId = resolveDeveloperId(
@@ -1882,6 +1928,10 @@ export class GitSync implements ConnectorInterface {
             snapshotsWritten = 0;
             snapshotsSkipped = 0;
             autoCreateAdvisories.length = 0;
+            // Derived from writes that were discarded, so reporting it would describe a
+            // state that does not exist — same reason the auto-create advisories are
+            // cleared. The rollback error below is the honest signal.
+            allUnmatched.clear();
             errors.push(
                 `Failed to write sync data (transaction rolled back — no cursor advanced, window will be re-fetched next run): ${err instanceof Error ? err.message : String(err)}`,
             );
@@ -1889,6 +1939,15 @@ export class GitSync implements ConnectorInterface {
 
         if (allUnmatched.size > 0) {
             errors.push(`${UNMATCHED_AUTHORS_PREFIX} ${[...allUnmatched].join(', ')}`);
+        }
+
+        // Say WHY cells were skipped, not just how many. `records_skipped` is a bare
+        // number on the sync log; without this an operator sees a "complete" run whose
+        // count silently disagrees with the data, and has nothing to search for.
+        if (snapshotsSkipped > 0) {
+            errors.push(
+                `${LEGACY_CELLS_SKIPPED_PREFIX} ${snapshotsSkipped} cell(s) were left untouched because they hold pre-upgrade totals the projection cannot reconstruct. Their raw authorship IS retained; re-run "sync older history" for the affected window if those days matter.`,
+            );
         }
 
         return {connector: CONNECTOR_NAME, snapshotsWritten, snapshotsSkipped, errors, lastSyncTime: now};
@@ -1913,11 +1972,16 @@ export class GitSync implements ConnectorInterface {
      * and `unreviewed` — the flag that keeps a self-asserted commit email from becoming an
      * attribution claim when nobody is vouching for the row — all passed as options.
      *
-     * Cost note: each creation replays that developer's retained dates, so N new humans cost
-     * N replays. That is a one-time first-sync shape — steady state creates ~0 — and it sits
-     * inside a run already dominated by minutes of network fetch. Batching the replays into
-     * one projection would mean forking the create path away from the canonical helper every
-     * other surface uses; the drift is the more expensive problem.
+     * Cost note: the creations are batched into ONE whole-day rebuild, not one replay each
+     * (`promoteAllCandidates` defers the per-create replay and issues a single
+     * `replayDevelopers` over the union of their dates). That matters because this runs
+     * inside the run's write transaction: a `dates`-mode projection rebuilds every cell on
+     * the days it covers regardless of whose replay asked for it, so the per-creation shape
+     * re-did almost the same rebuild once per author and held the SQLite write lock for the
+     * duration. Batching is exact rather than approximate — the projection is idempotent
+     * and order-independent, so one pass over the union writes what N passes converge to.
+     * It also does NOT fork the create path: `createDeveloperWithReplay` is still the single
+     * write boundary; only the projection call is hoisted out of the loop.
      */
     private runAutoCreate(
         db: Database.Database,

@@ -908,6 +908,73 @@ describe('admin API', () => {
             ]);
         });
 
+        it('re-maps an identity: the PATCH attributes the new owner AND retracts the old one (SEC-1)', async () => {
+            retain('adam', '2026-07-01', 5);
+            retain('adam', '2026-07-02', 4);
+
+            // dev-1 owns github:adam and is attributed adam's two days.
+            const first = await app.inject({
+                method: 'POST',
+                url: '/api/admin/developers',
+                headers: authHeaders(adminToken),
+                payload: {name: 'Wrong Owner', team: 'backend', github: 'adam'},
+            });
+            expect(first.statusCode).toBe(201);
+            const wrongId = first.json().data.id as string;
+            const snapsFor = (id: string): unknown[] =>
+                db
+                    .prepare('SELECT date, commits FROM git_snapshots WHERE developer_id = ? ORDER BY date')
+                    .all(id);
+            expect(snapsFor(wrongId)).toHaveLength(2);
+
+            // A second developer, with no git identity yet.
+            const second = await app.inject({
+                method: 'POST',
+                url: '/api/admin/developers',
+                headers: authHeaders(adminToken),
+                payload: {name: 'Real Adam', team: 'backend'},
+            });
+            const rightId = second.json().data.id as string;
+            expect(snapsFor(rightId)).toEqual([]);
+
+            // Admin corrects the mistake: strip the login off the wrong developer…
+            const cleared = await app.inject({
+                method: 'PATCH',
+                url: `/api/admin/developers/${wrongId}/identities`,
+                headers: authHeaders(adminToken),
+                payload: {github: ''},
+            });
+            expect(cleared.statusCode).toBe(200);
+            // …which must RETRACT the cells they were holding. Without a replay on the
+            // identity-edit path these survive forever: sync projects in `cells` mode and
+            // never retracts, so the wrong developer would keep another person's commits
+            // on their dashboard and in every team aggregate they roll up into.
+            expect(snapsFor(wrongId)).toEqual([]);
+
+            // …and give it to the right one, which attributes the same history.
+            const moved = await app.inject({
+                method: 'PATCH',
+                url: `/api/admin/developers/${rightId}/identities`,
+                headers: authHeaders(adminToken),
+                payload: {github: 'adam'},
+            });
+            expect(moved.statusCode).toBe(200);
+            expect(moved.json().replay).toEqual({dates_attributed: 2});
+            expect(snapsFor(rightId)).toEqual([
+                {date: '2026-07-01', commits: 5},
+                {date: '2026-07-02', commits: 4},
+            ]);
+            // No double-count across the re-map: adam's 9 commits are attributed once, to
+            // the new owner only. (Scoped to the two developers in play — the fixture
+            // seeds unrelated snapshots for other developers.)
+            const total = db
+                .prepare(
+                    'SELECT COALESCE(SUM(commits), 0) AS n FROM git_snapshots WHERE developer_id IN (?, ?)',
+                )
+                .get(wrongId, rightId) as {n: number};
+            expect(total.n).toBe(9);
+        });
+
         it('reports zero attributed dates for a developer with no retained authorship', async () => {
             retain('adam', '2026-07-01');
 

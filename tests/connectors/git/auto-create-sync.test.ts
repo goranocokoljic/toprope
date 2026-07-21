@@ -14,7 +14,13 @@ import {runMigrations} from '../../../src/storage/migrator';
 import {addTeam, getTeam, archiveTeam} from '../../../src/registry/teams';
 import {addDeveloper, listDevelopers} from '../../../src/registry/developers';
 import type {Developer} from '../../../src/registry/types';
-import {GitSync, AUTO_CREATE_SUMMARY_PREFIX, UNMATCHED_AUTHORS_PREFIX} from '../../../src/connectors/git/sync';
+import {
+    GitSync,
+    AUTO_CREATE_SUMMARY_PREFIX,
+    UNMATCHED_AUTHORS_PREFIX,
+    LEGACY_CELLS_SKIPPED_PREFIX,
+    isAdvisoryError,
+} from '../../../src/connectors/git/sync';
 import {listAuthorCandidates} from '../../../src/connectors/git/author-candidates';
 import {createDeveloperWithReplay} from '../../../src/connectors/git/onboarding';
 import type {GitConnectorConfig} from '../../../src/config/types';
@@ -501,6 +507,26 @@ describe('auto-create developers during sync (#256)', () => {
             expect(cursor.n).toBe(0);
             // And a rolled-back run must not CLAIM it onboarded anyone.
             expect(result.errors.some((e) => e.startsWith(AUTO_CREATE_SUMMARY_PREFIX))).toBe(false);
+        });
+    });
+
+    describe('advisory-vs-failure classification (TST-2)', () => {
+        it('classifies the auto-create SUMMARY as advisory and the FAILURE line as a genuine error', () => {
+            // The two lines come from the same function twelve lines apart and are told
+            // apart ONLY by their wording. If the failure line is ever reworded to start
+            // with the summary's sentinel, it is silently demoted to an advisory: a run
+            // that left authorship permanently unattributed then persists
+            // last_sync_status='ok' and the scheduler stops retrying it. Nothing else
+            // asserts that distinction, so it is pinned here against the ONE classifier
+            // every consumer now shares.
+            expect(isAdvisoryError(`${AUTO_CREATE_SUMMARY_PREFIX} 3 developers (1 bot authors skipped) into team 'discovered'`)).toBe(true);
+            expect(isAdvisoryError('Auto-create could not onboard 2 author(s): github:login:jane (conflict: ...)')).toBe(false);
+
+            // The other advisories, and a real failure, on the same rule.
+            expect(isAdvisoryError(`${UNMATCHED_AUTHORS_PREFIX} github:dependabot[bot]`)).toBe(true);
+            expect(isAdvisoryError(`${LEGACY_CELLS_SKIPPED_PREFIX} 4 cell(s) were left untouched...`)).toBe(true);
+            expect(isAdvisoryError('GitHub API error 401: bad token')).toBe(false);
+            expect(isAdvisoryError('Failed to write sync data (transaction rolled back ...)')).toBe(false);
         });
     });
 });

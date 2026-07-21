@@ -288,6 +288,32 @@ function bestKnown(stored: string | null, incoming: string | null): string | nul
 }
 
 /**
+ * Like {@link bestKnown}, but a value once observed is never REPLACED by a different one —
+ * a blank incoming still cannot erase it, and a blank stored is still filled.
+ *
+ * Used for `author_email`, where latest-wins is not a harmless preference but a way to
+ * lose already-attributed history. `sync.ts` stamps ONE sample commit email per (login,
+ * run) onto every date row that run writes, so under a LOGIN-derived key the stored
+ * address is whichever address the most recent overlapping run happened to sample —
+ * neither observation is more correct than the other. Letting it churn means a row that
+ * resolved to a developer (registered under the first address) can silently stop
+ * resolving, and the next whole-day rebuild covering that date RETRACTS their cell:
+ * history shrinking on its own, reported to nobody.
+ *
+ * Stability costs nothing here. Under an EMAIL-derived key the address is part of the key
+ * and cannot change anyway; under a login key, login resolution is tried first, so the
+ * email is only the fallback path — and a stable fallback is strictly better than an
+ * oscillating one. (Capturing EVERY address a key was seen with, rather than one per row,
+ * needs a schema change — see the `raw_author_daily` retention notes; this keeps the
+ * existing grain and removes the loss.)
+ */
+function firstKnown(stored: string | null, incoming: string | null): string | null {
+    if (stored !== null && stored.trim()) return stored;
+    const trimmed = (incoming ?? '').trim();
+    return trimmed || stored;
+}
+
+/**
  * Canonicalize a commit email to the SAME form the identity map is keyed by
  * (`buildDevLookupMap`/`resolveDeveloperId` both lowercase before lookup) and that
  * `rawAuthorKeyFor` already bakes into an email-derived key. Without this the stored
@@ -408,7 +434,7 @@ export function upsertRawAuthorDaily(
                   ...stored,
                   ...mergeDailyAcrossRuns(stored, row),
                   author_login: bestKnown(stored.author_login, row.author_login),
-                  author_email: bestKnown(stored.author_email, normalizeEmail(row.author_email)),
+                  author_email: firstKnown(stored.author_email, normalizeEmail(row.author_email)),
                   author_display_name: bestKnown(stored.author_display_name, row.author_display_name),
                   first_seen: stored.first_seen,
                   last_seen: laterInstant(stored.last_seen, observedAt),

@@ -26,8 +26,7 @@ import {providerContainer, resolveGitProviderConfigs} from '../../../connectors/
 import {createGitProvider} from '../../../connectors/git/providers/factory';
 import {
     GitSync,
-    UNMATCHED_AUTHORS_PREFIX,
-    AUTO_CREATE_SUMMARY_PREFIX,
+    isAdvisoryError,
     FIRST_SYNC_WINDOW_MIN_MONTHS,
     FIRST_SYNC_WINDOW_MAX_MONTHS,
     FIRST_SYNC_WINDOW_DEFAULT_MONTHS,
@@ -540,11 +539,7 @@ export function registerAdminGitProviderRoutes(
                 // (#256) is advisory on the same terms — it reports what was onboarded.
                 // Auto-create FAILURE lines carry neither prefix on purpose and stay
                 // classified as genuine errors. Classify and surface only those.
-                const genuineErrors = result.errors.filter(
-                    (e) =>
-                        !e.startsWith(UNMATCHED_AUTHORS_PREFIX) &&
-                        !e.startsWith(AUTO_CREATE_SUMMARY_PREFIX),
-                );
+                const genuineErrors = result.errors.filter((e) => !isAdvisoryError(e));
                 if (genuineErrors.length > 0) {
                     recordSyncOutcome(db, id, {
                         status: 'error',

@@ -1,6 +1,7 @@
 import type Database from 'better-sqlite3';
 import type {ConnectorInterface, SyncResult} from '../connectors/types';
 import {startSyncLog, finishSyncLog} from './sync-log';
+import {isAdvisoryError} from '../connectors/git/sync';
 
 export interface PipelineResult {
     connector: string;
@@ -36,7 +37,11 @@ async function runConnectorWithRetry(
         };
     }
 
-    if (result.errors.length > 0) {
+    // Retry on genuine FAILURES only. `errors` also carries advisories — unmatched CI bots
+    // and external contributors are the steady state of a healthy repo, so a run reporting
+    // them synced fine. Retrying on those meant every scheduled sync of a repo with one bot
+    // author did a second complete network fetch and was logged as an error, forever.
+    if (result.errors.some((e) => !isAdvisoryError(e))) {
         await sleep(retryDelayMs);
         retried = true;
         try {
