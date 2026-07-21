@@ -546,28 +546,6 @@ export interface GitSyncHealth {
 }
 
 /**
- * A provider that is ADVANCING but is still more than one cap-width behind the
- * present (#235) — a bounded catch-up in progress.
- *
- * This state is CREATED by {@link GIT_CATCHUP_WINDOW_MAX_DAYS}. Before the cap, a
- * complete run always reached `now`, so "the run completed" and "the data is
- * current" were the same statement. They no longer are: a provider recovering from
- * a 200-day stall completes every run and clears its stall streak while its cursor
- * is still ~170 days back, and needs ~6 more runs to catch up. Reporting only the
- * stall streak would call that provider healthy and print "advancing" — technically
- * true, and exactly the false all-clear an operator would act on right after
- * excluding the broken repo that caused the stall.
- */
-export interface LaggingProvider {
-    type: GitProviderType;
-    identifier: string;
-    /** The provider's current forward cursor (UTC ISO) — the instant it has synced to. */
-    cursor: string;
-    /** Whole days between {@link cursor} and now. Always > GIT_CATCHUP_WINDOW_MAX_DAYS. */
-    daysBehind: number;
-}
-
-/**
  * Classify every CONFIGURED provider's sync health in ONE pass (#248) — the single
  * canonical reader shared by `toprope doctor` and `toprope status`, so both report the
  * identical set on the identical thresholds.

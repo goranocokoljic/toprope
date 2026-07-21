@@ -589,13 +589,18 @@ function checkGitStalls(
             results.push(pass(label, 'No provider has synced yet — nothing to report'));
         } else {
             // Some current, some not. With no stalled or lagging providers here, the
-            // "not yet current" remainder is the never-synced ones plus any held below
-            // the stall alert or carrying an unreadable/future-dated cursor.
+            // "not yet current" remainder is the never-synced ones plus any that fell
+            // through every bucket: held below the stall alert, or carrying an
+            // unreadable/future-dated cursor that cannot prove currency.
             const notCurrent = total - health.current;
             const held = notCurrent - health.neverSynced;
             const parts: string[] = [];
             if (health.neverSynced > 0) parts.push(`${health.neverSynced} never synced`);
-            if (held > 0) parts.push(`${held} held below the stall alert or with an unreadable cursor`);
+            if (held > 0) {
+                parts.push(
+                    `${held} held below the stall alert, or with an unreadable or future-dated cursor`,
+                );
+            }
             results.push(
                 pass(
                     label,

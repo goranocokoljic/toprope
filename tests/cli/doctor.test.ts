@@ -446,6 +446,29 @@ describe('runDoctor', () => {
             expect(allOutput).toContain('1 never synced');
         });
 
+        it('names BOTH remainder parts when never-synced and held coexist (#248)', async () => {
+            // acme current, beta never synced, gamma held below the alert (cursor frozen).
+            // Exercises the two-element parts.join(', ') and the held = notCurrent -
+            // neverSynced subtraction with both terms non-zero — a regression that dropped
+            // a part or mis-computed `held` when both are present would otherwise ship green.
+            seedCursor('acme', 1);
+            seedCursor('gamma', 45);
+            seedStall(2, 'gamma');
+
+            await runDoctor(
+                db,
+                await reachableGitConfig(['acme', 'beta', 'gamma']),
+                tmpConfigPath,
+                MIGRATIONS_DIR,
+            );
+
+            const allOutput = output.join('\n');
+            expect(allOutput).toContain('1 of 3 provider(s) current');
+            expect(allOutput).toContain('2 not yet current');
+            expect(allOutput).toContain('1 never synced');
+            expect(allOutput).toContain('1 held below the stall alert');
+        });
+
         it('reports EVERY stalled provider, with a count matching the detail list', async () => {
             seedStall(4, 'acme');
             seedStall(6, 'beta');
