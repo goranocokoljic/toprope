@@ -329,6 +329,52 @@ describe('GitSync', () => {
         expect(bitbucketProvider.listRepos).not.toHaveBeenCalled();
     });
 
+    it('SUMS two same-type provider instances\' disjoint PRs on one day rather than max()-ing them (SEC-1)', async () => {
+        // `providerType` is the FAMILY ('github'), not the instance, so two configured
+        // GitHub orgs sharing an author produce the same raw_author_key AND the same date.
+        // Handing both to the store separately would combine them with the ACROSS-RUNS
+        // rule, which max()es prs_opened/prs_merged/review_comments_given — correct for one
+        // PR re-delivered twice, wrong here: org A's and org B's PRs are different PRs.
+        // The undercount would be permanent, since the cursor advances past the window.
+        const devLogin = 'alice';
+        seedDev(db, devLogin);
+
+        const orgA = makeMockProvider({
+            name: 'github',
+            listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+            getCommits: vi.fn().mockResolvedValue([makeProviderCommit(devLogin, '2024-01-15T10:00:00Z', 'sha-a')]),
+            getPullRequests: vi.fn().mockResolvedValue([{...makeProviderPR(devLogin), id: 'pr-a'}]),
+            getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+        });
+        const orgB = makeMockProvider({
+            name: 'github',
+            listRepos: vi.fn().mockResolvedValue([makeRepo('repo-b')]),
+            getCommits: vi.fn().mockResolvedValue([makeProviderCommit(devLogin, '2024-01-15T11:00:00Z', 'sha-b')]),
+            getPullRequests: vi.fn().mockResolvedValue([{...makeProviderPR(devLogin), id: 'pr-b'}]),
+            getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+        });
+        const createGitProvider = await getCreateGitProvider();
+        createGitProvider.mockReturnValueOnce(orgA).mockReturnValueOnce(orgB);
+
+        await new GitSync({
+            enabled: true,
+            providers: [
+                {type: 'github', org: 'org-a', auth: {type: 'token', api_token: 'token'}},
+                {type: 'github', org: 'org-b', auth: {type: 'token', api_token: 'token'}},
+            ],
+        }).sync(db);
+
+        const read = (date: string): {commits: number; prs_merged: number} | undefined =>
+            db.prepare(`SELECT commits, prs_merged FROM git_snapshots WHERE date = ?`).get(date) as
+                | {commits: number; prs_merged: number}
+                | undefined;
+
+        // One commit from each org, on the commit day…
+        expect(read('2024-01-15')?.commits).toBe(2);
+        // …and one MERGED PR from each, on the merge day. max() would have kept 1.
+        expect(read('2024-01-16')?.prs_merged).toBe(2);
+    });
+
     it('returns error when filtered provider type is not configured', async () => {
         const createGitProvider = await getCreateGitProvider();
         createGitProvider.mockReturnValue(makeMockProvider());

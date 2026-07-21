@@ -3,7 +3,12 @@ import {randomUUID} from 'crypto';
 import {aggregateDailyMetrics} from './analyzer.js';
 import {toAnalysisCommit, toAnalysisPR, toAnalysisReviewComment} from './analysis-types.js';
 import type {AnalysisCommit, AnalysisPR, AnalysisReviewComment} from './analysis-types.js';
-import {rawAuthorKeyFor, upsertRawAuthorDaily, type RawAuthorDailyInput} from './raw-author-daily.js';
+import {
+    mergeDailyDisjoint,
+    rawAuthorKeyFor,
+    upsertRawAuthorDaily,
+    type RawAuthorDailyInput,
+} from './raw-author-daily.js';
 import {
     buildDevLookupMap,
     projectSnapshots,
@@ -1593,7 +1598,11 @@ export class GitSync implements ConnectorInterface {
         // git_snapshots — is now the run's primary write: git_snapshots is derived from
         // it by projection below, so an author with no developer record is no longer
         // dropped but simply not yet projected.
-        const rawWrites: RawAuthorDailyInput[] = [];
+        // Keyed by `${raw_author_key} ${date}` so two provider INSTANCES of the same family
+        // contributing to one author-day are summed here rather than colliding in the store
+        // (see the accumulation below). Insertion-ordered, so the write pass stays
+        // deterministic.
+        const rawWrites = new Map<string, RawAuthorDailyInput>();
         // The raw author keys THIS run retained — the scope auto-create (#256) acts on.
         // Deliberately not "every current candidate": a hands-off run onboards the
         // authorship it just observed, and must not silently sweep up candidates an
@@ -1726,7 +1735,7 @@ export class GitSync implements ConnectorInterface {
                 retainedKeys.add(rawAuthorKey);
 
                 for (const [, metrics] of byDate) {
-                    rawWrites.push({
+                    const row: RawAuthorDailyInput = {
                         provider: providerType,
                         raw_author_key: rawAuthorKey,
                         author_login: login,
@@ -1745,7 +1754,21 @@ export class GitSync implements ConnectorInterface {
                         ai_signature_score: metrics.ai_signature_score,
                         avg_commit_size: metrics.avg_commit_size,
                         commit_burst_count: metrics.commit_burst_count,
-                    });
+                    };
+                    // Accumulate WITHIN the run before the store ever sees it. `providerType`
+                    // is the provider FAMILY, not the instance, so two configured GitHub orgs
+                    // (or two Bitbucket workspaces) sharing an author produce the same
+                    // (key, date) here. Pushing both would hand them to the across-runs rule,
+                    // which max()es the re-delivered PR fields — correct for one PR delivered
+                    // twice, badly wrong for two orgs' genuinely different PRs on one day: the
+                    // smaller org's count would vanish, permanently, since the cursor advances
+                    // past the window. These sides ARE disjoint, so they sum.
+                    const dedupeKey = `${rawAuthorKey} ${metrics.date}`;
+                    const prior = rawWrites.get(dedupeKey);
+                    rawWrites.set(
+                        dedupeKey,
+                        prior ? {...prior, ...mergeDailyDisjoint(prior, row)} : row,
+                    );
                 }
 
                 // Progress counter only — a live estimate for the UI, resolved against the
@@ -1779,7 +1802,7 @@ export class GitSync implements ConnectorInterface {
             // be in the store before either happens, or a freshly-created developer's
             // current-window activity would be invisible to their own replay. Splitting the
             // former single loop is exactly what buys "no second pass, no re-fetch".
-            for (const row of rawWrites) {
+            for (const row of rawWrites.values()) {
                 upsertRawAuthorDaily(db, row, now);
             }
 
@@ -1794,7 +1817,7 @@ export class GitSync implements ConnectorInterface {
             // produced them. (The same reason it is re-read at all: `devLookup` was built
             // before minutes of network fetch, during which a developer may have been added.)
             const writeLookup = buildDevLookupMap(db);
-            for (const row of rawWrites) {
+            for (const row of rawWrites.values()) {
                 const developerId = resolveDeveloperId(
                     writeLookup,
                     row.provider,

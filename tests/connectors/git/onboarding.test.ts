@@ -2,7 +2,7 @@ import {describe, it, expect, beforeEach, afterEach} from 'vitest';
 import Database from 'better-sqlite3';
 import path from 'path';
 import {runMigrations} from '../../../src/storage/migrator';
-import {addTeam, archiveTeam} from '../../../src/registry/teams';
+import {addTeam, archiveTeam, listTeams} from '../../../src/registry/teams';
 import {addDeveloper} from '../../../src/registry/developers';
 import {upsertRawAuthorDaily, type RawAuthorDailyInput} from '../../../src/connectors/git/raw-author-daily';
 import {listAuthorCandidates, type AuthorCandidate} from '../../../src/connectors/git/author-candidates';
@@ -473,6 +473,56 @@ describe('promoteAllCandidates', () => {
         // The skip carries the classifier's reason, not a bare boolean.
         const skipped = result.entries.find((e) => e.status === 'skipped_bot');
         expect(skipped?.status === 'skipped_bot' && skipped.reason).toContain('automation');
+    });
+
+    it('isolates a failing promotion to a SAVEPOINT when run inside a caller transaction (TST-1)', () => {
+        // The docstring on promoteAllCandidates claims better-sqlite3 promotes each inner
+        // `db.transaction` to a SAVEPOINT when it runs inside an OUTER transaction — which
+        // is exactly how #256's auto-create calls it, from the sync write transaction. The
+        // existing isolation test proves it OUTSIDE any outer transaction, the one case
+        // where savepoint semantics don't apply, so the claim that matters was unpinned.
+        //
+        // If it were wrong, one conflicting candidate would abort the WHOLE sync
+        // transaction: no snapshots, no cursor advance, the run silently losing everything
+        // it fetched. This asserts the opposite — the outer transaction commits, keeping
+        // both the successful promotions and an unrelated write made alongside them.
+        //
+        // The documented failure shape: TWO raw keys for one person. Jane's login-keyed
+        // rows (seeded above, 2 days) and an email-keyed row carrying the SAME address.
+        // Both are unmatched candidates when the list is snapshotted; promoting the
+        // login-keyed one mints a developer owning jane@work.com, so the email-keyed one
+        // then conflicts. Fewer commits than the login key, so it is promoted second.
+        upsertRawAuthorDaily(
+            db,
+            rawRow({
+                raw_author_key: 'github:email:jane@work.com',
+                author_login: null,
+                author_email: 'jane@work.com',
+                author_display_name: null,
+                date: '2026-07-05',
+                commits: 1,
+            }),
+        );
+
+        let result: ReturnType<typeof promoteAllCandidates> | undefined;
+        db.transaction(() => {
+            result = promoteAllCandidates(db, 'eng');
+            // An unrelated write in the OUTER transaction. If the failing inner promotion
+            // had aborted the outer one, this would be rolled back with everything else.
+            addTeam(db, 'outer-tx-survived');
+        })();
+
+        // The conflicting candidate failed, and was reported rather than swallowed…
+        expect(result?.failed).toBe(1);
+        const failed = result?.entries.find((e) => e.status === 'failed');
+        expect(failed?.status === 'failed' && failed.reason).toBe('conflict');
+        // …while the clean promotions, and the outer transaction, both committed.
+        expect(result?.promoted).toBe(2);
+        const names = (db.prepare('SELECT name FROM developers ORDER BY name').all() as {name: string}[]).map(
+            (r) => r.name,
+        );
+        expect(names).toEqual(['bob', 'jane']);
+        expect(listTeams(db).map((t) => t.name)).toContain('outer-tx-survived');
     });
 
     it('promotes bots too under --include-bots', () => {

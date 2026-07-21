@@ -318,7 +318,7 @@ describe('listAuthorCandidates — unmapped retained authors (#254)', () => {
             upsertRawAuthorDaily(db, rawRow({raw_author_key: key, author_login: login, commits}), observedAt);
         };
         // last_seen deliberately runs OPPOSITE to commit_count: if the list inherited
-        // distinctRawAuthors' last_seen tiebreak, this ordering would come out reversed.
+        // a last_seen-based tiebreak, this ordering would come out reversed.
         seed('github:login:low', 'low', 1, '2026-07-09T00:00:00.000Z');
         seed('github:login:mid', 'mid', 5, '2026-07-05T00:00:00.000Z');
         seed('github:login:high', 'high', 9, '2026-07-01T00:00:00.000Z');

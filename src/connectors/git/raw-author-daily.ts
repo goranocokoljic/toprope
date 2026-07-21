@@ -38,7 +38,7 @@ const UTC_DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
  * / negative ISO years ('+010000-01-01T00:00:00.000Z') round-trip cleanly through
  * `toISOString()` yet sort BEFORE ordinary years, which would invert every string
  * comparison of `first_seen`/`last_seen` (including the MIN/MAX in
- * {@link distinctRawAuthors}). Pinning the shape at the write boundary is what makes
+ * {@link distinctRawAuthorIdentities}). Pinning the shape at the write boundary is what makes
  * those comparisons sound.
  */
 const UTC_ISO_INSTANT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
@@ -183,6 +183,55 @@ export function commitWeightedAvg(aVal: number, aCommits: number, bVal: number, 
 }
 
 /**
+ * Merge two DISJOINT contributions to the same day — sides that share no commit and no
+ * PR, so every field is genuinely additive. The counterpart to
+ * {@link mergeDailyAcrossRuns}: same day, but the two inputs are known not to overlap,
+ * which is what makes summing (rather than max()-ing) the re-delivered PR fields correct.
+ *
+ * Two situations produce genuinely-disjoint sides, and both must use THIS rule:
+ *   - one run's contributions from two DIFFERENT provider instances of the same family
+ *     (two GitHub orgs, two Bitbucket workspaces). They resolve to the same
+ *     `raw_author_key` and day, but their PRs are different PRs — see `sync.ts`, which
+ *     accumulates with this before a single store write, precisely so the across-runs
+ *     `max()` never sees them and silently keeps only the larger org's PR count;
+ *   - two different raw authors folding into one `git_snapshots` cell (see
+ *     `mergeSnapshots`, which delegates the arithmetic here).
+ *
+ * Rate/score fields are commit-count-weighted so the result does not depend on fold
+ * ORDER — which matters because three or more identities can share a cell.
+ */
+export function mergeDailyDisjoint(a: DailyGitMetrics, b: DailyGitMetrics): DailyGitMetrics {
+    const totalCommits = a.commits + b.commits;
+    const totalPrs = a.prs_merged + b.prs_merged;
+
+    let avgTTM: number | null;
+    if (a.avg_time_to_merge_hours !== null && b.avg_time_to_merge_hours !== null && totalPrs > 0) {
+        avgTTM = (a.avg_time_to_merge_hours * a.prs_merged + b.avg_time_to_merge_hours * b.prs_merged) / totalPrs;
+    } else {
+        avgTTM = a.avg_time_to_merge_hours ?? b.avg_time_to_merge_hours;
+    }
+
+    return {
+        commits: totalCommits,
+        lines_added: a.lines_added + b.lines_added,
+        lines_removed: a.lines_removed + b.lines_removed,
+        files_changed: a.files_changed + b.files_changed,
+        prs_opened: a.prs_opened + b.prs_opened,
+        prs_merged: totalPrs,
+        review_comments_given: a.review_comments_given + b.review_comments_given,
+        avg_time_to_merge_hours: avgTTM,
+        // Commit-weighted like every other rate field. Cross-identity churn cannot be
+        // recomputed exactly without the full commit set, so this stays an approximation
+        // — but a commit-weighted one, which is both closer and (unlike a plain two-way
+        // mean) independent of the order identities are folded in.
+        code_churn_rate: commitWeightedAvg(a.code_churn_rate, a.commits, b.code_churn_rate, b.commits),
+        ai_signature_score: commitWeightedAvg(a.ai_signature_score, a.commits, b.ai_signature_score, b.commits),
+        avg_commit_size: commitWeightedAvg(a.avg_commit_size, a.commits, b.avg_commit_size, b.commits),
+        commit_burst_count: a.commit_burst_count + b.commit_burst_count,
+    };
+}
+
+/**
  * Merge an incoming per-run set of daily metrics against the STORED row for the same
  * (identity, day). This is the ACROSS-RUNS rule — the two sides are NOT disjoint:
  *
@@ -243,7 +292,7 @@ function bestKnown(stored: string | null, incoming: string | null): string | nul
  * (`buildDevLookupMap`/`resolveDeveloperId` both lowercase before lookup) and that
  * `rawAuthorKeyFor` already bakes into an email-derived key. Without this the stored
  * column would keep provider casing verbatim, so a consumer matching on it would miss
- * `Alice@Example.COM`, and `MAX(author_email)` in distinctRawAuthors would roll the
+ * `Alice@Example.COM`, and the rollups' email grouping would split the
  * same author up to whichever casing byte-sorts higher rather than to one canonical
  * value.
  */
@@ -520,39 +569,8 @@ const ROLLUP_AGGREGATES = `MAX(author_display_name) AS display_name,
                     MAX(last_seen) AS last_seen`;
 
 /**
- * One row per distinct raw author, rolled up across every retained day. A single grouped
- * query, no per-author fan-out.
- *
- * `MAX(author_login)` / `MAX(author_email)` collapse the key's days to ONE identity. That
- * is sound for the login (rows under a login-derived key carry the same login by
- * construction) but LOSSY for the email: `sync.ts` stamps one run's sample commit email
- * onto every date row that run writes, so a person committing from two addresses leaves
- * different emails on different days under one login key, and this picks whichever
- * byte-sorts higher. Callers that must not lose the other addresses — anything deciding
- * whether an author is attributed — want {@link distinctRawAuthorIdentities} instead.
- *
- * Ordering is explicit and total: busiest author first, then most-recently-seen, with
- * the UNIQUE (provider, raw_author_key) identity as the final tiebreak — never a
- * nondeterministic rowid or UUID.
- */
-export function distinctRawAuthors(db: Database.Database): DistinctRawAuthor[] {
-    return db
-        .prepare(
-            `SELECT provider,
-                    raw_author_key,
-                    MAX(author_login) AS login,
-                    MAX(author_email) AS email,
-                    ${ROLLUP_AGGREGATES}
-             FROM raw_author_daily
-             GROUP BY provider, raw_author_key
-             ORDER BY commit_count DESC, last_seen DESC, provider ASC, raw_author_key ASC`,
-        )
-        .all() as DistinctRawAuthor[];
-}
-
-/**
  * One row per (author key, observed login, observed email) — the SAME rollup as
- * {@link distinctRawAuthors} at a finer grain, keeping every distinct identity a key was
+ * the per-key rollup at a finer grain, keeping every distinct identity a key was
  * ever seen with instead of collapsing them to one.
  *
  * This grain exists because attribution is decided PER ROW: `foldRawRows` (the projection)

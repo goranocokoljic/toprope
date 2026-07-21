@@ -318,7 +318,7 @@ function foldVariant(kept: DistinctRawAuthor, next: RawAuthorIdentityVariant): D
  * `(author_login, author_email)`, and `sync.ts` stamps one run's sample commit email onto
  * every date row that run writes — so one login key can carry a mapped address on some days
  * and an unmapped one on others. Collapsing the key to a single email first (what
- * `distinctRawAuthors` does, correctly, for its own callers) would then get BOTH directions
+ * a per-key rollup would, by collapsing them) would then get BOTH directions
  * wrong:
  *   - the collapsed email happens to be the MAPPED one → the author vanishes from the queue
  *     while their other days project to nobody. Silently unattributed history with no

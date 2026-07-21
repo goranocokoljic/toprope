@@ -27,7 +27,7 @@ import {addDeveloper} from '../../registry/developers';
 import type {Developer} from '../../registry/types';
 import {getTeam} from '../../registry/teams';
 import {findIdentityConflict} from '../../registry/identity-guard';
-import {replayDeveloper, type ProjectionResult} from './projection';
+import {replayDeveloper, replayDevelopers, type ProjectionResult} from './projection';
 import {listAuthorCandidates, type AuthorCandidate} from './author-candidates';
 import {isLoginKey} from './raw-author-daily';
 import type {GitProviderType} from './providers/types';
@@ -73,6 +73,7 @@ export type CreateDeveloperOutcome =
 export function createDeveloperWithReplay(
     db: Database.Database,
     input: CreateDeveloperInput,
+    options: {deferReplay?: boolean} = {},
 ): CreateDeveloperOutcome {
     const name = input.name.trim();
     const team = input.team.trim();
@@ -138,7 +139,16 @@ export function createDeveloperWithReplay(
         // Inside the same transaction on purpose — see the module header. The developer row
         // is visible to `buildDevLookupMap` here (same connection), so the replay resolves
         // the identities that were just written.
-        const replay = replayDeveloper(db, developer.id);
+        //
+        // `deferReplay` is for BULK callers only: a `dates`-mode projection rebuilds whole
+        // days across all developers, so running one per creation repeats nearly the same
+        // rebuild N times. The bulk path creates everyone first and issues a single
+        // `replayDevelopers` over the union instead (same output — the projection is
+        // idempotent). It must never be set by a caller that doesn't then replay, or the
+        // developer is created with their history left unattributed.
+        const replay = options.deferReplay
+            ? {cellsWritten: 0, cellsRetracted: 0, cellsSkippedLegacy: 0, datesCovered: 0}
+            : replayDeveloper(db, developer.id);
         return {ok: true, developer, replay};
     })();
 }
@@ -380,7 +390,9 @@ export function promoteAllCandidates(
         const input = options.unreviewed
             ? verifiedCreateInput(candidate, team)
             : candidateCreateInput(candidate, team);
-        const outcome = createDeveloperWithReplay(db, input);
+        // Replay DEFERRED — see below. Each create still gets its own transaction, so the
+        // per-promotion failure isolation is unchanged.
+        const outcome = createDeveloperWithReplay(db, input, {deferReplay: true});
         entries.push(
             outcome.ok
                 ? {
@@ -391,6 +403,24 @@ export function promoteAllCandidates(
                   }
                 : {status: 'failed', candidate, reason: outcome.reason, message: outcome.message},
         );
+    }
+
+    // ONE whole-day rebuild covering everyone just created, instead of one per promotion.
+    // A `dates`-mode projection's cost is driven by the day set rather than by whose replay
+    // requested it, and promoted candidates overwhelmingly share days, so the per-candidate
+    // version re-rebuilt almost the same days once per author — quadratic in practice, and
+    // holding the SQLite write lock throughout when this runs inside the sync write
+    // transaction (#256). Idempotency is what makes the collapse exact: one pass over the
+    // union writes precisely what N passes would have converged to.
+    const promotedIds = entries.flatMap((e) => (e.status === 'promoted' ? [e.developer.id] : []));
+    if (promotedIds.length > 0) {
+        const {datesPerDeveloper} = replayDevelopers(db, promotedIds);
+        for (const entry of entries) {
+            if (entry.status !== 'promoted') continue;
+            // Per-entry reporting stays per-developer: the operator-facing "N date(s)
+            // attributed" is about THIS author's history, not the batch's total.
+            entry.replay = {...entry.replay, datesCovered: datesPerDeveloper.get(entry.developer.id) ?? 0};
+        }
     }
 
     return {

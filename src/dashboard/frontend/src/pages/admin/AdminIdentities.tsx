@@ -571,6 +571,13 @@ export function AdminIdentities(): JSX.Element {
                 no retained authorship, which is worth noticing. */}
             {created ? (
                 <div
+                    // `role="status"` for the same reason `TempPasswordBanner` carries it
+                    // (#239): this banner renders on the PAGE after `FormModal` unmounts and
+                    // focus is restored to the ＋ Add developer header button, so it lands
+                    // nowhere near the user's focus. Unannounced, a screen-reader admin gets
+                    // no confirmation at all — and the attributed-days count IS the payload
+                    // of the feature, the thing #251/#255 promise the operator.
+                    role="status"
                     data-testid="create-developer-confirmation"
                     className="rounded-lg border border-success/30 bg-success/10 px-4 py-3 text-sm text-success"
                 >

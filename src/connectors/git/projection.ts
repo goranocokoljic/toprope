@@ -33,8 +33,8 @@ import type Database from 'better-sqlite3';
 import {randomUUID} from 'crypto';
 import {
     chunk,
-    commitWeightedAvg,
-    distinctRawAuthors,
+    mergeDailyDisjoint,
+    distinctRawAuthorIdentities,
     readRawDailyForDates,
     readRawDailyForKeys,
     READ_CHUNK_SIZE,
@@ -94,6 +94,13 @@ export interface ProjectionResult {
      * Always 0 in `cells` mode, which never retracts.
      */
     cellsRetracted: number;
+    /**
+     * Cells the projection produced a value for but REFUSED to write because the stored
+     * cell is legacy (`is_projected = 0`) — a pre-#253 accumulated total no raw row can
+     * reconstruct. Non-zero only on an upgraded deployment, and only until those days
+     * age out of interest.
+     */
+    cellsSkippedLegacy: number;
     /** Distinct UTC days the projection covered. */
     datesCovered: number;
 }
@@ -193,36 +200,16 @@ export function resolveDeveloperId(
  * PR can appear under two keys. This is NOT the rule for combining across RUNS under
  * one key — that is `mergeDailyAcrossRuns`, which lives one level down in the raw store
  * and has already been applied by the time a row gets here.
+ *
+ * The metric arithmetic itself is `mergeDailyDisjoint`, shared with the sync path's
+ * same-run cross-provider-instance accumulation; this function only carries the
+ * `git_snapshots`-specific identity columns over it.
  */
 export function mergeSnapshots(a: GitSnapshotRow, b: GitSnapshotRow): GitSnapshotRow {
-    const totalCommits = a.commits + b.commits;
-    const totalPrs = a.prs_merged + b.prs_merged;
-
-    let avgTTM: number | null;
-    if (a.avg_time_to_merge_hours !== null && b.avg_time_to_merge_hours !== null && totalPrs > 0) {
-        avgTTM = (a.avg_time_to_merge_hours * a.prs_merged + b.avg_time_to_merge_hours * b.prs_merged) / totalPrs;
-    } else {
-        avgTTM = a.avg_time_to_merge_hours ?? b.avg_time_to_merge_hours;
-    }
-
-    // Cross-identity churn cannot be recomputed without the full commit set; simple average is an approximation.
-    const avgChurn = (a.code_churn_rate + b.code_churn_rate) / 2;
-
     return {
         developer_id: a.developer_id,
         date: a.date,
-        commits: totalCommits,
-        lines_added: a.lines_added + b.lines_added,
-        lines_removed: a.lines_removed + b.lines_removed,
-        files_changed: a.files_changed + b.files_changed,
-        prs_opened: a.prs_opened + b.prs_opened,
-        prs_merged: totalPrs,
-        review_comments_given: a.review_comments_given + b.review_comments_given,
-        avg_time_to_merge_hours: avgTTM,
-        code_churn_rate: avgChurn,
-        ai_signature_score: commitWeightedAvg(a.ai_signature_score, a.commits, b.ai_signature_score, b.commits),
-        avg_commit_size: commitWeightedAvg(a.avg_commit_size, a.commits, b.avg_commit_size, b.commits),
-        commit_burst_count: a.commit_burst_count + b.commit_burst_count,
+        ...mergeDailyDisjoint(a, b),
         data_source: a.data_source === b.data_source ? a.data_source : 'multi',
     };
 }
@@ -304,7 +291,8 @@ const WRITE_SQL = `INSERT INTO git_snapshots
        avg_commit_size = excluded.avg_commit_size,
        commit_burst_count = excluded.commit_burst_count,
        data_source = excluded.data_source,
-       is_projected = 1`;
+       is_projected = 1
+     WHERE git_snapshots.is_projected = 1`;
 
 /**
  * Rebuild `git_snapshots` from `raw_author_daily` for the requested scope.
@@ -321,26 +309,28 @@ const WRITE_SQL = `INSERT INTO git_snapshots
  * can call this inside the run's own write transaction and still get one atomic unit
  * with its cursor advance.
  *
- * KNOWN UPGRADE CAVEAT, stated at its true blast radius — a cell written before #253
- * (`is_projected = 0`) holds an accumulated total that NO raw row can account for,
- * because raw authorship was not retained then. Such a cell is left completely alone
- * until the projection produces a value for it, at which point it is OVERWRITTEN by the
- * raw-derived value rather than merged with. The affected set is not "a sliver of today":
- * it is the CURSOR DAY. A provider whose cursor sits at `D 23:00` re-covers only
- * `[D 23:00, …]` on its first post-upgrade run, so day `D` projects from that final hour
- * alone and replaces a legacy cell that held the whole of `D` — up to ~23 hours of that
- * day's activity, per developer, gone for good (the forward cursor never re-fetches `D`).
- * Bounded to ONE calendar day per provider and never recurring, but silent and
- * unrecoverable, so it is called out here rather than discovered.
+ * LEGACY CELLS ARE NEVER WRITTEN. A cell written before #253 (`is_projected = 0`) holds
+ * an accumulated total that NO raw row can account for, because raw authorship was not
+ * retained then. The `ON CONFLICT … WHERE git_snapshots.is_projected = 1` guard makes the
+ * upsert a no-op for such a cell: it is left exactly as it stands and counted in
+ * `cellsSkippedLegacy` rather than replaced by a raw-derived value that can only be
+ * partial.
+ *
+ * That guard is load-bearing well beyond the upgrade's cursor day, because `runSync`'s
+ * `backfill` option drives this same write path over ARBITRARY past windows. Backfill is
+ * per-provider, so a day whose legacy cell held GitHub + Bitbucket activity, backfilled on
+ * GitHub alone, would otherwise be rewritten as GitHub-only — permanently losing the other
+ * provider's contribution to a day the forward cursor will never re-fetch. Refusing the
+ * write keeps the legacy total intact; the day simply stays legacy-owned.
  *
  * Merging into a legacy cell instead was considered and rejected: it is not idempotent
  * (the second projection of the same cell would have to either re-add the legacy residue
  * or drop it), and idempotent re-projection is the property the whole replay design rests
- * on. Retraction, unlike overwrite, is strict and never touches a legacy row at all (see
- * `is_projected`, migration 041).
+ * on. Retraction is likewise strict and never touches a legacy row (see `is_projected`,
+ * migration 041) — so legacy cells are immutable to the projection in BOTH directions.
  */
 export function projectSnapshots(db: Database.Database, target: ProjectionTarget): ProjectionResult {
-    const empty: ProjectionResult = {cellsWritten: 0, cellsRetracted: 0, datesCovered: 0};
+    const empty: ProjectionResult = {cellsWritten: 0, cellsRetracted: 0, cellsSkippedLegacy: 0, datesCovered: 0};
 
     const wholeDayRebuild = 'dates' in target;
     // Drop malformed days rather than letting one bad string widen or corrupt the scan;
@@ -362,12 +352,21 @@ export function projectSnapshots(db: Database.Database, target: ProjectionTarget
     return db.transaction((): ProjectionResult => {
         const write = db.prepare(WRITE_SQL);
         let cellsWritten = 0;
+        let cellsSkippedLegacy = 0;
         for (const [key, snap] of projected) {
             // In `cells` mode a cell outside the requested set belongs to a developer this
             // run never touched; rebuilding it would be correct but is not this call's
             // business, and doing so would silently widen a scoped sync into a global one.
             if (wantedCells && !wantedCells.has(key)) continue;
-            write.run({id: randomUUID(), ...snap});
+            // `changes === 0` means the ON CONFLICT guard refused: the cell exists and is
+            // LEGACY (`is_projected = 0`). Its accumulated total predates retention, so no
+            // raw-derived value can reconstruct it — overwriting would silently discard
+            // whatever the projection cannot account for. Left intact and counted.
+            const {changes} = write.run({id: randomUUID(), ...snap});
+            if (changes === 0) {
+                cellsSkippedLegacy++;
+                continue;
+            }
             cellsWritten++;
         }
 
@@ -394,7 +393,7 @@ export function projectSnapshots(db: Database.Database, target: ProjectionTarget
             }
         }
 
-        return {cellsWritten, cellsRetracted, datesCovered: dates.length};
+        return {cellsWritten, cellsRetracted, cellsSkippedLegacy, datesCovered: dates.length};
     })();
 }
 
@@ -423,29 +422,113 @@ export function projectSnapshots(db: Database.Database, target: ProjectionTarget
  * or already-deleted id must fail loudly rather than silently rebuild nothing.
  */
 export function replayDeveloper(db: Database.Database, developerId: string): ProjectionResult {
-    const exists = db.prepare('SELECT id FROM developers WHERE id = ?').get(developerId) as
-        | {id: string}
-        | undefined;
-    if (!exists) {
-        throw new ProjectionError('developer_not_found', `No developer with id: ${developerId}`);
+    const {result} = replayDevelopers(db, [developerId]);
+    return result;
+}
+
+/** What a batched replay covered, in total and per developer. */
+export interface BatchReplayResult {
+    /** The single whole-day rebuild that covered every requested developer. */
+    result: ProjectionResult;
+    /** developer_id → the number of distinct UTC days THAT developer's scope contributed. */
+    datesPerDeveloper: Map<string, number>;
+}
+
+/**
+ * Replay SEVERAL developers as ONE whole-day rebuild — the bulk-promotion entry point
+ * ({@link replayDeveloper} is the one-developer wrapper over it).
+ *
+ * Batching is not an optimization here, it is what makes bulk promotion viable. A
+ * `dates`-mode projection rebuilds every cell on the days it covers, for EVERY developer
+ * — the cost is driven by the day set, not by whose replay asked for it. Replaying N
+ * developers one at a time therefore repeats the whole-org rebuild N times over almost
+ * exactly the same days: promoting 200 authors who share ~400 active days is 200 full
+ * rebuilds of those 400 days, plus 200 identity rollups. Unioning the scopes first
+ * collapses that to a single rebuild covering the same days, with identical output —
+ * the projection is idempotent and order-independent, so one pass over the union is by
+ * construction what N passes would have converged to. This matters most on the path that
+ * runs INSIDE the sync write transaction (#256's auto-create), where the repeated version
+ * holds the SQLite write lock for the duration.
+ *
+ * @throws {ProjectionError} `developer_not_found` if any id has no developer row.
+ */
+export function replayDevelopers(db: Database.Database, developerIds: readonly string[]): BatchReplayResult {
+    const ids = [...new Set(developerIds)];
+    const empty: ProjectionResult = {cellsWritten: 0, cellsRetracted: 0, cellsSkippedLegacy: 0, datesCovered: 0};
+    if (ids.length === 0) return {result: empty, datesPerDeveloper: new Map()};
+
+    const exists = new Set(
+        (
+            db
+                .prepare(`SELECT id FROM developers WHERE id IN (${ids.map(() => '?').join(', ')})`)
+                .all(...ids) as {id: string}[]
+        ).map((r) => r.id),
+    );
+    for (const id of ids) {
+        if (!exists.has(id)) throw new ProjectionError('developer_not_found', `No developer with id: ${id}`);
     }
 
+    const wanted = new Set(ids);
     const lookup = buildDevLookupMap(db);
-    // distinctRawAuthors is ONE grouped query returning one row per author (small), so
-    // finding this developer's keys costs a single scan — not a query per key.
-    const keys = distinctRawAuthors(db)
-        .filter((author) => resolveDeveloperId(lookup, author.provider, author.login, author.email) === developerId)
-        .map((author) => author.raw_author_key);
 
-    const dates = new Set(keys.length > 0 ? readRawDailyForKeys(db, keys).map((row) => row.date) : []);
-    // The retract side: days this developer is currently attributed on. Restricted to
-    // projection-owned cells — a legacy row is not ours to rebuild or retract, and
-    // pulling its day in would only widen the rebuild for no gain.
-    const attributed = db
-        .prepare('SELECT DISTINCT date FROM git_snapshots WHERE developer_id = ? AND is_projected = 1')
-        .all(developerId) as {date: string}[];
-    for (const row of attributed) dates.add(row.date);
+    // Resolve at the PER-IDENTITY grain, not a per-key rollup. A per-key rollup collapses
+    // a key's days to one `MAX(author_email)`, so a person committing from two addresses
+    // under one login key would be resolved against whichever email byte-sorts higher:
+    // register the OTHER address and the key resolves to nobody, the date scope comes back
+    // empty, and their retained history is reported as a clean `datesCovered: 0` while the
+    // rows that DO resolve are never re-projected (later syncs run in `cells` mode and
+    // never revisit those days). One grouped query either way; a key is in scope for a
+    // developer if ANY of its observed identities resolves to them. Same per-row-vs-
+    // per-author grain rule `listAuthorCandidates` folds by.
+    const keysByDeveloper = new Map<string, Set<string>>();
+    for (const variant of distinctRawAuthorIdentities(db)) {
+        const owner = resolveDeveloperId(lookup, variant.provider, variant.login, variant.email);
+        if (!owner || !wanted.has(owner)) continue;
+        const keys = keysByDeveloper.get(owner) ?? new Set<string>();
+        keys.add(variant.raw_author_key);
+        keysByDeveloper.set(owner, keys);
+    }
 
-    if (dates.size === 0) return {cellsWritten: 0, cellsRetracted: 0, datesCovered: 0};
-    return projectSnapshots(db, {dates: [...dates]});
+    // One read covering every requested developer's keys, then split back out per owner.
+    const allKeys = [...new Set([...keysByDeveloper.values()].flatMap((s) => [...s]))];
+    const datesByKey = new Map<string, Set<string>>();
+    if (allKeys.length > 0) {
+        for (const row of readRawDailyForKeys(db, allKeys)) {
+            const dates = datesByKey.get(row.raw_author_key) ?? new Set<string>();
+            dates.add(row.date);
+            datesByKey.set(row.raw_author_key, dates);
+        }
+    }
+
+    // The retract side: days each developer is currently attributed on. Restricted to
+    // projection-owned cells — a legacy row is not ours to rebuild or retract, and pulling
+    // its day in would only widen the rebuild for no gain. One query for the whole batch.
+    const attributedByDeveloper = new Map<string, Set<string>>();
+    for (const batch of chunk(ids, READ_CHUNK_SIZE)) {
+        const rows = db
+            .prepare(
+                `SELECT DISTINCT developer_id, date FROM git_snapshots
+                 WHERE developer_id IN (${batch.map(() => '?').join(', ')}) AND is_projected = 1`,
+            )
+            .all(...batch) as {developer_id: string; date: string}[];
+        for (const row of rows) {
+            const dates = attributedByDeveloper.get(row.developer_id) ?? new Set<string>();
+            dates.add(row.date);
+            attributedByDeveloper.set(row.developer_id, dates);
+        }
+    }
+
+    const union = new Set<string>();
+    const datesPerDeveloper = new Map<string, number>();
+    for (const id of ids) {
+        const scope = new Set<string>(attributedByDeveloper.get(id) ?? []);
+        for (const key of keysByDeveloper.get(id) ?? []) {
+            for (const date of datesByKey.get(key) ?? []) scope.add(date);
+        }
+        datesPerDeveloper.set(id, scope.size);
+        for (const date of scope) union.add(date);
+    }
+
+    if (union.size === 0) return {result: empty, datesPerDeveloper};
+    return {result: projectSnapshots(db, {dates: [...union]}), datesPerDeveloper};
 }

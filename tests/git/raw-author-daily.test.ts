@@ -9,7 +9,7 @@ import {
     upsertRawAuthorDaily,
     readRawDailyForKeys,
     readRawDailyForDates,
-    distinctRawAuthors,
+    distinctRawAuthorIdentities,
     RawAuthorDailyError,
     type DailyGitMetrics,
     type RawAuthorDailyInput,
@@ -374,7 +374,7 @@ describe('upsertRawAuthorDaily + readers (#252)', () => {
             }),
             '2026-07-02T10:00:00.000Z',
         );
-        const bob = distinctRawAuthors(db).find((a) => a.raw_author_key === 'github:email:bob@example.com');
+        const bob = distinctRawAuthorIdentities(db).find((a) => a.raw_author_key === 'github:email:bob@example.com');
         expect(bob?.email).toBe('bob@example.com');
         expect(bob?.commit_count).toBe(2);
     });
@@ -521,12 +521,12 @@ describe('upsertRawAuthorDaily + readers (#252)', () => {
         });
     });
 
-    describe('distinctRawAuthors', () => {
+    describe('distinctRawAuthorIdentities (rollup semantics)', () => {
         it('rolls each key up across its days, summing commits and spanning first/last seen', () => {
             upsertRawAuthorDaily(db, input({date: '2026-07-01', commits: 3}), '2026-07-01T10:00:00.000Z');
             upsertRawAuthorDaily(db, input({date: '2026-07-02', commits: 4}), '2026-07-04T10:00:00.000Z');
 
-            const authors = distinctRawAuthors(db);
+            const authors = distinctRawAuthorIdentities(db);
             expect(authors).toHaveLength(1);
             expect(authors[0]).toMatchObject({
                 provider: 'github',
@@ -554,10 +554,10 @@ describe('upsertRawAuthorDaily + readers (#252)', () => {
                 '2026-07-01T10:00:00.000Z',
             );
 
-            const order = distinctRawAuthors(db).map((a) => a.raw_author_key);
+            const order = distinctRawAuthorIdentities(db).map((a) => a.raw_author_key);
             expect(order).toEqual(['github:login:bob', 'github:login:alice', 'github:login:carol']);
             // Stable across repeated calls — no rowid/UUID dependence.
-            expect(distinctRawAuthors(db).map((a) => a.raw_author_key)).toEqual(order);
+            expect(distinctRawAuthorIdentities(db).map((a) => a.raw_author_key)).toEqual(order);
         });
 
         it('surfaces an email-keyed author with a null login', () => {
@@ -572,13 +572,15 @@ describe('upsertRawAuthorDaily + readers (#252)', () => {
                 }),
                 '2026-07-01T10:00:00.000Z',
             );
-            const author = distinctRawAuthors(db).find((a) => a.raw_author_key === 'github:email:ghost@example.com');
+            const author = distinctRawAuthorIdentities(db).find(
+                (a) => a.raw_author_key === 'github:email:ghost@example.com',
+            );
             expect(author?.login).toBeNull();
             expect(author?.email).toBe('ghost@example.com');
         });
 
         it('returns [] on an empty store', () => {
-            expect(distinctRawAuthors(db)).toEqual([]);
+            expect(distinctRawAuthorIdentities(db)).toEqual([]);
         });
     });
 });

@@ -97,7 +97,7 @@ describe('projectSnapshots — git_snapshots as a projection of raw_author_daily
 
         const result = projectSnapshots(db, {cells: [{developer_id: dev.id, date: '2024-01-15'}]});
 
-        expect(result).toEqual({cellsWritten: 1, cellsRetracted: 0, datesCovered: 1});
+        expect(result).toEqual({cellsWritten: 1, cellsSkippedLegacy: 0, cellsRetracted: 0, datesCovered: 1});
         const cell = readCell(db, dev.id, '2024-01-15')!;
         expect(cell.commits).toBe(1);
         expect(cell.lines_added).toBe(50);
@@ -212,6 +212,33 @@ describe('projectSnapshots — git_snapshots as a projection of raw_author_daily
         expect(readCell(db, alice.id, '2024-01-15')!.commits).toBe(42);
     });
 
+    it('NEVER overwrites a legacy (pre-#253) cell — a backfill cannot rewrite it partially (SO-2)', () => {
+        // The other half of the legacy-row contract. Retraction was already pinned above;
+        // the OVERWRITE side was not, and it is the dangerous one: `runSync`'s backfill
+        // drives this same write path over arbitrary past windows, per provider. A day
+        // whose legacy cell held GitHub + Bitbucket activity, backfilled on GitHub alone,
+        // would be rewritten as GitHub-only — permanently losing the other provider's
+        // contribution to a day the forward cursor never re-fetches.
+        const alice = addDeveloper(db, 'Alice', 'eng', 'alice@example.com', 'alice');
+        // 100 commits = the merged multi-provider total an old sync accumulated.
+        db.prepare(
+            `INSERT INTO git_snapshots (id, developer_id, date, commits, data_source)
+             VALUES ('legacy-1', ?, '2024-01-15', 100, 'multi')`,
+        ).run(alice.id);
+        // Retention covers only what one provider's backfill re-fetched: 3 commits.
+        upsertRawAuthorDaily(db, rawRow({raw_author_key: 'github:login:alice', author_login: 'alice', commits: 3}));
+
+        const result = projectSnapshots(db, {dates: ['2024-01-15']});
+
+        // The legacy total stands, untouched and still legacy-owned…
+        const cell = readCell(db, alice.id, '2024-01-15')!;
+        expect(cell.commits).toBe(100);
+        expect(cell.is_projected).toBe(0);
+        // …and the refusal is reported rather than silent.
+        expect(result.cellsSkippedLegacy).toBe(1);
+        expect(result.cellsWritten).toBe(0);
+    });
+
     it('ignores malformed dates rather than widening or corrupting the scan', () => {
         const alice = addDeveloper(db, 'Alice', 'eng', 'alice@example.com', 'alice');
         upsertRawAuthorDaily(db, rawRow({raw_author_key: 'github:login:alice', author_login: 'alice'}));
@@ -219,6 +246,7 @@ describe('projectSnapshots — git_snapshots as a projection of raw_author_daily
         expect(projectSnapshots(db, {dates: ['not-a-date', '2024/01/15', '']})).toEqual({
             cellsWritten: 0,
             cellsRetracted: 0,
+            cellsSkippedLegacy: 0,
             datesCovered: 0,
         });
         expect(readCell(db, alice.id, '2024-01-15')).toBeUndefined();
@@ -261,6 +289,52 @@ describe('replayDeveloper — attributing retained history (#253)', () => {
         expect(result.datesCovered).toBe(2);
         expect(readCell(db, dana.id, '2024-01-15')!.commits).toBe(3);
         expect(readCell(db, dana.id, '2024-01-16')!.commits).toBe(5);
+    });
+
+    it('resolves a key whose days carry TWO emails, matching on either one (SO-1)', () => {
+        // `sync.ts` stamps one run's sample commit email onto every date row that run
+        // writes, so one login key legitimately carries different emails on different days.
+        // A per-key rollup collapses those to MAX(author_email) — 'jane@personal.com'
+        // byte-sorts ABOVE 'jane@corp.com', so the rollup answers 'jane@personal.com',
+        // which resolves to NOBODY here. The whole key would then be filtered out of the
+        // replay scope: empty date set, a reassuring `datesCovered: 0`, and the
+        // jane@corp.com day left permanently unattributed even though it resolves
+        // perfectly well — later syncs project in `cells` mode and never revisit it.
+        // Resolution must happen per identity variant: the key is in scope if ANY variant
+        // resolves, and each ROW then attributes on its own merits.
+        upsertRawAuthorDaily(
+            db,
+            rawRow({
+                raw_author_key: 'github:login:jane',
+                author_login: 'jane',
+                author_email: 'jane@corp.com',
+                date: '2024-01-15',
+                commits: 3,
+            }),
+        );
+        upsertRawAuthorDaily(
+            db,
+            rawRow({
+                raw_author_key: 'github:login:jane',
+                author_login: 'jane',
+                author_email: 'jane@personal.com',
+                date: '2024-01-16',
+                commits: 5,
+            }),
+        );
+
+        // Registered by the LOSING email only — no github login, so the key is reachable
+        // only through the variant MAX(author_email) would have discarded.
+        const jane = addDeveloper(db, 'Jane', 'eng', 'jane@corp.com');
+        const result = replayDeveloper(db, jane.id);
+
+        // The key made it into scope (pre-fix this was 0 and nothing below was written).
+        expect(result.datesCovered).toBe(2);
+        // Her corp-email day is attributed…
+        expect(readCell(db, jane.id, '2024-01-15')!.commits).toBe(3);
+        // …while the personal-email day stays unattributed, which is correct: nothing
+        // tells the system that address is hers. Registering it would attribute it too.
+        expect(readCell(db, jane.id, '2024-01-16')).toBeUndefined();
     });
 
     it('is idempotent — replaying twice does not double-count', () => {
@@ -329,7 +403,7 @@ describe('replayDeveloper — attributing retained history (#253)', () => {
              VALUES ('legacy-1', ?, '2024-01-15', 42, 'github')`,
         ).run(alice.id);
 
-        expect(replayDeveloper(db, alice.id)).toEqual({cellsWritten: 0, cellsRetracted: 0, datesCovered: 0});
+        expect(replayDeveloper(db, alice.id)).toEqual({cellsWritten: 0, cellsSkippedLegacy: 0, cellsRetracted: 0, datesCovered: 0});
         expect(readCell(db, alice.id, '2024-01-15')!.commits).toBe(42);
     });
 
@@ -379,7 +453,7 @@ describe('replayDeveloper — attributing retained history (#253)', () => {
 
     it('is a no-op for a real developer with no retained authorship', () => {
         const dev = addDeveloper(db, 'New', 'eng', 'new@example.com', 'new');
-        expect(replayDeveloper(db, dev.id)).toEqual({cellsWritten: 0, cellsRetracted: 0, datesCovered: 0});
+        expect(replayDeveloper(db, dev.id)).toEqual({cellsWritten: 0, cellsSkippedLegacy: 0, cellsRetracted: 0, datesCovered: 0});
         expect(readSnapshots(db)).toEqual([]);
     });
 
