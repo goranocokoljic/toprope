@@ -10,6 +10,7 @@ import {createUser} from '../../src/auth/users';
 import {findByEmail, findByExternalId} from '../../src/registry/developers';
 import {hashPassword} from '../../src/auth/password';
 import {SESSION_COOKIE} from '../../src/auth/cookies';
+import {upsertRawAuthorDaily} from '../../src/connectors/git/raw-author-daily';
 
 const PASSWORD = 'correct-horse-battery';
 
@@ -787,6 +788,160 @@ describe('admin API', () => {
                 payload: {developer_id: 'dev-1', tool: 'cursor', monthly_cost: -5},
             });
             expect(res.statusCode).toBe(400);
+        });
+    });
+
+    // The review queue + post-create replay (DO1.5 / #255). These are what turn
+    // "sync imported activity but there are no developers" into a fixable state:
+    // the queue names the unattributed authors, and creating one of them attributes
+    // the history already retained for them.
+    describe('unmatched-author review queue', () => {
+        /** Retain one day of authorship for a github login. */
+        function retain(login: string, date: string, commits = 1): void {
+            upsertRawAuthorDaily(db, {
+                provider: 'github',
+                raw_author_key: `github:login:${login}`,
+                author_login: login,
+                author_email: `${login}@work.com`,
+                author_display_name: null,
+                date,
+                commits,
+                lines_added: 10,
+                lines_removed: 2,
+                files_changed: 1,
+                prs_opened: 0,
+                prs_merged: 0,
+                review_comments_given: 0,
+                avg_time_to_merge_hours: null,
+                code_churn_rate: 0,
+                ai_signature_score: 0,
+                avg_commit_size: 12,
+                commit_burst_count: 0,
+            });
+        }
+
+        function getCandidates(token: string): ReturnType<typeof app.inject> {
+            return app.inject({
+                method: 'GET',
+                url: '/api/admin/developers/candidates',
+                headers: authHeaders(token),
+            });
+        }
+
+        it('rejects a developer session with 403', async () => {
+            const res = await getCandidates(devToken);
+            expect(res.statusCode).toBe(403);
+        });
+
+        it('rejects an anonymous request', async () => {
+            const res = await app.inject({
+                method: 'GET',
+                url: '/api/admin/developers/candidates',
+            });
+            expect(res.statusCode).toBeGreaterThanOrEqual(401);
+        });
+
+        it('returns unmapped authors busiest-first with the full candidate shape', async () => {
+            retain('zoe', '2026-07-01', 1);
+            retain('adam', '2026-07-01', 5);
+            retain('adam', '2026-07-02', 4);
+
+            const res = await getCandidates(adminToken);
+
+            expect(res.statusCode).toBe(200);
+            const rows = res.json().data as {raw_author_key: string; commit_count: number}[];
+            expect(rows.map((r) => r.raw_author_key)).toEqual([
+                'github:login:adam',
+                'github:login:zoe',
+            ]);
+            expect(rows[0]).toMatchObject({
+                provider: 'github',
+                login: 'adam',
+                email: 'adam@work.com',
+                commit_count: 9,
+                likely_bot: false,
+            });
+        });
+
+        it('flags a bot without hiding it from the queue', async () => {
+            retain('dependabot[bot]', '2026-07-01');
+
+            const rows = (await getCandidates(adminToken)).json().data as {
+                likely_bot: boolean;
+                bot_reason?: string;
+            }[];
+
+            expect(rows).toHaveLength(1);
+            expect(rows[0].likely_bot).toBe(true);
+            expect(rows[0].bot_reason).toContain('automation');
+        });
+
+        it('creating a developer attributes their retained history and empties them from the queue', async () => {
+            retain('adam', '2026-07-01', 5);
+            retain('adam', '2026-07-02', 4);
+            retain('zoe', '2026-07-01');
+            expect((await getCandidates(adminToken)).json().data).toHaveLength(2);
+
+            const created = await app.inject({
+                method: 'POST',
+                url: '/api/admin/developers',
+                headers: authHeaders(adminToken),
+                payload: {name: 'Adam Dev', team: 'backend', github: 'adam'},
+            });
+
+            expect(created.statusCode).toBe(201);
+            // The confirmation count the UI renders — both days, attributed.
+            expect(created.json().replay).toEqual({dates_attributed: 2});
+            // Derived: the promoted author is gone, the other one remains.
+            const remaining = (await getCandidates(adminToken)).json().data as {
+                raw_author_key: string;
+            }[];
+            expect(remaining.map((r) => r.raw_author_key)).toEqual(['github:login:zoe']);
+            // And the history is really attributed, not just reported.
+            const id = created.json().data.id;
+            const snaps = db
+                .prepare('SELECT date, commits FROM git_snapshots WHERE developer_id = ? ORDER BY date')
+                .all(id);
+            expect(snaps).toEqual([
+                {date: '2026-07-01', commits: 5},
+                {date: '2026-07-02', commits: 4},
+            ]);
+        });
+
+        it('reports zero attributed dates for a developer with no retained authorship', async () => {
+            retain('adam', '2026-07-01');
+
+            const created = await app.inject({
+                method: 'POST',
+                url: '/api/admin/developers',
+                headers: authHeaders(adminToken),
+                payload: {name: 'New Hire', team: 'backend', github: 'nobody-yet'},
+            });
+
+            expect(created.statusCode).toBe(201);
+            expect(created.json().replay.dates_attributed).toBe(0);
+            // Positive control: the retained author is untouched and still queued.
+            expect((await getCandidates(adminToken)).json().data).toHaveLength(1);
+        });
+
+        it('leaves the queue unchanged when the create is rejected as a duplicate', async () => {
+            retain('adam', '2026-07-01');
+            await app.inject({
+                method: 'POST',
+                url: '/api/admin/developers',
+                headers: authHeaders(adminToken),
+                payload: {name: 'Owner', team: 'backend', github: 'taken-gh'},
+            });
+
+            const res = await app.inject({
+                method: 'POST',
+                url: '/api/admin/developers',
+                headers: authHeaders(adminToken),
+                payload: {name: 'Adam Dev', team: 'backend', github: 'taken-gh'},
+            });
+
+            expect(res.statusCode).toBe(409);
+            expect((await getCandidates(adminToken)).json().data).toHaveLength(1);
         });
     });
 

@@ -6,6 +6,11 @@ import {openDb} from './storage/db';
 import {runMigrations, getMigrationStatus} from './storage/migrator';
 import {printStatus} from './cli/status';
 import {runDoctor} from './cli/doctor';
+import {
+    runListCandidates,
+    runPromoteAllCandidates,
+    runPromoteCandidate,
+} from './cli/discover-repo';
 import {addTeam, listTeams, teamExists} from './registry/teams';
 import {addDeveloper, listDevelopers, linkDeveloper, findByExternalId, findByEmail} from './registry/developers';
 import {discoverOrgMembers} from './registry/discovery';
@@ -466,6 +471,69 @@ devCommand
                 for (const dev of result.created) {
                     console.log(`  + ${dev.name} (${dev.external_ids.github}) -> team: ${dev.team}`);
                 }
+            } finally {
+                db.close();
+            }
+        },
+    );
+
+devCommand
+    .command('discover-repo')
+    .description(
+        'Discover developers from synced repository authorship (provider-agnostic sibling of `dev discover`)',
+    )
+    .option('--promote <raw-author-key>', 'Promote one unmatched author to a developer')
+    .option('--promote-all', 'Promote every unmatched author (bots excluded unless --include-bots)')
+    .option('--include-bots', 'Include likely-bot authors in --promote-all')
+    .option('--team <team>', 'Team for the promoted developer(s) — required with --promote/--promote-all')
+    .option('--name <name>', 'Display name for --promote (defaults to the author display name/login/email)')
+    .option('--email <email>', 'Override the promoted developer’s primary email')
+    .option('--github <username>', 'GitHub username for the promoted developer')
+    .option('--bitbucket <username>', 'Bitbucket username for the promoted developer')
+    .option('--gitlab <username>', 'GitLab username for the promoted developer')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
+    .action(
+        (options: {
+            promote?: string;
+            promoteAll?: boolean;
+            includeBots?: boolean;
+            team?: string;
+            name?: string;
+            email?: string;
+            github?: string;
+            bitbucket?: string;
+            gitlab?: string;
+            config: string;
+        }) => {
+            // Mutually exclusive: one invocation promotes one author or the whole
+            // queue, never both — with both set it is ambiguous whether --name and
+            // the identity overrides apply to the single promotion or to all of them.
+            if (options.promote && options.promoteAll) {
+                console.error('Error: use either --promote or --promote-all, not both.');
+                process.exit(1);
+            }
+            const promoting = Boolean(options.promote || options.promoteAll);
+            if (promoting && !options.team?.trim()) {
+                console.error('Error: --team is required when promoting.');
+                process.exit(1);
+            }
+
+            const configPath = path.resolve(process.cwd(), options.config);
+            const db = openRegistryDb(configPath);
+            try {
+                const team = options.team?.trim() ?? '';
+                const code = options.promote
+                    ? runPromoteCandidate(db, options.promote, team, {
+                          name: options.name,
+                          email: options.email,
+                          github: options.github,
+                          bitbucket: options.bitbucket,
+                          gitlab: options.gitlab,
+                      })
+                    : options.promoteAll
+                      ? runPromoteAllCandidates(db, team, {includeBots: options.includeBots})
+                      : runListCandidates(db);
+                if (code !== 0) process.exitCode = code;
             } finally {
                 db.close();
             }
