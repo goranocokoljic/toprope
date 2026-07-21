@@ -12,7 +12,8 @@ import {
     runPromoteCandidate,
 } from './cli/discover-repo';
 import {addTeam, listTeams, teamExists} from './registry/teams';
-import {addDeveloper, listDevelopers, linkDeveloper, findByExternalId, findByEmail} from './registry/developers';
+import {listDevelopers, linkDeveloper, findByExternalId, findByEmail} from './registry/developers';
+import {createDeveloperWithReplay} from './connectors/git/onboarding';
 import {discoverOrgMembers} from './registry/discovery';
 import {seedTeamsFromConfig} from './registry/config-seeder';
 import {CopilotSync} from './connectors/copilot/sync';
@@ -267,43 +268,39 @@ devCommand
             const configPath = path.resolve(process.cwd(), options.config);
             const db = openRegistryDb(configPath);
             try {
-                if (!teamExists(db, options.team)) {
-                    console.error(`Error: team '${options.team}' does not exist.`);
-                    process.exit(1);
-                }
-                const idChecks: Array<{provider: 'github' | 'bitbucket' | 'gitlab'; value?: string}> = [
-                    {provider: 'github', value: options.github},
-                    {provider: 'bitbucket', value: options.bitbucket},
-                    {provider: 'gitlab', value: options.gitlab},
-                ];
-                for (const {provider, value} of idChecks) {
-                    if (!value) continue;
-                    const duplicate = findByExternalId(db, provider, value);
-                    if (duplicate) {
-                        console.warn(
-                            `Warning: developer with ${provider} identity '${value}' already exists (id: ${duplicate.id}, name: ${duplicate.name}).`,
-                        );
-                        return;
-                    }
-                }
-                const emailChecks = [options.email, ...options.gitEmail].filter(
-                    (e): e is string => !!e,
-                );
-                for (const email of emailChecks) {
-                    const duplicate = findByEmail(db, email);
-                    if (duplicate) {
-                        console.warn(
-                            `Warning: developer with email '${email}' already exists (id: ${duplicate.id}, name: ${duplicate.name}).`,
-                        );
-                        return;
-                    }
-                }
-                const dev = addDeveloper(db, options.name, options.team, options.email, options.github, {
+                // Routed through the canonical create boundary (DO1.7 / #257) rather
+                // than calling `addDeveloper` behind hand-rolled team and duplicate
+                // checks. Two reasons, both about this command telling the truth:
+                //
+                //  - It REPLAYS. `createDeveloperWithReplay` re-projects every retained
+                //    day the new identities now resolve, in the same transaction. The
+                //    documented onboarding guarantee is "add a developer at any time and
+                //    their already-synced history is attributed"; before this, that held
+                //    for the Admin UI and `dev discover-repo` but silently did not hold
+                //    for `dev add` — the one path the docs point a new operator at first.
+                //  - It is ONE guard. The checks removed here were a second copy of
+                //    `findIdentityConflict`, running outside the write transaction and
+                //    disagreeing with it: they warned and exited 0 on a duplicate (a
+                //    create that looks like it worked), missed archived teams, and split
+                //    comma-joined git emails differently from the write path.
+                const outcome = createDeveloperWithReplay(db, {
+                    name: options.name,
+                    team: options.team,
+                    email: options.email,
+                    github: options.github,
                     bitbucket: options.bitbucket,
                     gitlab: options.gitlab,
                     gitEmails: options.gitEmail,
                 });
-                console.log(`Developer '${dev.name}' created with id: ${dev.id}`);
+                if (!outcome.ok) {
+                    console.error(`Error: ${outcome.message}`);
+                    process.exit(1);
+                }
+                const {developer, replay} = outcome;
+                console.log(`Developer '${developer.name}' created with id: ${developer.id}`);
+                console.log(
+                    `Attributed ${replay.datesCovered} snapshot date(s) of retained history.`,
+                );
             } finally {
                 db.close();
             }

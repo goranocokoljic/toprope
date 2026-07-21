@@ -44,10 +44,16 @@ toprope <command> [subcommand] [options]
 
 | Command | Description |
 |---|---|
-| `toprope dev add --name <name> --team <team> [--email <e>] [--github <u>] [--bitbucket <u>] [--gitlab <u>] [--git-email <e>]...` | Add a developer. `--git-email` is repeatable. Duplicate identities/emails are detected and warned. |
+| `toprope dev add --name <name> --team <team> [--email <e>] [--github <u>] [--bitbucket <u>] [--gitlab <u>] [--git-email <e>]...` | Add a developer, and immediately attribute any **already-synced** git history their identities resolve (the count of attributed dates is printed). `--git-email` is repeatable. An identity or email already owned by another developer is rejected with a non-zero exit. |
 | `toprope dev list [--team <name>]` | List developers, optionally filtered by team, showing linked identities. |
 | `toprope dev link --id <dev-id> [--copilot <u>] [--claude <e>] [--windsurf <e>] [--cursor <e>] [--github <u>] [--bitbucket <u>] [--gitlab <u>] [--slack <id>] [--git-email <e>]...` | Link a developer to tool, git-provider, and Slack identities. At least one identity is required; conflicts with another developer are rejected. |
-| `toprope dev discover --org <org> [--token <t>] [--team <team>]` | Auto-discover developers from GitHub org members. Reads `--token` or `GITHUB_TOKEN`. Defaults discovered devs to team `discovered`. |
+| `toprope dev discover --org <org> [--token <t>] [--team <team>]` | Discover developers from **GitHub org members**. Reads `--token` or `GITHUB_TOKEN`. Defaults discovered devs to team `discovered`. GitHub-only, and includes members who never committed. |
+| `toprope dev discover-repo` | List the review queue: git authors in the **already-synced** history that map to no developer, busiest first, with commit counts and a `[likely-bot]` flag. Provider-agnostic. An empty queue is not an error. |
+| `toprope dev discover-repo --promote <raw-author-key> --team <team> [--name <n>] [--email <e>] [--github <u>] [--bitbucket <u>] [--gitlab <u>]` | Promote one unmatched author to a developer and attribute their retained history. |
+| `toprope dev discover-repo --promote-all --team <team> [--include-bots]` | Promote every unmatched author. Likely bots are skipped unless `--include-bots`. |
+
+See [Getting developers into Toprope](./developer-onboarding.md) for when to use
+which of these, and for the opt-in auto-create-during-sync config.
 
 ## Users (dashboard accounts)
 

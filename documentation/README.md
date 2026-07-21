@@ -23,21 +23,22 @@ reference. Each chapter is self-contained.
 
 ### Connecting your data
 6. [Connectors](./connectors.md) — Copilot, Claude Code, Windsurf, Cursor, and multi-provider git
-7. [Expenses & waste detection](./expenses-and-waste.md) — importing cost data, reconciliation, and finding wasted spend
-8. [Self-reporting](./self-reporting.md) — the CLI `log` command and the Slack bot
+7. [Getting developers into Toprope](./developer-onboarding.md) — the three onboarding paths, and why adding someone late still recovers their history
+8. [Expenses & waste detection](./expenses-and-waste.md) — importing cost data, reconciliation, and finding wasted spend
+9. [Self-reporting](./self-reporting.md) — the CLI `log` command and the Slack bot
 
 ### Insights & reporting
-9. [Dashboard](./dashboard.md) — manager and developer views, accounts, and settings
-10. [Aggregation & AI summaries](./aggregation-and-summaries.md) — trends, the maturity score, and narrative reports
-11. [Anomalies, surveys & Slack](./anomalies-surveys-slack.md) — anomaly detection, data-prompted surveys, and alerting
+10. [Dashboard](./dashboard.md) — manager and developer views, accounts, and settings
+11. [Aggregation & AI summaries](./aggregation-and-summaries.md) — trends, the maturity score, and narrative reports
+12. [Anomalies, surveys & Slack](./anomalies-surveys-slack.md) — anomaly detection, data-prompted surveys, and alerting
 
 ### Developer coaching (Phase 5)
-12. [Coaching](./coaching.md) — the three coaching pillars, prompt capture, and the exemplary-conversation showcase
+13. [Coaching](./coaching.md) — the three coaching pillars, prompt capture, and the exemplary-conversation showcase
 
 ### Reference
-13. [CLI reference](./cli-reference.md) — every `toprope` command
-14. [REST API reference](./api-reference.md) — every endpoint
-15. [Operations & troubleshooting](./operations-and-troubleshooting.md) — running in production, the scheduler, `doctor`, and common gotchas
+14. [CLI reference](./cli-reference.md) — every `toprope` command
+15. [REST API reference](./api-reference.md) — every endpoint
+16. [Operations & troubleshooting](./operations-and-troubleshooting.md) — running in production, the scheduler, `doctor`, and common gotchas
 
 ---
 
