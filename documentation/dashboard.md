@@ -86,6 +86,12 @@ through `/api/leaderboard/*`. Enable it only deliberately.
 
 - **Admin → Management** — users, teams, identity mapping, and subscriptions (a UI
   over the Phase-1 CLI capabilities).
+- **Admin → Developer identities** — add developers (**＋ Add developer**), link their
+  tool and git identities, move them between teams, and work the **Unmatched authors**
+  review queue: git authors in the synced history that map to nobody, each promotable
+  to a developer in one click. Adding or promoting someone attributes their retained
+  history on the spot. See
+  [Getting developers into Toprope](./developer-onboarding.md).
 - **Admin → Reconciliation** — review expense/subscription mismatches.
 - **Admin → Git Providers** — connect, test, edit, remove, and sync git providers
   (GitHub, GitLab, Bitbucket incl. self-hosted) and choose which repositories are

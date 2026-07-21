@@ -122,6 +122,16 @@ connectors:
     analysis:
       churn_window_hours: 48               # window for churn detection
       ai_signature_enabled: true
+    # Opt-in hands-off onboarding — DEFAULT OFF. Sync attributes commits only to
+    # developers that already exist; with this on it also CREATES a developer for
+    # each unmatched author it sees. `auto_create_team` is REQUIRED when the flag
+    # is true (a missing one is a startup error, never a silent no-op).
+    # See documentation/developer-onboarding.md.
+    auto_create_developers: false          # boolean only — "true"/${ENV} is rejected
+    auto_create_team: "unassigned"         # required when auto_create_developers: true
+    auto_create_exclude: []                # extra never-create patterns; `*` is the
+                                           # only wildcard. Max 200 patterns, 200
+                                           # chars each, 2 wildcards per pattern.
     # Multi-provider: supply a `providers:` list to analyze GitHub + GitLab +
     # Bitbucket together. See documentation/connectors.md.
 ```

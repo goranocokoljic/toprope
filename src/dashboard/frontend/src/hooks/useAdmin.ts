@@ -105,10 +105,18 @@ export function useAdminDevelopers(): UseQueryResult<AdminDeveloper[], Error> {
  * The unmatched-author review queue (DO1.5 / #255) — retained git authors that map
  * to no developer, busiest first.
  */
-export function useAdminDeveloperCandidates(): UseQueryResult<AuthorCandidate[], Error> {
+export function useAdminDeveloperCandidates(
+    // Optional and defaulted so the review queue's existing call site is
+    // unchanged. The onboarding empty-state (DO1.7 / #257) passes `false` when
+    // the org already has developers or the viewer is not an admin — the route
+    // is admin-gated, so an ungated fetch would 403 for every manager who loads
+    // the overview, and the query would be pure noise even when it succeeded.
+    options: {enabled?: boolean} = {},
+): UseQueryResult<AuthorCandidate[], Error> {
     return useQuery({
         queryKey: queryKeys.adminDeveloperCandidates,
         queryFn: api.getAdminDeveloperCandidates,
+        enabled: options.enabled ?? true,
     });
 }
 

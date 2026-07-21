@@ -40,7 +40,10 @@ the setup guide.
 identity isn't mapped is tracked at LOW/MEDIUM quality, and their commits may be
 unattributed.
 **Workaround:** map identities (`dev add --git-email/--copilot/...` or the Admin
-identity-mapping UI) and re-sync. Unmatched authors are printed by `sync git`.
+identity-mapping UI). Unmatched git authors are retained and listed by
+`dev discover-repo` / **Admin → Developer identities → Unmatched authors**;
+promoting one attributes its retained history immediately, with no re-sync. Adding
+identities to an *existing* developer still needs a re-sync.
 
 ### K-5. Cold-start: charts look sparse on day one
 **Impact:** low (expected by design). With only a few days of history, time-series

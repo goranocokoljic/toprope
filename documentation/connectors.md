@@ -6,9 +6,13 @@ and a **multi-provider git analyzer** (GitHub, GitLab, Bitbucket). All write
 `tool_snapshots` (tools) or `git_snapshots` (git) as one row per developer per
 day, at data-quality tier **HIGH** for APIs and **MEDIUM** for git analysis.
 
-Before a connector's data can attribute to a person, that person must be linked to
-the matching identity with `toprope dev link` (see
-[Getting started](./getting-started.md#3-initialize-the-database-and-register-people)).
+Before a connector's data can attribute to a person, that person must **exist as a
+developer record** and be linked to the matching identity. No connector — git
+included — creates developer records on its own. See
+[Getting developers into Toprope](./developer-onboarding.md) for how to populate
+the registry, and
+[Getting started](./getting-started.md#3-initialize-the-database-and-register-people)
+for `toprope dev link`.
 
 ## Common behavior
 
@@ -107,10 +111,18 @@ connectors:
 
 ## Git repository analysis
 
-The universal, tool-agnostic source. It works for **every** developer regardless
-of which AI tool they use — which is why a git-only deployment still gets useful
-adoption signals and PR/review coaching from day one. Analysis is **clone-free**:
+The universal, tool-agnostic source. It works for **every registered** developer
+regardless of which AI tool they use — which is why a git-only deployment still
+gets useful adoption signals and PR/review coaching. Analysis is **clone-free**:
 it reads commits, PRs/MRs, and reviews over the provider's REST API.
+
+> **Connecting a provider does not create developers.** Sync attributes each commit
+> to a developer record that already exists; authors matching nobody are retained
+> but attributed to no one, so a first sync against an empty registry imports the
+> repository and shows **zero developers**. That is the expected first-run state,
+> not a failure — see
+> [Getting developers into Toprope](./developer-onboarding.md) for the three ways
+> to populate the registry (and why you never have to re-sync afterwards).
 
 > **The dashboard is now the primary way to connect git providers.** Add, test,
 > edit, remove, and sync providers — and pick which repositories are analyzed —
@@ -141,6 +153,11 @@ connectors:
     analysis:
       churn_window_hours: 48
       ai_signature_enabled: true
+    # Opt-in hands-off onboarding — DEFAULT OFF. See
+    # documentation/developer-onboarding.md.
+    auto_create_developers: false
+    auto_create_team: "unassigned"   # required when auto_create_developers: true
+    auto_create_exclude: []          # extra never-create patterns (`*` wildcard)
 ```
 
 - **Repo list:** entries are **bare repo names** (matched within the org). `[]`

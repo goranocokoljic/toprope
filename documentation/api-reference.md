@@ -182,7 +182,8 @@ data.
 | GET/POST | `/api/admin/users` | List / create accounts |
 | GET/POST | `/api/admin/teams` | List / create teams |
 | GET/POST | `/api/admin/subscriptions` | List / create subscriptions |
-| GET | `/api/admin/developers` | List developers (admin) |
+| GET/POST | `/api/admin/developers` | List developers / create one. The create replays the new developer's retained git history and returns `replay.dates_attributed`. |
+| GET | `/api/admin/developers/candidates` | Review queue: retained git authors that map to no developer, busiest first |
 | GET | `/api/admin/data-sources` | Connector / provider status |
 | POST | `/api/admin/reconciliation/run` | Run expense reconciliation |
 | GET/POST | `/api/admin/showcase`, `.../:id/remove` | Team-lead showcase moderation (remove only) |

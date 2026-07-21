@@ -15,6 +15,7 @@ import {SkeletonChart, SkeletonStatCard, SkeletonText} from '../components/Skele
 import {ErrorState} from '../components/ErrorState';
 import {EmptyState} from '../components/EmptyState';
 import {ColdStartPanel, type ConnectorStatus} from '../components/ColdStartPanel';
+import {OnboardingEmptyState} from '../components/OnboardingEmptyState';
 import {classifyDataState} from '../components/dataState';
 import {toolLabel} from '../components/toolLabels';
 import {formatCurrency, formatPercent, formatDateTick} from '../components/format';
@@ -315,6 +316,13 @@ export function ManagerOverview(): JSX.Element {
                 <h1 className="text-2xl font-semibold text-foreground">Organization Overview</h1>
                 <p className="mt-1 text-sm text-muted">Unified AI adoption across all connected tools.</p>
             </div>
+
+            {/* Outside the `state` branches on purpose. The dead end it addresses —
+                git authorship retained, zero developers — can coexist with EITHER
+                cold-start (no tool snapshots yet) or ready (a tool connector is
+                reporting while git attribution lands nowhere), and the panel's own
+                gate is strictly more precise than either. */}
+            {data ? <OnboardingEmptyState totalDevelopers={data.total_developers} /> : null}
 
             {state === 'loading' ? <LoadingOverview /> : null}
 
