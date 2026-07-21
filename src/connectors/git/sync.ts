@@ -3,11 +3,27 @@ import {randomUUID} from 'crypto';
 import {aggregateDailyMetrics} from './analyzer.js';
 import {toAnalysisCommit, toAnalysisPR, toAnalysisReviewComment} from './analysis-types.js';
 import type {AnalysisCommit, AnalysisPR, AnalysisReviewComment} from './analysis-types.js';
+import {
+    mergeDailyDisjoint,
+    rawAuthorKeyFor,
+    upsertRawAuthorDaily,
+    type RawAuthorDailyInput,
+} from './raw-author-daily.js';
+import {
+    buildDevLookupMap,
+    projectSnapshots,
+    resolveDeveloperId,
+    resolveRawAuthor,
+    type SnapshotCell,
+} from './projection.js';
 import {createGitProvider} from './providers/factory.js';
 import {providerContainer} from './providers/config.js';
 import {resolveAllGitProviders} from './providers/resolve.js';
 import {loadServerKey} from './providers/secret.js';
 import type {GitProviderConfig, GitProviderType, GitCommit, GitFileDiff, GitPR} from './providers/types.js';
+import {promoteAllCandidates} from './onboarding.js';
+import {ensureTeam} from '../../registry/teams.js';
+import {resolveAutoCreateSettings, type AutoCreateSettings} from '../../config/git-auto-create.js';
 import type {ConnectorInterface, SyncResult} from '../types.js';
 import type {GitConnectorConfig} from '../../config/types.js';
 
@@ -23,6 +39,71 @@ const CONNECTOR_NAME = 'git';
  * sentinel rather than a matched string literal that can drift.
  */
 export const UNMATCHED_AUTHORS_PREFIX = 'Unmatched authors (no developer record found):';
+
+/**
+ * Prefix of the run summary pushed into a SyncResult's `errors` when opt-in auto-create
+ * (#256) ran. Like {@link UNMATCHED_AUTHORS_PREFIX} this is an ADVISORY, not a failure —
+ * it reports what the run onboarded — so outcome classifiers must exclude it.
+ *
+ * Auto-create FAILURES are deliberately NOT given this prefix: a promotion that could not
+ * complete is a genuine error the operator must see turn a provider red, and hiding it
+ * behind the same sentinel as the success summary is how a half-onboarded run reads as
+ * an all-clear.
+ */
+export const AUTO_CREATE_SUMMARY_PREFIX = 'auto-created';
+
+/**
+ * Prefix of the advisory pushed when the projection REFUSED to write cells because their
+ * stored rows are legacy (`is_projected = 0`, pre-#253) — accumulated totals no retained
+ * raw row can reconstruct, so overwriting them would replace a real number with a partial
+ * one.
+ *
+ * An ADVISORY rather than a failure: the run itself succeeded and the refusal is the safe
+ * choice. But it must be SAID, because it is the one case where "the sync completed" stops
+ * implying "the data for those days is current" — an upgraded deployment's straddling day,
+ * or a backfill over a window that predates retention. A full distinctive sentence, not a
+ * bare word, so a future error can never collide with it.
+ */
+export const LEGACY_CELLS_SKIPPED_PREFIX = 'Legacy snapshot cells left untouched:';
+
+/** Every sentinel that marks an `errors` entry as advisory rather than a failure. */
+const ADVISORY_PREFIXES: readonly string[] = [
+    UNMATCHED_AUTHORS_PREFIX,
+    AUTO_CREATE_SUMMARY_PREFIX,
+    LEGACY_CELLS_SKIPPED_PREFIX,
+];
+
+/**
+ * Is this `SyncResult.errors` entry an ADVISORY (something the run wants to report) rather
+ * than a FAILURE (something that went wrong)?
+ *
+ * `errors` carries both, because advisories describe the steady state of a healthy sync —
+ * unmatched CI bots and external contributors exist in nearly every real repo — and a run
+ * that reports them synced perfectly well. Every consumer that classifies a run's outcome
+ * must agree on which is which, so the rule lives here, once, beside the sentinels it
+ * matches. Two consumers previously disagreed: the sync-now route excluded advisories, the
+ * scheduler did not, so a repo with one bot author had every scheduled run retried in full
+ * (a second complete network fetch) and logged as an error.
+ *
+ * Auto-create FAILURE lines deliberately match nothing here: a promotion that could not
+ * complete is authorship left unattributed, and the operator must see it turn a provider
+ * red rather than have it hidden behind the success summary's sentinel.
+ */
+export function isAdvisoryError(error: string): boolean {
+    return ADVISORY_PREFIXES.some((prefix) => error.startsWith(prefix));
+}
+
+/**
+ * The line auto-create emits when it could NOT onboard some candidates.
+ *
+ * Extracted so the classification test can assert against the string the code actually
+ * produces rather than a copy of it. The distinction it carries — this line is a genuine
+ * failure, the summary beside it is an advisory — is enforced only by wording, so a test
+ * holding its own literal would keep passing through exactly the reword that breaks it.
+ */
+export function autoCreateFailureLine(failed: number, detail: string): string {
+    return `Auto-create could not onboard ${failed} author(s): ${detail}`;
+}
 
 /**
  * The stages a sync run passes through, in pipeline order (GC#209). The network
@@ -646,30 +727,6 @@ interface SyncStateRow {
     value: string;
 }
 
-interface DeveloperRow {
-    id: string;
-    email: string | null;
-    external_ids: string | null;
-}
-
-interface GitSnapshotRow {
-    developer_id: string;
-    date: string;
-    commits: number;
-    lines_added: number;
-    lines_removed: number;
-    files_changed: number;
-    prs_opened: number;
-    prs_merged: number;
-    review_comments_given: number;
-    avg_time_to_merge_hours: number | null;
-    code_churn_rate: number;
-    ai_signature_score: number;
-    avg_commit_size: number;
-    commit_burst_count: number;
-    data_source: string;
-}
-
 // The single read/write pair for every `sync_state` row this module owns — the
 // forward cursor, the earliest-synced watermark, and the stall counter. Named for
 // the VALUE they move rather than for any one caller's meaning: not every row here
@@ -866,225 +923,28 @@ function isUtcIsoInstant(value: string): boolean {
     return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
 }
 
-// Build a map from identifier → developer_id, covering:
-//   - email (from developers.email)
-//   - github:<login>, bitbucket:<login>, gitlab:<login> (from external_ids JSON)
-function buildDevLookupMap(db: Database.Database): Map<string, string> {
-    const rows = db.prepare('SELECT id, email, external_ids FROM developers').all() as DeveloperRow[];
-    const map = new Map<string, string>();
-
-    for (const row of rows) {
-        if (row.email) {
-            map.set(`email:${row.email.toLowerCase()}`, row.id);
-        }
-        if (!row.external_ids) continue;
-        try {
-            const ext = JSON.parse(row.external_ids) as Record<string, string | undefined>;
-            for (const [key, value] of Object.entries(ext)) {
-                if (!value) continue;
-                // git_emails holds a comma-separated list of additional commit
-                // emails; register each as an email-lookup rather than a username.
-                if (key === 'git_emails') {
-                    for (const raw of value.split(',')) {
-                        const email = raw.trim().toLowerCase();
-                        if (email) map.set(`email:${email}`, row.id);
-                    }
-                    continue;
-                }
-                map.set(`${key}:${value}`, row.id);
-            }
-        } catch {
-            // malformed external_ids — skip
-        }
-    }
-
-    return map;
-}
-
-function resolveDeveloperId(
-    lookup: Map<string, string>,
+/**
+ * Derive the immutable raw-author key a day's metrics are RETAINED under (#253).
+ *
+ * `aggregateDailyMetrics` groups by `AnalysisCommit.authorLogin`, which
+ * `toAnalysisCommit` fills as `username || email` — so a "login" that is byte-equal to
+ * the author's email means the commit carried NO provider username. Passing it through
+ * as a login would key an email-only author as `${provider}:login:alice@example.com`,
+ * an identity shape nothing else in the system produces. Detect that case and let
+ * {@link rawAuthorKeyFor} take its email branch, so the stored key matches the identity
+ * the resolver actually looks the author up by.
+ *
+ * Returns null only for a truly anonymous author (no login, no email), whose day is
+ * skipped: there is no stable key to retain it under, and bucketing every such commit
+ * together would attribute unrelated people to one identity.
+ */
+function retentionKeyFor(
     providerType: GitProviderType,
-    login: string | null,
+    analysisLogin: string,
     email: string | null,
 ): string | null {
-    if (login) {
-        const byLogin = lookup.get(`${providerType}:${login}`);
-        if (byLogin) return byLogin;
-    }
-    if (email) {
-        const byEmail = lookup.get(`email:${email.toLowerCase()}`);
-        if (byEmail) return byEmail;
-    }
-    return null;
-}
-
-// Commit-count-weighted mean of a rate/score field. When two snapshots' commit
-// counts add, a straight average would ignore that one side may represent far more
-// commits than the other. total===0 (no commits on either side) yields 0 — the
-// neutral value for these per-commit metrics.
-function commitWeightedAvg(aVal: number, aCommits: number, bVal: number, bCommits: number): number {
-    const total = aCommits + bCommits;
-    return total > 0 ? (aVal * aCommits + bVal * bCommits) / total : 0;
-}
-
-// Merge two snapshots for the same (developer_id, date) from DIFFERENT providers
-// WITHIN a single sync run. Every field is additive/combinable because the two sides
-// are genuinely disjoint (distinct providers, distinct PRs). This is NOT the right
-// rule for combining against a previously-stored row across runs — see
-// remergeStoredSnapshot for why PR/review fields must not be summed there.
-function mergeSnapshots(a: GitSnapshotRow, b: GitSnapshotRow): GitSnapshotRow {
-    const totalCommits = a.commits + b.commits;
-    const totalPrs = a.prs_merged + b.prs_merged;
-
-    let avgTTM: number | null = null;
-    if (a.avg_time_to_merge_hours !== null && b.avg_time_to_merge_hours !== null && totalPrs > 0) {
-        avgTTM = (a.avg_time_to_merge_hours * a.prs_merged + b.avg_time_to_merge_hours * b.prs_merged) / totalPrs;
-    } else {
-        avgTTM = a.avg_time_to_merge_hours ?? b.avg_time_to_merge_hours;
-    }
-
-    // Cross-provider churn cannot be recomputed without the full commit set; simple average is an approximation.
-    const avgChurn = (a.code_churn_rate + b.code_churn_rate) / 2;
-
-    return {
-        developer_id: a.developer_id,
-        date: a.date,
-        commits: totalCommits,
-        lines_added: a.lines_added + b.lines_added,
-        lines_removed: a.lines_removed + b.lines_removed,
-        files_changed: a.files_changed + b.files_changed,
-        prs_opened: a.prs_opened + b.prs_opened,
-        prs_merged: totalPrs,
-        review_comments_given: a.review_comments_given + b.review_comments_given,
-        avg_time_to_merge_hours: avgTTM,
-        code_churn_rate: avgChurn,
-        ai_signature_score: commitWeightedAvg(a.ai_signature_score, a.commits, b.ai_signature_score, b.commits),
-        avg_commit_size: commitWeightedAvg(a.avg_commit_size, a.commits, b.avg_commit_size, b.commits),
-        commit_burst_count: a.commit_burst_count + b.commit_burst_count,
-        data_source: a.data_source === b.data_source ? a.data_source : 'multi',
-    };
-}
-
-// Re-merge an incoming per-run snapshot against the STORED (developer_id, date) row.
-// Deliberately different from mergeSnapshots (which combines DISTINCT providers within
-// one run and so may add every field): across runs the two sides are NOT disjoint.
-//   - Commit windows ARE disjoint (each run fetches commits on a [since, now] committer-
-//     date window that advances), so commit-derived counts are ADDED — this is the
-//     accumulation the issue asks for.
-//   - PR / review activity is RE-DELIVERED: providers fetch PRs by updated_at/updated_on
-//     (github/bitbucket getPullRequests), so a PR merely touched since the last cursor is
-//     re-fetched and re-aggregated on the next run, and its review comments are re-fetched
-//     unconditionally. Additively summing prs_opened/prs_merged/review_comments_given
-//     against the stored row would inflate them on essentially every scheduled sync of an
-//     active PR. So they are combined with max(): idempotent under re-delivery (re-seeing
-//     the same PRs never inflates) and never below the stored value (a scoped single-
-//     provider run cannot drop another provider's already-recorded PRs). The known cost is
-//     an undercount when genuinely-distinct PRs accrue across runs/providers on the same
-//     day — a bounded, conservative error rooted in git_snapshots having no provider
-//     dimension (tracked by the #192 SEC-2 follow-up), and far preferable to the unbounded
-//     per-sync inflation additive summing would produce.
-//   - Rate/score fields are commit-count-weighted so a small delta can't drag a large
-//     accumulated row halfway (the exponential-recency skew a straight mean would cause).
-function remergeStoredSnapshot(stored: GitSnapshotRow, incoming: GitSnapshotRow): GitSnapshotRow {
-    return {
-        developer_id: stored.developer_id,
-        date: stored.date,
-        commits: stored.commits + incoming.commits,
-        lines_added: stored.lines_added + incoming.lines_added,
-        lines_removed: stored.lines_removed + incoming.lines_removed,
-        files_changed: stored.files_changed + incoming.files_changed,
-        prs_opened: Math.max(stored.prs_opened, incoming.prs_opened),
-        prs_merged: Math.max(stored.prs_merged, incoming.prs_merged),
-        review_comments_given: Math.max(stored.review_comments_given, incoming.review_comments_given),
-        // avg_time_to_merge pairs with prs_merged (which we take via max). Source it from
-        // the SAME side that owns the larger merge count so the (count, TTM) pair always
-        // matches a real observation — never a maxed count paired with a stale first-
-        // observed average from a different run. On a tie (the common same-PR re-delivery
-        // case) keep the first-observed value.
-        avg_time_to_merge_hours:
-            incoming.prs_merged > stored.prs_merged
-                ? incoming.avg_time_to_merge_hours ?? stored.avg_time_to_merge_hours
-                : stored.avg_time_to_merge_hours ?? incoming.avg_time_to_merge_hours,
-        code_churn_rate: commitWeightedAvg(stored.code_churn_rate, stored.commits, incoming.code_churn_rate, incoming.commits),
-        ai_signature_score: commitWeightedAvg(stored.ai_signature_score, stored.commits, incoming.ai_signature_score, incoming.commits),
-        avg_commit_size: commitWeightedAvg(stored.avg_commit_size, stored.commits, incoming.avg_commit_size, incoming.commits),
-        commit_burst_count: stored.commit_burst_count + incoming.commit_burst_count,
-        data_source: stored.data_source === incoming.data_source ? stored.data_source : 'multi',
-    };
-}
-
-// Re-merge the incoming snapshot against the stored (developer_id, date) row rather
-// than REPLACE-ing it, so a scoped/per-provider sync (CLI --provider, UI "Sync now")
-// no longer overwrites the merged row with just its own metrics and permanently drops
-// another provider's same-day commits (the incremental cursor never re-fetches them),
-// and a second incremental run of the same provider on the same day accumulates rather
-// than replaces. remergeStoredSnapshot ADDS the disjoint commit delta while keeping the
-// re-delivered PR/review fields idempotent (see its doc). Runs inside runSync's outer
-// db.transaction (the upsert loop), so this SELECT → merge → write is atomic — no other
-// writer can slip a row in between the read and the write.
-//
-// Known trade-off of the issue's additive-incremental design: because commit counts are
-// added, re-fetching the same commits (a manual cursor reset or a full re-sync with an
-// empty `since`) double-counts them — the rows are no longer reconstructible by re-running
-// sync from scratch. Normal incremental operation never re-fetches a committed window, so
-// this is the accepted cost; a provider-dimension snapshot (the #192 SEC-2 follow-up) is
-// the durable fix.
-function upsertSnapshot(db: Database.Database, snap: GitSnapshotRow): 'written' | 'skipped' {
-    const existing = db
-        .prepare(
-            `SELECT developer_id, date, commits, lines_added, lines_removed, files_changed,
-                    prs_opened, prs_merged, review_comments_given, avg_time_to_merge_hours,
-                    code_churn_rate, ai_signature_score, avg_commit_size, commit_burst_count, data_source
-             FROM git_snapshots WHERE developer_id = ? AND date = ?`,
-        )
-        .get(snap.developer_id, snap.date) as GitSnapshotRow | undefined;
-
-    // On conflict the stored row already contributed to `merged`, so writing the
-    // merged values is the accumulated result — not a clobber.
-    const merged = existing ? remergeStoredSnapshot(existing, snap) : snap;
-
-    const result = db
-        .prepare(
-            `INSERT INTO git_snapshots
-             (id, developer_id, date, commits, lines_added, lines_removed, files_changed,
-              prs_opened, prs_merged, review_comments_given, avg_time_to_merge_hours,
-              code_churn_rate, ai_signature_score, avg_commit_size, commit_burst_count, data_source)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(developer_id, date) DO UPDATE SET
-               commits = excluded.commits,
-               lines_added = excluded.lines_added,
-               lines_removed = excluded.lines_removed,
-               files_changed = excluded.files_changed,
-               prs_opened = excluded.prs_opened,
-               prs_merged = excluded.prs_merged,
-               review_comments_given = excluded.review_comments_given,
-               avg_time_to_merge_hours = excluded.avg_time_to_merge_hours,
-               code_churn_rate = excluded.code_churn_rate,
-               ai_signature_score = excluded.ai_signature_score,
-               avg_commit_size = excluded.avg_commit_size,
-               commit_burst_count = excluded.commit_burst_count,
-               data_source = excluded.data_source`,
-        )
-        .run(
-            randomUUID(),
-            merged.developer_id,
-            merged.date,
-            merged.commits,
-            merged.lines_added,
-            merged.lines_removed,
-            merged.files_changed,
-            merged.prs_opened,
-            merged.prs_merged,
-            merged.review_comments_given,
-            merged.avg_time_to_merge_hours,
-            merged.code_churn_rate,
-            merged.ai_signature_score,
-            merged.avg_commit_size,
-            merged.commit_burst_count,
-            merged.data_source,
-        );
-
-    return result.changes > 0 ? 'written' : 'skipped';
+    const isEmailFallback = email !== null && analysisLogin.toLowerCase() === email.toLowerCase();
+    return rawAuthorKeyFor(providerType, isEmailFallback ? null : analysisLogin, email);
 }
 
 // Raw container identifier (org/workspace/group) for a provider — the canonical
@@ -1720,6 +1580,26 @@ export class GitSync implements ConnectorInterface {
         const now = new Date().toISOString();
         const allUnmatched = new Set<string>();
 
+        // Narrow + validate the auto-create config BEFORE any network work (#256). This is
+        // the second of the feature's two trust boundaries — `loadConfig` is the first, but
+        // a `GitConnectorConfig` also reaches here assembled programmatically (tests, the
+        // admin sync-now path, an embedder), and the boundary that must never be bypassed
+        // is the one next to the write. An invalid config aborts the run rather than
+        // syncing with the feature silently off: the operator asked for hands-off
+        // onboarding, and "ran fine, created nobody" is the failure mode this rejects.
+        let autoCreate: AutoCreateSettings;
+        try {
+            autoCreate = resolveAutoCreateSettings(this.config);
+        } catch (err) {
+            return {
+                connector: CONNECTOR_NAME,
+                snapshotsWritten: 0,
+                snapshotsSkipped: 0,
+                errors: [`Invalid auto-create config: ${err instanceof Error ? err.message : String(err)}`],
+                lastSyncTime: now,
+            };
+        }
+
         // One mutable progress state for the whole run; every report merges into
         // it and emits a copy, so the listener always sees cumulative counters.
         const progressState: GitSyncProgress = {
@@ -1767,18 +1647,46 @@ export class GitSync implements ConnectorInterface {
             p.current_repo = null;
         });
 
-        // Accumulate snapshots from all providers into a single map keyed by
-        // "developer_id:date" so same-day multi-provider data is merged.
-        const globalSnapshots = new Map<string, GitSnapshotRow>();
-        // Per-PR records (Task 5.2) resolved to developers, written after the
-        // snapshot pass. Keyed naturally by (provider, repo, pr_id), so no
-        // cross-provider merging is needed.
-        const resolvedPRRecords: Array<{record: PRRecordInput; developerId: string}> = [];
+        // Every author's daily facts this run observed, matched AND unmatched, ready to
+        // be RETAINED under their immutable raw identity (#253). This — not
+        // git_snapshots — is now the run's primary write: git_snapshots is derived from
+        // it by projection below, so an author with no developer record is no longer
+        // dropped but simply not yet projected.
+        // Keyed by `${raw_author_key} ${date}` so two provider INSTANCES of the same family
+        // contributing to one author-day are summed here rather than colliding in the store
+        // (see the accumulation below). Insertion-ordered, so the write pass stays
+        // deterministic.
+        const rawWrites = new Map<string, RawAuthorDailyInput>();
+        // The raw author keys THIS run retained — the scope auto-create (#256) acts on.
+        // Deliberately not "every current candidate": a hands-off run onboards the
+        // authorship it just observed, and must not silently sweep up candidates an
+        // operator left unpromoted in the review queue on purpose.
+        const retainedKeys = new Set<string>();
+        // The (developer_id, date) cells this run's raw writes resolve to — exactly the
+        // cells the projection must rebuild. Deduped by composite key so a developer
+        // reached under two identities (a github login and a bitbucket login) yields one
+        // cell, not two rebuilds of the same one.
+        const touchedCells = new Map<string, SnapshotCell>();
+        // Per-PR records (Task 5.2), written after the snapshot pass. Keyed naturally by
+        // (provider, repo, pr_id), so no cross-provider merging is needed.
+        //
+        // Collected UNRESOLVED and resolved inside the write transaction against the same
+        // post-auto-create lookup the snapshot projection uses. Resolving here would use
+        // the pre-fetch map, so a developer created during the run — by auto-create (#256),
+        // or by an admin during the minutes of network fetch — would have their PRs
+        // silently dropped. That loss is PERMANENT: providers re-fetch PRs by `updated_at`,
+        // so a PR that is already merged and never touched again is never re-delivered.
+        const fetchedPRRecords: Array<{record: PRRecordInput; providerType: GitProviderType}> = [];
         // Deferred sync-state advances (#231). Each entry is applied INSIDE the write
         // transaction below, so a provider's cursor/watermark commits atomically with
         // — and only if — its data is persisted. Populated only for providers whose
         // fetch was complete; an incomplete provider contributes nothing this run.
         const cursorAdvances: Array<() => void> = [];
+        // Auto-create's summary/failure lines (#256). Staged rather than pushed straight
+        // into `errors` because they are produced INSIDE the write transaction: on a
+        // rollback no developer was created, so reporting that any were would be a lie.
+        // Appended only after the transaction commits, and discarded on failure.
+        const autoCreateAdvisories: string[] = [];
         // Deferred stall-counter updates (#235), applied in the SAME transaction as
         // the cursor advances so the counter and the cursor can never disagree about
         // whether this run moved the provider forward. Unlike `cursorAdvances` this
@@ -1849,16 +1757,16 @@ export class GitSync implements ConnectorInterface {
             });
 
             for (const record of prRecords) {
+                fetchedPRRecords.push({record, providerType});
+                // Progress counter only — the authoritative resolution happens in the
+                // write transaction (see `fetchedPRRecords`).
                 const developerId = resolveDeveloperId(
                     devLookup,
                     providerType,
                     record.authorLogin,
                     record.authorEmail,
                 );
-                if (developerId) {
-                    resolvedPRRecords.push({record, developerId});
-                    matchedDevelopers.add(developerId);
-                }
+                if (developerId) matchedDevelopers.add(developerId);
             }
 
             if (commits.length === 0 && prs.length === 0 && reviewComments.length === 0) {
@@ -1868,24 +1776,25 @@ export class GitSync implements ConnectorInterface {
 
             const metricsMap = aggregateDailyMetrics(commits, prs, churnWindowHours, reviewComments);
 
-            // Check for unmatched authors
-            for (const commit of commits) {
-                const devId = resolveDeveloperId(devLookup, providerType, commit.authorLogin, commit.authorEmail);
-                if (!devId) {
-                    const label = commit.authorLogin ?? commit.authorEmail ?? 'unknown';
-                    allUnmatched.add(`${providerType}:${label}`);
-                }
-            }
-
             for (const [login, byDate] of metricsMap) {
-                const emailForLogin = commits.find((c) => c.authorLogin === login)?.authorEmail ?? null;
-                const developerId = resolveDeveloperId(devLookup, providerType, login, emailForLogin);
-                if (!developerId) continue;
-                matchedDevelopers.add(developerId);
+                // The first commit under this analysis login carries the identity fields
+                // the raw row is keyed and pre-filled by. A PR-only author has no commit,
+                // so both stay null and the row is keyed by the login alone — the same
+                // identity the resolver would have used for them before #253.
+                const sampleCommit = commits.find((c) => c.authorLogin === login);
+                const emailForLogin = sampleCommit?.authorEmail ?? null;
+                const rawAuthorKey = retentionKeyFor(providerType, login, emailForLogin);
+                // No stable identity (no login, no email) — nothing to retain it under.
+                if (!rawAuthorKey) continue;
+                retainedKeys.add(rawAuthorKey);
 
                 for (const [, metrics] of byDate) {
-                    const snap: GitSnapshotRow = {
-                        developer_id: developerId,
+                    const row: RawAuthorDailyInput = {
+                        provider: providerType,
+                        raw_author_key: rawAuthorKey,
+                        author_login: login,
+                        author_email: emailForLogin,
+                        author_display_name: sampleCommit?.authorName ?? null,
                         date: metrics.date,
                         commits: metrics.commits,
                         lines_added: metrics.lines_added,
@@ -1899,13 +1808,36 @@ export class GitSync implements ConnectorInterface {
                         ai_signature_score: metrics.ai_signature_score,
                         avg_commit_size: metrics.avg_commit_size,
                         commit_burst_count: metrics.commit_burst_count,
-                        data_source: providerType,
                     };
-
-                    const key = `${developerId}:${metrics.date}`;
-                    const existing = globalSnapshots.get(key);
-                    globalSnapshots.set(key, existing ? mergeSnapshots(existing, snap) : snap);
+                    // Accumulate WITHIN the run before the store ever sees it. `providerType`
+                    // is the provider FAMILY, not the instance, so two configured GitHub orgs
+                    // (or two Bitbucket workspaces) sharing an author produce the same
+                    // (key, date) here. Pushing both would hand them to the across-runs rule,
+                    // which max()es the re-delivered PR fields — correct for one PR delivered
+                    // twice, badly wrong for two orgs' genuinely different PRs on one day: the
+                    // smaller org's count would vanish, permanently, since the cursor advances
+                    // past the window. These sides ARE disjoint, so they sum.
+                    const dedupeKey = `${rawAuthorKey}\u0000${metrics.date}`;
+                    const prior = rawWrites.get(dedupeKey);
+                    rawWrites.set(
+                        dedupeKey,
+                        prior ? {...prior, ...mergeDailyDisjoint(prior, row)} : row,
+                    );
                 }
+
+                // Progress counter only — a live estimate for the UI, resolved against the
+                // pre-fetch map. The AUTHORITATIVE resolution (which cells to project, and
+                // who goes in the unmatched advisory) happens inside the write transaction
+                // below against a freshly-read map, because minutes of network fetch sit
+                // between the two and a developer created in that gap must not be missed.
+                const developerId = resolveRawAuthor(
+                    devLookup,
+                    providerType,
+                    rawAuthorKey,
+                    login,
+                    emailForLogin,
+                );
+                if (developerId) matchedDevelopers.add(developerId);
             }
         }
 
@@ -1914,23 +1846,78 @@ export class GitSync implements ConnectorInterface {
             p.developers_matched = matchedDevelopers.size;
         });
 
-        // Upsert all merged snapshots + per-PR records AND advance every complete
-        // provider's cursor/watermark in a SINGLE transaction (#231). The cursor
-        // advances live inside the same tx as the data write, so on any write failure
-        // the whole transaction rolls back — no cursor moves past a window whose data
-        // was never persisted, and the next run re-covers it. `snapshotsWritten` /
-        // `snapshotsSkipped` are staged locally and only committed to the run counters
-        // after the tx succeeds, so a rolled-back run never reports phantom writes.
+        // Retain every author's daily facts, PROJECT the touched cells of git_snapshots
+        // from them, write the per-PR records AND advance every complete provider's
+        // cursor/watermark in a SINGLE transaction (#231/#253). The cursor advances live
+        // inside the same tx as the data write, so on any write failure the whole
+        // transaction rolls back — no cursor moves past a window whose data was never
+        // persisted, no raw row is retained for it either, and the next run re-covers it.
+        // `snapshotsWritten` / `snapshotsSkipped` are staged locally and only committed to
+        // the run counters after the tx succeeds, so a rolled-back run never reports
+        // phantom writes.
         const insertMany = db.transaction(() => {
-            let written = 0;
-            let skipped = 0;
-            for (const snap of globalSnapshots.values()) {
-                const outcome = upsertSnapshot(db, snap);
-                if (outcome === 'written') written++;
-                else skipped++;
+            // RETAIN FIRST, in a pass of its own. Auto-create below derives its candidates
+            // from `raw_author_daily`, and the replay it performs re-projects every date a
+            // new developer's retained rows touch — so every row of this run must already
+            // be in the store before either happens, or a freshly-created developer's
+            // current-window activity would be invisible to their own replay. Splitting the
+            // former single loop is exactly what buys "no second pass, no re-fetch".
+            for (const row of rawWrites.values()) {
+                upsertRawAuthorDaily(db, row, now);
             }
-            for (const {record, developerId} of resolvedPRRecords) {
-                upsertPRRecord(db, record, developerId, now);
+
+            // Opt-in hands-off onboarding (#256), between retention and projection.
+            if (autoCreate.enabled && autoCreate.team !== null) {
+                autoCreateAdvisories.push(...this.runAutoCreate(db, autoCreate.team, autoCreate, retainedKeys));
+            }
+
+            // Read the identity map INSIDE the transaction, and AFTER auto-create: it must
+            // see the developers this run just minted, or their rows would be retained but
+            // their cells never projected while the cursor advanced past the window that
+            // produced them. (The same reason it is re-read at all: `devLookup` was built
+            // before minutes of network fetch, during which a developer may have been added.)
+            const writeLookup = buildDevLookupMap(db);
+            for (const row of rawWrites.values()) {
+                const developerId = resolveRawAuthor(
+                    writeLookup,
+                    row.provider,
+                    row.raw_author_key,
+                    row.author_login,
+                    row.author_email,
+                );
+                if (developerId) {
+                    touchedCells.set(`${developerId}:${row.date}`, {developer_id: developerId, date: row.date});
+                } else {
+                    // The advisory is sourced from the RETAINED rows: exactly the authors
+                    // whose day was kept but could not be attributed — precisely the set the
+                    // onboarding review queue (DO1.4/DO1.5) will offer to promote.
+                    allUnmatched.add(`${row.provider}:${row.author_login ?? row.author_email ?? 'unknown'}`);
+                }
+            }
+            // Rebuild EXACTLY the cells this run touched. Each is recomputed from every
+            // retained raw row on that day — including identities this run never fetched —
+            // so a scoped single-provider run still yields the full multi-provider total
+            // rather than dropping the other provider's same-day contribution (#192/#205).
+            const projection = projectSnapshots(db, {cells: [...touchedCells.values()]});
+            const written = projection.cellsWritten;
+            // A touched cell is skipped ONLY when its stored row is legacy (`is_projected
+            // = 0`, pre-#253) and the projection refuses to overwrite an accumulated total
+            // it cannot reconstruct. That is real, operator-visible data: on an upgraded
+            // deployment the day straddling the upgrade is legacy, so this run's newly
+            // retained commits for that day are NOT written while the cursor advances past
+            // them. Reporting 0 here would make an incomplete run read as a clean one —
+            // exactly the "completion signal is not a currency claim" failure. Surfaced as
+            // an advisory below as well, since `records_skipped` alone doesn't say why.
+            const skipped = projection.cellsSkippedLegacy;
+            // Resolved HERE, against the post-auto-create map — see `fetchedPRRecords`.
+            for (const {record, providerType} of fetchedPRRecords) {
+                const developerId = resolveDeveloperId(
+                    writeLookup,
+                    providerType,
+                    record.authorLogin,
+                    record.authorEmail,
+                );
+                if (developerId) upsertPRRecord(db, record, developerId, now);
             }
             // Advance cursors LAST, still inside the tx: they persist iff every write
             // above committed. Collected only for complete providers (see the loop).
@@ -1951,12 +1938,20 @@ export class GitSync implements ConnectorInterface {
 
         try {
             insertMany();
+            // Committed — only now is the auto-create summary true.
+            errors.push(...autoCreateAdvisories);
         } catch (err) {
-            // Hard failure: the tx rolled back, so NO snapshots were written and NO
-            // cursor advanced — the window is intact and will be re-fetched next run.
-            // Surface it clearly rather than swallowing it into a "successful" result.
+            // Hard failure: the tx rolled back, so NO snapshots were written, NO developer
+            // was auto-created and NO cursor advanced — the window is intact and will be
+            // re-fetched next run. Surface it clearly rather than swallowing it into a
+            // "successful" result.
             snapshotsWritten = 0;
             snapshotsSkipped = 0;
+            autoCreateAdvisories.length = 0;
+            // Derived from writes that were discarded, so reporting it would describe a
+            // state that does not exist — same reason the auto-create advisories are
+            // cleared. The rollback error below is the honest signal.
+            allUnmatched.clear();
             errors.push(
                 `Failed to write sync data (transaction rolled back — no cursor advanced, window will be re-fetched next run): ${err instanceof Error ? err.message : String(err)}`,
             );
@@ -1966,7 +1961,93 @@ export class GitSync implements ConnectorInterface {
             errors.push(`${UNMATCHED_AUTHORS_PREFIX} ${[...allUnmatched].join(', ')}`);
         }
 
+        // Say WHY cells were skipped, not just how many. `records_skipped` is a bare
+        // number on the sync log; without this an operator sees a "complete" run whose
+        // count silently disagrees with the data, and has nothing to search for.
+        if (snapshotsSkipped > 0) {
+            errors.push(
+                `${LEGACY_CELLS_SKIPPED_PREFIX} ${snapshotsSkipped} cell(s) were left untouched because they hold pre-upgrade totals the projection cannot reconstruct. Their raw authorship IS retained; re-run "sync older history" for the affected window if those days matter.`,
+            );
+        }
+
         return {connector: CONNECTOR_NAME, snapshotsWritten, snapshotsSkipped, errors, lastSyncTime: now};
+    }
+
+    /**
+     * Opt-in auto-create (#256): turn this run's unmatched HUMAN authors into developers,
+     * attributed in the same run. Returns the lines to surface on the SyncResult.
+     *
+     * MUST be called from inside the sync write transaction, between retention and
+     * projection. That placement is what makes the epic's atomicity criterion hold —
+     * creation, projection and the cursor advance commit together, so a rolled-back run
+     * creates nobody — and what makes "no second pass, no re-fetch" true: the new
+     * developer's own replay sees this run's rows because they are already retained.
+     *
+     * Everything below the team check is DELEGATED, not re-implemented. `promoteAllCandidates`
+     * already derives candidates from the raw store, hard-skips bots via the shared
+     * classifier, and creates each developer through `createDeveloperWithReplay` — which
+     * carries the identity-uniqueness guard and the replay. Re-deriving any of that here
+     * would be a second definition of who a bot is, or of what a duplicate is, and the two
+     * would drift. Auto-create's only additions are the run scope, the operator denylist,
+     * and `unreviewed` — the flag that keeps a self-asserted commit email from becoming an
+     * attribution claim when nobody is vouching for the row — all passed as options.
+     *
+     * Cost note: the creations are batched into ONE whole-day rebuild, not one replay each
+     * (`promoteAllCandidates` defers the per-create replay and issues a single
+     * `replayDevelopers` over the union of their dates). That matters because this runs
+     * inside the run's write transaction: a `dates`-mode projection rebuilds every cell on
+     * the days it covers regardless of whose replay asked for it, so the per-creation shape
+     * re-did almost the same rebuild once per author and held the SQLite write lock for the
+     * duration. Batching is exact rather than approximate — the projection is idempotent
+     * and order-independent, so one pass over the union writes what N passes converge to.
+     * It also does NOT fork the create path: `createDeveloperWithReplay` is still the single
+     * write boundary; only the projection call is hoisted out of the loop.
+     */
+    private runAutoCreate(
+        db: Database.Database,
+        team: string,
+        settings: AutoCreateSettings,
+        retainedKeys: ReadonlySet<string>,
+    ): string[] {
+        // FAIL CLOSED on an unusable team: create it when absent (parity with GitHub-org
+        // discovery's default team), but refuse an ARCHIVED one. A developer created into
+        // an archived team is absent from every team aggregate — the write "succeeds" and
+        // the person never appears, which is the silent hole this epic exists to close.
+        // Reported as a genuine error (no advisory prefix) so it turns the provider red
+        // rather than reading as a run that simply had nobody to onboard.
+        if (!ensureTeam(db, team)) {
+            return [
+                `Auto-create is enabled but team '${team}' is archived — no developers were created. Un-archive it or change connectors.git.auto_create_team.`,
+            ];
+        }
+        if (retainedKeys.size === 0) return [];
+
+        const result = promoteAllCandidates(db, team, {
+            onlyKeys: retainedKeys,
+            exclusions: settings.exclude,
+            // No human is reviewing these rows, so only provider-verified logins are
+            // onboarded and the created developers claim no self-asserted commit email.
+            unreviewed: true,
+        });
+        // Nothing observed and nothing skipped — stay silent rather than emit a line every
+        // run reporting that a steady-state sync onboarded nobody.
+        if (result.promoted === 0 && result.skippedBots === 0 && result.failed === 0) return [];
+
+        const lines = [
+            `${AUTO_CREATE_SUMMARY_PREFIX} ${result.promoted} developers (${result.skippedBots} bot authors skipped) into team '${team}'`,
+        ];
+        if (result.failed > 0) {
+            // Deliberately NOT advisory-prefixed. A candidate that could not be promoted is
+            // authorship that stays unattributed, and the operator has to see it. The most
+            // common cause is benign-but-worth-knowing: two raw keys for one person, the
+            // second colliding with the developer the first just created.
+            const detail = result.entries
+                .filter((e): e is Extract<typeof e, {status: 'failed'}> => e.status === 'failed')
+                .map((e) => `${e.candidate.raw_author_key} (${e.reason}: ${e.message})`)
+                .join('; ');
+            lines.push(autoCreateFailureLine(result.failed, detail));
+        }
+        return lines;
     }
 
     // Resolve the providers this sync run should cover: DB-connected providers

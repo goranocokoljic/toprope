@@ -39,10 +39,35 @@ export interface DeveloperIdentities {
     gitEmails?: string[];
 }
 
+/**
+ * Split git-email entries into INDIVIDUAL addresses.
+ *
+ * Storage and lookup disagree about what one entry is: {@link joinGitEmails} persists the
+ * set comma-joined, while `buildDevLookupMap` and `findByEmail` split the stored value on
+ * ',' and register each part as its own attribution key. So an entry like
+ * 'mine@x.com,victim@corp.com' is uniqueness-checked as one opaque string that matches
+ * nobody, then stored and split into a live claim on victim@corp.com — silently
+ * re-pointing that person's commit attribution.
+ *
+ * Every writer must tokenize BEFORE it checks for conflicts, not merely before it stores:
+ * splitting at storage alone still registers the stolen address, it just does so tidily.
+ * Exported so the create path, the admin PATCH and the CLI share one definition rather
+ * than each carrying its own copy of the rule.
+ */
+export function tokenizeGitEmails(entries: readonly string[]): string[] {
+    return entries.flatMap((entry) =>
+        entry
+            .split(/[,\s]+/)
+            .map((part) => part.trim())
+            .filter(Boolean),
+    );
+}
+
 // Normalize a set of git emails into a deduped, lowercased comma-separated string.
+// Tokenizes first, so a composite entry can never be stored whole.
 function joinGitEmails(emails: string[]): string {
     const seen = new Set<string>();
-    for (const e of emails) {
+    for (const e of tokenizeGitEmails(emails)) {
         const trimmed = e.trim().toLowerCase();
         if (trimmed) seen.add(trimmed);
     }

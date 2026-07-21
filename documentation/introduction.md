@@ -74,7 +74,9 @@ you deploy:
 - **Privacy first.** Individual data is visible only to that developer; managers
   see team aggregates only. Coaching, never surveillance.
 - **Tier-aware honesty.** Nothing implies data Toprope doesn't have. Insights
-  strengthen automatically as more sources connect.
+  strengthen as more sources connect — for the developers on the roster. A
+  connector never populates the roster itself; see
+  [Getting developers into Toprope](./developer-onboarding.md).
 - **Self-hosted.** Data stays in your infrastructure. The default AI-summary
   model is local (Ollama), so nothing leaves the network unless you choose it.
 - **Append-only.** Daily snapshots are immutable; history is never rewritten.

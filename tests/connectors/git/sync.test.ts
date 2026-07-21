@@ -22,9 +22,12 @@ import {
     loadGitSyncHealth,
     GIT_STALL_ALERT_RUNS,
     GIT_CATCHUP_WINDOW_MAX_DAYS,
+    UNMATCHED_AUTHORS_PREFIX,
     type GitSyncProgress,
     type GitSyncStage,
 } from '../../../src/connectors/git/sync';
+import {projectSnapshots, replayDeveloper} from '../../../src/connectors/git/projection';
+import type {SyncResult} from '../../../src/connectors/types';
 import {createProvider} from '../../../src/connectors/git/providers/store';
 import {loadServerKey} from '../../../src/connectors/git/providers/secret';
 import type {GitConnectorConfig} from '../../../src/config/types';
@@ -324,6 +327,52 @@ describe('GitSync', () => {
         // Only the github provider's listRepos should be called
         expect(githubProvider.listRepos).toHaveBeenCalledOnce();
         expect(bitbucketProvider.listRepos).not.toHaveBeenCalled();
+    });
+
+    it('SUMS two same-type provider instances\' disjoint PRs on one day rather than max()-ing them (SEC-1)', async () => {
+        // `providerType` is the FAMILY ('github'), not the instance, so two configured
+        // GitHub orgs sharing an author produce the same raw_author_key AND the same date.
+        // Handing both to the store separately would combine them with the ACROSS-RUNS
+        // rule, which max()es prs_opened/prs_merged/review_comments_given — correct for one
+        // PR re-delivered twice, wrong here: org A's and org B's PRs are different PRs.
+        // The undercount would be permanent, since the cursor advances past the window.
+        const devLogin = 'alice';
+        seedDev(db, devLogin);
+
+        const orgA = makeMockProvider({
+            name: 'github',
+            listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
+            getCommits: vi.fn().mockResolvedValue([makeProviderCommit(devLogin, '2024-01-15T10:00:00Z', 'sha-a')]),
+            getPullRequests: vi.fn().mockResolvedValue([{...makeProviderPR(devLogin), id: 'pr-a'}]),
+            getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+        });
+        const orgB = makeMockProvider({
+            name: 'github',
+            listRepos: vi.fn().mockResolvedValue([makeRepo('repo-b')]),
+            getCommits: vi.fn().mockResolvedValue([makeProviderCommit(devLogin, '2024-01-15T11:00:00Z', 'sha-b')]),
+            getPullRequests: vi.fn().mockResolvedValue([{...makeProviderPR(devLogin), id: 'pr-b'}]),
+            getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+        });
+        const createGitProvider = await getCreateGitProvider();
+        createGitProvider.mockReturnValueOnce(orgA).mockReturnValueOnce(orgB);
+
+        await new GitSync({
+            enabled: true,
+            providers: [
+                {type: 'github', org: 'org-a', auth: {type: 'token', api_token: 'token'}},
+                {type: 'github', org: 'org-b', auth: {type: 'token', api_token: 'token'}},
+            ],
+        }).sync(db);
+
+        const read = (date: string): {commits: number; prs_merged: number} | undefined =>
+            db.prepare(`SELECT commits, prs_merged FROM git_snapshots WHERE date = ?`).get(date) as
+                | {commits: number; prs_merged: number}
+                | undefined;
+
+        // One commit from each org, on the commit day…
+        expect(read('2024-01-15')?.commits).toBe(2);
+        // …and one MERGED PR from each, on the merge day. max() would have kept 1.
+        expect(read('2024-01-16')?.prs_merged).toBe(2);
     });
 
     it('returns error when filtered provider type is not configured', async () => {
@@ -3587,5 +3636,281 @@ describe('GitSync — stalled-provider detection (#235)', () => {
             // narrowing it here would silently import less than the guard cleared.
             expect(getCommits).toHaveBeenCalledWith('repo1', backfill.since, backfill.until);
         });
+    });
+});
+
+// DO1.3 (#253): the sync run now RETAINS every author's daily facts under their raw
+// identity and DERIVES git_snapshots from them. The 165 tests above are the golden
+// regression — they assert the pre-change additive output and all still pass through the
+// projection unchanged. These add what only the new design can be asked.
+describe('GitSync — raw authorship retention + projection (#253)', () => {
+    let db: Database.Database;
+
+    const CONFIG: GitProviderConfig = {
+        type: 'github',
+        org: 'test-org',
+        auth: {type: 'token', api_token: 't'},
+    };
+
+    beforeEach(() => {
+        db = makeDb();
+        vi.resetAllMocks();
+    });
+
+    afterEach(() => {
+        db.close();
+        vi.restoreAllMocks();
+    });
+
+    function countRaw(): number {
+        return (db.prepare('SELECT COUNT(*) AS n FROM raw_author_daily').get() as {n: number}).n;
+    }
+
+    function readCell(developerId: string, date: string): {commits: number} | undefined {
+        return db
+            .prepare('SELECT commits FROM git_snapshots WHERE developer_id = ? AND date = ?')
+            .get(developerId, date) as {commits: number} | undefined;
+    }
+
+    async function syncCommits(commits: GitCommit[], prs: GitPR[] = []): Promise<SyncResult> {
+        const createGitProvider = await getCreateGitProvider();
+        createGitProvider.mockReturnValueOnce(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                getCommits: vi.fn().mockResolvedValue(commits),
+                getPullRequests: vi.fn().mockResolvedValue(prs),
+                getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+            }),
+        );
+        return new GitSync({enabled: false}).syncProviders(db, [CONFIG]);
+    }
+
+    it('retains EVERY unmatched author on a fresh DB: 0 snapshots, N raw rows, advisory names them', async () => {
+        const result = await syncCommits([
+            makeProviderCommit('nobody-one', '2024-01-15T10:00:00Z', 'c1'),
+            makeProviderCommit('nobody-two', '2024-01-15T11:00:00Z', 'c2'),
+            makeProviderCommit('nobody-one', '2024-01-16T10:00:00Z', 'c3'),
+        ]);
+
+        // Nothing attributes — there is no developer registry at all.
+        expect(countSnapshots(db)).toBe(0);
+        // …but nothing is LOST either: 2 authors × the days they were active.
+        expect(countRaw()).toBe(3);
+        const advisory = result.errors.find((e) => e.startsWith(UNMATCHED_AUTHORS_PREFIX))!;
+        expect(advisory).toContain('github:nobody-one');
+        expect(advisory).toContain('github:nobody-two');
+    });
+
+    it('keys an email-only author (no provider username) by their EMAIL, not a login-shaped key', async () => {
+        await syncCommits([
+            {
+                sha: 'e1',
+                author: {name: 'Erin Example', email: 'Erin@Example.COM', username: ''},
+                date: '2024-01-15T10:00:00Z',
+                message: 'feat: x',
+                additions: 5,
+                deletions: 1,
+                filesChanged: ['src/x.ts'],
+            },
+        ]);
+
+        const row = db
+            .prepare('SELECT raw_author_key, author_email, author_display_name FROM raw_author_daily')
+            .get() as {raw_author_key: string; author_email: string; author_display_name: string};
+        // A username-less author must not be filed under `github:login:<an email>` — that
+        // identity shape exists nowhere else and would never match a promoted developer.
+        expect(row.raw_author_key).toBe('github:email:erin@example.com');
+        expect(row.author_email).toBe('erin@example.com');
+        // Display name is retained for candidate pre-fill (DO1.4), never for resolution.
+        expect(row.author_display_name).toBe('Erin Example');
+    });
+
+    it('git_snapshots is DERIVABLE: wiping it and re-projecting reproduces the synced rows exactly', async () => {
+        seedDev(db, 'alice');
+        await syncCommits([makeProviderCommit('alice', '2024-01-15T09:00:00Z', 'c1')], [makeProviderPR('alice')]);
+        // A second incremental run, so the stored rows are an ACCUMULATED total rather
+        // than one run's output — the case a naive rebuild would get wrong.
+        await syncCommits([makeProviderCommit('alice', '2024-01-15T15:00:00Z', 'c2')]);
+
+        const before = db
+            .prepare(
+                `SELECT developer_id, date, commits, lines_added, lines_removed, files_changed,
+                        prs_opened, prs_merged, review_comments_given, avg_time_to_merge_hours,
+                        code_churn_rate, ai_signature_score, avg_commit_size, commit_burst_count, data_source
+                 FROM git_snapshots ORDER BY date, developer_id`,
+            )
+            .all();
+        expect(before.length).toBeGreaterThan(0);
+
+        // Destroy the derived table entirely and rebuild it from the retained facts alone.
+        db.exec('DELETE FROM git_snapshots');
+        const dates = (db.prepare('SELECT DISTINCT date FROM raw_author_daily').all() as {date: string}[]).map(
+            (r) => r.date,
+        );
+        projectSnapshots(db, {dates});
+
+        const after = db
+            .prepare(
+                `SELECT developer_id, date, commits, lines_added, lines_removed, files_changed,
+                        prs_opened, prs_merged, review_comments_given, avg_time_to_merge_hours,
+                        code_churn_rate, ai_signature_score, avg_commit_size, commit_burst_count, data_source
+                 FROM git_snapshots ORDER BY date, developer_id`,
+            )
+            .all();
+        expect(after).toEqual(before);
+    });
+
+    it('HEAD-TO-HEAD: create-then-replay equals developer-existed-then-sync (no double-count, no undercount)', async () => {
+        const commits = [
+            makeProviderCommit('frank', '2024-01-15T09:00:00Z', 'f1'),
+            makeProviderCommit('frank', '2024-01-15T20:00:00Z', 'f2'),
+            makeProviderCommit('frank', '2024-01-16T09:00:00Z', 'f3'),
+        ];
+        const prs = [makeProviderPR('frank')];
+
+        // Branch A — the ONBOARDING path: sync first (frank is unmatched and retained),
+        // create the developer afterwards, then replay.
+        await syncCommits(commits, prs);
+        expect(countSnapshots(db)).toBe(0);
+        const lateId = seedDev(db, 'frank');
+        replayDeveloper(db, lateId);
+        const replayed = db
+            .prepare(
+                `SELECT date, commits, lines_added, lines_removed, files_changed, prs_opened, prs_merged,
+                        review_comments_given, avg_time_to_merge_hours, code_churn_rate, ai_signature_score,
+                        avg_commit_size, commit_burst_count, data_source
+                 FROM git_snapshots WHERE developer_id = ? ORDER BY date`,
+            )
+            .all(lateId);
+
+        // Branch B — the CONTROL: a pristine DB where frank existed before the sync ran.
+        const control = makeDb();
+        try {
+            addTeam(control, 'eng');
+            const earlyDev = addDeveloper(control, 'frank', 'eng', 'frank@example.com', 'frank');
+            control
+                .prepare(`UPDATE developers SET external_ids = '{"github":"frank"}' WHERE id = ?`)
+                .run(earlyDev.id);
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValueOnce(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits: vi.fn().mockResolvedValue(commits),
+                    getPullRequests: vi.fn().mockResolvedValue(prs),
+                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+                }),
+            );
+            await new GitSync({enabled: false}).syncProviders(control, [CONFIG]);
+
+            const direct = control
+                .prepare(
+                    `SELECT date, commits, lines_added, lines_removed, files_changed, prs_opened, prs_merged,
+                            review_comments_given, avg_time_to_merge_hours, code_churn_rate, ai_signature_score,
+                            avg_commit_size, commit_burst_count, data_source
+                     FROM git_snapshots WHERE developer_id = ? ORDER BY date`,
+                )
+                .all(earlyDev.id);
+
+            expect(direct.length).toBeGreaterThan(0);
+            // Every metric column, every date — a double-count or an undercount anywhere
+            // in the replay path fails this.
+            expect(replayed).toEqual(direct);
+        } finally {
+            control.close();
+        }
+    });
+
+    it('rolls back the RAW rows too when the write transaction fails — no cursor, no facts, no snapshots', async () => {
+        seedDev(db, 'alice');
+        const createGitProvider = await getCreateGitProvider();
+        createGitProvider.mockReturnValueOnce(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                getCommits: vi.fn().mockResolvedValue([makeProviderCommit('alice', '2024-01-15T09:00:00Z', 'c1')]),
+                // A PR forces the tx to reach upsertPRRecord AFTER the raw rows and the
+                // projection have already been written inside it.
+                getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+                getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+            }),
+        );
+        db.exec('DROP TABLE pr_records');
+
+        const result = await new GitSync({enabled: false}).syncProviders(db, [CONFIG]);
+
+        expect(result.errors.some((e) => e.includes('transaction rolled back'))).toBe(true);
+        expect(result.snapshotsWritten).toBe(0);
+        // Retention is inside the SAME transaction: a rolled-back run retains nothing,
+        // so the next run re-covers the window with no double-count.
+        expect(countRaw()).toBe(0);
+        expect(countSnapshots(db)).toBe(0);
+        expect(
+            db.prepare('SELECT value FROM sync_state WHERE key = ?').get(syncStateKey('github', 'test-org')),
+        ).toBeUndefined();
+    });
+
+    it('attributes a developer created WHILE the run was fetching — the cursor never advances past unprojected work', async () => {
+        const createGitProvider = await getCreateGitProvider();
+        let lateId = '';
+        createGitProvider.mockReturnValueOnce(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                // The fetch is where a real run spends minutes. An admin promoting a
+                // candidate right here must not be missed by a lookup map that was read
+                // before the fetch started.
+                getCommits: vi.fn().mockImplementation(async () => {
+                    lateId = seedDev(db, 'grace');
+                    return [makeProviderCommit('grace', '2024-01-15T10:00:00Z', 'g1')];
+                }),
+                getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+            }),
+        );
+
+        const result = await new GitSync({enabled: false}).syncProviders(db, [CONFIG]);
+
+        expect(readCell(lateId, '2024-01-15')?.commits).toBe(1);
+        // …and she is not simultaneously reported as an unmatched author.
+        expect(result.errors.some((e) => e.startsWith(UNMATCHED_AUTHORS_PREFIX))).toBe(false);
+    });
+
+    it('a scoped single-provider run projects the FULL multi-provider cell, not just its own share', async () => {
+        try { addTeam(db, 'eng'); } catch { /* already present */ }
+        const dev = addDeveloper(db, 'Alice', 'eng', 'alice@example.com', 'alice');
+        db.prepare(`UPDATE developers SET external_ids = '{"github":"alice","bitbucket":"alice-bb"}' WHERE id = ?`)
+            .run(dev.id);
+
+        await syncCommits([makeProviderCommit('alice', '2024-01-15T10:00:00Z', 'gh-1')]);
+
+        const createGitProvider = await getCreateGitProvider();
+        createGitProvider.mockReturnValueOnce(
+            makeMockProvider({
+                name: 'bitbucket',
+                listRepos: vi.fn().mockResolvedValue([makeRepo('bb-repo')]),
+                getCommits: vi.fn().mockResolvedValue([{
+                    sha: 'bb-1',
+                    author: {name: 'Alice', email: 'alice@example.com', username: 'alice-bb'},
+                    date: '2024-01-15T14:00:00Z',
+                    message: 'fix: bug',
+                    additions: 20,
+                    deletions: 3,
+                    filesChanged: ['src/y.ts'],
+                }]),
+                getCommitDiff: vi.fn().mockResolvedValue([{path: 'src/y.ts', additions: 20, deletions: 3, status: 'modified'}]),
+            }),
+        );
+        await new GitSync({enabled: false}).syncProviders(db, [
+            {type: 'bitbucket', workspace: 'bb-ws', auth: {type: 'app_password', username: 'u', app_password: 'p'}},
+        ]);
+
+        // The bitbucket-scoped run never fetched the github commit, yet the rebuilt cell
+        // still carries it — because the projection reads the RETAINED github raw row.
+        const row = db
+            .prepare(`SELECT commits, data_source, is_projected FROM git_snapshots WHERE developer_id = ? AND date = '2024-01-15'`)
+            .get(dev.id) as {commits: number; data_source: string; is_projected: number};
+        expect(row.commits).toBe(2);
+        expect(row.data_source).toBe('multi');
+        expect(row.is_projected).toBe(1);
+        // Two disjoint raw identities, one derived cell.
+        expect(countRaw()).toBe(2);
+        expect(countSnapshots(db)).toBe(1);
     });
 });

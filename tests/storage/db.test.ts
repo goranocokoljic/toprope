@@ -1,9 +1,17 @@
 import {describe, it, expect, beforeEach, afterEach} from 'vitest';
 import Database from 'better-sqlite3';
+import fs from 'fs';
 import path from 'path';
 import {runMigrations, getMigrationStatus} from '../../src/storage/migrator';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../src/storage/migrations');
+
+// Derived from the directory, not hardcoded: these tests assert that EVERY migration
+// on disk is applied/reported, which is the actual contract. A literal count turns
+// every new migration into an unrelated test failure (it did, on #252).
+const MIGRATION_COUNT = fs
+    .readdirSync(MIGRATIONS_DIR)
+    .filter((f) => /^\d{3}_.*\.sql$/.test(f)).length;
 
 function makeDb(): Database.Database {
     const db = new Database(':memory:');
@@ -24,7 +32,8 @@ describe('runMigrations', () => {
 
     it('applies all migrations on a fresh database', () => {
         const count = runMigrations(db, MIGRATIONS_DIR);
-        expect(count).toBe(39);
+        expect(count).toBe(MIGRATION_COUNT);
+        expect(MIGRATION_COUNT).toBeGreaterThan(0);
     });
 
     it('is idempotent — running twice applies nothing the second time', () => {
@@ -56,7 +65,7 @@ describe('getMigrationStatus', () => {
     it('returns one entry per migration after all are applied', () => {
         runMigrations(db, MIGRATIONS_DIR);
         const statuses = getMigrationStatus(db, MIGRATIONS_DIR);
-        expect(statuses).toHaveLength(39);
+        expect(statuses).toHaveLength(MIGRATION_COUNT);
     });
 
     it('marks all migrations as applied', () => {

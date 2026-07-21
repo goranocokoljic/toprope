@@ -1,0 +1,715 @@
+import {describe, it, expect, beforeEach, afterEach} from 'vitest';
+import Database from 'better-sqlite3';
+import path from 'path';
+import {runMigrations} from '../../../src/storage/migrator';
+import {addTeam, archiveTeam, listTeams} from '../../../src/registry/teams';
+import {addDeveloper} from '../../../src/registry/developers';
+import {upsertRawAuthorDaily, type RawAuthorDailyInput} from '../../../src/connectors/git/raw-author-daily';
+import {listAuthorCandidates, type AuthorCandidate} from '../../../src/connectors/git/author-candidates';
+import {
+    candidateCreateInput,
+    createDeveloperWithReplay,
+    deriveCandidateName,
+    promoteAllCandidates,
+    promoteCandidate,
+    MAX_DEVELOPER_NAME_LENGTH,
+} from '../../../src/connectors/git/onboarding';
+import type {GitProviderType} from '../../../src/connectors/git/providers/types';
+
+const MIGRATIONS_DIR = path.resolve(__dirname, '../../../src/storage/migrations');
+
+let db: Database.Database;
+
+function makeDb(): Database.Database {
+    const database = new Database(':memory:');
+    database.pragma('foreign_keys = ON');
+    runMigrations(database, MIGRATIONS_DIR);
+    addTeam(database, 'eng');
+    return database;
+}
+
+/** One retained raw daily fact. Defaults to a single-commit github day. */
+function rawRow(over: Partial<RawAuthorDailyInput> & {raw_author_key: string}): RawAuthorDailyInput {
+    return {
+        provider: 'github' as GitProviderType,
+        author_login: null,
+        author_email: null,
+        author_display_name: null,
+        date: '2026-07-01',
+        commits: 1,
+        lines_added: 10,
+        lines_removed: 2,
+        files_changed: 1,
+        prs_opened: 0,
+        prs_merged: 0,
+        review_comments_given: 0,
+        avg_time_to_merge_hours: null,
+        code_churn_rate: 0,
+        ai_signature_score: 0,
+        avg_commit_size: 12,
+        commit_burst_count: 0,
+        ...over,
+    };
+}
+
+/** Retain N days of authorship for one github login, one commit each. */
+function seedGithubLogin(login: string, dates: string[], commitsPerDay = 1): void {
+    for (const date of dates) {
+        upsertRawAuthorDaily(
+            db,
+            rawRow({
+                raw_author_key: `github:login:${login}`,
+                author_login: login,
+                author_email: `${login}@work.com`,
+                author_display_name: null,
+                date,
+                commits: commitsPerDay,
+            }),
+        );
+    }
+}
+
+function snapshotsFor(developerId: string): {date: string; commits: number}[] {
+    return db
+        .prepare('SELECT date, commits FROM git_snapshots WHERE developer_id = ? ORDER BY date')
+        .all(developerId) as {date: string; commits: number}[];
+}
+
+function candidate(over: Partial<AuthorCandidate> = {}): AuthorCandidate {
+    return {
+        provider: 'github',
+        raw_author_key: 'github:login:jane',
+        login: 'jane',
+        email: 'jane@work.com',
+        display_name: 'Jane Doe',
+        commit_count: 5,
+        first_seen: '2026-07-01T00:00:00.000Z',
+        last_seen: '2026-07-05T00:00:00.000Z',
+        likely_bot: false,
+        ...over,
+    };
+}
+
+beforeEach(() => {
+    db = makeDb();
+});
+
+afterEach(() => {
+    db.close();
+});
+
+describe('createDeveloperWithReplay — create + attribute retained history atomically (#255)', () => {
+    it('attributes the retained history the new identities resolve', () => {
+        seedGithubLogin('jane', ['2026-07-01', '2026-07-02', '2026-07-03']);
+
+        const outcome = createDeveloperWithReplay(db, {name: 'Jane', team: 'eng', github: 'jane'});
+
+        expect(outcome.ok).toBe(true);
+        if (!outcome.ok) return;
+        expect(outcome.replay.datesCovered).toBe(3);
+        expect(snapshotsFor(outcome.developer.id).map((s) => s.date)).toEqual([
+            '2026-07-01',
+            '2026-07-02',
+            '2026-07-03',
+        ]);
+    });
+
+    it('reports zero attributed dates — and writes no snapshots — when nothing retained matches', () => {
+        seedGithubLogin('jane', ['2026-07-01']);
+
+        const outcome = createDeveloperWithReplay(db, {name: 'New Hire', team: 'eng', github: 'newbie'});
+
+        expect(outcome.ok).toBe(true);
+        if (!outcome.ok) return;
+        // The honest zero: a real developer, no retained authorship of theirs.
+        expect(outcome.replay.datesCovered).toBe(0);
+        expect(snapshotsFor(outcome.developer.id)).toEqual([]);
+    });
+
+    it('does not double-count when the same day is retained across two providers', () => {
+        upsertRawAuthorDaily(
+            db,
+            rawRow({
+                raw_author_key: 'github:login:jane',
+                author_login: 'jane',
+                date: '2026-07-01',
+                commits: 3,
+            }),
+        );
+        upsertRawAuthorDaily(
+            db,
+            rawRow({
+                provider: 'bitbucket' as GitProviderType,
+                raw_author_key: 'bitbucket:login:jane-bb',
+                author_login: 'jane-bb',
+                date: '2026-07-01',
+                commits: 4,
+            }),
+        );
+
+        const outcome = createDeveloperWithReplay(db, {
+            name: 'Jane',
+            team: 'eng',
+            github: 'jane',
+            bitbucket: 'jane-bb',
+        });
+
+        expect(outcome.ok).toBe(true);
+        if (!outcome.ok) return;
+        // One (developer, date) cell holding the SUM once — not 3, not 14.
+        expect(snapshotsFor(outcome.developer.id)).toEqual([{date: '2026-07-01', commits: 7}]);
+    });
+
+    it('is idempotent across a re-run: a second create for the same person conflicts, snapshots unchanged', () => {
+        seedGithubLogin('jane', ['2026-07-01', '2026-07-02']);
+        const first = createDeveloperWithReplay(db, {name: 'Jane', team: 'eng', github: 'jane'});
+        expect(first.ok).toBe(true);
+        if (!first.ok) return;
+        const before = snapshotsFor(first.developer.id);
+
+        const second = createDeveloperWithReplay(db, {name: 'Jane Again', team: 'eng', github: 'jane'});
+
+        expect(second.ok).toBe(false);
+        if (second.ok) return;
+        expect(second.reason).toBe('conflict');
+        expect(second.message).toContain('already mapped to Jane');
+        expect(snapshotsFor(first.developer.id)).toEqual(before);
+        expect(db.prepare('SELECT COUNT(*) AS n FROM developers').get()).toEqual({n: 1});
+    });
+
+    it('rolls the whole create back on a duplicate email — no developer row survives', () => {
+        addDeveloper(db, 'Existing', 'eng', 'taken@work.com');
+
+        const outcome = createDeveloperWithReplay(db, {
+            name: 'Impostor',
+            team: 'eng',
+            email: 'taken@work.com',
+        });
+
+        expect(outcome.ok).toBe(false);
+        if (outcome.ok) return;
+        expect(outcome.reason).toBe('conflict');
+        expect(outcome.message).toContain("email 'taken@work.com' is already mapped to Existing");
+        expect(db.prepare("SELECT COUNT(*) AS n FROM developers WHERE name = 'Impostor'").get()).toEqual({
+            n: 0,
+        });
+    });
+
+    it('tokenizes a comma-bearing git email so it cannot smuggle a claim past the guard (SEC)', () => {
+        // A provider-supplied author email is unvalidated and lands verbatim in
+        // the raw store, so a crafted commit author can carry a comma. Storage
+        // joins git emails with ',' and the lookup SPLITS on ',' — so an entry
+        // checked as one opaque string but stored as two would silently re-point
+        // an existing developer's commits at whoever submitted it.
+        addDeveloper(db, 'Jane', 'eng', 'jane@corp.com');
+        seedGithubLogin('jane', ['2026-07-01', '2026-07-02']);
+
+        const outcome = createDeveloperWithReplay(db, {
+            name: 'Evil',
+            team: 'eng',
+            email: 'evil@x.com',
+            gitEmails: ['other@x.com,jane@corp.com'],
+        });
+
+        expect(outcome.ok).toBe(false);
+        if (outcome.ok) return;
+        expect(outcome.reason).toBe('conflict');
+        expect(outcome.message).toContain("git email 'jane@corp.com' is already mapped to Jane");
+        expect(db.prepare("SELECT COUNT(*) AS n FROM developers WHERE name = 'Evil'").get()).toEqual({
+            n: 0,
+        });
+    });
+
+    it('splits a multi-address git email into individually-resolvable identities', () => {
+        // Positive control for the tokenization above: when nothing is taken, both
+        // halves must become REAL lookup keys, not one dead composite string.
+        upsertRawAuthorDaily(
+            db,
+            rawRow({
+                raw_author_key: 'github:email:second@x.com',
+                author_email: 'second@x.com',
+                date: '2026-07-03',
+                commits: 2,
+            }),
+        );
+
+        const outcome = createDeveloperWithReplay(db, {
+            name: 'Multi',
+            team: 'eng',
+            email: 'primary@x.com',
+            gitEmails: ['first@x.com, second@x.com'],
+        });
+
+        expect(outcome.ok).toBe(true);
+        if (!outcome.ok) return;
+        expect(outcome.developer.external_ids.git_emails).toBe('first@x.com,second@x.com');
+        // The second address really resolves — the retained day attributed.
+        expect(snapshotsFor(outcome.developer.id)).toEqual([{date: '2026-07-03', commits: 2}]);
+    });
+
+    it('stores the same provider id it uniqueness-checked, trimmed (SEC)', () => {
+        seedGithubLogin('jane', ['2026-07-01']);
+
+        const outcome = createDeveloperWithReplay(db, {name: 'Jane', team: 'eng', github: '  jane  '});
+
+        expect(outcome.ok).toBe(true);
+        if (!outcome.ok) return;
+        // Untrimmed, this would store ' jane ', resolve nothing forever, and leave
+        // a later honest claim of 'jane' looking free.
+        expect(outcome.developer.external_ids.github).toBe('jane');
+        expect(outcome.replay.datesCovered).toBe(1);
+
+        const second = createDeveloperWithReplay(db, {name: 'Impostor', team: 'eng', github: 'jane'});
+        expect(second.ok).toBe(false);
+    });
+
+    it('fails closed on a team that does not exist', () => {
+        const outcome = createDeveloperWithReplay(db, {name: 'Jane', team: 'ghost-team'});
+
+        expect(outcome.ok).toBe(false);
+        if (outcome.ok) return;
+        expect(outcome.reason).toBe('invalid_team');
+        expect(db.prepare('SELECT COUNT(*) AS n FROM developers').get()).toEqual({n: 0});
+    });
+
+    it('fails closed on an archived team', () => {
+        addTeam(db, 'legacy');
+        archiveTeam(db, 'legacy');
+
+        const outcome = createDeveloperWithReplay(db, {name: 'Jane', team: 'legacy'});
+
+        expect(outcome.ok).toBe(false);
+        if (outcome.ok) return;
+        expect(outcome.reason).toBe('invalid_team');
+        expect(outcome.message).toContain('archived');
+        expect(db.prepare('SELECT COUNT(*) AS n FROM developers').get()).toEqual({n: 0});
+    });
+});
+
+describe('candidateCreateInput — seeding the create from a candidate', () => {
+    it("writes the candidate's login onto ITS OWN provider, not github", () => {
+        const input = candidateCreateInput(
+            candidate({provider: 'bitbucket', raw_author_key: 'bitbucket:login:carol', login: 'carol'}),
+            'eng',
+        );
+
+        expect(input.bitbucket).toBe('carol');
+        expect(input.github).toBeUndefined();
+        expect(input.gitlab).toBeUndefined();
+    });
+
+    it('routes a gitlab candidate to the gitlab field', () => {
+        const input = candidateCreateInput(
+            candidate({provider: 'gitlab', raw_author_key: 'gitlab:login:gina', login: 'gina'}),
+            'eng',
+        );
+
+        expect(input.gitlab).toBe('gina');
+        expect(input.github).toBeUndefined();
+    });
+
+    it("keeps the candidate's email as a git email when the operator overrides the primary one", () => {
+        const input = candidateCreateInput(candidate({email: 'jane@work.com'}), 'eng', {
+            email: 'jane@corp.com',
+        });
+
+        expect(input.email).toBe('jane@corp.com');
+        // Dropping it is how a promotion "succeeds" and attributes nothing.
+        expect(input.gitEmails).toEqual(['jane@work.com']);
+    });
+
+    it('does not duplicate the candidate email into git_emails when it IS the primary email', () => {
+        const input = candidateCreateInput(candidate({email: 'jane@work.com'}), 'eng');
+
+        expect(input.email).toBe('jane@work.com');
+        expect(input.gitEmails).toEqual([]);
+    });
+
+    it('treats a case-differing override as the same address, not a second one', () => {
+        const input = candidateCreateInput(candidate({email: 'jane@work.com'}), 'eng', {
+            email: 'Jane@Work.com',
+        });
+
+        expect(input.gitEmails).toEqual([]);
+    });
+
+    it('carries an override for a DIFFERENT provider through alongside the candidate login', () => {
+        const input = candidateCreateInput(
+            candidate({provider: 'bitbucket', raw_author_key: 'bitbucket:login:carol', login: 'carol'}),
+            'eng',
+            {github: 'carol-gh'},
+        );
+
+        expect(input.bitbucket).toBe('carol');
+        expect(input.github).toBe('carol-gh');
+    });
+
+    it('lets an explicit name override the derived one', () => {
+        expect(candidateCreateInput(candidate(), 'eng', {name: 'Jane Q. Doe'}).name).toBe('Jane Q. Doe');
+    });
+});
+
+describe('deriveCandidateName', () => {
+    it('prefers the display name, then the login, then the email', () => {
+        expect(deriveCandidateName(candidate())).toBe('Jane Doe');
+        expect(deriveCandidateName(candidate({display_name: null}))).toBe('jane');
+        expect(deriveCandidateName(candidate({display_name: null, login: null}))).toBe('jane@work.com');
+    });
+
+    it('clamps an unbounded provider-supplied name to the create limit', () => {
+        const long = 'x'.repeat(500);
+
+        const name = deriveCandidateName(candidate({display_name: long}));
+
+        expect(name).toHaveLength(MAX_DEVELOPER_NAME_LENGTH);
+    });
+});
+
+describe('promoteCandidate', () => {
+    it('creates the developer and attributes their retained history in one call', () => {
+        seedGithubLogin('jane', ['2026-07-01', '2026-07-02']);
+
+        const outcome = promoteCandidate(db, 'github:login:jane', 'eng');
+
+        expect(outcome.ok).toBe(true);
+        if (!outcome.ok) return;
+        expect(outcome.replay.datesCovered).toBe(2);
+        expect(snapshotsFor(outcome.developer.id)).toHaveLength(2);
+    });
+
+    it('removes the promoted author from the candidate list (derived, no cleanup step)', () => {
+        seedGithubLogin('jane', ['2026-07-01']);
+        seedGithubLogin('bob', ['2026-07-01']);
+        expect(listAuthorCandidates(db).map((c) => c.raw_author_key)).toContain('github:login:jane');
+
+        promoteCandidate(db, 'github:login:jane', 'eng');
+
+        const keys = listAuthorCandidates(db).map((c) => c.raw_author_key);
+        expect(keys).not.toContain('github:login:jane');
+        // Positive control: the OTHER unmatched author is still queued, so the
+        // assertion above is about the promotion and not an empty list.
+        expect(keys).toContain('github:login:bob');
+    });
+
+    it('refuses an unknown key rather than creating a developer for nobody', () => {
+        const outcome = promoteCandidate(db, 'github:login:ghost', 'eng');
+
+        expect(outcome.ok).toBe(false);
+        if (outcome.ok) return;
+        expect(outcome.reason).toBe('candidate_not_found');
+        expect(db.prepare('SELECT COUNT(*) AS n FROM developers').get()).toEqual({n: 0});
+    });
+
+    it('refuses a key that is already mapped, instead of minting a duplicate developer', () => {
+        seedGithubLogin('jane', ['2026-07-01']);
+        addDeveloper(db, 'Jane', 'eng', undefined, 'jane');
+
+        const outcome = promoteCandidate(db, 'github:login:jane', 'eng');
+
+        expect(outcome.ok).toBe(false);
+        if (outcome.ok) return;
+        expect(outcome.reason).toBe('candidate_not_found');
+        expect(db.prepare('SELECT COUNT(*) AS n FROM developers').get()).toEqual({n: 1});
+    });
+
+    it('rejects a promotion whose overridden identity is already owned (409 message shape)', () => {
+        seedGithubLogin('jane', ['2026-07-01']);
+        addDeveloper(db, 'Existing', 'eng', undefined, 'taken-gh');
+
+        const outcome = promoteCandidate(db, 'github:login:jane', 'eng', {github: 'taken-gh'});
+
+        expect(outcome.ok).toBe(false);
+        if (outcome.ok) return;
+        expect(outcome.reason).toBe('conflict');
+        expect(outcome.message).toBe("github identity 'taken-gh' is already mapped to Existing");
+    });
+
+    it('attributes an email-keyed candidate that has no login at all', () => {
+        upsertRawAuthorDaily(
+            db,
+            rawRow({
+                raw_author_key: 'github:email:dan@work.com',
+                author_login: null,
+                author_email: 'dan@work.com',
+                date: '2026-07-04',
+                commits: 2,
+            }),
+        );
+
+        const outcome = promoteCandidate(db, 'github:email:dan@work.com', 'eng');
+
+        expect(outcome.ok).toBe(true);
+        if (!outcome.ok) return;
+        expect(outcome.developer.email).toBe('dan@work.com');
+        expect(snapshotsFor(outcome.developer.id)).toEqual([{date: '2026-07-04', commits: 2}]);
+    });
+});
+
+describe('promoteAllCandidates', () => {
+    beforeEach(() => {
+        seedGithubLogin('jane', ['2026-07-01', '2026-07-02']);
+        seedGithubLogin('bob', ['2026-07-01']);
+        upsertRawAuthorDaily(
+            db,
+            rawRow({
+                raw_author_key: 'github:login:dependabot[bot]',
+                author_login: 'dependabot[bot]',
+                date: '2026-07-01',
+                commits: 9,
+            }),
+        );
+    });
+
+    it('promotes the humans and skips the bots by default', () => {
+        const result = promoteAllCandidates(db, 'eng');
+
+        expect(result.promoted).toBe(2);
+        expect(result.skippedBots).toBe(1);
+        expect(result.failed).toBe(0);
+        const names = (
+            db.prepare('SELECT name FROM developers ORDER BY name').all() as {name: string}[]
+        ).map((r) => r.name);
+        expect(names).toEqual(['bob', 'jane']);
+        // The skip carries the classifier's reason, not a bare boolean.
+        const skipped = result.entries.find((e) => e.status === 'skipped_bot');
+        expect(skipped?.status === 'skipped_bot' && skipped.reason).toContain('automation');
+    });
+
+    it('isolates a failing promotion to a SAVEPOINT when run inside a caller transaction (TST-1)', () => {
+        // The docstring on promoteAllCandidates claims better-sqlite3 promotes each inner
+        // `db.transaction` to a SAVEPOINT when it runs inside an OUTER transaction — which
+        // is exactly how #256's auto-create calls it, from the sync write transaction. The
+        // existing isolation test proves it OUTSIDE any outer transaction, the one case
+        // where savepoint semantics don't apply, so the claim that matters was unpinned.
+        //
+        // If it were wrong, one conflicting candidate would abort the WHOLE sync
+        // transaction: no snapshots, no cursor advance, the run silently losing everything
+        // it fetched. This asserts the opposite — the outer transaction commits, keeping
+        // both the successful promotions and an unrelated write made alongside them.
+        //
+        // The documented failure shape: TWO raw keys for one person. Jane's login-keyed
+        // rows (seeded above, 2 days) and an email-keyed row carrying the SAME address.
+        // Both are unmatched candidates when the list is snapshotted; promoting the
+        // login-keyed one mints a developer owning jane@work.com, so the email-keyed one
+        // then conflicts. Fewer commits than the login key, so it is promoted second.
+        upsertRawAuthorDaily(
+            db,
+            rawRow({
+                raw_author_key: 'github:email:jane@work.com',
+                author_login: null,
+                author_email: 'jane@work.com',
+                author_display_name: null,
+                date: '2026-07-05',
+                commits: 1,
+            }),
+        );
+
+        let result: ReturnType<typeof promoteAllCandidates> | undefined;
+        db.transaction(() => {
+            result = promoteAllCandidates(db, 'eng');
+            // An unrelated write in the OUTER transaction. If the failing inner promotion
+            // had aborted the outer one, this would be rolled back with everything else.
+            addTeam(db, 'outer-tx-survived');
+        })();
+
+        // The conflicting candidate failed, and was reported rather than swallowed…
+        expect(result?.failed).toBe(1);
+        const failed = result?.entries.find((e) => e.status === 'failed');
+        expect(failed?.status === 'failed' && failed.reason).toBe('conflict');
+        // …while the clean promotions, and the outer transaction, both committed.
+        expect(result?.promoted).toBe(2);
+        const names = (db.prepare('SELECT name FROM developers ORDER BY name').all() as {name: string}[]).map(
+            (r) => r.name,
+        );
+        expect(names).toEqual(['bob', 'jane']);
+        expect(listTeams(db).map((t) => t.name)).toContain('outer-tx-survived');
+    });
+
+    it('promotes bots too under --include-bots', () => {
+        const result = promoteAllCandidates(db, 'eng', {includeBots: true});
+
+        expect(result.promoted).toBe(3);
+        expect(result.skippedBots).toBe(0);
+        expect(
+            db.prepare("SELECT COUNT(*) AS n FROM developers WHERE name = 'dependabot[bot]'").get(),
+        ).toEqual({n: 1});
+    });
+
+    it('attributes each promoted developer their own history — nothing is merged or doubled', () => {
+        const result = promoteAllCandidates(db, 'eng');
+
+        const promoted = result.entries.filter((e) => e.status === 'promoted');
+        const byName = new Map(
+            promoted.map((e) => [
+                e.status === 'promoted' ? e.developer.name : '',
+                e.status === 'promoted' ? e.replay.datesCovered : -1,
+            ]),
+        );
+        expect(byName.get('jane')).toBe(2);
+        expect(byName.get('bob')).toBe(1);
+    });
+
+    it('empties the queue it promoted from', () => {
+        promoteAllCandidates(db, 'eng', {includeBots: true});
+
+        expect(listAuthorCandidates(db)).toEqual([]);
+    });
+
+    it('reports a mid-run conflict as a failed entry and keeps promoting the rest', () => {
+        // A second key for a person the first promotion is about to create: the
+        // guard must catch it, and it must not abort the whole run.
+        upsertRawAuthorDaily(
+            db,
+            rawRow({
+                provider: 'bitbucket' as GitProviderType,
+                raw_author_key: 'bitbucket:email:jane@work.com',
+                author_login: null,
+                author_email: 'jane@work.com',
+                date: '2026-07-05',
+                commits: 1,
+            }),
+        );
+
+        const result = promoteAllCandidates(db, 'eng');
+
+        expect(result.failed).toBe(1);
+        expect(result.promoted).toBe(2);
+        const failure = result.entries.find((e) => e.status === 'failed');
+        expect(failure?.status === 'failed' && failure.reason).toBe('conflict');
+        expect(failure?.status === 'failed' && failure.message).toContain('already mapped to jane');
+    });
+
+    it('returns an empty, all-zero result when there is nothing to promote', () => {
+        const fresh = makeDb();
+        try {
+            const result = promoteAllCandidates(fresh, 'eng');
+            expect(result).toEqual({entries: [], promoted: 0, skippedBots: 0, failed: 0});
+        } finally {
+            fresh.close();
+        }
+    });
+
+    describe('scoping and exclusions (#256)', () => {
+        it('promotes only the keys in onlyKeys', () => {
+            const result = promoteAllCandidates(db, 'eng', {
+                onlyKeys: new Set(['github:login:jane']),
+            });
+
+            expect(result.promoted).toBe(1);
+            // bob and the bot are out of scope entirely — not promoted, and not counted
+            // as skipped bots either, because they were never considered.
+            expect(result.skippedBots).toBe(0);
+            expect(result.entries).toHaveLength(1);
+            const names = (db.prepare('SELECT name FROM developers').all() as {name: string}[]).map(
+                (r) => r.name,
+            );
+            expect(names).toEqual(['jane']);
+        });
+
+        it('an out-of-scope key stays a candidate', () => {
+            promoteAllCandidates(db, 'eng', {onlyKeys: new Set(['github:login:jane'])});
+            expect(listAuthorCandidates(db).map((c) => c.raw_author_key)).toContain('github:login:bob');
+        });
+
+        it('an empty onlyKeys promotes nobody (it is a scope, not "unset")', () => {
+            const result = promoteAllCandidates(db, 'eng', {onlyKeys: new Set()});
+            expect(result).toEqual({entries: [], promoted: 0, skippedBots: 0, failed: 0});
+        });
+
+        it('omitting onlyKeys still means "every candidate"', () => {
+            expect(promoteAllCandidates(db, 'eng', {}).promoted).toBe(2);
+        });
+
+        it('skips a candidate matched by an operator exclusion pattern', () => {
+            const result = promoteAllCandidates(db, 'eng', {exclusions: [/^jane$/i]});
+
+            expect(result.promoted).toBe(1);
+            // jane joins the bot in the skipped bucket — one classification, one answer.
+            expect(result.skippedBots).toBe(2);
+            const skipped = result.entries.filter((e) => e.status === 'skipped_bot');
+            expect(skipped.map((e) => e.candidate.login).sort()).toEqual(['dependabot[bot]', 'jane']);
+            expect(
+                skipped.find((e) => e.candidate.login === 'jane')?.status === 'skipped_bot' &&
+                    skipped.find((e) => e.candidate.login === 'jane')?.reason,
+            ).toMatch(/operator exclusion pattern/);
+        });
+
+        describe('unreviewed mode (auto-create)', () => {
+            it('creates from the provider login only — never the self-asserted commit email', () => {
+                promoteAllCandidates(db, 'eng', {
+                    onlyKeys: new Set(['github:login:jane']),
+                    unreviewed: true,
+                });
+
+                const row = db.prepare('SELECT email, external_ids FROM developers').get() as {
+                    email: string | null;
+                    external_ids: string;
+                };
+                expect(row.email).toBeNull();
+                const ext = JSON.parse(row.external_ids) as Record<string, string>;
+                expect(ext.github).toBe('jane');
+                expect(ext.git_emails).toBeUndefined();
+            });
+
+            it('the reviewed path still seeds the email (a human vouched for the row)', () => {
+                promoteAllCandidates(db, 'eng', {onlyKeys: new Set(['github:login:jane'])});
+
+                const row = db.prepare('SELECT email FROM developers').get() as {email: string | null};
+                expect(row.email).toBe('jane@work.com');
+            });
+
+            it('skips an email-keyed candidate, and says why', () => {
+                upsertRawAuthorDaily(
+                    db,
+                    rawRow({
+                        raw_author_key: 'github:email:nolo@work.com',
+                        author_email: 'nolo@work.com',
+                        date: '2026-07-01',
+                    }),
+                );
+
+                const result = promoteAllCandidates(db, 'eng', {
+                    onlyKeys: new Set(['github:email:nolo@work.com']),
+                    unreviewed: true,
+                });
+
+                expect(result.promoted).toBe(0);
+                expect(result.skippedBots).toBe(1);
+                const skipped = result.entries[0];
+                expect(skipped.status === 'skipped_bot' && skipped.reason).toMatch(/no provider login/);
+                // Still a candidate — held for review, not discarded.
+                expect(listAuthorCandidates(db).map((c) => c.raw_author_key)).toContain(
+                    'github:email:nolo@work.com',
+                );
+            });
+
+            it('the reviewed path DOES promote an email-keyed candidate', () => {
+                upsertRawAuthorDaily(
+                    db,
+                    rawRow({
+                        raw_author_key: 'github:email:nolo@work.com',
+                        author_email: 'nolo@work.com',
+                        date: '2026-07-01',
+                    }),
+                );
+
+                const result = promoteAllCandidates(db, 'eng', {
+                    onlyKeys: new Set(['github:email:nolo@work.com']),
+                });
+
+                expect(result.promoted).toBe(1);
+            });
+        });
+
+        it('combines scope and exclusions', () => {
+            const result = promoteAllCandidates(db, 'eng', {
+                onlyKeys: new Set(['github:login:jane', 'github:login:bob']),
+                exclusions: [/^jane$/i],
+            });
+
+            expect(result.promoted).toBe(1);
+            expect(result.skippedBots).toBe(1);
+            expect(result.entries.find((e) => e.status === 'promoted')?.candidate.login).toBe('bob');
+        });
+    });
+});

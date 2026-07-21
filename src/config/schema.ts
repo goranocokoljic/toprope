@@ -57,6 +57,13 @@ export const configSchema: Record<string, unknown> = {
                     required: ['enabled'],
                     properties: {
                         enabled: {type: 'boolean'},
+                        // DO1.6 (#256). Shape only — the AUTHORITATIVE narrowing lives in
+                        // `resolveAutoCreateSettings`, which the loader calls after this
+                        // schema passes. Both run: the schema gives a good message for the
+                        // common typo, the resolver is what the sync write path also calls.
+                        auto_create_developers: {type: 'boolean'},
+                        auto_create_team: {type: 'string', minLength: 1},
+                        auto_create_exclude: {type: 'array', items: {type: 'string', minLength: 1}},
                     },
                 },
             },

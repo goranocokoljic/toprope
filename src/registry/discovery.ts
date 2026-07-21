@@ -2,7 +2,8 @@ import https from 'https';
 import type {Developer} from './types';
 import Database from 'better-sqlite3';
 import {addDeveloper, findByGithubUsername} from './developers';
-import {teamExists} from './teams';
+import {ensureTeam} from './teams';
+import {replayDevelopers} from '../connectors/git/projection';
 
 interface GithubMember {
     login: string;
@@ -67,6 +68,8 @@ async function fetchUserDetail(login: string, token: string): Promise<GithubUser
 export interface DiscoveryResult {
     created: Developer[];
     skipped: string[];
+    /** Distinct UTC days the created developers' retained history was re-projected over. */
+    datesAttributed: number;
 }
 
 export async function discoverOrgMembers(
@@ -75,19 +78,25 @@ export async function discoverOrgMembers(
     token: string,
     defaultTeam?: string,
 ): Promise<DiscoveryResult> {
+    const team = defaultTeam ?? 'discovered';
+
+    // Resolve the target team BEFORE the network fetch: creating it when absent, refusing
+    // it when ARCHIVED. Shared with DO1.6's auto-create via `ensureTeam` rather than an
+    // inline INSERT, so both hands-off onboarding paths agree about what a usable default
+    // team is — previously this path would have happily created developers into an archived
+    // team, where they are invisible to every team aggregate.
+    //
+    // Checked first so an unusable team costs zero API calls and fails immediately, rather
+    // than after paginating a whole org's membership.
+    if (!ensureTeam(db, team)) {
+        throw new Error(
+            `Team '${team}' is archived; discovered developers would be invisible in every team aggregate. Un-archive it or pass a different --team.`,
+        );
+    }
+
     const members = await fetchOrgMembers(org, token);
     const created: Developer[] = [];
     const skipped: string[] = [];
-
-    const team = defaultTeam ?? 'discovered';
-
-    // Create default team if it doesn't exist
-    if (!teamExists(db, team)) {
-        db.prepare('INSERT INTO teams (name, created_at) VALUES (?, ?)').run(
-            team,
-            new Date().toISOString(),
-        );
-    }
 
     for (const member of members) {
         const existing = findByGithubUsername(db, member.login);
@@ -108,5 +117,20 @@ export async function discoverOrgMembers(
         created.push(dev);
     }
 
-    return {created, skipped};
+    // Attribute the retained history the new logins now resolve. Without this, org
+    // discovery would be the ONE onboarding path that silently opts out of the epic's
+    // guarantee — `dev add`, `dev discover-repo --promote` and the admin create route
+    // all replay, and the docs state the guarantee universally. It would not self-heal
+    // either: sync projects in `cells` mode, which never revisits a past day.
+    //
+    // Batched into one whole-day rebuild rather than one per developer, for the same
+    // reason `promoteAllCandidates` batches — a `dates`-mode projection's cost is driven
+    // by the day set, not by whose replay asked for it, and a freshly-discovered org
+    // shares almost all of its active days.
+    const replay =
+        created.length > 0
+            ? replayDevelopers(db, created.map((d) => d.id)).result
+            : {cellsWritten: 0, cellsRetracted: 0, cellsSkippedLegacy: 0, datesCovered: 0};
+
+    return {created, skipped, datesAttributed: replay.datesCovered};
 }

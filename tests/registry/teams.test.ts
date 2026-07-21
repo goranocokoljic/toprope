@@ -2,7 +2,7 @@ import {describe, it, expect, beforeEach, afterEach} from 'vitest';
 import Database from 'better-sqlite3';
 import path from 'path';
 import {runMigrations} from '../../src/storage/migrator';
-import {addTeam, listTeams, teamExists} from '../../src/registry/teams';
+import {addTeam, listTeams, teamExists, ensureTeam, archiveTeam, getTeam} from '../../src/registry/teams';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../src/storage/migrations');
 
@@ -105,5 +105,47 @@ describe('teamExists', () => {
 
     it('returns false for a non-existent team', () => {
         expect(teamExists(db, 'nonexistent')).toBe(false);
+    });
+});
+
+describe('ensureTeam (#256)', () => {
+    let db: Database.Database;
+
+    beforeEach(() => {
+        db = makeDb();
+    });
+
+    afterEach(() => {
+        db.close();
+    });
+
+    it('creates the team when it does not exist', () => {
+        expect(getTeam(db, 'discovered')).toBeNull();
+
+        const team = ensureTeam(db, 'discovered');
+
+        expect(team?.name).toBe('discovered');
+        expect(getTeam(db, 'discovered')).not.toBeNull();
+    });
+
+    it('returns the existing team without creating a second one', () => {
+        addTeam(db, 'eng', 'Engineering', 'ada');
+
+        const team = ensureTeam(db, 'eng');
+
+        // The EXISTING row, with its fields intact — not a blank overwrite.
+        expect(team?.department).toBe('Engineering');
+        expect(team?.manager).toBe('ada');
+        expect(listTeams(db)).toHaveLength(1);
+    });
+
+    it('returns null for an ARCHIVED team rather than writing into it', () => {
+        addTeam(db, 'retired');
+        archiveTeam(db, 'retired');
+
+        expect(ensureTeam(db, 'retired')).toBeNull();
+        // And it must NOT have been resurrected or duplicated as a side effect.
+        expect(listTeams(db, true)).toHaveLength(1);
+        expect(getTeam(db, 'retired')?.archived_at).not.toBeNull();
     });
 });

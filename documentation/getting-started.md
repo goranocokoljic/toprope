@@ -69,13 +69,26 @@ A developer can map to **multiple** tool identities and **multiple** git author
 emails — that cross-tool identity mapping is what lets Toprope unify a person's
 activity. Use `--bitbucket` / `--gitlab` / `--git-email` (repeatable) as needed.
 
-**Optional — auto-discover** developers from a GitHub org (reads `GITHUB_TOKEN` or
-`--token`):
+**Optional — discover developers instead of typing them in.** Two commands, and they
+are not the same:
 
 ```powershell
+# From the repositories you have already synced (any provider). If you have not
+# synced yet, come back to this after step 6.
+npx toprope dev discover-repo                                  # who is committing?
+npx toprope dev discover-repo --promote-all --team frontend    # onboard them
+
+# From GitHub org membership (GitHub only; includes members who never committed).
 $env:GITHUB_TOKEN = "ghp_..."
 npx toprope dev discover --org my-org --team frontend
 ```
+
+> **You are not on a clock here.** Sync attributes commits only to developers that
+> already exist — but it *retains* every author it sees, so adding someone later
+> attributes their already-synced history immediately, with no re-sync and no
+> double-counting. If you would rather connect a provider first and sort out people
+> afterwards, that works. See
+> [Getting developers into Toprope](./developer-onboarding.md).
 
 ## 4. Create your dashboard login
 

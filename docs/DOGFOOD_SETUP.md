@@ -102,9 +102,21 @@ npx toprope dev add --name "Jane Dev" --team engineering `
 npx toprope dev link --id <dev-id> --copilot jane-gh --claude jane@company.com
 ```
 
-For GitHub orgs you can bootstrap the roster with `npx toprope dev discover`.
-Any unmatched commit authors are printed at the end of `sync git` — add them and
-re-sync to raise their data quality from LOW to MEDIUM/HIGH.
+Bootstrap the roster from the repositories you already synced — any provider,
+including contractors who are not org members:
+
+```powershell
+npx toprope dev discover-repo                                # who is committing?
+npx toprope dev discover-repo --promote-all --team engineering
+```
+
+(For GitHub orgs, `npx toprope dev discover --org <org>` bootstraps from org
+*membership* instead — GitHub-only, and it includes members who never committed.)
+
+Unmatched authors are also listed in the dashboard at **Admin → Developer
+identities → Unmatched authors**. You do **not** need to re-sync after adding
+someone: their already-synced history is attributed on the spot. See
+`documentation/developer-onboarding.md`.
 
 (Optional) import subscription costs so waste detection and Plan ROI have spend
 data: `npx toprope expenses import subscriptions.csv`.
@@ -467,6 +479,7 @@ as your liveness probe.
 |---------|-----|
 | `doctor` fails on a provider | Re-check the env var name matches the `${VAR}` in your config; confirm the token scope can read repos. |
 | Developers show LOW data quality | Their git-email/tool identity isn't mapped — add it (step 4) and re-sync. |
+| No developers at all after `sync git` | Expected on an empty registry: sync attributes only to existing developers. Run `npx toprope dev discover-repo`, or use **Admin → Developer identities → Unmatched authors**. No re-sync needed. |
 | Empty charts | Pick a wider time range (the selector defaults to the smallest range that fits available history); confirm `sync all` ran. |
 | Dashboard 404 at `/dashboard` | You started `toprope start` instead of `node dist/server.js`. |
 | Login locked out | The login limiter throttles repeated failures per IP; wait and retry. |

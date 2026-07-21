@@ -67,12 +67,15 @@ async function getCreateGitProvider() {
     return createGitProvider as ReturnType<typeof vi.fn>;
 }
 
-async function buildApp(db: Database.Database): Promise<FastifyInstance> {
+async function buildApp(
+    db: Database.Database,
+    gitConfig: GitConnectorConfig = GIT_CONFIG,
+): Promise<FastifyInstance> {
     const app = Fastify({logger: false});
     registerSessionAuth(app, db);
     registerAuthRoutes(app, db, {sessionTtlHours: 24, cookieSecure: false});
     registerMeRoutes(app, db);
-    registerAdminRoutes(app, db, GIT_CONFIG);
+    registerAdminRoutes(app, db, gitConfig);
     await app.ready();
     return app;
 }
@@ -271,6 +274,49 @@ describe('admin git-provider sync-now API (#199)', () => {
                 .prepare(`SELECT developer_id FROM git_snapshots WHERE date = '2024-01-15'`)
                 .get() as {developer_id: string} | undefined;
             expect(snap?.developer_id).toBe('dev-1');
+        });
+
+        it('settles status=ok when the only "error" is the auto-create SUMMARY advisory (TST-2)', async () => {
+            // The sibling exemption above (UNMATCHED_AUTHORS_PREFIX) has had a test since
+            // #253; AUTO_CREATE_SUMMARY_PREFIX had none. Without this, dropping or
+            // mistyping the second filter clause in `genuineErrors` makes EVERY
+            // auto-create-enabled sync persist last_sync_status='error' with a SUCCESS
+            // message ("auto-created 1 developers…") as the failure text — green work
+            // reported red, and nothing would fail.
+            await app.close();
+            app = await buildApp(db, {
+                ...GIT_CONFIG,
+                auto_create_developers: true,
+                auto_create_team: 'discovered',
+            });
+            adminToken = await login(app, 'admin@test.com');
+
+            const id = await createGithub();
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('myrepo')]),
+                    // `carol` has no developer record, is not a bot, and carries a provider
+                    // login — so auto-create onboards her and emits its summary advisory.
+                    getCommits: vi.fn().mockResolvedValue([makeCommit('carol')]),
+                    getCommitDiff: vi
+                        .fn()
+                        .mockResolvedValue([{path: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'}]),
+                }),
+            );
+
+            expect((await triggerSync(id)).statusCode).toBe(202);
+
+            const row = await waitForSyncStatus(id, 'ok');
+            // The positive control: auto-create really did run this sync, so the advisory
+            // it emits really was on `result.errors` and really was classified.
+            const created = db.prepare(`SELECT id FROM developers WHERE name = 'carol'`).get() as
+                | {id: string}
+                | undefined;
+            expect(created).toBeDefined();
+            // …and the advisory did not turn the provider red.
+            expect(row.last_sync_error).toBeNull();
+            expect(row.last_sync_at).not.toBeNull();
         });
 
         it('persists status=error with the failure message when the provider fails', async () => {

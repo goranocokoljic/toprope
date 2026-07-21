@@ -9,12 +9,19 @@ import {AdminUsers} from '../pages/admin/AdminUsers';
 import {AdminSubscriptions} from '../pages/admin/AdminSubscriptions';
 import {AdminTeams} from '../pages/admin/AdminTeams';
 import {AdminIdentities} from '../pages/admin/AdminIdentities';
-import type {AdminDeveloper, AdminSubscription, AdminTeam, AdminUser} from '../api/types';
+import type {
+    AdminDeveloper,
+    AdminSubscription,
+    AdminTeam,
+    AdminUser,
+    AuthorCandidate,
+} from '../api/types';
 
 let users: AdminUser[];
 let subscriptions: AdminSubscription[];
 let teams: AdminTeam[];
 let developers: AdminDeveloper[];
+let candidates: AuthorCandidate[];
 let fetchMock: Mock;
 
 function json(body: unknown, status = 200): Response {
@@ -71,6 +78,45 @@ beforeEach(() => {
             created_at: '2026-01-02T00:00:00.000Z',
         },
     ];
+    // The unmatched-author review queue (DO1.5). Three rows on purpose: a plain
+    // human on a NON-github provider (so a prefill that hardcodes `github` has a
+    // signal to fail on), a login-less email-keyed author, and a flagged bot.
+    candidates = [
+        {
+            provider: 'bitbucket',
+            raw_author_key: 'bitbucket:login:carol-bb',
+            login: 'carol-bb',
+            email: 'carol@work.com',
+            display_name: 'Carol Coder',
+            commit_count: 42,
+            first_seen: '2026-05-01T00:00:00.000Z',
+            last_seen: '2026-06-30T00:00:00.000Z',
+            likely_bot: false,
+        },
+        {
+            provider: 'github',
+            raw_author_key: 'github:email:dan@work.com',
+            login: null,
+            email: 'dan@work.com',
+            display_name: null,
+            commit_count: 7,
+            first_seen: '2026-05-02T00:00:00.000Z',
+            last_seen: '2026-06-20T00:00:00.000Z',
+            likely_bot: false,
+        },
+        {
+            provider: 'github',
+            raw_author_key: 'github:login:dependabot[bot]',
+            login: 'dependabot[bot]',
+            email: null,
+            display_name: 'dependabot',
+            commit_count: 3,
+            first_seen: '2026-05-03T00:00:00.000Z',
+            last_seen: '2026-06-10T00:00:00.000Z',
+            likely_bot: true,
+            bot_reason: 'login "dependabot[bot]" is a known automation account',
+        },
+    ];
     // Two teams that differ in EVERY editable field — one fully populated, one
     // with nulls — so a cross-row pre-fill leak has a visible signal to catch.
     teams = [
@@ -125,6 +171,71 @@ beforeEach(() => {
             const updated: AdminDeveloper = {...target, team: String(body.team)};
             developers = developers.map((d) => (d.id === id ? updated : d));
             return json({data: updated});
+        }
+        // Create (DO1.1): appends to the same list the table reads, and enforces
+        // the server's identity-uniqueness 409 so the dialog's conflict path is
+        // driven by a real response shape rather than a hand-built error.
+        if (u.includes('/api/admin/developers') && method === 'POST') {
+            const owner = developers.find(
+                (d) => body.github !== undefined && d.external_ids.github === String(body.github),
+            );
+            if (owner) {
+                return json(
+                    {
+                        error: 'Conflict',
+                        message: `github identity '${String(body.github)}' is already mapped to ${owner.name}`,
+                    },
+                    409,
+                );
+            }
+            const created: AdminDeveloper = {
+                id: `dev-${developers.length + 1}`,
+                name: String(body.name),
+                email: (body.email as string) ?? null,
+                team: String(body.team),
+                external_ids: {
+                    ...(body.github ? {github: String(body.github)} : {}),
+                    ...(body.bitbucket ? {bitbucket: String(body.bitbucket)} : {}),
+                    ...(body.gitlab ? {gitlab: String(body.gitlab)} : {}),
+                    ...(Array.isArray(body.git_emails)
+                        ? {git_emails: (body.git_emails as string[]).join(', ')}
+                        : {}),
+                },
+                created_at: '2026-02-01T00:00:00.000Z',
+            };
+            developers = [...developers, created];
+            // Mirror the server's post-create replay (DO1.5): the candidate whose
+            // identity was just claimed stops being unmatched, and the response
+            // reports how much retained history that attributed. Modelling the
+            // removal here is what lets "success removes the row" be asserted
+            // through the real query invalidation rather than a hand-built list.
+            const matched = candidates.find(
+                (c) =>
+                    (c.login !== null &&
+                        [body.github, body.bitbucket, body.gitlab].some(
+                            (v) => v !== undefined && String(v) === c.login,
+                        )) ||
+                    (c.email !== null && body.email !== undefined && String(body.email) === c.email),
+            );
+            if (matched) {
+                candidates = candidates.filter((c) => c.raw_author_key !== matched.raw_author_key);
+            }
+            return json(
+                {
+                    data: created,
+                    // A stand-in count: the real server returns the projection's
+                    // datesCovered. What matters here is that a non-zero number
+                    // reaches the confirmation and a miss reports zero.
+                    replay: {dates_attributed: matched ? 5 : 0, cells_written: matched ? 5 : 0},
+                },
+                201,
+            );
+        }
+        // Must precede the developers-list catch-all: the candidates route shares
+        // its path prefix, and returning developer rows here is how a page renders
+        // a candidate table full of undefined fields.
+        if (u.includes('/api/admin/developers/candidates')) {
+            return json({data: candidates});
         }
         if (u.includes('/api/admin/developers')) {
             return json({data: developers});
@@ -1202,11 +1313,14 @@ describe('AdminIdentities page', () => {
         renderPage(<AdminIdentities />);
         await screen.findByText('Dev 00');
 
-        expect(document.querySelectorAll('tbody tr')).toHaveLength(25);
+        // Scoped to the developers card: the page also renders the unmatched-author
+        // queue, and an unscoped tbody count would silently include its rows.
+        const devCard = (): HTMLElement => screen.getByTestId('developers-card');
+        expect(devCard().querySelectorAll('tbody tr')).toHaveLength(25);
         expect(screen.queryByText('Dev 25')).not.toBeInTheDocument();
 
-        fireEvent.click(screen.getByRole('button', {name: 'Next page'}));
-        expect(document.querySelectorAll('tbody tr')).toHaveLength(5);
+        fireEvent.click(within(devCard()).getByRole('button', {name: 'Next page'}));
+        expect(devCard().querySelectorAll('tbody tr')).toHaveLength(5);
         expect(screen.getByText('Dev 29')).toBeInTheDocument();
         expect(screen.queryByText('Dev 00')).not.toBeInTheDocument();
     });
@@ -1666,6 +1780,404 @@ describe('AdminIdentities page', () => {
         renderPage(<AdminIdentities />);
 
         expect(await screen.findByText(/Failed to load/)).toBeInTheDocument();
-        expect(screen.queryByRole('table')).not.toBeInTheDocument();
+        // Scoped: only the DEVELOPERS load failed here, so the unmatched-author
+        // queue legitimately still renders its own table.
+        expect(
+            within(screen.getByTestId('developers-card')).queryByRole('table'),
+        ).not.toBeInTheDocument();
+    });
+
+    // DO1.1 / #251 — the create path. Before it this screen was edit-only, so a
+    // fresh install had no way to get a developer into the system at all.
+    describe('add developer', () => {
+        /** Open the create dialog and wait for the team options to arrive. */
+        async function openAddModal(): Promise<void> {
+            fireEvent.click(screen.getByRole('button', {name: '＋ Add developer'}));
+            await screen.findByRole('option', {name: 'frontend'});
+        }
+
+        /** Every POST sent to the create route, in order. */
+        function creates(): [unknown, RequestInit?][] {
+            return fetchMock.mock.calls.filter(
+                (c) =>
+                    String(c[0]).endsWith('/api/admin/developers') &&
+                    (c[1]?.method ?? 'GET').toUpperCase() === 'POST',
+            ) as [unknown, RequestInit?][];
+        }
+
+        it('opens the dialog from the header affordance, which announces it opens a dialog', async () => {
+            renderPage(<AdminIdentities />);
+            await waitForTableLoaded();
+
+            const opener = screen.getByRole('button', {name: '＋ Add developer'});
+            expect(opener).toHaveAttribute('aria-haspopup', 'dialog');
+            expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+
+            await openAddModal();
+            expect(screen.getByRole('dialog', {name: 'Add developer'})).toBeInTheDocument();
+            // The create dialog is NOT the identity editor: it has no tool-identity
+            // fields and no team-move control.
+            expect(screen.queryByLabelText('Copilot username')).not.toBeInTheDocument();
+            expect(screen.queryByRole('button', {name: 'Move developer'})).not.toBeInTheDocument();
+        });
+
+        it('keeps Save disabled until both required fields are filled', async () => {
+            renderPage(<AdminIdentities />);
+            await waitForTableLoaded();
+            await openAddModal();
+
+            const submit = screen.getByRole('button', {name: 'Add developer'});
+            // Name and team both empty.
+            expect(submit).toBeDisabled();
+
+            // Name alone is not enough — team is still unselected.
+            fireEvent.change(screen.getByLabelText('Name'), {target: {value: 'Dana Dev'}});
+            expect(submit).toBeDisabled();
+
+            // A whitespace-only name doesn't count either.
+            fireEvent.change(screen.getByLabelText('Name'), {target: {value: '   '}});
+            fireEvent.change(screen.getByLabelText('Team'), {target: {value: 'platform'}});
+            expect(submit).toBeDisabled();
+
+            fireEvent.change(screen.getByLabelText('Name'), {target: {value: 'Dana Dev'}});
+            expect(submit).toBeEnabled();
+        });
+
+        it('submits the trimmed payload, omitting blank optional fields', async () => {
+            renderPage(<AdminIdentities />);
+            await waitForTableLoaded();
+            await openAddModal();
+
+            fireEvent.change(screen.getByLabelText('Name'), {target: {value: '  Dana Dev  '}});
+            fireEvent.change(screen.getByLabelText('Team'), {target: {value: 'platform'}});
+            fireEvent.change(screen.getByLabelText('GitHub username'), {target: {value: ' dana-gh '}});
+            fireEvent.change(screen.getByLabelText('Git commit emails (comma-separated)'), {
+                target: {value: 'dana@work.com, dana@home.com'},
+            });
+            fireEvent.click(screen.getByRole('button', {name: 'Add developer'}));
+
+            await waitFor(() => expect(creates()).toHaveLength(1));
+            // Email / Bitbucket / GitLab were left blank, so they are absent —
+            // an empty identity is no identity, not an empty string to store.
+            expect(sentBody(creates()[0])).toEqual({
+                name: 'Dana Dev',
+                team: 'platform',
+                github: 'dana-gh',
+                git_emails: ['dana@work.com', 'dana@home.com'],
+            });
+        });
+
+        it('closes the dialog and shows the new developer without a manual refetch', async () => {
+            renderPage(<AdminIdentities />);
+            await waitForTableLoaded();
+            expect(screen.queryByText('Dana Dev')).not.toBeInTheDocument();
+
+            await openAddModal();
+            fireEvent.change(screen.getByLabelText('Name'), {target: {value: 'Dana Dev'}});
+            fireEvent.change(screen.getByLabelText('Team'), {target: {value: 'platform'}});
+            fireEvent.change(screen.getByLabelText('Email'), {target: {value: 'dana@test.com'}});
+            fireEvent.click(screen.getByRole('button', {name: 'Add developer'}));
+
+            // The row is read back through the real hook (POST → invalidate →
+            // GET), not asserted off the submitted draft.
+            await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+            const row = await waitFor(() => developerRow('Dana Dev'));
+            expect(within(row).getByText('platform')).toBeInTheDocument();
+            expect(within(row).getByText('dana@test.com')).toBeInTheDocument();
+        });
+
+        it('renders the 409 conflict message inline and keeps the draft', async () => {
+            renderPage(<AdminIdentities />);
+            await waitForTableLoaded();
+            await openAddModal();
+
+            // 'alice-gh' is already Alice's GitHub id in the seeded list.
+            fireEvent.change(screen.getByLabelText('Name'), {target: {value: 'Dana Dev'}});
+            fireEvent.change(screen.getByLabelText('Team'), {target: {value: 'platform'}});
+            fireEvent.change(screen.getByLabelText('GitHub username'), {target: {value: 'alice-gh'}});
+            fireEvent.click(screen.getByRole('button', {name: 'Add developer'}));
+
+            // The server's own copy, not a generic failure line.
+            expect(
+                await screen.findByText("github identity 'alice-gh' is already mapped to Alice Dev"),
+            ).toBeInTheDocument();
+            // The dialog stays open with the draft intact so the duplicate can be
+            // corrected rather than retyped, and nothing was added to the table.
+            expect(screen.getByRole('dialog', {name: 'Add developer'})).toBeInTheDocument();
+            expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('Dana Dev');
+            expect((screen.getByLabelText('GitHub username') as HTMLInputElement).value).toBe('alice-gh');
+            expect(screen.queryByText('Dana Dev')).not.toBeInTheDocument();
+        });
+
+        it('gates the team select — and Save — while the roster is unresolved', async () => {
+            const base = fetchMock.getMockImplementation();
+            fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+                if (String(url).endsWith('/api/admin/teams')) return json({message: 'boom'}, 500);
+                return base!(url, init);
+            });
+
+            renderPage(<AdminIdentities />);
+            await waitForTableLoaded();
+            fireEvent.click(screen.getByRole('button', {name: '＋ Add developer'}));
+
+            const select = (await screen.findByLabelText('Team')) as HTMLSelectElement;
+            expect(await screen.findByRole('option', {name: 'Couldn’t load teams'})).toBeInTheDocument();
+            expect(select).toBeDisabled();
+            // Positive control: the roster really did fail, so no real team loaded.
+            expect(screen.queryByRole('option', {name: 'frontend'})).not.toBeInTheDocument();
+            // A name alone can't submit a developer onto no team.
+            fireEvent.change(screen.getByLabelText('Name'), {target: {value: 'Dana Dev'}});
+            expect(screen.getByRole('button', {name: 'Add developer'})).toBeDisabled();
+        });
+
+        it('offers only non-archived teams as create targets', async () => {
+            teams = [
+                ...teams,
+                {
+                    name: 'retired',
+                    department: null,
+                    manager: null,
+                    created_at: '2026-01-03T00:00:00.000Z',
+                    archived_at: '2026-02-01T00:00:00.000Z',
+                    developer_count: 0,
+                },
+            ];
+            renderPage(<AdminIdentities />);
+            await waitForTableLoaded();
+            await openAddModal();
+
+            expect(screen.getByRole('option', {name: 'platform'})).toBeInTheDocument();
+            expect(screen.queryByRole('option', {name: 'retired'})).not.toBeInTheDocument();
+        });
+    });
+
+    // The Admin review queue (DO1.5 / #255): unmatched git authors, and the
+    // one-action path from "this author is a person" to "their history is theirs".
+    describe('unmatched authors review queue', () => {
+        function queue(): HTMLElement {
+            return screen.getByTestId('unmatched-authors-card');
+        }
+
+        // getAllByText: an email-keyed author renders the same string in both the
+        // Author and the Login/email column, so the first match is taken rather
+        // than letting a legitimately-repeated value throw.
+        function candidateRow(text: string): HTMLElement {
+            const row = within(queue()).getAllByText(text)[0]?.closest('tr');
+            if (!row) throw new Error(`No candidate row for ${text}`);
+            return row;
+        }
+
+        function creates(): [unknown, RequestInit?][] {
+            return fetchMock.mock.calls.filter(
+                (c) =>
+                    String(c[0]).endsWith('/api/admin/developers') &&
+                    (c[1]?.method ?? 'GET').toUpperCase() === 'POST',
+            ) as [unknown, RequestInit?][];
+        }
+
+        it('renders each unmatched author with its provider, identity, commits and last-seen day', async () => {
+            renderPage(<AdminIdentities />);
+
+            const row = await waitFor(() => candidateRow('Carol Coder'));
+            expect(within(row).getByText('bitbucket')).toBeInTheDocument();
+            expect(within(row).getByText('carol-bb')).toBeInTheDocument();
+            expect(within(row).getByText('42')).toBeInTheDocument();
+            expect(within(row).getByText('2026-06-30')).toBeInTheDocument();
+        });
+
+        it('flags a likely bot with an explained badge, and leaves humans unbadged', async () => {
+            renderPage(<AdminIdentities />);
+            await waitFor(() => candidateRow('Carol Coder'));
+
+            const bot = candidateRow('dependabot');
+            const badge = within(bot).getByText('likely bot');
+            expect(badge).toHaveAttribute(
+                'title',
+                'login "dependabot[bot]" is a known automation account',
+            );
+            // Positive control: a human row carries no badge, so the assertion
+            // above is about the flag and not about the badge always rendering.
+            expect(within(candidateRow('Carol Coder')).queryByText('likely bot')).not.toBeInTheDocument();
+            // Flagged, not hidden — an admin can still promote it.
+            expect(within(bot).getByRole('button', {name: 'Add as developer'})).toBeInTheDocument();
+        });
+
+        it('falls back to the login/email when the author has no display name', async () => {
+            renderPage(<AdminIdentities />);
+
+            const row = await waitFor(() => candidateRow('dan@work.com'));
+            expect(row).toBeTruthy();
+        });
+
+        it('pre-fills the dialog from the candidate — onto its OWN provider field', async () => {
+            renderPage(<AdminIdentities />);
+            await waitFor(() => candidateRow('Carol Coder'));
+
+            fireEvent.click(
+                within(candidateRow('Carol Coder')).getByRole('button', {name: 'Add as developer'}),
+            );
+
+            await screen.findByRole('dialog');
+            expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('Carol Coder');
+            expect((screen.getByLabelText('Email') as HTMLInputElement).value).toBe('carol@work.com');
+            // The candidate is a BITBUCKET author: writing the login into GitHub
+            // would create a developer that resolves nothing.
+            expect((screen.getByLabelText('Bitbucket username') as HTMLInputElement).value).toBe(
+                'carol-bb',
+            );
+            expect((screen.getByLabelText('GitHub username') as HTMLInputElement).value).toBe('');
+            // Team is never guessed — the repo cannot tell us one.
+            expect((screen.getByLabelText('Team') as HTMLSelectElement).value).toBe('');
+        });
+
+        it('leaves the login field blank for an author known only by email', async () => {
+            renderPage(<AdminIdentities />);
+            await waitFor(() => candidateRow('dan@work.com'));
+
+            fireEvent.click(
+                within(candidateRow('dan@work.com')).getByRole('button', {
+                    name: 'Add as developer',
+                }),
+            );
+
+            await screen.findByRole('dialog');
+            expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('dan@work.com');
+            expect((screen.getByLabelText('Email') as HTMLInputElement).value).toBe('dan@work.com');
+            expect((screen.getByLabelText('GitHub username') as HTMLInputElement).value).toBe('');
+        });
+
+        it('promotes: submits the candidate identity, removes the row, and confirms the attributed days', async () => {
+            renderPage(<AdminIdentities />);
+            await waitFor(() => candidateRow('Carol Coder'));
+
+            fireEvent.click(
+                within(candidateRow('Carol Coder')).getByRole('button', {name: 'Add as developer'}),
+            );
+            await screen.findByRole('dialog');
+            // The roster must have arrived before the select can take a value —
+            // changing to an option that isn't rendered yet is a silent no-op,
+            // and Save would stay gated on the empty team.
+            await screen.findByRole('option', {name: 'platform'});
+            fireEvent.change(screen.getByLabelText('Team'), {target: {value: 'platform'}});
+            fireEvent.click(screen.getByRole('button', {name: 'Add developer'}));
+
+            await waitFor(() => expect(creates()).toHaveLength(1));
+            expect(sentBody(creates()[0])).toEqual({
+                name: 'Carol Coder',
+                team: 'platform',
+                email: 'carol@work.com',
+                bitbucket: 'carol-bb',
+                // The candidate's own commit address is sent as a git_email as WELL as the
+                // primary email, mirroring the server-side `candidateCreateInput`. It is
+                // the address the retained rows actually carry, and the Email field is the
+                // one an admin naturally rewrites (a noreply address looks like junk) — if
+                // it lived only there, that edit would drop it and the promotion would
+                // succeed while attributing nothing. See the git_emails-survives-an-edit
+                // case below.
+                git_emails: ['carol@work.com'],
+            });
+
+            // The queue is derived server-side, so the promoted row leaves it via
+            // the real invalidation + refetch — not a local splice.
+            await waitFor(() =>
+                expect(within(queue()).queryByText('Carol Coder')).not.toBeInTheDocument(),
+            );
+            // The other candidates are untouched: the removal is about this row.
+            expect(within(queue()).getByText('dependabot')).toBeInTheDocument();
+            // The attributed-dates confirmation the acceptance criteria ask for.
+            expect(screen.getByTestId('create-developer-confirmation')).toHaveTextContent(
+                'attributed 5 day(s) of retained history',
+            );
+        });
+
+        it('keeps the candidate commit address as a git_email when the admin rewrites Email (DUP-1)', async () => {
+            // The failure this guards: an admin promotes an author whose retained rows
+            // carry a provider noreply address, sees it pre-filled in a field labelled
+            // "Email" next to a `jane@company.com` placeholder, and replaces it with the
+            // person's real address — the natural act. If the commit address lived only in
+            // that field, the created developer would claim only the new one, nothing in
+            // `raw_author_daily` would resolve, and the banner would report "no retained
+            // history matched" for a promotion that should have recovered everything.
+            renderPage(<AdminIdentities />);
+            await waitForTableLoaded();
+
+            fireEvent.click(
+                within(queue()).getAllByRole('button', {name: 'Add as developer'})[0],
+            );
+            await screen.findByRole('dialog');
+            await screen.findByRole('option', {name: 'platform'});
+            fireEvent.change(screen.getByLabelText('Team'), {target: {value: 'platform'}});
+            // The admin swaps the pre-filled commit address for the corporate one.
+            fireEvent.change(screen.getByLabelText('Email'), {
+                target: {value: 'carol.coder@corp.example'},
+            });
+            fireEvent.click(screen.getByRole('button', {name: 'Add developer'}));
+
+            await waitFor(() => expect(creates()).toHaveLength(1));
+            const body = sentBody(creates()[0]) as {email: string; git_emails?: string[]};
+            expect(body.email).toBe('carol.coder@corp.example');
+            // …and the address the commits actually carry still reaches the server, so the
+            // replay resolves.
+            expect(body.git_emails).toEqual(['carol@work.com']);
+        });
+
+        it('reports honestly when a create attributed no history', async () => {
+            renderPage(<AdminIdentities />);
+            await waitForTableLoaded();
+
+            // The plain add path with an identity that matches no candidate.
+            fireEvent.click(screen.getByRole('button', {name: '＋ Add developer'}));
+            await screen.findByRole('dialog');
+            fireEvent.change(screen.getByLabelText('Name'), {target: {value: 'New Hire'}});
+            fireEvent.change(screen.getByLabelText('Team'), {target: {value: 'platform'}});
+            fireEvent.click(screen.getByRole('button', {name: 'Add developer'}));
+
+            const banner = await screen.findByTestId('create-developer-confirmation');
+            expect(banner).toHaveTextContent('no retained history matched');
+            expect(banner).not.toHaveTextContent('attributed 5');
+        });
+
+        it('does not seed the blank Add-developer form from a previously opened candidate', async () => {
+            renderPage(<AdminIdentities />);
+            await waitFor(() => candidateRow('Carol Coder'));
+
+            fireEvent.click(
+                within(candidateRow('Carol Coder')).getByRole('button', {name: 'Add as developer'}),
+            );
+            await screen.findByRole('dialog');
+            expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('Carol Coder');
+            fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
+            await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+
+            fireEvent.click(screen.getByRole('button', {name: '＋ Add developer'}));
+
+            await screen.findByRole('dialog');
+            expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('');
+            expect((screen.getByLabelText('Bitbucket username') as HTMLInputElement).value).toBe('');
+        });
+
+        it('shows a settled empty state when every author is already mapped', async () => {
+            candidates = [];
+            renderPage(<AdminIdentities />);
+
+            expect(await within(queue()).findByTestId('candidates-empty')).toBeInTheDocument();
+            expect(within(queue()).queryByRole('table')).not.toBeInTheDocument();
+        });
+
+        it('surfaces a failed candidate load instead of a silently empty queue', async () => {
+            const base = fetchMock.getMockImplementation();
+            fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+                if (String(url).includes('/api/admin/developers/candidates')) {
+                    return json({message: 'boom'}, 500);
+                }
+                return base!(url, init);
+            });
+
+            renderPage(<AdminIdentities />);
+
+            expect(await within(queue()).findByText(/Failed to load/)).toBeInTheDocument();
+            // An error is NOT an empty state — the two must not be confusable.
+            expect(within(queue()).queryByTestId('candidates-empty')).not.toBeInTheDocument();
+        });
     });
 });

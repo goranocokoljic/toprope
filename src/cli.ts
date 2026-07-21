@@ -6,8 +6,20 @@ import {openDb} from './storage/db';
 import {runMigrations, getMigrationStatus} from './storage/migrator';
 import {printStatus} from './cli/status';
 import {runDoctor} from './cli/doctor';
+import {
+    runListCandidates,
+    runPromoteAllCandidates,
+    runPromoteCandidate,
+} from './cli/discover-repo';
 import {addTeam, listTeams, teamExists} from './registry/teams';
-import {addDeveloper, listDevelopers, linkDeveloper, findByExternalId, findByEmail} from './registry/developers';
+import {
+    listDevelopers,
+    linkDeveloper,
+    findByExternalId,
+    findByEmail,
+    tokenizeGitEmails,
+} from './registry/developers';
+import {createDeveloperWithReplay} from './connectors/git/onboarding';
 import {discoverOrgMembers} from './registry/discovery';
 import {seedTeamsFromConfig} from './registry/config-seeder';
 import {CopilotSync} from './connectors/copilot/sync';
@@ -15,6 +27,7 @@ import {ClaudeCodeSync} from './connectors/claude-code/sync';
 import {WindsurfSync} from './connectors/windsurf/sync';
 import {CursorSync} from './connectors/cursor/sync';
 import {GitSync} from './connectors/git/sync';
+import {replayDeveloper} from './connectors/git/projection';
 import {setHistoryFloor} from './cli/git-history-floor';
 import {runPipeline} from './scheduler/sync-pipeline';
 import {importCsv} from './expenses/importer';
@@ -262,43 +275,39 @@ devCommand
             const configPath = path.resolve(process.cwd(), options.config);
             const db = openRegistryDb(configPath);
             try {
-                if (!teamExists(db, options.team)) {
-                    console.error(`Error: team '${options.team}' does not exist.`);
-                    process.exit(1);
-                }
-                const idChecks: Array<{provider: 'github' | 'bitbucket' | 'gitlab'; value?: string}> = [
-                    {provider: 'github', value: options.github},
-                    {provider: 'bitbucket', value: options.bitbucket},
-                    {provider: 'gitlab', value: options.gitlab},
-                ];
-                for (const {provider, value} of idChecks) {
-                    if (!value) continue;
-                    const duplicate = findByExternalId(db, provider, value);
-                    if (duplicate) {
-                        console.warn(
-                            `Warning: developer with ${provider} identity '${value}' already exists (id: ${duplicate.id}, name: ${duplicate.name}).`,
-                        );
-                        return;
-                    }
-                }
-                const emailChecks = [options.email, ...options.gitEmail].filter(
-                    (e): e is string => !!e,
-                );
-                for (const email of emailChecks) {
-                    const duplicate = findByEmail(db, email);
-                    if (duplicate) {
-                        console.warn(
-                            `Warning: developer with email '${email}' already exists (id: ${duplicate.id}, name: ${duplicate.name}).`,
-                        );
-                        return;
-                    }
-                }
-                const dev = addDeveloper(db, options.name, options.team, options.email, options.github, {
+                // Routed through the canonical create boundary (DO1.7 / #257) rather
+                // than calling `addDeveloper` behind hand-rolled team and duplicate
+                // checks. Two reasons, both about this command telling the truth:
+                //
+                //  - It REPLAYS. `createDeveloperWithReplay` re-projects every retained
+                //    day the new identities now resolve, in the same transaction. The
+                //    documented onboarding guarantee is "add a developer at any time and
+                //    their already-synced history is attributed"; before this, that held
+                //    for the Admin UI and `dev discover-repo` but silently did not hold
+                //    for `dev add` — the one path the docs point a new operator at first.
+                //  - It is ONE guard. The checks removed here were a second copy of
+                //    `findIdentityConflict`, running outside the write transaction and
+                //    disagreeing with it: they warned and exited 0 on a duplicate (a
+                //    create that looks like it worked), missed archived teams, and split
+                //    comma-joined git emails differently from the write path.
+                const outcome = createDeveloperWithReplay(db, {
+                    name: options.name,
+                    team: options.team,
+                    email: options.email,
+                    github: options.github,
                     bitbucket: options.bitbucket,
                     gitlab: options.gitlab,
                     gitEmails: options.gitEmail,
                 });
-                console.log(`Developer '${dev.name}' created with id: ${dev.id}`);
+                if (!outcome.ok) {
+                    console.error(`Error: ${outcome.message}`);
+                    process.exit(1);
+                }
+                const {developer, replay} = outcome;
+                console.log(`Developer '${developer.name}' created with id: ${developer.id}`);
+                console.log(
+                    `Attributed ${replay.datesCovered} snapshot date(s) of retained history.`,
+                );
             } finally {
                 db.close();
             }
@@ -404,7 +413,14 @@ devCommand
                         process.exit(1);
                     }
                 }
-                for (const email of options.gitEmail) {
+                // Tokenize BEFORE checking. `joinGitEmails` splits on ',' when it stores and
+                // `buildDevLookupMap`/`findByEmail` split when they read, so a composite
+                // entry like 'mine@x.com,victim@corp.com' checked whole matches nobody and
+                // is then registered as a live claim on victim@corp.com — re-pointing that
+                // person's attribution. Checking each address individually is what closes
+                // it; the storage-side split alone would only make the theft tidier.
+                const gitEmails = tokenizeGitEmails(options.gitEmail);
+                for (const email of gitEmails) {
                     const conflict = findByEmail(db, email);
                     if (conflict && conflict.id !== options.id) {
                         console.error(
@@ -413,23 +429,40 @@ devCommand
                         process.exit(1);
                     }
                 }
-                const dev = linkDeveloper(db, options.id, {
-                    copilot: options.copilot,
-                    claude: options.claude,
-                    windsurf: options.windsurf,
-                    cursor: options.cursor,
-                    github: options.github,
-                    bitbucket: options.bitbucket,
-                    gitlab: options.gitlab,
-                    slack,
-                    gitEmails: options.gitEmail,
-                });
-                if (!dev) {
+                // Write and re-project in ONE transaction, the same shape as the admin
+                // identities PATCH this mirrors. Not cosmetic parity: if the replay threw
+                // after a committed write, the identity map would have changed while
+                // `git_snapshots` had not — leaving the developer holding cells no raw row
+                // resolves to, which is the exact state the replay exists to prevent.
+                //
+                // Re-projection is required because `git_snapshots` is a pure function of
+                // (raw store, identity map). A REMOVED or corrected identity otherwise
+                // leaves stale cells behind (sync's `cells`-mode projection never
+                // retracts), and an ADDED one attributes nothing until some unrelated
+                // whole-day rebuild happens by.
+                const linked = db.transaction(() => {
+                    const updated = linkDeveloper(db, options.id, {
+                        copilot: options.copilot,
+                        claude: options.claude,
+                        windsurf: options.windsurf,
+                        cursor: options.cursor,
+                        github: options.github,
+                        bitbucket: options.bitbucket,
+                        gitlab: options.gitlab,
+                        slack,
+                        gitEmails,
+                    });
+                    if (!updated) return null;
+                    return {dev: updated, replay: replayDeveloper(db, updated.id)};
+                })();
+                if (!linked) {
                     console.error(`Error: developer with id '${options.id}' not found.`);
                     process.exit(1);
                 }
+                const {dev, replay} = linked;
                 console.log(`Developer '${dev.name}' (${dev.id}) updated.`);
                 console.log('External IDs:', JSON.stringify(dev.external_ids, null, 2));
+                console.log(`Re-attributed ${replay.datesCovered} snapshot date(s).`);
             } finally {
                 db.close();
             }
@@ -458,6 +491,9 @@ devCommand
                 console.log(`Discovering members of GitHub org '${options.org}'...`);
                 const result = await discoverOrgMembers(db, options.org, token, options.team);
                 console.log(`Created ${result.created.length} developer(s).`);
+                if (result.created.length > 0) {
+                    console.log(`Attributed ${result.datesAttributed} snapshot date(s) of retained history.`);
+                }
                 if (result.skipped.length > 0) {
                     console.log(
                         `Skipped ${result.skipped.length} duplicate(s): ${result.skipped.join(', ')}`,
@@ -466,6 +502,69 @@ devCommand
                 for (const dev of result.created) {
                     console.log(`  + ${dev.name} (${dev.external_ids.github}) -> team: ${dev.team}`);
                 }
+            } finally {
+                db.close();
+            }
+        },
+    );
+
+devCommand
+    .command('discover-repo')
+    .description(
+        'Discover developers from synced repository authorship (provider-agnostic sibling of `dev discover`)',
+    )
+    .option('--promote <raw-author-key>', 'Promote one unmatched author to a developer')
+    .option('--promote-all', 'Promote every unmatched author (bots excluded unless --include-bots)')
+    .option('--include-bots', 'Include likely-bot authors in --promote-all')
+    .option('--team <team>', 'Team for the promoted developer(s) — required with --promote/--promote-all')
+    .option('--name <name>', 'Display name for --promote (defaults to the author display name/login/email)')
+    .option('--email <email>', 'Override the promoted developer’s primary email')
+    .option('--github <username>', 'GitHub username for the promoted developer')
+    .option('--bitbucket <username>', 'Bitbucket username for the promoted developer')
+    .option('--gitlab <username>', 'GitLab username for the promoted developer')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
+    .action(
+        (options: {
+            promote?: string;
+            promoteAll?: boolean;
+            includeBots?: boolean;
+            team?: string;
+            name?: string;
+            email?: string;
+            github?: string;
+            bitbucket?: string;
+            gitlab?: string;
+            config: string;
+        }) => {
+            // Mutually exclusive: one invocation promotes one author or the whole
+            // queue, never both — with both set it is ambiguous whether --name and
+            // the identity overrides apply to the single promotion or to all of them.
+            if (options.promote && options.promoteAll) {
+                console.error('Error: use either --promote or --promote-all, not both.');
+                process.exit(1);
+            }
+            const promoting = Boolean(options.promote || options.promoteAll);
+            if (promoting && !options.team?.trim()) {
+                console.error('Error: --team is required when promoting.');
+                process.exit(1);
+            }
+
+            const configPath = path.resolve(process.cwd(), options.config);
+            const db = openRegistryDb(configPath);
+            try {
+                const team = options.team?.trim() ?? '';
+                const code = options.promote
+                    ? runPromoteCandidate(db, options.promote, team, {
+                          name: options.name,
+                          email: options.email,
+                          github: options.github,
+                          bitbucket: options.bitbucket,
+                          gitlab: options.gitlab,
+                      })
+                    : options.promoteAll
+                      ? runPromoteAllCandidates(db, team, {includeBots: options.includeBots})
+                      : runListCandidates(db);
+                if (code !== 0) process.exitCode = code;
             } finally {
                 db.close();
             }

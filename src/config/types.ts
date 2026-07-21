@@ -48,6 +48,18 @@ export interface GitConnectorConfig extends ConnectorBaseConfig {
     // importing provider types into the config layer at load time; the sync
     // orchestrator casts and validates via the provider factory.
     providers?: unknown[];
+    // Opt-in hands-off onboarding (DO1.6 / #256). DEFAULT OFF: a fresh install
+    // never silently manufactures developer records. The three keys are typed
+    // here for editor support only — they are declared `unknown` on purpose,
+    // because a TypeScript union is a COMPILE-time claim and this config is
+    // parsed from YAML with `${ENV}` expansion at RUNTIME (an expanded
+    // `auto_create_developers: "${X}"` is the string "false", which is truthy).
+    // `resolveAutoCreateSettings` in `config/git-auto-create.ts` is the single
+    // runtime trust boundary that narrows and validates them; nothing else in
+    // the codebase may read these fields directly.
+    auto_create_developers?: unknown;
+    auto_create_team?: unknown;
+    auto_create_exclude?: unknown;
 }
 
 export interface ConnectorsConfig {
