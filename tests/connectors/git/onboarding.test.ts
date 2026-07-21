@@ -538,4 +538,61 @@ describe('promoteAllCandidates', () => {
             fresh.close();
         }
     });
+
+    describe('scoping and exclusions (#256)', () => {
+        it('promotes only the keys in onlyKeys', () => {
+            const result = promoteAllCandidates(db, 'eng', {
+                onlyKeys: new Set(['github:login:jane']),
+            });
+
+            expect(result.promoted).toBe(1);
+            // bob and the bot are out of scope entirely — not promoted, and not counted
+            // as skipped bots either, because they were never considered.
+            expect(result.skippedBots).toBe(0);
+            expect(result.entries).toHaveLength(1);
+            const names = (db.prepare('SELECT name FROM developers').all() as {name: string}[]).map(
+                (r) => r.name,
+            );
+            expect(names).toEqual(['jane']);
+        });
+
+        it('an out-of-scope key stays a candidate', () => {
+            promoteAllCandidates(db, 'eng', {onlyKeys: new Set(['github:login:jane'])});
+            expect(listAuthorCandidates(db).map((c) => c.raw_author_key)).toContain('github:login:bob');
+        });
+
+        it('an empty onlyKeys promotes nobody (it is a scope, not "unset")', () => {
+            const result = promoteAllCandidates(db, 'eng', {onlyKeys: new Set()});
+            expect(result).toEqual({entries: [], promoted: 0, skippedBots: 0, failed: 0});
+        });
+
+        it('omitting onlyKeys still means "every candidate"', () => {
+            expect(promoteAllCandidates(db, 'eng', {}).promoted).toBe(2);
+        });
+
+        it('skips a candidate matched by an operator exclusion pattern', () => {
+            const result = promoteAllCandidates(db, 'eng', {exclusions: [/^jane$/i]});
+
+            expect(result.promoted).toBe(1);
+            // jane joins the bot in the skipped bucket — one classification, one answer.
+            expect(result.skippedBots).toBe(2);
+            const skipped = result.entries.filter((e) => e.status === 'skipped_bot');
+            expect(skipped.map((e) => e.candidate.login).sort()).toEqual(['dependabot[bot]', 'jane']);
+            expect(
+                skipped.find((e) => e.candidate.login === 'jane')?.status === 'skipped_bot' &&
+                    skipped.find((e) => e.candidate.login === 'jane')?.reason,
+            ).toMatch(/operator exclusion pattern/);
+        });
+
+        it('combines scope and exclusions', () => {
+            const result = promoteAllCandidates(db, 'eng', {
+                onlyKeys: new Set(['github:login:jane', 'github:login:bob']),
+                exclusions: [/^jane$/i],
+            });
+
+            expect(result.promoted).toBe(1);
+            expect(result.skippedBots).toBe(1);
+            expect(result.entries.find((e) => e.status === 'promoted')?.candidate.login).toBe('bob');
+        });
+    });
 });

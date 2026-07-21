@@ -4,6 +4,7 @@ import Ajv from 'ajv';
 import { configSchema } from './schema';
 import { defaultConfig } from './defaults';
 import { resolveConfigPathWithLegacyFallback } from './compat';
+import { resolveAutoCreateSettings } from './git-auto-create';
 import type { TopropeConfig } from './types';
 
 const ajv = new Ajv({ allErrors: true });
@@ -74,5 +75,13 @@ export function loadConfig(configPath: string): TopropeConfig {
         throw new Error(`Invalid config:\n${messages}`);
     }
 
-    return merged as unknown as TopropeConfig;
+    const config = merged as unknown as TopropeConfig;
+
+    // Semantic checks the JSON Schema cannot express, run AFTER `${ENV}` expansion so a
+    // reference that expanded to an empty or non-boolean string is caught rather than
+    // silently coerced (#256). Throws GitAutoCreateConfigError; loading fails closed at
+    // startup rather than at the first sync that would have created developers.
+    resolveAutoCreateSettings(config.connectors?.git);
+
+    return config;
 }

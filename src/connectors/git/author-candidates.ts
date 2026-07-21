@@ -189,15 +189,43 @@ function emailDomain(email: string): string | null {
  * had their say and the email adds nothing trustworthy; without one, the address is the
  * only identity there is and a no-reply address is not a person to promote.
  *
- * Pure: no DB, no clock, no config. Shared verbatim by DO1.5's queue and DO1.6's
- * auto-create so the two can never disagree about what a bot is.
+ * `exclusions` are the operator's own denylist (DO1.6's `connectors.git.auto_create_exclude`),
+ * already compiled and bounds-checked at the config trust boundary. They are consulted
+ * BEFORE the built-in rules and matched against the login AND the email, because they are
+ * the most specific signal available: an operator naming `svc-*` knows their own estate
+ * better than any heuristic here does. Passing none (the default) leaves behaviour exactly
+ * as it was — the built-in floor — which is what DO1.5's queue does.
+ *
+ * The exclusions are the ONE place this function's conservative bias is overridden on
+ * purpose: an operator match flags the author even if every built-in rule says human. That
+ * is the point of an operator denylist, and it is safe here because the consequence is
+ * "left in the review queue for a human", never "deleted".
+ *
+ * Pure: no DB, no clock; config enters only as the already-validated `exclusions` argument
+ * so this stays a pure function. Shared verbatim by DO1.5's queue and DO1.6's auto-create
+ * so the two can never disagree about what a bot is.
  */
-export function classifyAuthor(author: AuthorIdentityInput): AuthorClassification {
+export function classifyAuthor(
+    author: AuthorIdentityInput,
+    exclusions: readonly RegExp[] = [],
+): AuthorClassification {
     const login = (author.login ?? '').trim();
     const email = (author.email ?? '').trim();
 
     if (!login && !email) {
         return {isBot: true, reason: 'empty identity (no login, no email)'};
+    }
+
+    for (const pattern of exclusions) {
+        // `pattern.test` on a shared RegExp is stateless here: the patterns are compiled
+        // WITHOUT the /g flag (see compileExcludePattern), so there is no `lastIndex` to
+        // carry between calls and a reused instance cannot skip a match.
+        if (login && pattern.test(login)) {
+            return {isBot: true, reason: `login "${quoteLogin(login)}" matches an operator exclusion pattern`};
+        }
+        if (email && pattern.test(email)) {
+            return {isBot: true, reason: `email "${quoteLogin(email)}" matches an operator exclusion pattern`};
+        }
     }
 
     if (login) {
@@ -305,8 +333,16 @@ function foldVariant(kept: DistinctRawAuthor, next: RawAuthorIdentityVariant): D
  *
  * The result is derived, never stored: mapping a candidate's identity to a developer removes
  * it from the next call with no invalidation step.
+ *
+ * `exclusions` is threaded straight through to {@link classifyAuthor} so a caller that has
+ * the operator's denylist (DO1.6's auto-create) gets `likely_bot` computed against it,
+ * rather than classifying once here and re-classifying differently downstream — two answers
+ * to "is this a bot" for one author is exactly what the shared classifier exists to prevent.
  */
-export function listAuthorCandidates(db: Database.Database): AuthorCandidate[] {
+export function listAuthorCandidates(
+    db: Database.Database,
+    exclusions: readonly RegExp[] = [],
+): AuthorCandidate[] {
     const lookup = buildDevLookupMap(db);
 
     const unattributed = new Map<string, DistinctRawAuthor>();
@@ -317,7 +353,7 @@ export function listAuthorCandidates(db: Database.Database): AuthorCandidate[] {
     }
 
     const candidates = [...unattributed.values()].map((author): AuthorCandidate => {
-        const {isBot, reason} = classifyAuthor({login: author.login, email: author.email});
+        const {isBot, reason} = classifyAuthor({login: author.login, email: author.email}, exclusions);
         return {
             ...author,
             likely_bot: isBot,

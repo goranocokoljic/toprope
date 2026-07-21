@@ -258,6 +258,26 @@ export interface BulkPromoteResult {
     failed: number;
 }
 
+/** How a bulk promotion is scoped and classified. */
+export interface PromoteAllOptions {
+    /** Promote authors the classifier flagged as automation too. Never set by auto-create. */
+    includeBots?: boolean;
+    /**
+     * Restrict promotion to these `raw_author_key`s (DO1.6: exactly the keys ONE sync run
+     * retained). Omitted means "every current candidate", which is what the CLI's
+     * `--promote-all` means. Scoping matters for the hands-off path: a run should act on
+     * the authorship it just observed, not silently sweep up candidates an operator left
+     * unpromoted in the review queue on purpose.
+     */
+    onlyKeys?: ReadonlySet<string>;
+    /**
+     * The operator's compiled `auto_create_exclude` denylist. Threaded into
+     * {@link listAuthorCandidates} so `likely_bot` here is computed against the SAME rules
+     * the skip decision below reads — never classified twice with two answers.
+     */
+    exclusions?: readonly RegExp[];
+}
+
 /**
  * Promote every current candidate, bots excluded unless `includeBots`.
  *
@@ -270,16 +290,20 @@ export interface BulkPromoteResult {
  *
  * Each promotion is its own transaction. One failure does not roll back the developers
  * already created, which is what makes a partial bulk run resumable — re-running promotes
- * only what is still a candidate.
+ * only what is still a candidate. When this runs INSIDE a caller's transaction (DO1.6 calls
+ * it from the sync write transaction), better-sqlite3 turns each inner `db.transaction` into
+ * a SAVEPOINT, so the per-promotion boundary still isolates one failure while the whole
+ * batch remains atomic with the caller's cursor advance — a rolled-back sync creates nobody.
  */
 export function promoteAllCandidates(
     db: Database.Database,
     team: string,
-    options: {includeBots?: boolean} = {},
+    options: PromoteAllOptions = {},
 ): BulkPromoteResult {
     const entries: BulkPromoteEntry[] = [];
 
-    for (const candidate of listAuthorCandidates(db)) {
+    for (const candidate of listAuthorCandidates(db, options.exclusions ?? [])) {
+        if (options.onlyKeys && !options.onlyKeys.has(candidate.raw_author_key)) continue;
         if (candidate.likely_bot && !options.includeBots) {
             entries.push({
                 status: 'skipped_bot',

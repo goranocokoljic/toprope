@@ -2,7 +2,7 @@ import https from 'https';
 import type {Developer} from './types';
 import Database from 'better-sqlite3';
 import {addDeveloper, findByGithubUsername} from './developers';
-import {teamExists} from './teams';
+import {ensureTeam} from './teams';
 
 interface GithubMember {
     login: string;
@@ -75,19 +75,25 @@ export async function discoverOrgMembers(
     token: string,
     defaultTeam?: string,
 ): Promise<DiscoveryResult> {
+    const team = defaultTeam ?? 'discovered';
+
+    // Resolve the target team BEFORE the network fetch: creating it when absent, refusing
+    // it when ARCHIVED. Shared with DO1.6's auto-create via `ensureTeam` rather than an
+    // inline INSERT, so both hands-off onboarding paths agree about what a usable default
+    // team is — previously this path would have happily created developers into an archived
+    // team, where they are invisible to every team aggregate.
+    //
+    // Checked first so an unusable team costs zero API calls and fails immediately, rather
+    // than after paginating a whole org's membership.
+    if (!ensureTeam(db, team)) {
+        throw new Error(
+            `Team '${team}' is archived; discovered developers would be invisible in every team aggregate. Un-archive it or pass a different --team.`,
+        );
+    }
+
     const members = await fetchOrgMembers(org, token);
     const created: Developer[] = [];
     const skipped: string[] = [];
-
-    const team = defaultTeam ?? 'discovered';
-
-    // Create default team if it doesn't exist
-    if (!teamExists(db, team)) {
-        db.prepare('INSERT INTO teams (name, created_at) VALUES (?, ?)').run(
-            team,
-            new Date().toISOString(),
-        );
-    }
 
     for (const member of members) {
         const existing = findByGithubUsername(db, member.login);

@@ -484,3 +484,92 @@ describe('listAuthorCandidates — unmapped retained authors (#254)', () => {
         expect(listAuthorCandidates(db).map((c) => c.raw_author_key)).toEqual(['github:login:sam']);
     });
 });
+
+describe('operator exclusion patterns (#256)', () => {
+    // Compiled the way the config boundary compiles them: anchored, case-insensitive,
+    // `*` -> `.*`. Built here rather than imported so this file stays a pure-logic test.
+    const svc = [/^svc-.*$/i];
+
+    describe('classifyAuthor', () => {
+        it('flags a login the operator excluded that no built-in rule would catch', () => {
+            expect(classifyAuthor({login: 'svc-deploy'})).toEqual({isBot: false});
+
+            const verdict = classifyAuthor({login: 'svc-deploy'}, svc);
+            expect(verdict.isBot).toBe(true);
+            expect(verdict.reason).toMatch(/operator exclusion pattern/);
+        });
+
+        it('flags on the EMAIL as well as the login', () => {
+            const verdict = classifyAuthor({login: null, email: 'deploy@bots.corp.example'}, [
+                /^.*@bots\.corp\.example$/i,
+            ]);
+            expect(verdict.isBot).toBe(true);
+            expect(verdict.reason).toMatch(/operator exclusion pattern/);
+        });
+
+        it('flags on the email even when a login is present', () => {
+            // The built-in no-reply rule deliberately ignores the email when a login
+            // exists; an OPERATOR pattern is an explicit instruction and must not be.
+            expect(classifyAuthor({login: 'deployer', email: 'x@bots.corp.example'}, [
+                /^.*@bots\.corp\.example$/i,
+            ]).isBot).toBe(true);
+        });
+
+        it('leaves an author the patterns do not match alone', () => {
+            expect(classifyAuthor({login: 'alice', email: 'alice@corp.example'}, svc)).toEqual({isBot: false});
+        });
+
+        it('still applies the built-in rules when patterns are supplied', () => {
+            expect(classifyAuthor({login: 'dependabot[bot]'}, svc).isBot).toBe(true);
+        });
+
+        it('is stateless across calls on a reused pattern instance', () => {
+            // A /g-flagged RegExp carries `lastIndex` between .test() calls and would
+            // alternate true/false. The compiled patterns must not be global.
+            const shared = [/^svc-.*$/i];
+            expect(classifyAuthor({login: 'svc-a'}, shared).isBot).toBe(true);
+            expect(classifyAuthor({login: 'svc-b'}, shared).isBot).toBe(true);
+            expect(classifyAuthor({login: 'svc-c'}, shared).isBot).toBe(true);
+        });
+
+        it('defaults to no exclusions, leaving behaviour exactly as #254 defined it', () => {
+            expect(classifyAuthor({login: 'svc-deploy'})).toEqual(classifyAuthor({login: 'svc-deploy'}, []));
+        });
+    });
+
+    describe('listAuthorCandidates', () => {
+        let db: Database.Database;
+
+        beforeEach(() => {
+            db = makeDb();
+        });
+
+        afterEach(() => {
+            db.close();
+        });
+
+        it('computes likely_bot against the operator patterns it is given', () => {
+            upsertRawAuthorDaily(
+                db,
+                rawRow({raw_author_key: 'github:login:svc-deploy', author_login: 'svc-deploy'}),
+                '2026-07-01T00:00:00.000Z',
+            );
+
+            expect(listAuthorCandidates(db)[0].likely_bot).toBe(false);
+
+            const flagged = listAuthorCandidates(db, [/^svc-.*$/i])[0];
+            expect(flagged.likely_bot).toBe(true);
+            expect(flagged.bot_reason).toMatch(/operator exclusion pattern/);
+        });
+
+        it('still LISTS an excluded author — exclusion suppresses auto-create, not review', () => {
+            upsertRawAuthorDaily(
+                db,
+                rawRow({raw_author_key: 'github:login:svc-deploy', author_login: 'svc-deploy'}),
+                '2026-07-01T00:00:00.000Z',
+            );
+
+            expect(listAuthorCandidates(db, [/^svc-.*$/i])).toHaveLength(1);
+        });
+    });
+});
