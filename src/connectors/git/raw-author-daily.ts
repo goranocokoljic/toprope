@@ -115,7 +115,7 @@ export interface RawAuthorDailyRecord extends RawAuthorDailyInput {
     last_seen: string;
 }
 
-/** One distinct raw author across all their retained days — the candidate feed (DO1.4). */
+/** One distinct raw author across all their retained days — the replay feed (DO1.3). */
 export interface DistinctRawAuthor {
     provider: GitProviderType;
     raw_author_key: string;
@@ -484,14 +484,36 @@ export function readRawDailyForDates(db: Database.Database, dates: string[]): Ra
 }
 
 /**
- * One row per distinct raw author, rolled up across every retained day — the feed the
- * candidate derivation (DO1.4 / #254) reads. A single grouped query, no per-author
- * fan-out.
+ * One raw author under ONE of the identities their rows were observed with — the feed
+ * the candidate derivation (DO1.4 / #254) reads. Same shape as {@link DistinctRawAuthor};
+ * aliased rather than restated so the two can never drift apart. What differs is the
+ * GRAIN: a key with two observed emails yields two of these and one of those.
+ */
+export type RawAuthorIdentityVariant = DistinctRawAuthor;
+
+/**
+ * The rollup arithmetic, written ONCE and shared by both groupings below so a change to
+ * how a day-set is summarised can never apply to one grain and not the other.
  *
- * `MAX(author_*)` picks a non-null when any day has one (SQLite's MAX ignores NULLs).
- * Rows under one key carry the same login by construction (the key is derived from
- * it), so this is a deterministic pick of the known value rather than a meaningful
- * ranking.
+ * `MAX(author_display_name)` picks a non-null when any day has one (SQLite's MAX ignores
+ * NULLs) — a deterministic pick of a known value, not a meaningful ranking.
+ */
+const ROLLUP_AGGREGATES = `MAX(author_display_name) AS display_name,
+                    SUM(commits) AS commit_count,
+                    MIN(first_seen) AS first_seen,
+                    MAX(last_seen) AS last_seen`;
+
+/**
+ * One row per distinct raw author, rolled up across every retained day. A single grouped
+ * query, no per-author fan-out.
+ *
+ * `MAX(author_login)` / `MAX(author_email)` collapse the key's days to ONE identity. That
+ * is sound for the login (rows under a login-derived key carry the same login by
+ * construction) but LOSSY for the email: `sync.ts` stamps one run's sample commit email
+ * onto every date row that run writes, so a person committing from two addresses leaves
+ * different emails on different days under one login key, and this picks whichever
+ * byte-sorts higher. Callers that must not lose the other addresses — anything deciding
+ * whether an author is attributed — want {@link distinctRawAuthorIdentities} instead.
  *
  * Ordering is explicit and total: busiest author first, then most-recently-seen, with
  * the UNIQUE (provider, raw_author_key) identity as the final tiebreak — never a
@@ -504,13 +526,45 @@ export function distinctRawAuthors(db: Database.Database): DistinctRawAuthor[] {
                     raw_author_key,
                     MAX(author_login) AS login,
                     MAX(author_email) AS email,
-                    MAX(author_display_name) AS display_name,
-                    SUM(commits) AS commit_count,
-                    MIN(first_seen) AS first_seen,
-                    MAX(last_seen) AS last_seen
+                    ${ROLLUP_AGGREGATES}
              FROM raw_author_daily
              GROUP BY provider, raw_author_key
              ORDER BY commit_count DESC, last_seen DESC, provider ASC, raw_author_key ASC`,
         )
         .all() as DistinctRawAuthor[];
+}
+
+/**
+ * One row per (author key, observed login, observed email) — the SAME rollup as
+ * {@link distinctRawAuthors} at a finer grain, keeping every distinct identity a key was
+ * ever seen with instead of collapsing them to one.
+ *
+ * This grain exists because attribution is decided PER ROW: `foldRawRows` (the projection)
+ * and the sync write loop both resolve `(row.author_login, row.author_email)`, so a key
+ * whose days carry two different emails can be attributed on some days and unattributed
+ * on others. Resolving a collapsed one-email-per-key rollup would answer that question
+ * with an identity half the rows never had — hiding a partially-unattributed author, or
+ * reporting an attributed one as a candidate with an inflated commit count.
+ *
+ * Still ONE query. The row count is bounded by the number of distinct identities observed,
+ * which is the author count plus the handful of authors who use a second address — not the
+ * row count of the table.
+ *
+ * Ordering is total: `commit_count DESC` first (so a key's BUSIEST variant is the first one
+ * a caller folding by key encounters), then the full group key as the tiebreak.
+ */
+export function distinctRawAuthorIdentities(db: Database.Database): RawAuthorIdentityVariant[] {
+    return db
+        .prepare(
+            `SELECT provider,
+                    raw_author_key,
+                    author_login AS login,
+                    author_email AS email,
+                    ${ROLLUP_AGGREGATES}
+             FROM raw_author_daily
+             GROUP BY provider, raw_author_key, author_login, author_email
+             ORDER BY commit_count DESC, provider ASC, raw_author_key ASC,
+                      author_email ASC, author_login ASC`,
+        )
+        .all() as RawAuthorIdentityVariant[];
 }
