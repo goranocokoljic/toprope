@@ -190,8 +190,14 @@ describe('migration 040 — raw_author_daily schema (#252)', () => {
             }
             expect(tableExists(fresh, 'raw_author_daily')).toBe(false);
 
-            // Now the new migration alone must apply.
-            expect(runMigrations(fresh, MIGRATIONS_DIR)).toBe(1);
+            // Only the not-yet-applied migrations run — 040 among them. Asserted as
+            // "040 is now in the ledger" rather than as a literal count, so adding a
+            // later migration (041 did) does not fail this forward-apply test.
+            const appliedNow = runMigrations(fresh, MIGRATIONS_DIR);
+            expect(appliedNow).toBeGreaterThanOrEqual(1);
+            expect(
+                fresh.prepare('SELECT name FROM schema_migrations WHERE id = 40').get(),
+            ).toEqual({name: '040_raw_author_daily.sql'});
             expect(tableExists(fresh, 'raw_author_daily')).toBe(true);
             expect(indexExists(fresh, 'idx_raw_author_daily_key')).toBe(true);
             insertRaw(fresh);
