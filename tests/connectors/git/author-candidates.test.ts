@@ -45,18 +45,17 @@ function rawRow(over: Partial<RawAuthorDailyInput> & {raw_author_key: string}): 
 describe('classifyAuthor — the shared bot classifier (#254)', () => {
     describe('bot-suffixed logins', () => {
         it.each([
-            ['dependabot[bot]'],
             ['some-new-thing[bot]'],
             ['scanner-bot'],
             ['scanner_bot'],
-        ])('flags "%s" as a bot', (login) => {
+        ])('flags the unknown-but-suffixed login "%s" as a bot', (login) => {
             const verdict = classifyAuthor({login, email: 'x@example.com'});
             expect(verdict.isBot).toBe(true);
             expect(verdict.reason).toContain('bot suffix');
         });
 
         it('matches the suffix case-insensitively', () => {
-            expect(classifyAuthor({login: 'Renovate[Bot]'}).isBot).toBe(true);
+            expect(classifyAuthor({login: 'Some-Thing[Bot]'}).isBot).toBe(true);
         });
     });
 
@@ -70,6 +69,16 @@ describe('classifyAuthor — the shared bot classifier (#254)', () => {
             ['web-flow'],
         ])('flags the known bot "%s"', (login) => {
             expect(classifyAuthor({login}).isBot).toBe(true);
+        });
+
+        it('resolves a suffixed known bot by NAME, not by its suffix', () => {
+            // The known-bot rule must run BEFORE the generic suffix rule, or every
+            // "<name>-bot" / "<name>[bot]" entry in the set becomes unreachable and the
+            // set silently stops meaning anything. Asserting the REASON is what makes
+            // this test fail if the two rules are reordered or the set is emptied.
+            for (const login of ['dependabot[bot]', 'snyk-bot', 'renovate[bot]']) {
+                expect(classifyAuthor({login}).reason).toContain('known automation account');
+            }
         });
 
         it('matches a known bot regardless of login casing', () => {
@@ -163,6 +172,15 @@ describe('classifyAuthor — the shared bot classifier (#254)', () => {
         it('treats a malformed email as no signal rather than as a bot', () => {
             expect(classifyAuthor({email: 'not-an-address'}).isBot).toBe(false);
             expect(classifyAuthor({email: 'trailing@'}).isBot).toBe(false);
+        });
+
+        it('bounds the login it quotes back, so an unbounded provider login cannot ride into the reason', () => {
+            // author_login is passed through from the provider API unvalidated; the reason
+            // is headed for an admin UI.
+            const verdict = classifyAuthor({login: `${'x'.repeat(5000)}[bot]`});
+            expect(verdict.isBot).toBe(true);
+            expect(verdict.reason!.length).toBeLessThan(120);
+            expect(verdict.reason).toContain('…');
         });
     });
 });
@@ -345,7 +363,7 @@ describe('listAuthorCandidates — unmapped retained authors (#254)', () => {
 
         const candidates = listAuthorCandidates(db);
         expect(candidates.map((c) => c.likely_bot)).toEqual([true, false]);
-        expect(candidates[0].bot_reason).toContain('bot suffix');
+        expect(candidates[0].bot_reason).toContain('known automation account');
         expect(candidates[1].bot_reason).toBeUndefined();
     });
 
@@ -370,6 +388,87 @@ describe('listAuthorCandidates — unmapped retained authors (#254)', () => {
             'github:login:sam',
             'gitlab:login:sam',
         ]);
+    });
+
+    describe('an author whose days carry DIFFERENT emails under one login key', () => {
+        // sync.ts stamps ONE run's sample commit email onto every date row that run
+        // writes, so a person committing from two addresses leaves different emails on
+        // different days under a single `github:login:x` key. Attribution is decided per
+        // row, so such an author can be mapped on some days and unmapped on others.
+        function seedTwoEmailAuthor(mappedEmail: string, unmappedEmail: string): void {
+            upsertRawAuthorDaily(
+                db,
+                rawRow({
+                    raw_author_key: 'github:login:carl',
+                    author_login: 'carl',
+                    author_email: mappedEmail,
+                    date: '2026-07-01',
+                    commits: 4,
+                }),
+                '2026-07-01T00:00:00.000Z',
+            );
+            upsertRawAuthorDaily(
+                db,
+                rawRow({
+                    raw_author_key: 'github:login:carl',
+                    author_login: 'carl',
+                    author_email: unmappedEmail,
+                    date: '2026-07-02',
+                    commits: 6,
+                }),
+                '2026-07-02T00:00:00.000Z',
+            );
+        }
+
+        it('LISTS them when the collapsed email would have byte-sorted to the MAPPED one', () => {
+            // MAX(author_email) picks 'zz@corp.io' -> a per-author resolve would say
+            // "mapped" and drop the candidate entirely, while the aa@ days project to
+            // nobody: silently unattributed history with nothing surfacing it.
+            addDeveloper(db, 'Carl', 'eng', 'zz@corp.io');
+            seedTwoEmailAuthor('zz@corp.io', 'aa@personal.dev');
+
+            const candidates = listAuthorCandidates(db);
+            expect(candidates.map((c) => c.raw_author_key)).toEqual(['github:login:carl']);
+            // ONLY the unattributed day's commits — the 4 already attributed to Carl are
+            // not waiting for anyone and must not be counted again.
+            expect(candidates[0].commit_count).toBe(6);
+            expect(candidates[0].email).toBe('aa@personal.dev');
+        });
+
+        it('counts ONLY unattributed commits when the collapsed email would have been the UNMAPPED one', () => {
+            // MAX picks 'zz@personal.dev' -> a per-author resolve says "unmapped" and
+            // reports all 10 commits, including the 4 already attributed. #256 would then
+            // auto-create a duplicate developer for a person who is already here.
+            addDeveloper(db, 'Carl', 'eng', 'aa@corp.io');
+            seedTwoEmailAuthor('aa@corp.io', 'zz@personal.dev');
+
+            const candidates = listAuthorCandidates(db);
+            expect(candidates).toHaveLength(1);
+            expect(candidates[0].commit_count).toBe(6);
+        });
+
+        it('drops the candidate only once EVERY one of its identities is mapped', () => {
+            addDeveloper(db, 'Carl', 'eng', 'aa@corp.io');
+            seedTwoEmailAuthor('aa@corp.io', 'zz@personal.dev');
+            expect(listAuthorCandidates(db)).toHaveLength(1);
+
+            // Registering the github login attributes every one of the key's days.
+            addDeveloper(db, 'Carl (git)', 'eng', undefined, 'carl');
+
+            expect(listAuthorCandidates(db)).toEqual([]);
+        });
+
+        it('folds unattributed variants into one candidate, spanning their full seen-range', () => {
+            seedTwoEmailAuthor('one@personal.dev', 'two@personal.dev');
+
+            const [carl] = listAuthorCandidates(db);
+            expect(carl.commit_count).toBe(10);
+            expect(carl.first_seen).toBe('2026-07-01T00:00:00.000Z');
+            expect(carl.last_seen).toBe('2026-07-02T00:00:00.000Z');
+            // Pre-fill comes from the BUSIEST variant, deterministically.
+            expect(carl.email).toBe('two@personal.dev');
+            expect(carl.login).toBe('carl');
+        });
     });
 
     it('still lists a github author when only the SAME-named gitlab identity is mapped', () => {

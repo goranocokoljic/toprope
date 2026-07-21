@@ -8,8 +8,8 @@
  *
  * This module answers exactly that, as a DERIVED VIEW:
  *
- *     listAuthorCandidates(db) = distinctRawAuthors(db) MINUS everything the identity
- *                                map already resolves
+ *     listAuthorCandidates(db) = every retained raw identity MINUS everything the
+ *                                identity map already resolves
  *
  * Deliberately not a stored `author_candidates` table. A stored list would be a second
  * source of truth that drifts the moment a developer is created, renamed, or has an
@@ -27,7 +27,11 @@
  */
 
 import type Database from 'better-sqlite3';
-import {distinctRawAuthors, type DistinctRawAuthor} from './raw-author-daily.js';
+import {
+    distinctRawAuthorIdentities,
+    type DistinctRawAuthor,
+    type RawAuthorIdentityVariant,
+} from './raw-author-daily.js';
 import {buildDevLookupMap, resolveDeveloperId} from './projection.js';
 
 /** What {@link classifyAuthor} is handed — the raw identity fields, both optional. */
@@ -58,19 +62,22 @@ export interface AuthorCandidate extends DistinctRawAuthor {
 
 /**
  * Email domains/hosts that identify a synthetic address rather than a person's mailbox.
- * Matched on the domain part only (after the last `@`), case-insensitively:
+ * Matched on the domain part only (after the last `@`), case-insensitively.
  *
- *   - `users.noreply.github.com` — GitHub's privacy-mode commit address. NOTE this is a
- *     WEAK signal about botness: a real human with "keep my email private" enabled commits
- *     from exactly this domain. It is only ever consulted for an author with NO login (see
- *     {@link classifyAuthor}), where there is no person-shaped identity to promote anyway.
- *   - a `noreply.`-prefixed or bare `noreply`/`no-reply` host — the generic shape of an
- *     unattended sender address.
+ * Two generic shapes, not a curated host list: a `no-reply`/`noreply` label at the START
+ * of the domain (`noreply.example.com`, and the bare `noreply` host), or one ANYWHERE as a
+ * dot-delimited label (`users.noreply.github.com`, `x.no-reply.corp`). GitHub's
+ * privacy-mode domain is deliberately NOT listed separately — it is matched by the second
+ * pattern, and listing it would suggest the denylist is narrower than it is.
+ *
+ * Requiring a whole dot-delimited label is what keeps `replyto.example.com` and
+ * `noreplyclothing.com` out. Note this is a WEAK signal about botness: a real human with
+ * "keep my email private" enabled commits from `users.noreply.github.com`. It is therefore
+ * only ever consulted for an author with NO login at all (see {@link classifyAuthor}).
  */
 const NOREPLY_DOMAIN_PATTERNS: readonly RegExp[] = [
-    /^users\.noreply\.github\.com$/,
     /^no-?reply(\.|$)/,
-    /(^|\.)no-?reply\./,
+    /\.no-?reply\./,
 ];
 
 /**
@@ -90,12 +97,10 @@ const NOREPLY_DOMAIN_PATTERNS: readonly RegExp[] = [
 const KNOWN_BOT_LOGINS: ReadonlySet<string> = new Set([
     'dependabot',
     'renovate',
-    'renovate-bot',
     'github-actions',
     'actions-user',
     'mergify',
     'snyk',
-    'snyk-bot',
     'greenkeeper',
     'imgbot',
     'codecov',
@@ -131,6 +136,22 @@ function stripBotSuffix(login: string): string {
     return login.replace(BOT_SUFFIX_RE, '');
 }
 
+/**
+ * How much of a login {@link classifyAuthor} will quote back inside a `reason`. `reason`
+ * is provider-supplied text headed for an admin UI (#255) and nothing upstream bounds
+ * `author_login` — `upsertRawAuthorDaily` shape-validates the key, the date and the
+ * metrics, but passes the identity columns through verbatim. A self-hosted instance can
+ * hand back a login of arbitrary length, so the quote is capped where it is minted rather
+ * than trusting every future renderer to cope. (The reason is human-readable prose, NOT a
+ * machine-readable field: callers branch on `isBot`/`likely_bot`, never on this string.)
+ */
+const REASON_LOGIN_MAX = 64;
+
+/** The login as it will appear inside a reason: bounded, with the truncation made visible. */
+function quoteLogin(login: string): string {
+    return login.length <= REASON_LOGIN_MAX ? login : `${login.slice(0, REASON_LOGIN_MAX)}…`;
+}
+
 /** The domain part of an email, lowercased — or null if it isn't shaped like an address. */
 function emailDomain(email: string): string | null {
     const at = email.lastIndexOf('@');
@@ -151,10 +172,16 @@ function emailDomain(email: string): string | null {
  *
  * Signals, in order:
  *   1. an empty/whitespace identity on BOTH fields — nothing to promote;
- *   2. a `[bot]` / `-bot` / `_bot` login suffix;
- *   3. a login in {@link KNOWN_BOT_LOGINS} (after suffix-stripping);
+ *   2. a login in {@link KNOWN_BOT_LOGINS} (after suffix-stripping);
+ *   3. a `[bot]` / `-bot` / `_bot` login suffix;
  *   4. a placeholder login ({@link PLACEHOLDER_LOGINS});
  *   5. a no-reply email domain — ONLY when the author has no login at all.
+ *
+ * Rules 2 and 3 are in that order on purpose. Both fire for `dependabot[bot]`, and the
+ * named-bot answer is the more specific one; running the generic suffix rule first would
+ * shadow it, leaving `stripBotSuffix` unreachable and every `*-bot` entry in the set dead.
+ * The verdict is the same either way — only the `reason` differs — but a dead branch is
+ * how a set entry silently stops meaning anything.
  *
  * Rule 5's login guard is the important one: GitHub's privacy mode gives ordinary humans
  * a `users.noreply.github.com` commit address, so flagging on the email alone would mark
@@ -175,18 +202,18 @@ export function classifyAuthor(author: AuthorIdentityInput): AuthorClassificatio
 
     if (login) {
         const lower = login.toLowerCase();
+        const quoted = quoteLogin(login);
 
-        if (BOT_SUFFIX_RE.test(lower)) {
-            return {isBot: true, reason: `login "${login}" carries a bot suffix`};
+        if (KNOWN_BOT_LOGINS.has(stripBotSuffix(lower))) {
+            return {isBot: true, reason: `login "${quoted}" is a known automation account`};
         }
 
-        const base = stripBotSuffix(lower);
-        if (KNOWN_BOT_LOGINS.has(base)) {
-            return {isBot: true, reason: `login "${login}" is a known automation account`};
+        if (BOT_SUFFIX_RE.test(lower)) {
+            return {isBot: true, reason: `login "${quoted}" carries a bot suffix`};
         }
 
         if (PLACEHOLDER_LOGINS.has(lower)) {
-            return {isBot: true, reason: `login "${login}" is a placeholder, not an identity`};
+            return {isBot: true, reason: `login "${quoted}" is a placeholder, not an identity`};
         }
 
         // A login is present and matched nothing. Do NOT consult the email: a human on
@@ -212,37 +239,91 @@ function compareText(a: string, b: string): number {
     return a < b ? -1 : a > b ? 1 : 0;
 }
 
+/** Keep a known value rather than letting a variant that lacks the field erase it. */
+function firstKnown(kept: string | null, next: string | null): string | null {
+    return kept ?? next;
+}
+
 /**
- * Every retained raw author that resolves to NO developer under the CURRENT identity map,
- * busiest first.
+ * Roll a second unattributed variant of the same key into the accumulated candidate.
  *
- * Cost is two queries total regardless of author count — `distinctRawAuthors` (one grouped
- * rollup) and `buildDevLookupMap` (one scan of `developers`) — then an in-memory check per
- * author. Never a lookup per row.
+ * `distinctRawAuthorIdentities` returns a key's variants in `commit_count DESC` order, so
+ * `kept` is always the BUSIEST one — its login/email are what a promote form should
+ * pre-fill, and the merge only ever fills in fields it was missing. `first_seen`/`last_seen`
+ * are shape-pinned UTC ISO instants at the write boundary, so comparing them as strings is
+ * sound (that pin is exactly what makes it sound — see UTC_ISO_INSTANT_RE in the store).
+ */
+function foldVariant(kept: DistinctRawAuthor, next: RawAuthorIdentityVariant): DistinctRawAuthor {
+    return {
+        ...kept,
+        login: firstKnown(kept.login, next.login),
+        email: firstKnown(kept.email, next.email),
+        display_name: firstKnown(kept.display_name, next.display_name),
+        commit_count: kept.commit_count + next.commit_count,
+        first_seen: compareText(next.first_seen, kept.first_seen) < 0 ? next.first_seen : kept.first_seen,
+        last_seen: compareText(next.last_seen, kept.last_seen) > 0 ? next.last_seen : kept.last_seen,
+    };
+}
+
+/**
+ * Every retained raw author with activity that resolves to NO developer under the CURRENT
+ * identity map, busiest first.
+ *
+ * RESOLVED PER IDENTITY VARIANT, not per author, and this is the whole subtlety of the
+ * function. Attribution happens per row: the projection resolves each retained row's own
+ * `(author_login, author_email)`, and `sync.ts` stamps one run's sample commit email onto
+ * every date row that run writes — so one login key can carry a mapped address on some days
+ * and an unmapped one on others. Collapsing the key to a single email first (what
+ * `distinctRawAuthors` does, correctly, for its own callers) would then get BOTH directions
+ * wrong:
+ *   - the collapsed email happens to be the MAPPED one → the author vanishes from the queue
+ *     while their other days project to nobody. Silently unattributed history with no
+ *     surface reporting it is precisely the failure this epic exists to end.
+ *   - the collapsed email happens to be the UNMAPPED one → the author is listed with a
+ *     `commit_count` that includes commits ALREADY attributed to an existing developer, and
+ *     #256's auto-create mints a duplicate record for a person who is already here.
+ * Folding only the UNATTRIBUTED variants makes `commit_count` mean what a reviewer reads it
+ * as: commits currently waiting to be attributed.
+ *
+ * Cost is two queries total regardless of author count — `distinctRawAuthorIdentities` (one
+ * grouped rollup) and `buildDevLookupMap` (one scan of `developers`) — then an in-memory
+ * check per variant. Never a lookup per row.
  *
  * Ordering is `commit_count DESC, raw_author_key ASC`, applied here rather than inherited:
- * `distinctRawAuthors` sorts by `commit_count DESC, last_seen DESC, …` for its own callers,
- * and a candidate list whose order depends on `last_seen` would reshuffle on every sync
- * even when nothing about the candidates changed. The comparator is TOTAL —
- * `raw_author_key` embeds its provider and `(provider, raw_author_key)` is UNIQUE in the
- * store, so the key alone is a unique final tiebreak and no two rows can compare equal.
+ * the store's readers sort by `commit_count DESC, last_seen DESC, …` for their own callers,
+ * and a candidate list whose order depends on `last_seen` would reshuffle on every sync even
+ * when nothing about the candidates changed. The comparator is TOTAL — `raw_author_key`
+ * embeds its provider and `(provider, raw_author_key)` is UNIQUE in the store, so the key
+ * alone is a unique final tiebreak and no two rows can compare equal.
  *
- * The result is derived, never stored: mapping a candidate's identity to a developer
- * removes it from the next call with no invalidation step.
+ * KNOWN LIMIT, inherited deliberately: `resolveDeveloperId` matches a provider login
+ * CASE-SENSITIVELY, so a developer registered as `--github alice` against an API that
+ * reports `Alice` is listed here as a candidate. That is self-consistent — the projection
+ * fails to attribute that author too, so surfacing them reports a real mapping defect rather
+ * than inventing one — and making the resolver case-insensitive is a cross-cutting identity
+ * change for the epic, not this module's to make unilaterally.
+ *
+ * The result is derived, never stored: mapping a candidate's identity to a developer removes
+ * it from the next call with no invalidation step.
  */
 export function listAuthorCandidates(db: Database.Database): AuthorCandidate[] {
     const lookup = buildDevLookupMap(db);
 
-    const candidates = distinctRawAuthors(db)
-        .filter((author) => resolveDeveloperId(lookup, author.provider, author.login, author.email) === null)
-        .map((author): AuthorCandidate => {
-            const {isBot, reason} = classifyAuthor({login: author.login, email: author.email});
-            return {
-                ...author,
-                likely_bot: isBot,
-                ...(isBot && reason ? {bot_reason: reason} : {}),
-            };
-        });
+    const unattributed = new Map<string, DistinctRawAuthor>();
+    for (const variant of distinctRawAuthorIdentities(db)) {
+        if (resolveDeveloperId(lookup, variant.provider, variant.login, variant.email) !== null) continue;
+        const kept = unattributed.get(variant.raw_author_key);
+        unattributed.set(variant.raw_author_key, kept ? foldVariant(kept, variant) : variant);
+    }
+
+    const candidates = [...unattributed.values()].map((author): AuthorCandidate => {
+        const {isBot, reason} = classifyAuthor({login: author.login, email: author.email});
+        return {
+            ...author,
+            likely_bot: isBot,
+            ...(isBot && reason ? {bot_reason: reason} : {}),
+        };
+    });
 
     return candidates.sort(
         (a, b) => b.commit_count - a.commit_count || compareText(a.raw_author_key, b.raw_author_key),
