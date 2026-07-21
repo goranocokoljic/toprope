@@ -1485,6 +1485,30 @@ function upsertPRRecord(
     );
 }
 
+/**
+ * The newest forward CURSOR across an already-resolved provider set — the instant git
+ * data has been synced UP TO. Factored out of {@link GitSync.getLastSyncTime} so a
+ * caller that has already resolved its providers once (e.g. `toprope status`, #246) can
+ * reuse the identical scan without resolving them a second time, keeping the read and
+ * the writer of `git_last_sync:<type>:<container>` cursors from drifting apart.
+ * Returns null when no resolved provider has a cursor yet.
+ */
+export function latestProviderCursor(
+    db: Database.Database,
+    providerConfigs: GitProviderConfig[],
+): string | null {
+    let latest: string | null = null;
+    for (const pc of providerConfigs) {
+        const key = syncStateKey(pc.type, providerIdentifier(pc));
+        const row = db
+            .prepare('SELECT value FROM sync_state WHERE key = ?')
+            .get(key) as SyncStateRow | undefined;
+        const t = row?.value ?? null;
+        if (t && (!latest || t > latest)) latest = t;
+    }
+    return latest;
+}
+
 export class GitSync implements ConnectorInterface {
     private readonly config: GitConnectorConfig;
 
@@ -1505,21 +1529,11 @@ export class GitSync implements ConnectorInterface {
      * stall syncs successfully every night while this still reports an instant weeks
      * back, because that is genuinely how far the data reaches. That is the honest
      * answer for a freshness/staleness question and the wrong one for "did the sync
-     * run?"; a caller wanting the latter must not use this. No production caller reads
-     * it today (see #246).
+     * run?"; a caller wanting the latter must not use this. `toprope status` reads it
+     * for the Git connector's "last sync" line (#246).
      */
     getLastSyncTime(db: Database.Database): string | null {
-        const providers = this.getProviderConfigs(db);
-        let latest: string | null = null;
-        for (const pc of providers) {
-            const key = syncStateKey(pc.type, providerIdentifier(pc));
-            const row = db
-                .prepare('SELECT value FROM sync_state WHERE key = ?')
-                .get(key) as SyncStateRow | undefined;
-            const t = row?.value ?? null;
-            if (t && (!latest || t > latest)) latest = t;
-        }
-        return latest;
+        return latestProviderCursor(db, this.getProviderConfigs(db));
     }
 
     async sync(db: Database.Database, providerFilter?: string): Promise<SyncResult> {

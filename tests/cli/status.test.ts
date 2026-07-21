@@ -204,14 +204,24 @@ describe('printStatus', () => {
              VALUES ('gs-1', ?, ?, 2, 50, 10, 3, 1, 0, 0, NULL, 0.1, 0.5, 25, 0)`,
         ).run(dev.id, daysAgo(1));
         db.prepare(
-            `INSERT INTO sync_state (key, value) VALUES ('git_last_sync', ?)`,
+            `INSERT INTO sync_state (key, value) VALUES ('git_last_sync:github:acme', ?)`,
         ).run(new Date().toISOString());
 
         const configWithRepos = baseConfig();
-        (configWithRepos.connectors.git as {enabled: boolean; repos: string[]}).repos = [
-            'org/repo1',
-            'org/repo2',
-        ];
+        (
+            configWithRepos.connectors.git as {
+                enabled: boolean;
+                repos: string[];
+                providers: unknown[];
+            }
+        ).repos = ['org/repo1', 'org/repo2'];
+        (
+            configWithRepos.connectors.git as {
+                enabled: boolean;
+                repos: string[];
+                providers: unknown[];
+            }
+        ).providers = [{type: 'github', org: 'acme', auth: {type: 'token', api_token: 't'}}];
         printStatus(db, configWithRepos);
 
         const combined = output.join('\n');
@@ -344,6 +354,67 @@ describe('printStatus', () => {
             const combined = output.join('\n');
             expect(combined).not.toContain('stalled');
             expect(combined).not.toContain('catching up');
+        });
+    });
+
+    // #246: the Git connector's "last sync" line must read the per-provider cursor
+    // the pipeline actually writes (git_last_sync:<type>:<container>), NOT the bare
+    // `git_last_sync` key that nothing in src/ ever writes.
+    describe('git connector last-sync line reads per-provider cursors (#246)', () => {
+        function gitConfig(orgs: string[] = ['acme']): TopropeConfig {
+            const config = baseConfig();
+            (config.connectors.git as {enabled: boolean; providers: unknown[]}).providers = orgs.map(
+                (org) => ({type: 'github', org, auth: {type: 'token', api_token: 't'}}),
+            );
+            return config;
+        }
+
+        function seedCursorIso(key: string, iso: string): void {
+            db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(key, iso);
+        }
+
+        // The Git connector's own line — distinguished from the per-provider
+        // stall/catch-up lines (those use lowercase "github:") and other connectors.
+        function gitLine(): string | undefined {
+            return output.find(
+                (l) => l.includes('Git ') && (l.includes('connected') || l.includes('not synced')),
+            );
+        }
+
+        it('renders "connected" and the newest cursor across providers', () => {
+            const threeHoursAgo = new Date(Date.now() - 3 * 3_600_000).toISOString();
+            const oneHourAgo = new Date(Date.now() - 1 * 3_600_000).toISOString();
+            seedCursorIso('git_last_sync:github:acme', threeHoursAgo);
+            seedCursorIso('git_last_sync:github:beta', oneHourAgo);
+
+            printStatus(db, gitConfig(['acme', 'beta']));
+
+            const line = gitLine();
+            expect(line).toBeDefined();
+            expect(line).toContain('✓ connected');
+            // Newest of the two cursors (1h ago), not the older 3h one.
+            expect(line).toContain('1h ago');
+        });
+
+        it('renders "not synced" when the bare git_last_sync key is set but no per-provider cursor is (regression)', () => {
+            // The exact pre-#246 bug: the reader looked at the bare key, which nothing
+            // writes. Seeding ONLY it must now leave the Git line "not synced".
+            seedCursorIso('git_last_sync', new Date().toISOString());
+
+            printStatus(db, gitConfig());
+
+            const line = gitLine();
+            expect(line).toBeDefined();
+            expect(line).toContain('○ not synced');
+            expect(line).not.toContain('connected');
+        });
+
+        it('renders "not synced" when no cursor exists at all', () => {
+            printStatus(db, gitConfig());
+
+            const line = gitLine();
+            expect(line).toBeDefined();
+            expect(line).toContain('○ not synced');
         });
     });
 });
