@@ -126,6 +126,40 @@ beforeEach(() => {
             developers = developers.map((d) => (d.id === id ? updated : d));
             return json({data: updated});
         }
+        // Create (DO1.1): appends to the same list the table reads, and enforces
+        // the server's identity-uniqueness 409 so the dialog's conflict path is
+        // driven by a real response shape rather than a hand-built error.
+        if (u.includes('/api/admin/developers') && method === 'POST') {
+            const owner = developers.find(
+                (d) => body.github !== undefined && d.external_ids.github === String(body.github),
+            );
+            if (owner) {
+                return json(
+                    {
+                        error: 'Conflict',
+                        message: `github identity '${String(body.github)}' is already mapped to ${owner.name}`,
+                    },
+                    409,
+                );
+            }
+            const created: AdminDeveloper = {
+                id: `dev-${developers.length + 1}`,
+                name: String(body.name),
+                email: (body.email as string) ?? null,
+                team: String(body.team),
+                external_ids: {
+                    ...(body.github ? {github: String(body.github)} : {}),
+                    ...(body.bitbucket ? {bitbucket: String(body.bitbucket)} : {}),
+                    ...(body.gitlab ? {gitlab: String(body.gitlab)} : {}),
+                    ...(Array.isArray(body.git_emails)
+                        ? {git_emails: (body.git_emails as string[]).join(', ')}
+                        : {}),
+                },
+                created_at: '2026-02-01T00:00:00.000Z',
+            };
+            developers = [...developers, created];
+            return json({data: created}, 201);
+        }
         if (u.includes('/api/admin/developers')) {
             return json({data: developers});
         }
@@ -1667,5 +1701,169 @@ describe('AdminIdentities page', () => {
 
         expect(await screen.findByText(/Failed to load/)).toBeInTheDocument();
         expect(screen.queryByRole('table')).not.toBeInTheDocument();
+    });
+
+    // DO1.1 / #251 — the create path. Before it this screen was edit-only, so a
+    // fresh install had no way to get a developer into the system at all.
+    describe('add developer', () => {
+        /** Open the create dialog and wait for the team options to arrive. */
+        async function openAddModal(): Promise<void> {
+            fireEvent.click(screen.getByRole('button', {name: '＋ Add developer'}));
+            await screen.findByRole('option', {name: 'frontend'});
+        }
+
+        /** Every POST sent to the create route, in order. */
+        function creates(): [unknown, RequestInit?][] {
+            return fetchMock.mock.calls.filter(
+                (c) =>
+                    String(c[0]).endsWith('/api/admin/developers') &&
+                    (c[1]?.method ?? 'GET').toUpperCase() === 'POST',
+            ) as [unknown, RequestInit?][];
+        }
+
+        it('opens the dialog from the header affordance, which announces it opens a dialog', async () => {
+            renderPage(<AdminIdentities />);
+            await waitForTableLoaded();
+
+            const opener = screen.getByRole('button', {name: '＋ Add developer'});
+            expect(opener).toHaveAttribute('aria-haspopup', 'dialog');
+            expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+
+            await openAddModal();
+            expect(screen.getByRole('dialog', {name: 'Add developer'})).toBeInTheDocument();
+            // The create dialog is NOT the identity editor: it has no tool-identity
+            // fields and no team-move control.
+            expect(screen.queryByLabelText('Copilot username')).not.toBeInTheDocument();
+            expect(screen.queryByRole('button', {name: 'Move developer'})).not.toBeInTheDocument();
+        });
+
+        it('keeps Save disabled until both required fields are filled', async () => {
+            renderPage(<AdminIdentities />);
+            await waitForTableLoaded();
+            await openAddModal();
+
+            const submit = screen.getByRole('button', {name: 'Add developer'});
+            // Name and team both empty.
+            expect(submit).toBeDisabled();
+
+            // Name alone is not enough — team is still unselected.
+            fireEvent.change(screen.getByLabelText('Name'), {target: {value: 'Dana Dev'}});
+            expect(submit).toBeDisabled();
+
+            // A whitespace-only name doesn't count either.
+            fireEvent.change(screen.getByLabelText('Name'), {target: {value: '   '}});
+            fireEvent.change(screen.getByLabelText('Team'), {target: {value: 'platform'}});
+            expect(submit).toBeDisabled();
+
+            fireEvent.change(screen.getByLabelText('Name'), {target: {value: 'Dana Dev'}});
+            expect(submit).toBeEnabled();
+        });
+
+        it('submits the trimmed payload, omitting blank optional fields', async () => {
+            renderPage(<AdminIdentities />);
+            await waitForTableLoaded();
+            await openAddModal();
+
+            fireEvent.change(screen.getByLabelText('Name'), {target: {value: '  Dana Dev  '}});
+            fireEvent.change(screen.getByLabelText('Team'), {target: {value: 'platform'}});
+            fireEvent.change(screen.getByLabelText('GitHub username'), {target: {value: ' dana-gh '}});
+            fireEvent.change(screen.getByLabelText('Git commit emails (comma-separated)'), {
+                target: {value: 'dana@work.com, dana@home.com'},
+            });
+            fireEvent.click(screen.getByRole('button', {name: 'Add developer'}));
+
+            await waitFor(() => expect(creates()).toHaveLength(1));
+            // Email / Bitbucket / GitLab were left blank, so they are absent —
+            // an empty identity is no identity, not an empty string to store.
+            expect(sentBody(creates()[0])).toEqual({
+                name: 'Dana Dev',
+                team: 'platform',
+                github: 'dana-gh',
+                git_emails: ['dana@work.com', 'dana@home.com'],
+            });
+        });
+
+        it('closes the dialog and shows the new developer without a manual refetch', async () => {
+            renderPage(<AdminIdentities />);
+            await waitForTableLoaded();
+            expect(screen.queryByText('Dana Dev')).not.toBeInTheDocument();
+
+            await openAddModal();
+            fireEvent.change(screen.getByLabelText('Name'), {target: {value: 'Dana Dev'}});
+            fireEvent.change(screen.getByLabelText('Team'), {target: {value: 'platform'}});
+            fireEvent.change(screen.getByLabelText('Email'), {target: {value: 'dana@test.com'}});
+            fireEvent.click(screen.getByRole('button', {name: 'Add developer'}));
+
+            // The row is read back through the real hook (POST → invalidate →
+            // GET), not asserted off the submitted draft.
+            await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+            const row = await waitFor(() => developerRow('Dana Dev'));
+            expect(within(row).getByText('platform')).toBeInTheDocument();
+            expect(within(row).getByText('dana@test.com')).toBeInTheDocument();
+        });
+
+        it('renders the 409 conflict message inline and keeps the draft', async () => {
+            renderPage(<AdminIdentities />);
+            await waitForTableLoaded();
+            await openAddModal();
+
+            // 'alice-gh' is already Alice's GitHub id in the seeded list.
+            fireEvent.change(screen.getByLabelText('Name'), {target: {value: 'Dana Dev'}});
+            fireEvent.change(screen.getByLabelText('Team'), {target: {value: 'platform'}});
+            fireEvent.change(screen.getByLabelText('GitHub username'), {target: {value: 'alice-gh'}});
+            fireEvent.click(screen.getByRole('button', {name: 'Add developer'}));
+
+            // The server's own copy, not a generic failure line.
+            expect(
+                await screen.findByText("github identity 'alice-gh' is already mapped to Alice Dev"),
+            ).toBeInTheDocument();
+            // The dialog stays open with the draft intact so the duplicate can be
+            // corrected rather than retyped, and nothing was added to the table.
+            expect(screen.getByRole('dialog', {name: 'Add developer'})).toBeInTheDocument();
+            expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('Dana Dev');
+            expect((screen.getByLabelText('GitHub username') as HTMLInputElement).value).toBe('alice-gh');
+            expect(screen.queryByText('Dana Dev')).not.toBeInTheDocument();
+        });
+
+        it('gates the team select — and Save — while the roster is unresolved', async () => {
+            const base = fetchMock.getMockImplementation();
+            fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+                if (String(url).endsWith('/api/admin/teams')) return json({message: 'boom'}, 500);
+                return base!(url, init);
+            });
+
+            renderPage(<AdminIdentities />);
+            await waitForTableLoaded();
+            fireEvent.click(screen.getByRole('button', {name: '＋ Add developer'}));
+
+            const select = (await screen.findByLabelText('Team')) as HTMLSelectElement;
+            expect(await screen.findByRole('option', {name: 'Couldn’t load teams'})).toBeInTheDocument();
+            expect(select).toBeDisabled();
+            // Positive control: the roster really did fail, so no real team loaded.
+            expect(screen.queryByRole('option', {name: 'frontend'})).not.toBeInTheDocument();
+            // A name alone can't submit a developer onto no team.
+            fireEvent.change(screen.getByLabelText('Name'), {target: {value: 'Dana Dev'}});
+            expect(screen.getByRole('button', {name: 'Add developer'})).toBeDisabled();
+        });
+
+        it('offers only non-archived teams as create targets', async () => {
+            teams = [
+                ...teams,
+                {
+                    name: 'retired',
+                    department: null,
+                    manager: null,
+                    created_at: '2026-01-03T00:00:00.000Z',
+                    archived_at: '2026-02-01T00:00:00.000Z',
+                    developer_count: 0,
+                },
+            ];
+            renderPage(<AdminIdentities />);
+            await waitForTableLoaded();
+            await openAddModal();
+
+            expect(screen.getByRole('option', {name: 'platform'})).toBeInTheDocument();
+            expect(screen.queryByRole('option', {name: 'retired'})).not.toBeInTheDocument();
+        });
     });
 });

@@ -1,6 +1,7 @@
 import type {
     AdminDataSources,
     AdminDeveloper,
+    AdminDeveloperInput,
     AdminPasswordReset,
     AdminSubscription,
     AdminTeam,
@@ -482,6 +483,11 @@ export const api = {
     // --- Admin: developers (identity mapping + team move) ---
     async getAdminDevelopers(): Promise<AdminDeveloper[]> {
         const body = await request<ApiEnvelope<AdminDeveloper[]>>('/api/admin/developers');
+        return body.data;
+    },
+
+    async createAdminDeveloper(input: AdminDeveloperInput): Promise<AdminDeveloper> {
+        const body = await postJson<ApiEnvelope<AdminDeveloper>>('/api/admin/developers', input);
         return body.data;
     },
 
