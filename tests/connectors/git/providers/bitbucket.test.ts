@@ -569,6 +569,7 @@ describe('BitbucketProvider', () => {
                 createdAt: '2024-01-15T09:00:00+00:00',
                 mergedAt: null,
                 closedAt: null,
+                updatedAt: '2024-01-15T09:00:00+00:00',
                 reviewers: [{name: 'Bob', email: '', username: 'bob'}],
                 additions: 0,
                 deletions: 0,

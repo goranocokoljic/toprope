@@ -37,6 +37,7 @@ function makeEquivalentPR(username: string, id: string): GitPR {
         createdAt: '2024-03-10T08:00:00Z',
         mergedAt: '2024-03-11T14:00:00Z',
         closedAt: '2024-03-11T14:00:00Z',
+        updatedAt: '2024-03-11T14:00:00Z',
         reviewers: [],
         additions: 245,
         deletions: 40,

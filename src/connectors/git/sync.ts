@@ -107,33 +107,28 @@ export const EARLIEST_SYNC_EPOCH = new Date(0).toISOString();
  *   - BOUNDED everywhere: the commit walk's `[since, until]` span, and with it the
  *     per-commit `getCommitDiff` fan-out (one API call PER COMMIT — usually the
  *     largest single cost of a catch-up).
- *   - NOT bounded, and made WORSE on recovery: the PR listing.
- *     `getPullRequests(repo, state, since)` takes no `until` (see GitProvider), so a
- *     run still lists every PR touched since the cursor and fans out to
- *     getReviewComments + getPRReviews per PR. Two distinct consequences, and the
- *     second is a real cost this cap ADDS — stated plainly rather than buried:
- *       · While STALLED: `since` is pinned and `now` marches on, so that half of the
- *         cost grows every run, exactly as it did before this cap existed.
- *       · While RECOVERING: chunking multiplies the PR half's TOTAL cost. Catching up
- *         200 days used to be one run listing 200 days of PRs; it is now 7 runs
- *         listing 200+170+140+110+80+50+20 = 770 PR-days, because each chunk re-lists
- *         everything from its (advancing) `since` to `now`. The amplification is
- *         ~lag/(2·cap) — ~4x for a 200-day recovery, ~12x for a two-year one. The
- *         commit half is unaffected (its chunks are disjoint), so what the cap really
- *         buys is a bounded PEAK per run, paid for with a higher TOTAL on the PR side.
- *         For a rare, one-off recovery that is the right trade — a single run walking
- *         200 days of commits with a getCommitDiff per commit is what actually
- *         exhausts a rate limit — but it is a trade, not a free win.
- *     Correctness is unaffected either way: those fields are max()-merged idempotently
- *     (see remergeStoredSnapshot), so re-delivery is extra fetch, never inflation.
- *     Bounding it properly needs an `until` on the provider PR interface — GitPR does
- *     not even carry the `updated_at` the delivery is keyed on, so a filter here could
- *     not be proven lossless: follow-up #247, deliberately not #235.
- *   - PROVIDER-DEPENDENT: github/gitlab push `since`+`until` to the server, so the
- *     cap really does shrink what is listed. Bitbucket's getCommits pages from HEAD
- *     newest-first and breaks only when it crosses `since`, filtering `until` in
- *     memory — so for Bitbucket the cap bounds the diff fan-out but NOT the commit
- *     paging, and a chunked recovery re-pages HEAD→since once per chunk.
+ *   - BOUNDED since #247: the per-PR review fan-out. `getPullRequests(repo, state,
+ *     since)` still takes no `until` (see GitProvider), so a run lists every PR touched
+ *     since the cursor — but the fan-out that dominates its cost (getReviewComments +
+ *     getPRReviews, 2 API calls PER PR) is now filtered to the same `[since, until]`
+ *     window as the commit walk (prWithinFetchWindow, keyed on the `updatedAt` #247
+ *     added to GitPR). This collapses the recovery amplification the cap used to ADD —
+ *     a 200-day recovery no longer re-fans 200+170+…+20 = 770 PR-days of reviews across
+ *     7 chunks, only the ~1x disjoint total — and bounds the stalled case, where each
+ *     held run now fans out at most one cap-width of PRs instead of an ever-widening
+ *     `[since, now]`. Lossless: a PR dropped for `updatedAt > until` is re-listed on the
+ *     next chunk (whose `since` IS this `until`). Correctness was never at risk either
+ *     way — these fields are max()-merged idempotently (see remergeStoredSnapshot).
+ *   - STILL UNBOUNDED: the PR LIST paging itself. github/bitbucket page PRs by
+ *     `updated_at` DESC, so the out-of-window (newest) PRs sort FIRST and must be paged
+ *     through to reach `[since, until]` — an upper bound on the list call cannot skip
+ *     them. That paging is one list request per ~50–100 PRs though, far cheaper than the
+ *     2-per-PR fan-out #247 bounds; the dominant cost is handled.
+ *   - PROVIDER-DEPENDENT (commit walk): github/gitlab push `since`+`until` to the server,
+ *     so the cap really does shrink what is listed. Bitbucket's getCommits pages from HEAD
+ *     newest-first and breaks only when it crosses `since`, filtering `until` in memory —
+ *     so for Bitbucket the cap bounds the diff fan-out but NOT the commit paging, and a
+ *     chunked recovery re-pages HEAD→since once per chunk.
  */
 export const GIT_CATCHUP_WINDOW_MAX_DAYS = 30;
 
@@ -154,6 +149,40 @@ export function catchUpUntil(since: string, now: string): string {
     const capMs = GIT_CATCHUP_WINDOW_MAX_DAYS * 86_400_000;
     if (nowMs - sinceMs <= capMs) return now;
     return new Date(sinceMs + capMs).toISOString();
+}
+
+/**
+ * Whether a PR falls within a run's upper fetch bound (#247) — i.e. its last
+ * activity is at or before `until`, so its per-PR review fan-out
+ * (getReviewComments + getPRReviews) should run this run.
+ *
+ * `getPullRequests(repo, state, since)` takes no upper bound (see GitProvider), so a
+ * run lists every PR touched since the cursor and — before this filter — fanned out
+ * two API calls PER PR over the whole `[since, now]` span, unbounded while a cursor is
+ * held and AMPLIFIED chunk-by-chunk on a capped recovery. Dropping PRs with
+ * `updatedAt > until` bounds that fan-out to the same `[since, until]` window the
+ * commit walk already covers.
+ *
+ * LOSSLESS by construction: a PR touched in `(until, now]` has `updatedAt > until`,
+ * and a capped run advances the cursor to exactly `until` (see forwardCursorTarget),
+ * so the next run's `since` IS this run's `until` and re-lists that PR (`getPullRequests`
+ * fetches `updatedAt >= since`). The final, uncapped chunk (`until === now`) skips
+ * nothing. On the backfill path `until` is the earliest watermark, so this also stops
+ * a backfill re-fanning PRs already covered by the forward window — same predicate,
+ * same correctness (PR/review fields are max()-merged idempotently regardless).
+ *
+ * Compared as PARSED INSTANTS, never as strings: provider `updatedAt` values are raw
+ * API timestamps (github `...:00Z`, no millis) while `until` is a `toISOString()`
+ * value (`...:00.000Z`), so a lexical `<=` would mis-order equal instants. Total and
+ * FAIL-OPEN: an unparseable `until` (no usable bound) or an unparseable `updatedAt`
+ * (can't place the PR) keeps the PR — a bounded extra fetch, never a silent drop.
+ */
+export function prWithinFetchWindow(updatedAt: string, until: string): boolean {
+    const untilMs = Date.parse(until);
+    if (Number.isNaN(untilMs)) return true;
+    const updatedMs = Date.parse(updatedAt);
+    if (Number.isNaN(updatedMs)) return true;
+    return updatedMs <= untilMs;
 }
 
 /** Knobs a sync run accepts beyond the provider set. */
@@ -1162,10 +1191,10 @@ async function fetchProviderData(
     //   - First sync (no cursor): `now`. The cap deliberately does NOT apply — the
     //     window is already bounded by firstSyncWindowMonths, and capping it would
     //     silently turn a requested 6-month import into a 30-day one.
-    // The cap bounds the COMMIT walk and its per-commit getCommitDiff fan-out only —
-    // the PR listing below is fetched by `since` with no upper bound, so its cost still
-    // grows while a cursor is held. See GIT_CATCHUP_WINDOW_MAX_DAYS for the full scope
-    // of what is and is not bounded (and follow-up #247).
+    // `until` bounds BOTH the commit walk (with its per-commit getCommitDiff fan-out)
+    // and — since #247 — the per-PR review fan-out below, which is filtered to
+    // `updatedAt <= until` (prWithinFetchWindow). See GIT_CATCHUP_WINDOW_MAX_DAYS for the
+    // full scope of what is and is not bounded.
     const until = backfill
         ? backfill.until
         : storedCursor !== null
@@ -1276,13 +1305,20 @@ async function fetchProviderData(
                 `[${providerType}/${repoName}] Failed to fetch PRs: ${err instanceof Error ? err.message : String(err)}`,
             );
         }
+        // Bound the per-PR review fan-out to the run's [since, until] window (#247).
+        // getPullRequests has no upper bound, so a held cursor would otherwise fan out
+        // getReviewComments + getPRReviews (2 API calls each) over an ever-widening span;
+        // dropping PRs updated after `until` is lossless (they re-list next chunk — see
+        // prWithinFetchWindow) and collapses the recovery amplification back to ~1x. On a
+        // normal uncapped run (until === now) nothing is dropped.
+        const prsInWindow = rawPRs.filter((pr) => prWithinFetchWindow(pr.updatedAt, until));
         report?.((p) => {
-            p.prs_fetched += rawPRs.length;
+            p.prs_fetched += prsInWindow.length;
         });
 
         let commentFetchFailures = 0;
         let reviewFetchFailures = 0;
-        for (const pr of rawPRs) {
+        for (const pr of prsInWindow) {
             allPRs.push(toAnalysisPR(pr));
             let prCommentCount = 0;
             let commentsOk = true;

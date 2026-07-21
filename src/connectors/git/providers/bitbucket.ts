@@ -337,6 +337,7 @@ export class BitbucketProvider implements GitProvider {
                     // observed value (see upsertPRRecord in ../sync.ts).
                     mergedAt: normalizedState === 'merged' ? pr.updated_on : null,
                     closedAt: normalizedState === 'closed' ? pr.updated_on : null,
+                    updatedAt: pr.updated_on,
                     reviewers: (pr.reviewers ?? []).map(participantToAuthor),
                     additions: 0,
                     deletions: 0,

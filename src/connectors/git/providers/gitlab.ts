@@ -150,6 +150,7 @@ interface RawMR {
     author: RawMRAuthor | null;
     state: string;
     created_at: string;
+    updated_at: string;
     merged_at: string | null;
     closed_at: string | null;
     reviewers?: RawMRAuthor[];
@@ -348,6 +349,7 @@ export class GitLabProvider implements GitProvider {
                     createdAt: mr.created_at,
                     mergedAt: mr.merged_at,
                     closedAt: mr.closed_at,
+                    updatedAt: mr.updated_at,
                     reviewers,
                     additions: 0,
                     deletions: 0,

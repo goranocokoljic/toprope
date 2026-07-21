@@ -17,6 +17,7 @@ import {
     FIRST_SYNC_WINDOW_MAX_MONTHS,
     FIRST_SYNC_WINDOW_DEFAULT_MONTHS,
     catchUpUntil,
+    prWithinFetchWindow,
     getProviderStall,
     loadStalledProviders,
     loadLaggingProviders,
@@ -101,6 +102,7 @@ function makeProviderPR(username: string): GitPR {
         createdAt: '2024-01-15T08:00:00Z',
         mergedAt: '2024-01-16T10:00:00Z',
         closedAt: '2024-01-16T10:00:00Z',
+        updatedAt: '2024-01-16T10:00:00Z',
         reviewers: [],
         additions: 50,
         deletions: 10,
@@ -2993,6 +2995,44 @@ describe('GitSync — stalled-provider detection (#235)', () => {
             );
         });
 
+        describe('prWithinFetchWindow (PR fan-out bound, #247)', () => {
+            const UNTIL = '2026-07-15T00:00:00.000Z';
+
+            it('keeps a PR updated before `until`', () => {
+                expect(prWithinFetchWindow('2026-07-10T00:00:00.000Z', UNTIL)).toBe(true);
+            });
+
+            it('keeps a PR updated exactly AT `until` (inclusive boundary)', () => {
+                // Inclusive: the boundary PR is processed this run AND re-listed next run
+                // (next `since` === this `until`); an idempotent re-delivery, never a gap.
+                expect(prWithinFetchWindow(UNTIL, UNTIL)).toBe(true);
+            });
+
+            it('drops a PR updated after `until`', () => {
+                expect(prWithinFetchWindow('2026-07-20T00:00:00.000Z', UNTIL)).toBe(false);
+            });
+
+            it('compares parsed instants, not strings (no-millis updatedAt equals millis until)', () => {
+                // Provider timestamps arrive without millis (github `...:00Z`); `until` is a
+                // toISOString() value (`...:00.000Z`). A lexical `<=` would call the shorter
+                // string "less" and mis-handle the equal-instant boundary — parse both.
+                expect(prWithinFetchWindow('2026-07-15T00:00:00Z', UNTIL)).toBe(true);
+                expect(prWithinFetchWindow('2026-07-15T00:00:00.001Z', '2026-07-15T00:00:00Z')).toBe(
+                    false,
+                );
+            });
+
+            it('fails OPEN on an unparseable `until` (no usable bound → keep the PR)', () => {
+                expect(prWithinFetchWindow('2026-07-20T00:00:00.000Z', 'not-a-date')).toBe(true);
+            });
+
+            it('fails OPEN on an unparseable `updatedAt` (can\'t place the PR → fetch it)', () => {
+                // A bounded extra fetch is strictly safer than silently dropping a PR whose
+                // activity time we can't read.
+                expect(prWithinFetchWindow('garbage', UNTIL)).toBe(true);
+            });
+        });
+
         it('caps the fetch window AND the cursor advance when the cursor is far behind', async () => {
             seedDev(db, 'alice');
             const cursor = new Date(Date.now() - 90 * DAY_MS).toISOString();
@@ -3124,11 +3164,11 @@ describe('GitSync — stalled-provider detection (#235)', () => {
             // wall-clock every run. Two identical windows prove the commit walk (and its
             // per-commit diff fan-out) is constant per run.
             //
-            // Scope, deliberately not asserted here because it is NOT true: the PR
-            // listing takes no `until`, so that half of the fetch does still grow every
-            // run. See GIT_CATCHUP_WINDOW_MAX_DAYS and follow-up #247 — this test proves
-            // the bounded half, and must not be read as "a stalled run costs a constant
-            // amount".
+            // Since #247 the per-PR review fan-out is bounded to this same window too
+            // (see the "bounds the per-PR review fan-out" test below). The PR LIST paging
+            // still grows (getPullRequests takes no `until` and github/bitbucket sort
+            // newest-first), but that is one list call per ~50–100 PRs, not the 2-per-PR
+            // fan-out — see GIT_CATCHUP_WINDOW_MAX_DAYS for the full scope.
             expect(windows).toHaveLength(2);
             expect(windows[1]).toEqual(windows[0]);
             expect(Date.parse(windows[0][1]) - Date.parse(windows[0][0])).toBe(CAP_MS);
@@ -3188,6 +3228,102 @@ describe('GitSync — stalled-provider detection (#235)', () => {
                 .prepare('SELECT commits FROM git_snapshots WHERE developer_id = ? AND date = ?')
                 .get(devId, splitDay) as {commits: number} | undefined;
             expect(row?.commits).toBe(2);
+        });
+
+        it('bounds the per-PR review fan-out to the capped catch-up window (#247)', async () => {
+            seedDev(db, 'alice');
+            const cursor = new Date(Date.now() - 90 * DAY_MS).toISOString();
+            writeState(FORWARD_KEY, cursor);
+            // until = cursor + 30d. One PR updated inside [cursor, until], one after it.
+            const inWindow = {
+                ...makeProviderPR('alice'),
+                id: 'in',
+                updatedAt: new Date(Date.parse(cursor) + 10 * DAY_MS).toISOString(),
+            };
+            const outWindow = {
+                ...makeProviderPR('alice'),
+                id: 'out',
+                updatedAt: new Date(Date.parse(cursor) + 50 * DAY_MS).toISOString(),
+            };
+            const getReviewComments = vi.fn().mockResolvedValue([]);
+            const getPRReviews = vi.fn().mockResolvedValue([]);
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits: vi.fn().mockResolvedValue([]),
+                    getPullRequests: vi.fn().mockResolvedValue([inWindow, outWindow]),
+                    getReviewComments,
+                    getPRReviews,
+                }),
+            );
+
+            await new GitSync({enabled: false}).syncProviders(db, [CONFIG]);
+
+            // The out-of-window PR is NOT fanned out (2 API calls per PR saved). It gets
+            // re-listed on the next chunk (whose `since` IS this `until`), so lossless.
+            expect(getReviewComments.mock.calls.map((c) => c[1])).toEqual(['in']);
+            expect(getPRReviews.mock.calls.map((c) => c[1])).toEqual(['in']);
+        });
+
+        it('re-fans a window-deferred PR on the NEXT chunk — lossless (#247)', async () => {
+            seedDev(db, 'alice');
+            const cursor = new Date(Date.now() - 90 * DAY_MS).toISOString();
+            writeState(FORWARD_KEY, cursor);
+            // Updated 50d past the cursor: after run-1's until (cursor+30d), inside
+            // run-2's window ([cursor+30d, cursor+60d]).
+            const pr = {
+                ...makeProviderPR('alice'),
+                id: 'deferred',
+                updatedAt: new Date(Date.parse(cursor) + 50 * DAY_MS).toISOString(),
+            };
+            const getReviewComments = vi.fn().mockResolvedValue([]);
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockImplementation(() =>
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits: vi.fn().mockResolvedValue([]),
+                    getPullRequests: vi.fn().mockResolvedValue([pr]),
+                    getReviewComments,
+                }),
+            );
+
+            const sync = new GitSync({enabled: false});
+            await sync.syncProviders(db, [CONFIG]); // run 1: deferred (updated > until)
+            expect(getReviewComments).not.toHaveBeenCalled();
+            await sync.syncProviders(db, [CONFIG]); // run 2: since advanced, PR now in window
+            expect(getReviewComments.mock.calls.map((c) => c[1])).toEqual(['deferred']);
+        });
+
+        it('fans out EVERY PR on a healthy uncapped run (until === now) (#247)', async () => {
+            seedDev(db, 'alice');
+            const cursor = new Date(Date.now() - DAY_MS).toISOString();
+            writeState(FORWARD_KEY, cursor);
+            const p1 = {
+                ...makeProviderPR('alice'),
+                id: 'p1',
+                updatedAt: new Date(Date.now() - 2 * 3_600_000).toISOString(),
+            };
+            const p2 = {
+                ...makeProviderPR('alice'),
+                id: 'p2',
+                updatedAt: new Date(Date.now() - 3_600_000).toISOString(),
+            };
+            const getReviewComments = vi.fn().mockResolvedValue([]);
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits: vi.fn().mockResolvedValue([]),
+                    getPullRequests: vi.fn().mockResolvedValue([p1, p2]),
+                    getReviewComments,
+                }),
+            );
+
+            await new GitSync({enabled: false}).syncProviders(db, [CONFIG]);
+
+            // Uncapped: nothing dropped — the normal daily path is unchanged by #247.
+            expect(getReviewComments.mock.calls.map((c) => c[1]).sort()).toEqual(['p1', 'p2']);
         });
 
         it('does NOT cap a backfill — its window is the validated slice the caller passed', async () => {

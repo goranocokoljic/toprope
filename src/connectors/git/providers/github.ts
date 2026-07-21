@@ -351,6 +351,7 @@ export class GitHubProvider implements GitProvider {
                     createdAt: pr.created_at,
                     mergedAt: pr.merged_at,
                     closedAt: pr.closed_at,
+                    updatedAt: pr.updated_at,
                     reviewers,
                     // additions/deletions are absent from the PR list endpoint;
                     // only the individual PR endpoint (/pulls/{number}) returns them.

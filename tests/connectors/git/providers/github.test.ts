@@ -419,6 +419,7 @@ describe('GitHubProvider', () => {
                 createdAt: '2024-01-15T09:00:00Z',
                 mergedAt: null,
                 closedAt: null,
+                updatedAt: '2024-01-15T09:00:00Z',
                 reviewers: [{name: '', email: '', username: 'bob'}],
                 // additions/deletions are not returned by the PR list endpoint
                 additions: 0,
