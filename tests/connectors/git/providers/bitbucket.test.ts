@@ -73,7 +73,9 @@ function makePRFixture(overrides: Record<string, unknown> = {}): Record<string, 
         author: {nickname: 'alice', account_id: 'acc-alice', display_name: 'Alice'},
         state: 'OPEN',
         created_on: '2024-01-15T09:00:00+00:00',
-        updated_on: '2024-01-15T09:00:00+00:00',
+        // Distinct from created_on so the mapping assertion pins updatedAt to
+        // `updated_on`, not `created_on` (#247 review TST-1).
+        updated_on: '2024-01-16T09:00:00+00:00',
         reviewers: [{nickname: 'bob', account_id: 'acc-bob', display_name: 'Bob'}],
         ...overrides,
     };
@@ -569,7 +571,7 @@ describe('BitbucketProvider', () => {
                 createdAt: '2024-01-15T09:00:00+00:00',
                 mergedAt: null,
                 closedAt: null,
-                updatedAt: '2024-01-15T09:00:00+00:00',
+                updatedAt: '2024-01-16T09:00:00+00:00',
                 reviewers: [{name: 'Bob', email: '', username: 'bob'}],
                 additions: 0,
                 deletions: 0,

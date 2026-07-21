@@ -66,13 +66,10 @@ export interface GitPR {
     /**
      * The instant this PR was last touched (github `updated_at`, bitbucket
      * `updated_on`, gitlab `updated_at`) — the field all three providers list and
-     * page PRs by, and the ONLY field on which a run's upper fetch bound can be
-     * proven lossless (#247). Required: every provider's list payload always
-     * carries it, so this is guaranteed, not best-effort. The catch-up-window
-     * filter in fetchProviderData keys off it to bound the per-PR review fan-out
-     * (getReviewComments + getPRReviews) while a cursor is held — a PR dropped
-     * because `updatedAt > until` is re-delivered on the next chunk (whose `since`
-     * IS this run's `until`), so skipping its fan-out now costs nothing.
+     * page PRs by. Required: every provider's list payload always carries it, so this
+     * is guaranteed, not best-effort. `fetchProviderData` keys the catch-up-window
+     * bound off it to defer the per-PR review fan-out for PRs updated after the run's
+     * `until` (#247); see `prWithinFetchWindow` for the losslessness argument.
      */
     updatedAt: string;
     reviewers: GitAuthor[];

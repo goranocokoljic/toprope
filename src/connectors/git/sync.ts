@@ -107,18 +107,22 @@ export const EARLIEST_SYNC_EPOCH = new Date(0).toISOString();
  *   - BOUNDED everywhere: the commit walk's `[since, until]` span, and with it the
  *     per-commit `getCommitDiff` fan-out (one API call PER COMMIT — usually the
  *     largest single cost of a catch-up).
- *   - BOUNDED since #247: the per-PR review fan-out. `getPullRequests(repo, state,
+ *   - BOUNDED since #247: the per-PR review FAN-OUT. `getPullRequests(repo, state,
  *     since)` still takes no `until` (see GitProvider), so a run lists every PR touched
- *     since the cursor — but the fan-out that dominates its cost (getReviewComments +
- *     getPRReviews, 2 API calls PER PR) is now filtered to the same `[since, until]`
- *     window as the commit walk (prWithinFetchWindow, keyed on the `updatedAt` #247
- *     added to GitPR). This collapses the recovery amplification the cap used to ADD —
- *     a 200-day recovery no longer re-fans 200+170+…+20 = 770 PR-days of reviews across
- *     7 chunks, only the ~1x disjoint total — and bounds the stalled case, where each
- *     held run now fans out at most one cap-width of PRs instead of an ever-widening
- *     `[since, now]`. Lossless: a PR dropped for `updatedAt > until` is re-listed on the
- *     next chunk (whose `since` IS this `until`). Correctness was never at risk either
- *     way — these fields are max()-merged idempotently (see remergeStoredSnapshot).
+ *     since the cursor — the list rows all still feed the snapshot (prs_opened/prs_merged
+ *     stay whole) — but the fan-out that dominates its cost (getReviewComments +
+ *     getPRReviews, 2 API calls PER PR) is filtered to the same `[since, until]` window as
+ *     the commit walk (prWithinFetchWindow, keyed on the `updatedAt` #247 added to GitPR).
+ *     This collapses the recovery amplification the cap used to ADD — a 200-day recovery
+ *     no longer re-fans 200+170+…+20 = 770 PR-days of reviews across 7 chunks, only the
+ *     ~1x disjoint total (each PR is fanned out in exactly one chunk) — and bounds the
+ *     stalled case. Lossless for the fan-out: a PR deferred for `updatedAt > until` is
+ *     re-listed and fanned out on the next chunk (whose `since` IS this `until`). The one
+ *     residual, on the multi-chunk recovery/backfill path only: `review_comments_given` is
+ *     a per-day aggregate built from the fetched comments and max()-merged, so same-day
+ *     comments on PRs whose `updatedAt` straddles a chunk boundary can undercount that day
+ *     — a bounded, conservative error of the same class git_snapshots already accepts for
+ *     lacking a provider/PR dimension (#192 SEC-2). See prWithinFetchWindow.
  *   - STILL UNBOUNDED: the PR LIST paging itself. github/bitbucket page PRs by
  *     `updated_at` DESC, so the out-of-window (newest) PRs sort FIRST and must be paged
  *     through to reach `[since, until]` — an upper bound on the list call cannot skip
@@ -152,30 +156,42 @@ export function catchUpUntil(since: string, now: string): string {
 }
 
 /**
- * Whether a PR falls within a run's upper fetch bound (#247) — i.e. its last
- * activity is at or before `until`, so its per-PR review fan-out
- * (getReviewComments + getPRReviews) should run this run.
+ * Whether a PR's expensive review FAN-OUT (getReviewComments + getPRReviews) should run
+ * this run (#247) — i.e. its last activity is at or before the run's upper bound `until`.
  *
- * `getPullRequests(repo, state, since)` takes no upper bound (see GitProvider), so a
- * run lists every PR touched since the cursor and — before this filter — fanned out
- * two API calls PER PR over the whole `[since, now]` span, unbounded while a cursor is
- * held and AMPLIFIED chunk-by-chunk on a capped recovery. Dropping PRs with
- * `updatedAt > until` bounds that fan-out to the same `[since, until]` window the
- * commit walk already covers.
+ * This gates the FAN-OUT ONLY, never whether the PR feeds the snapshot. The list row is
+ * already in hand and cheap, so the caller pushes EVERY listed PR into `allPRs`
+ * (keeping prs_opened/prs_merged whole — see the SO-1 note at the call site); this
+ * predicate only decides whether to spend the two per-PR review API calls now.
  *
- * LOSSLESS by construction: a PR touched in `(until, now]` has `updatedAt > until`,
- * and a capped run advances the cursor to exactly `until` (see forwardCursorTarget),
- * so the next run's `since` IS this run's `until` and re-lists that PR (`getPullRequests`
- * fetches `updatedAt >= since`). The final, uncapped chunk (`until === now`) skips
- * nothing. On the backfill path `until` is the earliest watermark, so this also stops
- * a backfill re-fanning PRs already covered by the forward window — same predicate,
- * same correctness (PR/review fields are max()-merged idempotently regardless).
+ * `getPullRequests(repo, state, since)` takes no upper bound (see GitProvider), so a run
+ * lists every PR touched since the cursor and — before this gate — fanned out two API
+ * calls PER PR over the whole `[since, now]` span, unbounded while a cursor is held and
+ * AMPLIFIED chunk-by-chunk on a capped recovery. Gating on `updatedAt <= until` fans each
+ * PR out in EXACTLY ONE chunk (its `updatedAt` lands in exactly one contiguous
+ * `[since, until]`), collapsing the amplification to ~1x.
  *
- * Compared as PARSED INSTANTS, never as strings: provider `updatedAt` values are raw
- * API timestamps (github `...:00Z`, no millis) while `until` is a `toISOString()`
- * value (`...:00.000Z`), so a lexical `<=` would mis-order equal instants. Total and
- * FAIL-OPEN: an unparseable `until` (no usable bound) or an unparseable `updatedAt`
- * (can't place the PR) keeps the PR — a bounded extra fetch, never a silent drop.
+ * LOSSLESS for the fan-out: a PR touched in `(until, now]` has `updatedAt > until`, and a
+ * capped run advances the cursor to exactly `until` (see forwardCursorTarget), so the next
+ * run's `since` IS this run's `until` and re-lists it (`getPullRequests` fetches
+ * `updatedAt >= since`); it is fanned out then. The final uncapped chunk (`until === now`)
+ * defers nothing. On backfill, `until` is the earliest watermark, so a PR updated after it
+ * is already covered by the forward window.
+ *
+ * KNOWN RESIDUAL (recovery/backfill only): `review_comments_given` is a per-day aggregate
+ * built from the fetched comments and max()-merged across runs. Because each PR is fanned
+ * out in only one chunk, two same-day comments on PRs whose `updatedAt` straddles a chunk
+ * boundary are seen in different runs, so max() can undercount that day. Bounded, rare
+ * (multi-chunk catch-up with same-day cross-PR comment activity), and the same class of
+ * conservative undercount git_snapshots already accepts for lacking a provider/PR
+ * dimension (#192 SEC-2). prs_opened/prs_merged are NOT affected — they come from the
+ * always-complete `allPRs` list, whose widest first chunk captures the full set.
+ *
+ * Compared as PARSED INSTANTS, never as strings: provider `updatedAt` values are raw API
+ * timestamps (github `...:00Z`, no millis) while `until` is a `toISOString()` value
+ * (`...:00.000Z`), so a lexical `<=` would mis-order equal instants. Total and FAIL-OPEN:
+ * an unparseable `until` (no usable bound) or an unparseable `updatedAt` (can't place the
+ * PR) runs the fan-out — a bounded extra fetch, never a silent drop.
  */
 export function prWithinFetchWindow(updatedAt: string, until: string): boolean {
     const untilMs = Date.parse(until);
@@ -1305,50 +1321,69 @@ async function fetchProviderData(
                 `[${providerType}/${repoName}] Failed to fetch PRs: ${err instanceof Error ? err.message : String(err)}`,
             );
         }
-        // Bound the per-PR review fan-out to the run's [since, until] window (#247).
-        // getPullRequests has no upper bound, so a held cursor would otherwise fan out
-        // getReviewComments + getPRReviews (2 API calls each) over an ever-widening span;
-        // dropping PRs updated after `until` is lossless (they re-list next chunk — see
-        // prWithinFetchWindow) and collapses the recovery amplification back to ~1x. On a
-        // normal uncapped run (until === now) nothing is dropped.
-        const prsInWindow = rawPRs.filter((pr) => prWithinFetchWindow(pr.updatedAt, until));
         report?.((p) => {
-            p.prs_fetched += prsInWindow.length;
+            p.prs_fetched += rawPRs.length;
         });
 
         let commentFetchFailures = 0;
         let reviewFetchFailures = 0;
-        for (const pr of prsInWindow) {
+        for (const pr of rawPRs) {
+            // EVERY listed PR feeds allPRs / prRecords unconditionally — the list row is
+            // already in hand and cheap, and the per-day open/merge aggregate is combined
+            // across runs with max() (remergeStoredSnapshot), which is only idempotent if
+            // each run delivers the FULL per-day set. Dropping list rows here would
+            // partition a single day's PRs across catch-up chunks and make max(partial,
+            // partial) silently undercount prs_opened/prs_merged (#247 review SO-1; the
+            // additive/idempotent-merge rule from #205/#192).
             allPRs.push(toAnalysisPR(pr));
+
+            // Bound ONLY the expensive per-PR review fan-out (getReviewComments +
+            // getPRReviews, 2 API calls each) to the run's [since, until] window (#247).
+            // getPullRequests takes no upper bound, so a held cursor would otherwise
+            // re-fan an ever-widening span; gating the fan-out on `updatedAt <= until`
+            // fans each PR out in exactly one chunk (its updatedAt lands in exactly one
+            // contiguous [since, until]) — collapsing the recovery amplification to ~1x.
+            // Lossless: a deferred PR re-lists next chunk (since' === until) and is fanned
+            // out then. On a normal uncapped run (until === now) nothing is deferred.
+            const fanOut = prWithinFetchWindow(pr.updatedAt, until);
+
+            // A deferred fan-out is "not observed this run" — exactly like a failed fetch,
+            // so commentsOk/reviewsOk are false and upsertPRRecord carries forward the
+            // previously-observed review counts instead of clobbering them with zeros. It
+            // is NOT a fetch FAILURE, so it is not counted toward the error advisories.
             let prCommentCount = 0;
-            let commentsOk = true;
-            try {
-                const comments = await provider.getReviewComments(repoName, pr.id);
-                prCommentCount = comments.length;
-                for (const c of comments) {
-                    allReviewComments.push(toAnalysisReviewComment(c));
+            let commentsOk = fanOut;
+            if (fanOut) {
+                try {
+                    const comments = await provider.getReviewComments(repoName, pr.id);
+                    prCommentCount = comments.length;
+                    for (const c of comments) {
+                        allReviewComments.push(toAnalysisReviewComment(c));
+                    }
+                } catch {
+                    // Review comment fetch failed — counted and surfaced below
+                    commentsOk = false;
+                    commentFetchFailures++;
                 }
-            } catch {
-                // Review comment fetch failed — counted and surfaced below
-                commentsOk = false;
-                commentFetchFailures++;
             }
 
             // Review verdict events (Task 5.2). Best-effort like comments: a
-            // failed fetch still records the PR, flagged so the upsert
+            // failed (or deferred) fetch still records the PR, flagged so the upsert
             // preserves previously-observed verdict data.
             let changesRequestedCount = 0;
             let reviewEventCount = 0;
-            let reviewsOk = true;
-            try {
-                const reviews = await provider.getPRReviews(repoName, pr.id);
-                reviewEventCount = reviews.length;
-                changesRequestedCount = reviews.filter(
-                    (r) => r.state === 'changes_requested',
-                ).length;
-            } catch {
-                reviewsOk = false;
-                reviewFetchFailures++;
+            let reviewsOk = fanOut;
+            if (fanOut) {
+                try {
+                    const reviews = await provider.getPRReviews(repoName, pr.id);
+                    reviewEventCount = reviews.length;
+                    changesRequestedCount = reviews.filter(
+                        (r) => r.state === 'changes_requested',
+                    ).length;
+                } catch {
+                    reviewsOk = false;
+                    reviewFetchFailures++;
+                }
             }
 
             allPRRecords.push({

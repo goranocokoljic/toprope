@@ -3326,6 +3326,90 @@ describe('GitSync — stalled-provider detection (#235)', () => {
             expect(getReviewComments.mock.calls.map((c) => c[1]).sort()).toEqual(['p1', 'p2']);
         });
 
+        it('keeps prs_opened whole when a day\'s PRs straddle a chunk boundary (#247 SO-1)', async () => {
+            const devId = seedDev(db, 'alice');
+            const cursor = new Date(Date.now() - 90 * DAY_MS).toISOString();
+            writeState(FORWARD_KEY, cursor);
+            const createdAt = new Date(Date.parse(cursor) + 5 * DAY_MS).toISOString();
+            const day = createdAt.slice(0, 10);
+            // Two PRs opened the SAME day; their updatedAt lands in different 30d chunks:
+            // `early` in chunk 1 [cursor, cursor+30d], `late` in chunk 2 [cursor+30d, +60d].
+            const early = {
+                ...makeProviderPR('alice'),
+                id: 'pr-early',
+                state: 'open',
+                mergedAt: null,
+                closedAt: null,
+                createdAt,
+                updatedAt: new Date(Date.parse(cursor) + 5 * DAY_MS).toISOString(),
+            };
+            const late = {
+                ...makeProviderPR('alice'),
+                id: 'pr-late',
+                state: 'open',
+                mergedAt: null,
+                closedAt: null,
+                createdAt,
+                updatedAt: new Date(Date.parse(cursor) + 50 * DAY_MS).toISOString(),
+            };
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockImplementation(() =>
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits: vi.fn().mockResolvedValue([]),
+                    // Mirror a real provider's `since` cutoff: lists PRs updated >= since.
+                    getPullRequests: vi.fn(async (_repo: string, _state: string, since: string) =>
+                        [early, late].filter((pr) => Date.parse(pr.updatedAt) >= Date.parse(since)),
+                    ),
+                }),
+            );
+
+            const sync = new GitSync({enabled: false});
+            await sync.syncProviders(db, [CONFIG]); // chunk 1: lists both → prs_opened = 2
+            await sync.syncProviders(db, [CONFIG]); // chunk 2: lists only `late` → prs_opened = 1
+
+            // Both PRs opened that day must survive the max()-merge. Bounding the LIST row
+            // (not just the fan-out) would leave each chunk seeing one → max(1,1)=1, a
+            // silent undercount — the SO-1 regression this guards.
+            const row = db
+                .prepare('SELECT prs_opened FROM git_snapshots WHERE developer_id = ? AND date = ?')
+                .get(devId, day) as {prs_opened: number} | undefined;
+            expect(row?.prs_opened).toBe(2);
+        });
+
+        it('bounds the fan-out on a backfill run too (until = watermark) (#247)', async () => {
+            seedDev(db, 'alice');
+            writeState(FORWARD_KEY, new Date(Date.now() - 90 * DAY_MS).toISOString());
+            const backfill = {since: '2024-01-01T00:00:00.000Z', until: '2024-07-01T00:00:00.000Z'};
+            const inWindow = {
+                ...makeProviderPR('alice'),
+                id: 'bf-in',
+                updatedAt: '2024-03-01T00:00:00.000Z',
+            };
+            const afterWatermark = {
+                ...makeProviderPR('alice'),
+                id: 'bf-after',
+                updatedAt: '2024-09-01T00:00:00.000Z',
+            };
+            const getReviewComments = vi.fn().mockResolvedValue([]);
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits: vi.fn().mockResolvedValue([]),
+                    getPullRequests: vi.fn().mockResolvedValue([inWindow, afterWatermark]),
+                    getReviewComments,
+                    getPRReviews: vi.fn().mockResolvedValue([]),
+                }),
+            );
+
+            await new GitSync({enabled: false}).syncProviders(db, [CONFIG], undefined, {backfill});
+
+            // On backfill `until` is the earliest watermark, so a PR updated after it is
+            // already covered by the forward window and its fan-out is skipped.
+            expect(getReviewComments.mock.calls.map((c) => c[1])).toEqual(['bf-in']);
+        });
+
         it('does NOT cap a backfill — its window is the validated slice the caller passed', async () => {
             writeState(FORWARD_KEY, new Date(Date.now() - 90 * DAY_MS).toISOString());
             const backfill = {since: '2024-01-01T00:00:00.000Z', until: '2024-07-01T00:00:00.000Z'};
