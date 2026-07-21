@@ -342,6 +342,81 @@ describe('upsertRawAuthorDaily + readers (#252)', () => {
         expect(() => upsertRawAuthorDaily(db, input(), '+010000-01-01T00:00:00.000Z')).toThrow(RawAuthorDailyError);
     });
 
+    it('LOWERCASES author_email at the write boundary, matching the identity-map lookup', () => {
+        upsertRawAuthorDaily(
+            db,
+            input({author_email: '  Alice@Example.COM  '}),
+            '2026-07-01T10:00:00.000Z',
+        );
+        expect(stored().author_email).toBe('alice@example.com');
+    });
+
+    it('canonicalizes casing across runs so one author never rolls up under two spellings', () => {
+        upsertRawAuthorDaily(
+            db,
+            input({
+                raw_author_key: 'github:email:bob@example.com',
+                author_login: null,
+                author_email: 'BOB@example.com',
+                date: '2026-07-01',
+                commits: 1,
+            }),
+            '2026-07-01T10:00:00.000Z',
+        );
+        upsertRawAuthorDaily(
+            db,
+            input({
+                raw_author_key: 'github:email:bob@example.com',
+                author_login: null,
+                author_email: 'bob@Example.com',
+                date: '2026-07-02',
+                commits: 1,
+            }),
+            '2026-07-02T10:00:00.000Z',
+        );
+        const bob = distinctRawAuthors(db).find((a) => a.raw_author_key === 'github:email:bob@example.com');
+        expect(bob?.email).toBe('bob@example.com');
+        expect(bob?.commit_count).toBe(2);
+    });
+
+    it('rejects a key whose provider prefix disagrees with the provider column', () => {
+        expect(() =>
+            upsertRawAuthorDaily(
+                db,
+                input({provider: 'gitlab', raw_author_key: 'github:login:alice'}),
+                '2026-07-01T10:00:00.000Z',
+            ),
+        ).toThrow(RawAuthorDailyError);
+        // The read whose safety argument is that invariant stays uncontaminated.
+        expect(readRawDailyForKeys(db, ['github:login:alice'])).toEqual([]);
+    });
+
+    it('rejects out-of-range metrics with a typed error, not a raw SQLITE_CONSTRAINT', () => {
+        const codeOf = (fn: () => void): string => {
+            try {
+                fn();
+            } catch (e) {
+                expect(e).toBeInstanceOf(RawAuthorDailyError);
+                return (e as RawAuthorDailyError).code;
+            }
+            throw new Error('expected a throw');
+        };
+        expect(codeOf(() => upsertRawAuthorDaily(db, input({commits: -1}), '2026-07-01T10:00:00.000Z'))).toBe('invalid_metric');
+        expect(codeOf(() => upsertRawAuthorDaily(db, input({prs_merged: 1.5}), '2026-07-01T10:00:00.000Z'))).toBe('invalid_metric');
+        // NaN binds as NULL into a NOT NULL column — the raw error would name the wrong problem.
+        expect(codeOf(() => upsertRawAuthorDaily(db, input({commits: NaN}), '2026-07-01T10:00:00.000Z'))).toBe('invalid_metric');
+        expect(codeOf(() => upsertRawAuthorDaily(db, input({code_churn_rate: NaN}), '2026-07-01T10:00:00.000Z'))).toBe('invalid_metric');
+        expect(codeOf(() => upsertRawAuthorDaily(db, input({ai_signature_score: Infinity}), '2026-07-01T10:00:00.000Z'))).toBe('invalid_metric');
+        expect(codeOf(() => upsertRawAuthorDaily(db, input({avg_time_to_merge_hours: NaN}), '2026-07-01T10:00:00.000Z'))).toBe('invalid_metric');
+        expect(db.prepare('SELECT COUNT(*) AS n FROM raw_author_daily').get()).toEqual({n: 0});
+    });
+
+    it('accepts a null avg_time_to_merge_hours (the "nothing merged" case is not a bad metric)', () => {
+        expect(() =>
+            upsertRawAuthorDaily(db, input({avg_time_to_merge_hours: null}), '2026-07-01T10:00:00.000Z'),
+        ).not.toThrow();
+    });
+
     describe('readRawDailyForKeys', () => {
         beforeEach(() => {
             upsertRawAuthorDaily(db, input({date: '2026-07-02', commits: 2}), '2026-07-02T10:00:00.000Z');
@@ -406,6 +481,43 @@ describe('upsertRawAuthorDaily + readers (#252)', () => {
         it('returns [] for an empty list and drops malformed dates rather than scanning', () => {
             expect(readRawDailyForDates(db, [])).toEqual([]);
             expect(readRawDailyForDates(db, ['2026-7-1', 'yesterday'])).toEqual([]);
+        });
+
+        // A chunked read orders each chunk in SQL; without a final sort the concatenated
+        // result is a sequence of independently-sorted runs — correct below the chunk
+        // size and silently wrong above it. Exercise BOTH readers past the boundary.
+        it('stays globally sorted across chunk boundaries, for both readers', () => {
+            const fresh = new Database(':memory:');
+            try {
+                runMigrations(fresh, MIGRATIONS_DIR);
+
+                const DAYS = 700; // > READ_CHUNK_SIZE (500)
+                const dates: string[] = [];
+                const keys: string[] = [];
+                for (let i = 0; i < DAYS; i++) {
+                    const day = new Date(Date.UTC(2024, 0, 1 + i)).toISOString().slice(0, 10);
+                    const key = `github:login:dev${String(i).padStart(4, '0')}`;
+                    dates.push(day);
+                    keys.push(key);
+                    upsertRawAuthorDaily(
+                        fresh,
+                        input({raw_author_key: key, author_login: `dev${i}`, date: day, commits: 1}),
+                        '2026-07-01T10:00:00.000Z',
+                    );
+                }
+
+                // Feed both readers in DESCENDING order so an unsorted concatenation
+                // would come back visibly out of order rather than accidentally right.
+                const byDate = readRawDailyForDates(fresh, [...dates].reverse());
+                const byKey = readRawDailyForKeys(fresh, [...keys].reverse());
+
+                expect(byDate).toHaveLength(DAYS);
+                expect(byKey).toHaveLength(DAYS);
+                expect(byDate.map((r) => r.date)).toEqual([...dates]);
+                expect(byKey.map((r) => r.date)).toEqual([...dates]);
+            } finally {
+                fresh.close();
+            }
         });
     });
 

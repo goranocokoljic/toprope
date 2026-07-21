@@ -51,7 +51,12 @@ const UTC_ISO_INSTANT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const READ_CHUNK_SIZE = 500;
 
 /** Why a raw-author write refused. Typed so callers map it instead of leaking a raw DB error. */
-export type RawAuthorDailyErrorCode = 'invalid_provider' | 'invalid_key' | 'invalid_date' | 'invalid_instant';
+export type RawAuthorDailyErrorCode =
+    | 'invalid_provider'
+    | 'invalid_key'
+    | 'invalid_date'
+    | 'invalid_instant'
+    | 'invalid_metric';
 
 /** A fail-closed refusal from the raw-author store — the input never reached SQLite. */
 export class RawAuthorDailyError extends Error {
@@ -218,6 +223,20 @@ function bestKnown(stored: string | null, incoming: string | null): string | nul
 }
 
 /**
+ * Canonicalize a commit email to the SAME form the identity map is keyed by
+ * (`buildDevLookupMap`/`resolveDeveloperId` both lowercase before lookup) and that
+ * `rawAuthorKeyFor` already bakes into an email-derived key. Without this the stored
+ * column would keep provider casing verbatim, so a consumer matching on it would miss
+ * `Alice@Example.COM`, and `MAX(author_email)` in distinctRawAuthors would roll the
+ * same author up to whichever casing byte-sorts higher rather than to one canonical
+ * value.
+ */
+function normalizeEmail(email: string | null): string | null {
+    const trimmed = (email ?? '').trim().toLowerCase();
+    return trimmed || null;
+}
+
+/**
  * Later of two UTC ISO instants, as a TOTAL comparator: an unparseable operand loses
  * rather than propagating NaN through a `>` that silently compares false. Used so
  * `last_seen` only ever advances, even if a run hands back a skewed clock reading.
@@ -230,6 +249,17 @@ function laterInstant(stored: string, incoming: string): string {
     return incomingMs > storedMs ? incoming : stored;
 }
 
+/** Counters that must be non-negative integers; the schema CHECKs these too. */
+const COUNTER_FIELDS: readonly (keyof DailyGitMetrics)[] = [
+    'commits', 'lines_added', 'lines_removed', 'files_changed',
+    'prs_opened', 'prs_merged', 'review_comments_given', 'commit_burst_count',
+];
+
+/** Rate/score fields: any finite real, but never NaN/Infinity. */
+const RATE_FIELDS: readonly (keyof DailyGitMetrics)[] = [
+    'code_churn_rate', 'ai_signature_score', 'avg_commit_size',
+];
+
 function assertValidInput(row: RawAuthorDailyInput, observedAt: string): void {
     if (!RAW_AUTHOR_PROVIDERS.includes(row.provider)) {
         throw new RawAuthorDailyError('invalid_provider', `Unknown git provider: ${String(row.provider)}`);
@@ -237,11 +267,42 @@ function assertValidInput(row: RawAuthorDailyInput, observedAt: string): void {
     if (!row.raw_author_key || !row.raw_author_key.trim()) {
         throw new RawAuthorDailyError('invalid_key', 'raw_author_key must be a non-blank string');
     }
+    // The key must carry the SAME provider as the column. readRawDailyForKeys relies on
+    // a key embedding its own provider to justify querying without a provider predicate;
+    // that invariant has to be ENFORCED at the write boundary, not merely assumed, or a
+    // mismatched pair writes a second row (the UNIQUE triple includes provider) that the
+    // key-read would then return as cross-provider contamination.
+    if (!row.raw_author_key.startsWith(`${row.provider}:`)) {
+        throw new RawAuthorDailyError(
+            'invalid_key',
+            `raw_author_key must be namespaced by its provider (${row.provider}:…), got: ${row.raw_author_key}`,
+        );
+    }
     if (!UTC_DAY_RE.test(row.date)) {
         throw new RawAuthorDailyError('invalid_date', `date must be a UTC YYYY-MM-DD day, got: ${row.date}`);
     }
     if (!UTC_ISO_INSTANT_RE.test(observedAt)) {
         throw new RawAuthorDailyError('invalid_instant', `observedAt must be a UTC ISO instant, got: ${observedAt}`);
+    }
+    // Range-validate the metrics here rather than letting the schema CHECKs surface a raw
+    // SQLITE_CONSTRAINT — and because NaN binds as NULL into a NOT NULL column, which
+    // would fail with an error that names the wrong problem.
+    for (const field of COUNTER_FIELDS) {
+        const value = row[field];
+        if (!Number.isInteger(value) || (value as number) < 0) {
+            throw new RawAuthorDailyError('invalid_metric', `${field} must be a non-negative integer, got: ${String(value)}`);
+        }
+    }
+    for (const field of RATE_FIELDS) {
+        if (!Number.isFinite(row[field])) {
+            throw new RawAuthorDailyError('invalid_metric', `${field} must be a finite number, got: ${String(row[field])}`);
+        }
+    }
+    if (row.avg_time_to_merge_hours !== null && !Number.isFinite(row.avg_time_to_merge_hours)) {
+        throw new RawAuthorDailyError(
+            'invalid_metric',
+            `avg_time_to_merge_hours must be a finite number or null, got: ${String(row.avg_time_to_merge_hours)}`,
+        );
     }
 }
 
@@ -282,7 +343,7 @@ export function upsertRawAuthorDaily(
                   ...stored,
                   ...mergeDailyAcrossRuns(stored, row),
                   author_login: bestKnown(stored.author_login, row.author_login),
-                  author_email: bestKnown(stored.author_email, row.author_email),
+                  author_email: bestKnown(stored.author_email, normalizeEmail(row.author_email)),
                   author_display_name: bestKnown(stored.author_display_name, row.author_display_name),
                   first_seen: stored.first_seen,
                   last_seen: laterInstant(stored.last_seen, observedAt),
@@ -290,7 +351,7 @@ export function upsertRawAuthorDaily(
             : {
                   ...row,
                   author_login: bestKnown(null, row.author_login),
-                  author_email: bestKnown(null, row.author_email),
+                  author_email: normalizeEmail(row.author_email),
                   author_display_name: bestKnown(null, row.author_display_name),
                   id: randomUUID(),
                   first_seen: observedAt,
@@ -343,8 +404,32 @@ function chunk<T>(items: T[], size: number): T[][] {
 /**
  * Deterministic order for every batched read: by day, then by the (provider, key)
  * identity. Total — `(provider, raw_author_key, date)` is UNIQUE, so no two rows tie.
+ *
+ * The SQL clause orders each CHUNK; {@link sortReadRows} re-applies the same order to
+ * the concatenated result, because a chunked read would otherwise return a sequence of
+ * independently-sorted runs (chunk 2's earliest day following chunk 1's latest) — right
+ * on a small org and silently wrong past READ_CHUNK_SIZE keys.
  */
 const READ_ORDER_BY = 'ORDER BY date ASC, provider ASC, raw_author_key ASC';
+
+/**
+ * The JS twin of {@link READ_ORDER_BY} — same total order, applied across chunks.
+ * Deliberately code-unit comparison (`<`/`>`) rather than `localeCompare`, to match
+ * SQLite's BINARY collation; a locale-aware sort would order the same rows differently
+ * from the SQL clause it is supposed to mirror.
+ */
+function compareText(a: string, b: string): number {
+    return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function sortReadRows(rows: RawAuthorDailyRecord[]): RawAuthorDailyRecord[] {
+    return rows.sort(
+        (a, b) =>
+            compareText(a.date, b.date) ||
+            compareText(a.provider, b.provider) ||
+            compareText(a.raw_author_key, b.raw_author_key),
+    );
+}
 
 /**
  * Every retained row for the given raw-author keys. One statement per chunk of keys —
@@ -367,7 +452,7 @@ export function readRawDailyForKeys(db: Database.Database, keys: string[]): RawA
                 .all(...batch) as RawAuthorDailyRecord[]),
         );
     }
-    return rows;
+    return sortReadRows(rows);
 }
 
 /**
@@ -390,7 +475,7 @@ export function readRawDailyForDates(db: Database.Database, dates: string[]): Ra
                 .all(...batch) as RawAuthorDailyRecord[]),
         );
     }
-    return rows;
+    return sortReadRows(rows);
 }
 
 /**
