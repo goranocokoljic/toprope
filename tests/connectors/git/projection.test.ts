@@ -300,6 +300,56 @@ describe('replayDeveloper — attributing retained history (#253)', () => {
         expect(readSnapshots(db)).toHaveLength(1);
     });
 
+    it('RE-MAP from the LOSING side: replaying A — who now resolves NO keys — still retracts A', () => {
+        // The asymmetric half. A key-derived date scope sees nothing for A here (A has no
+        // keys left), so without the "days I am currently attributed on" half of the scope
+        // this replay is a no-op and A keeps a permanent duplicate of B's history.
+        const alice = addDeveloper(db, 'Alice', 'eng', 'alice@example.com', 'alice');
+        const bob = addDeveloper(db, 'Bob', 'eng', 'bob@example.com', 'bob');
+        upsertRawAuthorDaily(db, rawRow({raw_author_key: 'github:login:alice', author_login: 'alice', commits: 6}));
+        replayDeveloper(db, alice.id);
+        expect(readCell(db, alice.id, '2024-01-15')!.commits).toBe(6);
+
+        db.prepare(`UPDATE developers SET external_ids = '{}', email = NULL WHERE id = ?`).run(alice.id);
+        db.prepare(`UPDATE developers SET external_ids = '{"github":"alice"}' WHERE id = ?`).run(bob.id);
+
+        const result = replayDeveloper(db, alice.id);
+
+        expect(result.cellsRetracted).toBe(1);
+        expect(readCell(db, alice.id, '2024-01-15')).toBeUndefined();
+        // …and the same rebuild attributed the day to its new owner.
+        expect(readCell(db, bob.id, '2024-01-15')!.commits).toBe(6);
+        expect(readSnapshots(db)).toHaveLength(1);
+    });
+
+    it('never retracts a LEGACY cell when replaying a developer who lost every key', () => {
+        const alice = addDeveloper(db, 'Alice', 'eng', 'alice@example.com', 'alice');
+        db.prepare(
+            `INSERT INTO git_snapshots (id, developer_id, date, commits, data_source)
+             VALUES ('legacy-1', ?, '2024-01-15', 42, 'github')`,
+        ).run(alice.id);
+
+        expect(replayDeveloper(db, alice.id)).toEqual({cellsWritten: 0, cellsRetracted: 0, datesCovered: 0});
+        expect(readCell(db, alice.id, '2024-01-15')!.commits).toBe(42);
+    });
+
+    it('an external_ids entry literally named "email" cannot hijack another developer\'s commits', () => {
+        const victim = addDeveloper(db, 'Victim', 'eng', 'victim@corp.com');
+        const attacker = addDeveloper(db, 'Attacker', 'eng', 'attacker@corp.com');
+        // The reserved `email:` namespace, reached through the free-form external_ids blob.
+        db.prepare(`UPDATE developers SET external_ids = '{"email":"victim@corp.com"}' WHERE id = ?`)
+            .run(attacker.id);
+        upsertRawAuthorDaily(db, rawRow({
+            raw_author_key: 'github:email:victim@corp.com',
+            author_email: 'victim@corp.com',
+        }));
+
+        projectSnapshots(db, {dates: ['2024-01-15']});
+
+        expect(readCell(db, victim.id, '2024-01-15')!.commits).toBe(1);
+        expect(readCell(db, attacker.id, '2024-01-15')).toBeUndefined();
+    });
+
     it('a re-map that only PARTLY moves an author leaves the remainder on A', () => {
         const alice = addDeveloper(db, 'Alice', 'eng', 'alice@example.com', 'alice', {bitbucket: 'alice-bb'});
         const bob = addDeveloper(db, 'Bob', 'eng', 'bob@example.com', 'bob');

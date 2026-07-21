@@ -3620,6 +3620,12 @@ describe('GitSync — raw authorship retention + projection (#253)', () => {
         return (db.prepare('SELECT COUNT(*) AS n FROM raw_author_daily').get() as {n: number}).n;
     }
 
+    function readCell(developerId: string, date: string): {commits: number} | undefined {
+        return db
+            .prepare('SELECT commits FROM git_snapshots WHERE developer_id = ? AND date = ?')
+            .get(developerId, date) as {commits: number} | undefined;
+    }
+
     async function syncCommits(commits: GitCommit[], prs: GitPR[] = []): Promise<SyncResult> {
         const createGitProvider = await getCreateGitProvider();
         createGitProvider.mockReturnValueOnce(
@@ -3794,6 +3800,30 @@ describe('GitSync — raw authorship retention + projection (#253)', () => {
         expect(
             db.prepare('SELECT value FROM sync_state WHERE key = ?').get(syncStateKey('github', 'test-org')),
         ).toBeUndefined();
+    });
+
+    it('attributes a developer created WHILE the run was fetching — the cursor never advances past unprojected work', async () => {
+        const createGitProvider = await getCreateGitProvider();
+        let lateId = '';
+        createGitProvider.mockReturnValueOnce(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                // The fetch is where a real run spends minutes. An admin promoting a
+                // candidate right here must not be missed by a lookup map that was read
+                // before the fetch started.
+                getCommits: vi.fn().mockImplementation(async () => {
+                    lateId = seedDev(db, 'grace');
+                    return [makeProviderCommit('grace', '2024-01-15T10:00:00Z', 'g1')];
+                }),
+                getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+            }),
+        );
+
+        const result = await new GitSync({enabled: false}).syncProviders(db, [CONFIG]);
+
+        expect(readCell(lateId, '2024-01-15')?.commits).toBe(1);
+        // …and she is not simultaneously reported as an unmatched author.
+        expect(result.errors.some((e) => e.startsWith(UNMATCHED_AUTHORS_PREFIX))).toBe(false);
     });
 
     it('a scoped single-provider run projects the FULL multi-provider cell, not just its own share', async () => {

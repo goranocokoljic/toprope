@@ -141,6 +141,15 @@ export function buildDevLookupMap(db: Database.Database): Map<string, string> {
                     }
                     continue;
                 }
+                // `email:` is a RESERVED namespace in this map, filled only from the
+                // columns above. A raw `{"email": "victim@corp.com"}` entry would
+                // otherwise register as `email:victim@corp.com` and silently capture
+                // another person's commits — attributing one developer's activity to
+                // another, which this product treats as a privacy boundary. No writer
+                // produces such a key today (registry/developers.ts allowlists the
+                // provider keys), but the projection is the trust boundary that consumes
+                // it, so the guard belongs here rather than in every writer.
+                if (key === 'email') continue;
                 map.set(`${key}:${value}`, row.id);
             }
         } catch {
@@ -312,14 +321,23 @@ const WRITE_SQL = `INSERT INTO git_snapshots
  * can call this inside the run's own write transaction and still get one atomic unit
  * with its cursor advance.
  *
- * KNOWN, BOUNDED UPGRADE CAVEAT — a cell written before #253 (`is_projected = 0`) holds
- * an accumulated total that NO raw row can account for, because raw authorship was not
- * retained then. Such a cell is left completely alone until the projection produces a
- * value for it, at which point it is OVERWRITTEN by the (smaller, raw-derived) value
- * rather than merged with. The forward cursor never re-fetches a covered day, so the
- * only cells that can hit this are the days straddling the upgrade — the partially
- * synced current day, or a day an explicit backfill re-covers. Retraction is stricter
- * still and never touches a legacy row at all (see `is_projected`, migration 041).
+ * KNOWN UPGRADE CAVEAT, stated at its true blast radius — a cell written before #253
+ * (`is_projected = 0`) holds an accumulated total that NO raw row can account for,
+ * because raw authorship was not retained then. Such a cell is left completely alone
+ * until the projection produces a value for it, at which point it is OVERWRITTEN by the
+ * raw-derived value rather than merged with. The affected set is not "a sliver of today":
+ * it is the CURSOR DAY. A provider whose cursor sits at `D 23:00` re-covers only
+ * `[D 23:00, …]` on its first post-upgrade run, so day `D` projects from that final hour
+ * alone and replaces a legacy cell that held the whole of `D` — up to ~23 hours of that
+ * day's activity, per developer, gone for good (the forward cursor never re-fetches `D`).
+ * Bounded to ONE calendar day per provider and never recurring, but silent and
+ * unrecoverable, so it is called out here rather than discovered.
+ *
+ * Merging into a legacy cell instead was considered and rejected: it is not idempotent
+ * (the second projection of the same cell would have to either re-add the legacy residue
+ * or drop it), and idempotent re-projection is the property the whole replay design rests
+ * on. Retraction, unlike overwrite, is strict and never touches a legacy row at all (see
+ * `is_projected`, migration 041).
  */
 export function projectSnapshots(db: Database.Database, target: ProjectionTarget): ProjectionResult {
     const empty: ProjectionResult = {cellsWritten: 0, cellsRetracted: 0, datesCovered: 0};
@@ -384,11 +402,19 @@ export function projectSnapshots(db: Database.Database, target: ProjectionTarget
  * Re-attribute a developer's RETAINED history — the entry point the onboarding surfaces
  * (DO1.5/DO1.6) call right after a developer is created or their identities are edited.
  *
- * Finds every raw author key that now resolves to `developerId`, then rebuilds the
- * WHOLE of each UTC day those keys touch. Whole days, not just this developer's cells,
- * because an identity change is two-sided: re-mapping an author from developer A to
- * developer B must add the history to B *and* retract it from A, and only a whole-day
- * rebuild sees A at all. Replaying either side of a re-map therefore fixes both.
+ * Rebuilds the WHOLE of every UTC day in the union of:
+ *   - the days this developer's CURRENTLY-resolving raw keys touch (what they GAIN), and
+ *   - the days they already hold a projection-owned cell on (what they may LOSE).
+ *
+ * Both halves are required, and whole days rather than this developer's cells alone,
+ * because an identity change is two-sided. Re-mapping an author from developer A to
+ * developer B must add the history to B *and* retract it from A:
+ *   - replaying B is covered by the first half (B's new key brings the days with it);
+ *   - replaying A is covered ONLY by the second half — A no longer resolves that key, so
+ *     its days are invisible to a key-derived scope, and A's stale cells would survive
+ *     as a permanent double-count. A may even end up with no keys at all, which is
+ *     precisely the case a "no keys, nothing to do" early return would get wrong.
+ * With both halves, replaying EITHER side of a re-map fixes both sides.
  *
  * Idempotent: the projection is a pure function of (raw store, identity map), so
  * replaying twice writes the same bytes. It re-fetches nothing.
@@ -410,8 +436,16 @@ export function replayDeveloper(db: Database.Database, developerId: string): Pro
     const keys = distinctRawAuthors(db)
         .filter((author) => resolveDeveloperId(lookup, author.provider, author.login, author.email) === developerId)
         .map((author) => author.raw_author_key);
-    if (keys.length === 0) return {cellsWritten: 0, cellsRetracted: 0, datesCovered: 0};
 
-    const dates = [...new Set(readRawDailyForKeys(db, keys).map((row) => row.date))];
-    return projectSnapshots(db, {dates});
+    const dates = new Set(keys.length > 0 ? readRawDailyForKeys(db, keys).map((row) => row.date) : []);
+    // The retract side: days this developer is currently attributed on. Restricted to
+    // projection-owned cells — a legacy row is not ours to rebuild or retract, and
+    // pulling its day in would only widen the rebuild for no gain.
+    const attributed = db
+        .prepare('SELECT DISTINCT date FROM git_snapshots WHERE developer_id = ? AND is_projected = 1')
+        .all(developerId) as {date: string}[];
+    for (const row of attributed) dates.add(row.date);
+
+    if (dates.size === 0) return {cellsWritten: 0, cellsRetracted: 0, datesCovered: 0};
+    return projectSnapshots(db, {dates: [...dates]});
 }

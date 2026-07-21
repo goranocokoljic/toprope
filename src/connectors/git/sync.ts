@@ -1696,22 +1696,13 @@ export class GitSync implements ConnectorInterface {
                     });
                 }
 
-                // The advisory is now sourced from the RETAINED rows rather than from raw
-                // commits: it lists exactly the authors whose day was kept but could not be
-                // attributed, which is precisely the set the onboarding review queue
-                // (DO1.4/DO1.5) will offer to promote.
+                // Progress counter only — a live estimate for the UI, resolved against the
+                // pre-fetch map. The AUTHORITATIVE resolution (which cells to project, and
+                // who goes in the unmatched advisory) happens inside the write transaction
+                // below against a freshly-read map, because minutes of network fetch sit
+                // between the two and a developer created in that gap must not be missed.
                 const developerId = resolveDeveloperId(devLookup, providerType, login, emailForLogin);
-                if (developerId) {
-                    matchedDevelopers.add(developerId);
-                    for (const [, metrics] of byDate) {
-                        touchedCells.set(`${developerId}:${metrics.date}`, {
-                            developer_id: developerId,
-                            date: metrics.date,
-                        });
-                    }
-                } else {
-                    allUnmatched.add(`${providerType}:${login}`);
-                }
+                if (developerId) matchedDevelopers.add(developerId);
             }
         }
 
@@ -1730,8 +1721,28 @@ export class GitSync implements ConnectorInterface {
         // the run counters after the tx succeeds, so a rolled-back run never reports
         // phantom writes.
         const insertMany = db.transaction(() => {
+            // Read the identity map INSIDE the transaction: `devLookup` was built before
+            // the network fetch, so a developer added while this run was fetching would be
+            // absent from it — their raw rows would be retained but their cells never
+            // projected, and the cursor would advance past the window that produced them.
+            const writeLookup = buildDevLookupMap(db);
             for (const row of rawWrites) {
                 upsertRawAuthorDaily(db, row, now);
+
+                const developerId = resolveDeveloperId(
+                    writeLookup,
+                    row.provider,
+                    row.author_login,
+                    row.author_email,
+                );
+                if (developerId) {
+                    touchedCells.set(`${developerId}:${row.date}`, {developer_id: developerId, date: row.date});
+                } else {
+                    // The advisory is sourced from the RETAINED rows: exactly the authors
+                    // whose day was kept but could not be attributed — precisely the set the
+                    // onboarding review queue (DO1.4/DO1.5) will offer to promote.
+                    allUnmatched.add(`${row.provider}:${row.author_login ?? row.author_email ?? 'unknown'}`);
+                }
             }
             // Rebuild EXACTLY the cells this run touched. Each is recomputed from every
             // retained raw row on that day — including identities this run never fetched —
