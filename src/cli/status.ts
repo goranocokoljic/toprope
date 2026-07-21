@@ -4,6 +4,7 @@ import {resolveAllGitProviders} from '../connectors/git/providers/resolve';
 import {loadServerKey} from '../connectors/git/providers/secret';
 import {
     GIT_CATCHUP_WINDOW_MAX_DAYS,
+    latestProviderCursor,
     loadLaggingProviders,
     loadStalledProviders,
     type LaggingProvider,
@@ -31,11 +32,11 @@ interface StatusData {
      * Reported per PROVIDER, on their own lines, because the `Git` connector line is
      * per CONNECTOR and cannot express either state: a provider is what stalls, and
      * one line cannot say "reachable, advancing, and 170 days behind" for one of three
-     * providers. (The connector line is also, today, unable to say anything at all —
-     * it reads the bare `git_last_sync` key, which no code in `src/` writes; the
-     * pipeline writes per-provider `git_last_sync:<type>:<container>` keys. So it
-     * renders "never" for everyone regardless of sync state. That is a pre-existing
-     * bug, not something these lines introduce or fix — see #246.)
+     * providers. (The connector line's own "last sync" is the newest per-provider
+     * cursor `git_last_sync:<type>:<container>`, resolved via
+     * {@link latestProviderCursor} — #246. It is a single connector-wide freshness
+     * instant and still cannot express a per-provider stall or catch-up, which is why
+     * those remain separate lines.)
      */
     gitStalls: StalledProvider[];
     gitLagging: LaggingProvider[];
@@ -55,13 +56,16 @@ function collectGitHealth(
     db: Database.Database,
     config: TopropeConfig,
     now: string,
-): {stalls: StalledProvider[]; lagging: LaggingProvider[]} {
+): {stalls: StalledProvider[]; lagging: LaggingProvider[]; lastSync: string | null} {
     const {git} = config.connectors;
-    if (!git.enabled) return {stalls: [], lagging: []};
+    if (!git.enabled) return {stalls: [], lagging: [], lastSync: null};
+    // Resolve providers ONCE for all three git-health reads — the newest cursor,
+    // the stalls, and the lagging set all derive from the same resolved set.
     const providerConfigs = resolveAllGitProviders(db, loadServerKey(), git);
     return {
         stalls: loadStalledProviders(db, providerConfigs),
         lagging: loadLaggingProviders(db, providerConfigs, now),
+        lastSync: latestProviderCursor(db, providerConfigs),
     };
 }
 
@@ -143,7 +147,7 @@ function collectStatus(db: Database.Database, config: TopropeConfig): StatusData
         {
             name: 'Git',
             enabled: config.connectors.git.enabled,
-            lastSync: getLastSync(db, 'git_last_sync'),
+            lastSync: gitHealth.lastSync,
             devsTracked: 0,
             reposTracked: gitRepoCount,
         },
