@@ -1,7 +1,9 @@
 import type {
     AdminDataSources,
     AdminDeveloper,
+    AdminDeveloperCreated,
     AdminDeveloperInput,
+    AuthorCandidate,
     AdminPasswordReset,
     AdminSubscription,
     AdminTeam,
@@ -486,8 +488,23 @@ export const api = {
         return body.data;
     },
 
-    async createAdminDeveloper(input: AdminDeveloperInput): Promise<AdminDeveloper> {
-        const body = await postJson<ApiEnvelope<AdminDeveloper>>('/api/admin/developers', input);
+    /**
+     * Create a developer. The server also replays their retained git authorship in
+     * the same transaction, so `dates_attributed` reports how much history the
+     * create actually recovered — the confirmation the review queue shows.
+     */
+    async createAdminDeveloper(input: AdminDeveloperInput): Promise<AdminDeveloperCreated> {
+        const body = await postJson<ApiEnvelope<AdminDeveloper> & {replay?: {dates_attributed?: number}}>(
+            '/api/admin/developers',
+            input,
+        );
+        return {developer: body.data, dates_attributed: body.replay?.dates_attributed ?? 0};
+    },
+
+    async getAdminDeveloperCandidates(): Promise<AuthorCandidate[]> {
+        const body = await request<ApiEnvelope<AuthorCandidate[]>>(
+            '/api/admin/developers/candidates',
+        );
         return body.data;
     },
 

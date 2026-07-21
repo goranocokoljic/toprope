@@ -74,6 +74,10 @@ export const queryKeys = {
     adminUsers: ['admin', 'users'] as const,
     adminTeams: ['admin', 'teams'] as const,
     adminDevelopers: ['admin', 'developers'] as const,
+    // The unmatched-author review queue (DO1.5 / #255). Its own key rather than a
+    // slice of adminDevelopers: the list is derived from (raw store, identity map),
+    // so it changes on every developer create — creating invalidates BOTH.
+    adminDeveloperCandidates: ['admin', 'developers', 'candidates'] as const,
     adminSubscriptions: ['admin', 'subscriptions'] as const,
     adminDataSources: ['admin', 'data-sources'] as const,
     // Git providers (GC1 / #200): the admin-managed connection list. A single

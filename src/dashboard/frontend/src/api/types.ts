@@ -889,6 +889,40 @@ export interface AdminDeveloperInput {
     git_emails?: string[];
 }
 
+/**
+ * What POST /api/admin/developers returns (DO1.5). Creating a developer also
+ * replays the git authorship already retained for their identities, so the
+ * response carries both the new row and how much history that attributed.
+ */
+export interface AdminDeveloperCreated {
+    developer: AdminDeveloper;
+    /** Snapshot dates the create attributed. 0 when nothing retained matched. */
+    dates_attributed: number;
+}
+
+/**
+ * A retained git author that resolves to no developer — one row of the Admin
+ * review queue (DO1.5 / #255).
+ *
+ * `provider` is typed as the open `string` the wire actually carries rather than
+ * a closed union: it comes from `raw_author_daily.provider`, an unconstrained
+ * TEXT column, and asserting a union the data does not enforce is how a
+ * self-hosted provider name becomes an impossible-state render.
+ */
+export interface AuthorCandidate {
+    provider: string;
+    raw_author_key: string;
+    login: string | null;
+    email: string | null;
+    display_name: string | null;
+    commit_count: number;
+    first_seen: string;
+    last_seen: string;
+    likely_bot: boolean;
+    /** Present only when `likely_bot` — the signal that fired. */
+    bot_reason?: string;
+}
+
 /** A subscription as returned by the admin subscriptions API. */
 export interface AdminSubscription {
     id: string;

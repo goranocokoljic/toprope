@@ -1,9 +1,6 @@
 import type {FastifyInstance} from 'fastify';
 import type Database from 'better-sqlite3';
 import {
-    addDeveloper,
-    findByEmail,
-    findByExternalId,
     getDeveloperById,
     listDevelopers,
     setDeveloperIdentities,
@@ -11,6 +8,12 @@ import {
     type IdentityUpdates,
 } from '../../../registry/developers';
 import {getTeam} from '../../../registry/teams';
+import {ATTRIBUTION_PROVIDERS, findIdentityConflict} from '../../../registry/identity-guard';
+import {
+    MAX_DEVELOPER_NAME_LENGTH,
+    createDeveloperWithReplay,
+} from '../../../connectors/git/onboarding';
+import {listAuthorCandidates} from '../../../connectors/git/author-candidates';
 import {
     FIELD_INVALID,
     asObject,
@@ -22,66 +25,9 @@ import {
     optionalStringField,
 } from './helpers';
 
-// Git-attribution providers must be unique across developers, or commit
-// attribution becomes ambiguous (same rule the Phase 1 registry enforces).
-const ATTRIBUTION_PROVIDERS = ['github', 'bitbucket', 'gitlab'] as const;
 // Tool identities (Copilot/Claude/Windsurf/Cursor) are not attribution keys;
 // they are not subject to the uniqueness check.
 const ALL_PROVIDERS = [...ATTRIBUTION_PROVIDERS, 'copilot', 'claude', 'windsurf', 'cursor'] as const;
-
-const MAX_NAME_LENGTH = 100;
-
-/**
- * A set of git-attribution identities one developer is claiming. Emails carry
- * their own label: the primary `email` and each `git_emails` entry are both
- * checked with `findByEmail` (it matches either column) but read differently in
- * the conflict message.
- */
-interface IdentityClaim {
-    github?: string;
-    bitbucket?: string;
-    gitlab?: string;
-    emails?: {value: string; label: string}[];
-}
-
-/**
- * The conflict message for the first claimed git-attribution identity or git
- * email already owned by a DIFFERENT developer, or null when the whole claim is
- * free. `excludeId` is the developer making the claim — null on create, where
- * the row does not exist yet.
- *
- * MUST be called inside the same `db.transaction` as the write it guards. The
- * uniqueness model is best-effort (the ids live in a JSON blob with no DB unique
- * index), so the transaction is what closes the read-then-write race that would
- * otherwise let two concurrent writes both pass the check and map one git
- * identity to two developers — which makes commit attribution ambiguous.
- *
- * Both the create route and the identities PATCH go through here so the rule and
- * its message shape have exactly one definition.
- */
-function findIdentityConflict(
-    db: Database.Database,
-    claim: IdentityClaim,
-    excludeId: string | null,
-): string | null {
-    for (const provider of ATTRIBUTION_PROVIDERS) {
-        const value = claim[provider]?.trim();
-        if (!value) continue;
-        const owner = findByExternalId(db, provider, value);
-        if (owner && owner.id !== excludeId) {
-            return `${provider} identity '${value}' is already mapped to ${owner.name}`;
-        }
-    }
-    for (const {value, label} of claim.emails ?? []) {
-        const trimmed = value.trim();
-        if (!trimmed) continue;
-        const owner = findByEmail(db, trimmed);
-        if (owner && owner.id !== excludeId) {
-            return `${label} '${trimmed}' is already mapped to ${owner.name}`;
-        }
-    }
-    return null;
-}
 
 /**
  * Resolve a REQUIRED `team` field: a non-blank string naming a team that exists
@@ -166,8 +112,8 @@ export function registerAdminDeveloperRoutes(app: FastifyInstance, db: Database.
 
         const name = typeof body.name === 'string' ? body.name.trim() : '';
         if (!name) return badRequest(reply, 'name is required');
-        if (name.length > MAX_NAME_LENGTH) {
-            return badRequest(reply, `name must be at most ${MAX_NAME_LENGTH} characters`);
+        if (name.length > MAX_DEVELOPER_NAME_LENGTH) {
+            return badRequest(reply, `name must be at most ${MAX_DEVELOPER_NAME_LENGTH} characters`);
         }
 
         const team = requiredTeamField(db, body.team, reply);
@@ -184,33 +130,55 @@ export function registerAdminDeveloperRoutes(app: FastifyInstance, db: Database.
         const gitEmails = gitEmailsField(body.git_emails, reply);
         if (gitEmails === FIELD_INVALID) return;
 
-        // The uniqueness check and the INSERT run in ONE transaction — see
-        // findIdentityConflict for why the read-then-write must not be split.
-        let conflictMessage: string | null = null;
-        const created = db.transaction((): ReturnType<typeof addDeveloper> | null => {
-            conflictMessage = findIdentityConflict(
-                db,
-                {
-                    github: github ?? undefined,
-                    bitbucket: bitbucket ?? undefined,
-                    gitlab: gitlab ?? undefined,
-                    emails: [
-                        ...(email ? [{value: email, label: 'email'}] : []),
-                        ...(gitEmails ?? []).map((value) => ({value, label: 'git email'})),
-                    ],
-                },
-                null,
-            );
-            if (conflictMessage) return null;
-            return addDeveloper(db, name, team, email ?? undefined, github ?? undefined, {
-                bitbucket: bitbucket ?? undefined,
-                gitlab: gitlab ?? undefined,
-                gitEmails: gitEmails ?? undefined,
-            });
-        })();
+        // The uniqueness check, the INSERT and the history replay run in ONE
+        // transaction inside createDeveloperWithReplay — see that module for why
+        // the read-then-write must not be split, and why the replay belongs in
+        // the same transaction rather than as a follow-up call.
+        //
+        // The replay (DO1.5 / #255) is what makes a newly-added developer inherit
+        // the authorship sync already retained for them: without it the row is
+        // created and their commits stay attributed to nobody until the next sync.
+        const outcome = createDeveloperWithReplay(db, {
+            name,
+            team,
+            email: email ?? undefined,
+            github: github ?? undefined,
+            bitbucket: bitbucket ?? undefined,
+            gitlab: gitlab ?? undefined,
+            gitEmails: gitEmails ?? undefined,
+        });
 
-        if (conflictMessage) return conflict(reply, conflictMessage);
-        return reply.status(201).send({data: created});
+        if (!outcome.ok) {
+            return outcome.reason === 'conflict'
+                ? conflict(reply, outcome.message)
+                : badRequest(reply, outcome.message);
+        }
+
+        // `replay` rides alongside `data` rather than inside it: `data` is the
+        // developer row (same shape as the GET list), while the counts describe
+        // what the create DID, and the UI reads them for its confirmation.
+        return reply.status(201).send({
+            data: outcome.developer,
+            replay: {
+                dates_attributed: outcome.replay.datesCovered,
+                cells_written: outcome.replay.cellsWritten,
+            },
+        });
+    });
+
+    /**
+     * The review queue (DO1.5 / #255): retained git authors that resolve to no
+     * developer under the current identity map, busiest first.
+     *
+     * Derived on every call from (raw store, identity map) — never a stored list —
+     * so promoting a candidate removes it here with no invalidation step. Static
+     * path, declared alongside `/:id` routes: Fastify's radix router matches a
+     * static segment ahead of a parametric one, so this is not shadowed by
+     * `PATCH /:id` (different method anyway) and no ordering trick is needed.
+     */
+    app.get('/api/admin/developers/candidates', async (request, reply) => {
+        if (!isAdmin(request)) return forbidden(reply);
+        return {data: listAuthorCandidates(db)};
     });
 
     app.patch<{Params: {id: string}; Body: unknown}>(

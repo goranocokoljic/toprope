@@ -10,7 +10,9 @@ import {queryKeys} from '../api/queryKeys';
 import type {
     AdminDataSources,
     AdminDeveloper,
+    AdminDeveloperCreated,
     AdminDeveloperInput,
+    AuthorCandidate,
     AdminGitProvider,
     AdminPasswordReset,
     AdminSubscription,
@@ -100,18 +102,34 @@ export function useAdminDevelopers(): UseQueryResult<AdminDeveloper[], Error> {
 }
 
 /**
+ * The unmatched-author review queue (DO1.5 / #255) — retained git authors that map
+ * to no developer, busiest first.
+ */
+export function useAdminDeveloperCandidates(): UseQueryResult<AuthorCandidate[], Error> {
+    return useQuery({
+        queryKey: queryKeys.adminDeveloperCandidates,
+        queryFn: api.getAdminDeveloperCandidates,
+    });
+}
+
+/**
  * Create a developer (DO1.1 / #251). Invalidates the developers list so the new
- * row appears without a manual refetch.
+ * row appears without a manual refetch, AND the candidate queue: the create
+ * replays the new developer's retained authorship server-side, so whichever
+ * candidate they matched is no longer unmatched (DO1.5 / #255).
  */
 export function useCreateAdminDeveloper(): UseMutationResult<
-    AdminDeveloper,
+    AdminDeveloperCreated,
     Error,
     AdminDeveloperInput
 > {
     const qc = useQueryClient();
     return useMutation({
         mutationFn: api.createAdminDeveloper,
-        onSuccess: () => void qc.invalidateQueries({queryKey: queryKeys.adminDevelopers}),
+        onSuccess: () => {
+            void qc.invalidateQueries({queryKey: queryKeys.adminDevelopers});
+            void qc.invalidateQueries({queryKey: queryKeys.adminDeveloperCandidates});
+        },
     });
 }
 
