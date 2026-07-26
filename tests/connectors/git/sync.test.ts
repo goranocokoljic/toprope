@@ -23,6 +23,8 @@ import {
     GIT_STALL_ALERT_RUNS,
     GIT_CATCHUP_WINDOW_MAX_DAYS,
     UNMATCHED_AUTHORS_PREFIX,
+    PROVIDER_DELETED_MID_RUN_PREFIX,
+    isAdvisoryError,
     type GitSyncProgress,
     type GitSyncStage,
 } from '../../../src/connectors/git/sync';
@@ -397,6 +399,233 @@ describe('GitSync', () => {
             {container: 'org-a', pr_id: 'pr-a'},
             {container: 'org-b', pr_id: 'pr-b'},
         ]);
+    });
+
+    // #264 review SEC-9: `resolveGitProviderConfigs` deliberately keeps a malformed entry so
+    // `doctor` can name it, so a provider with no org/workspace/group reaches the pipeline with
+    // `container: undefined`. Before this guard it threw at the raw-store write boundary INSIDE
+    // the run's write transaction, taking every other provider's data down with it.
+    describe('provider with no container (#264)', () => {
+        it('skips it with a surfaced error and still writes its healthy siblings', async () => {
+            seedDev(db, 'alice');
+            const provider = (): ReturnType<typeof makeMockProvider> =>
+                makeMockProvider({
+                    name: 'github',
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits: vi.fn().mockResolvedValue([makeProviderCommit('alice')]),
+                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+                });
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(provider());
+
+            const result = await new GitSync({enabled: true}).syncProviders(db, [
+                // No `org` — exactly what a YAML entry missing the field resolves to.
+                {type: 'github', auth: {type: 'token', api_token: 't'}} as unknown as GitProviderConfig,
+                {type: 'github', org: 'good-org', auth: {type: 'token', api_token: 't'}},
+            ]);
+
+            // The healthy sibling's data landed…
+            expect(db.prepare('SELECT container FROM raw_author_daily').all()).toEqual([
+                {container: 'good-org'},
+            ]);
+            // …and no `github:undefined` cursor was minted.
+            expect(
+                (
+                    db
+                        .prepare("SELECT COUNT(*) AS n FROM sync_state WHERE key LIKE '%undefined%'")
+                        .get() as {n: number}
+                ).n,
+            ).toBe(0);
+            // Reported as a genuine error (the operator must fix the config), not an advisory.
+            const line = result.errors.find((e) => e.includes('no org/workspace/group'));
+            expect(line).toBeDefined();
+            expect(isAdvisoryError(line as string)).toBe(false);
+        });
+    });
+
+    // #264 review SO-1/SEC-1: a provider deleted DURING a run must not have its data and
+    // cursor re-created by the settling run. The admin DELETE route only guards against its
+    // own in-flight sync-now runs; the scheduler and CLI resolve DB providers too and are
+    // invisible to that registry. The gate therefore lives at the write boundary.
+    describe('mid-run provider delete (#264)', () => {
+        // A DB-backed provider config: passed to syncProviders explicitly, and deliberately
+        // NOT present in the connector config — so its only possible owner is a
+        // `git_providers` row, exactly like a UI-connected provider.
+        const DB_PROVIDER: GitProviderConfig = {
+            type: 'github',
+            org: 'db-org',
+            auth: {type: 'token', api_token: 'token'},
+        };
+
+        function insertProviderRow(db: Database.Database, container: string): void {
+            db.prepare(
+                `INSERT INTO git_providers
+                 (id, type, container, url, include_subgroups, auth_method, auth_username,
+                  token_ciphertext, token_meta, token_last4, repos_include, repos_exclude,
+                  enabled, created_at, updated_at, created_by, last_sync_at, last_sync_status, last_sync_error)
+                 VALUES ('p1', 'github', ?, NULL, NULL, 'token', NULL, ?, ?, '1234', NULL, NULL,
+                         1, '2026-07-01T00:00:00.000Z', '2026-07-01T00:00:00.000Z', NULL, NULL, NULL, NULL)`,
+            ).run(
+                container,
+                Buffer.from('cipher'),
+                '{"algo":"AES-256-GCM","iv":"x","auth_tag":"y","key_id":"k1"}',
+            );
+        }
+
+        /**
+         * Run one provider, optionally deleting a `git_providers` row DURING the fetch —
+         * `getCommits` is called after the run has snapshotted which containers were owned, so
+         * this reproduces the real interleaving (admin deletes while the run is on the network)
+         * rather than the trivially-different "never owned" state.
+         */
+        async function runWithOneCommit(
+            db: Database.Database,
+            configs: GitProviderConfig[] = [DB_PROVIDER],
+            deleteRowIdDuringFetch?: string,
+        ): Promise<SyncResult> {
+            const createGitProvider = await getCreateGitProvider();
+            const provider = (): ReturnType<typeof makeMockProvider> =>
+                makeMockProvider({
+                    name: 'github',
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits: vi.fn().mockImplementation(() => {
+                        if (deleteRowIdDuringFetch !== undefined) {
+                            db.prepare('DELETE FROM git_providers WHERE id = ?').run(
+                                deleteRowIdDuringFetch,
+                            );
+                        }
+                        return Promise.resolve([makeProviderCommit('alice')]);
+                    }),
+                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+                });
+            configs.forEach(() => createGitProvider.mockReturnValueOnce(provider()));
+            // `enabled: true` with NO config providers — the container's only owner is the row.
+            return new GitSync({enabled: true}).syncProviders(db, configs);
+        }
+
+        it('discards the whole fetched window when the provider row is deleted mid-run', async () => {
+            seedDev(db, 'alice');
+            insertProviderRow(db, 'db-org');
+            // Owned when the run starts; the row disappears while it is fetching.
+            const result = await runWithOneCommit(db, [DB_PROVIDER], 'p1');
+
+            expect(
+                (db.prepare('SELECT COUNT(*) AS n FROM raw_author_daily').get() as {n: number}).n,
+            ).toBe(0);
+            expect(countSnapshots(db)).toBe(0);
+            expect(
+                (db.prepare('SELECT COUNT(*) AS n FROM pr_records').get() as {n: number}).n,
+            ).toBe(0);
+            // Critically: NO cursor. A resurrected cursor is what hands a re-added provider the
+            // #262 "window silently discarded" state.
+            expect(
+                (
+                    db.prepare("SELECT COUNT(*) AS n FROM sync_state WHERE key LIKE 'git_%'").get() as {
+                        n: number;
+                    }
+                ).n,
+            ).toBe(0);
+            // Loud, not silent — and an ADVISORY, since the operator's own delete caused it.
+            const line = result.errors.find((e) => e.startsWith(PROVIDER_DELETED_MID_RUN_PREFIX));
+            expect(line).toBeDefined();
+            expect(line).toContain('github:db-org');
+            expect(isAdvisoryError(line as string)).toBe(true);
+        });
+
+        // The narrower "never owned" shape is deliberately NOT rejected: an embedder (or a test)
+        // passing an ad-hoc provider config was never predicated on a row existing, so there is
+        // nothing that could have been retracted underneath it. The gate targets the
+        // owned→deleted TRANSITION, not the absence of a row.
+        it('leaves a container that was never owned alone', async () => {
+            seedDev(db, 'alice');
+            const result = await runWithOneCommit(db);
+            expect(
+                (db.prepare('SELECT COUNT(*) AS n FROM raw_author_daily').get() as {n: number}).n,
+            ).toBe(1);
+            expect(
+                result.errors.some((e) => e.startsWith(PROVIDER_DELETED_MID_RUN_PREFIX)),
+            ).toBe(false);
+        });
+
+        it('writes normally while the provider row still exists', async () => {
+            seedDev(db, 'alice');
+            insertProviderRow(db, 'db-org');
+
+            const result = await runWithOneCommit(db);
+
+            expect(
+                (db.prepare('SELECT COUNT(*) AS n FROM raw_author_daily').get() as {n: number}).n,
+            ).toBe(1);
+            expect(
+                db.prepare("SELECT value FROM sync_state WHERE key = 'git_last_sync:github:db-org'").get(),
+            ).toBeDefined();
+            expect(
+                result.errors.some((e) => e.startsWith(PROVIDER_DELETED_MID_RUN_PREFIX)),
+            ).toBe(false);
+        });
+
+        it('treats a CONFIG-file provider as an owner (it has no git_providers row by design)', async () => {
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    name: 'github',
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits: vi.fn().mockResolvedValue([makeProviderCommit('alice')]),
+                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+                }),
+            );
+            // Same provider, but now declared in the connector config.
+            const result = await new GitSync({enabled: true, providers: [DB_PROVIDER]}).syncProviders(
+                db,
+                [DB_PROVIDER],
+            );
+
+            expect(
+                (db.prepare('SELECT COUNT(*) AS n FROM raw_author_daily').get() as {n: number}).n,
+            ).toBe(1);
+            expect(
+                result.errors.some((e) => e.startsWith(PROVIDER_DELETED_MID_RUN_PREFIX)),
+            ).toBe(false);
+        });
+
+        it('writes a SURVIVING provider’s data even when a sibling in the same run was deleted', async () => {
+            seedDev(db, 'alice');
+            insertProviderRow(db, 'db-org'); // id 'p1' — deleted mid-run below
+            db.prepare(
+                `INSERT INTO git_providers
+                 (id, type, container, url, include_subgroups, auth_method, auth_username,
+                  token_ciphertext, token_meta, token_last4, repos_include, repos_exclude,
+                  enabled, created_at, updated_at, created_by, last_sync_at, last_sync_status, last_sync_error)
+                 VALUES ('p2', 'github', 'kept-org', NULL, NULL, 'token', NULL, ?, ?, '1234', NULL,
+                         NULL, 1, '2026-07-01T00:00:00.000Z', '2026-07-01T00:00:00.000Z',
+                         NULL, NULL, NULL, NULL)`,
+            ).run(
+                Buffer.from('cipher'),
+                '{"algo":"AES-256-GCM","iv":"x","auth_tag":"y","key_id":"k1"}',
+            );
+            const kept: GitProviderConfig = {
+                type: 'github',
+                org: 'kept-org',
+                auth: {type: 'token', api_token: 'token'},
+            };
+
+            const result = await runWithOneCommit(db, [DB_PROVIDER, kept], 'p1');
+
+            // Only the surviving container's rows and cursor land.
+            expect(
+                db.prepare('SELECT container FROM raw_author_daily').all(),
+            ).toEqual([{container: 'kept-org'}]);
+            const cursors = (
+                db.prepare("SELECT key FROM sync_state WHERE key LIKE 'git_last_sync:%'").all() as {
+                    key: string;
+                }[]
+            ).map((r) => r.key);
+            expect(cursors).toEqual(['git_last_sync:github:kept-org']);
+            expect(
+                result.errors.find((e) => e.startsWith(PROVIDER_DELETED_MID_RUN_PREFIX)),
+            ).toContain('github:db-org');
+        });
     });
 
     // #264: a PR id is unique only WITHIN a container, so two orgs that happen to use the

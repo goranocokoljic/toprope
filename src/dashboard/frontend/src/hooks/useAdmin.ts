@@ -278,18 +278,18 @@ export function useDeleteAdminGitProvider(): UseMutationResult<
 
 /**
  * What deleting a provider would remove (#264) — the numbers the destructive-action
- * confirmation states. `enabled` gates the fetch so it only runs while the confirmation is
- * actually open, and `staleTime: 0` keeps it from serving a count that predates the last
- * sync.
+ * confirmation states.
+ *
+ * No `enabled` parameter: the caller renders the confirmation only while it is open, so the
+ * mount is the gate. `staleTime: 0` does earn its place — the client default is 30s, and a
+ * destructive action must not be confirmed against a count that predates the last sync.
  */
 export function useGitProviderDeleteImpact(
     id: string,
-    enabled: boolean,
 ): UseQueryResult<GitProviderDeleteImpact, Error> {
     return useQuery({
         queryKey: queryKeys.adminGitProviderDeleteImpact(id),
         queryFn: () => api.getAdminGitProviderDeleteImpact(id),
-        enabled,
         staleTime: 0,
     });
 }

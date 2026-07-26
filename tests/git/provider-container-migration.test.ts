@@ -138,6 +138,27 @@ describe('migration 042 — the resulting schema (#264)', () => {
         ]);
     });
 
+    // The raw store refuses a blank container in TypeScript, at a runtime allowlist AND in the
+    // schema. `pr_records` has no typed write helper, so the schema CHECK is its only runtime
+    // backstop — fire it, or a future caller that widens the type writes an un-retractable row.
+    it('rejects a blank or NULL pr_records.container at the schema edge', () => {
+        db.prepare(
+            `INSERT INTO developers (id, name, email, team, external_ids, created_at)
+             VALUES ('dev-1', 'Alice', 'a@e.com', 'eng', '{}', '2026-01-01T00:00:00.000Z')`,
+        ).run();
+        const insert = (container: unknown): void => {
+            db.prepare(
+                `INSERT INTO pr_records
+                 (id, developer_id, provider, container, repo, pr_id, state, created_at, synced_at)
+                 VALUES (?, 'dev-1', 'github', ?, 'repo1', '1', 'open',
+                         '2026-07-01T00:00:00.000Z', '2026-07-01T00:00:00.000Z')`,
+            ).run(String(Math.random()), container);
+        };
+        expect(() => insert('')).toThrow();
+        expect(() => insert(null)).toThrow();
+        expect(() => insert('acme')).not.toThrow();
+    });
+
     it('keeps git_snapshots at the (developer_id, date) grain — no container column', () => {
         // It is a PROJECTION of the raw store, so a delete re-projects the affected days
         // rather than deleting by provenance. Adding a column here would fork that model

@@ -1,5 +1,8 @@
 import {describe, it, expect, afterEach} from 'vitest';
-import {resolveGitProviderConfigs} from '../../../../src/connectors/git/providers/config';
+import {
+    providerContainer,
+    resolveGitProviderConfigs,
+} from '../../../../src/connectors/git/providers/config';
 import type {GitConnectorConfig} from '../../../../src/config/types';
 
 describe('resolveGitProviderConfigs', () => {
@@ -33,6 +36,19 @@ describe('resolveGitProviderConfigs', () => {
         const resolved = resolveGitProviderConfigs(config);
         expect(resolved).toHaveLength(1);
         expect(resolved[0].type).toBe('github');
+    });
+
+    // Deliberately KEPT: `doctor` resolves through here in order to report a malformed entry
+    // by name ("bitbucket provider with no workspace"), so this resolver must not swallow it.
+    // The sync pipeline guards itself instead — see the container-less provider tests in
+    // tests/connectors/git/sync.test.ts.
+    it('keeps an entry with a type but no container, so doctor can diagnose it', () => {
+        const resolved = resolveGitProviderConfigs({
+            enabled: true,
+            providers: [{type: 'bitbucket', auth: {type: 'oauth', token: 't'}}],
+        });
+        expect(resolved).toHaveLength(1);
+        expect(providerContainer(resolved[0])).toBeUndefined();
     });
 
     it('falls back to the github shorthand when org + token are set', () => {

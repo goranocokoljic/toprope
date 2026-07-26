@@ -26,6 +26,7 @@ import {
     deleteProviderWithCascade,
     providerDeleteImpact,
 } from '../../../connectors/git/providers/delete-cascade';
+import {recomputeAggregatesForRange} from '../../../aggregation/retract';
 import {loadServerKey} from '../../../connectors/git/providers/secret';
 import {providerContainer, resolveGitProviderConfigs} from '../../../connectors/git/providers/config';
 import {createGitProvider} from '../../../connectors/git/providers/factory';
@@ -800,10 +801,24 @@ export function registerAdminGitProviderRoutes(
         // `(type, container)`. Developers, identities and team membership are untouched.
         try {
             const removed = deleteProviderWithCascade(db, id, configContainerKeys());
+            // The DERIVED rollups are a second projection and the aggregation scheduler only
+            // ever recomputes the just-closed period, so every older weekly/monthly row still
+            // holds the removed provider's totals — and `/api/aggregates` serves them. Run the
+            // recompute over exactly the retracted span, AFTER the cascade commits (both
+            // helpers deliberately own their own per-period transactions). Never throws: a
+            // failure is reported so the operator learns the trend charts are still stale.
+            const aggregates = recomputeAggregatesForRange(db, removed.earliest_date, removed.latest_date);
+            // The single most destructive admin action in the product — record it server-side.
+            // The HTTP response reaches one dismissible banner; six weeks later "why does Alice
+            // have no commits before March?" has to be answerable from the logs.
+            request.log.warn(
+                {providerId: id, removed, aggregates},
+                'git provider deleted with data cascade',
+            );
             // Report WHAT was removed, not a bare `{deleted: true}`: the UI states it back to
             // the admin, and a cascade that retracted nothing is a different outcome from one
             // that removed six months of history.
-            return {data: {id, deleted: true, removed}};
+            return {data: {id, deleted: true, removed, aggregates}};
         } catch (err) {
             if (err instanceof GitProviderStoreError) return replyStoreError(reply, err);
             throw err;

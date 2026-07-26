@@ -230,10 +230,17 @@ export function resolveRawAuthor(
  * (a github login plus a bitbucket login, or a login plus an email-keyed identity).
  *
  * Every field is additive/combinable because the two sides are genuinely DISJOINT:
- * `raw_author_daily` is keyed by (provider, raw_author_key, date), so no commit and no
- * PR can appear under two keys. This is NOT the rule for combining across RUNS under
- * one key — that is `mergeDailyAcrossRuns`, which lives one level down in the raw store
+ * `raw_author_daily` is keyed by (provider, container, raw_author_key, date) since #264, so
+ * no commit and no PR can appear under two rows — a commit belongs to exactly one container,
+ * and each container fetches its own PRs. This is NOT the rule for combining across RUNS
+ * under one key — that is `mergeDailyAcrossRuns`, which lives one level down in the raw store
  * and has already been applied by the time a row gets here.
+ *
+ * The one configuration that can violate the disjointness premise is two OVERLAPPING
+ * containers of the same family — a GitLab group and one of its own subgroups, both connected
+ * with `include_subgroups`, which list the same projects. Their rows are then two containers'
+ * views of ONE commit and are summed here. That overlap is unsupported rather than handled;
+ * connect the parent group or the subgroups, not both.
  *
  * The metric arithmetic itself is `mergeDailyDisjoint`, shared with the sync path's
  * same-run cross-provider-instance accumulation; this function only carries the

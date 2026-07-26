@@ -111,7 +111,6 @@ const DEFAULT_DELETE_IMPACT: GitProviderDeleteImpact = {
     pr_records: 9,
     authors: 4,
     developers_affected: 3,
-    cursor_keys: 3,
     cascade_skipped: false,
 };
 
@@ -123,6 +122,8 @@ const DELETE_REMOVED: GitProviderDeleteResult['removed'] = {
     raw_author_rows: 42,
     pr_records: 9,
     days: 12,
+    earliest_date: '2026-01-05',
+    latest_date: '2026-07-01',
     snapshot_cells_retracted: 7,
     snapshot_cells_rewritten: 5,
     snapshot_cells_legacy_skipped: 0,
@@ -131,8 +132,22 @@ const DELETE_REMOVED: GitProviderDeleteResult['removed'] = {
     cascade_skipped: false,
 };
 
+/** The post-cascade aggregate recompute the server reports alongside it (#264). */
+const DELETE_AGGREGATES: GitProviderDeleteResult['aggregates'] = {
+    from: '2026-01-05',
+    to: '2026-07-01',
+    periods: 34,
+    prMetricPeriods: 32,
+    error: null,
+};
+
 let providers: AdminGitProvider[];
 let deleteImpact: GitProviderDeleteImpact;
+let deleteRemoved: GitProviderDeleteResult['removed'];
+let deleteAggregates: GitProviderDeleteResult['aggregates'];
+/** HTTP status the delete-impact preview answers with — 500 drives the failure path. */
+let deleteImpactStatus: number;
+let deleteImpactCalls: number;
 let repos: RepoRow[];
 let dataSourceGitProviders: DataSourceGitProvider[];
 let fetchMock: Mock;
@@ -155,6 +170,10 @@ beforeEach(() => {
     createCount = 0;
     providers = [structuredClone(DB_GITHUB), structuredClone(CONFIG_GITLAB)];
     deleteImpact = structuredClone(DEFAULT_DELETE_IMPACT);
+    deleteRemoved = structuredClone(DELETE_REMOVED);
+    deleteAggregates = structuredClone(DELETE_AGGREGATES);
+    deleteImpactStatus = 200;
+    deleteImpactCalls = 0;
     repos = [
         {slug: 'api', name: 'API Service', archived: false, defaultBranch: 'main'},
         {slug: 'web', name: 'Web App', archived: false, defaultBranch: 'main'},
@@ -233,15 +252,26 @@ beforeEach(() => {
             return json({data: updated});
         }
         // Delete-impact preview (#264) — GET /:id/delete-impact. Checked before the
-        // generic list route.
+        // generic list route. `deleteImpactStatus` lets a test drive the failure path.
         if (/\/git\/providers\/[^/]+\/delete-impact$/.test(u) && method === 'GET') {
+            deleteImpactCalls += 1;
+            if (deleteImpactStatus !== 200) {
+                return json({error: 'Internal Server Error', message: 'boom'}, deleteImpactStatus);
+            }
             return json({data: deleteImpact});
         }
         // Delete (#264): the response reports what the cascade removed.
         if (/\/git\/providers\/[^/]+$/.test(u) && method === 'DELETE') {
             const id = decodeURIComponent(u.split('/').pop() ?? '');
             providers = providers.filter((p) => p.id !== id);
-            return json({data: {id, deleted: true, removed: {...DELETE_REMOVED, id}}});
+            return json({
+                data: {
+                    id,
+                    deleted: true,
+                    removed: {...deleteRemoved, id},
+                    aggregates: deleteAggregates,
+                },
+            });
         }
         // List.
         if (/\/git\/providers$/.test(u)) {
@@ -748,6 +778,76 @@ describe('AdminGitProviders — list + row actions', () => {
             expect(banner.textContent).toContain('7 snapshot cell(s) removed');
             expect(banner.textContent).toContain('3 sync cursor(s) cleared');
             expect(banner.textContent).toContain('none were deleted');
+            // The derived rollups are recomputed server-side; the count is reported so the
+            // admin can tell a recompute happened from one that silently didn't.
+            expect(banner.textContent).toContain('34 trend aggregate period(s)');
+        });
+
+        // A refused legacy cell means the retraction was PARTIAL — that must not render
+        // identically to a complete one.
+        it('says so when some snapshot cells could NOT be retracted', async () => {
+            deleteRemoved = {...DELETE_REMOVED, snapshot_cells_legacy_skipped: 4};
+            const dialog = await openRemoveDialog();
+            await screen.findByTestId('remove-impact');
+            fireEvent.click(
+                within(dialog).getByRole('button', {name: 'Remove provider and its data'}),
+            );
+            const banner = await screen.findByTestId('provider-removed-banner');
+            expect(banner.textContent).toContain('4 snapshot cell(s) could NOT be retracted');
+            expect(banner.textContent).toContain('still include this provider');
+        });
+
+        // The data is gone but the trend charts are not — the admin has to be told, with the
+        // remedy, rather than shown a clean success line.
+        it('reports a FAILED aggregate recompute with the backfill remedy', async () => {
+            deleteAggregates = {...DELETE_AGGREGATES, periods: 0, prMetricPeriods: 0, error: 'disk full'};
+            const dialog = await openRemoveDialog();
+            await screen.findByTestId('remove-impact');
+            fireEvent.click(
+                within(dialog).getByRole('button', {name: 'Remove provider and its data'}),
+            );
+            const banner = await screen.findByTestId('provider-removed-banner');
+            expect(banner.textContent).toContain('Trend aggregates were NOT recomputed');
+            expect(banner.textContent).toContain('disk full');
+            expect(banner.textContent).toContain('toprope aggregate backfill');
+        });
+
+        it('reports the skipped-cascade outcome through to the banner', async () => {
+            deleteImpact = {...DEFAULT_DELETE_IMPACT, cascade_skipped: true};
+            deleteRemoved = {...DELETE_REMOVED, cascade_skipped: true, raw_author_rows: 0, days: 0};
+            const dialog = await openRemoveDialog();
+            await screen.findByTestId('remove-impact');
+            fireEvent.click(
+                within(dialog).getByRole('button', {name: 'Remove provider and its data'}),
+            );
+            const banner = await screen.findByTestId('provider-removed-banner');
+            expect(banner.textContent).toContain('config-file provider still owns its data');
+            expect(banner.textContent).toContain('nothing was retracted');
+            // …and NOT the retraction counts, which would be a lie on this path.
+            expect(banner.textContent).not.toContain('author-day row(s)');
+        });
+
+        // Fail-closed on a preview that could not load — confirming against nothing is
+        // confirming blind — but with a retry, so one transient 500 doesn't permanently
+        // block the delete.
+        it('disables the confirm when the impact fails to load, and offers a retry', async () => {
+            deleteImpactStatus = 500;
+            const dialog = await openRemoveDialog();
+            await within(dialog).findByText(/Could not check what this would remove/);
+            expect(
+                within(dialog).getByRole('button', {name: 'Remove provider and its data'}),
+            ).toBeDisabled();
+
+            const callsBeforeRetry = deleteImpactCalls;
+            deleteImpactStatus = 200;
+            fireEvent.click(within(dialog).getByRole('button', {name: 'Retry'}));
+            await screen.findByTestId('remove-impact');
+            expect(deleteImpactCalls).toBeGreaterThan(callsBeforeRetry);
+            expect(
+                within(dialog).getByRole('button', {name: 'Remove provider and its data'}),
+            ).not.toBeDisabled();
+            // And nothing was deleted while the preview was broken.
+            expect(lastCall(/\/git\/providers\/p-gh$/, 'DELETE')).toBeUndefined();
         });
 
         it('cancelling closes the dialog without deleting', async () => {

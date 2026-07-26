@@ -678,6 +678,23 @@ describe('upsertRawAuthorDaily + readers (#252)', () => {
             expect(deleteContainerRawDaily(db, 'github', 'nothing-here')).toBe(0);
         });
 
+        // The replay path (#253) reads by KEY, deliberately unscoped by container: who a raw
+        // identity is does not depend on which workspace they committed in, so a scope that
+        // missed one container would rebuild only part of that developer's days.
+        it('readRawDailyForKeys spans EVERY container a key was seen in', () => {
+            upsertRawAuthorDaily(db, input({container: 'ws-a', commits: 3}), '2026-07-01T10:00:00.000Z');
+            upsertRawAuthorDaily(
+                db,
+                input({container: 'ws-b', date: '2026-07-05', commits: 4}),
+                '2026-07-05T10:00:00.000Z',
+            );
+            const rows = readRawDailyForKeys(db, ['github:login:alice']);
+            expect(rows.map((r) => [r.container, r.date])).toEqual([
+                ['ws-a', '2026-07-01'],
+                ['ws-b', '2026-07-05'],
+            ]);
+        });
+
         it('scopes the delete by the FULL key — the same container name under another family survives', () => {
             upsertRawAuthorDaily(db, input({container: 'shared', commits: 3}), '2026-07-01T10:00:00.000Z');
             upsertRawAuthorDaily(

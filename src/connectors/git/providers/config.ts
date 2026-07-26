@@ -8,6 +8,14 @@ import type {GitConnectorConfig} from '../../../config/types.js';
 export function resolveGitProviderConfigs(config: GitConnectorConfig): GitProviderConfig[] {
     if (Array.isArray(config.providers) && config.providers.length > 0) {
         // config.providers is unknown[] to avoid circular imports; validate minimally.
+        //
+        // Deliberately does NOT require a container, even though #264 makes `(type, container)`
+        // the attribution key: `toprope doctor` resolves through here precisely so it can REPORT
+        // a malformed entry ("bitbucket provider with no workspace"), and filtering it out here
+        // would replace that specific diagnostic with a generic "no valid providers". The
+        // pipeline guards itself instead — `GitSync.runSync` drops a container-less provider with
+        // a surfaced error rather than letting it reach a write boundary (see `hasUsableContainer`
+        // in sync.ts).
         return (config.providers as unknown[]).filter(
             (p): p is GitProviderConfig =>
                 typeof p === 'object' &&

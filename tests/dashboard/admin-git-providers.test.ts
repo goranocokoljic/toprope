@@ -13,6 +13,7 @@ import {loadServerKey} from '../../src/connectors/git/providers/secret';
 import {getDecryptedConfig} from '../../src/connectors/git/providers/store';
 import {upsertRawAuthorDaily} from '../../src/connectors/git/raw-author-daily';
 import {projectSnapshots} from '../../src/connectors/git/projection';
+import {computeAllWeeklyAggregates} from '../../src/aggregation/weekly';
 import type {GitConnectorConfig} from '../../src/config/types';
 
 const PASSWORD = 'correct-horse-battery';
@@ -406,6 +407,8 @@ describe('admin git-provider CRUD API (#197)', () => {
                     raw_author_rows: 0,
                     pr_records: 0,
                     days: 0,
+                    earliest_date: null,
+                    latest_date: null,
                     snapshot_cells_retracted: 0,
                     snapshot_cells_rewritten: 0,
                     snapshot_cells_legacy_skipped: 0,
@@ -413,6 +416,8 @@ describe('admin git-provider CRUD API (#197)', () => {
                     cursor_keys_purged: 0,
                     cascade_skipped: false,
                 },
+                // Nothing was retracted, so there is no span to recompute.
+                aggregates: {from: null, to: null, periods: 0, prMetricPeriods: 0, error: null},
             });
             const list = await app.inject({
                 method: 'GET',
@@ -552,7 +557,6 @@ describe('admin git-provider CRUD API (#197)', () => {
                 pr_records: 0,
                 authors: 1,
                 developers_affected: 1,
-                cursor_keys: 1,
                 cascade_skipped: false,
             });
             // Read-only.
@@ -574,6 +578,8 @@ describe('admin git-provider CRUD API (#197)', () => {
                 container: 'db-org',
                 raw_author_rows: 2,
                 days: 2,
+                earliest_date: '2026-07-01',
+                latest_date: '2026-07-02',
                 snapshot_cells_retracted: 2,
                 snapshot_cells_rewritten: 0,
                 developers_affected: 1,
@@ -583,6 +589,129 @@ describe('admin git-provider CRUD API (#197)', () => {
             expect(
                 (db.prepare('SELECT COUNT(*) AS n FROM raw_author_daily').get() as {n: number}).n,
             ).toBe(0);
+        });
+
+        // The derived rollups are a SECOND projection and the aggregation scheduler only ever
+        // recomputes the just-closed period — so the delete must recompute the retracted span
+        // itself, or the trend charts keep serving the removed activity forever.
+        it('recomputes the derived aggregates over the retracted span, and reports it', async () => {
+            const dto = await createGithub();
+            seedDbOrgHistory();
+            // A weekly aggregate for the retracted week, holding the doomed commits. Written
+            // through the real rollup so the row is exactly what the dashboard would read.
+            computeAllWeeklyAggregates(db, '2026-07-01', new Date('2026-07-20T00:00:00.000Z'));
+            const weekly = (): {commits: number} | undefined =>
+                db
+                    .prepare(
+                        `SELECT total_commits AS commits FROM weekly_aggregates
+                          WHERE developer_id = 'dev-1' AND week_start = ?`,
+                    )
+                    .get('2026-06-29') as {commits: number} | undefined;
+            expect(weekly()?.commits).toBe(7);
+
+            const del = await app.inject({
+                method: 'DELETE',
+                url: `/api/admin/git/providers/${dto.id as string}`,
+                headers: authHeaders(adminToken),
+            });
+            expect(del.statusCode).toBe(200);
+            const aggregates = del.json().data.aggregates as {
+                from: string;
+                to: string;
+                periods: number;
+                error: string | null;
+            };
+            expect(aggregates.error).toBeNull();
+            expect(aggregates.from).toBe('2026-07-01');
+            expect(aggregates.to).toBe('2026-07-02');
+            // 1 week + 1 month + 1 quarter + 1 year for a two-day span.
+            expect(aggregates.periods).toBe(4);
+            // And the rollup no longer reports the retracted commits.
+            expect(weekly()?.commits ?? 0).toBe(0);
+        });
+
+        // AC6 at the ROUTE, not just in the cascade unit test. Without this, replacing the
+        // route's `configContainerKeys()` argument with `new Set()` would break the skip in
+        // production and leave the suite green. The colliding state is unreachable through
+        // POST (it 409s), but it is the realistic production case: the config file gains the
+        // provider AFTER the DB row was saved.
+        it('SKIPS the cascade when a config-file provider owns the same container', async () => {
+            // Insert the DB row directly, bypassing the create-route conflict guard.
+            db.prepare(
+                `INSERT INTO git_providers
+                 (id, type, container, url, include_subgroups, auth_method, auth_username,
+                  token_ciphertext, token_meta, token_last4, repos_include, repos_exclude,
+                  enabled, created_at, updated_at, created_by, last_sync_at, last_sync_status, last_sync_error)
+                 VALUES ('shadowed', 'github', 'config-org', NULL, NULL, 'token', NULL, ?, ?, '1234',
+                         NULL, NULL, 1, '2026-07-01T00:00:00.000Z', '2026-07-01T00:00:00.000Z',
+                         NULL, NULL, NULL, NULL)`,
+            ).run(
+                Buffer.from('cipher'),
+                '{"algo":"AES-256-GCM","iv":"x","auth_tag":"y","key_id":"k1"}',
+            );
+            db.prepare(`UPDATE developers SET external_ids = '{"github":"alice"}' WHERE id = 'dev-1'`).run();
+            upsertRawAuthorDaily(
+                db,
+                {
+                    provider: 'github',
+                    container: 'config-org',
+                    raw_author_key: 'github:login:alice',
+                    author_login: 'alice',
+                    author_email: 'alice@example.com',
+                    author_display_name: null,
+                    date: '2026-07-01',
+                    commits: 5,
+                    lines_added: 10,
+                    lines_removed: 1,
+                    files_changed: 1,
+                    prs_opened: 0,
+                    prs_merged: 0,
+                    review_comments_given: 0,
+                    avg_time_to_merge_hours: null,
+                    code_churn_rate: 0,
+                    ai_signature_score: 0,
+                    avg_commit_size: 10,
+                    commit_burst_count: 0,
+                },
+                '2026-07-10T00:00:00.000Z',
+            );
+            projectSnapshots(db, {dates: ['2026-07-01']});
+            db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+                'git_last_sync:github:config-org',
+                '2026-07-10T00:00:00.000Z',
+            );
+
+            // The preview says so up front…
+            const impact = await impactOf('shadowed');
+            expect(impact.statusCode).toBe(200);
+            expect(impact.json().data.cascade_skipped).toBe(true);
+            expect(impact.json().data.raw_author_rows).toBe(0);
+
+            const del = await app.inject({
+                method: 'DELETE',
+                url: '/api/admin/git/providers/shadowed',
+                headers: authHeaders(adminToken),
+            });
+            expect(del.statusCode).toBe(200);
+            expect(del.json().data.removed.cascade_skipped).toBe(true);
+            expect(del.json().data.removed.raw_author_rows).toBe(0);
+            expect(del.json().data.removed.cursor_keys_purged).toBe(0);
+            // …and the config provider's data, snapshots and cursor all survive.
+            expect(
+                (db.prepare('SELECT COUNT(*) AS n FROM raw_author_daily').get() as {n: number}).n,
+            ).toBe(1);
+            expect(
+                (
+                    db
+                        .prepare("SELECT COUNT(*) AS n FROM git_snapshots WHERE date = '2026-07-01'")
+                        .get() as {n: number}
+                ).n,
+            ).toBe(1);
+            expect(
+                db
+                    .prepare("SELECT value FROM sync_state WHERE key = 'git_last_sync:github:config-org'")
+                    .get(),
+            ).toEqual({value: '2026-07-10T00:00:00.000Z'});
         });
 
         it('rejects the preview for a developer session (403)', async () => {

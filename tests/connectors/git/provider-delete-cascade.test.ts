@@ -5,7 +5,11 @@ import {randomUUID} from 'crypto';
 import {runMigrations} from '../../../src/storage/migrator';
 import {addTeam} from '../../../src/registry/teams';
 import {addDeveloper} from '../../../src/registry/developers';
-import {upsertRawAuthorDaily, type RawAuthorDailyInput} from '../../../src/connectors/git/raw-author-daily';
+import {
+    containerRawAuthorIdentities,
+    upsertRawAuthorDaily,
+    type RawAuthorDailyInput,
+} from '../../../src/connectors/git/raw-author-daily';
 import {projectSnapshots} from '../../../src/connectors/git/projection';
 import {
     containerKey,
@@ -163,18 +167,29 @@ describe('deleteProviderWithCascade (#264)', () => {
     });
 
     it('leaves the sibling workspace byte-identical, incl. days both contributed to', () => {
-        const before = rawRowsFor(db, 'ws-b');
+        // Full rows, not counts: the sibling's PR record and all three of its cursor VALUES
+        // are compared, so a mutation (not just a deletion) of the survivor would be caught.
+        const rawBefore = rawRowsFor(db, 'ws-b');
+        const prBefore = db
+            .prepare("SELECT * FROM pr_records WHERE container = 'ws-b' ORDER BY pr_id")
+            .all();
+        const stateBefore = db
+            .prepare("SELECT * FROM sync_state WHERE key LIKE '%:bitbucket:ws-b' ORDER BY key")
+            .all();
+        expect(prBefore).toHaveLength(1);
+        expect(stateBefore).toHaveLength(3);
+
         deleteProviderWithCascade(db, providerA, new Set());
-        expect(rawRowsFor(db, 'ws-b')).toEqual(before);
-        // Its PR record and its cursors survive untouched too.
+
+        expect(rawRowsFor(db, 'ws-b')).toEqual(rawBefore);
         expect(
-            db.prepare("SELECT COUNT(*) AS n FROM pr_records WHERE container = 'ws-b'").get(),
-        ).toEqual({n: 1});
+            db.prepare("SELECT * FROM pr_records WHERE container = 'ws-b' ORDER BY pr_id").all(),
+        ).toEqual(prBefore);
         expect(
             db
-                .prepare("SELECT value FROM sync_state WHERE key = 'git_last_sync:bitbucket:ws-b'")
-                .get(),
-        ).toEqual({value: '2026-07-10T00:00:00.000Z'});
+                .prepare("SELECT * FROM sync_state WHERE key LIKE '%:bitbucket:ws-b' ORDER BY key")
+                .all(),
+        ).toEqual(stateBefore);
     });
 
     it('retracts exactly the deleted container rows and reports what it removed', () => {
@@ -183,6 +198,9 @@ describe('deleteProviderWithCascade (#264)', () => {
         expect(result.raw_author_rows).toBe(2); // 07-01 + 07-02
         expect(result.pr_records).toBe(1);
         expect(result.days).toBe(2);
+        // The span the caller must recompute the derived rollups over.
+        expect(result.earliest_date).toBe('2026-07-01');
+        expect(result.latest_date).toBe('2026-07-02');
         expect(result.developers_affected).toBe(1);
         expect(result.cursor_keys_purged).toBe(3);
         expect(result.cascade_skipped).toBe(false);
@@ -197,15 +215,70 @@ describe('deleteProviderWithCascade (#264)', () => {
     });
 
     it('re-projects a shared day to the survivor’s contribution ALONE, and removes an orphaned day', () => {
+        // Snapshot ws-b's SOLE contribution to the shared day first, by projecting a store
+        // that contains only it — the exact row the re-projection must converge to. Compared
+        // across every projected column, so a recompute bug in prs_merged / data_source /
+        // review_comments_given cannot slip through a three-field assertion.
+        const expected = ((): Record<string, unknown> => {
+            const probe = new Database(':memory:');
+            try {
+                probe.pragma('foreign_keys = ON');
+                runMigrations(probe, MIGRATIONS_DIR);
+                addTeam(probe, 'eng');
+                const probeDev = addDeveloper(probe, 'Alice', 'eng', 'alice@example.com', undefined, {
+                    bitbucket: 'alice',
+                }).id;
+                upsertRawAuthorDaily(
+                    probe,
+                    rawRow({container: 'ws-b', commits: 5, lines_added: 50}),
+                    OBSERVED_AT,
+                );
+                projectSnapshots(probe, {dates: ['2026-07-01']});
+                const cell = snapshotCell(probe, probeDev, '2026-07-01')!;
+                // developer_id differs between the two in-memory DBs; the metrics are the point.
+                return {...cell, developer_id: devId};
+            } finally {
+                probe.close();
+            }
+        })();
+
         deleteProviderWithCascade(db, providerA, new Set());
 
-        const shared = snapshotCell(db, devId, '2026-07-01');
-        // Recomputed, not merely decremented: exactly ws-b's own numbers.
-        expect(shared?.commits).toBe(5);
-        expect(shared?.lines_added).toBe(50);
-        expect(shared?.is_projected).toBe(1);
+        expect(snapshotCell(db, devId, '2026-07-01')).toEqual(expected);
         // The day only ws-a contributed to is gone entirely.
         expect(snapshotCell(db, devId, '2026-07-02')).toBeUndefined();
+    });
+
+    // The whole-day rebuild recomputes EVERY developer's cell on the affected days, not just
+    // the deleted container's authors. A second developer active only in the SURVIVING
+    // workspace is the widest blast radius this design has — they must come out untouched.
+    it('leaves an unrelated developer’s cell on an affected day byte-identical', () => {
+        const bob = addDeveloper(db, 'Bob', 'eng', 'bob@example.com', undefined, {
+            bitbucket: 'bob',
+        }).id;
+        upsertRawAuthorDaily(
+            db,
+            rawRow({
+                container: 'ws-b',
+                raw_author_key: 'bitbucket:login:bob',
+                author_login: 'bob',
+                author_email: 'bob@example.com',
+                author_display_name: 'Bob B',
+                commits: 11,
+                lines_added: 110,
+                prs_merged: 2,
+            }),
+            OBSERVED_AT,
+        );
+        projectSnapshots(db, {dates: ['2026-07-01']});
+        const before = snapshotCell(db, bob, '2026-07-01');
+        expect(before?.commits).toBe(11);
+
+        const result = deleteProviderWithCascade(db, providerA, new Set());
+
+        expect(snapshotCell(db, bob, '2026-07-01')).toEqual(before);
+        // And Bob is NOT counted as affected — he has no rows in the deleted container.
+        expect(result.developers_affected).toBe(1);
     });
 
     it('purges the deleted container’s three cursor kinds and nothing else', () => {
@@ -360,7 +433,7 @@ describe('providerDeleteImpact (#264)', () => {
             // Only alice resolves to a registered developer; the unmatched author counts as
             // an AUTHOR but not as a developer whose totals change.
             developers_affected: 1,
-            cursor_keys: 3,
+            // cursor_keys removed (#264 review OR-2): nothing rendered it.
             cascade_skipped: false,
         });
     });
@@ -388,7 +461,66 @@ describe('providerDeleteImpact (#264)', () => {
         expect(impact.authors).toBe(0);
         expect(impact.days).toBe(0);
         expect(impact.earliest_date).toBeNull();
-        expect(impact.cursor_keys).toBe(0);
+        expect(impact.latest_date).toBeNull();
+    });
+
+    // The grain rule (#254): attribution is decided PER OBSERVED IDENTITY, so one key seen
+    // with two commit addresses must be resolved as two variants. A `GROUP BY raw_author_key`
+    // with `MAX(author_email)` would pass every other assertion here while reporting
+    // `developers_affected: 0` for a developer whose totals the delete really does change —
+    // whenever the non-resolving address happens to byte-sort higher.
+    it('resolves each observed identity variant, not a per-key rollup of the email', () => {
+        // A SECOND address for the same login key. 'z-old@example.com' sorts ABOVE the
+        // registered 'alice@example.com', so a MAX() rollup would resolve on it and miss her.
+        upsertRawAuthorDaily(
+            db,
+            rawRow({
+                container: 'ws-a',
+                date: '2026-07-06',
+                author_email: 'z-old@example.com',
+                commits: 5,
+            }),
+            OBSERVED_AT,
+        );
+        // Alice resolves by LOGIN, so both variants are hers — but the count must come from
+        // resolving each variant, not from one collapsed email.
+        const impact = providerDeleteImpact(db, getProvider(db, 'prov-a')!, new Set());
+        expect(impact.developers_affected).toBe(1);
+        // The finer grain is visible in the identity feed the resolution runs over.
+        expect(containerRawAuthorIdentities(db, 'bitbucket', 'ws-a')).toEqual([
+            {raw_author_key: 'bitbucket:login:alice', login: 'alice', email: 'alice@example.com'},
+            {raw_author_key: 'bitbucket:login:alice', login: 'alice', email: 'z-old@example.com'},
+            {raw_author_key: 'bitbucket:login:ghost', login: 'ghost', email: 'ghost@example.com'},
+        ]);
+    });
+
+    // The same shape where the LOGIN does not resolve: only one of the two observed emails is
+    // registered, so a rollup that kept the other would report nobody affected.
+    it('counts a developer reached through only ONE of a key’s two observed emails', () => {
+        const carol = addDeveloper(db, 'Carol', 'eng', 'carol-primary@example.com').id;
+        // Email-keyed author (no provider login), seen with two addresses across two days.
+        for (const [date, email] of [
+            ['2026-07-07', 'carol-primary@example.com'],
+            ['2026-07-08', 'zz-unregistered@example.com'],
+        ] as const) {
+            upsertRawAuthorDaily(
+                db,
+                rawRow({
+                    container: 'ws-a',
+                    date,
+                    raw_author_key: 'bitbucket:email:carol-primary@example.com',
+                    author_login: null,
+                    author_email: email,
+                    commits: 2,
+                }),
+                OBSERVED_AT,
+            );
+        }
+        const impact = providerDeleteImpact(db, getProvider(db, 'prov-a')!, new Set());
+        // alice + carol. A MAX(author_email) rollup would pick 'zz-unregistered@…' for carol's
+        // key and report 1.
+        expect(impact.developers_affected).toBe(2);
+        expect(carol).toBeTruthy();
     });
 
     it('is read-only — computing it changes nothing', () => {

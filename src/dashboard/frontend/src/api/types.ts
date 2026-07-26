@@ -1016,7 +1016,6 @@ export interface GitProviderDeleteImpact {
     pr_records: number;
     authors: number;
     developers_affected: number;
-    cursor_keys: number;
     cascade_skipped: boolean;
 }
 
@@ -1031,12 +1030,32 @@ export interface GitProviderDeleteResult {
         raw_author_rows: number;
         pr_records: number;
         days: number;
+        earliest_date: string | null;
+        latest_date: string | null;
         snapshot_cells_retracted: number;
         snapshot_cells_rewritten: number;
+        /**
+         * Cells the re-projection REFUSED to touch because they are legacy pre-#253 totals.
+         * Non-zero means the retraction was partial — those days still include the removed
+         * provider's activity — so the UI must say so rather than report a clean total.
+         */
         snapshot_cells_legacy_skipped: number;
         developers_affected: number;
         cursor_keys_purged: number;
         cascade_skipped: boolean;
+    };
+    /**
+     * The derived weekly/monthly/quarterly/yearly rollups and `pr_review_metrics` are a SECOND
+     * projection of the retracted rows, and the aggregation scheduler only recomputes the
+     * just-closed period — so the server recomputes the retracted span itself. `error` is
+     * non-null when that failed: the data is gone but the trend charts are still stale.
+     */
+    aggregates: {
+        from: string | null;
+        to: string | null;
+        periods: number;
+        prMetricPeriods: number;
+        error: string | null;
     };
 }
 

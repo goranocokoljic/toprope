@@ -17,8 +17,9 @@ import {
     type SnapshotCell,
 } from './projection.js';
 import {createGitProvider} from './providers/factory.js';
-import {providerContainer} from './providers/config.js';
+import {providerContainer, resolveGitProviderConfigs} from './providers/config.js';
 import {resolveAllGitProviders} from './providers/resolve.js';
+import {findProviderByTypeContainer} from './providers/store.js';
 import {loadServerKey} from './providers/secret.js';
 import type {GitProviderConfig, GitProviderType, GitCommit, GitFileDiff, GitPR} from './providers/types.js';
 import {promoteAllCandidates} from './onboarding.js';
@@ -66,11 +67,29 @@ export const AUTO_CREATE_SUMMARY_PREFIX = 'auto-created';
  */
 export const LEGACY_CELLS_SKIPPED_PREFIX = 'Legacy snapshot cells left untouched:';
 
+/**
+ * Prefix of the advisory pushed when a provider this run FETCHED no longer has an owner by
+ * the time the run writes — its `git_providers` row was deleted (and, since #264, its data
+ * retracted and its cursors purged) during the minutes of network I/O.
+ *
+ * Deliberately NOT a failure: nothing went wrong, the operator asked for the provider to be
+ * removed and it was. But it must be SAID, because the run silently discards a whole
+ * provider's fetched window — and because the alternative is far worse. Writing those rows
+ * would re-create the container's `raw_author_daily`/`pr_records` and its forward cursor with
+ * no provider row pointing at them: invisible in the admin list, folded into every
+ * developer's totals by the projection, and unreachable by the delete cascade (which is keyed
+ * off a provider row), so nothing could ever retract them again. A re-added provider would
+ * then inherit the resurrected cursor and silently discard its first-sync window — exactly the
+ * #262 state that #264 exists to make unreachable.
+ */
+export const PROVIDER_DELETED_MID_RUN_PREFIX = 'Provider removed during this run:';
+
 /** Every sentinel that marks an `errors` entry as advisory rather than a failure. */
 const ADVISORY_PREFIXES: readonly string[] = [
     UNMATCHED_AUTHORS_PREFIX,
     AUTO_CREATE_SUMMARY_PREFIX,
     LEGACY_CELLS_SKIPPED_PREFIX,
+    PROVIDER_DELETED_MID_RUN_PREFIX,
 ];
 
 /**
@@ -951,6 +970,49 @@ function retentionKeyFor(
 // helper, shared with the resolver so the mapping lives in one place.
 const providerIdentifier = providerContainer;
 
+/**
+ * The de-dupe/ownership identity of a provider instance — `${type}:${container}`. Since #264
+ * this pair keys the imported data AND the sync cursors, so it is also what "does this
+ * container still have an owner?" is asked about.
+ */
+function containerOwnershipKey(providerType: GitProviderType, container: string): string {
+    return `${providerType}:${container}`;
+}
+
+/**
+ * Does this provider config carry a usable container?
+ *
+ * `providerContainer` is typed `string`, but `resolveGitProviderConfigs` narrows YAML entries on
+ * `typeof type === 'string'` alone (deliberately — `doctor` resolves through it in order to
+ * REPORT a malformed entry), so a config missing its `org`/`workspace`/`group` reaches here with
+ * `undefined`. Since #264 that is no longer a cosmetic gap: the container keys every imported
+ * row and every sync cursor, so such a provider would throw at the raw-store write boundary —
+ * inside the run's write transaction, taking every OTHER provider's data down with it — and
+ * would register as the literal ownership key `${type}:undefined`. Dropped with a surfaced
+ * error instead, matching the resolver's "one bad row can't sink the run" contract.
+ */
+function hasUsableContainer(config: GitProviderConfig): boolean {
+    const container: unknown = providerIdentifier(config);
+    return typeof container === 'string' && container.trim() !== '';
+}
+
+/**
+ * Is `(providerType, container)` owned by something that may write it — a live `git_providers`
+ * row, or a config-file provider?
+ *
+ * Config-file providers count as owners: they have no `git_providers` row by design, are
+ * un-deletable through the API, and own their container's data outright.
+ */
+function containerOwned(
+    db: Database.Database,
+    providerType: GitProviderType,
+    container: string,
+    configOwnedKeys: ReadonlySet<string>,
+): boolean {
+    if (configOwnedKeys.has(containerOwnershipKey(providerType, container))) return true;
+    return findProviderByTypeContainer(db, providerType, container) !== undefined;
+}
+
 function applyRepoFilter(
     repos: string[],
     include: string[] | undefined,
@@ -1581,11 +1643,23 @@ export class GitSync implements ConnectorInterface {
     // the fetch/merge/upsert logic lives in exactly one place.
     private async runSync(
         db: Database.Database,
-        providerConfigs: GitProviderConfig[],
+        allProviderConfigs: GitProviderConfig[],
         onProgress?: GitSyncProgressListener,
         options?: SyncRunOptions,
     ): Promise<SyncResult> {
         const errors: string[] = [];
+        // Drop a provider with no usable container BEFORE any network work or any key is built
+        // from it — see hasUsableContainer. Loud (a genuine error, not an advisory: the operator
+        // configured a provider that cannot be synced) but non-fatal for its siblings.
+        const providerConfigs = allProviderConfigs.filter((pc) => {
+            if (hasUsableContainer(pc)) return true;
+            errors.push(
+                `[${pc.type}] Skipped: this provider has no org/workspace/group, so its activity ` +
+                    'cannot be attributed or re-synced. Add the missing field to ' +
+                    'connectors.git.providers (or remove the entry).',
+            );
+            return false;
+        });
         let snapshotsWritten = 0;
         let snapshotsSkipped = 0;
         const now = new Date().toISOString();
@@ -1634,6 +1708,26 @@ export class GitSync implements ConnectorInterface {
 
         const devLookup = buildDevLookupMap(db);
         const churnWindowHours = this.config.analysis?.churn_window_hours ?? 48;
+
+        // Which of this run's containers were OWNED before the fetch started (#264 review
+        // SO-1/SEC-1). The write boundary re-checks these, and skips any that lost its owner
+        // meanwhile — see the ownership gate in the write transaction below.
+        //
+        // Snapshotting the START state, rather than simply requiring ownership at write time,
+        // is what makes this target the actual hazard: a DELETE that lands mid-run. A container
+        // that was never owned to begin with is a caller passing an ad-hoc provider config
+        // (an embedder, a test) and is left exactly as before — the run was never predicated on
+        // a row existing, so there is nothing to have been retracted underneath it.
+        const configOwnedKeys = new Set(
+            resolveGitProviderConfigs(this.config).map((c) =>
+                containerOwnershipKey(c.type, providerContainer(c)),
+            ),
+        );
+        const ownedAtStart = new Set(
+            providerConfigs
+                .filter((pc) => containerOwned(db, pc.type, providerIdentifier(pc), configOwnedKeys))
+                .map((pc) => containerOwnershipKey(pc.type, providerIdentifier(pc))),
+        );
 
         // Fetch data from all providers separately (for per-provider sync state),
         // then merge before analysis so multi-provider contributions to the same
@@ -1692,7 +1786,13 @@ export class GitSync implements ConnectorInterface {
         // transaction below, so a provider's cursor/watermark commits atomically with
         // — and only if — its data is persisted. Populated only for providers whose
         // fetch was complete; an incomplete provider contributes nothing this run.
-        const cursorAdvances: Array<() => void> = [];
+        // Tagged with the provider instance so the write transaction can drop the advance for
+        // a container that lost its owner mid-run (see containerStillOwned).
+        const cursorAdvances: Array<{
+            providerType: GitProviderType;
+            container: string;
+            apply: () => void;
+        }> = [];
         // Auto-create's summary/failure lines (#256). Staged rather than pushed straight
         // into `errors` because they are produced INSIDE the write transaction: on a
         // rollback no developer was created, so reporting that any were would be a lie.
@@ -1703,7 +1803,15 @@ export class GitSync implements ConnectorInterface {
         // whether this run moved the provider forward. Unlike `cursorAdvances` this
         // covers EVERY provider in the run — a complete one clears its streak, an
         // incomplete one extends it.
-        const stallUpdates: Array<() => void> = [];
+        const stallUpdates: Array<{
+            providerType: GitProviderType;
+            container: string;
+            apply: () => void;
+        }> = [];
+        // Containers this run fetched whose owner DISAPPEARED while it was fetching. Filled
+        // inside the write transaction (that is where the check must happen) and reported after
+        // it commits.
+        const orphanedContainers = new Set<string>();
 
         for (const {result, providerType} of fetchResults) {
             const {commits, prs, reviewComments, prRecords, stateKey, identifier} = result;
@@ -1714,11 +1822,13 @@ export class GitSync implements ConnectorInterface {
             // backfill would raise a stall alert for a provider syncing perfectly, and
             // a successful one would clear a real stall that is still stuck.
             if (!options?.backfill) {
-                if (result.complete) {
-                    stallUpdates.push(() => clearProviderStall(db, providerType, identifier));
-                } else {
-                    stallUpdates.push(() => recordProviderStallRun(db, providerType, identifier, now));
-                }
+                stallUpdates.push({
+                    providerType,
+                    container: identifier,
+                    apply: result.complete
+                        ? (): void => clearProviderStall(db, providerType, identifier)
+                        : (): void => recordProviderStallRun(db, providerType, identifier, now),
+                });
             }
 
             // A provider whose commit fetch was incomplete (listRepos or any repo's
@@ -1742,7 +1852,10 @@ export class GitSync implements ConnectorInterface {
             // to `now`. Written per-provider even on an empty fetch (a complete run
             // that found nothing legitimately covered its window), so a backfill can
             // only ever widen backward and never re-covers a slice.
-            cursorAdvances.push(() => {
+            cursorAdvances.push({
+                providerType,
+                container: identifier,
+                apply: () => {
                 if (options?.backfill) {
                     setProviderEarliestSyncTime(db, providerType, identifier, options.backfill.since);
                 } else {
@@ -1765,6 +1878,7 @@ export class GitSync implements ConnectorInterface {
                     // every uncapped run, which is all of them for a healthy provider.
                     setSyncStateValue(db, stateKey, result.forwardCursorTarget);
                 }
+                },
             });
 
             for (const record of prRecords) {
@@ -1832,12 +1946,19 @@ export class GitSync implements ConnectorInterface {
                     // workspaces) sharing an author no longer collide here at all: they are
                     // separate rows in the store, so their genuinely-different PRs are never
                     // handed to the across-runs `max()` rule that would have kept only the
-                    // larger org's count, permanently, once the cursor advanced past the
-                    // window. This accumulation therefore now only fires when one container
-                    // appears twice in a single run's provider set — which `UNIQUE(type,
-                    // container)` and the resolver's (type, container) de-dupe both prevent.
-                    // Kept, not removed: for that shape the two sides ARE disjoint, so summing
-                    // is the correct rule and the map must not silently drop one of them.
+                    // larger org's count, permanently, once the cursor advanced past the window.
+                    //
+                    // The branch is RETAINED for the one shape that still reaches it: the SAME
+                    // container appearing twice in one run's provider set. `UNIQUE(type,
+                    // container)` cannot prevent that — it constrains `git_providers` rows, and
+                    // the resolver only de-dupes config entries against DB rows, never config
+                    // against config — so a YAML `providers:` list naming one org twice yields
+                    // two identical containers in a single run. Note those two sides are the
+                    // SAME commits fetched twice, so summing them double-counts; the merge here
+                    // is the least-bad option (dropping one would lose a genuinely different
+                    // org's data in the case this rule was written for) and the real fix is to
+                    // de-dupe the resolved provider list. Pre-existing either way: the old
+                    // family-keyed dedupe summed that shape too.
                     //
                     // NUL-separated on BOTH joins: a container is free-form text and may
                     // contain spaces, so a space separator would let ('a b', 'key') and
@@ -1881,6 +2002,33 @@ export class GitSync implements ConnectorInterface {
         // the run counters after the tx succeeds, so a rolled-back run never reports
         // phantom writes.
         const insertMany = db.transaction(() => {
+            // OWNERSHIP GATE, before anything is written (#264 review SO-1/SEC-1). A provider
+            // deleted during this run's minutes of network fetch has had its data retracted and
+            // its cursors purged; writing this run's rows for it would re-create a container
+            // that no provider row owns — unretractable, because the delete cascade is keyed off
+            // a provider row — and would hand a re-added provider a resurrected cursor.
+            //
+            // Checked INSIDE the transaction, which is what makes it sound rather than a
+            // narrower race: on this process's single connection this read and the writes below
+            // are one unit, and across connections SQLite orders the two transactions — so
+            // either the row is still here (the cascade has not committed, and will remove
+            // whatever we write when it does) or it is gone (it committed, and we discard).
+            //
+            // Only containers that WERE owned at the start of the run are subject to it; see
+            // `ownedAtStart`. Memoized per container so a large run costs one lookup each.
+            const stillOwned = new Map<string, boolean>();
+            const isWritable = (providerType: GitProviderType, container: string): boolean => {
+                const key = containerOwnershipKey(providerType, container);
+                if (!ownedAtStart.has(key)) return true;
+                let owned = stillOwned.get(key);
+                if (owned === undefined) {
+                    owned = containerOwned(db, providerType, container, configOwnedKeys);
+                    stillOwned.set(key, owned);
+                    if (!owned) orphanedContainers.add(key);
+                }
+                return owned;
+            };
+
             // RETAIN FIRST, in a pass of its own. Auto-create below derives its candidates
             // from `raw_author_daily`, and the replay it performs re-projects every date a
             // new developer's retained rows touch — so every row of this run must already
@@ -1888,6 +2036,7 @@ export class GitSync implements ConnectorInterface {
             // current-window activity would be invisible to their own replay. Splitting the
             // former single loop is exactly what buys "no second pass, no re-fetch".
             for (const row of rawWrites.values()) {
+                if (!isWritable(row.provider, row.container)) continue;
                 upsertRawAuthorDaily(db, row, now);
             }
 
@@ -1903,6 +2052,7 @@ export class GitSync implements ConnectorInterface {
             // before minutes of network fetch, during which a developer may have been added.)
             const writeLookup = buildDevLookupMap(db);
             for (const row of rawWrites.values()) {
+                if (!isWritable(row.provider, row.container)) continue;
                 const developerId = resolveRawAuthor(
                     writeLookup,
                     row.provider,
@@ -1936,6 +2086,7 @@ export class GitSync implements ConnectorInterface {
             const skipped = projection.cellsSkippedLegacy;
             // Resolved HERE, against the post-auto-create map — see `fetchedPRRecords`.
             for (const {record, providerType} of fetchedPRRecords) {
+                if (!isWritable(providerType, record.container)) continue;
                 const developerId = resolveDeveloperId(
                     writeLookup,
                     providerType,
@@ -1945,17 +2096,25 @@ export class GitSync implements ConnectorInterface {
                 if (developerId) upsertPRRecord(db, record, developerId, now);
             }
             // Advance cursors LAST, still inside the tx: they persist iff every write
-            // above committed. Collected only for complete providers (see the loop).
+            // above committed. Collected only for complete providers (see the loop), and
+            // skipped for a container whose owner disappeared mid-run — advancing a cursor
+            // the cascade just purged is exactly what re-arms the #262 double-count.
             for (const advance of cursorAdvances) {
-                advance();
+                if (!isWritable(advance.providerType, advance.container)) continue;
+                advance.apply();
             }
             // Stall counters move with the cursors, in the same tx and on the same
             // all-or-nothing terms (#235). A rolled-back run therefore records no stall
             // either — correct, because nothing about it persisted: no cursor moved, and
             // the next run re-covers the window and accounts for itself. Its failure is
             // still loud via the rollback error pushed below.
+            //
+            // Skipped for an orphaned container for the same reason as the cursor: the stall
+            // key is one of the three the cascade just purged, so writing it would leave
+            // sync_state carrying a row for a provider that no longer exists.
             for (const update of stallUpdates) {
-                update();
+                if (!isWritable(update.providerType, update.container)) continue;
+                update.apply();
             }
             snapshotsWritten = written;
             snapshotsSkipped = skipped;
@@ -1977,6 +2136,9 @@ export class GitSync implements ConnectorInterface {
             // state that does not exist — same reason the auto-create advisories are
             // cleared. The rollback error below is the honest signal.
             allUnmatched.clear();
+            // Same reason: the gate's findings describe a discarded transaction. Whether the
+            // provider is really gone is re-established by the next run's own gate.
+            orphanedContainers.clear();
             errors.push(
                 `Failed to write sync data (transaction rolled back — no cursor advanced, window will be re-fetched next run): ${err instanceof Error ? err.message : String(err)}`,
             );
@@ -1984,6 +2146,18 @@ export class GitSync implements ConnectorInterface {
 
         if (allUnmatched.size > 0) {
             errors.push(`${UNMATCHED_AUTHORS_PREFIX} ${[...allUnmatched].join(', ')}`);
+        }
+
+        // Say that a whole provider's window was discarded, and why. Silent would be the
+        // wrong choice twice over: the operator's own delete caused it (so it is not a
+        // failure), but a run that fetched a provider and wrote none of it must not read as a
+        // clean full run.
+        if (orphanedContainers.size > 0) {
+            errors.push(
+                `${PROVIDER_DELETED_MID_RUN_PREFIX} ${[...orphanedContainers].sort().join(', ')} — ` +
+                    'their fetched activity was discarded and no cursor advanced, because the ' +
+                    'provider (and its imported data) was removed while this run was fetching.',
+            );
         }
 
         // Say WHY cells were skipped, not just how many. `records_skipped` is a bare

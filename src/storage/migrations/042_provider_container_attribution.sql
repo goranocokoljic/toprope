@@ -30,13 +30,29 @@
 -- the table means every rebuilt row is projection-owned and therefore retractable, which is
 -- what makes the cascade complete rather than partial.
 --
--- Weekly/monthly aggregates derived from `git_snapshots` are recomputed from the projection
--- by the aggregation scheduler, so they follow automatically once the resync lands.
+-- THE DERIVED ROLLUPS DO *NOT* FOLLOW AUTOMATICALLY. `weekly_aggregates`,
+-- `monthly_aggregates`, `quarterly_aggregates`, `yearly_aggregates` and `pr_review_metrics`
+-- are a SECOND projection, UPSERTed per period key — and the aggregation scheduler recomputes
+-- only the just-closed period (plus a short trailing window for the coaching engines). Every
+-- older period therefore still holds totals for the `git_snapshots` rows this migration
+-- deletes, and `/api/aggregates` serves those rows. After the post-migration resync, run
+-- `toprope aggregate backfill --from <first-synced-day>` to rebuild them; the provider delete
+-- path does this automatically for its own span (see `aggregation/retract.ts`), but a
+-- migration cannot, because it does not know what the resync will import.
 --
 -- NOTE ON IDEMPOTENCE: unlike 040/041 this file is deliberately DESTRUCTIVE and is NOT
 -- safe to re-execute against a populated database — re-running it would wipe a synced
 -- store. The `schema_migrations` ledger runs it exactly once. The `IF EXISTS` clauses make
 -- it safe against a *fresh* database only.
+--
+-- OPERATOR NOTE — WHAT THE FIRST RUN AFTER THIS MIGRATION DOES. `runMigrations` executes at
+-- server start and at the top of every scheduled sync, so this reset applies without a
+-- prompt. Because it clears the forward cursors, the next SCHEDULED run passes no first-sync
+-- window, `firstSyncSince` returns '' (see sync.ts), and the pipeline walks the FULL history
+-- of every configured provider — the first post-upgrade nightly sync is a complete re-import,
+-- not a resumption. That is intended (the data is being rebuilt), but it is long and it
+-- consumes provider rate limit; for a controlled rebuild, use the admin UI's per-provider
+-- "Sync now" with an explicit months window before the scheduler fires.
 
 -- ─── raw_author_daily: + container, unique key widened ────────────────────────
 DROP TABLE IF EXISTS raw_author_daily;
@@ -166,15 +182,22 @@ DELETE FROM sync_state
 -- whose id the admin has been operating on. This can only ever delete a row that was
 -- already unreachable-by-design (its container's data and cursor belonged to the sibling),
 -- and the imported data it would have owned is being cleared above regardless.
+-- Phrased as "delete any row that has an OLDER sibling for the same pair" rather than as a
+-- NOT IN over a keep-set: it is one level instead of three, and it is TOTAL. A NOT IN
+-- formulation compares with `=`, which yields NULL (not false) for a NULL column, so a row
+-- with a NULL type/container/id would fall out of the keep-set logic in both directions and
+-- survive as a duplicate — making the unqualified CREATE UNIQUE INDEX below throw and abort
+-- the whole migration. `EXISTS` has no such hole, and the explicit tiebreak on `id` keeps the
+-- ordering total when two duplicates share a `created_at`.
 DELETE FROM git_providers
- WHERE id NOT IN (
-    SELECT id FROM git_providers g
-     WHERE g.id = (
-        SELECT id FROM git_providers x
-         WHERE x.type = g.type AND x.container = g.container
-         ORDER BY x.created_at ASC, x.id ASC
-         LIMIT 1
-     )
+ WHERE EXISTS (
+    SELECT 1 FROM git_providers o
+     WHERE o.type = git_providers.type
+       AND o.container = git_providers.container
+       AND (
+            o.created_at < git_providers.created_at
+            OR (o.created_at = git_providers.created_at AND o.id < git_providers.id)
+       )
  );
 
 -- Replace the non-unique index with a UNIQUE one under the same name. The DROP is
