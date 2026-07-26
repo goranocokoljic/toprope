@@ -10,8 +10,12 @@ import {useModalState} from '../components/useModalState';
  * Unit tests for the modal foundation (#237): the `FormModal` footer contract
  * (Save/Cancel/ErrorText, the pending + submitDisabled gates) and — the reason
  * the wrapper exists — the close-guard that makes EVERY dismiss affordance
- * (Cancel, Esc, ×, backdrop) inert while a write is in flight. Plus the
- * `useModalState` create/edit/close transitions.
+ * (Cancel, Esc, ×) inert while a write is in flight. Plus the `useModalState`
+ * create/edit/close transitions.
+ *
+ * A backdrop click is deliberately absent from that table since #265: `Modal`
+ * no longer closes on one at all, so it is not an affordance the guard can be
+ * proven on. That behavior — and its coverage — lives in `modal.test.tsx`.
  */
 
 afterEach(() => {
@@ -19,7 +23,7 @@ afterEach(() => {
     document.body.style.overflow = '';
 });
 
-/** Every close affordance, so the pending guard is proven on all four. */
+/** Every close affordance, so the pending guard is proven on all three. */
 function closeAffordances(): Array<{name: string; dismiss: () => void}> {
     return [
         {name: 'Cancel', dismiss: () => fireEvent.click(screen.getByRole('button', {name: 'Cancel'}))},
@@ -30,15 +34,6 @@ function closeAffordances(): Array<{name: string; dismiss: () => void}> {
         {
             name: 'Escape',
             dismiss: () => fireEvent.keyDown(screen.getByRole('dialog'), {key: 'Escape'}),
-        },
-        {
-            name: 'a backdrop click',
-            dismiss: () => {
-                const backdrop = screen.getByTestId('form-modal-backdrop');
-                fireEvent.mouseDown(backdrop);
-                fireEvent.mouseUp(backdrop);
-                fireEvent.click(backdrop);
-            },
         },
     ];
 }
@@ -146,6 +141,11 @@ describe('FormModal — close guard while pending', () => {
         renderFormModal({pending: true});
         expect(screen.getByRole('button', {name: 'Cancel'})).toBeDisabled();
     });
+
+    // #265: a backdrop click is inert UNCONDITIONALLY, so it is not a guarded
+    // affordance and has no entry above. `Modal` owns that behavior and
+    // `modal.test.tsx` owns its coverage — asserting it again here could only
+    // fail when those tests are already red, so this file deliberately doesn't.
 });
 
 type Row = {id: string; name: string};
