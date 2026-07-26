@@ -149,18 +149,17 @@ describe('FormModal — close guard while pending', () => {
         expect(screen.getByRole('button', {name: 'Cancel'})).toBeDisabled();
     });
 
-    // #265: not a guarded affordance — a backdrop click is inert UNCONDITIONALLY,
-    // so the idle case (the one that used to discard a filled-in form) is the
-    // interesting one. Guards against a future re-introduction under FormModal.
-    it('never closes on a backdrop click — idle or pending', () => {
+    // #265: not a guarded affordance — a backdrop click is inert UNCONDITIONALLY.
+    // Only the IDLE case is worth asserting: it is the one that used to discard a
+    // filled-in form, and a re-introduced close path would route through
+    // `requestClose`, which the pending branch already blocks — so a pending
+    // variant could not fail while this passes. Guards against FormModal (or a
+    // future Modal change) re-arming dismissal on the dim area.
+    it('never closes on a backdrop click, even when idle', () => {
         const {onClose} = renderFormModal();
         clickBackdrop();
         expect(onClose).not.toHaveBeenCalled();
-        cleanup();
-
-        const pendingRender = renderFormModal({pending: true});
-        clickBackdrop();
-        expect(pendingRender.onClose).not.toHaveBeenCalled();
+        expect(screen.getByRole('dialog', {name: 'Add git provider'})).toBeInTheDocument();
     });
 });
 

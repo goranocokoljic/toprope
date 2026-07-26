@@ -1823,13 +1823,19 @@ describe('AdminGitProviders — repo-scope modal (#213)', () => {
         expect(lastCall(/\/git\/providers\/p-all$/, 'PATCH')).toBeUndefined();
     });
 
-    // #265: flipped — a backdrop click no longer closes anything. The selection
-    // session survives a misplaced click on the dim area, in either drag
-    // direction and for a straight press-and-release.
-    it('a backdrop click does NOT close the modal — the selection session survives', async () => {
+    // #265: flipped — a backdrop click no longer closes anything. Asserting the
+    // dialog is still mounted is not enough: the harm this fixes is losing the
+    // UNSAVED session, so the mode, the ticked set and the filter text are all
+    // read back after the click.
+    it('a backdrop click does NOT close the modal — the unsaved selection session survives', async () => {
         providers = [structuredClone(DB_MONITOR_ALL)];
         renderPage();
         await openSelectMode();
+
+        // Build real unsaved state: untick a repo (2 of 3 → 1 of 3) and filter.
+        fireEvent.click(screen.getByRole('checkbox', {name: 'api'}));
+        fireEvent.change(screen.getByLabelText('Filter repositories'), {target: {value: 'web'}});
+        expect(screen.getByTestId('selected-count')).toHaveTextContent('1 of 3 selected');
 
         const backdrop = screen.getByTestId('repo-scope-modal-p-all-backdrop');
         // Drag that STARTS inside the dialog (e.g. selecting filter text) and
@@ -1842,12 +1848,12 @@ describe('AdminGitProviders — repo-scope modal (#213)', () => {
         fireEvent.mouseDown(backdrop);
         fireEvent.mouseUp(backdrop);
         fireEvent.click(backdrop);
-        expect(screen.getByRole('dialog')).toBeInTheDocument();
-        expect(lastCall(/\/git\/providers\/p-all$/, 'PATCH')).toBeUndefined();
 
-        // Escape is still the way out, and still saves nothing.
-        fireEvent.keyDown(screen.getByRole('dialog'), {key: 'Escape'});
-        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+        // Still open AND still carrying the session — the data-loss regression.
+        expect(screen.getByRole('dialog')).toBeInTheDocument();
+        expect(screen.getByRole('radio', {name: 'Select repositories'})).toBeChecked();
+        expect(screen.getByTestId('selected-count')).toHaveTextContent('1 of 3 selected');
+        expect((screen.getByLabelText('Filter repositories') as HTMLInputElement).value).toBe('web');
         expect(lastCall(/\/git\/providers\/p-all$/, 'PATCH')).toBeUndefined();
     });
 
@@ -1872,7 +1878,8 @@ describe('AdminGitProviders — repo-scope modal (#213)', () => {
         fireEvent.click(screen.getByRole('button', {name: 'Save scope'}));
         expect(await screen.findByRole('button', {name: 'Saving…'})).toBeInTheDocument();
 
-        // Esc, the × button, and a genuine backdrop click are all inert mid-save.
+        // Esc and the × button are both inert mid-save. The backdrop click below
+        // is inert UNCONDITIONALLY since #265, so it no longer proves the guard.
         const dialog = screen.getByRole('dialog');
         fireEvent.keyDown(dialog, {key: 'Escape'});
         expect(screen.getByRole('dialog')).toBeInTheDocument();

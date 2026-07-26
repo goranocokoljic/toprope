@@ -107,6 +107,11 @@ describe('Modal — focus management', () => {
  * Every mouse interaction that ends with `click` dispatched on the backdrop —
  * the browser fires `click` on the common ancestor of mousedown and mouseup, so
  * a drag in either direction lands there too. Since #265 NONE of them closes.
+ *
+ * They no longer traverse distinct branches (the component observes no mouse
+ * event at all), so they cannot fail independently against today's code. They
+ * are kept as re-introduction fixtures: they encode the shapes a re-added close
+ * path would take, including the press/release-tracking variant #265 deleted.
  */
 function backdropInteractions(): Array<{name: string; interact: () => void}> {
     const backdrop = (): HTMLElement => screen.getByTestId('test-modal-backdrop');
@@ -164,6 +169,29 @@ describe('Modal — dismissal', () => {
 
         expect(screen.getByRole('dialog')).toBeInTheDocument();
         expect((screen.getByLabelText('First field') as HTMLInputElement).value).toBe('ghp_secret');
+    });
+
+    // The state #265 newly makes persistent: pressing the dim area blurs focus
+    // out of the dialog subtree, and the dialog now STAYS open there. Escape
+    // must still work from it — via the document-level backstop, since the
+    // element-level handler never sees a keypress aimed at <body>. Without this
+    // the promise "the dim area is inert but Escape still works" is only
+    // assembled from two tests that never meet.
+    it('after a backdrop click has parked focus outside the dialog, Escape still closes it', () => {
+        render(<Harness />);
+        fireEvent.click(screen.getByRole('button', {name: 'Open'}));
+        const backdrop = screen.getByTestId('test-modal-backdrop');
+        fireEvent.mouseDown(backdrop);
+        fireEvent.mouseUp(backdrop);
+        fireEvent.click(backdrop);
+        expect(screen.getByRole('dialog')).toBeInTheDocument();
+
+        // jsdom does not move focus on mousedown; reproduce what a browser does.
+        (document.activeElement as HTMLElement).blur();
+        expect(document.activeElement).toBe(document.body);
+
+        fireEvent.keyDown(document.body, {key: 'Escape'});
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     });
 
     it('the × button still closes', () => {

@@ -289,11 +289,16 @@ as a `PrimaryButton` with `ariaHasPopup="dialog"`.
 ### `<Modal>`
 The accessible primitive: portal-rendered, focus moved in on open and restored
 to the opener on close, Tab trapped behind `aria-modal`, Escape closing the
-topmost dialog only, ref-counted body scroll-lock, and a backdrop click that
-closes only when press AND release both land on the backdrop (a drag that
-crosses the dialog edge never discards unsaved state). Props: `title`,
-`onClose`, `children`, `testId?`. The caller owns open state — render it only
-while open. Use it directly only for a non-form dialog; forms use `FormModal`.
+topmost dialog only, ref-counted body scroll-lock, and a dim area that is
+**inert** — a misplaced click on it never dismisses the dialog and so never
+discards unsaved input (#265); Escape, × and Cancel are the exits. Props:
+`title`, `onClose`, `children`, `testId?`. The caller owns open state — render
+it only while open. Use it directly only for a non-form dialog; forms use
+`FormModal`.
+
+Do **not** add a dismiss-on-outside-click option: every dialog in the app wants
+the same behavior, so the knob would have no production caller that sets it
+(#265). If one genuinely needs it later, add the seam then.
 
 ### `<FormModal>`
 `Modal` + the footer every admin form repeats: primary Save, Cancel, inline
@@ -336,10 +341,12 @@ consumer needs a `mutation.reset()` on close. Hoisting the mutation to the page
 is the mistake this note exists to prevent: its last failed error would then
 outlive the dialog and render on the next clean open.
 
-**The close guard is the point.** While `pending`, Cancel / Esc / × / backdrop
-are all inert (the `RepoScopeModal.requestClose` lesson) — a dismiss mid-write
-can't let the mutation land, or fail, invisibly. Don't re-implement it in a
-screen. `pending` must cover EVERY write the dialog can start, not just the
+**The close guard is the point.** While `pending`, Cancel / Esc / × are all
+inert (the `RepoScopeModal.requestClose` lesson) — a dismiss mid-write can't let
+the mutation land, or fail, invisibly. Don't re-implement it in a screen. (A
+backdrop click is not on that list: since #265 `Modal` never closes on one, so
+it is inert whether or not a write is in flight, and it proves nothing about
+this guard.) `pending` must cover EVERY write the dialog can start, not just the
 primary one (see `AdminIdentities`: `save.isPending || move.isPending`).
 
 `submitDisabled` is validation only: never fold the WRITE's own in-flight state
