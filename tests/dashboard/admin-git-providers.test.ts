@@ -419,5 +419,45 @@ describe('admin git-provider CRUD API (#197)', () => {
             expect(res.statusCode).toBe(404);
             expect(res.json().message).toMatch(/not found/);
         });
+
+        // KNOWN GAP, pinned deliberately (#262 → #264). The pipeline's cursors are keyed
+        // by `type:container`, not by provider id, so this delete leaves them behind and
+        // a provider re-added for the same container inherits them. Purging them here in
+        // isolation is unsafe: `raw_author_daily` has no container column, so the deleted
+        // provider's rows cannot be retracted, and `mergeDailyAcrossRuns` ADDS the commit
+        // counters — a re-import over the same window would double-count permanently.
+        // #264 adds container attribution and flips this expectation; this test exists so
+        // that flip is deliberate rather than silent. The UI is protected in the meantime
+        // by `first_sync_pending` (see the create-route test above), which reports false
+        // for such a provider and hides the window input.
+        it('leaves the container pipeline cursors in place (see #264)', async () => {
+            const dto = await createGithub();
+            const id = dto.id as string;
+            for (const key of [
+                'git_last_sync:github:db-org',
+                'git_earliest_sync:github:db-org',
+                'git_stall:github:db-org',
+            ]) {
+                db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(key, 'seeded');
+            }
+
+            const del = await app.inject({
+                method: 'DELETE',
+                url: `/api/admin/git/providers/${id}`,
+                headers: authHeaders(adminToken),
+            });
+            expect(del.statusCode).toBe(200);
+
+            const remaining = (
+                db
+                    .prepare("SELECT key FROM sync_state WHERE key LIKE 'git_%' ORDER BY key")
+                    .all() as Array<{key: string}>
+            ).map((r) => r.key);
+            expect(remaining).toEqual([
+                'git_earliest_sync:github:db-org',
+                'git_last_sync:github:db-org',
+                'git_stall:github:db-org',
+            ]);
+        });
     });
 });
