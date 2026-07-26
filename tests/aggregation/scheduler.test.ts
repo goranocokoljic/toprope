@@ -208,9 +208,9 @@ describe('PR/review metrics hookup (Task 5.2)', () => {
     function seedPRRecord(developerId: string, prId: string, createdAt: string): void {
         db.prepare(
             `INSERT INTO pr_records
-             (id, developer_id, provider, repo, pr_id, state, created_at, merged_at, closed_at,
+             (id, developer_id, provider, container, repo, pr_id, state, created_at, merged_at, closed_at,
               review_comment_count, review_rounds, changes_requested_count, time_to_merge_hours, synced_at)
-             VALUES (?, ?, 'github', 'repo-a', ?, 'merged', ?, ?, ?, 2, 1, 0, 24, ?)`,
+             VALUES (?, ?, 'github', 'acme', 'repo-a', ?, 'merged', ?, ?, ?, 2, 1, 0, 24, ?)`,
         ).run(randomUUID(), developerId, prId, createdAt, createdAt, createdAt, createdAt);
     }
 

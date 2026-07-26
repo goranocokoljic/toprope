@@ -29,6 +29,8 @@ function seedDev(db: Database.Database, name: string): string {
 interface PRSeed {
     developerId: string;
     provider?: string;
+    /** Provider instance (org/workspace/group) the PR was imported from (#264). */
+    container?: string;
     repo?: string;
     prId: string;
     state?: string;
@@ -44,13 +46,14 @@ interface PRSeed {
 function seedPR(db: Database.Database, seed: PRSeed): void {
     db.prepare(
         `INSERT INTO pr_records
-         (id, developer_id, provider, repo, pr_id, state, created_at, merged_at, closed_at,
+         (id, developer_id, provider, container, repo, pr_id, state, created_at, merged_at, closed_at,
           review_comment_count, review_rounds, changes_requested_count, time_to_merge_hours, synced_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
         randomUUID(),
         seed.developerId,
         seed.provider ?? 'github',
+        seed.container ?? 'acme',
         seed.repo ?? 'repo-a',
         seed.prId,
         seed.state ?? 'merged',

@@ -23,6 +23,7 @@ let err: string[];
 function rawRow(over: Partial<RawAuthorDailyInput> & {raw_author_key: string}): RawAuthorDailyInput {
     return {
         provider: 'github' as GitProviderType,
+        container: 'acme',
         author_login: null,
         author_email: null,
         author_display_name: null,

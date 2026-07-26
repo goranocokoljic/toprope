@@ -41,12 +41,20 @@ export function TextField({
     onChange,
     placeholder,
     type = 'text',
+    disabled = false,
 }: {
     label: string;
     value: string;
     onChange: (next: string) => void;
     placeholder?: string;
     type?: string;
+    /**
+     * Gate the control, e.g. for a field that is immutable after creation. Say WHY in visible
+     * copy next to the form, not in a `title` tooltip: a native tooltip on a *disabled* input
+     * is suppressed by several engines (no pointer events), so it would be invisible in
+     * exactly the state that needs the explanation — and it is not an accessible surface.
+     */
+    disabled?: boolean;
 }): JSX.Element {
     return (
         <label className="flex flex-col gap-1">
@@ -55,8 +63,9 @@ export function TextField({
                 type={type}
                 value={value}
                 placeholder={placeholder}
+                disabled={disabled}
                 onChange={(e) => onChange(e.target.value)}
-                className="rounded-md border border-border bg-surface px-3 py-1.5 text-sm text-foreground"
+                className="rounded-md border border-border bg-surface px-3 py-1.5 text-sm text-foreground disabled:opacity-50"
             />
         </label>
     );
@@ -181,15 +190,73 @@ export function optionsGate(
  */
 export function TempPasswordBanner({password, onDismiss}: {password: string; onDismiss: () => void}): JSX.Element {
     return (
+        <AdminBanner onDismiss={onDismiss} testId="temp-password-banner">
+            Temporary password (shown once — copy it now):{' '}
+            <code className="font-mono font-semibold">{password}</code>
+        </AdminBanner>
+    );
+}
+
+/** Tone of an {@link AdminBanner}: an informational reveal, or the outcome of a destructive action. */
+export type AdminBannerTone = 'accent' | 'warning';
+
+interface BannerToneStyle {
+    /** Frame (border + background). */
+    frame: string;
+    /** Dismiss link colour — toned with the frame, so it isn't indigo on an amber panel. */
+    dismiss: string;
+}
+
+const BANNER_TONE: Record<AdminBannerTone, BannerToneStyle> = {
+    accent: {frame: 'border-accent/40 bg-accent-soft', dismiss: 'text-accent'},
+    warning: {frame: 'border-warning/40 bg-warning/10', dismiss: 'text-warning'},
+};
+
+/**
+ * The shared "what a write just did" banner for admin pages.
+ *
+ * Deliberately NOT `StatePanel`, which is the shell behind every *data-state* treatment
+ * (cold-start, empty, error) and renders as a dashed, centered, `max-w-md` box meaning "there
+ * is nothing here". An action outcome is the opposite kind of message: it carries real content
+ * the user must read, it sits above the surface that just changed, and — on the git-providers
+ * page specifically — it can appear on the very same render as the genuine empty state
+ * (deleting your only provider satisfies both), where two dashed panels stacked one above the
+ * other are indistinguishable.
+ *
+ * Generalized out of {@link TempPasswordBanner}, which is now a thin caller. `role="status"`
+ * is kept from it and is load-bearing: these banners appear on the page after a dialog
+ * unmounts and focus returns to the opener, so they land nowhere near the user's focus.
+ */
+export function AdminBanner({
+    children,
+    onDismiss,
+    tone = 'accent',
+    testId,
+}: {
+    children: ReactNode;
+    onDismiss: () => void;
+    tone?: AdminBannerTone;
+    testId?: string;
+}): JSX.Element {
+    return (
         <div
             role="status"
-            className="flex items-center justify-between gap-4 rounded-md border border-accent/40 bg-accent-soft px-4 py-3"
+            data-testid={testId}
+            // Alignment follows the tone rather than being fixed: an `accent` reveal is a single
+            // line and centers (preserving TempPasswordBanner's rendered output byte-for-byte),
+            // while a `warning` outcome report is multi-paragraph and must top-align.
+            className={[
+                'flex justify-between gap-4 rounded-md border px-4 py-3',
+                tone === 'warning' ? 'items-start' : 'items-center',
+                BANNER_TONE[tone].frame,
+            ].join(' ')}
         >
-            <div className="text-sm text-foreground">
-                Temporary password (shown once — copy it now):{' '}
-                <code className="font-mono font-semibold">{password}</code>
-            </div>
-            <button type="button" onClick={onDismiss} className="text-xs font-medium text-accent">
+            <div className="text-sm text-foreground">{children}</div>
+            <button
+                type="button"
+                onClick={onDismiss}
+                className={`shrink-0 text-xs font-medium ${BANNER_TONE[tone].dismiss}`}
+            >
                 Dismiss
             </button>
         </div>

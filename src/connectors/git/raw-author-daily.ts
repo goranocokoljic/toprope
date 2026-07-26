@@ -53,6 +53,7 @@ export const READ_CHUNK_SIZE = 500;
 /** Why a raw-author write refused. Typed so callers map it instead of leaking a raw DB error. */
 export type RawAuthorDailyErrorCode =
     | 'invalid_provider'
+    | 'invalid_container'
     | 'invalid_key'
     | 'invalid_date'
     | 'invalid_instant'
@@ -92,6 +93,16 @@ export interface DailyGitMetrics {
 /** The raw identity a `raw_author_daily` row is keyed and pre-filled by. */
 export interface RawAuthorIdentity {
     provider: GitProviderType;
+    /**
+     * The provider INSTANCE this row was imported from — org (github) / workspace
+     * (bitbucket) / group (gitlab), i.e. `providerContainer(config)`. REQUIRED, and
+     * required by TYPE rather than by convention (#264): `(provider, container)` is the
+     * attribution key a provider delete retracts by, so a write path that could omit it
+     * would silently produce rows no delete can ever remove. Non-optional here is what
+     * makes "no write path can omit the container" a compile-time property, with the
+     * runtime allowlist below and the schema CHECK as the two backstops.
+     */
+    container: string;
     /** `${provider}:login:${login}` or `${provider}:email:${lowercased-email}`. */
     raw_author_key: string;
     author_login: string | null;
@@ -109,7 +120,7 @@ export interface RawAuthorDailyInput extends RawAuthorIdentity, DailyGitMetrics 
 /** A full `raw_author_daily` row as stored. */
 export interface RawAuthorDailyRecord extends RawAuthorDailyInput {
     id: string;
-    /** UTC ISO; the earliest run that recorded this (provider, key, date). */
+    /** UTC ISO; the earliest run that recorded this (provider, container, key, date). */
     first_seen: string;
     /** UTC ISO; the most recent run that touched it. */
     last_seen: string;
@@ -355,6 +366,17 @@ function assertValidInput(row: RawAuthorDailyInput, observedAt: string): void {
     if (!RAW_AUTHOR_PROVIDERS.includes(row.provider)) {
         throw new RawAuthorDailyError('invalid_provider', `Unknown git provider: ${String(row.provider)}`);
     }
+    // The container is half the attribution key (#264). A blank one would merge two
+    // provider instances back into one bucket — the exact defect the column removes — and
+    // would leave rows that no per-container delete can retract. Refused at the write
+    // boundary, not just by the schema CHECK, so the caller gets a message naming the
+    // problem instead of a raw SQLITE_CONSTRAINT.
+    if (typeof row.container !== 'string' || !row.container.trim()) {
+        throw new RawAuthorDailyError(
+            'invalid_container',
+            `container must be a non-blank string (the provider's org/workspace/group), got: ${String(row.container)}`,
+        );
+    }
     if (!row.raw_author_key || !row.raw_author_key.trim()) {
         throw new RawAuthorDailyError('invalid_key', 'raw_author_key must be a non-blank string');
     }
@@ -397,14 +419,20 @@ function assertValidInput(row: RawAuthorDailyInput, observedAt: string): void {
     }
 }
 
-const SELECT_COLUMNS = `id, provider, raw_author_key, author_login, author_email, author_display_name,
+const SELECT_COLUMNS = `id, provider, container, raw_author_key, author_login, author_email, author_display_name,
      date, commits, lines_added, lines_removed, files_changed, prs_opened, prs_merged,
      review_comments_given, avg_time_to_merge_hours, code_churn_rate, ai_signature_score,
      avg_commit_size, commit_burst_count, first_seen, last_seen`;
 
 /**
- * Record one run's contribution for a (provider, raw_author_key, date), merging it
- * against whatever is already stored under {@link mergeDailyAcrossRuns}'s rules.
+ * Record one run's contribution for a (provider, container, raw_author_key, date), merging
+ * it against whatever is already stored under {@link mergeDailyAcrossRuns}'s rules.
+ *
+ * The key includes the CONTAINER (#264): two provider instances of one family (two GitHub
+ * orgs, two Bitbucket workspaces) contributing to the same author-day are two independent
+ * rows, not one row to be merged. That is what makes a per-provider delete able to retract
+ * exactly its own contribution — and it also removes the old hazard of handing two
+ * workspaces' genuinely-different PRs to the across-runs `max()` rule.
  *
  * Read-modify-write, so it runs inside a `db.transaction` — the graduated rule is
  * that a check-then-act mutation must be serialized by a transaction, not merely
@@ -426,8 +454,10 @@ export function upsertRawAuthorDaily(
     return db.transaction((): RawAuthorDailyRecord => {
         const stored = db
             .prepare(`SELECT ${SELECT_COLUMNS} FROM raw_author_daily
-                      WHERE provider = ? AND raw_author_key = ? AND date = ?`)
-            .get(row.provider, row.raw_author_key, row.date) as RawAuthorDailyRecord | undefined;
+                      WHERE provider = ? AND container = ? AND raw_author_key = ? AND date = ?`)
+            .get(row.provider, row.container, row.raw_author_key, row.date) as
+            | RawAuthorDailyRecord
+            | undefined;
 
         const merged: RawAuthorDailyRecord = stored
             ? {
@@ -451,16 +481,16 @@ export function upsertRawAuthorDaily(
 
         db.prepare(
             `INSERT INTO raw_author_daily
-             (id, provider, raw_author_key, author_login, author_email, author_display_name,
+             (id, provider, container, raw_author_key, author_login, author_email, author_display_name,
               date, commits, lines_added, lines_removed, files_changed, prs_opened, prs_merged,
               review_comments_given, avg_time_to_merge_hours, code_churn_rate, ai_signature_score,
               avg_commit_size, commit_burst_count, first_seen, last_seen)
              VALUES
-             (@id, @provider, @raw_author_key, @author_login, @author_email, @author_display_name,
+             (@id, @provider, @container, @raw_author_key, @author_login, @author_email, @author_display_name,
               @date, @commits, @lines_added, @lines_removed, @files_changed, @prs_opened, @prs_merged,
               @review_comments_given, @avg_time_to_merge_hours, @code_churn_rate, @ai_signature_score,
               @avg_commit_size, @commit_burst_count, @first_seen, @last_seen)
-             ON CONFLICT(provider, raw_author_key, date) DO UPDATE SET
+             ON CONFLICT(provider, container, raw_author_key, date) DO UPDATE SET
                author_login = excluded.author_login,
                author_email = excluded.author_email,
                author_display_name = excluded.author_display_name,
@@ -498,15 +528,19 @@ export function chunk<T>(items: T[], size: number): T[][] {
 }
 
 /**
- * Deterministic order for every batched read: by day, then by the (provider, key)
- * identity. Total — `(provider, raw_author_key, date)` is UNIQUE, so no two rows tie.
+ * Deterministic order for every batched read: by day, then by the full
+ * (provider, container, key) identity. Total — `(provider, container, raw_author_key,
+ * date)` is UNIQUE, so no two rows tie. `container` is part of the clause precisely
+ * because it is part of that key: omitting it would leave two workspaces' rows for one
+ * author-day ordered arbitrarily, and the fold order decides the value of the
+ * order-sensitive rate averages downstream.
  *
  * The SQL clause orders each CHUNK; {@link sortReadRows} re-applies the same order to
  * the concatenated result, because a chunked read would otherwise return a sequence of
  * independently-sorted runs (chunk 2's earliest day following chunk 1's latest) — right
  * on a small org and silently wrong past READ_CHUNK_SIZE keys.
  */
-const READ_ORDER_BY = 'ORDER BY date ASC, provider ASC, raw_author_key ASC';
+const READ_ORDER_BY = 'ORDER BY date ASC, provider ASC, container ASC, raw_author_key ASC';
 
 /**
  * The JS twin of {@link READ_ORDER_BY} — same total order, applied across chunks.
@@ -523,6 +557,7 @@ function sortReadRows(rows: RawAuthorDailyRecord[]): RawAuthorDailyRecord[] {
         (a, b) =>
             compareText(a.date, b.date) ||
             compareText(a.provider, b.provider) ||
+            compareText(a.container, b.container) ||
             compareText(a.raw_author_key, b.raw_author_key),
     );
 }
@@ -531,6 +566,10 @@ function sortReadRows(rows: RawAuthorDailyRecord[]): RawAuthorDailyRecord[] {
  * Every retained row for the given raw-author keys. One statement per chunk of keys —
  * never a query per key. A key embeds its own provider, so `raw_author_key IN (…)` is
  * unambiguous.
+ *
+ * Deliberately NOT scoped by container: WHO a raw identity is does not depend on which
+ * org/workspace they committed in, so a replay must cover every container the key was seen
+ * in or it would rebuild only part of that developer's days.
  */
 export function readRawDailyForKeys(db: Database.Database, keys: string[]): RawAuthorDailyRecord[] {
     const wanted = keys.filter((k) => k && k.trim());
@@ -612,6 +651,11 @@ const ROLLUP_AGGREGATES = `MAX(author_display_name) AS display_name,
  *
  * Ordering is total: `commit_count DESC` first (so a key's BUSIEST variant is the first one
  * a caller folding by key encounters), then the full group key as the tiebreak.
+ *
+ * `container` is deliberately NOT in the GROUP BY (#264). This grain exists to match the
+ * grain attribution is DECIDED at, and attribution resolves `(login, email)` — the
+ * container plays no part in it. Splitting by container would list one person twice for
+ * committing in two workspaces, which is a finer grain than any consumer's question.
  */
 export function distinctRawAuthorIdentities(db: Database.Database): RawAuthorIdentityVariant[] {
     return db
@@ -627,4 +671,139 @@ export function distinctRawAuthorIdentities(db: Database.Database): RawAuthorIde
                       author_email ASC, author_login ASC`,
         )
         .all() as RawAuthorIdentityVariant[];
+}
+
+// ─── Per-container reads/deletes — the provider-delete cascade's raw half (#264) ──
+//
+// All SQL against `raw_author_daily` lives in this module, so the cascade composes these
+// helpers instead of hand-rolling a second set of queries over the same table (the
+// canonical-helper rule). The cascade itself — ordering, the re-projection, the cursor
+// purge — is in `providers/delete-cascade.ts`.
+
+/** What one container has imported into `raw_author_daily`. Every field is a plain count. */
+export interface ContainerRawDailySummary {
+    /** Retained (author, day) rows attributed to this container. */
+    rows: number;
+    /** Distinct UTC days those rows cover. */
+    days: number;
+    /** Oldest / newest day covered, or null when the container has no rows. */
+    earliestDate: string | null;
+    latestDate: string | null;
+    /** Total commits recorded for this container. */
+    commits: number;
+    /** Distinct raw author identities that committed under this container. */
+    authors: number;
+}
+
+interface ContainerSummaryRow {
+    rows: number;
+    days: number;
+    earliest_date: string | null;
+    latest_date: string | null;
+    commits: number | null;
+    authors: number;
+}
+
+/**
+ * Summarize exactly what a `(provider, container)` pair has imported — the impact preview
+ * the admin delete confirmation states before anything is removed (#264 AC9).
+ *
+ * ONE aggregate query, no per-row fan-out. `SUM(commits)` is NULL on an empty set, so it is
+ * coalesced to 0 here rather than surfacing null as "unknown".
+ */
+export function summarizeContainerRawDaily(
+    db: Database.Database,
+    provider: GitProviderType,
+    container: string,
+): ContainerRawDailySummary {
+    const row = db
+        .prepare(
+            `SELECT COUNT(*) AS rows,
+                    COUNT(DISTINCT date) AS days,
+                    MIN(date) AS earliest_date,
+                    MAX(date) AS latest_date,
+                    SUM(commits) AS commits,
+                    COUNT(DISTINCT raw_author_key) AS authors
+               FROM raw_author_daily
+              WHERE provider = ? AND container = ?`,
+        )
+        .get(provider, container) as ContainerSummaryRow;
+    return {
+        rows: row.rows,
+        days: row.days,
+        earliestDate: row.earliest_date,
+        latestDate: row.latest_date,
+        commits: row.commits ?? 0,
+        authors: row.authors,
+    };
+}
+
+/**
+ * The distinct raw identities a container's rows were observed with — the input for
+ * "how many developers does deleting this affect?".
+ *
+ * Grouped at the SAME (key, login, email) grain attribution is decided at (see
+ * {@link distinctRawAuthorIdentities}), so each returned tuple is one thing the identity map
+ * either resolves or does not. One query; the caller resolves in memory against a single
+ * lookup map rather than querying per identity.
+ */
+export function containerRawAuthorIdentities(
+    db: Database.Database,
+    provider: GitProviderType,
+    container: string,
+): Array<{raw_author_key: string; login: string | null; email: string | null}> {
+    return db
+        .prepare(
+            `SELECT DISTINCT raw_author_key,
+                    author_login AS login,
+                    author_email AS email
+               FROM raw_author_daily
+              WHERE provider = ? AND container = ?
+              ORDER BY raw_author_key ASC, author_email ASC, author_login ASC`,
+        )
+        .all(provider, container) as Array<{
+        raw_author_key: string;
+        login: string | null;
+        email: string | null;
+    }>;
+}
+
+/**
+ * The distinct UTC days a container's retained rows touch — the exact date scope a
+ * re-projection must rebuild after those rows are removed.
+ *
+ * MUST be read BEFORE the delete: once the rows are gone there is no way to learn which
+ * days were affected, and a re-projection over the wrong scope silently leaves stale cells
+ * behind. Sorted so the returned scope is deterministic.
+ */
+export function containerRawDailyDates(
+    db: Database.Database,
+    provider: GitProviderType,
+    container: string,
+): string[] {
+    return (
+        db
+            .prepare(
+                `SELECT DISTINCT date FROM raw_author_daily
+                  WHERE provider = ? AND container = ? ORDER BY date ASC`,
+            )
+            .all(provider, container) as Array<{date: string}>
+    ).map((r) => r.date);
+}
+
+/**
+ * Retract every retained row belonging to one `(provider, container)`. Returns the number
+ * of rows removed.
+ *
+ * Scoped by the FULL attribution key, never by `provider` alone: a sibling workspace of the
+ * same family shares the provider column and must survive byte-identical.
+ */
+export function deleteContainerRawDaily(
+    db: Database.Database,
+    provider: GitProviderType,
+    container: string,
+): number {
+    return db
+        .prepare('DELETE FROM raw_author_daily WHERE provider = ? AND container = ?')
+        .run(provider, container).changes;
 }

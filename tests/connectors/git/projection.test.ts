@@ -46,6 +46,7 @@ function seedTeam(db: Database.Database): void {
 function rawRow(overrides: Partial<RawAuthorDailyInput> & {raw_author_key: string}): RawAuthorDailyInput {
     const defaults: RawAuthorDailyInput = {
         provider: 'github' as GitProviderType,
+        container: 'acme',
         author_login: null,
         author_email: null,
         author_display_name: null,

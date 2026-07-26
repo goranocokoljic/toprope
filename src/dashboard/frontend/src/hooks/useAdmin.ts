@@ -19,6 +19,8 @@ import type {
     AdminTeam,
     AdminUser,
     AdminUserWithTempPassword,
+    GitProviderDeleteImpact,
+    GitProviderDeleteResult,
     GitProviderInput,
     GitProviderProbeResult,
     GitProviderRepo,
@@ -261,9 +263,35 @@ export function useUpdateAdminGitProvider(): UseMutationResult<
     });
 }
 
-export function useDeleteAdminGitProvider(): UseMutationResult<{id: string; deleted: boolean}, Error, string> {
+/**
+ * Delete a provider AND retract its container's imported data (#264). Resolves with the
+ * server's report of what was removed, which the page states back to the admin.
+ */
+export function useDeleteAdminGitProvider(): UseMutationResult<
+    GitProviderDeleteResult,
+    Error,
+    string
+> {
     const invalidate = useInvalidateGitProviders();
     return useMutation({mutationFn: (id: string) => api.deleteAdminGitProvider(id), onSuccess: invalidate});
+}
+
+/**
+ * What deleting a provider would remove (#264) — the numbers the destructive-action
+ * confirmation states.
+ *
+ * No `enabled` parameter: the caller renders the confirmation only while it is open, so the
+ * mount is the gate. `staleTime: 0` does earn its place — the client default is 30s, and a
+ * destructive action must not be confirmed against a count that predates the last sync.
+ */
+export function useGitProviderDeleteImpact(
+    id: string,
+): UseQueryResult<GitProviderDeleteImpact, Error> {
+    return useQuery({
+        queryKey: queryKeys.adminGitProviderDeleteImpact(id),
+        queryFn: () => api.getAdminGitProviderDeleteImpact(id),
+        staleTime: 0,
+    });
 }
 
 /** Probe a saved provider by id. Resolves to {ok:false} on a reachability/auth failure. */

@@ -20,6 +20,7 @@ import {
     useAdminGitProviders,
     useCreateAdminGitProvider,
     useDeleteAdminGitProvider,
+    useGitProviderDeleteImpact,
     useSyncAdminGitProvider,
     useSyncOlderHistoryGitProvider,
     useTestAdminGitProvider,
@@ -29,12 +30,23 @@ import {
 import type {
     AdminGitProvider,
     GitProviderActiveSync,
+    GitProviderDeleteResult,
     GitProviderInput,
     GitProviderProbeResult,
     GitProviderRepo,
     GitProviderType,
 } from '../../api/types';
-import {ErrorText, PageHeader, PrimaryButton, SelectField, Table, Td, TextField, Th} from './adminUi';
+import {
+    AdminBanner,
+    ErrorText,
+    PageHeader,
+    PrimaryButton,
+    SelectField,
+    Table,
+    Td,
+    TextField,
+    Th,
+} from './adminUi';
 
 /**
  * Admin → Connectors → Git (GC1.8 / #200). Lets an admin connect, test, edit,
@@ -424,7 +436,17 @@ function ProviderFormModal({
         >
             <div className="flex flex-col gap-4">
                 <div className="flex flex-wrap items-end gap-4">
-                    <SelectField label="Provider type" value={type} onChange={changeType}>
+                    {/* Type and container are IMMUTABLE after creation (#264): together they
+                        key every imported row and every sync cursor, so moving a saved
+                        provider to a different pair would orphan the old container's data.
+                        The server refuses such a PATCH; the fields are locked here so the
+                        admin never types a change that cannot be saved. */}
+                    <SelectField
+                        label="Provider type"
+                        value={type}
+                        onChange={changeType}
+                        disabled={isEdit}
+                    >
                         {PROVIDER_TYPES.map((t) => (
                             <option key={t} value={t}>
                                 {PROVIDER_META[t].label}
@@ -436,6 +458,7 @@ function ProviderFormModal({
                         value={container}
                         onChange={setContainer}
                         placeholder={meta.containerPlaceholder}
+                        disabled={isEdit}
                     />
                     {meta.authMethods.length > 1 ? (
                         <SelectField label="Auth method" value={authMethod} onChange={setAuthMethod}>
@@ -503,9 +526,196 @@ function ProviderFormModal({
                     {testDraft.data ? <ProbeResultView result={testDraft.data} /> : null}
                     <ErrorText error={testDraft.isError ? testDraft.error : null} />
                 </div>
+
+                {isEdit ? (
+                    <p className="text-xs text-muted" data-testid="container-immutable-note">
+                        The provider type and {meta.containerLabel.toLowerCase()} cannot be changed —
+                        this provider’s imported commits, PRs and sync cursors are keyed by them. To
+                        point at a different {meta.containerLabel.toLowerCase()}, remove this provider
+                        (which also removes its imported data) and add the new one.
+                    </p>
+                ) : null}
             </div>
         </FormModal>
     );
+}
+
+/**
+ * Destructive-delete confirmation (#264). A provider delete no longer just forgets a
+ * connection — it retracts exactly that container's imported commits, PRs and snapshot
+ * contribution and purges its sync cursors. So the dialog states the REAL numbers, fetched
+ * from `/delete-impact` while it is open, rather than a generic warning.
+ *
+ * Reuses `FormModal` (the shared dialog + its close-guard-while-pending contract) instead of
+ * hand-rolling a second modal shell; only the body and the button labels differ.
+ */
+function RemoveProviderModal({
+    provider,
+    onClose,
+    onDeleted,
+}: {
+    provider: AdminGitProvider;
+    onClose: () => void;
+    /** Fired with the server's report of what was removed — the page states it back. */
+    onDeleted: (result: GitProviderDeleteResult) => void;
+}): JSX.Element {
+    const remove = useDeleteAdminGitProvider();
+    // No `enabled` gate: this component is mounted only while the confirmation is open, so
+    // the mount IS the gate — a parameter restating it would have exactly one caller passing
+    // a literal `true`.
+    const impact = useGitProviderDeleteImpact(provider.id);
+    const label = `${PROVIDER_META[provider.type].label} · ${provider.container}`;
+
+    return (
+        <FormModal
+            title={`Remove ${label}?`}
+            onClose={onClose}
+            onSubmit={() =>
+                remove.mutate(provider.id, {
+                    onSuccess: (result) => {
+                        onDeleted(result);
+                        onClose();
+                    },
+                })
+            }
+            submitLabel="Remove provider and its data"
+            pendingLabel="Removing…"
+            pending={remove.isPending}
+            // Gate the destructive action on having actually LOADED the impact: confirming
+            // against "Loading…" is confirming against nothing.
+            submitDisabled={!impact.data}
+            error={remove.isError ? remove.error : null}
+            testId="remove-provider-modal"
+        >
+            <div className="flex flex-col gap-3 text-sm">
+                {impact.isPending ? (
+                    <p className="text-muted">Checking what this would remove…</p>
+                ) : impact.isError ? (
+                    // Fail-closed (Save stays disabled) — but with a way out: one transient
+                    // 500 must not leave the admin permanently unable to remove the provider.
+                    <div className="flex flex-col items-start gap-2">
+                        <p className="text-foreground">Could not check what this would remove.</p>
+                        {/* The admin-standard inline error treatment, and the app-wide retry
+                            wording ("Try again", as ErrorState uses) — not a second spelling. */}
+                        <ErrorText error={impact.error} />
+                        <AccentButton onClick={() => void impact.refetch()} disabled={impact.isFetching}>
+                            {impact.isFetching ? 'Trying…' : 'Try again'}
+                        </AccentButton>
+                    </div>
+                ) : impact.data.cascade_skipped ? (
+                    <p className="text-foreground" data-testid="remove-impact">
+                        A config-file provider still covers <strong>{label}</strong>, so it keeps
+                        owning this data. Removing this connection deletes only the saved
+                        connection — no imported activity and no sync state are removed.
+                    </p>
+                ) : (
+                    <div data-testid="remove-impact" className="flex flex-col gap-2">
+                        <p className="text-foreground">
+                            This permanently removes everything imported from{' '}
+                            <strong>{label}</strong>:
+                        </p>
+                        <ul className="list-disc pl-5 text-muted">
+                            <li>
+                                <strong>{impact.data.days}</strong> day
+                                {impact.data.days === 1 ? '' : 's'} of history
+                                {impact.data.earliest_date && impact.data.latest_date
+                                    ? ` (${impact.data.earliest_date} → ${impact.data.latest_date})`
+                                    : ''}{' '}
+                                — {impact.data.commits} commit
+                                {impact.data.commits === 1 ? '' : 's'} from {impact.data.authors}{' '}
+                                git author{impact.data.authors === 1 ? '' : 's'}
+                            </li>
+                            <li>
+                                <strong>{impact.data.pr_records}</strong> pull-request record
+                                {impact.data.pr_records === 1 ? '' : 's'}
+                            </li>
+                            <li>
+                                <strong>{impact.data.developers_affected}</strong> developer
+                                {impact.data.developers_affected === 1 ? '' : 's'} will lose this
+                                provider’s activity from their totals
+                            </li>
+                        </ul>
+                        <p className="text-muted">
+                            Developers, their identity mappings and team membership are{' '}
+                            <strong>not</strong> removed, and no other provider’s data is touched.
+                            Re-adding {provider.container} later starts a clean import from the
+                            history window you choose.
+                        </p>
+                    </div>
+                )}
+            </div>
+        </FormModal>
+    );
+}
+
+/**
+ * What a completed delete removed, as the sentences the page banner shows.
+ *
+ * Returned as a list rather than one long string so the banner can render the caveats
+ * (`snapshot_cells_legacy_skipped`, a failed aggregate recompute) as their own lines: both
+ * describe a retraction that is INCOMPLETE, and folding them into a run-on success sentence is
+ * how an incomplete outcome comes to read as a clean one.
+ */
+export function removedSummary(result: GitProviderDeleteResult): string[] {
+    const {removed, aggregates} = result;
+    if (removed.cascade_skipped) {
+        return [
+            `Removed the saved connection for ${removed.provider} · ${removed.container}. A config-file provider still owns its data, so nothing was retracted.`,
+        ];
+    }
+    const lines = [
+        `Removed ${removed.provider} · ${removed.container}: ` +
+            `${removed.raw_author_rows} author-day row(s) and ${removed.pr_records} PR record(s) retracted ` +
+            `across ${removed.days} day(s); ${removed.snapshot_cells_retracted} snapshot cell(s) removed and ` +
+            `${removed.snapshot_cells_rewritten} recomputed from the remaining providers; ` +
+            `${removed.cursor_keys_purged} sync cursor(s) cleared. ` +
+            `${removed.developers_affected} developer(s) affected — none were deleted.`,
+    ];
+    // A refused (legacy) cell means this provider's contribution to that day is STILL counted.
+    // Reporting the totals without it would make a partial retraction look complete.
+    if (removed.snapshot_cells_legacy_skipped > 0) {
+        lines.push(
+            `${removed.snapshot_cells_legacy_skipped} snapshot cell(s) could NOT be retracted: they hold ` +
+                'pre-upgrade totals the projection cannot reconstruct, so those days still include this ' +
+                'provider’s activity.',
+        );
+    }
+    if (aggregates.error !== null) {
+        // Report what DID land: the recompute commits one period at a time, so claiming nothing
+        // happened would send the operator hunting for a problem that may be half-fixed.
+        lines.push(
+            `The derived rollups were only partly recomputed (${aggregates.error}). ` +
+                `${aggregates.periods} trend period(s) and ${aggregates.coachingPeriods} coaching ` +
+                'period(s) did land; the rest still include the removed activity. ' +
+                `Run \`toprope aggregate backfill --from ${aggregates.from ?? ''} --to ${aggregates.to ?? ''}\` ` +
+                'to rebuild the trend rollups — note that command does not cover PR-review or ' +
+                'coaching metrics, which the next scheduled weekly/monthly job refreshes only for ' +
+                'its recent trailing window.',
+        );
+    } else if (aggregates.periods > 0) {
+        lines.push(
+            `${aggregates.periods} trend aggregate period(s) and ${aggregates.coachingPeriods} ` +
+                `coaching period(s) recomputed for ${aggregates.from} → ${aggregates.to}.`,
+        );
+    }
+    if (aggregates.truncated) {
+        // The remedy belongs here as much as on the error branch: a capped range is the one case
+        // where the delete succeeded completely and the rollups are still knowingly stale.
+        lines.push(
+            `The recomputed range was capped at ${aggregates.from} → ${aggregates.to}; periods outside ` +
+                'it were not rebuilt and still include the removed activity. Run ' +
+                `\`toprope aggregate backfill --from <the oldest affected day> --to ${aggregates.from ?? ''}\` ` +
+                'to rebuild them.',
+        );
+    }
+    if (aggregates.anomaliesNotRescanned) {
+        lines.push(
+            'Anomaly alerts for this range were deliberately not re-scanned — re-scanning would raise ' +
+                'new “activity dropped” alerts for the removal itself. Existing alerts may still refer ' +
+                'to the removed activity.',
+        );
+    }
+    return lines;
 }
 
 /** Default client-side page size for the repo table (#213); adjustable via the
@@ -884,14 +1094,17 @@ function ProviderRow({
     onEdit,
     promptScope,
     onScopeClose,
+    onDeleted,
 }: {
     provider: AdminGitProvider;
     onEdit: (p: AdminGitProvider) => void;
     promptScope: boolean;
     onScopeClose: () => void;
+    /** Bubbled to the page: the row unmounts on delete, so the report can't live here. */
+    onDeleted: (result: GitProviderDeleteResult) => void;
 }): JSX.Element {
     const update = useUpdateAdminGitProvider();
-    const remove = useDeleteAdminGitProvider();
+    const [removeOpen, setRemoveOpen] = useState(false);
     const sync = useSyncAdminGitProvider();
     const syncOlder = useSyncOlderHistoryGitProvider();
     const test = useTestAdminGitProvider();
@@ -1096,11 +1309,14 @@ function ProviderRow({
                                 >
                                     Edit
                                 </button>
+                                {/* Destructive since #264 — it retracts this container's
+                                    imported data too, so it goes through a confirmation
+                                    that states what will be removed. */}
                                 <button
                                     type="button"
-                                    onClick={() => remove.mutate(provider.id)}
-                                    disabled={remove.isPending}
-                                    className="text-sm font-medium text-danger hover:underline disabled:opacity-50"
+                                    onClick={() => setRemoveOpen(true)}
+                                    aria-haspopup="dialog"
+                                    className="text-sm font-medium text-danger hover:underline"
                                 >
                                     Remove
                                 </button>
@@ -1148,6 +1364,13 @@ function ProviderRow({
                 rows is legal — no DOM ends up inside the table. */}
             {scopeVisible && !isConfig ? (
                 <RepoScopeModal provider={provider} onClose={closeScope} prompt={promptScope} />
+            ) : null}
+            {removeOpen && !isConfig ? (
+                <RemoveProviderModal
+                    provider={provider}
+                    onClose={() => setRemoveOpen(false)}
+                    onDeleted={onDeleted}
+                />
             ) : null}
         </>
     );
@@ -1206,6 +1429,9 @@ export function AdminGitProviders(): JSX.Element {
     // repo-scope editor open, prompting a selection before the first sync.
     // Cleared when that editor closes (save or cancel) so it never re-prompts.
     const [justCreatedId, setJustCreatedId] = useState<string | null>(null);
+    // What the last delete actually removed (#264). Held at page level because the row that
+    // triggered it has unmounted by the time the report arrives.
+    const [lastRemoved, setLastRemoved] = useState<GitProviderDeleteResult | null>(null);
 
     const providerList = providers.data ?? [];
     const hasProviders = providerList.length > 0;
@@ -1230,6 +1456,24 @@ export function AdminGitProviders(): JSX.Element {
                     </PrimaryButton>
                 }
             />
+            {/* The delete is destructive, so its OUTCOME is reported rather than left silent
+                (#264): the admin sees exactly how much history was retracted, and that no
+                developer was deleted. Rendered ABOVE the empty state deliberately — deleting
+                your only provider satisfies both conditions on the same render, and the report
+                of what just happened must not sit below a "nothing here yet" panel. */}
+            {lastRemoved ? (
+                <AdminBanner
+                    tone="warning"
+                    testId="provider-removed-banner"
+                    onDismiss={() => setLastRemoved(null)}
+                >
+                    {removedSummary(lastRemoved).map((line, i) => (
+                        <p key={line} className={i === 0 ? undefined : 'mt-1'}>
+                            {line}
+                        </p>
+                    ))}
+                </AdminBanner>
+            ) : null}
             {showEmptyState ? <GitEmptyState /> : null}
             {/* No form renders until the admin asks for one. Keyed so add ⇄ edit
                 ⇄ another row always remounts clean fields (#236 criterion 3). */}
@@ -1280,6 +1524,7 @@ export function AdminGitProviders(): JSX.Element {
                                 onEdit={formModal.openEdit}
                                 promptScope={p.id === justCreatedId}
                                 onScopeClose={() => setJustCreatedId(null)}
+                                onDeleted={setLastRemoved}
                             />
                         ))}
                     </Table>

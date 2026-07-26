@@ -30,6 +30,7 @@ function insertRaw(db: Database.Database, overrides: Record<string, unknown> = {
     const row = {
         id: 'r1',
         provider: 'github',
+        container: 'acme',
         raw_author_key: 'github:login:alice',
         author_login: 'alice',
         author_email: 'alice@example.com',
@@ -53,19 +54,19 @@ function insertRaw(db: Database.Database, overrides: Record<string, unknown> = {
     };
     db.prepare(
         `INSERT INTO raw_author_daily
-         (id, provider, raw_author_key, author_login, author_email, author_display_name,
+         (id, provider, container, raw_author_key, author_login, author_email, author_display_name,
           date, commits, lines_added, lines_removed, files_changed, prs_opened, prs_merged,
           review_comments_given, avg_time_to_merge_hours, code_churn_rate, ai_signature_score,
           avg_commit_size, commit_burst_count, first_seen, last_seen)
          VALUES
-         (@id, @provider, @raw_author_key, @author_login, @author_email, @author_display_name,
+         (@id, @provider, @container, @raw_author_key, @author_login, @author_email, @author_display_name,
           @date, @commits, @lines_added, @lines_removed, @files_changed, @prs_opened, @prs_merged,
           @review_comments_given, @avg_time_to_merge_hours, @code_churn_rate, @ai_signature_score,
           @avg_commit_size, @commit_burst_count, @first_seen, @last_seen)`,
     ).run(row);
 }
 
-describe('migration 040 — raw_author_daily schema (#252)', () => {
+describe('raw_author_daily schema (040 / #252, widened by 042 / #264)', () => {
     let db: Database.Database;
 
     beforeEach(() => {
@@ -82,15 +83,16 @@ describe('migration 040 — raw_author_daily schema (#252)', () => {
         expect(tableExists(db, 'raw_author_daily')).toBe(true);
     });
 
-    it('creates both documented indexes', () => {
+    it('creates every documented index, incl. the container scan the delete cascade uses', () => {
         expect(indexExists(db, 'idx_raw_author_daily_key')).toBe(true);
         expect(indexExists(db, 'idx_raw_author_daily_date')).toBe(true);
+        expect(indexExists(db, 'idx_raw_author_daily_container')).toBe(true);
     });
 
     it('has exactly the specified columns', () => {
         expect(columnNames(db, 'raw_author_daily').sort()).toEqual(
             [
-                'id', 'provider', 'raw_author_key', 'author_login', 'author_email',
+                'id', 'provider', 'container', 'raw_author_key', 'author_login', 'author_email',
                 'author_display_name', 'date', 'commits', 'lines_added', 'lines_removed',
                 'files_changed', 'prs_opened', 'prs_merged', 'review_comments_given',
                 'avg_time_to_merge_hours', 'code_churn_rate', 'ai_signature_score',
@@ -122,9 +124,27 @@ describe('migration 040 — raw_author_daily schema (#252)', () => {
         ).not.toThrow();
     });
 
-    it('enforces UNIQUE(provider, raw_author_key, date)', () => {
+    it('enforces UNIQUE(provider, container, raw_author_key, date)', () => {
         insertRaw(db);
         expect(() => insertRaw(db, {id: 'r2'})).toThrow(/UNIQUE/i);
+    });
+
+    // The whole point of #264: two workspaces of one family are two INDEPENDENT
+    // contributions to the same author-day, not one row to be merged.
+    it('allows the same key/date under a DIFFERENT container (independent attribution)', () => {
+        insertRaw(db);
+        expect(() => insertRaw(db, {id: 'r2', container: 'other-ws'})).not.toThrow();
+        expect(
+            (db.prepare('SELECT COUNT(*) AS n FROM raw_author_daily').get() as {n: number}).n,
+        ).toBe(2);
+    });
+
+    it('rejects a blank container (CHECK) — no un-attributable bucket', () => {
+        expect(() => insertRaw(db, {id: 'bad', container: ''})).toThrow();
+    });
+
+    it('rejects a NULL container (NOT NULL)', () => {
+        expect(() => insertRaw(db, {id: 'bad', container: null})).toThrow();
     });
 
     it('allows the same key on a DIFFERENT date, and a different key on the same date', () => {
