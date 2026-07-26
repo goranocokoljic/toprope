@@ -5,7 +5,13 @@ import {afterEach, beforeEach, describe, expect, it, vi, type Mock} from 'vitest
 import {cleanup, fireEvent, render, screen, waitFor, within} from '@testing-library/react';
 import {QueryClient, QueryClientProvider} from '@tanstack/react-query';
 import {MemoryRouter} from 'react-router-dom';
-import {AdminGitProviders, parseReposList, repoScopeLabel, syncProgressLabel} from '../pages/admin/AdminGitProviders';
+import {
+    AdminGitProviders,
+    findContainerConflict,
+    parseReposList,
+    repoScopeLabel,
+    syncProgressLabel,
+} from '../pages/admin/AdminGitProviders';
 import {gitProvidersRefetchInterval} from '../hooks/useAdmin';
 import type {
     AdminGitProvider,
@@ -2378,5 +2384,168 @@ describe('AdminGitProviders — empty-state onboarding (#201)', () => {
         // Wait for the loaded (empty) list to settle, then assert no onboarding.
         await screen.findByText(/No providers connected yet/);
         expect(screen.queryByTestId('git-empty-state')).not.toBeInTheDocument();
+    });
+});
+
+/**
+ * #266 — the duplicate container is caught WHILE TYPING, beside the field, instead of only
+ * after a pointless round-trip to the server.
+ *
+ * The comparison runs through the SERVER's `sameContainer`, so the case/whitespace variants
+ * that used to create a second independent (and permanently double-counting) data set are all
+ * flagged. It is an affordance, not the guard: the last test here proves the server's 409
+ * still lands inline when the loaded list was stale.
+ */
+describe('findContainerConflict (#266)', () => {
+    const rows: AdminGitProvider[] = [DB_GITHUB, CONFIG_GITLAB];
+
+    it('matches exact, case-variant and whitespace-padded containers', () => {
+        for (const typed of ['acme-org', 'ACME-ORG', 'Acme-Org ', '  acme-org']) {
+            expect(findContainerConflict(rows, 'github', typed, null)?.id).toBe('p-gh');
+        }
+    });
+
+    it('is scoped to the provider TYPE, and misses a free container', () => {
+        // One container NAME under two families is two different data sets — not a conflict.
+        expect(findContainerConflict(rows, 'gitlab', 'acme-org', null)).toBeNull();
+        expect(findContainerConflict(rows, 'github', 'unclaimed', null)).toBeNull();
+    });
+
+    it('matches a read-only config-file provider too', () => {
+        expect(findContainerConflict(rows, 'gitlab', 'TEAM ', null)?.id).toBe('config:gitlab:team');
+    });
+
+    it('excludes the provider being edited, so a row never collides with itself', () => {
+        expect(findContainerConflict(rows, 'github', 'acme-org', 'p-gh')).toBeNull();
+        // …but still catches a DIFFERENT row.
+        expect(findContainerConflict(rows, 'gitlab', 'team', 'p-gh')?.id).toBe('config:gitlab:team');
+    });
+
+    it('treats a blank/whitespace-only container as unfinished, not as a conflict', () => {
+        expect(findContainerConflict(rows, 'github', '', null)).toBeNull();
+        expect(findContainerConflict(rows, 'github', '   ', null)).toBeNull();
+    });
+});
+
+describe('AdminGitProviders — inline duplicate-container validation (#266)', () => {
+    /** The container input's inline error message, or null when none is shown. */
+    function containerError(): string | null {
+        const field = screen.getByLabelText('Organization');
+        const describedBy = field.getAttribute('aria-describedby');
+        if (!describedBy) return null;
+        return document.getElementById(describedBy)?.textContent ?? null;
+    }
+
+    function saveButton(): HTMLButtonElement {
+        return screen.getByRole('button', {name: 'Add provider'}) as HTMLButtonElement;
+    }
+
+    it.each([
+        ['an exact match', 'acme-org'],
+        ['a case variant', 'ACME-ORG'],
+        ['a trailing space', 'acme-org '],
+        ['a leading space + mixed case', ' Acme-Org'],
+    ])('flags %s inline beside the field and blocks Save', async (_label, typed) => {
+        renderPage();
+        await screen.findByText('acme-org');
+        openAddModal();
+
+        // A free container: no error, and Save is gated only by the missing token.
+        fireEvent.change(screen.getByLabelText('Organization'), {target: {value: 'brand-new'}});
+        fireEvent.change(screen.getByLabelText('Token'), {target: {value: 'ghp_secret'}});
+        expect(containerError()).toBeNull();
+        expect(saveButton()).not.toBeDisabled();
+
+        fireEvent.change(screen.getByLabelText('Organization'), {target: {value: typed}});
+        // Names the existing provider as the table spells it, and says why.
+        expect(containerError()).toContain('GitHub · acme-org');
+        expect(containerError()).toContain('already connected');
+        expect(screen.getByLabelText('Organization')).toHaveAttribute('aria-invalid', 'true');
+        expect(saveButton()).toBeDisabled();
+
+        // Correcting the value clears the error and re-enables Save.
+        fireEvent.change(screen.getByLabelText('Organization'), {target: {value: 'acme-org-2'}});
+        expect(containerError()).toBeNull();
+        expect(screen.getByLabelText('Organization')).not.toHaveAttribute('aria-invalid');
+        expect(saveButton()).not.toBeDisabled();
+
+        // Nothing was ever sent for the colliding value.
+        expect(lastCall(/\/git\/providers$/, 'POST')).toBeUndefined();
+    });
+
+    it('flags a container owned by a read-only CONFIG-FILE provider, with its own remediation', async () => {
+        renderPage();
+        await screen.findByText('acme-org');
+        openAddModal();
+        // The config-file row is a GitLab group, so switch type first.
+        fireEvent.change(screen.getByRole('combobox', {name: 'Provider type'}), {
+            target: {value: 'gitlab'},
+        });
+        fireEvent.change(screen.getByLabelText('Group'), {target: {value: 'TEAM '}});
+        fireEvent.change(screen.getByLabelText('Token'), {target: {value: 'glpat-x'}});
+
+        const field = screen.getByLabelText('Group');
+        const message = document.getElementById(field.getAttribute('aria-describedby') ?? '')
+            ?.textContent;
+        expect(message).toContain('config-file provider');
+        expect(message).toContain('GitLab · team');
+        expect(screen.getByRole('button', {name: 'Add provider'})).toBeDisabled();
+    });
+
+    it('does NOT flag a provider as its own duplicate when editing it (AC8)', async () => {
+        renderPage();
+        await screen.findByText('acme-org');
+        openEditModal('acme-org');
+
+        // The container is pre-filled with this provider's own value and is immutable (#264).
+        expect((screen.getByLabelText('Organization') as HTMLInputElement).value).toBe('acme-org');
+        expect(containerError()).toBeNull();
+        const save = screen.getByRole('button', {name: 'Save changes'});
+        expect(save).not.toBeDisabled();
+
+        // Saving without touching it goes through.
+        fireEvent.click(save);
+        await waitFor(() => expect(lastCall(/\/git\/providers\/[^/]+$/, 'PATCH')).toBeDefined());
+    });
+
+    it('keeps the server 409 authoritative: a STALE list still surfaces it inline (AC10)', async () => {
+        // The list the client loaded does NOT contain the provider, so its own check passes —
+        // exactly the window where another admin connected it between load and submit. The
+        // server refuses, and the dialog must stay open and render that message.
+        providers = [];
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const u = String(url);
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (/\/admin\/data-sources$/.test(u)) {
+                return json({data: {connectors: [], git_providers: []}});
+            }
+            if (/\/git\/providers$/.test(u) && method === 'POST') {
+                return json(
+                    {
+                        error: 'Conflict',
+                        message:
+                            "A github provider for 'acme-org' already exists — it is owned by the connected provider p-gh.",
+                    },
+                    409,
+                );
+            }
+            if (/\/git\/providers$/.test(u)) return json({data: providers});
+            return json({error: 'not found'}, 404);
+        });
+
+        renderPage();
+        await screen.findByText(/No providers connected yet/);
+        openAddModal();
+        fireEvent.change(screen.getByLabelText('Organization'), {target: {value: 'acme-org'}});
+        fireEvent.change(screen.getByLabelText('Token'), {target: {value: 'ghp_secret'}});
+        // No client-side error — the client cannot know.
+        expect(containerError()).toBeNull();
+        fireEvent.click(saveButton());
+
+        // The server's typed message lands inside the still-open dialog.
+        expect(
+            await screen.findByText(/already exists — it is owned by the connected provider p-gh/),
+        ).toBeInTheDocument();
+        expect(screen.getByRole('dialog', {name: 'Add git provider'})).toBeInTheDocument();
     });
 });

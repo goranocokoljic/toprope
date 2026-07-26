@@ -48,7 +48,29 @@ describe('resolveGitProviderConfigs', () => {
             providers: [{type: 'bitbucket', auth: {type: 'oauth', token: 't'}}],
         });
         expect(resolved).toHaveLength(1);
-        expect(providerContainer(resolved[0])).toBeUndefined();
+        // '' — not `undefined` — since #266: `providerContainer` normalizes, and that
+        // normalization is TOTAL over the untrusted config entries this resolver
+        // deliberately passes through. A missing container becomes the blank container the
+        // write guards refuse by name, instead of `undefined` leaking into a
+        // `${type}:${container}` cursor key (or throwing where sync builds those keys,
+        // which is outside its per-provider try/catch).
+        expect(providerContainer(resolved[0])).toBe('');
+    });
+
+    it('normalizes case and surrounding whitespace on every provider type (#266)', () => {
+        const resolved = resolveGitProviderConfigs({
+            enabled: true,
+            providers: [
+                {type: 'github', org: '  Wireless_Media ', auth: {type: 'token', api_token: 't'}},
+                {type: 'bitbucket', workspace: 'ACME-WS', auth: {type: 'oauth', token: 't'}},
+                {type: 'gitlab', group: ' Platform\t', auth: {type: 'oauth', token: 't'}},
+            ],
+        });
+        expect(resolved.map((c) => providerContainer(c))).toEqual([
+            'wireless_media',
+            'acme-ws',
+            'platform',
+        ]);
     });
 
     it('falls back to the github shorthand when org + token are set', () => {

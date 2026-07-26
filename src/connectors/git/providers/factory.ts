@@ -9,9 +9,15 @@ import type {
 import {GitHubProvider} from './github.js';
 import {BitbucketProvider} from './bitbucket.js';
 import {GitLabProvider} from './gitlab.js';
+import {isBlankContainer} from './container.js';
 
+// The container checks below use `isBlankContainer`, not `!config.org` (#266): a plain
+// truthiness test passes '   ', which then reaches the pipeline as a real container and — since
+// #264 — as a real attribution key. This is the canonical validation seam `createGitProvider`
+// runs on every sync/probe path, so closing it here also stops a whitespace-only org from
+// being fetched under, not just from being stored.
 function validateGitHub(config: GitHubProviderConfig): void {
-    if (!config.org) {
+    if (isBlankContainer(config.org)) {
         throw new Error('GitHub provider requires org');
     }
     if (!config.auth?.api_token) {
@@ -20,7 +26,7 @@ function validateGitHub(config: GitHubProviderConfig): void {
 }
 
 function validateBitbucket(config: BitbucketProviderConfig): void {
-    if (!config.workspace) {
+    if (isBlankContainer(config.workspace)) {
         throw new Error('Bitbucket provider requires workspace');
     }
     if (config.auth.type === 'app_password') {
@@ -37,7 +43,7 @@ function validateBitbucket(config: BitbucketProviderConfig): void {
 }
 
 function validateGitLab(config: GitLabProviderConfig): void {
-    if (!config.group) {
+    if (isBlankContainer(config.group)) {
         throw new Error('GitLab provider requires group');
     }
     if (!config.auth?.token) {

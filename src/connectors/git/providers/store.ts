@@ -28,6 +28,7 @@ import {randomUUID} from 'crypto';
 import {validateGitProviderConfig} from './factory.js';
 import {providerConfigToRowFields, rowToProviderConfig, type GitProviderRow} from './codec.js';
 import {decryptSecret, encryptSecret, type SecretMeta, type ServerKeyResult} from './secret.js';
+import {isBlankContainer, normalizeContainer} from './container.js';
 import type {GitProviderConfig, GitProviderType} from './types.js';
 
 /** The mask shown in place of a secret — a fixed run of bullets, never key material. */
@@ -42,15 +43,17 @@ export type GitProviderStoreErrorCode =
     | 'secret_key_unconfigured'
     | 'not_found'
     | 'duplicate_container'
-    | 'container_immutable';
+    | 'container_immutable'
+    | 'blank_container';
 
 /**
  * A fail-closed refusal from the store: the server key is unconfigured/invalid
  * (`secret_key_unconfigured`), the target row does not exist (`not_found`), the
  * `(type, container)` pair is already owned by another provider
- * (`duplicate_container`), or a write tried to move an existing provider to a
+ * (`duplicate_container`), a write tried to move an existing provider to a
  * different `(type, container)` (`container_immutable`, #264 — see
- * {@link updateProvider}). Typed so the API layer maps it to a real status instead of
+ * {@link updateProvider}), or the container was empty once normalized
+ * (`blank_container`, #266). Typed so the API layer maps it to a real status instead of
  * leaking a raw DB error (data-integrity review-rule: validate existence + return a
  * typed error).
  */
@@ -204,6 +207,24 @@ function requireKey(keyResult: ServerKeyResult): Extract<ServerKeyResult, {ok: t
     return keyResult.key;
 }
 
+// Refuse a container that is empty once normalized (#266). `git_providers.container` is
+// only NOT NULL — an empty string satisfies it — and the factory's `!config.org` check
+// passes any whitespace-only value because '   ' is truthy. So without this guard a
+// container of spaces reached the row, where `(type, '')` is a real key that two different
+// workspaces could both be filed under: exactly the collapsed attribution bucket #264
+// exists to remove, and one that `UNIQUE(type, container)` would then hand a raw
+// SQLITE_CONSTRAINT for on the second write. Typed and fail-closed at the write boundary,
+// for BOTH create and update.
+function requireContainer(type: GitProviderType, container: string): void {
+    if (isBlankContainer(container)) {
+        throw new GitProviderStoreError(
+            'blank_container',
+            `A ${type} provider requires a container (its org/workspace/group); ` +
+                'the value given was empty or only whitespace.',
+        );
+    }
+}
+
 /**
  * The provider that owns a `(type, container)` pair, or `undefined` when it is free.
  *
@@ -213,6 +234,16 @@ function requireKey(keyResult: ServerKeyResult): Extract<ServerKeyResult, {ok: t
  * `UNIQUE(type, container)`. This is the canonical reader for that pair — the create/update
  * guards below and the admin API's 409s all go through it rather than re-deriving the
  * lookup, so "who owns this container" has one definition.
+ *
+ * The lookup is NORMALIZED (#266). SQLite's `=` on TEXT is case-sensitive and nothing
+ * trims, so a raw comparison answered "free" for `wireless_media` while `Wireless_Media`
+ * sat in the table — and since #264 that means two independent data sets for one real
+ * workspace, i.e. a permanent double-count through the front door of the guard added to
+ * prevent it. Every stored `container` is written through `providerConfigToRowFields` →
+ * `providerContainer`, so the column already holds the normalized form (migration 043
+ * normalizes pre-#266 rows); re-applying the idempotent normalization to the ARGUMENT is
+ * the defensive half, so a caller that hands over raw admin input still resolves to the
+ * same owner the write would collide with.
  */
 export function findProviderByTypeContainer(
     db: Database.Database,
@@ -221,7 +252,7 @@ export function findProviderByTypeContainer(
 ): GitProviderRecord | undefined {
     return db
         .prepare('SELECT * FROM git_providers WHERE type = ? AND container = ?')
-        .get(type, container) as GitProviderRecord | undefined;
+        .get(type, normalizeContainer(container)) as GitProviderRecord | undefined;
 }
 
 /**
@@ -233,6 +264,11 @@ export function findProviderByTypeContainer(
  * `duplicate_container` (#264), so the caller can name the owner instead of surfacing a raw
  * `SQLITE_CONSTRAINT`. The check-then-insert runs in ONE transaction: the UNIQUE index is a
  * fail-fast backstop against a race, it does not serialize one.
+ *
+ * The container the guard compares IS the container the INSERT writes — one
+ * `fields.container`, produced once by the codec's normalizing extraction (#266/#255).
+ * A container that is blank once normalized is refused with a typed `blank_container`
+ * before any write.
  */
 export function createProvider(
     db: Database.Database,
@@ -240,11 +276,17 @@ export function createProvider(
     input: CreateProviderInput,
 ): GitProviderRecord {
     const key = requireKey(keyResult);
-    // Validate BEFORE encrypting so a bad shape / missing token surfaces the
-    // factory's clear message, not the crypto layer's empty-secret guard.
+    // The container is checked FIRST, against the NORMALIZED value the row will hold, so a
+    // whitespace-only container reports what is actually wrong ("requires a container")
+    // rather than whichever other field the factory happens to complain about first — and so
+    // this write-boundary guard is the authoritative one, not an unreachable duplicate of the
+    // factory's (review-rule: allowlist/validate inside the write function itself).
+    const fields = providerConfigToRowFields(input.config);
+    requireContainer(fields.type, fields.container);
+    // Then validate the rest of the shape, still BEFORE encrypting, so a bad shape / missing
+    // token surfaces the factory's clear message and not the crypto layer's empty-secret guard.
     validateGitProviderConfig(input.config);
 
-    const fields = providerConfigToRowFields(input.config);
     const token = tokenOf(input.config);
     const encrypted = encryptSecret(token, key);
 
@@ -368,8 +410,10 @@ export function updateProvider(
             : decryptSecret(existing.token_ciphertext, JSON.parse(existing.token_meta) as SecretMeta, key);
 
         const config = withToken(patch.config, validationToken);
-        validateGitProviderConfig(config);
+        // Container first, for the same reason as create (see above).
         const fields = providerConfigToRowFields(config);
+        requireContainer(fields.type, fields.container);
+        validateGitProviderConfig(config);
 
         // The attribution key is immutable — see the doc above. Checked here, inside the
         // write transaction, so no caller can bypass it (the admin route validates the
@@ -383,9 +427,15 @@ export function updateProvider(
         // exists to refuse. (The converse — two instances that both have a group named
         // `platform` — is not connectable under `UNIQUE(type, container)`; that limitation is
         // stated in the 409 rather than worked around here.)
+        //
+        // Both sides of the container comparison are NORMALIZED (#266): `fields.container`
+        // by the codec, `existing.container` because every stored row was written through the
+        // same path (migration 043 normalizes pre-#266 rows). Re-normalizing the stored value
+        // is what keeps "re-typing the same workspace in different case" a NO-OP rather than
+        // a refused move — the pair did not actually change, so refusing would be a lie.
         if (
             fields.type !== existing.type ||
-            fields.container !== existing.container ||
+            fields.container !== normalizeContainer(existing.container) ||
             fields.url !== existing.url
         ) {
             throw new GitProviderStoreError(

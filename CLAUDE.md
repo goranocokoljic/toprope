@@ -41,6 +41,10 @@ No proxy, no traffic interception. Pure API-pull + git analysis.
   licensed only as a pre-production reset, and it is what makes the cascade *complete*: a
   legacy cell can never be retracted by the projection, so leaving any behind would make every
   later provider delete silently partial. No runtime path may do this.
+  **Migration 043 (#266)** also drops projected cells, but strictly WITHIN the `is_projected`
+  bound and only when the database actually holds a non-normalized `container` — the raw rows
+  it clears alongside them cannot be honestly re-attributed to one spelling, so the days they
+  fed have to be re-projected by a resync. Legacy cells are left untouched there.
   `tool_snapshots` and every other snapshot table remain strictly append-only.
 - Waste detection: subscription with zero activity for 14+ days = unused
 - Data quality tracked per data point: high (API), medium (git), low (expense only)

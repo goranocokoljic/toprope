@@ -1,5 +1,6 @@
 import type {GitProviderConfig, GitProviderType} from './types.js';
 import type {GitConnectorConfig} from '../../../config/types.js';
+import {normalizeContainer} from './container.js';
 
 // Resolve the list of git provider configs from a git connector config.
 // Prefers the explicit `providers` array; falls back to the legacy
@@ -40,19 +41,40 @@ export function resolveGitProviderConfigs(config: GitConnectorConfig): GitProvid
     ];
 }
 
-// The container identifier for a provider — org (GitHub), workspace (Bitbucket),
-// group (GitLab). The canonical extraction reused wherever a raw container value
-// is needed (sync state keys, the resolver's (type, container) de-dupe key) so
-// the mapping lives in exactly one place.
+/**
+ * The container identifier for a provider — org (GitHub), workspace (Bitbucket),
+ * group (GitLab). The canonical extraction reused wherever a raw container value is
+ * needed (sync state keys, the imported rows' attribution column, the resolver's
+ * (type, container) de-dupe key, the stored `git_providers.container`) so the
+ * mapping lives in exactly one place.
+ *
+ * NORMALIZED since #266. This is the single point every container consumer already
+ * goes through, so normalizing HERE is what makes "the value compared is the value
+ * persisted" a property of the code rather than a convention each caller has to
+ * remember: `providerConfigToRowFields` (the stored row), `syncStateKey` /
+ * `earliestSyncStateKey` / `stallStateKey` (the cursors), the `raw_author_daily`
+ * and `pr_records` container columns, `containerKey` (the resolver de-dupe and the
+ * delete cascade's skip check) and `configProviderId` all derive from it. A
+ * provider whose YAML or DB row spells the container `Wireless_Media ` therefore
+ * resolves to exactly the same data as one spelling it `wireless_media` — which is
+ * what lets a delete + re-add with different casing find its existing data instead
+ * of a fresh empty set (#266 AC3).
+ */
 export function providerContainer(config: GitProviderConfig): string {
     switch (config.type) {
         case 'github':
-            return config.org;
+            return normalizeContainer(config.org);
         case 'bitbucket':
-            return config.workspace;
+            return normalizeContainer(config.workspace);
         case 'gitlab':
-            return config.group;
+            return normalizeContainer(config.group);
     }
+    // Runtime fallback, deliberately OUTSIDE the switch so the compiler still enforces
+    // exhaustiveness over the union: `resolveGitProviderConfigs` yields UNVALIDATED
+    // config-file entries, so `type` here is really untrusted text and may be a value
+    // this build doesn't know. '' is the blank container every write guard refuses —
+    // total rather than `undefined` leaking into a `${type}:${container}` key.
+    return '';
 }
 
 /**

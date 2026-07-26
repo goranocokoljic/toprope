@@ -396,7 +396,9 @@ function dbProviderToDto(
 
 // Map a typed store error to an HTTP reply. secret_key_unconfigured is a
 // fail-closed server-config condition (503, NOT 500); duplicate_container and
-// container_immutable are state conflicts (409, #264); not_found is a typed 404.
+// container_immutable are state conflicts (409, #264); blank_container is a malformed
+// request (400, #266) — the client sent no usable container, which is its bug, not a
+// conflicting state; not_found is a typed 404.
 function replyStoreError(reply: Parameters<typeof forbidden>[0], err: GitProviderStoreError): void {
     switch (err.code) {
         case 'secret_key_unconfigured':
@@ -405,6 +407,9 @@ function replyStoreError(reply: Parameters<typeof forbidden>[0], err: GitProvide
         case 'duplicate_container':
         case 'container_immutable':
             conflict(reply, err.message);
+            return;
+        case 'blank_container':
+            badRequest(reply, err.message);
             return;
         case 'not_found':
             notFound(reply, err.message);

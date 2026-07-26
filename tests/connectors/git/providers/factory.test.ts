@@ -33,6 +33,17 @@ describe('createGitProvider', () => {
             ).toThrow('GitHub provider requires org');
         });
 
+        // #266: '   ' is truthy, so the old `!config.org` check accepted it and the pipeline
+        // then fetched (and attributed rows) under a blank container.
+        it('throws when org is only whitespace', () => {
+            expect(() =>
+                createGitProvider({...validGitHub, org: '   '} as GitProviderConfig),
+            ).toThrow('GitHub provider requires org');
+            expect(() =>
+                createGitProvider({...validGitHub, org: '\t\n'} as GitProviderConfig),
+            ).toThrow('GitHub provider requires org');
+        });
+
         it('throws when api_token is missing', () => {
             expect(() =>
                 createGitProvider({
@@ -53,6 +64,12 @@ describe('createGitProvider', () => {
         it('throws when workspace is missing', () => {
             expect(() =>
                 createGitProvider({...validBitbucket, workspace: ''} as GitProviderConfig),
+            ).toThrow('Bitbucket provider requires workspace');
+        });
+
+        it('throws when workspace is only whitespace (#266)', () => {
+            expect(() =>
+                createGitProvider({...validBitbucket, workspace: '  '} as GitProviderConfig),
             ).toThrow('Bitbucket provider requires workspace');
         });
 
@@ -105,6 +122,12 @@ describe('createGitProvider', () => {
         it('throws when group is missing', () => {
             expect(() =>
                 createGitProvider({...validGitLab, group: ''} as GitProviderConfig),
+            ).toThrow('GitLab provider requires group');
+        });
+
+        it('throws when group is only whitespace (#266)', () => {
+            expect(() =>
+                createGitProvider({...validGitLab, group: ' \t '} as GitProviderConfig),
             ).toThrow('GitLab provider requires group');
         });
 

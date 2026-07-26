@@ -42,6 +42,7 @@ export function TextField({
     placeholder,
     type = 'text',
     disabled = false,
+    error = null,
 }: {
     label: string;
     value: string;
@@ -55,19 +56,52 @@ export function TextField({
      * exactly the state that needs the explanation — and it is not an accessible surface.
      */
     disabled?: boolean;
+    /**
+     * A FIELD-LEVEL validation message rendered directly beneath the input (#266) — for a
+     * problem the client can see in the entered value itself, like a container that collides
+     * with an already-connected provider. Optional and defaulting to `null`, so every
+     * existing call site renders exactly what it did before.
+     *
+     * Wired to the input via `aria-invalid` + `aria-describedby` so the message is announced
+     * as part of the field rather than as unrelated text somewhere in the dialog. A
+     * server-side write error stays where it has always been — `FormModal`'s error slot;
+     * this is for validation the client performs itself, and it never replaces the server's
+     * authoritative answer.
+     */
+    error?: string | null;
 }): JSX.Element {
+    // Derived from the label so two fields in one form get distinct ids without threading an
+    // explicit id prop through every call site.
+    const errorId = `${label.replace(/\s+/g, '-').toLowerCase()}-error`;
     return (
-        <label className="flex flex-col gap-1">
-            <span className="text-xs font-medium text-muted">{label}</span>
-            <input
-                type={type}
-                value={value}
-                placeholder={placeholder}
-                disabled={disabled}
-                onChange={(e) => onChange(e.target.value)}
-                className="rounded-md border border-border bg-surface px-3 py-1.5 text-sm text-foreground disabled:opacity-50"
-            />
-        </label>
+        // The message sits OUTSIDE the <label> on purpose: a <label>'s accessible name is its
+        // whole text content, so nesting the error inside would rename the field from
+        // "Organization" to "Organization<the error>" — breaking every accessible-name lookup
+        // (and every getByLabelText) exactly when a validation error is showing. It reaches
+        // the input through `aria-describedby` instead, which is the description slot.
+        <div className="flex flex-col gap-1">
+            <label className="flex flex-col gap-1">
+                <span className="text-xs font-medium text-muted">{label}</span>
+                <input
+                    type={type}
+                    value={value}
+                    placeholder={placeholder}
+                    disabled={disabled}
+                    aria-invalid={error ? true : undefined}
+                    aria-describedby={error ? errorId : undefined}
+                    onChange={(e) => onChange(e.target.value)}
+                    className={[
+                        'rounded-md border bg-surface px-3 py-1.5 text-sm text-foreground disabled:opacity-50',
+                        error ? 'border-danger' : 'border-border',
+                    ].join(' ')}
+                />
+            </label>
+            {error ? (
+                <span id={errorId} role="alert" className="text-xs text-danger">
+                    {error}
+                </span>
+            ) : null}
+        </div>
     );
 }
 

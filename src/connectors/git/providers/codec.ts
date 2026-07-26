@@ -6,6 +6,7 @@ import type {
     GitLabProviderConfig,
 } from './types.js';
 import {validateGitProviderConfig} from './factory.js';
+import {providerContainer} from './config.js';
 
 /**
  * Lossless codec between a `git_providers` DB row and the `GitProviderConfig`
@@ -85,13 +86,22 @@ function jsonToRepos(value: string | null, column: string): string[] | undefined
 /**
  * Encode a validated config into the provider-shape column values (minus the
  * encrypted token, which the store encrypts and writes separately).
+ *
+ * `container` comes from the canonical {@link providerContainer} rather than being
+ * re-derived per type here (#266). Two reasons, and the second is the important one:
+ * the per-type mapping now lives in exactly one place, and — because
+ * `providerContainer` NORMALIZES (trim + casefold) — the value this function hands
+ * the store's duplicate guard is byte-for-byte the value the store persists and the
+ * value the pipeline's cursors and imported rows are keyed by. Deriving it twice is
+ * how #255 happened: the guard proved `alice` free and the write stored ` alice`.
  */
 export function providerConfigToRowFields(config: GitProviderConfig): GitProviderRowFields {
+    const container = providerContainer(config);
     switch (config.type) {
         case 'github':
             return {
                 type: 'github',
-                container: config.org,
+                container,
                 url: null,
                 include_subgroups: null,
                 auth_method: config.auth.type,
@@ -102,7 +112,7 @@ export function providerConfigToRowFields(config: GitProviderConfig): GitProvide
         case 'bitbucket':
             return {
                 type: 'bitbucket',
-                container: config.workspace,
+                container,
                 url: null,
                 include_subgroups: null,
                 auth_method: config.auth.type,
@@ -113,7 +123,7 @@ export function providerConfigToRowFields(config: GitProviderConfig): GitProvide
         case 'gitlab':
             return {
                 type: 'gitlab',
-                container: config.group,
+                container,
                 url: config.url ?? null,
                 include_subgroups:
                     config.include_subgroups === undefined ? null : config.include_subgroups ? 1 : 0,

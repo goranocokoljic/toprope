@@ -137,6 +137,123 @@ describe('provider store — create + read (#195)', () => {
     });
 });
 
+/**
+ * #266 — the duplicate-container guard must not be defeatable by letter case or surrounding
+ * whitespace. Before this, `Wireless_Media` and `wireless_media` were two providers for one
+ * real workspace, i.e. two independent data sets whose commits `git_snapshots` then summed.
+ */
+describe('provider store — container normalization (#266)', () => {
+    // Every write path per type, so a normalization applied to only one branch of the codec's
+    // switch would fail here.
+    const BASE: Record<string, (container: string) => GitProviderConfig> = {
+        github: (container) => ({
+            type: 'github',
+            org: container,
+            auth: {type: 'token', api_token: 'ghp_normAAAA1234'},
+        }),
+        bitbucket: (container) => ({
+            type: 'bitbucket',
+            workspace: container,
+            auth: {type: 'access_token', token: 'bb-at-NORM9012'},
+        }),
+        gitlab: (container) => ({
+            type: 'gitlab',
+            group: container,
+            auth: {type: 'personal_access_token', token: 'glpat-NORM3456'},
+        }),
+    };
+
+    // The four spellings the issue names: the original plus the three that used to slip past
+    // the guard.
+    const VARIANTS = ['wireless_media', 'WIRELESS_MEDIA', 'Wireless_Media ', '  wireless_media'];
+
+    for (const [type, make] of Object.entries(BASE)) {
+        it(`[${type}] refuses every case/whitespace variant with a typed duplicate_container`, () => {
+            const first = createProvider(db, keyOk(), {config: make('Wireless_Media')});
+            for (const variant of VARIANTS) {
+                try {
+                    createProvider(db, keyOk(), {config: make(variant)});
+                    throw new Error(`should have refused variant "${variant}"`);
+                } catch (e) {
+                    expect(e).toBeInstanceOf(GitProviderStoreError);
+                    expect((e as GitProviderStoreError).code).toBe('duplicate_container');
+                    // Names the owner, so the caller can point the admin at it.
+                    expect((e as GitProviderStoreError).message).toContain(first.id);
+                }
+            }
+            // Nothing was written by any of the refused attempts.
+            expect(listProviders(db)).toHaveLength(1);
+        });
+
+        it(`[${type}] STORES the same normalized value the guard compared`, () => {
+            // The #255 regression shape: the guard normalized, the write stored raw, so the
+            // identifier proved free was not the identifier claimed. Asserted directly off
+            // the row, not inferred from the guard's behavior.
+            const rec = createProvider(db, keyOk(), {config: make('  Wireless_Media ')});
+            expect(rec.container).toBe('wireless_media');
+            const stored = db
+                .prepare('SELECT container FROM git_providers WHERE id = ?')
+                .get(rec.id) as {container: string};
+            expect(stored.container).toBe('wireless_media');
+            // And the canonical reader resolves it from ANY spelling — which is what makes
+            // the value that was stored the value a later claim collides with.
+            for (const variant of VARIANTS) {
+                expect(
+                    findProviderByTypeContainer(db, type as GitProviderRecord['type'], variant)?.id,
+                ).toBe(rec.id);
+            }
+        });
+
+        it(`[${type}] refuses a whitespace-only container with a typed error, not SQLITE_CONSTRAINT`, () => {
+            for (const blank of ['', '   ', '\t\n']) {
+                try {
+                    createProvider(db, keyOk(), {config: make(blank)});
+                    throw new Error(`should have refused blank container ${JSON.stringify(blank)}`);
+                } catch (e) {
+                    expect(e).toBeInstanceOf(GitProviderStoreError);
+                    expect((e as GitProviderStoreError).code).toBe('blank_container');
+                    // Not a raw DB failure leaking through.
+                    expect((e as Error).message).not.toContain('SQLITE_CONSTRAINT');
+                }
+            }
+            expect(listProviders(db)).toHaveLength(0);
+        });
+    }
+
+    it('re-typing the same container in different case is a NO-OP update, not container_immutable', () => {
+        // The pair did not actually change, so refusing the PATCH would be a lie — and the
+        // admin UI's edit form re-sends the container on every save.
+        const rec = createProvider(db, keyOk(), {config: BASE.github('Wireless_Media')});
+        const updated = updateProvider(db, keyOk(), rec.id, {
+            config: BASE.github('WIRELESS_MEDIA '),
+        });
+        expect(updated.container).toBe('wireless_media');
+        expect(listProviders(db)).toHaveLength(1);
+    });
+
+    it('a PATCH onto a genuinely different container is still refused as container_immutable', () => {
+        const rec = createProvider(db, keyOk(), {config: BASE.github('wireless_media')});
+        try {
+            updateProvider(db, keyOk(), rec.id, {config: BASE.github('other-org')});
+            throw new Error('should have thrown');
+        } catch (e) {
+            expect((e as GitProviderStoreError).code).toBe('container_immutable');
+        }
+        expect(getProvider(db, rec.id)?.container).toBe('wireless_media');
+    });
+
+    it('a PATCH cannot blank the container', () => {
+        const rec = createProvider(db, keyOk(), {config: BASE.github('wireless_media')});
+        try {
+            updateProvider(db, keyOk(), rec.id, {config: BASE.github('   ')});
+            throw new Error('should have thrown');
+        } catch (e) {
+            expect((e as GitProviderStoreError).code).toBe('blank_container');
+        }
+        expect(getProvider(db, rec.id)?.container).toBe('wireless_media');
+    });
+});
+
 describe('provider store — fail-closed on the server key (#195)', () => {
     it('rejects create when the server key is unconfigured (no plaintext-at-rest)', () => {
         expect(() => createProvider(db, keyMissing(), {config: GITHUB})).toThrow(GitProviderStoreError);
