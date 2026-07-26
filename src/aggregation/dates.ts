@@ -13,6 +13,35 @@
  */
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * Is `value` the canonical UTC day SHAPE (YYYY-MM-DD)?
+ *
+ * The shape check alone, without {@link assertValidDate}'s calendar validation — for callers
+ * that must pin the shape BEFORE comparing two day strings with `<`/`>`, because a
+ * non-conforming value (`'not-a-date'`) byte-sorts arbitrarily and would silently invert the
+ * comparison rather than failing. Exposed as a predicate so those callers do not each carry
+ * their own copy of the regex.
+ */
+export function isUtcDay(value: string): boolean {
+    return DATE_RE.test(value);
+}
+
+/** Today as a YYYY-MM-DD key in UTC, matching the daily-snapshot keying. */
+export function todayUtc(now: Date): string {
+    return now.toISOString().slice(0, 10);
+}
+
+/**
+ * `date` shifted back `months` calendar months, returned as YYYY-MM-DD (UTC), via `Date`
+ * normalization so the result is always a valid ISO date. A day-of-month that does not exist
+ * in the target month normalizes FORWARD (Jan 31 − 1mo → Mar 3), which for a range floor only
+ * ever shortens the span — never lengthens it past the caller's intended bound.
+ */
+export function subtractMonths(date: string, months: number): string {
+    const [year, mon, day] = date.split('-').map(Number);
+    return new Date(Date.UTC(year, mon - 1 - months, day)).toISOString().slice(0, 10);
+}
 // ISO week-numbering label: YYYY-Wnn with the week zero-padded to two digits
 // (W01..W53). The summary layer keys weekly periods by this label rather than by
 // the Monday date so the period label matches the YYYY-Wnn form the numbers-only

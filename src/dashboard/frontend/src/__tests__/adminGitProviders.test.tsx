@@ -137,7 +137,6 @@ const DELETE_AGGREGATES: GitProviderDeleteResult['aggregates'] = {
     from: '2026-01-05',
     to: '2026-07-01',
     periods: 34,
-    prMetricPeriods: 32,
     coachingPeriods: 32,
     truncated: false,
     anomaliesNotRescanned: true,
@@ -820,7 +819,7 @@ describe('AdminGitProviders — list + row actions', () => {
             deleteAggregates = {
                 ...DELETE_AGGREGATES,
                 periods: 11,
-                prMetricPeriods: 8,
+                coachingPeriods: 8,
                 error: 'disk full',
             };
             const dialog = await openRemoveDialog();
@@ -832,6 +831,7 @@ describe('AdminGitProviders — list + row actions', () => {
             expect(banner.textContent).toContain('only partly recomputed');
             expect(banner.textContent).toContain('disk full');
             expect(banner.textContent).toContain('11 trend period(s)');
+            expect(banner.textContent).toContain('8 coaching period(s)');
             expect(banner.textContent).toContain('toprope aggregate backfill');
             // …and says plainly that the command does not cover the other engines.
             expect(banner.textContent).toContain('does not cover PR-review or');

@@ -43,6 +43,8 @@ import {
     enumerateMonths,
     enumerateQuarters,
     enumerateYears,
+    subtractMonths,
+    todayUtc,
 } from './dates';
 import {computeAllWeeklyAggregates} from './weekly';
 import {computeAllMonthlyAggregates} from './monthly';
@@ -90,22 +92,6 @@ export interface BackfillResult {
     periodsProcessed: number;
     /** Total aggregate rows written/overwritten across every level. */
     rowsWritten: number;
-}
-
-/** Today's date as a YYYY-MM-DD key in UTC, matching the daily-snapshot keying. */
-function todayUtc(now: Date): string {
-    return now.toISOString().slice(0, 10);
-}
-
-/**
- * `date` shifted back `months` calendar months, returned as YYYY-MM-DD (UTC),
- * via Date normalisation so the result is always a valid ISO date. (The sole
- * caller subtracts a whole year; the only day-of-month shift that produces is a
- * Feb-29 `to` normalising forward to Mar-01, which is harmless for a range bound.)
- */
-function subtractMonths(date: string, months: number): string {
-    const [year, mon, day] = date.split('-').map(Number);
-    return new Date(Date.UTC(year, mon - 1 - months, day)).toISOString().slice(0, 10);
 }
 
 /**

@@ -970,16 +970,8 @@ function retentionKeyFor(
 const providerIdentifier = providerContainer;
 
 /**
- * Sentinel owner for a container a CONFIG-FILE provider owns. Config providers have no
- * `git_providers` row by design and cannot be deleted through the API, so their ownership is
- * stable for the life of the process — one sentinel compares equal to itself across the run.
- * Not a valid uuid, so it can never collide with a real row id.
- */
-const CONFIG_OWNED = 'config-file-provider';
-
-/**
- * WHO owns `(providerType, container)` right now — the id of the `git_providers` row, the
- * {@link CONFIG_OWNED} sentinel, or `null` when nothing owns it.
+ * The id of the `git_providers` row that owns `(providerType, container)` right now, or `null`
+ * when no DB row does.
  *
  * Deliberately the owner's IDENTITY, not a boolean (#264 review SEC-2/SO-3/TST-5). A boolean
  * "is it owned?" cannot tell "the row this run was predicated on is still here" from "a
@@ -988,14 +980,17 @@ const CONFIG_OWNED = 'config-file-provider';
  * pre-delete window under a re-added provider partially undoes the delete AND resurrects the
  * forward cursor, which makes the re-added provider's first-sync window silently ignored: the
  * #262 state this issue exists to make unreachable.
+ *
+ * Config-file providers are deliberately NOT represented here. They have no `git_providers` row
+ * by design, cannot be deleted through the API, and the config cannot change mid-process — so
+ * their ownership can never change during a run, and the gate simply excludes them from the
+ * snapshot rather than giving them a synthetic owner to compare against itself.
  */
 function containerOwner(
     db: Database.Database,
     providerType: GitProviderType,
     container: string,
-    configOwnedKeys: ReadonlySet<string>,
 ): string | null {
-    if (configOwnedKeys.has(containerKeyOf(providerType, container))) return CONFIG_OWNED;
     return findProviderByTypeContainer(db, providerType, container)?.id ?? null;
 }
 
@@ -1700,8 +1695,13 @@ export class GitSync implements ConnectorInterface {
         const configOwnedKeys = new Set(resolveGitProviderConfigs(this.config).map(containerKey));
         const ownerAtStart = new Map<string, string>();
         for (const pc of providerConfigs) {
-            const owner = containerOwner(db, pc.type, providerIdentifier(pc), configOwnedKeys);
-            if (owner !== null) ownerAtStart.set(containerKey(pc), owner);
+            const key = containerKey(pc);
+            // A config-file provider's ownership cannot change mid-run (no row to delete, and the
+            // config is immutable at runtime), so it is excluded rather than tracked — an absent
+            // entry already means "writable" below.
+            if (configOwnedKeys.has(key)) continue;
+            const owner = containerOwner(db, pc.type, providerIdentifier(pc));
+            if (owner !== null) ownerAtStart.set(key, owner);
         }
         // Containers whose owner disappeared or changed while this run was fetching. Filled by
         // the gate below and reported after the write transaction commits.
@@ -1727,7 +1727,7 @@ export class GitSync implements ConnectorInterface {
             if (startOwner === undefined) return true;
             let current = ownerNow.get(key);
             if (current === undefined) {
-                current = containerOwner(db, providerType, container, configOwnedKeys);
+                current = containerOwner(db, providerType, container);
                 ownerNow.set(key, current);
                 if (current !== startOwner) orphanedContainers.add(key);
             }
@@ -1956,17 +1956,15 @@ export class GitSync implements ConnectorInterface {
                     // handed to the across-runs `max()` rule that would have kept only the
                     // larger org's count, permanently, once the cursor advanced past the window.
                     //
-                    // The branch is RETAINED for the one shape that still reaches it: the SAME
-                    // container appearing twice in one run's provider set. `UNIQUE(type,
-                    // container)` cannot prevent that — it constrains `git_providers` rows, and
-                    // the resolver only de-dupes config entries against DB rows, never config
-                    // against config — so a YAML `providers:` list naming one org twice yields
-                    // two identical containers in a single run. Note those two sides are the
-                    // SAME commits fetched twice, so summing them double-counts; the merge here
-                    // is the least-bad option (dropping one would lose a genuinely different
-                    // org's data in the case this rule was written for) and the real fix is to
-                    // de-dupe the resolved provider list. Pre-existing either way: the old
-                    // family-keyed dedupe summed that shape too.
+                    // The branch is RETAINED as defence-in-depth for a caller that reaches
+                    // `syncProviders(db, configs)` with the SAME container twice. Both routes that
+                    // build the list are now closed to it — `UNIQUE(type, container)` for DB rows,
+                    // and `resolveAllGitProviders` de-dupes config-against-DB *and*
+                    // config-against-config (#264) — so this is unreachable through either, and
+                    // only a direct programmatic caller bypassing the resolver can produce it.
+                    // Summing is the right rule for the shape it was written for (two genuinely
+                    // different orgs on one author-day); for a literally-duplicated container it
+                    // would double-count, which is exactly why the de-dupe belongs upstream.
                     //
                     // NUL-separated on BOTH joins: a container is free-form text and may
                     // contain spaces, so a space separator would let ('a b', 'key') and

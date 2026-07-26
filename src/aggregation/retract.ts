@@ -45,7 +45,14 @@
 
 import type Database from 'better-sqlite3';
 import {runBackfill} from './backfill.js';
-import {enumerateMonths, enumerateWeekStarts, isoWeekLabel} from './dates.js';
+import {
+    enumerateMonths,
+    enumerateWeekStarts,
+    isoWeekLabel,
+    isUtcDay,
+    subtractMonths,
+    todayUtc,
+} from './dates.js';
 import {computePRReviewMetricsForPeriod} from '../coaching/pr-review/compute.js';
 import {generateCoachingSignalsForPeriod} from '../coaching/available/generator.js';
 import {markStaleSummariesForRecompute} from '../summaries/staleness.js';
@@ -61,14 +68,17 @@ import {markStaleSummariesForRecompute} from '../summaries/staleness.js';
  * developer — on the synchronous better-sqlite3 connection, i.e. a process-wide hang that no
  * timeout can interrupt, after the cascade has already committed.
  *
- * 36 months comfortably exceeds any real retention window this product reports on (the
- * first-sync history window caps at 60 months but the trend surfaces read far less), and the
- * cap is REPORTED rather than silently applied — see {@link AggregateRecomputeResult.truncated}.
+ * 36 months is DELIBERATELY below `FIRST_SYNC_WINDOW_MAX_MONTHS` (60), so it can fire on
+ * legitimate data — an admin who imported five years and then deletes that provider. That is the
+ * intended trade: the recompute runs synchronously on the request path and its cost is
+ * O(span × developers) across five engines, so an unbounded span is a multi-minute freeze of the
+ * whole process. Bounding it and TELLING the operator (with the `aggregate backfill` remedy, see
+ * {@link AggregateRecomputeResult.truncated}) is strictly better than either silently truncating
+ * or blocking for as long as the data happens to be deep. Moving the recompute off the request
+ * path is the follow-up that would let this ceiling rise.
  */
 export const RETRACTION_RECOMPUTE_MAX_MONTHS = 36;
 
-/** Anchored UTC-day shape — the same pin `raw_author_daily.date` enforces at its write boundary. */
-const UTC_DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 /** What a post-retraction recompute covered, what it deliberately skipped, and why. */
 export interface AggregateRecomputeResult {
@@ -77,9 +87,12 @@ export interface AggregateRecomputeResult {
     to: string | null;
     /** Aggregate periods recomputed across the four levels (weeks + months + quarters + years). */
     periods: number;
-    /** `pr_review_metrics` periods recomputed (weeks + months). */
-    prMetricPeriods: number;
-    /** `coaching_signals` periods recomputed (weeks + months). */
+    /**
+     * Coaching periods recomputed (weeks + months). ONE counter for both coaching engines —
+     * `pr_review_metrics` and `coaching_signals` are driven over the same period set in the same
+     * loops, so two counters would always be equal and there is no state an operator could act
+     * on the difference in.
+     */
     coachingPeriods: number;
     /**
      * True when the requested span was CLAMPED — a future-dated day pulled back to today, or a
@@ -95,22 +108,11 @@ export interface AggregateRecomputeResult {
     anomaliesNotRescanned: boolean;
     /**
      * Non-null when the recompute FAILED. The retraction itself already committed, so this is
-     * reported rather than thrown. `periods`/`prMetricPeriods`/`coachingPeriods` still carry what
+     * reported rather than thrown. `periods`/`coachingPeriods` still carry what
      * DID commit before the failure — `runBackfill` commits one transaction per period, so
      * reporting 0 would claim nothing happened when half the span may already be correct.
      */
     error: string | null;
-}
-
-/** Today as a YYYY-MM-DD UTC key, matching the daily-snapshot keying. */
-function todayUtc(now: Date): string {
-    return now.toISOString().slice(0, 10);
-}
-
-/** `date` shifted back `months` calendar months as YYYY-MM-DD (UTC), via Date normalization. */
-function subtractMonths(date: string, months: number): string {
-    const [year, mon, day] = date.split('-').map(Number);
-    return new Date(Date.UTC(year, mon - 1 - months, day)).toISOString().slice(0, 10);
 }
 
 /**
@@ -134,7 +136,6 @@ export function recomputeAggregatesForRange(
         from: null,
         to: null,
         periods: 0,
-        prMetricPeriods: 0,
         coachingPeriods: 0,
         truncated: false,
         anomaliesNotRescanned: false,
@@ -146,7 +147,7 @@ export function recomputeAggregatesForRange(
     // (sound only for `YYYY-MM-DD`), so a malformed bound must be rejected here rather than
     // silently ordering somewhere arbitrary — `'not-a-date'` byte-sorts above every real date and
     // would otherwise be read as "entirely in the future" and skipped with no error at all.
-    if (!UTC_DAY_RE.test(from) || !UTC_DAY_RE.test(to)) {
+    if (!isUtcDay(from) || !isUtcDay(to)) {
         return {
             ...empty,
             from,
@@ -158,17 +159,36 @@ export function recomputeAggregatesForRange(
     // CLAMP BOTH ENDS before anything walks the range (see RETRACTION_RECOMPUTE_MAX_MONTHS).
     // Upper edge to today: a future-dated commit must not enumerate periods that cannot have
     // aggregates. Lower edge to the ceiling: a legitimately-ancient floor is bounded too.
-    const today = todayUtc(now);
-    const clampedTo = to > today ? today : to;
-    const floor = subtractMonths(clampedTo, RETRACTION_RECOMPUTE_MAX_MONTHS);
-    const clampedFrom = from < floor ? floor : from;
-    const truncated = clampedTo !== to || clampedFrom !== from;
-    // Everything retracted is in the future, so no period the rollups cover was affected.
-    if (clampedFrom > clampedTo) return {...empty, truncated: true};
+    //
+    // `todayUtc` is inside the try only because `now.toISOString()` throws a RangeError on an
+    // Invalid Date, and this function's contract is that it NEVER throws — the cascade has
+    // already committed by the time it runs, so an exception here would turn a successful delete
+    // into a 500 with no report.
+    let clampedFrom: string;
+    let clampedTo: string;
+    let truncated: boolean;
+    try {
+        const today = todayUtc(now);
+        clampedTo = to > today ? today : to;
+        const floor = subtractMonths(clampedTo, RETRACTION_RECOMPUTE_MAX_MONTHS);
+        clampedFrom = from < floor ? floor : from;
+        truncated = clampedTo !== to || clampedFrom !== from;
+    } catch (err) {
+        return {
+            ...empty,
+            from,
+            to,
+            error: `Could not resolve the recompute range: ${err instanceof Error ? err.message : String(err)}`,
+        };
+    }
+    // Everything retracted is in the future, so no period the rollups cover was affected. The
+    // CLAMPED bounds are reported, not nulls — the caller renders them ("capped at X → Y").
+    if (clampedFrom > clampedTo) {
+        return {...empty, from: clampedFrom, to: clampedTo, truncated: true};
+    }
 
     // Counted as they commit, so a mid-walk failure reports what actually landed.
     let periods = 0;
-    let prMetricPeriods = 0;
     let coachingPeriods = 0;
     try {
         const backfill = runBackfill(db, {
@@ -185,26 +205,28 @@ export function recomputeAggregatesForRange(
         for (const weekStart of enumerateWeekStarts(clampedFrom, clampedTo)) {
             const label = isoWeekLabel(weekStart);
             computePRReviewMetricsForPeriod(db, 'weekly', label, now);
-            prMetricPeriods++;
             generateCoachingSignalsForPeriod(db, 'weekly', label, now);
             coachingPeriods++;
+            // `markStaleSummariesForRecompute` takes the AGGREGATE period key and converts it
+            // itself, so the weekly arm passes `weekStart`, not the label.
+            markStaleSummariesForRecompute(db, 'weekly', weekStart);
         }
         for (const month of enumerateMonths(clampedFrom, clampedTo)) {
             computePRReviewMetricsForPeriod(db, 'monthly', month, now);
-            prMetricPeriods++;
             generateCoachingSignalsForPeriod(db, 'monthly', month, now);
             coachingPeriods++;
-            // Narrative summaries are not recomputed here (they cost model calls) but they DO
+            // Narrative summaries are not regenerated here (they cost model calls) but they DO
             // name commit counts that no longer exist — flag them so the next generation run
             // rebuilds them instead of serving a stale story. Idempotent and read-only against
-            // snapshots.
+            // snapshots. Both period units are marked; quarterly/yearly narratives are not,
+            // because neither coaching engine runs at those units and a quarterly narrative is
+            // regenerated from the (already-recomputed) quarterly rollup.
             markStaleSummariesForRecompute(db, 'monthly', month);
         }
         return {
             from: backfill.from,
             to: backfill.to,
             periods,
-            prMetricPeriods,
             coachingPeriods,
             truncated,
             anomaliesNotRescanned: true,
@@ -215,7 +237,6 @@ export function recomputeAggregatesForRange(
             from: clampedFrom,
             to: clampedTo,
             periods,
-            prMetricPeriods,
             coachingPeriods,
             truncated,
             anomaliesNotRescanned: true,

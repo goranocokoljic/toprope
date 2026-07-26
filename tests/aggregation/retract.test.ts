@@ -9,6 +9,7 @@ import {computeAllWeeklyAggregates} from '../../src/aggregation/weekly';
 import {computeAllMonthlyAggregates} from '../../src/aggregation/monthly';
 import {recomputeAggregatesForRange} from '../../src/aggregation/retract';
 import {computePRReviewMetricsForPeriod} from '../../src/coaching/pr-review/compute';
+import {generateCoachingSignalsForPeriod} from '../../src/coaching/available/generator';
 
 /**
  * `recomputeAggregatesForRange` (#264 review SO-2/SEC-2).
@@ -93,7 +94,7 @@ describe('recomputeAggregatesForRange (#264)', () => {
         // 2 weeks + 1 month + 1 quarter + 1 year.
         expect(result.periods).toBe(5);
         // 2 weeks + 1 month of pr_review_metrics.
-        expect(result.prMetricPeriods).toBe(3);
+        expect(result.coachingPeriods).toBe(3);
         expect(weeklyCommits('2026-06-01')).toBe(0);
         expect(weeklyCommits('2026-06-08')).toBe(0);
         expect(monthlyCommits('2026-06')).toBe(0);
@@ -129,7 +130,6 @@ describe('recomputeAggregatesForRange (#264)', () => {
             from: null,
             to: null,
             periods: 0,
-            prMetricPeriods: 0,
             coachingPeriods: 0,
             truncated: false,
             anomaliesNotRescanned: false,
@@ -222,6 +222,19 @@ describe('recomputeAggregatesForRange (#264)', () => {
             expect(result.truncated).toBe(true);
             expect(result.periods).toBe(0);
             expect(result.error).toBeNull();
+            // Reports the CLAMPED bounds, not nulls — the banner renders them as "capped at X → Y",
+            // and "capped at null → null" would be incoherent.
+            expect(result.from).not.toBeNull();
+            expect(result.to).toBe('2026-07-20');
+        });
+
+        // The contract is "never throws" because the cascade has already committed by the time
+        // this runs — an exception here would turn a successful delete into a 500 with no report.
+        // `now.toISOString()` on an Invalid Date is the one throw that happens before the walk.
+        it('reports rather than throws when `now` is an Invalid Date', () => {
+            const result = recomputeAggregatesForRange(db, '2026-06-02', '2026-06-10', new Date(NaN));
+            expect(result.error).toMatch(/Could not resolve the recompute range/);
+            expect(result.periods).toBe(0);
         });
     });
 
@@ -277,12 +290,65 @@ describe('recomputeAggregatesForRange (#264)', () => {
             expect(prMetricRows('2026-W01')).toBe(0);
         });
 
-        it('recomputes coaching_signals over the same span', () => {
-            const result = recomputeAggregatesForRange(db, '2026-06-02', '2026-06-10', NOW);
-            expect(result.coachingPeriods).toBe(result.prMetricPeriods);
+        // #264 review TST-1: `coachingPeriods` is a bare counter incremented NEXT TO the call, so
+        // asserting it proves nothing — the reviewer verified that deleting both
+        // `generateCoachingSignalsForPeriod` calls left 51 tests green. This asserts the EFFECT:
+        // the engine is delete-then-insert per period, so a signal derived from a retracted day
+        // must be gone afterwards.
+        it('actually retracts coaching_signals for the recomputed period', () => {
+            seedSnapshot('2026-06-02', 12); // ISO week 2026-W23
+            generateCoachingSignalsForPeriod(db, 'weekly', '2026-W23', NOW);
+            const signalsFor = (period: string): number =>
+                (
+                    db
+                        .prepare('SELECT COUNT(*) AS n FROM coaching_signals WHERE period = ?')
+                        .get(period) as {n: number}
+                ).n;
+            expect(signalsFor('2026-W23')).toBeGreaterThan(0);
+
+            // Retract the day (as the cascade would) and recompute the span it fell in.
+            db.prepare('DELETE FROM git_snapshots').run();
+            const result = recomputeAggregatesForRange(db, '2026-06-02', '2026-06-02', NOW);
+
+            expect(result.error).toBeNull();
             expect(result.coachingPeriods).toBeGreaterThan(0);
+            // The RIGHT week was recomputed — a wrong ISO label would leave this row behind, and
+            // a missing call would leave it behind too.
+            expect(signalsFor('2026-W23')).toBe(0);
             // And says plainly that anomaly alerts were NOT re-scanned.
             expect(result.anomaliesNotRescanned).toBe(true);
+        });
+
+        // #264 review TST-2 / SO-4: the staleness marking is new wiring in the retraction path and
+        // was asserted nowhere — and only the MONTHLY arm was wired, so a weekly narrative kept
+        // naming retracted commits and was never flagged.
+        it('marks in-range narrative summaries stale, at BOTH period units', () => {
+            const seedSummary = (periodType: string, periodValue: string): string => {
+                const id = randomUUID();
+                db.prepare(
+                    `INSERT INTO summaries
+                     (id, scope, scope_name, period_type, period_value, summary_text, model_used,
+                      data_hash, input_hash, generated_at, is_stale)
+                     VALUES (?, 'org', 'org', ?, ?, 'Commits rose sharply.', 'test-model',
+                             'stale-hash', 'stale-hash', ?, 0)`,
+                ).run(id, periodType, periodValue, NOW.toISOString());
+                return id;
+            };
+            const isStale = (id: string): number =>
+                (db.prepare('SELECT is_stale FROM summaries WHERE id = ?').get(id) as {is_stale: number})
+                    .is_stale;
+
+            seedSnapshot('2026-06-02', 5);
+            const weekly = seedSummary('weekly', '2026-W23');
+            const monthly = seedSummary('monthly', '2026-06');
+            expect(isStale(weekly)).toBe(0);
+            expect(isStale(monthly)).toBe(0);
+
+            db.prepare('DELETE FROM git_snapshots').run();
+            expect(recomputeAggregatesForRange(db, '2026-06-02', '2026-06-02', NOW).error).toBeNull();
+
+            expect(isStale(weekly)).toBe(1);
+            expect(isStale(monthly)).toBe(1);
         });
     });
 });

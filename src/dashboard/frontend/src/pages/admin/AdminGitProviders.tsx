@@ -685,7 +685,7 @@ export function removedSummary(result: GitProviderDeleteResult): string[] {
         // happened would send the operator hunting for a problem that may be half-fixed.
         lines.push(
             `The derived rollups were only partly recomputed (${aggregates.error}). ` +
-                `${aggregates.periods} trend period(s) and ${aggregates.prMetricPeriods} PR-metric ` +
+                `${aggregates.periods} trend period(s) and ${aggregates.coachingPeriods} coaching ` +
                 'period(s) did land; the rest still include the removed activity. ' +
                 `Run \`toprope aggregate backfill --from ${aggregates.from ?? ''} --to ${aggregates.to ?? ''}\` ` +
                 'to rebuild the trend rollups — note that command does not cover PR-review or ' +
@@ -694,15 +694,18 @@ export function removedSummary(result: GitProviderDeleteResult): string[] {
         );
     } else if (aggregates.periods > 0) {
         lines.push(
-            `${aggregates.periods} trend aggregate period(s), ${aggregates.prMetricPeriods} PR-metric ` +
-                `period(s) and ${aggregates.coachingPeriods} coaching period(s) recomputed for ` +
-                `${aggregates.from} → ${aggregates.to}.`,
+            `${aggregates.periods} trend aggregate period(s) and ${aggregates.coachingPeriods} ` +
+                `coaching period(s) recomputed for ${aggregates.from} → ${aggregates.to}.`,
         );
     }
     if (aggregates.truncated) {
+        // The remedy belongs here as much as on the error branch: a capped range is the one case
+        // where the delete succeeded completely and the rollups are still knowingly stale.
         lines.push(
             `The recomputed range was capped at ${aggregates.from} → ${aggregates.to}; periods outside ` +
-                'it were not rebuilt and still include the removed activity.',
+                'it were not rebuilt and still include the removed activity. Run ' +
+                `\`toprope aggregate backfill --from <the oldest affected day> --to ${aggregates.from ?? ''}\` ` +
+                'to rebuild them.',
         );
     }
     if (aggregates.anomaliesNotRescanned) {

@@ -1058,7 +1058,7 @@ export interface GitProviderDeleteResult {
         from: string | null;
         to: string | null;
         periods: number;
-        prMetricPeriods: number;
+        /** Weeks + months recomputed across BOTH coaching engines (they share one period set). */
         coachingPeriods: number;
         truncated: boolean;
         anomaliesNotRescanned: boolean;

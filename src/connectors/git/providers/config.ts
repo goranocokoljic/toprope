@@ -13,9 +13,11 @@ export function resolveGitProviderConfigs(config: GitConnectorConfig): GitProvid
         // the attribution key: `toprope doctor` resolves through here precisely so it can REPORT
         // a malformed entry ("bitbucket provider with no workspace"), and filtering it out here
         // would replace that specific diagnostic with a generic "no valid providers". The
-        // pipeline guards itself instead — `GitSync.runSync` drops a container-less provider with
-        // a surfaced error rather than letting it reach a write boundary (see `hasUsableContainer`
-        // in sync.ts).
+        // pipeline guards itself instead: `GitSync.runSync` wraps each provider's
+        // `fetchProviderData` in a try/catch, and that function's FIRST statement is
+        // `createGitProvider` → `validateGitProviderConfig`, which rejects a missing
+        // org/workspace/group before any key is built or any row is written. So a malformed entry
+        // is skipped with its own surfaced error and its siblings still sync.
         return (config.providers as unknown[]).filter(
             (p): p is GitProviderConfig =>
                 typeof p === 'object' &&

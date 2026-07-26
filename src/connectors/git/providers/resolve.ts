@@ -30,10 +30,6 @@ import type {ServerKeyResult} from './secret.js';
 import {containerKey, resolveGitProviderConfigs} from './config.js';
 import {getDecryptedConfig, listProviders} from './store.js';
 
-// The de-dupe identity of a provider — `${type}:${container}`, from the canonical builder in
-// `config.ts` (#264 consolidated three byte-identical copies of this onto it, because the same
-// string now also keys imported rows, cursors and the delete cascade's skip check).
-
 /**
  * Merge DB-backed providers (enabled only) with config-file providers into the
  * single list the sync/doctor pipeline consumes. DB wins on `(type, container)`;

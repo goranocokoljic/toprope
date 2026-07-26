@@ -200,9 +200,16 @@ export function TempPasswordBanner({password, onDismiss}: {password: string; onD
 /** Tone of an {@link AdminBanner}: an informational reveal, or the outcome of a destructive action. */
 export type AdminBannerTone = 'accent' | 'warning';
 
-const BANNER_TONE: Record<AdminBannerTone, string> = {
-    accent: 'border-accent/40 bg-accent-soft',
-    warning: 'border-warning/40 bg-warning/10',
+interface BannerToneStyle {
+    /** Frame (border + background). */
+    frame: string;
+    /** Dismiss link colour — toned with the frame, so it isn't indigo on an amber panel. */
+    dismiss: string;
+}
+
+const BANNER_TONE: Record<AdminBannerTone, BannerToneStyle> = {
+    accent: {frame: 'border-accent/40 bg-accent-soft', dismiss: 'text-accent'},
+    warning: {frame: 'border-warning/40 bg-warning/10', dismiss: 'text-warning'},
 };
 
 /**
@@ -241,14 +248,14 @@ export function AdminBanner({
             className={[
                 'flex justify-between gap-4 rounded-md border px-4 py-3',
                 tone === 'warning' ? 'items-start' : 'items-center',
-                BANNER_TONE[tone],
+                BANNER_TONE[tone].frame,
             ].join(' ')}
         >
             <div className="text-sm text-foreground">{children}</div>
             <button
                 type="button"
                 onClick={onDismiss}
-                className="shrink-0 text-xs font-medium text-accent"
+                className={`shrink-0 text-xs font-medium ${BANNER_TONE[tone].dismiss}`}
             >
                 Dismiss
             </button>
