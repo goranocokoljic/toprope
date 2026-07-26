@@ -417,7 +417,16 @@ describe('admin git-provider CRUD API (#197)', () => {
                     cascade_skipped: false,
                 },
                 // Nothing was retracted, so there is no span to recompute.
-                aggregates: {from: null, to: null, periods: 0, prMetricPeriods: 0, error: null},
+                aggregates: {
+                    from: null,
+                    to: null,
+                    periods: 0,
+                    prMetricPeriods: 0,
+                    coachingPeriods: 0,
+                    truncated: false,
+                    anomaliesNotRescanned: false,
+                    error: null,
+                },
             });
             const list = await app.inject({
                 method: 'GET',
@@ -696,6 +705,18 @@ describe('admin git-provider CRUD API (#197)', () => {
             expect(del.json().data.removed.cascade_skipped).toBe(true);
             expect(del.json().data.removed.raw_author_rows).toBe(0);
             expect(del.json().data.removed.cursor_keys_purged).toBe(0);
+            // Nothing was retracted, so nothing may be recomputed either — otherwise the banner
+            // would claim "N period(s) recomputed" for a delete that removed no data.
+            expect(del.json().data.aggregates).toEqual({
+                from: null,
+                to: null,
+                periods: 0,
+                prMetricPeriods: 0,
+                coachingPeriods: 0,
+                truncated: false,
+                anomaliesNotRescanned: false,
+                error: null,
+            });
             // …and the config provider's data, snapshots and cursor all survive.
             expect(
                 (db.prepare('SELECT COUNT(*) AS n FROM raw_author_daily').get() as {n: number}).n,

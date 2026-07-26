@@ -374,12 +374,27 @@ export function updateProvider(
         // The attribution key is immutable — see the doc above. Checked here, inside the
         // write transaction, so no caller can bypass it (the admin route validates the
         // COLLIDING case first, to name the owner; this is the total guard).
-        if (fields.type !== existing.type || fields.container !== existing.container) {
+        //
+        // `url` is part of it for self-hosted GitLab: `platform` on `gitlab.corp.example` and
+        // `platform` on `gitlab.acquired.example` are DIFFERENT containers that
+        // `providerContainer` spells identically, so leaving `url` mutable would let a PATCH
+        // re-point a provider at another instance while every imported row, cursor and day of
+        // retained history stayed attributed to it — exactly the silent relabelling this guard
+        // exists to refuse. (The converse — two instances that both have a group named
+        // `platform` — is not connectable under `UNIQUE(type, container)`; that limitation is
+        // stated in the 409 rather than worked around here.)
+        if (
+            fields.type !== existing.type ||
+            fields.container !== existing.container ||
+            fields.url !== existing.url
+        ) {
             throw new GitProviderStoreError(
                 'container_immutable',
-                `A provider's type and container cannot be changed (${existing.type}/${existing.container} → ` +
-                    `${fields.type}/${fields.container}): its imported data and sync cursors are keyed by that pair. ` +
-                    'Delete this provider — which now removes exactly its own data — and add the new one.',
+                `A provider's type, container and self-hosted URL cannot be changed ` +
+                    `(${existing.type}/${existing.container}${existing.url ? ` @ ${existing.url}` : ''} → ` +
+                    `${fields.type}/${fields.container}${fields.url ? ` @ ${fields.url}` : ''}): its imported ` +
+                    'data and sync cursors are keyed by them. Delete this provider — which now removes ' +
+                    'exactly its own data — and add the new one.',
             );
         }
 

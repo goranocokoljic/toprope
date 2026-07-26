@@ -235,7 +235,14 @@ export function AdminBanner({
         <div
             role="status"
             data-testid={testId}
-            className={`flex items-start justify-between gap-4 rounded-md border px-4 py-3 ${BANNER_TONE[tone]}`}
+            // Alignment follows the tone rather than being fixed: an `accent` reveal is a single
+            // line and centers (preserving TempPasswordBanner's rendered output byte-for-byte),
+            // while a `warning` outcome report is multi-paragraph and must top-align.
+            className={[
+                'flex justify-between gap-4 rounded-md border px-4 py-3',
+                tone === 'warning' ? 'items-start' : 'items-center',
+                BANNER_TONE[tone],
+            ].join(' ')}
         >
             <div className="text-sm text-foreground">{children}</div>
             <button

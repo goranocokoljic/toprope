@@ -1,4 +1,4 @@
-import type {GitProviderConfig} from './types.js';
+import type {GitProviderConfig, GitProviderType} from './types.js';
 import type {GitConnectorConfig} from '../../../config/types.js';
 
 // Resolve the list of git provider configs from a git connector config.
@@ -51,4 +51,24 @@ export function providerContainer(config: GitProviderConfig): string {
         case 'gitlab':
             return config.group;
     }
+}
+
+/**
+ * The de-dupe / ownership / attribution identity of a provider instance — `${type}:${container}`.
+ *
+ * THE one definition. Since #264 this pair keys the imported `raw_author_daily`/`pr_records`
+ * rows, the three `sync_state` cursors, the `UNIQUE(type, container)` constraint, the resolver's
+ * config-vs-DB de-dupe, and the delete cascade's skip check — so every one of those must agree
+ * byte-for-byte on how it is spelled. It lives here, beside {@link providerContainer} (which
+ * every caller already goes through), because this module is the one both `sync.ts` and
+ * `providers/*` can import without a cycle: the cascade imports the sync-state key builders from
+ * `sync.ts`, so a definition in either of those two would force one of them to clone it.
+ */
+export function containerKeyOf(type: GitProviderType, container: string): string {
+    return `${type}:${container}`;
+}
+
+/** {@link containerKeyOf} for a resolved provider config. */
+export function containerKey(config: GitProviderConfig): string {
+    return containerKeyOf(config.type, providerContainer(config));
 }

@@ -12,10 +12,10 @@ import {
 } from '../../../src/connectors/git/raw-author-daily';
 import {projectSnapshots} from '../../../src/connectors/git/projection';
 import {
-    containerKey,
     deleteProviderWithCascade,
     providerDeleteImpact,
 } from '../../../src/connectors/git/providers/delete-cascade';
+import {containerKeyOf} from '../../../src/connectors/git/providers/config';
 import {getProvider, GitProviderStoreError} from '../../../src/connectors/git/providers/store';
 import type {GitProviderType} from '../../../src/connectors/git/providers/types';
 
@@ -316,7 +316,7 @@ describe('deleteProviderWithCascade (#264)', () => {
     // retracting it would delete history its live owner is still maintaining — and purging
     // its cursor would make the next scheduled run re-import an already-counted window.
     it('SKIPS the cascade when a config-file provider owns the same (type, container)', () => {
-        const configOwned = new Set([containerKey('bitbucket', 'ws-a')]);
+        const configOwned = new Set([containerKeyOf('bitbucket', 'ws-a')]);
         const result = deleteProviderWithCascade(db, providerA, configOwned);
 
         expect(result.cascade_skipped).toBe(true);
@@ -341,7 +341,7 @@ describe('deleteProviderWithCascade (#264)', () => {
         const result = deleteProviderWithCascade(
             db,
             providerA,
-            new Set([containerKey('bitbucket', 'ws-b'), containerKey('github', 'ws-a')]),
+            new Set([containerKeyOf('bitbucket', 'ws-b'), containerKeyOf('github', 'ws-a')]),
         );
         expect(result.cascade_skipped).toBe(false);
         expect(rawRowsFor(db, 'ws-a')).toEqual([]);
@@ -442,7 +442,7 @@ describe('providerDeleteImpact (#264)', () => {
         const impact = providerDeleteImpact(
             db,
             getProvider(db, 'prov-a')!,
-            new Set([containerKey('bitbucket', 'ws-a')]),
+            new Set([containerKeyOf('bitbucket', 'ws-a')]),
         );
         expect(impact.cascade_skipped).toBe(true);
         expect(impact.raw_author_rows).toBe(0);

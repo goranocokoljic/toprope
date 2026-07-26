@@ -66,12 +66,9 @@ import {
 import {buildDevLookupMap, projectSnapshots, resolveRawAuthor} from '../projection.js';
 import {earliestSyncStateKey, stallStateKey, syncStateKey} from '../sync.js';
 import {deleteProvider, getProvider, GitProviderStoreError, type GitProviderRecord} from './store.js';
-import type {GitProviderType} from './types.js';
+import {containerKeyOf} from './config.js';
 
-/** The de-dupe identity of a provider instance — `${type}:${container}`. */
-export function containerKey(type: GitProviderType, container: string): string {
-    return `${type}:${container}`;
-}
+import type {GitProviderType} from './types.js';
 
 /**
  * What deleting a provider would remove — the preview the admin confirmation states before
@@ -181,7 +178,7 @@ function developersAffectedByContainer(
  * Preview what deleting `record` would remove.
  *
  * `configContainerKeys` is the set of `${type}:${container}` keys owned by config-file
- * providers (see {@link containerKey}). A hit means the container's data has another live
+ * providers (see {@link containerKeyOf}). A hit means the container's data has another live
  * owner, so the cascade would be skipped — the caller states that instead of promising a
  * retraction that will not happen.
  */
@@ -196,7 +193,7 @@ export function providerDeleteImpact(
     // would have gone" — the confirmation must not describe a retraction the config sibling
     // prevents. Returned early rather than as a per-field ternary so the two queries below are
     // not run just to be discarded, and so this reads like the cascade's own skip branch.
-    if (configContainerKeys.has(containerKey(type, container))) {
+    if (configContainerKeys.has(containerKeyOf(type, container))) {
         return {
             provider: type,
             container,
@@ -257,7 +254,7 @@ export function deleteProviderWithCascade(
         }
         const {type, container} = record;
 
-        if (configContainerKeys.has(containerKey(type, container))) {
+        if (configContainerKeys.has(containerKeyOf(type, container))) {
             // A config-file provider still resolves to this (type, container) and continues
             // to sync it, so its data and cursors must survive verbatim: retracting them
             // would delete history the surviving owner is actively maintaining, and purging

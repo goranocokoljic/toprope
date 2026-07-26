@@ -279,6 +279,35 @@ describe('provider store — update (#195)', () => {
         expect(getProvider(db, rec.id)?.container).toBe('acme');
     });
 
+    // #264 review SO-4: for self-hosted GitLab the `url` is part of the real identity —
+    // `platform` on two different instances is two different containers that
+    // `providerContainer` spells identically. Leaving `url` mutable would let a PATCH re-point
+    // a provider at another instance while all its imported rows and cursors stayed attributed
+    // to it: the same silent relabelling the container guard exists to refuse.
+    it('refuses to change a self-hosted GitLab url (it is part of the attribution key)', () => {
+        const rec = createProvider(db, keyOk(), {config: GITLAB});
+        try {
+            updateProvider(db, keyOk(), rec.id, {
+                config: {...GITLAB, url: 'https://gitlab.acquired.example'} as GitProviderConfig,
+            });
+            throw new Error('should have thrown');
+        } catch (e) {
+            expect(e).toBeInstanceOf(GitProviderStoreError);
+            expect((e as GitProviderStoreError).code).toBe('container_immutable');
+            expect((e as GitProviderStoreError).message).toContain('self-hosted URL');
+        }
+        expect(getProvider(db, rec.id)?.url).toBe('https://gitlab.internal.acme.dev');
+    });
+
+    it('still allows an edit that leaves type, container and url alone', () => {
+        const rec = createProvider(db, keyOk(), {config: GITLAB});
+        const patched = updateProvider(db, keyOk(), rec.id, {
+            config: {...GITLAB, repos: ['team/other']} as GitProviderConfig,
+        });
+        expect(patched.repos_include).toBe(JSON.stringify(['team/other']));
+        expect(patched.url).toBe('https://gitlab.internal.acme.dev');
+    });
+
     it('refuses to change the provider TYPE too (the pair is the key, not just the name)', () => {
         const rec = createProvider(db, keyOk(), {config: GITHUB});
         try {

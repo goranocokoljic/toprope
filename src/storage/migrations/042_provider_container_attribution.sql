@@ -53,6 +53,14 @@
 -- not a resumption. That is intended (the data is being rebuilt), but it is long and it
 -- consumes provider rate limit; for a controlled rebuild, use the admin UI's per-provider
 -- "Sync now" with an explicit months window before the scheduler fires.
+--
+-- EITHER WAY, FINISH WITH A BACKFILL. Whichever path is taken, the derived rollups are still
+-- holding pre-042 totals for the rows deleted above, and only the just-closed period is
+-- recomputed on its own. After the resync, run
+--   toprope aggregate backfill --from <the earliest day the resync imported>
+-- The "Sync now with a months window" path makes that MORE important, not less: it imports a
+-- narrower span, so `--from` must still reach back to the oldest period that holds stale
+-- totals, not merely to the start of the window just imported.
 
 -- ─── raw_author_daily: + container, unique key widened ────────────────────────
 DROP TABLE IF EXISTS raw_author_daily;

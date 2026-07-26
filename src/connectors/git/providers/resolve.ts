@@ -27,14 +27,12 @@ import type Database from 'better-sqlite3';
 import type {GitProviderConfig} from './types.js';
 import type {GitConnectorConfig} from '../../../config/types.js';
 import type {ServerKeyResult} from './secret.js';
-import {providerContainer, resolveGitProviderConfigs} from './config.js';
+import {containerKey, resolveGitProviderConfigs} from './config.js';
 import {getDecryptedConfig, listProviders} from './store.js';
 
-// The de-dupe identity of a provider: its type plus its container. A composite
-// so a GitHub org and a GitLab group of the same name never collide.
-function dedupeKey(config: GitProviderConfig): string {
-    return `${config.type}:${providerContainer(config)}`;
-}
+// The de-dupe identity of a provider — `${type}:${container}`, from the canonical builder in
+// `config.ts` (#264 consolidated three byte-identical copies of this onto it, because the same
+// string now also keys imported rows, cursors and the delete cascade's skip check).
 
 /**
  * Merge DB-backed providers (enabled only) with config-file providers into the
@@ -84,14 +82,23 @@ export function resolveAllGitProviders(
                 // Row vanished between list and fetch (concurrent delete) — skip.
                 if (config === undefined) continue;
                 dbProviders.push(config);
-                dbKeys.add(dedupeKey(config));
+                dbKeys.add(containerKey(config));
             }
         }
     }
 
     const merged: GitProviderConfig[] = [...dbProviders];
+    // Seeded from the DB keys and then EXTENDED as config entries are accepted, so the loop
+    // de-dupes config-against-config as well as config-against-DB (#264 review OR-5/SO-5).
+    // The second half matters more than it looks: two YAML entries naming one org are the SAME
+    // commits fetched twice, and the run's per-(container, author, day) accumulator sums them —
+    // a permanent double-count of that org's commits, lines and churn, with both entries also
+    // fighting over one cursor and one stall key. `UNIQUE(type, container)` cannot see it (it
+    // constrains `git_providers` rows, not config). One `seen` set closes it here, at the single
+    // seam every consumer resolves through, rather than leaving the accumulator to absorb it.
+    const seen = new Set(dbKeys);
     for (const cfg of configProviders) {
-        const key = dedupeKey(cfg);
+        const key = containerKey(cfg);
         if (dbKeys.has(key)) {
             // DB wins — the config entry is shadowed. Log it (never silent).
             console.warn(
@@ -100,6 +107,15 @@ export function resolveAllGitProviders(
             );
             continue;
         }
+        if (seen.has(key)) {
+            console.warn(
+                `[git] Config provider ${key} is declared more than once — keeping the first entry and ` +
+                    'ignoring the duplicate. Syncing one container twice in a run double-counts its ' +
+                    'commits and makes two entries fight over one sync cursor.',
+            );
+            continue;
+        }
+        seen.add(key);
         merged.push(cfg);
     }
 

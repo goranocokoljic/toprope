@@ -22,13 +22,17 @@ import {
     type PublicGitProvider,
 } from '../../../connectors/git/providers/store';
 import {
-    containerKey,
     deleteProviderWithCascade,
     providerDeleteImpact,
 } from '../../../connectors/git/providers/delete-cascade';
 import {recomputeAggregatesForRange} from '../../../aggregation/retract';
 import {loadServerKey} from '../../../connectors/git/providers/secret';
-import {providerContainer, resolveGitProviderConfigs} from '../../../connectors/git/providers/config';
+import {
+    containerKey,
+    containerKeyOf,
+    providerContainer,
+    resolveGitProviderConfigs,
+} from '../../../connectors/git/providers/config';
 import {createGitProvider} from '../../../connectors/git/providers/factory';
 import {
     GitSync,
@@ -509,7 +513,7 @@ export function registerAdminGitProviderRoutes(
     // a config-owned container and to skip the delete cascade when a config sibling still
     // owns the data (#264 AC6).
     const configContainerKeys = (): Set<string> =>
-        new Set(configProviders().map((c) => containerKey(c.type, providerContainer(c))));
+        new Set(configProviders().map(containerKey));
 
     /**
      * Who already owns `(type, container)`, as a human phrase, or null when it is free.
@@ -529,7 +533,7 @@ export function registerAdminGitProviderRoutes(
         if (dbOwner !== undefined && dbOwner.id !== excludeId) {
             return `the connected provider ${dbOwner.id}`;
         }
-        if (configContainerKeys().has(containerKey(type, container))) {
+        if (configContainerKeys().has(containerKeyOf(type, container))) {
             return 'a read-only config-file provider';
         }
         return null;
@@ -781,12 +785,17 @@ export function registerAdminGitProviderRoutes(
         if (configProviders().some((c) => configProviderId(c) === id)) {
             return conflict(reply, 'Config-file providers are read-only and cannot be deleted');
         }
-        // Overlap guard, matching the sync routes: an in-flight run applies its cursor
-        // and watermark writes at the very END of the run, keyed by container and with no
-        // re-check that the provider row still exists. Deleting mid-run therefore leaves a
-        // settling run writing cursors for a row that no longer exists — and deleting a
-        // provider because its sync is misbehaving is one of the likeliest ways to get
-        // here. Typed 409, not a racy success.
+        // Overlap guard, matching the sync routes: an in-flight run applies its cursor and
+        // watermark writes at the very END of the run, so deleting mid-run leaves a settling run
+        // writing state for a row that is gone — and deleting a provider because its sync is
+        // misbehaving is one of the likeliest ways to get here. Typed 409, not a racy success.
+        //
+        // This guard is process- and route-LOCAL: it only sees runs this route started. The
+        // nightly scheduler and `toprope sync git` resolve DB providers too and are invisible to
+        // it, so the pipeline carries its own ownership gate at the write boundary (see
+        // `containerOwner`/`isWritable` in `connectors/git/sync.ts`) — that is what actually makes
+        // a mid-run delete safe. This check remains as the cheap, immediate answer for the case
+        // it can see, so the admin gets a 409 instead of a silently-discarded sync.
         if (activeSyncs.has(id)) {
             return conflict(reply, 'A sync is in progress for this provider; wait for it to finish before deleting');
         }

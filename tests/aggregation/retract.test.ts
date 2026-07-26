@@ -8,6 +8,7 @@ import {addDeveloper} from '../../src/registry/developers';
 import {computeAllWeeklyAggregates} from '../../src/aggregation/weekly';
 import {computeAllMonthlyAggregates} from '../../src/aggregation/monthly';
 import {recomputeAggregatesForRange} from '../../src/aggregation/retract';
+import {computePRReviewMetricsForPeriod} from '../../src/coaching/pr-review/compute';
 
 /**
  * `recomputeAggregatesForRange` (#264 review SO-2/SEC-2).
@@ -124,7 +125,16 @@ describe('recomputeAggregatesForRange (#264)', () => {
 
     it('is a no-op for a null range (nothing was retracted)', () => {
         const result = recomputeAggregatesForRange(db, null, null, NOW);
-        expect(result).toEqual({from: null, to: null, periods: 0, prMetricPeriods: 0, error: null});
+        expect(result).toEqual({
+            from: null,
+            to: null,
+            periods: 0,
+            prMetricPeriods: 0,
+            coachingPeriods: 0,
+            truncated: false,
+            anomaliesNotRescanned: false,
+            error: null,
+        });
         expect(
             (db.prepare('SELECT COUNT(*) AS n FROM weekly_aggregates').get() as {n: number}).n,
         ).toBe(0);
@@ -135,8 +145,144 @@ describe('recomputeAggregatesForRange (#264)', () => {
     // no idea the trend charts are stale.
     it('reports a failure instead of throwing, so the committed delete is not reported as a 500', () => {
         const result = recomputeAggregatesForRange(db, 'not-a-date', '2026-06-10', NOW);
-        expect(result.error).not.toBeNull();
+        expect(result.error).toMatch(/malformed range/);
         expect(result.periods).toBe(0);
-        expect(result.from).toBe('not-a-date');
+    });
+
+    // A malformed bound must not be SILENTLY skipped. It byte-sorts above every real date, so a
+    // clamp that compared it as a date would read it as "entirely in the future" and return a
+    // clean no-op — reporting success for a recompute that never happened.
+    it('refuses a malformed bound loudly rather than treating it as a future date', () => {
+        seedSnapshot('2026-06-02', 4);
+        computeAllWeeklyAggregates(db, '2026-06-01', NOW);
+        db.prepare('DELETE FROM git_snapshots').run();
+
+        const result = recomputeAggregatesForRange(db, '2026-6-2', '2026-06-10', NOW);
+        expect(result.error).toMatch(/malformed range/);
+        expect(result.truncated).toBe(false);
+        // And nothing was recomputed, which is exactly why it has to be reported.
+        expect(weeklyCommits('2026-06-01')).toBe(4);
+    });
+
+    // #264 review TST-4: a failure MID-WALK must report the periods that already committed.
+    // `runBackfill` commits one transaction per period, so reporting 0 would tell the operator
+    // nothing happened when half the span may already be correct.
+    it('reports the periods that DID commit when the walk fails part-way', () => {
+        seedSnapshot('2026-06-02', 4);
+        seedSnapshot('2026-07-02', 6);
+        // Abort the monthly level, which runs AFTER every weekly period has committed.
+        db.exec(
+            `CREATE TRIGGER boom BEFORE INSERT ON monthly_aggregates
+             BEGIN SELECT RAISE(ABORT, 'boom'); END`,
+        );
+
+        const result = recomputeAggregatesForRange(db, '2026-06-02', '2026-07-02', NOW);
+
+        expect(result.error).toMatch(/boom/);
+        // The weekly periods landed and are reported, not zeroed — which is the whole point: a
+        // `periods: 0` here would tell the operator nothing happened when the weekly half of the
+        // span is already correct.
+        expect(result.periods).toBeGreaterThan(0);
+        expect(
+            (db.prepare('SELECT COUNT(*) AS n FROM weekly_aggregates').get() as {n: number}).n,
+        ).toBeGreaterThan(0);
+    });
+
+    // #264 review SEC-1/SO-1: the span comes from `raw_author_daily.date`, which is the
+    // provider's client-set AUTHOR date — nothing downstream clamps it. Without a bound, one
+    // `git commit --date=9999-01-01` turns a delete into ~400k period transactions on the
+    // synchronous connection: a process-wide hang after the cascade already committed.
+    describe('range clamping', () => {
+        it('clamps a FUTURE upper bound to today and reports the truncation', () => {
+            const result = recomputeAggregatesForRange(db, '2026-07-01', '9999-01-01', NOW);
+            expect(result.truncated).toBe(true);
+            expect(result.to).toBe('2026-07-20'); // NOW
+            // Bounded: a handful of periods, not hundreds of thousands.
+            expect(result.periods).toBeLessThan(20);
+            expect(result.error).toBeNull();
+        });
+
+        it('clamps an ANCIENT lower bound to the ceiling and reports the truncation', () => {
+            const result = recomputeAggregatesForRange(db, '0001-01-01', '2026-07-02', NOW);
+            expect(result.truncated).toBe(true);
+            expect(result.from).toBe(
+                new Date(Date.UTC(2026 - 3, 6, 2)).toISOString().slice(0, 10),
+            );
+            expect(result.periods).toBeGreaterThan(0);
+            expect(result.error).toBeNull();
+        });
+
+        it('does not report truncation for an ordinary in-window span', () => {
+            const result = recomputeAggregatesForRange(db, '2026-06-02', '2026-06-10', NOW);
+            expect(result.truncated).toBe(false);
+        });
+
+        it('is a truncated no-op when the ENTIRE retracted span is in the future', () => {
+            const result = recomputeAggregatesForRange(db, '2099-01-01', '2099-02-01', NOW);
+            expect(result.truncated).toBe(true);
+            expect(result.periods).toBe(0);
+            expect(result.error).toBeNull();
+        });
+    });
+
+    // #264 review TST-3: `pr_review_metrics` is the one thing this module adds over
+    // `runBackfill`, and a loop counter proves nothing — an off-by-one `isoWeekLabel` would
+    // recompute the WRONG week while the count stayed right.
+    describe('pr_review_metrics and coaching_signals are actually retracted', () => {
+        function seedPR(date: string): void {
+            db.prepare(
+                `INSERT INTO pr_records
+                 (id, developer_id, provider, container, repo, pr_id, state, created_at, merged_at,
+                  closed_at, review_comment_count, review_rounds, changes_requested_count,
+                  time_to_merge_hours, synced_at)
+                 VALUES (?, ?, 'github', 'acme', 'repo1', ?, 'merged', ?, ?, NULL, 2, 1, 0, 5, ?)`,
+            ).run(randomUUID(), devId, `pr-${date}`, `${date}T08:00:00.000Z`, `${date}T13:00:00.000Z`, `${date}T14:00:00.000Z`);
+        }
+        function prMetricRows(period: string): number {
+            return (
+                db
+                    .prepare(
+                        `SELECT COUNT(*) AS n FROM pr_review_metrics
+                          WHERE developer_id = ? AND period = ?`,
+                    )
+                    .get(devId, period) as {n: number}
+            ).n;
+        }
+
+        it('removes a stale pr_review_metrics row for the exact retracted week', () => {
+            seedPR('2026-06-02'); // ISO week 2026-W23
+            computePRReviewMetricsForPeriod(db, 'weekly', '2026-W23', NOW);
+            expect(prMetricRows('2026-W23')).toBeGreaterThan(0);
+
+            // Retract the PR (as the cascade would) and recompute the span it fell in.
+            db.prepare('DELETE FROM pr_records').run();
+            const result = recomputeAggregatesForRange(db, '2026-06-02', '2026-06-02', NOW);
+
+            expect(result.error).toBeNull();
+            // The RIGHT week was recomputed — a wrong label would leave this row behind.
+            expect(prMetricRows('2026-W23')).toBe(0);
+        });
+
+        // The week/month label conversion is the fragile part; a year-boundary span is where a
+        // hand-rolled ISO-week computation is most likely to be off by one.
+        it('handles a span that crosses an ISO-year boundary', () => {
+            seedPR('2025-12-30'); // ISO week 2026-W01
+            computePRReviewMetricsForPeriod(db, 'weekly', '2026-W01', NOW);
+            expect(prMetricRows('2026-W01')).toBeGreaterThan(0);
+
+            db.prepare('DELETE FROM pr_records').run();
+            const result = recomputeAggregatesForRange(db, '2025-12-29', '2026-01-04', NOW);
+
+            expect(result.error).toBeNull();
+            expect(prMetricRows('2026-W01')).toBe(0);
+        });
+
+        it('recomputes coaching_signals over the same span', () => {
+            const result = recomputeAggregatesForRange(db, '2026-06-02', '2026-06-10', NOW);
+            expect(result.coachingPeriods).toBe(result.prMetricPeriods);
+            expect(result.coachingPeriods).toBeGreaterThan(0);
+            // And says plainly that anomaly alerts were NOT re-scanned.
+            expect(result.anomaliesNotRescanned).toBe(true);
+        });
     });
 });

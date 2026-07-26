@@ -594,11 +594,12 @@ function RemoveProviderModal({
                     // Fail-closed (Save stays disabled) — but with a way out: one transient
                     // 500 must not leave the admin permanently unable to remove the provider.
                     <div className="flex flex-col items-start gap-2">
-                        <p className="text-danger">
-                            Could not check what this would remove: {impact.error.message}
-                        </p>
+                        <p className="text-foreground">Could not check what this would remove.</p>
+                        {/* The admin-standard inline error treatment, and the app-wide retry
+                            wording ("Try again", as ErrorState uses) — not a second spelling. */}
+                        <ErrorText error={impact.error} />
                         <AccentButton onClick={() => void impact.refetch()} disabled={impact.isFetching}>
-                            {impact.isFetching ? 'Retrying…' : 'Retry'}
+                            {impact.isFetching ? 'Trying…' : 'Try again'}
                         </AccentButton>
                     </div>
                 ) : impact.data.cascade_skipped ? (
@@ -680,14 +681,35 @@ export function removedSummary(result: GitProviderDeleteResult): string[] {
         );
     }
     if (aggregates.error !== null) {
+        // Report what DID land: the recompute commits one period at a time, so claiming nothing
+        // happened would send the operator hunting for a problem that may be half-fixed.
         lines.push(
-            `Trend aggregates were NOT recomputed (${aggregates.error}), so weekly/monthly charts still ` +
-                `include the removed activity. Run \`toprope aggregate backfill --from ${aggregates.from ?? ''}\` to fix them.`,
+            `The derived rollups were only partly recomputed (${aggregates.error}). ` +
+                `${aggregates.periods} trend period(s) and ${aggregates.prMetricPeriods} PR-metric ` +
+                'period(s) did land; the rest still include the removed activity. ' +
+                `Run \`toprope aggregate backfill --from ${aggregates.from ?? ''} --to ${aggregates.to ?? ''}\` ` +
+                'to rebuild the trend rollups — note that command does not cover PR-review or ' +
+                'coaching metrics, which the next scheduled weekly/monthly job refreshes only for ' +
+                'its recent trailing window.',
         );
     } else if (aggregates.periods > 0) {
         lines.push(
-            `${aggregates.periods} trend aggregate period(s) and ${aggregates.prMetricPeriods} PR-metric ` +
-                `period(s) recomputed for ${aggregates.from} → ${aggregates.to}.`,
+            `${aggregates.periods} trend aggregate period(s), ${aggregates.prMetricPeriods} PR-metric ` +
+                `period(s) and ${aggregates.coachingPeriods} coaching period(s) recomputed for ` +
+                `${aggregates.from} → ${aggregates.to}.`,
+        );
+    }
+    if (aggregates.truncated) {
+        lines.push(
+            `The recomputed range was capped at ${aggregates.from} → ${aggregates.to}; periods outside ` +
+                'it were not rebuilt and still include the removed activity.',
+        );
+    }
+    if (aggregates.anomaliesNotRescanned) {
+        lines.push(
+            'Anomaly alerts for this range were deliberately not re-scanned — re-scanning would raise ' +
+                'new “activity dropped” alerts for the removal itself. Existing alerts may still refer ' +
+                'to the removed activity.',
         );
     }
     return lines;
@@ -1431,10 +1453,11 @@ export function AdminGitProviders(): JSX.Element {
                     </PrimaryButton>
                 }
             />
-            {showEmptyState ? <GitEmptyState /> : null}
             {/* The delete is destructive, so its OUTCOME is reported rather than left silent
                 (#264): the admin sees exactly how much history was retracted, and that no
-                developer was deleted. */}
+                developer was deleted. Rendered ABOVE the empty state deliberately — deleting
+                your only provider satisfies both conditions on the same render, and the report
+                of what just happened must not sit below a "nothing here yet" panel. */}
             {lastRemoved ? (
                 <AdminBanner
                     tone="warning"
@@ -1448,6 +1471,7 @@ export function AdminGitProviders(): JSX.Element {
                     ))}
                 </AdminBanner>
             ) : null}
+            {showEmptyState ? <GitEmptyState /> : null}
             {/* No form renders until the admin asks for one. Keyed so add ⇄ edit
                 ⇄ another row always remounts clean fields (#236 criterion 3). */}
             {formModal.mode !== 'closed' ? (

@@ -1045,16 +1045,23 @@ export interface GitProviderDeleteResult {
         cascade_skipped: boolean;
     };
     /**
-     * The derived weekly/monthly/quarterly/yearly rollups and `pr_review_metrics` are a SECOND
-     * projection of the retracted rows, and the aggregation scheduler only recomputes the
-     * just-closed period — so the server recomputes the retracted span itself. `error` is
-     * non-null when that failed: the data is gone but the trend charts are still stale.
+     * The derived rollups (weekly/monthly/quarterly/yearly), `pr_review_metrics` and
+     * `coaching_signals` are a SECOND projection of the retracted rows, and the aggregation
+     * scheduler only recomputes the just-closed period — so the server recomputes the retracted
+     * span itself. `truncated` means the span was clamped (future-dated or longer than the
+     * ceiling) and periods outside it still hold the removed activity; `anomaliesNotRescanned`
+     * is the one derived table deliberately left alone (re-scanning would invent "activity fell
+     * to zero" alerts for the retraction itself); `error` is non-null when the recompute failed,
+     * in which case the counts still report what committed before it did.
      */
     aggregates: {
         from: string | null;
         to: string | null;
         periods: number;
         prMetricPeriods: number;
+        coachingPeriods: number;
+        truncated: boolean;
+        anomaliesNotRescanned: boolean;
         error: string | null;
     };
 }

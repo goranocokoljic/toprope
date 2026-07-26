@@ -180,4 +180,36 @@ describe('resolveAllGitProviders', () => {
         const resolved = resolveAllGitProviders(db, okKey(), {enabled: true});
         expect(resolved).toEqual([]);
     });
+
+    // #264 review OR-5/SO-5: two YAML entries naming ONE container are the same commits fetched
+    // twice. The run's per-(container, author, day) accumulator sums them — a permanent
+    // double-count — and the two entries also fight over one cursor and one stall key.
+    // `UNIQUE(type, container)` cannot see it (it constrains `git_providers` rows, not config),
+    // so the de-dupe belongs at this seam, where every consumer resolves through.
+    it('de-dupes config-against-config, keeping the first entry and warning', () => {
+        const resolved = resolveAllGitProviders(db, okKey(), {
+            enabled: true,
+            providers: [
+                {type: 'github', org: 'dup-org', auth: {type: 'token', api_token: 'a'}, repos: ['x']},
+                {type: 'github', org: 'dup-org', auth: {type: 'token', api_token: 'b'}, repos: ['y']},
+                {type: 'github', org: 'other-org', auth: {type: 'token', api_token: 'c'}},
+            ],
+        });
+
+        expect(resolved.map((p) => (p as {org: string}).org)).toEqual(['dup-org', 'other-org']);
+        // The FIRST entry survives (its repo scope, not the duplicate's).
+        expect(resolved[0]).toMatchObject({repos: ['x']});
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining('declared more than once'));
+    });
+
+    it('still allows the same container NAME under a different provider family', () => {
+        const resolved = resolveAllGitProviders(db, okKey(), {
+            enabled: true,
+            providers: [
+                {type: 'github', org: 'shared', auth: {type: 'token', api_token: 'a'}},
+                {type: 'gitlab', group: 'shared', auth: {type: 'oauth', token: 'b'}},
+            ],
+        });
+        expect(resolved).toHaveLength(2);
+    });
 });
