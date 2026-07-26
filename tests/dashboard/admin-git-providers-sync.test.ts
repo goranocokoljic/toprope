@@ -731,25 +731,35 @@ describe('admin git-provider sync-now API (#199)', () => {
             expect(readState(EARLIEST_KEY)).toBe(since);
         });
 
-        it('leaves the cursors alone when a config-file provider still owns the container', async () => {
-            // A DB row shadowing the config-file provider config-org. Deleting the DB
-            // row must not strip the cursors the config provider still syncs against.
-            const res = await app.inject({
-                method: 'POST',
-                url: '/api/admin/git/providers',
-                headers: authHeaders(adminToken),
-                payload: {type: 'github', container: 'config-org', token: 'ghp_dbSHADOW_1234'},
+        // The config-sibling skip is covered at unit level and in the DELETE CRUD block
+        // of admin-git-providers.test.ts; not re-asserted here.
+
+        // An in-flight run applies its cursor/watermark writes at the END of the run, so a
+        // delete accepted mid-run would be silently undone by the settling run.
+        it('rejects a delete while a sync is in flight (409), leaving the provider intact', async () => {
+            const provider = await createGithubDto();
+            // Hold the run open so it is still in flight when the delete arrives.
+            let release: (() => void) | undefined;
+            const held = new Promise<GitCommit[]>((resolve) => {
+                release = () => resolve([]);
             });
-            expect(res.statusCode).toBe(201);
-            const configCursor = 'git_last_sync:github:config-org';
-            db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
-                configCursor,
-                '2026-07-20T00:00:00.000Z',
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits: vi.fn().mockReturnValue(held),
+                }),
             );
+            expect((await triggerSyncBody(provider.id, {months: 6})).statusCode).toBe(202);
 
-            expect(await deleteProviderRoute(res.json().data.id as string)).toBe(200);
+            expect(await deleteProviderRoute(provider.id)).toBe(409);
+            // Still there — a racy 200 would have purged cursors the settling run rewrites.
+            expect((await readProvider(provider.id))?.id).toBe(provider.id);
 
-            expect(readState(configCursor)).toBe('2026-07-20T00:00:00.000Z');
+            release?.();
+            await waitForSyncStatus(provider.id, 'ok');
+            // And once the run settles the delete succeeds.
+            expect(await deleteProviderRoute(provider.id)).toBe(200);
         });
     });
 

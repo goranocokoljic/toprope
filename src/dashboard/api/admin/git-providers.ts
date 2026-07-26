@@ -360,24 +360,27 @@ function configProviderToDto(config: GitProviderConfig): AdminGitProviderDto {
 }
 
 // `activeSync` is the route registration's in-flight entry for this row (null when no
-// run is in flight — the common case for create/update responses). `firstSyncPending`
-// is whether this provider still lacks a pipeline cursor. BOTH are required, with no
-// default: create used to inherit a hardcoded `true` here, which fails OPEN at exactly
-// the surface that exists to prevent the confusion — a provider re-created for a
-// container whose cursors still exist would offer the first-sync window input and
-// accept a months value the pipeline is guaranteed to ignore (#262). Every caller now
-// derives it from the stored cursor set (see loadProviderCursorKeys) — one derivation,
-// no fallback to guess with.
+// run is in flight — the common case for create/update responses). `cursorKeys` is the
+// stored cursor set from `loadProviderCursorKeys`, and `first_sync_pending` is derived
+// from it HERE — one derivation, not one per route.
+//
+// Both parameters are required, with no default. `first_sync_pending` used to default to
+// a hardcoded `true` for the create route, which fails OPEN at exactly the surface that
+// exists to prevent the confusion: a provider created for a container whose cursors
+// still exist would offer the first-sync window input and accept a months value the
+// pipeline is guaranteed to ignore (#262). Taking the cursor SET rather than a
+// precomputed boolean makes that impossible to get wrong — the DTO cannot be built
+// without the evidence it is derived from.
 function dbProviderToDto(
     record: Parameters<typeof toPublicProvider>[0],
     activeSync: ActiveSyncDto | null,
-    firstSyncPending: boolean,
+    cursorKeys: ReadonlySet<string>,
 ): AdminGitProviderDto {
     return {
         ...toPublicProvider(record),
         source: 'db',
         active_sync: activeSync,
-        first_sync_pending: firstSyncPending,
+        first_sync_pending: !cursorKeys.has(syncStateKey(record.type, record.container)),
     };
 }
 
@@ -584,11 +587,7 @@ export function registerAdminGitProviderRoutes(
         // Resolve the stored cursor set ONCE (not per row) to drive first_sync_pending.
         const cursorKeys = loadProviderCursorKeys(db);
         const dbRows = listProviders(db).map((record) =>
-            dbProviderToDto(
-                record,
-                activeSyncs.get(record.id) ?? null,
-                !cursorKeys.has(syncStateKey(record.type, record.container)),
-            ),
+            dbProviderToDto(record, activeSyncs.get(record.id) ?? null, cursorKeys),
         );
         const configRows = configProviders().map(configProviderToDto);
         return {data: [...dbRows, ...configRows]};
@@ -613,21 +612,14 @@ export function registerAdminGitProviderRoutes(
                 enabled: parsed.enabled,
                 createdBy: request.authUser?.userId ?? null,
             });
-            // Derive first_sync_pending from the STORED cursor set, exactly as the
-            // list/PATCH routes do (#262). A brand-new provider normally has no cursor
-            // and reports true — but one created for a container whose cursors survived
-            // an earlier provider has already "synced" as far as the pipeline is
-            // concerned, and must not be offered a window the pipeline will ignore.
-            // A just-created id can never be in the in-flight registry, hence null.
-            const cursorKeys = loadProviderCursorKeys(db);
+            // Pass the STORED cursor set, exactly as the list/PATCH routes do (#262). A
+            // brand-new provider normally has no cursor and reports first_sync_pending
+            // true — but one created for a container whose cursors survived an earlier
+            // provider has already "synced" as far as the pipeline is concerned, and must
+            // not be offered a window the pipeline will ignore. A just-created id can
+            // never be in the in-flight registry, hence null.
             reply.status(201);
-            return {
-                data: dbProviderToDto(
-                    record,
-                    null,
-                    !cursorKeys.has(syncStateKey(record.type, record.container)),
-                ),
-            };
+            return {data: dbProviderToDto(record, null, loadProviderCursorKeys(db))};
         } catch (err) {
             if (err instanceof GitProviderStoreError) return replyStoreError(reply, err);
             // A factory/validation failure (e.g. missing org) is a client bad
@@ -671,12 +663,11 @@ export function registerAdminGitProviderRoutes(
                 });
                 // An edit may rename the container (and thus the cursor key), so
                 // recompute first_sync_pending against the stored cursor set.
-                const cursorKeys = loadProviderCursorKeys(db);
                 return {
                     data: dbProviderToDto(
                         record,
                         activeSyncs.get(id) ?? null,
-                        !cursorKeys.has(syncStateKey(record.type, record.container)),
+                        loadProviderCursorKeys(db),
                     ),
                 };
             } catch (err) {
@@ -693,14 +684,44 @@ export function registerAdminGitProviderRoutes(
         if (configProviders().some((c) => configProviderId(c) === id)) {
             return conflict(reply, 'Config-file providers are read-only and cannot be deleted');
         }
+        // Overlap guard, matching the sync routes: an in-flight run applies its cursor
+        // and watermark writes at the very END of the run, keyed by container and with no
+        // re-check that the provider row still exists. Deleting mid-run would purge the
+        // cursors and then have them RESURRECTED minutes later by the settling run,
+        // silently restoring the inherited-cursor state this fix removes — and deleting a
+        // provider because its sync is misbehaving is one of the likeliest ways to get
+        // here. Typed 409, not a racy success.
+        if (activeSyncs.has(id)) {
+            return conflict(reply, 'A sync is in progress for this provider; wait for it to finish before deleting');
+        }
+
         // Delete the row AND (unless another provider still claims the same
-        // `type:container`) its pipeline cursors, atomically — #262. Leaving the
-        // cursors behind made a re-added provider inherit them and silently ignore the
-        // first-sync history window, stranding a history gap no UI path could fill.
-        if (!deleteProviderAndSyncState(db, id, configProviders()).deleted) {
+        // `type:container`) its pipeline cursors, atomically — #262. Leaving the cursors
+        // behind made a re-added provider inherit them and silently ignore the first-sync
+        // history window.
+        const outcome = deleteProviderAndSyncState(db, id, configProviders());
+        if (!outcome.deleted) {
             return notFound(reply, `Git provider not found: ${id}`);
         }
-        return {data: {id, deleted: true}};
+        // This endpoint now destroys pipeline state, so say what it actually did rather
+        // than reporting one undifferentiated success: "cursors gone, a re-add starts
+        // clean" and "cursors kept because a sibling owns the container, a re-add will
+        // inherit them" are materially different outcomes for the admin.
+        request.log.info(
+            {
+                providerId: id,
+                syncStateRowsCleared: outcome.syncStateRowsCleared,
+                syncStateRetainedReason: outcome.syncStateRetainedReason,
+            },
+            'deleted git provider',
+        );
+        return {
+            data: {
+                id,
+                deleted: true,
+                sync_state_cleared: outcome.syncStateRetainedReason === null,
+            },
+        };
     });
 
     // POST /:id/test — probe a SAVED provider (DB or read-only config-file) by

@@ -88,7 +88,11 @@ describe('deleteProviderAndSyncState (#262)', () => {
 
         const result = deleteProviderAndSyncState(db, rec.id, []);
 
-        expect(result).toEqual({deleted: true, syncStateCleared: true});
+        expect(result).toEqual({
+            deleted: true,
+            syncStateRowsCleared: 3,
+            syncStateRetainedReason: null,
+        });
         expect(getProvider(db, rec.id)).toBeUndefined();
         // All three of this container's kinds are gone…
         for (const key of OWN_KEYS) expect(readState(key)).toBeUndefined();
@@ -106,7 +110,11 @@ describe('deleteProviderAndSyncState (#262)', () => {
             {type: 'bitbucket', workspace: 'acme', auth: {type: 'oauth', token: 'cfg-token'}},
         ]);
 
-        expect(result).toEqual({deleted: true, syncStateCleared: false});
+        expect(result).toEqual({
+            deleted: true,
+            syncStateRowsCleared: 0,
+            syncStateRetainedReason: 'claimed-by-another-provider',
+        });
         expect(getProvider(db, rec.id)).toBeUndefined();
         for (const key of OWN_KEYS) expect(readState(key)).toBe('2026-01-01T00:00:00.000Z');
     });
@@ -118,9 +126,78 @@ describe('deleteProviderAndSyncState (#262)', () => {
 
         const result = deleteProviderAndSyncState(db, doomed.id, []);
 
-        expect(result).toEqual({deleted: true, syncStateCleared: false});
+        expect(result.syncStateRetainedReason).toBe('claimed-by-another-provider');
         expect(getProvider(db, survivor.id)).toBeDefined();
         for (const key of OWN_KEYS) expect(readState(key)).toBe('2026-01-01T00:00:00.000Z');
+    });
+
+    // The claimant scan deliberately does NOT filter on `enabled`: a disabled sibling can
+    // be re-enabled, and its cursor is the record of what it already imported. The sync
+    // resolver filters to `enabled = 1`, so pin this divergence rather than let a future
+    // `WHERE enabled = 1` here silently turn the guard off.
+    it('a DISABLED sibling DB row still protects the container cursors', () => {
+        const doomed = createProvider(db, keyOk(), {config: BITBUCKET_ACME, createdBy: null});
+        const disabled = createProvider(db, keyOk(), {
+            config: BITBUCKET_ACME,
+            enabled: false,
+            createdBy: null,
+        });
+        expect(getProvider(db, disabled.id)?.enabled).toBe(0);
+        seedSyncState();
+
+        const result = deleteProviderAndSyncState(db, doomed.id, []);
+
+        expect(result.syncStateRetainedReason).toBe('claimed-by-another-provider');
+        for (const key of OWN_KEYS) expect(readState(key)).toBe('2026-01-01T00:00:00.000Z');
+    });
+
+    // Keys are compared as resolved strings, so a sibling that differs only in CASE is a
+    // different key and protects nothing — it never touches these rows. Pinned because a
+    // future "normalize the container" change would silently make a mis-cased entry
+    // protect cursors with no live owner (the graduated mis-cased-identifier rule).
+    it('a config sibling differing only in container CASE does not protect the cursors', () => {
+        const rec = createProvider(db, keyOk(), {config: BITBUCKET_ACME, createdBy: null});
+        seedSyncState();
+
+        const result = deleteProviderAndSyncState(db, rec.id, [
+            {type: 'bitbucket', workspace: 'ACME', auth: {type: 'oauth', token: 'cfg-token'}},
+        ]);
+
+        expect(result.syncStateRetainedReason).toBeNull();
+        for (const key of OWN_KEYS) expect(readState(key)).toBeUndefined();
+    });
+
+    // A malformed config entry resolves to no container, so it can never be matched
+    // against the orphaned key. Fail CLOSED on its presence: the alternative is that a
+    // half-parsed entry for the very container being deleted drops out of the claim set
+    // and unprotects rows a live config provider is still advancing.
+    it('fails closed and retains the cursors when a config entry has no resolvable container', () => {
+        const rec = createProvider(db, keyOk(), {config: BITBUCKET_ACME, createdBy: null});
+        seedSyncState();
+
+        const result = deleteProviderAndSyncState(db, rec.id, [
+            // Shape the loose config resolver admits but `providerContainer` cannot map.
+            {type: 'bitbucket', auth: {type: 'oauth', token: 'cfg'}} as unknown as GitProviderConfig,
+        ]);
+
+        expect(result).toEqual({
+            deleted: true,
+            syncStateRowsCleared: 0,
+            syncStateRetainedReason: 'claimed-by-another-provider',
+        });
+        for (const key of OWN_KEYS) expect(readState(key)).toBe('2026-01-01T00:00:00.000Z');
+    });
+
+    it('resolves the gitlab group as the container key', () => {
+        const rec = createProvider(db, keyOk(), {
+            config: {type: 'gitlab', group: 'acme-grp', auth: {type: 'oauth', token: 'gl-token'}},
+            createdBy: null,
+        });
+        const groupCursor = syncStateKey('gitlab', 'acme-grp');
+        setState(groupCursor, '2026-01-01T00:00:00.000Z');
+
+        expect(deleteProviderAndSyncState(db, rec.id, []).syncStateRowsCleared).toBe(1);
+        expect(readState(groupCursor)).toBeUndefined();
     });
 
     it('purges when a config-file sibling is on the same container name but a DIFFERENT type', () => {
@@ -133,7 +210,7 @@ describe('deleteProviderAndSyncState (#262)', () => {
             {type: 'github', org: 'acme', auth: {type: 'token', api_token: 'ghp_other'}},
         ]);
 
-        expect(result.syncStateCleared).toBe(true);
+        expect(result.syncStateRetainedReason).toBeNull();
         for (const key of OWN_KEYS) expect(readState(key)).toBeUndefined();
         expect(readState(syncStateKey('github', 'acme'))).toBe('2026-02-02T00:00:00.000Z');
     });
@@ -145,7 +222,11 @@ describe('deleteProviderAndSyncState (#262)', () => {
 
         const result = deleteProviderAndSyncState(db, 'no-such-provider', []);
 
-        expect(result).toEqual({deleted: false, syncStateCleared: false});
+        expect(result).toEqual({
+            deleted: false,
+            syncStateRowsCleared: 0,
+            syncStateRetainedReason: null,
+        });
         expect(allStateKeys()).toEqual(before);
         expect(db.prepare('SELECT COUNT(*) AS n FROM git_providers').get()).toEqual({n: 1});
     });

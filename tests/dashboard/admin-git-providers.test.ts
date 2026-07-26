@@ -390,7 +390,7 @@ describe('admin git-provider CRUD API (#197)', () => {
                 headers: authHeaders(adminToken),
             });
             expect(del.statusCode).toBe(200);
-            expect(del.json().data).toEqual({id, deleted: true});
+            expect(del.json().data).toEqual({id, deleted: true, sync_state_cleared: true});
             const list = await app.inject({
                 method: 'GET',
                 url: '/api/admin/git/providers',
@@ -447,6 +447,7 @@ describe('admin git-provider CRUD API (#197)', () => {
                 headers: authHeaders(adminToken),
             });
             expect(del.statusCode).toBe(200);
+            expect(del.json().data.sync_state_cleared).toBe(true);
 
             const remaining = (
                 db.prepare("SELECT key FROM sync_state WHERE key LIKE 'git_%'").all() as Array<{
@@ -479,6 +480,8 @@ describe('admin git-provider CRUD API (#197)', () => {
                 headers: authHeaders(adminToken),
             });
             expect(del.statusCode).toBe(200);
+            // The delete says what it actually did — the two outcomes are not the same.
+            expect(del.json().data.sync_state_cleared).toBe(false);
 
             // The config-file provider still syncs this container; its cursor survives.
             const row = db
