@@ -711,7 +711,8 @@ describe('AdminUsers page', () => {
         await createUser('new@test.com');
         expect(await screen.findByRole('button', {name: 'Creating…'})).toBeInTheDocument();
 
-        // Cancel, Esc, ×, and a genuine backdrop click are all inert mid-write.
+        // Cancel, Esc and × are all inert mid-write. The backdrop click below is
+        // inert UNCONDITIONALLY since #265, so it no longer proves the guard.
         expect(screen.getByRole('button', {name: 'Cancel'})).toBeDisabled();
         fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
         expect(screen.getByRole('dialog', {name: 'Create user'})).toBeInTheDocument();
@@ -934,7 +935,8 @@ describe('AdminSubscriptions page', () => {
         fireEvent.click(screen.getByRole('button', {name: 'Assign'}));
         expect(await screen.findByRole('button', {name: 'Saving…'})).toBeInTheDocument();
 
-        // Cancel, Esc, ×, and a genuine backdrop click are all inert mid-write.
+        // Cancel, Esc and × are all inert mid-write. The backdrop click below is
+        // inert UNCONDITIONALLY since #265, so it no longer proves the guard.
         const dialogName = 'Assign or change subscription';
         expect(screen.getByRole('button', {name: 'Cancel'})).toBeDisabled();
         fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
@@ -1162,7 +1164,8 @@ describe('AdminTeams page', () => {
         fireEvent.click(screen.getByRole('button', {name: 'Save changes'}));
         expect(await screen.findByRole('button', {name: 'Saving…'})).toBeInTheDocument();
 
-        // Cancel, Esc, ×, and a genuine backdrop click are all inert mid-write.
+        // Cancel, Esc and × are all inert mid-write. The backdrop click below is
+        // inert UNCONDITIONALLY since #265, so it no longer proves the guard.
         const dialogName = 'Edit team — frontend';
         expect(screen.getByRole('button', {name: 'Cancel'})).toBeDisabled();
         fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
@@ -1214,6 +1217,7 @@ describe('AdminTeams page', () => {
         expect(screen.getByRole('dialog', {name: dialogName})).toBeInTheDocument();
         fireEvent.click(screen.getByRole('button', {name: 'Close dialog'}));
         expect(screen.getByRole('dialog', {name: dialogName})).toBeInTheDocument();
+        // Inert unconditionally since #265 — not evidence of the pending guard.
         const backdrop = screen.getByTestId('team-modal-backdrop');
         fireEvent.mouseDown(backdrop);
         fireEvent.mouseUp(backdrop);
@@ -1568,7 +1572,8 @@ describe('AdminIdentities page', () => {
         fireEvent.click(screen.getByRole('button', {name: 'Save identities'}));
         expect(await screen.findByRole('button', {name: 'Saving…'})).toBeInTheDocument();
 
-        // Cancel, Esc, ×, and a genuine backdrop click are all inert mid-write.
+        // Cancel, Esc and × are all inert mid-write. The backdrop click below is
+        // inert UNCONDITIONALLY since #265, so it no longer proves the guard.
         const dialogName = 'Identities — Alice Dev';
         expect(screen.getByRole('button', {name: 'Cancel'})).toBeDisabled();
         fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
@@ -1618,6 +1623,7 @@ describe('AdminIdentities page', () => {
         expect(screen.getByRole('dialog', {name: dialogName})).toBeInTheDocument();
         fireEvent.keyDown(screen.getByRole('dialog'), {key: 'Escape'});
         expect(screen.getByRole('dialog', {name: dialogName})).toBeInTheDocument();
+        // Inert unconditionally since #265 — not evidence of the pending guard.
         const backdrop = screen.getByTestId('identity-modal-backdrop');
         fireEvent.mouseDown(backdrop);
         fireEvent.mouseUp(backdrop);

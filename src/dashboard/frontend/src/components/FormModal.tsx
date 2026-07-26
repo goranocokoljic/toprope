@@ -8,10 +8,11 @@ import {Modal} from './Modal';
  * admin form repeats: a primary Save, a Cancel, and inline `ErrorText`.
  *
  * It owns the close-guard-while-pending contract lifted from
- * `RepoScopeModal.requestClose`: EVERY close affordance (Cancel, Esc, ×,
- * backdrop) funnels through one guard, so a dismiss mid-write can't let the
- * mutation land — or fail — invisibly. Migrated screens must not re-implement
- * it.
+ * `RepoScopeModal.requestClose`: EVERY close affordance (Cancel, Esc, ×)
+ * funnels through one guard, so a dismiss mid-write can't let the mutation
+ * land — or fail — invisibly. Migrated screens must not re-implement it.
+ * (A backdrop click is not among them since #265 — `Modal` no longer closes on
+ * one at all, so there is one fewer affordance to guard.)
  *
  * The caller owns open/close state (render the modal only while open) and the
  * form body; `children` are the fields, which this component does not touch.

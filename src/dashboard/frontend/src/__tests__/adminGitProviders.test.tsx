@@ -396,6 +396,41 @@ describe('AdminGitProviders — modal add/edit (#238)', () => {
         expect((screen.getByLabelText('Organization') as HTMLInputElement).value).toBe('');
     });
 
+    // #265: the actual data-loss regression. A misplaced click on the dim area
+    // used to close this form and discard the whole draft — type, container,
+    // auth method and a pasted token — with no confirmation and no undo.
+    it('a backdrop click keeps the add form open with every entered value intact', async () => {
+        renderPage();
+        await screen.findByText('acme-org');
+        openAddModal();
+
+        // The full four-field shape the issue names, so a partial survival fails.
+        fireEvent.change(screen.getByRole('combobox', {name: 'Provider type'}), {
+            target: {value: 'bitbucket'},
+        });
+        fireEvent.change(screen.getByRole('combobox', {name: 'Auth method'}), {
+            target: {value: 'access_token'},
+        });
+        fireEvent.change(screen.getByLabelText('Workspace'), {target: {value: 'acme-ws'}});
+        fireEvent.change(screen.getByLabelText('Token'), {target: {value: 'atl_pasted_secret'}});
+
+        const backdrop = screen.getByTestId('git-provider-modal-backdrop');
+        fireEvent.mouseDown(backdrop);
+        fireEvent.mouseUp(backdrop);
+        fireEvent.click(backdrop);
+
+        expect(screen.getByRole('dialog', {name: 'Add git provider'})).toBeInTheDocument();
+        expect((screen.getByRole('combobox', {name: 'Provider type'}) as HTMLSelectElement).value).toBe(
+            'bitbucket',
+        );
+        expect((screen.getByRole('combobox', {name: 'Auth method'}) as HTMLSelectElement).value).toBe(
+            'access_token',
+        );
+        expect((screen.getByLabelText('Workspace') as HTMLInputElement).value).toBe('acme-ws');
+        expect((screen.getByLabelText('Token') as HTMLInputElement).value).toBe('atl_pasted_secret');
+        expect(lastCall(/\/git\/providers$/, 'POST')).toBeUndefined();
+    });
+
     it("a row's Edit opens the same form pre-filled, titled for that provider", async () => {
         renderPage();
         await screen.findByText('acme-org');
@@ -477,7 +512,8 @@ describe('AdminGitProviders — modal add/edit (#238)', () => {
         createGithubProvider('new-org');
         expect(await screen.findByRole('button', {name: 'Saving…'})).toBeInTheDocument();
 
-        // Cancel, Esc, ×, and a genuine backdrop click are all inert mid-write.
+        // Cancel, Esc and × are all inert mid-write. The backdrop click below is
+        // inert UNCONDITIONALLY since #265, so it no longer proves the guard.
         expect(screen.getByRole('button', {name: 'Cancel'})).toBeDisabled();
         fireEvent.click(screen.getByRole('button', {name: 'Cancel'}));
         expect(screen.getByRole('dialog', {name: 'Add git provider'})).toBeInTheDocument();
@@ -1787,7 +1823,10 @@ describe('AdminGitProviders — repo-scope modal (#213)', () => {
         expect(lastCall(/\/git\/providers\/p-all$/, 'PATCH')).toBeUndefined();
     });
 
-    it('a genuine backdrop click closes the modal without saving; a drag-release from inside does not', async () => {
+    // #265: flipped — a backdrop click no longer closes anything. The selection
+    // session survives a misplaced click on the dim area, in either drag
+    // direction and for a straight press-and-release.
+    it('a backdrop click does NOT close the modal — the selection session survives', async () => {
         providers = [structuredClone(DB_MONITOR_ALL)];
         renderPage();
         await openSelectMode();
@@ -1799,10 +1838,15 @@ describe('AdminGitProviders — repo-scope modal (#213)', () => {
         fireEvent.click(backdrop);
         expect(screen.getByRole('dialog')).toBeInTheDocument();
 
-        // A real backdrop click (press + release on the backdrop) closes.
+        // …and neither does a press-and-release straight on the backdrop.
         fireEvent.mouseDown(backdrop);
         fireEvent.mouseUp(backdrop);
         fireEvent.click(backdrop);
+        expect(screen.getByRole('dialog')).toBeInTheDocument();
+        expect(lastCall(/\/git\/providers\/p-all$/, 'PATCH')).toBeUndefined();
+
+        // Escape is still the way out, and still saves nothing.
+        fireEvent.keyDown(screen.getByRole('dialog'), {key: 'Escape'});
         expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
         expect(lastCall(/\/git\/providers\/p-all$/, 'PATCH')).toBeUndefined();
     });
