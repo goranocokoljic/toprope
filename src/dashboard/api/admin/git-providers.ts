@@ -11,7 +11,6 @@ import {
 } from './helpers';
 import {
     createProvider,
-    deleteProvider,
     getDecryptedConfig,
     getProvider,
     listProviders,
@@ -22,6 +21,7 @@ import {
     type PublicGitProvider,
 } from '../../../connectors/git/providers/store';
 import {loadServerKey} from '../../../connectors/git/providers/secret';
+import {deleteProviderAndSyncState} from '../../../connectors/git/providers/delete';
 import {providerContainer, resolveGitProviderConfigs} from '../../../connectors/git/providers/config';
 import {createGitProvider} from '../../../connectors/git/providers/factory';
 import {
@@ -359,16 +359,19 @@ function configProviderToDto(config: GitProviderConfig): AdminGitProviderDto {
     };
 }
 
-// `activeSync` is the route registration's in-flight entry for this row (null
-// when no run is in flight — the common case for create/update responses).
-// `firstSyncPending` is whether this provider still lacks a pipeline cursor; it
-// defaults to true because the only caller that omits it is the create route
-// (a brand-new provider has never synced). The list/patch routes derive it from
-// the stored cursor set (see loadProviderCursorKeys).
+// `activeSync` is the route registration's in-flight entry for this row (null when no
+// run is in flight — the common case for create/update responses). `firstSyncPending`
+// is whether this provider still lacks a pipeline cursor. BOTH are required, with no
+// default: create used to inherit a hardcoded `true` here, which fails OPEN at exactly
+// the surface that exists to prevent the confusion — a provider re-created for a
+// container whose cursors still exist would offer the first-sync window input and
+// accept a months value the pipeline is guaranteed to ignore (#262). Every caller now
+// derives it from the stored cursor set (see loadProviderCursorKeys) — one derivation,
+// no fallback to guess with.
 function dbProviderToDto(
     record: Parameters<typeof toPublicProvider>[0],
-    activeSync: ActiveSyncDto | null = null,
-    firstSyncPending = true,
+    activeSync: ActiveSyncDto | null,
+    firstSyncPending: boolean,
 ): AdminGitProviderDto {
     return {
         ...toPublicProvider(record),
@@ -610,8 +613,21 @@ export function registerAdminGitProviderRoutes(
                 enabled: parsed.enabled,
                 createdBy: request.authUser?.userId ?? null,
             });
+            // Derive first_sync_pending from the STORED cursor set, exactly as the
+            // list/PATCH routes do (#262). A brand-new provider normally has no cursor
+            // and reports true — but one created for a container whose cursors survived
+            // an earlier provider has already "synced" as far as the pipeline is
+            // concerned, and must not be offered a window the pipeline will ignore.
+            // A just-created id can never be in the in-flight registry, hence null.
+            const cursorKeys = loadProviderCursorKeys(db);
             reply.status(201);
-            return {data: dbProviderToDto(record)};
+            return {
+                data: dbProviderToDto(
+                    record,
+                    null,
+                    !cursorKeys.has(syncStateKey(record.type, record.container)),
+                ),
+            };
         } catch (err) {
             if (err instanceof GitProviderStoreError) return replyStoreError(reply, err);
             // A factory/validation failure (e.g. missing org) is a client bad
@@ -677,7 +693,11 @@ export function registerAdminGitProviderRoutes(
         if (configProviders().some((c) => configProviderId(c) === id)) {
             return conflict(reply, 'Config-file providers are read-only and cannot be deleted');
         }
-        if (!deleteProvider(db, id)) {
+        // Delete the row AND (unless another provider still claims the same
+        // `type:container`) its pipeline cursors, atomically — #262. Leaving the
+        // cursors behind made a re-added provider inherit them and silently ignore the
+        // first-sync history window, stranding a history gap no UI path could fill.
+        if (!deleteProviderAndSyncState(db, id, configProviders()).deleted) {
             return notFound(reply, `Git provider not found: ${id}`);
         }
         return {data: {id, deleted: true}};

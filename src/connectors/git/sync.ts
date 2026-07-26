@@ -561,6 +561,46 @@ function clearProviderStall(
 }
 
 /**
+ * Every `sync_state` row this pipeline keys to ONE provider container: the forward
+ * cursor ({@link syncStateKey}), the earliest-synced watermark
+ * ({@link earliestSyncStateKey}), and the stall counter ({@link stallStateKey}).
+ * Lives here because this module is the only writer of all three — a second copy of
+ * the key formats elsewhere would be a second source of truth that drifts.
+ */
+function providerSyncStateKeys(providerType: GitProviderType, identifier: string): string[] {
+    return [
+        syncStateKey(providerType, identifier),
+        earliestSyncStateKey(providerType, identifier),
+        stallStateKey(providerType, identifier),
+    ];
+}
+
+/**
+ * Delete every sync-state row belonging to one provider container (#262), so a
+ * provider that is REMOVED does not leave cursors behind for a later provider on the
+ * same `type:container` to silently inherit. Returns the number of rows removed.
+ *
+ * All three keys are matched EXACTLY (an `IN` list), never by prefix: a
+ * `LIKE 'git_last_sync:github:acme%'` scan would also delete `acme-labs`' cursor,
+ * stranding a sibling provider's history in exactly the way this fixes.
+ *
+ * Callers must first establish that NO other provider (DB row or config-file entry)
+ * resolves to the same container — the keys are container-scoped, not row-scoped, so
+ * they are shared state. See `deleteProviderAndSyncState` in providers/delete.ts,
+ * which owns that guard and the surrounding transaction.
+ */
+export function deleteProviderSyncState(
+    db: Database.Database,
+    providerType: GitProviderType,
+    identifier: string,
+): number {
+    const keys = providerSyncStateKeys(providerType, identifier);
+    return db
+        .prepare(`DELETE FROM sync_state WHERE key IN (${keys.map(() => '?').join(', ')})`)
+        .run(...keys).changes;
+}
+
+/**
  * A provider that is ADVANCING but is still more than one cap-width behind the
  * present (#235) — a bounded catch-up in progress.
  *

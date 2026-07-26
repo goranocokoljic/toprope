@@ -194,6 +194,28 @@ describe('admin git-provider sync-now API (#199)', () => {
         throw new Error(`timed out waiting for status=${expected}; last=${JSON.stringify(last)}`);
     }
 
+    // Mock getCommits so a run resolves fast AND the [since, until] window it computed
+    // is observable. Returns [] so no snapshot bookkeeping runs. Shared by every
+    // window-related block below — one arming helper, not one per describe.
+    async function armGetCommits(): Promise<ReturnType<typeof vi.fn>> {
+        const getCommits = vi.fn().mockResolvedValue([]);
+        const createGitProvider = await getCreateGitProvider();
+        createGitProvider.mockReturnValue(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                getCommits,
+            }),
+        );
+        return getCommits;
+    }
+
+    // Raw sync_state read — the pipeline's own cursor/watermark storage.
+    function readState(key: string): string | undefined {
+        return (db.prepare('SELECT value FROM sync_state WHERE key = ?').get(key) as
+            | {value: string}
+            | undefined)?.value;
+    }
+
     describe('role enforcement — server is the trust boundary', () => {
         it('rejects a developer session (403)', async () => {
             const res = await triggerSync('some-id', devToken);
@@ -516,20 +538,6 @@ describe('admin git-provider sync-now API (#199)', () => {
     });
 
     describe('POST /:id/sync — first-sync history window (#228)', () => {
-        // Mock getCommits so the run resolves fast AND we can read the `since`
-        // argument the window computed. Returns [] so no snapshot bookkeeping runs.
-        async function armGetCommits(): Promise<ReturnType<typeof vi.fn>> {
-            const getCommits = vi.fn().mockResolvedValue([]);
-            const createGitProvider = await getCreateGitProvider();
-            createGitProvider.mockReturnValue(
-                makeMockProvider({
-                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
-                    getCommits,
-                }),
-            );
-            return getCommits;
-        }
-
         it('forwards a valid months window to the first sync (since ≈ now − months)', async () => {
             const id = await createGithub();
             const getCommits = await armGetCommits();
@@ -641,23 +649,113 @@ describe('admin git-provider sync-now API (#199)', () => {
         });
     });
 
-    describe('POST /:id/sync-older-history — backward extension (#229)', () => {
+    // #262 — delete + re-add of the SAME container. Cursors are keyed by
+    // `type:container`, not provider id, so before this fix the "new" provider
+    // inherited the deleted one's forward cursor: the pipeline discarded the admin's
+    // first-sync window and imported only the delta since the old cursor, while the
+    // surviving earliest-synced watermark kept claiming the old window was covered.
+    describe('delete + re-add of the same container (#262)', () => {
         const FORWARD_KEY = 'git_last_sync:github:db-org';
         const EARLIEST_KEY = 'git_earliest_sync:github:db-org';
 
-        // Arm getCommits so the run resolves fast AND we can read the [since, until]
-        // slice the backfill window computed. Returns [] → no snapshot bookkeeping.
-        async function armGetCommits(): Promise<ReturnType<typeof vi.fn>> {
-            const getCommits = vi.fn().mockResolvedValue([]);
-            const createGitProvider = await getCreateGitProvider();
-            createGitProvider.mockReturnValue(
-                makeMockProvider({
-                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
-                    getCommits,
-                }),
-            );
-            return getCommits;
+        // Create the db-org provider and return the CREATE response DTO (not just the
+        // id) — first_sync_pending on that response is half of what this issue fixes.
+        async function createGithubDto(): Promise<ProviderListRow> {
+            const res = await app.inject({
+                method: 'POST',
+                url: '/api/admin/git/providers',
+                headers: authHeaders(adminToken),
+                payload: {type: 'github', container: 'db-org', token: 'ghp_dbSECRET_TOKEN_ABCD'},
+            });
+            expect(res.statusCode).toBe(201);
+            return res.json().data as ProviderListRow;
         }
+
+        async function deleteProviderRoute(id: string): Promise<number> {
+            const res = await app.inject({
+                method: 'DELETE',
+                url: `/api/admin/git/providers/${id}`,
+                headers: authHeaders(adminToken),
+            });
+            return res.statusCode;
+        }
+
+        it('POST derives first_sync_pending from the stored cursor set, not a hardcoded true', async () => {
+            // A cursor for this container already exists (e.g. it survived an older
+            // provider on a build without the delete fix). The pipeline will IGNORE any
+            // window, so the create response must not offer one.
+            db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+                FORWARD_KEY,
+                '2026-07-20T00:00:00.000Z',
+            );
+            expect((await createGithubDto()).first_sync_pending).toBe(false);
+        });
+
+        it('POST still reports first_sync_pending=true for a container with no cursor', async () => {
+            expect((await createGithubDto()).first_sync_pending).toBe(true);
+        });
+
+        it('delete clears the container cursors, so the re-added provider honors its window end-to-end', async () => {
+            const first = await createGithubDto();
+            // What the deleted provider first sync left behind: a forward cursor a few
+            // days back and a watermark claiming ~6 months of history is imported.
+            db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+                FORWARD_KEY,
+                '2026-07-20T00:00:00.000Z',
+            );
+            db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+                EARLIEST_KEY,
+                '2026-01-20T00:00:00.000Z',
+            );
+
+            expect(await deleteProviderRoute(first.id)).toBe(200);
+            expect(readState(FORWARD_KEY)).toBeUndefined();
+            expect(readState(EARLIEST_KEY)).toBeUndefined();
+
+            // Re-add the same workspace: with no cursor left, the window is genuinely
+            // offered again…
+            const second = await createGithubDto();
+            expect(second.first_sync_pending).toBe(true);
+
+            // …and honored: the fetch starts at now − 6mo, not at the old cursor.
+            const getCommits = await armGetCommits();
+            const before = Date.now();
+            expect((await triggerSyncBody(second.id, {months: 6})).statusCode).toBe(202);
+            await waitForSyncStatus(second.id, 'ok');
+
+            const since = getCommits.mock.calls[0][1] as string;
+            const expected = new Date(before);
+            expected.setUTCMonth(expected.getUTCMonth() - 6);
+            expect(Math.abs(Date.parse(since) - expected.getTime())).toBeLessThan(60_000);
+            // The recorded floor equals the window start — no false claim of coverage.
+            expect(readState(EARLIEST_KEY)).toBe(since);
+        });
+
+        it('leaves the cursors alone when a config-file provider still owns the container', async () => {
+            // A DB row shadowing the config-file provider config-org. Deleting the DB
+            // row must not strip the cursors the config provider still syncs against.
+            const res = await app.inject({
+                method: 'POST',
+                url: '/api/admin/git/providers',
+                headers: authHeaders(adminToken),
+                payload: {type: 'github', container: 'config-org', token: 'ghp_dbSHADOW_1234'},
+            });
+            expect(res.statusCode).toBe(201);
+            const configCursor = 'git_last_sync:github:config-org';
+            db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+                configCursor,
+                '2026-07-20T00:00:00.000Z',
+            );
+
+            expect(await deleteProviderRoute(res.json().data.id as string)).toBe(200);
+
+            expect(readState(configCursor)).toBe('2026-07-20T00:00:00.000Z');
+        });
+    });
+
+    describe('POST /:id/sync-older-history — backward extension (#229)', () => {
+        const FORWARD_KEY = 'git_last_sync:github:db-org';
+        const EARLIEST_KEY = 'git_earliest_sync:github:db-org';
 
         async function triggerOlder(
             id: string,
@@ -670,12 +768,6 @@ describe('admin git-provider sync-now API (#199)', () => {
                 headers: authHeaders(token),
                 payload,
             });
-        }
-
-        function readState(key: string): string | undefined {
-            return (db.prepare('SELECT value FROM sync_state WHERE key = ?').get(key) as
-                | {value: string}
-                | undefined)?.value;
         }
 
         it('fetches [now − months, watermark], lowers the watermark, leaves the forward cursor untouched', async () => {
