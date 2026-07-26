@@ -29,9 +29,15 @@ let previousBodyOverflow = '';
  *  - Body scroll is locked while any modal is open (ref-counted).
  *  - Escape closes the topmost dialog only; the event does not propagate.
  *  - A backdrop click does NOT close (#265). A misplaced click must never
- *    discard unsaved input, so the dim area is inert: Escape, the × button and
- *    Cancel are the ways to dismiss. Escape stays because it is a deliberate
- *    keypress and the ARIA dialog pattern expects it.
+ *    discard unsaved input, so the dim area is inert: Escape and the × button
+ *    are this component's exits (`FormModal` adds Cancel). Escape stays because
+ *    it is a deliberate keypress and the ARIA dialog pattern expects it.
+ *  - A press on the dim area does not steal focus (#265). Since the dialog now
+ *    SURVIVES that press, letting the browser blur into <body> would leave it
+ *    open with the keyboard pointed at nothing — the same silent-input-loss the
+ *    inert backdrop exists to prevent, one keystroke at a time. preventDefault
+ *    on mousedown suppresses the focus change; it decides nothing about closing
+ *    and keeps no state.
  */
 export function Modal({
     title,
@@ -122,6 +128,12 @@ export function Modal({
     return createPortal(
         <div
             className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+            onMouseDown={(e) => {
+                // Keep focus where it is on a press that lands on the dim area
+                // itself: the dialog no longer closes (#265), so a blur to
+                // <body> would silently swallow everything typed next.
+                if (e.target === e.currentTarget) e.preventDefault();
+            }}
             data-testid={testId ? `${testId}-backdrop` : undefined}
         >
             <div

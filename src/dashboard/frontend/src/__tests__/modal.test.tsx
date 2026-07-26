@@ -2,7 +2,7 @@
 import '../test/setup';
 import '@testing-library/jest-dom/vitest';
 import {afterEach, describe, expect, it} from 'vitest';
-import {cleanup, fireEvent, render, screen, within} from '@testing-library/react';
+import {cleanup, createEvent, fireEvent, render, screen, within} from '@testing-library/react';
 import {useState} from 'react';
 import {Modal} from '../components/Modal';
 
@@ -171,27 +171,48 @@ describe('Modal — dismissal', () => {
         expect((screen.getByLabelText('First field') as HTMLInputElement).value).toBe('ghp_secret');
     });
 
-    // The state #265 newly makes persistent: pressing the dim area blurs focus
-    // out of the dialog subtree, and the dialog now STAYS open there. Escape
-    // must still work from it — via the document-level backstop, since the
-    // element-level handler never sees a keypress aimed at <body>. Without this
-    // the promise "the dim area is inert but Escape still works" is only
-    // assembled from two tests that never meet.
-    it('after a backdrop click has parked focus outside the dialog, Escape still closes it', () => {
+    // Because the dialog now SURVIVES a backdrop press, the browser's default
+    // "blur into <body>" would leave it open with the keyboard pointed at
+    // nothing, and every further keystroke would vanish. The press is
+    // preventDefault-ed so focus stays put. jsdom does not implement mousedown
+    // focus at all, so asserting activeElement here would pass either way —
+    // assert the cancellation itself, which is what a browser reads.
+    it('a press on the dim area is preventDefault-ed, so it cannot steal focus', () => {
         render(<Harness />);
         fireEvent.click(screen.getByRole('button', {name: 'Open'}));
-        const backdrop = screen.getByTestId('test-modal-backdrop');
-        fireEvent.mouseDown(backdrop);
-        fireEvent.mouseUp(backdrop);
-        fireEvent.click(backdrop);
+        const press = createEvent.mouseDown(screen.getByTestId('test-modal-backdrop'));
+        fireEvent(screen.getByTestId('test-modal-backdrop'), press);
+        expect(press.defaultPrevented).toBe(true);
+        expect(screen.getByRole('dialog')).toBeInTheDocument();
+    });
+
+    it('a press INSIDE the dialog is left alone — fields must still take focus', () => {
+        render(<Harness />);
+        fireEvent.click(screen.getByRole('button', {name: 'Open'}));
+        const press = createEvent.mouseDown(screen.getByLabelText('First field'));
+        fireEvent(screen.getByLabelText('First field'), press);
+        expect(press.defaultPrevented).toBe(false);
+    });
+
+    // Belt and braces for the state above: should focus ever end up outside the
+    // subtree while the dialog stays open (a disabled button blurring, an
+    // untrusted press the guard didn't cover), Escape must still close it AND
+    // still hand focus back to the opener — restore reads the opener captured at
+    // MOUNT, so it must not depend on where focus sat at close time.
+    it('closes on Escape and restores the opener even when focus has been parked on <body>', () => {
+        render(<Harness />);
+        const opener = screen.getByRole('button', {name: 'Open'});
+        opener.focus();
+        fireEvent.click(opener);
         expect(screen.getByRole('dialog')).toBeInTheDocument();
 
-        // jsdom does not move focus on mousedown; reproduce what a browser does.
-        (document.activeElement as HTMLElement).blur();
+        const active = document.activeElement;
+        if (active instanceof HTMLElement) active.blur();
         expect(document.activeElement).toBe(document.body);
 
         fireEvent.keyDown(document.body, {key: 'Escape'});
         expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+        expect(document.activeElement).toBe(opener);
     });
 
     it('the × button still closes', () => {
@@ -201,6 +222,10 @@ describe('Modal — dismissal', () => {
         expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     });
 
+    // Also a re-introduction fixture (see backdropInteractions above): with no
+    // click handler left on either node this cannot fail against today's code,
+    // but it pins the half of a re-added `e.target === e.currentTarget` check
+    // that must keep dialog-internal clicks harmless.
     it('clicks inside the dialog never close it', () => {
         render(<Harness />);
         fireEvent.click(screen.getByRole('button', {name: 'Open'}));

@@ -291,10 +291,11 @@ The accessible primitive: portal-rendered, focus moved in on open and restored
 to the opener on close, Tab trapped behind `aria-modal`, Escape closing the
 topmost dialog only, ref-counted body scroll-lock, and a dim area that is
 **inert** — a misplaced click on it never dismisses the dialog and so never
-discards unsaved input (#265); Escape, × and Cancel are the exits. Props:
-`title`, `onClose`, `children`, `testId?`. The caller owns open state — render
-it only while open. Use it directly only for a non-form dialog; forms use
-`FormModal`.
+discards unsaved input, and a press on it is `preventDefault`-ed so it cannot
+blur focus out of a dialog that now stays open (#265). Escape and × are this
+primitive's exits (`FormModal` adds Cancel). Props: `title`, `onClose`,
+`children`, `testId?`. The caller owns open state — render it only while open.
+Use it directly only for a non-form dialog; forms use `FormModal`.
 
 Do **not** add a dismiss-on-outside-click option: every dialog in the app wants
 the same behavior, so the knob would have no production caller that sets it

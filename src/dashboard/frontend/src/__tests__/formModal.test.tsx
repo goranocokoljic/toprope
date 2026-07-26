@@ -15,7 +15,7 @@ import {useModalState} from '../components/useModalState';
  *
  * A backdrop click is deliberately absent from that table since #265: `Modal`
  * no longer closes on one at all, so it is not an affordance the guard can be
- * proven on. It gets its own always-inert test instead.
+ * proven on. That behavior — and its coverage — lives in `modal.test.tsx`.
  */
 
 afterEach(() => {
@@ -36,13 +36,6 @@ function closeAffordances(): Array<{name: string; dismiss: () => void}> {
             dismiss: () => fireEvent.keyDown(screen.getByRole('dialog'), {key: 'Escape'}),
         },
     ];
-}
-
-function clickBackdrop(): void {
-    const backdrop = screen.getByTestId('form-modal-backdrop');
-    fireEvent.mouseDown(backdrop);
-    fireEvent.mouseUp(backdrop);
-    fireEvent.click(backdrop);
 }
 
 function renderFormModal(props: Partial<React.ComponentProps<typeof FormModal>> = {}): {
@@ -149,18 +142,10 @@ describe('FormModal — close guard while pending', () => {
         expect(screen.getByRole('button', {name: 'Cancel'})).toBeDisabled();
     });
 
-    // #265: not a guarded affordance — a backdrop click is inert UNCONDITIONALLY.
-    // Only the IDLE case is worth asserting: it is the one that used to discard a
-    // filled-in form, and a re-introduced close path would route through
-    // `requestClose`, which the pending branch already blocks — so a pending
-    // variant could not fail while this passes. Guards against FormModal (or a
-    // future Modal change) re-arming dismissal on the dim area.
-    it('never closes on a backdrop click, even when idle', () => {
-        const {onClose} = renderFormModal();
-        clickBackdrop();
-        expect(onClose).not.toHaveBeenCalled();
-        expect(screen.getByRole('dialog', {name: 'Add git provider'})).toBeInTheDocument();
-    });
+    // #265: a backdrop click is inert UNCONDITIONALLY, so it is not a guarded
+    // affordance and has no entry above. `Modal` owns that behavior and
+    // `modal.test.tsx` owns its coverage — asserting it again here could only
+    // fail when those tests are already red, so this file deliberately doesn't.
 });
 
 type Row = {id: string; name: string};
