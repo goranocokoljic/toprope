@@ -41,12 +41,18 @@ export function TextField({
     onChange,
     placeholder,
     type = 'text',
+    disabled = false,
+    title,
 }: {
     label: string;
     value: string;
     onChange: (next: string) => void;
     placeholder?: string;
     type?: string;
+    /** Gate the control, e.g. for a field that is immutable after creation. */
+    disabled?: boolean;
+    /** Native tooltip — say WHY when the field is disabled. */
+    title?: string;
 }): JSX.Element {
     return (
         <label className="flex flex-col gap-1">
@@ -55,8 +61,10 @@ export function TextField({
                 type={type}
                 value={value}
                 placeholder={placeholder}
+                disabled={disabled}
+                title={title}
                 onChange={(e) => onChange(e.target.value)}
-                className="rounded-md border border-border bg-surface px-3 py-1.5 text-sm text-foreground"
+                className="rounded-md border border-border bg-surface px-3 py-1.5 text-sm text-foreground disabled:opacity-50"
             />
         </label>
     );

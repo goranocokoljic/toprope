@@ -11,7 +11,7 @@ import {
 } from './helpers';
 import {
     createProvider,
-    deleteProvider,
+    findProviderByTypeContainer,
     getDecryptedConfig,
     getProvider,
     listProviders,
@@ -21,6 +21,11 @@ import {
     GitProviderStoreError,
     type PublicGitProvider,
 } from '../../../connectors/git/providers/store';
+import {
+    containerKey,
+    deleteProviderWithCascade,
+    providerDeleteImpact,
+} from '../../../connectors/git/providers/delete-cascade';
 import {loadServerKey} from '../../../connectors/git/providers/secret';
 import {providerContainer, resolveGitProviderConfigs} from '../../../connectors/git/providers/config';
 import {createGitProvider} from '../../../connectors/git/providers/factory';
@@ -385,13 +390,27 @@ function dbProviderToDto(
 }
 
 // Map a typed store error to an HTTP reply. secret_key_unconfigured is a
-// fail-closed server-config condition (503, NOT 500); not_found is a typed 404.
+// fail-closed server-config condition (503, NOT 500); duplicate_container and
+// container_immutable are state conflicts (409, #264); not_found is a typed 404.
 function replyStoreError(reply: Parameters<typeof forbidden>[0], err: GitProviderStoreError): void {
-    if (err.code === 'secret_key_unconfigured') {
-        serviceUnavailable(reply, err.message);
-        return;
+    switch (err.code) {
+        case 'secret_key_unconfigured':
+            serviceUnavailable(reply, err.message);
+            return;
+        case 'duplicate_container':
+        case 'container_immutable':
+            conflict(reply, err.message);
+            return;
+        case 'not_found':
+            notFound(reply, err.message);
+            return;
+        default: {
+            // Exhaustive over the union today; a future code must be mapped deliberately
+            // rather than silently degrading to a 404 that names the wrong problem.
+            const exhaustive: never = err.code;
+            notFound(reply, `${String(exhaustive)}: ${err.message}`);
+        }
     }
-    notFound(reply, err.message);
 }
 
 /**
@@ -483,6 +502,50 @@ export function registerAdminGitProviderRoutes(
     // runtime) git config. Deterministic order: config declaration order.
     const configProviders = (): GitProviderConfig[] =>
         gitConfig ? resolveGitProviderConfigs(gitConfig) : [];
+
+    // The `${type}:${container}` keys owned by config-file providers — the OTHER source
+    // that can own a container's data and cursors. Used both to reject a create/rename onto
+    // a config-owned container and to skip the delete cascade when a config sibling still
+    // owns the data (#264 AC6).
+    const configContainerKeys = (): Set<string> =>
+        new Set(configProviders().map((c) => containerKey(c.type, providerContainer(c))));
+
+    /**
+     * Who already owns `(type, container)`, as a human phrase, or null when it is free.
+     * `excludeId` is the provider being edited — a row does not collide with itself.
+     *
+     * `(type, container)` is the attribution key of every imported row and every sync cursor
+     * (#264), so exactly one provider may own it. Both sources are checked: a DB row (via the
+     * store's canonical reader) and a config-file provider. One derivation, shared by create
+     * and PATCH, so the two surfaces cannot disagree about what is taken.
+     */
+    function containerOwner(
+        type: GitProviderType,
+        container: string,
+        excludeId?: string,
+    ): string | null {
+        const dbOwner = findProviderByTypeContainer(db, type, container);
+        if (dbOwner !== undefined && dbOwner.id !== excludeId) {
+            return `the connected provider ${dbOwner.id}`;
+        }
+        if (configContainerKeys().has(containerKey(type, container))) {
+            return 'a read-only config-file provider';
+        }
+        return null;
+    }
+
+    // The 409 body for a taken container. One message so create and PATCH read identically.
+    function containerConflictMessage(
+        type: GitProviderType,
+        container: string,
+        owner: string,
+    ): string {
+        return (
+            `A ${type} provider for '${container}' already exists — it is owned by ${owner}. ` +
+            'One container is one independent data set: its imported commits, PRs and sync ' +
+            'cursors all belong to that provider. Edit or delete it instead of adding a second one.'
+        );
+    }
 
     // Overlap guard AND live-progress registry for sync-now (#199/#209): one
     // entry per provider id with an in-flight run, carrying its start time and
@@ -606,6 +669,19 @@ export function registerAdminGitProviderRoutes(
             throw err;
         }
 
+        // Reject a second provider for a container that is already owned (#264 AC3), naming
+        // the owner. The store repeats the DB half of this check inside its write
+        // transaction (a race between two creates would otherwise hit the UNIQUE index and
+        // surface a raw SQLITE_CONSTRAINT); this pass exists to also cover config-file
+        // owners, which the store cannot see, and to name the owner in the message.
+        const takenBy = containerOwner(parsed.config.type, providerContainer(parsed.config));
+        if (takenBy !== null) {
+            return conflict(
+                reply,
+                containerConflictMessage(parsed.config.type, providerContainer(parsed.config), takenBy),
+            );
+        }
+
         try {
             const record = createProvider(db, loadServerKey(), {
                 config: parsed.config,
@@ -640,7 +716,8 @@ export function registerAdminGitProviderRoutes(
             }
             // Existence is checked up front so a not-found returns a typed 404 even
             // when the secret key is unconfigured (fail-closed key only gates writes).
-            if (getProvider(db, id) === undefined) {
+            const existing = getProvider(db, id);
+            if (existing === undefined) {
                 return notFound(reply, `Git provider not found: ${id}`);
             }
 
@@ -653,6 +730,25 @@ export function registerAdminGitProviderRoutes(
             } catch (err) {
                 if (err instanceof BadProviderRequestError) return badRequest(reply, err.message);
                 throw err;
+            }
+
+            // A PATCH that moves the provider onto a container SOMEONE ELSE owns is the
+            // collision case, and gets the owner-naming 409 (#264 AC3). Checked before the
+            // store's blanket immutability refusal so the more specific — and more
+            // actionable — message wins; a rename onto a FREE container is refused by the
+            // store itself (`container_immutable`), because the old container's data and
+            // cursors would otherwise be orphaned.
+            const nextContainer = providerContainer(parsed.config);
+            const movingContainer =
+                parsed.config.type !== existing.type || nextContainer !== existing.container;
+            if (movingContainer) {
+                const owner = containerOwner(parsed.config.type, nextContainer, id);
+                if (owner !== null) {
+                    return conflict(
+                        reply,
+                        containerConflictMessage(parsed.config.type, nextContainer, owner),
+                    );
+                }
             }
 
             try {
@@ -694,22 +790,46 @@ export function registerAdminGitProviderRoutes(
             return conflict(reply, 'A sync is in progress for this provider; wait for it to finish before deleting');
         }
 
-        // NOTE (#262/#264): this deletes the `git_providers` row ONLY. The pipeline's
-        // cursors are keyed by `type:container`, so they survive, and a provider later
-        // re-added for the same container inherits them — its first-sync window is
-        // silently ignored. Purging them here is NOT safe on its own: `raw_author_daily`
-        // is keyed by provider FAMILY with no container column, so the deleted
-        // provider's imported rows cannot be retracted, and `mergeDailyAcrossRuns` ADDS
-        // commit counters — re-importing the window would double-count them permanently.
-        // The cursor purge lands in #264 together with container attribution, which lets
-        // the delete retract that container's data instead. Until then the admin UI
-        // correctly reports `first_sync_pending: false` for such a provider (below), so
-        // it never offers a window the pipeline would discard.
-        if (!deleteProvider(db, id)) {
-            return notFound(reply, `Git provider not found: ${id}`);
+        // DESTRUCTIVE since #264: this retracts the provider's container's
+        // `raw_author_daily` + `pr_records`, re-projects the affected `git_snapshots` days
+        // from what survives, and purges its `type:container` cursors — all in one
+        // transaction (see `delete-cascade.ts` for the ordering and why each step is where
+        // it is). Purging the cursors is safe ONLY because the data they licensed goes with
+        // them: that is what makes the #262 re-add double-count unreachable rather than
+        // merely guarded. Skipped when a config-file provider still owns the same
+        // `(type, container)`. Developers, identities and team membership are untouched.
+        try {
+            const removed = deleteProviderWithCascade(db, id, configContainerKeys());
+            // Report WHAT was removed, not a bare `{deleted: true}`: the UI states it back to
+            // the admin, and a cascade that retracted nothing is a different outcome from one
+            // that removed six months of history.
+            return {data: {id, deleted: true, removed}};
+        } catch (err) {
+            if (err instanceof GitProviderStoreError) return replyStoreError(reply, err);
+            throw err;
         }
-        return {data: {id, deleted: true}};
     });
+
+    // GET /:id/delete-impact — what a DELETE would remove, so the UI can confirm with the
+    // real numbers instead of a generic scare (#264 AC9). Read-only and cheap: a handful of
+    // aggregate queries, no per-row fan-out. Config-file rows report a zeroed impact (they
+    // cannot be deleted at all — the DELETE route rejects them with a 409).
+    app.get<{Params: {id: string}}>(
+        '/api/admin/git/providers/:id/delete-impact',
+        async (request, reply) => {
+            if (!isAdmin(request)) return forbidden(reply);
+            const {id} = request.params;
+
+            if (configProviders().some((c) => configProviderId(c) === id)) {
+                return conflict(reply, 'Config-file providers are read-only and cannot be deleted');
+            }
+            const record = getProvider(db, id);
+            if (record === undefined) {
+                return notFound(reply, `Git provider not found: ${id}`);
+            }
+            return {data: providerDeleteImpact(db, record, configContainerKeys())};
+        },
+    );
 
     // POST /:id/test — probe a SAVED provider (DB or read-only config-file) by
     // reusing provider.checkAccess(). A failed probe is a 200 with {ok:false}: the

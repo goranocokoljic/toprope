@@ -37,14 +37,22 @@ function nowIso(): string {
     return new Date().toISOString();
 }
 
-/** Why a store write refused — both are fail-closed, typed for the API to map. */
-export type GitProviderStoreErrorCode = 'secret_key_unconfigured' | 'not_found';
+/** Why a store write refused — all fail-closed, typed for the API to map. */
+export type GitProviderStoreErrorCode =
+    | 'secret_key_unconfigured'
+    | 'not_found'
+    | 'duplicate_container'
+    | 'container_immutable';
 
 /**
  * A fail-closed refusal from the store: the server key is unconfigured/invalid
- * (`secret_key_unconfigured`) or the target row does not exist (`not_found`).
- * Typed so the API layer maps it to a real status instead of leaking a raw DB
- * error (data-integrity review-rule: validate existence + return a typed error).
+ * (`secret_key_unconfigured`), the target row does not exist (`not_found`), the
+ * `(type, container)` pair is already owned by another provider
+ * (`duplicate_container`), or a write tried to move an existing provider to a
+ * different `(type, container)` (`container_immutable`, #264 — see
+ * {@link updateProvider}). Typed so the API layer maps it to a real status instead of
+ * leaking a raw DB error (data-integrity review-rule: validate existence + return a
+ * typed error).
  */
 export class GitProviderStoreError extends Error {
     readonly code: GitProviderStoreErrorCode;
@@ -197,9 +205,34 @@ function requireKey(keyResult: ServerKeyResult): Extract<ServerKeyResult, {ok: t
 }
 
 /**
+ * The provider that owns a `(type, container)` pair, or `undefined` when it is free.
+ *
+ * `(type, container)` is the ATTRIBUTION key since #264: it keys the pipeline's cursors,
+ * every `raw_author_daily`/`pr_records` row, and therefore the unit a delete retracts. One
+ * container must have exactly one owner, which migration 042 enforces with
+ * `UNIQUE(type, container)`. This is the canonical reader for that pair — the create/update
+ * guards below and the admin API's 409s all go through it rather than re-deriving the
+ * lookup, so "who owns this container" has one definition.
+ */
+export function findProviderByTypeContainer(
+    db: Database.Database,
+    type: GitProviderType,
+    container: string,
+): GitProviderRecord | undefined {
+    return db
+        .prepare('SELECT * FROM git_providers WHERE type = ? AND container = ?')
+        .get(type, container) as GitProviderRecord | undefined;
+}
+
+/**
  * Create a provider: validate the shape via the canonical factory seam, encrypt
  * the token with the server key (fail-closed if unconfigured), stamp
  * `token_last4`, and write the row. Returns the stored record.
+ *
+ * Refuses a `(type, container)` another row already owns with a typed
+ * `duplicate_container` (#264), so the caller can name the owner instead of surfacing a raw
+ * `SQLITE_CONSTRAINT`. The check-then-insert runs in ONE transaction: the UNIQUE index is a
+ * fail-fast backstop against a race, it does not serialize one.
  */
 export function createProvider(
     db: Database.Database,
@@ -220,39 +253,53 @@ export function createProvider(
     const enabled = input.enabled === false ? 0 : 1;
     const createdBy = input.createdBy ?? null;
 
-    db.prepare(
-        `INSERT INTO git_providers (
-            id, type, container, url, include_subgroups, auth_method, auth_username,
-            token_ciphertext, token_meta, token_last4, repos_include, repos_exclude,
-            enabled, created_at, updated_at, created_by,
-            last_sync_at, last_sync_status, last_sync_error
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)`,
-    ).run(
-        id,
-        fields.type,
-        fields.container,
-        fields.url,
-        fields.include_subgroups,
-        fields.auth_method,
-        fields.auth_username,
-        encrypted.ciphertext,
-        JSON.stringify(encrypted.meta),
-        last4Of(token),
-        fields.repos_include,
-        fields.repos_exclude,
-        enabled,
-        now,
-        now,
-        createdBy,
-    );
+    return db.transaction((): GitProviderRecord => {
+        const owner = findProviderByTypeContainer(db, fields.type, fields.container);
+        if (owner !== undefined) {
+            throw new GitProviderStoreError(
+                'duplicate_container',
+                `A ${fields.type} provider for '${fields.container}' already exists (id=${owner.id}). ` +
+                    'One container is one independent data set — edit or delete that provider instead.',
+            );
+        }
 
-    const stored = getProvider(db, id);
-    if (stored === undefined) {
-        // The insert just ran on this synchronous connection, so the row is
-        // always present; guard rather than cast so a future regression fails loudly.
-        throw new GitProviderStoreError('not_found', `git_providers row vanished immediately after insert (id=${id})`);
-    }
-    return stored;
+        db.prepare(
+            `INSERT INTO git_providers (
+                id, type, container, url, include_subgroups, auth_method, auth_username,
+                token_ciphertext, token_meta, token_last4, repos_include, repos_exclude,
+                enabled, created_at, updated_at, created_by,
+                last_sync_at, last_sync_status, last_sync_error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)`,
+        ).run(
+            id,
+            fields.type,
+            fields.container,
+            fields.url,
+            fields.include_subgroups,
+            fields.auth_method,
+            fields.auth_username,
+            encrypted.ciphertext,
+            JSON.stringify(encrypted.meta),
+            last4Of(token),
+            fields.repos_include,
+            fields.repos_exclude,
+            enabled,
+            now,
+            now,
+            createdBy,
+        );
+
+        const stored = getProvider(db, id);
+        if (stored === undefined) {
+            // The insert just ran on this synchronous connection, so the row is
+            // always present; guard rather than cast so a future regression fails loudly.
+            throw new GitProviderStoreError(
+                'not_found',
+                `git_providers row vanished immediately after insert (id=${id})`,
+            );
+        }
+        return stored;
+    })();
 }
 
 /**
@@ -286,6 +333,17 @@ export function listProviders(db: Database.Database): GitProviderRecord[] {
  * in one transaction (data-integrity review-rule). Fail-closed: unknown id →
  * `not_found`, unconfigured key → `secret_key_unconfigured`. Returns the updated
  * record.
+ *
+ * `(type, container)` IS IMMUTABLE (#264). Since that pair keys the pipeline's cursors and
+ * every imported `raw_author_daily`/`pr_records` row, moving a provider to a different pair
+ * would leave the old container's data and cursors owned by nobody — un-syncable, and
+ * un-retractable because no provider row resolves to them any more (the PATCH-orphan
+ * finding deferred from #262). The two honest options are "move the data with it" or
+ * "refuse"; refusing is the one chosen, because a container change is not always a rename —
+ * it is just as often a re-point at a genuinely different workspace, and relabelling
+ * workspace A's commits as workspace B's would be silent data corruption that no later
+ * operation can undo. Delete the provider (which now cleanly retracts its data) and add the
+ * new container instead. Reported as a typed `container_immutable`, never a silent no-op.
  */
 export function updateProvider(
     db: Database.Database,
@@ -312,6 +370,18 @@ export function updateProvider(
         const config = withToken(patch.config, validationToken);
         validateGitProviderConfig(config);
         const fields = providerConfigToRowFields(config);
+
+        // The attribution key is immutable — see the doc above. Checked here, inside the
+        // write transaction, so no caller can bypass it (the admin route validates the
+        // COLLIDING case first, to name the owner; this is the total guard).
+        if (fields.type !== existing.type || fields.container !== existing.container) {
+            throw new GitProviderStoreError(
+                'container_immutable',
+                `A provider's type and container cannot be changed (${existing.type}/${existing.container} → ` +
+                    `${fields.type}/${fields.container}): its imported data and sync cursors are keyed by that pair. ` +
+                    'Delete this provider — which now removes exactly its own data — and add the new one.',
+            );
+        }
 
         const enabled = patch.enabled === undefined ? existing.enabled : patch.enabled ? 1 : 0;
 
@@ -360,7 +430,14 @@ export function updateProvider(
     return run();
 }
 
-/** Delete a provider by id. Returns true when a row was actually removed. */
+/**
+ * Delete a provider ROW by id. Returns true when a row was actually removed.
+ *
+ * This is the row delete only. Since #264 a provider owns imported data and sync cursors
+ * keyed by its `(type, container)`, and removing a provider means retracting those too —
+ * that whole cascade lives in `delete-cascade.ts`, which composes this as its last step.
+ * Call this directly only when you genuinely mean "drop the row and leave the data".
+ */
 export function deleteProvider(db: Database.Database, id: string): boolean {
     return db.prepare('DELETE FROM git_providers WHERE id = ?').run(id).changes > 0;
 }

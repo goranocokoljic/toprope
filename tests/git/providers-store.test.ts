@@ -6,6 +6,7 @@ import {loadServerKey, type ServerKeyResult} from '../../src/connectors/git/prov
 import {
     createProvider,
     deleteProvider,
+    findProviderByTypeContainer,
     getDecryptedConfig,
     getProvider,
     GitProviderStoreError,
@@ -44,9 +45,11 @@ const BITBUCKET_APP: GitProviderConfig = {
     workspace: 'acme-ws',
     auth: {type: 'app_password', username: 'jane', app_password: 'app-pw-WXYZ5678'},
 };
+// A DISTINCT workspace from BITBUCKET_APP: (type, container) is UNIQUE since 042 (#264),
+// so two bitbucket fixtures for one workspace could never coexist in a store.
 const BITBUCKET_TOKEN: GitProviderConfig = {
     type: 'bitbucket',
-    workspace: 'acme-ws',
+    workspace: 'acme-ws-2',
     auth: {type: 'access_token', token: 'bb-at-TOKN9012'},
 };
 const GITLAB: GitProviderConfig = {
@@ -98,6 +101,39 @@ describe('provider store — create + read (#195)', () => {
 
     it('getProvider returns undefined for an unknown id', () => {
         expect(getProvider(db, 'nope')).toBeUndefined();
+    });
+
+    // #264: one container is one independent data set, so a second provider for it is
+    // refused with a typed error naming the owner — never a raw SQLITE_CONSTRAINT.
+    it('refuses a second provider for the same (type, container) with a typed error', () => {
+        const first = createProvider(db, keyOk(), {config: GITHUB});
+        try {
+            createProvider(db, keyOk(), {config: GITHUB});
+            throw new Error('should have thrown');
+        } catch (e) {
+            expect(e).toBeInstanceOf(GitProviderStoreError);
+            expect((e as GitProviderStoreError).code).toBe('duplicate_container');
+            // Names the owner so the caller can point the admin at it.
+            expect((e as GitProviderStoreError).message).toContain(first.id);
+        }
+        expect(listProviders(db)).toHaveLength(1);
+    });
+
+    it('allows the same container NAME under a different provider family', () => {
+        createProvider(db, keyOk(), {config: GITHUB}); // github/acme
+        expect(() =>
+            createProvider(db, keyOk(), {
+                config: {type: 'gitlab', group: 'acme', auth: {type: 'oauth', token: 'glpat-x'}},
+            }),
+        ).not.toThrow();
+        expect(listProviders(db)).toHaveLength(2);
+    });
+
+    it('findProviderByTypeContainer resolves the owner and misses a free pair', () => {
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        expect(findProviderByTypeContainer(db, 'github', 'acme')?.id).toBe(rec.id);
+        expect(findProviderByTypeContainer(db, 'github', 'other')).toBeUndefined();
+        expect(findProviderByTypeContainer(db, 'gitlab', 'acme')).toBeUndefined();
     });
 });
 
@@ -179,12 +215,14 @@ describe('provider store — update (#195)', () => {
         const beforeCipher = Buffer.from(rec.token_ciphertext);
         const beforeMeta = rec.token_meta;
 
-        // Change the shape (container + repos) but NOT the token.
+        // Change the shape (repo scope) but NOT the token. The container is deliberately
+        // held constant — it is immutable since #264 (see the dedicated tests below).
         const patched = updateProvider(db, keyOk(), rec.id, {
-            config: {...GITHUB, org: 'acme-renamed'} as GitProviderConfig,
+            config: {...GITHUB, repos: ['include:svc-c']} as GitProviderConfig,
         });
 
-        expect(patched.container).toBe('acme-renamed');
+        expect(patched.container).toBe('acme');
+        expect(patched.repos_include).toBe(JSON.stringify(['include:svc-c']));
         // Byte-for-byte identical ciphertext/meta/last4 — no re-encryption.
         expect(Buffer.compare(patched.token_ciphertext, beforeCipher)).toBe(0);
         expect(patched.token_meta).toBe(beforeMeta);
@@ -218,8 +256,40 @@ describe('provider store — update (#195)', () => {
         const rec = createProvider(db, keyOk(), {config: GITHUB});
         const disabled = updateProvider(db, keyOk(), rec.id, {config: GITHUB, enabled: false});
         expect(disabled.enabled).toBe(0);
-        const untouched = updateProvider(db, keyOk(), rec.id, {config: {...GITHUB, org: 'x2'}});
+        const untouched = updateProvider(db, keyOk(), rec.id, {
+            config: {...GITHUB, repos: ['include:svc-c']},
+        });
         expect(untouched.enabled).toBe(0); // omitted → kept
+    });
+
+    // #264: (type, container) keys every imported row and every sync cursor, so moving a
+    // saved provider to a different pair would orphan the old container's data and cursors.
+    // Refused with a typed error, in the write function itself, so no caller can bypass it.
+    it('refuses to change the container (typed container_immutable), writing nothing', () => {
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        try {
+            updateProvider(db, keyOk(), rec.id, {
+                config: {...GITHUB, org: 'acme-renamed'} as GitProviderConfig,
+            });
+            throw new Error('should have thrown');
+        } catch (e) {
+            expect(e).toBeInstanceOf(GitProviderStoreError);
+            expect((e as GitProviderStoreError).code).toBe('container_immutable');
+        }
+        expect(getProvider(db, rec.id)?.container).toBe('acme');
+    });
+
+    it('refuses to change the provider TYPE too (the pair is the key, not just the name)', () => {
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        try {
+            updateProvider(db, keyOk(), rec.id, {
+                config: {type: 'gitlab', group: 'acme', auth: {type: 'oauth', token: 'glpat-x'}},
+            });
+            throw new Error('should have thrown');
+        } catch (e) {
+            expect((e as GitProviderStoreError).code).toBe('container_immutable');
+        }
+        expect(getProvider(db, rec.id)?.type).toBe('github');
     });
 
     it('throws typed not_found for an unknown id (and writes nothing)', () => {

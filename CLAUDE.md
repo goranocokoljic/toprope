@@ -26,7 +26,17 @@ No proxy, no traffic interception. Pure API-pull + git analysis.
 
 ## Key Constraints
 - Daily snapshots are the atomic unit — one row per developer per day per tool
-- Append-only: never modify historical snapshots
+- Append-only: never modify historical snapshots.
+  **Documented exception — `git_snapshots` (#253 / #264).** Since #253 `git_snapshots` is not
+  a source of record but a deterministic PROJECTION of `(raw_author_daily, identity map)`
+  at the `(developer_id, date)` grain. Rebuilding or removing a projected cell is therefore
+  *recomputation*, not history rewriting: the facts live in `raw_author_daily`, keyed by the
+  immutable raw git identity and by `(provider, container)`. Two paths rely on it — replaying
+  a developer whose identities changed (#253), and the provider delete cascade, which
+  retracts one container's contribution and re-projects the affected days (#264). The
+  exception is bounded by `is_projected`: rows the projection did not produce are never
+  written or deleted by it. `tool_snapshots` and every other snapshot table remain strictly
+  append-only.
 - Waste detection: subscription with zero activity for 14+ days = unused
 - Data quality tracked per data point: high (API), medium (git), low (expense only)
 - Privacy: individual data visible only to developer. Managers see team aggregates.

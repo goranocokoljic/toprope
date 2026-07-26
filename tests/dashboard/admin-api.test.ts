@@ -800,6 +800,7 @@ describe('admin API', () => {
         function retain(login: string, date: string, commits = 1): void {
             upsertRawAuthorDaily(db, {
                 provider: 'github',
+                container: 'acme',
                 raw_author_key: `github:login:${login}`,
                 author_login: login,
                 author_email: `${login}@work.com`,

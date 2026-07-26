@@ -88,6 +88,11 @@ export const queryKeys = {
     // #201). Keyed by provider id so each provider's repos cache independently;
     // only fetched when the admin opens "Select repositories".
     adminGitProviderRepos: (id: string) => ['admin', 'git-providers', id, 'repos'] as const,
+    // What deleting one provider would remove (#264). Keyed by provider id; fetched only
+    // while that row's delete confirmation is open, since it exists to state the impact of a
+    // destructive action rather than to render the list.
+    adminGitProviderDeleteImpact: (id: string) =>
+        ['admin', 'git-providers', id, 'delete-impact'] as const,
     // Expense reconciliation (Task 4.4): keyed by status so switching the filter
     // refetches the right slice of the queue.
     adminReconciliation: (status: string) => ['admin', 'reconciliation', status] as const,

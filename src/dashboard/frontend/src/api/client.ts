@@ -21,6 +21,8 @@ import type {
     DeveloperIdentity,
     DeveloperJourney,
     MyPRReviewCoaching,
+    GitProviderDeleteImpact,
+    GitProviderDeleteResult,
     GitProviderInput,
     GitProviderProbeResult,
     GitProviderRepo,
@@ -588,9 +590,23 @@ export const api = {
         return body.data;
     },
 
-    async deleteAdminGitProvider(id: string): Promise<{id: string; deleted: boolean}> {
-        const body = await deleteJson<ApiEnvelope<{id: string; deleted: boolean}>>(
+    /**
+     * Delete a provider AND retract its container's imported data (#264). The response
+     * reports what was actually removed, which the page states back to the admin — a bare
+     * "deleted" would hide the difference between retracting nothing and retracting months
+     * of history.
+     */
+    async deleteAdminGitProvider(id: string): Promise<GitProviderDeleteResult> {
+        const body = await deleteJson<ApiEnvelope<GitProviderDeleteResult>>(
             `/api/admin/git/providers/${encodeURIComponent(id)}`,
+        );
+        return body.data;
+    },
+
+    /** What a delete WOULD remove — read-only, for the destructive-action confirmation (#264). */
+    async getAdminGitProviderDeleteImpact(id: string): Promise<GitProviderDeleteImpact> {
+        const body = await request<ApiEnvelope<GitProviderDeleteImpact>>(
+            `/api/admin/git/providers/${encodeURIComponent(id)}/delete-impact`,
         );
         return body.data;
     },

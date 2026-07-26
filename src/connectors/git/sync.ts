@@ -986,6 +986,13 @@ function parseRepoFilters(rawRepos: string[] | undefined): {include: string[]; e
 // to a developer and upserted in sync().
 interface PRRecordInput {
     provider: GitProviderType;
+    /**
+     * The provider INSTANCE this PR came from (org/workspace/group) — the other half of the
+     * attribution key `pr_records` is now unique on (#264). Non-optional so a write path
+     * cannot omit it: a PR id is unique only WITHIN a container, and a row with no container
+     * is a row no per-provider delete can retract.
+     */
+    container: string;
     repo: string;
     prId: string;
     authorLogin: string | null;
@@ -1284,6 +1291,7 @@ async function fetchProviderData(
 
             allPRRecords.push({
                 provider: providerType,
+                container: identifier,
                 repo: repoName,
                 prId: pr.id,
                 authorLogin: pr.author.username || null,
@@ -1390,9 +1398,11 @@ function upsertPRRecord(
         const existing = db
             .prepare(
                 `SELECT review_comment_count, review_rounds, changes_requested_count
-                 FROM pr_records WHERE provider = ? AND repo = ? AND pr_id = ?`,
+                 FROM pr_records WHERE provider = ? AND container = ? AND repo = ? AND pr_id = ?`,
             )
-            .get(record.provider, record.repo, record.prId) as PRRecordExistingRow | undefined;
+            .get(record.provider, record.container, record.repo, record.prId) as
+            | PRRecordExistingRow
+            | undefined;
         if (existing) {
             if (!record.commentsOk) commentCount = existing.review_comment_count;
             if (!record.reviewsOk) {
@@ -1413,10 +1423,10 @@ function upsertPRRecord(
 
     db.prepare(
         `INSERT INTO pr_records
-         (id, developer_id, provider, repo, pr_id, state, created_at, merged_at, closed_at,
+         (id, developer_id, provider, container, repo, pr_id, state, created_at, merged_at, closed_at,
           review_comment_count, review_rounds, changes_requested_count, time_to_merge_hours, synced_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(provider, repo, pr_id) DO UPDATE SET
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(provider, container, repo, pr_id) DO UPDATE SET
            developer_id = excluded.developer_id,
            state = excluded.state,
            created_at = excluded.created_at,
@@ -1438,6 +1448,7 @@ function upsertPRRecord(
         randomUUID(),
         developerId,
         record.provider,
+        record.container,
         record.repo,
         record.prId,
         record.state,
@@ -1791,6 +1802,11 @@ export class GitSync implements ConnectorInterface {
                 for (const [, metrics] of byDate) {
                     const row: RawAuthorDailyInput = {
                         provider: providerType,
+                        // The provider INSTANCE this row is attributed to (#264). `identifier`
+                        // is `providerContainer(pc)` — the exact same value this provider's
+                        // sync-state keys are built from, so data and cursors now share one
+                        // grain and a delete can retract both together.
+                        container: identifier,
                         raw_author_key: rawAuthorKey,
                         author_login: login,
                         author_email: emailForLogin,
@@ -1809,15 +1825,24 @@ export class GitSync implements ConnectorInterface {
                         avg_commit_size: metrics.avg_commit_size,
                         commit_burst_count: metrics.commit_burst_count,
                     };
-                    // Accumulate WITHIN the run before the store ever sees it. `providerType`
-                    // is the provider FAMILY, not the instance, so two configured GitHub orgs
-                    // (or two Bitbucket workspaces) sharing an author produce the same
-                    // (key, date) here. Pushing both would hand them to the across-runs rule,
-                    // which max()es the re-delivered PR fields — correct for one PR delivered
-                    // twice, badly wrong for two orgs' genuinely different PRs on one day: the
-                    // smaller org's count would vanish, permanently, since the cursor advances
-                    // past the window. These sides ARE disjoint, so they sum.
-                    const dedupeKey = `${rawAuthorKey}\u0000${metrics.date}`;
+                    // Accumulate WITHIN the run before the store ever sees it, keyed by the
+                    // FULL store key — container included (#264).
+                    //
+                    // Two provider instances of one family (two GitHub orgs, two Bitbucket
+                    // workspaces) sharing an author no longer collide here at all: they are
+                    // separate rows in the store, so their genuinely-different PRs are never
+                    // handed to the across-runs `max()` rule that would have kept only the
+                    // larger org's count, permanently, once the cursor advanced past the
+                    // window. This accumulation therefore now only fires when one container
+                    // appears twice in a single run's provider set — which `UNIQUE(type,
+                    // container)` and the resolver's (type, container) de-dupe both prevent.
+                    // Kept, not removed: for that shape the two sides ARE disjoint, so summing
+                    // is the correct rule and the map must not silently drop one of them.
+                    //
+                    // NUL-separated on BOTH joins: a container is free-form text and may
+                    // contain spaces, so a space separator would let ('a b', 'key') and
+                    // ('a', 'b key') produce the same composite key.
+                    const dedupeKey = `${identifier}\u0000${rawAuthorKey}\u0000${metrics.date}`;
                     const prior = rawWrites.get(dedupeKey);
                     rawWrites.set(
                         dedupeKey,

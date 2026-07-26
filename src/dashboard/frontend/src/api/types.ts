@@ -992,6 +992,54 @@ export interface AdminGitProvider {
     first_sync_pending: boolean;
 }
 
+/**
+ * What deleting a provider would remove (`GET /api/admin/git/providers/:id/delete-impact`,
+ * #264). Mirrors the server's `ProviderDeleteImpact`.
+ *
+ * A provider delete is DESTRUCTIVE since #264: it retracts exactly its container's imported
+ * commits, PRs and snapshot contribution. This is what the confirmation dialog states before
+ * the admin proceeds. Developers, their identities and team membership are never removed —
+ * `developers_affected` is "whose git numbers will change", not "who gets deleted".
+ *
+ * Every count is 0 and `cascade_skipped` is true when a config-file provider still owns the
+ * same `(type, container)`: it keeps the data, so only the DB row goes.
+ */
+export interface GitProviderDeleteImpact {
+    provider: GitProviderType;
+    container: string;
+    raw_author_rows: number;
+    /** Distinct UTC days of history that would be removed. */
+    days: number;
+    earliest_date: string | null;
+    latest_date: string | null;
+    commits: number;
+    pr_records: number;
+    authors: number;
+    developers_affected: number;
+    cursor_keys: number;
+    cascade_skipped: boolean;
+}
+
+/** What a completed delete removed (`DELETE /api/admin/git/providers/:id`, #264). */
+export interface GitProviderDeleteResult {
+    id: string;
+    deleted: boolean;
+    removed: {
+        id: string;
+        provider: GitProviderType;
+        container: string;
+        raw_author_rows: number;
+        pr_records: number;
+        days: number;
+        snapshot_cells_retracted: number;
+        snapshot_cells_rewritten: number;
+        snapshot_cells_legacy_skipped: number;
+        developers_affected: number;
+        cursor_keys_purged: number;
+        cascade_skipped: boolean;
+    };
+}
+
 /** The stages a sync run passes through, in pipeline order (#209). */
 export type GitSyncStage = 'listing_repos' | 'fetching' | 'analyzing' | 'writing';
 

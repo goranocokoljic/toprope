@@ -10,6 +10,10 @@ import {
     readRawDailyForKeys,
     readRawDailyForDates,
     distinctRawAuthorIdentities,
+    summarizeContainerRawDaily,
+    containerRawAuthorIdentities,
+    containerRawDailyDates,
+    deleteContainerRawDaily,
     RawAuthorDailyError,
     type DailyGitMetrics,
     type RawAuthorDailyInput,
@@ -39,6 +43,7 @@ function metrics(over: Partial<DailyGitMetrics> = {}): DailyGitMetrics {
 function input(over: Partial<RawAuthorDailyInput> = {}): RawAuthorDailyInput {
     return {
         provider: 'github',
+        container: 'acme',
         raw_author_key: 'github:login:alice',
         author_login: 'alice',
         author_email: 'alice@example.com',
@@ -581,6 +586,113 @@ describe('upsertRawAuthorDaily + readers (#252)', () => {
 
         it('returns [] on an empty store', () => {
             expect(distinctRawAuthorIdentities(db)).toEqual([]);
+        });
+
+        // #264: the container is NOT part of this grain. Attribution resolves (login, email),
+        // so splitting by container would list one person twice for committing in two
+        // workspaces — a finer grain than any consumer's question.
+        it('folds one author’s two containers into ONE identity variant', () => {
+            upsertRawAuthorDaily(db, input({container: 'ws-a', commits: 3}), '2026-07-01T10:00:00.000Z');
+            upsertRawAuthorDaily(db, input({container: 'ws-b', commits: 4}), '2026-07-01T10:00:00.000Z');
+            const authors = distinctRawAuthorIdentities(db);
+            expect(authors).toHaveLength(1);
+            expect(authors[0].commit_count).toBe(7);
+        });
+    });
+
+    // ─── Per-container attribution (#264) ─────────────────────────────────────────
+    describe('container attribution', () => {
+        it('refuses a missing/blank/whitespace container with a typed invalid_container', () => {
+            for (const container of [undefined, '', '   '] as unknown[]) {
+                try {
+                    upsertRawAuthorDaily(
+                        db,
+                        {...input(), container} as RawAuthorDailyInput,
+                        '2026-07-01T10:00:00.000Z',
+                    );
+                    throw new Error(`should have thrown for ${JSON.stringify(container)}`);
+                } catch (e) {
+                    expect(e).toBeInstanceOf(RawAuthorDailyError);
+                    expect((e as RawAuthorDailyError).code).toBe('invalid_container');
+                }
+            }
+            expect(readRawDailyForDates(db, ['2026-07-01'])).toEqual([]);
+        });
+
+        it('keeps two containers’ same-key/same-day contributions as INDEPENDENT rows', () => {
+            upsertRawAuthorDaily(db, input({container: 'ws-a', commits: 3, prs_merged: 1}), '2026-07-01T10:00:00.000Z');
+            upsertRawAuthorDaily(db, input({container: 'ws-b', commits: 5, prs_merged: 2}), '2026-07-01T10:00:00.000Z');
+
+            const rows = readRawDailyForDates(db, ['2026-07-01']);
+            expect(rows.map((r) => [r.container, r.commits, r.prs_merged])).toEqual([
+                ['ws-a', 3, 1],
+                ['ws-b', 5, 2],
+            ]);
+        });
+
+        it('still merges ACROSS RUNS within one container', () => {
+            upsertRawAuthorDaily(db, input({container: 'ws-a', commits: 3}), '2026-07-01T10:00:00.000Z');
+            upsertRawAuthorDaily(db, input({container: 'ws-a', commits: 4}), '2026-07-02T10:00:00.000Z');
+            const rows = readRawDailyForDates(db, ['2026-07-01']);
+            expect(rows).toHaveLength(1);
+            expect(rows[0].commits).toBe(7);
+        });
+
+        it('summarizes, lists dates for, and deletes ONE container without touching a sibling', () => {
+            upsertRawAuthorDaily(db, input({container: 'ws-a', commits: 3}), '2026-07-01T10:00:00.000Z');
+            upsertRawAuthorDaily(
+                db,
+                input({container: 'ws-a', date: '2026-07-03', commits: 4}),
+                '2026-07-03T10:00:00.000Z',
+            );
+            upsertRawAuthorDaily(db, input({container: 'ws-b', commits: 9}), '2026-07-01T10:00:00.000Z');
+
+            expect(summarizeContainerRawDaily(db, 'github', 'ws-a')).toEqual({
+                rows: 2,
+                days: 2,
+                earliestDate: '2026-07-01',
+                latestDate: '2026-07-03',
+                commits: 7,
+                authors: 1,
+            });
+            expect(containerRawDailyDates(db, 'github', 'ws-a')).toEqual(['2026-07-01', '2026-07-03']);
+            expect(containerRawAuthorIdentities(db, 'github', 'ws-a')).toEqual([
+                {raw_author_key: 'github:login:alice', login: 'alice', email: 'alice@example.com'},
+            ]);
+
+            expect(deleteContainerRawDaily(db, 'github', 'ws-a')).toBe(2);
+            const survivors = readRawDailyForDates(db, ['2026-07-01', '2026-07-03']);
+            expect(survivors.map((r) => [r.container, r.commits])).toEqual([['ws-b', 9]]);
+        });
+
+        it('summarizes an empty container as zeros with null date bounds (never null-as-unknown)', () => {
+            expect(summarizeContainerRawDaily(db, 'github', 'nothing-here')).toEqual({
+                rows: 0,
+                days: 0,
+                earliestDate: null,
+                latestDate: null,
+                commits: 0,
+                authors: 0,
+            });
+            expect(containerRawDailyDates(db, 'github', 'nothing-here')).toEqual([]);
+            expect(deleteContainerRawDaily(db, 'github', 'nothing-here')).toBe(0);
+        });
+
+        it('scopes the delete by the FULL key — the same container name under another family survives', () => {
+            upsertRawAuthorDaily(db, input({container: 'shared', commits: 3}), '2026-07-01T10:00:00.000Z');
+            upsertRawAuthorDaily(
+                db,
+                input({
+                    provider: 'gitlab',
+                    container: 'shared',
+                    raw_author_key: 'gitlab:login:alice',
+                    commits: 8,
+                }),
+                '2026-07-01T10:00:00.000Z',
+            );
+            expect(deleteContainerRawDaily(db, 'github', 'shared')).toBe(1);
+            const rows = readRawDailyForDates(db, ['2026-07-01']);
+            expect(rows.map((r) => [r.provider, r.commits])).toEqual([['gitlab', 8]]);
         });
     });
 });

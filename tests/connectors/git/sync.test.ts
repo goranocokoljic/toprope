@@ -373,6 +373,64 @@ describe('GitSync', () => {
         expect(read('2024-01-15')?.commits).toBe(2);
         // …and one MERGED PR from each, on the merge day. max() would have kept 1.
         expect(read('2024-01-16')?.prs_merged).toBe(2);
+
+        // #264: and the two orgs are now INDEPENDENTLY attributed under the raw key, one row
+        // per (container, author, day) — which is what lets a per-provider delete retract
+        // exactly one org's contribution. Before this, both summed into a single row that no
+        // delete could ever split.
+        const rawRows = db
+            .prepare(
+                `SELECT container, commits FROM raw_author_daily
+                  WHERE date = '2024-01-15' ORDER BY container`,
+            )
+            .all() as {container: string; commits: number}[];
+        expect(rawRows).toEqual([
+            {container: 'org-a', commits: 1},
+            {container: 'org-b', commits: 1},
+        ]);
+        // Same for the per-PR facts: two rows, each stamped with its own container.
+        expect(
+            db
+                .prepare('SELECT container, pr_id FROM pr_records ORDER BY container')
+                .all(),
+        ).toEqual([
+            {container: 'org-a', pr_id: 'pr-a'},
+            {container: 'org-b', pr_id: 'pr-b'},
+        ]);
+    });
+
+    // #264: a PR id is unique only WITHIN a container, so two orgs that happen to use the
+    // same repo name and PR number must not collide into one `pr_records` row (the pre-042
+    // unique key `(provider, repo, pr_id)` would have made the second an UPDATE of the
+    // first, silently losing one org's PR).
+    it('keeps same-repo/same-PR-id records from two orgs as separate pr_records rows', async () => {
+        const devLogin = 'alice';
+        seedDev(db, devLogin);
+
+        const org = (sha: string): ReturnType<typeof makeMockProvider> =>
+            makeMockProvider({
+                name: 'github',
+                listRepos: vi.fn().mockResolvedValue([makeRepo('shared-name')]),
+                getCommits: vi.fn().mockResolvedValue([makeProviderCommit(devLogin, '2024-01-15T10:00:00Z', sha)]),
+                getPullRequests: vi.fn().mockResolvedValue([{...makeProviderPR(devLogin), id: '42'}]),
+                getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+            });
+        const createGitProvider = await getCreateGitProvider();
+        createGitProvider.mockReturnValueOnce(org('sha-a')).mockReturnValueOnce(org('sha-b'));
+
+        await new GitSync({
+            enabled: true,
+            providers: [
+                {type: 'github', org: 'org-a', auth: {type: 'token', api_token: 'token'}},
+                {type: 'github', org: 'org-b', auth: {type: 'token', api_token: 'token'}},
+            ],
+        }).sync(db);
+
+        expect(
+            db
+                .prepare("SELECT container FROM pr_records WHERE repo = 'shared-name' AND pr_id = '42' ORDER BY container")
+                .all(),
+        ).toEqual([{container: 'org-a'}, {container: 'org-b'}]);
     });
 
     it('returns error when filtered provider type is not configured', async () => {

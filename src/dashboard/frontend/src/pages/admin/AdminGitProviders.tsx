@@ -20,6 +20,7 @@ import {
     useAdminGitProviders,
     useCreateAdminGitProvider,
     useDeleteAdminGitProvider,
+    useGitProviderDeleteImpact,
     useSyncAdminGitProvider,
     useSyncOlderHistoryGitProvider,
     useTestAdminGitProvider,
@@ -29,6 +30,7 @@ import {
 import type {
     AdminGitProvider,
     GitProviderActiveSync,
+    GitProviderDeleteResult,
     GitProviderInput,
     GitProviderProbeResult,
     GitProviderRepo,
@@ -424,7 +426,17 @@ function ProviderFormModal({
         >
             <div className="flex flex-col gap-4">
                 <div className="flex flex-wrap items-end gap-4">
-                    <SelectField label="Provider type" value={type} onChange={changeType}>
+                    {/* Type and container are IMMUTABLE after creation (#264): together they
+                        key every imported row and every sync cursor, so moving a saved
+                        provider to a different pair would orphan the old container's data.
+                        The server refuses such a PATCH; the fields are locked here so the
+                        admin never types a change that cannot be saved. */}
+                    <SelectField
+                        label="Provider type"
+                        value={type}
+                        onChange={changeType}
+                        disabled={isEdit}
+                    >
                         {PROVIDER_TYPES.map((t) => (
                             <option key={t} value={t}>
                                 {PROVIDER_META[t].label}
@@ -436,6 +448,12 @@ function ProviderFormModal({
                         value={container}
                         onChange={setContainer}
                         placeholder={meta.containerPlaceholder}
+                        disabled={isEdit}
+                        title={
+                            isEdit
+                                ? 'Cannot be changed — this provider’s imported data and sync cursors are keyed by it. Remove the provider and add the new one instead.'
+                                : undefined
+                        }
                     />
                     {meta.authMethods.length > 1 ? (
                         <SelectField label="Auth method" value={authMethod} onChange={setAuthMethod}>
@@ -503,8 +521,129 @@ function ProviderFormModal({
                     {testDraft.data ? <ProbeResultView result={testDraft.data} /> : null}
                     <ErrorText error={testDraft.isError ? testDraft.error : null} />
                 </div>
+
+                {isEdit ? (
+                    <p className="text-xs text-muted" data-testid="container-immutable-note">
+                        The provider type and {meta.containerLabel.toLowerCase()} cannot be changed —
+                        this provider’s imported commits, PRs and sync cursors are keyed by them. To
+                        point at a different {meta.containerLabel.toLowerCase()}, remove this provider
+                        (which also removes its imported data) and add the new one.
+                    </p>
+                ) : null}
             </div>
         </FormModal>
+    );
+}
+
+/**
+ * Destructive-delete confirmation (#264). A provider delete no longer just forgets a
+ * connection — it retracts exactly that container's imported commits, PRs and snapshot
+ * contribution and purges its sync cursors. So the dialog states the REAL numbers, fetched
+ * from `/delete-impact` while it is open, rather than a generic warning.
+ *
+ * Reuses `FormModal` (the shared dialog + its close-guard-while-pending contract) instead of
+ * hand-rolling a second modal shell; only the body and the button labels differ.
+ */
+function RemoveProviderModal({
+    provider,
+    onClose,
+    onDeleted,
+}: {
+    provider: AdminGitProvider;
+    onClose: () => void;
+    /** Fired with the server's report of what was removed — the page states it back. */
+    onDeleted: (removed: GitProviderDeleteResult['removed']) => void;
+}): JSX.Element {
+    const remove = useDeleteAdminGitProvider();
+    const impact = useGitProviderDeleteImpact(provider.id, true);
+    const label = `${PROVIDER_META[provider.type].label} · ${provider.container}`;
+
+    return (
+        <FormModal
+            title={`Remove ${label}?`}
+            onClose={onClose}
+            onSubmit={() =>
+                remove.mutate(provider.id, {
+                    onSuccess: (result) => {
+                        onDeleted(result.removed);
+                        onClose();
+                    },
+                })
+            }
+            submitLabel="Remove provider and its data"
+            pendingLabel="Removing…"
+            pending={remove.isPending}
+            // Gate the destructive action on having actually LOADED the impact: confirming
+            // against "Loading…" is confirming against nothing.
+            submitDisabled={!impact.data}
+            error={remove.isError ? remove.error : null}
+            testId="remove-provider-modal"
+        >
+            <div className="flex flex-col gap-3 text-sm">
+                {impact.isPending ? (
+                    <p className="text-muted">Checking what this would remove…</p>
+                ) : impact.isError ? (
+                    <p className="text-danger">
+                        Could not check what this would remove: {impact.error.message}
+                    </p>
+                ) : impact.data.cascade_skipped ? (
+                    <p className="text-foreground" data-testid="remove-impact">
+                        A config-file provider still covers <strong>{label}</strong>, so it keeps
+                        owning this data. Removing this connection deletes only the saved
+                        connection — no imported activity and no sync state are removed.
+                    </p>
+                ) : (
+                    <div data-testid="remove-impact" className="flex flex-col gap-2">
+                        <p className="text-foreground">
+                            This permanently removes everything imported from{' '}
+                            <strong>{label}</strong>:
+                        </p>
+                        <ul className="list-disc pl-5 text-muted">
+                            <li>
+                                <strong>{impact.data.days}</strong> day
+                                {impact.data.days === 1 ? '' : 's'} of history
+                                {impact.data.earliest_date && impact.data.latest_date
+                                    ? ` (${impact.data.earliest_date} → ${impact.data.latest_date})`
+                                    : ''}{' '}
+                                — {impact.data.commits} commit
+                                {impact.data.commits === 1 ? '' : 's'} from {impact.data.authors}{' '}
+                                git author{impact.data.authors === 1 ? '' : 's'}
+                            </li>
+                            <li>
+                                <strong>{impact.data.pr_records}</strong> pull-request record
+                                {impact.data.pr_records === 1 ? '' : 's'}
+                            </li>
+                            <li>
+                                <strong>{impact.data.developers_affected}</strong> developer
+                                {impact.data.developers_affected === 1 ? '' : 's'} will lose this
+                                provider’s activity from their totals
+                            </li>
+                        </ul>
+                        <p className="text-muted">
+                            Developers, their identity mappings and team membership are{' '}
+                            <strong>not</strong> removed, and no other provider’s data is touched.
+                            Re-adding {provider.container} later starts a clean import from the
+                            history window you choose.
+                        </p>
+                    </div>
+                )}
+            </div>
+        </FormModal>
+    );
+}
+
+/** One-line summary of a completed delete, for the page banner. */
+export function removedSummary(removed: GitProviderDeleteResult['removed']): string {
+    if (removed.cascade_skipped) {
+        return `Removed the saved connection for ${removed.provider} · ${removed.container}. A config-file provider still owns its data, so nothing was retracted.`;
+    }
+    return (
+        `Removed ${removed.provider} · ${removed.container}: ` +
+        `${removed.raw_author_rows} author-day row(s) and ${removed.pr_records} PR record(s) retracted ` +
+        `across ${removed.days} day(s); ${removed.snapshot_cells_retracted} snapshot cell(s) removed and ` +
+        `${removed.snapshot_cells_rewritten} recomputed from the remaining providers; ` +
+        `${removed.cursor_keys_purged} sync cursor(s) cleared. ` +
+        `${removed.developers_affected} developer(s) affected — none were deleted.`
     );
 }
 
@@ -884,14 +1023,17 @@ function ProviderRow({
     onEdit,
     promptScope,
     onScopeClose,
+    onDeleted,
 }: {
     provider: AdminGitProvider;
     onEdit: (p: AdminGitProvider) => void;
     promptScope: boolean;
     onScopeClose: () => void;
+    /** Bubbled to the page: the row unmounts on delete, so the report can't live here. */
+    onDeleted: (removed: GitProviderDeleteResult['removed']) => void;
 }): JSX.Element {
     const update = useUpdateAdminGitProvider();
-    const remove = useDeleteAdminGitProvider();
+    const [removeOpen, setRemoveOpen] = useState(false);
     const sync = useSyncAdminGitProvider();
     const syncOlder = useSyncOlderHistoryGitProvider();
     const test = useTestAdminGitProvider();
@@ -1096,11 +1238,14 @@ function ProviderRow({
                                 >
                                     Edit
                                 </button>
+                                {/* Destructive since #264 — it retracts this container's
+                                    imported data too, so it goes through a confirmation
+                                    that states what will be removed. */}
                                 <button
                                     type="button"
-                                    onClick={() => remove.mutate(provider.id)}
-                                    disabled={remove.isPending}
-                                    className="text-sm font-medium text-danger hover:underline disabled:opacity-50"
+                                    onClick={() => setRemoveOpen(true)}
+                                    aria-haspopup="dialog"
+                                    className="text-sm font-medium text-danger hover:underline"
                                 >
                                     Remove
                                 </button>
@@ -1148,6 +1293,13 @@ function ProviderRow({
                 rows is legal — no DOM ends up inside the table. */}
             {scopeVisible && !isConfig ? (
                 <RepoScopeModal provider={provider} onClose={closeScope} prompt={promptScope} />
+            ) : null}
+            {removeOpen && !isConfig ? (
+                <RemoveProviderModal
+                    provider={provider}
+                    onClose={() => setRemoveOpen(false)}
+                    onDeleted={onDeleted}
+                />
             ) : null}
         </>
     );
@@ -1206,6 +1358,9 @@ export function AdminGitProviders(): JSX.Element {
     // repo-scope editor open, prompting a selection before the first sync.
     // Cleared when that editor closes (save or cancel) so it never re-prompts.
     const [justCreatedId, setJustCreatedId] = useState<string | null>(null);
+    // What the last delete actually removed (#264). Held at page level because the row that
+    // triggered it has unmounted by the time the report arrives.
+    const [lastRemoved, setLastRemoved] = useState<GitProviderDeleteResult['removed'] | null>(null);
 
     const providerList = providers.data ?? [];
     const hasProviders = providerList.length > 0;
@@ -1231,6 +1386,19 @@ export function AdminGitProviders(): JSX.Element {
                 }
             />
             {showEmptyState ? <GitEmptyState /> : null}
+            {/* The delete is destructive, so its OUTCOME is reported rather than left silent
+                (#264): the admin sees exactly how much history was retracted, and that no
+                developer was deleted. */}
+            {lastRemoved ? (
+                <StatePanel
+                    tone="warning"
+                    testId="provider-removed-banner"
+                    icon={<span aria-hidden>🗑️</span>}
+                    title="Provider removed"
+                    description={removedSummary(lastRemoved)}
+                    action={{label: 'Dismiss', onClick: () => setLastRemoved(null)}}
+                />
+            ) : null}
             {/* No form renders until the admin asks for one. Keyed so add ⇄ edit
                 ⇄ another row always remounts clean fields (#236 criterion 3). */}
             {formModal.mode !== 'closed' ? (
@@ -1280,6 +1448,7 @@ export function AdminGitProviders(): JSX.Element {
                                 onEdit={formModal.openEdit}
                                 promptScope={p.id === justCreatedId}
                                 onScopeClose={() => setJustCreatedId(null)}
+                                onDeleted={setLastRemoved}
                             />
                         ))}
                     </Table>

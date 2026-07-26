@@ -87,6 +87,27 @@ describe('migration 039 — git_providers schema (#193)', () => {
         expect(indexExists(db, 'idx_git_providers_type_container')).toBe(true);
     });
 
+    // #264 AC1: 039 shipped a NON-unique index, which allowed two rows for one workspace —
+    // both syncing it through the one shared container-keyed cursor. 042 replaces it with a
+    // UNIQUE one, so "one provider = one independent data set" holds by construction.
+    it('the (type, container) index is UNIQUE (042 / #264)', () => {
+        const row = db
+            .prepare("SELECT [unique] FROM pragma_index_list('git_providers') WHERE name = ?")
+            .get('idx_git_providers_type_container') as {unique: number} | undefined;
+        expect(row?.unique).toBe(1);
+    });
+
+    it('rejects a second provider for the same (type, container)', () => {
+        insertProvider(db, {id: 'first', type: 'github', container: 'acme'});
+        expect(() => insertProvider(db, {id: 'second', type: 'github', container: 'acme'})).toThrow(
+            /UNIQUE/i,
+        );
+        // A different family for the same NAME is a different container — still allowed.
+        expect(() =>
+            insertProvider(db, {id: 'third', type: 'gitlab', container: 'acme'}),
+        ).not.toThrow();
+    });
+
     it('has exactly the specified columns', () => {
         expect(columnNames(db, 'git_providers').sort()).toEqual(
             [
@@ -130,8 +151,12 @@ describe('migration 039 — git_providers schema (#193)', () => {
 
     it('accepts every valid auth_method', () => {
         const methods = ['token', 'app_password', 'access_token', 'oauth', 'personal_access_token', 'job_token'];
+        // Distinct containers per row: (type, container) is UNIQUE since 042 (#264), so
+        // reusing one container would fail on the constraint rather than on auth_method.
         methods.forEach((m, i) => {
-            expect(() => insertProvider(db, {id: `gp-${i}`, auth_method: m})).not.toThrow();
+            expect(() =>
+                insertProvider(db, {id: `gp-${i}`, auth_method: m, container: `acme-${i}`}),
+            ).not.toThrow();
         });
     });
 
@@ -149,7 +174,9 @@ describe('migration 039 — git_providers schema (#193)', () => {
 
     it('accepts the three valid last_sync_status values', () => {
         ['ok', 'error', 'never'].forEach((s, i) => {
-            expect(() => insertProvider(db, {id: `st-${i}`, last_sync_status: s})).not.toThrow();
+            expect(() =>
+                insertProvider(db, {id: `st-${i}`, last_sync_status: s, container: `acme-st-${i}`}),
+            ).not.toThrow();
         });
     });
 

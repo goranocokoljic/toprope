@@ -113,6 +113,7 @@ describe('discoverOrgMembers — attributes retained history (#250 SO-2)', () =>
     function retain(login: string, date: string, commits: number): void {
         upsertRawAuthorDaily(db, {
             provider: 'github',
+            container: 'acme',
             raw_author_key: `github:login:${login}`,
             author_login: login,
             author_email: `${login}@work.com`,
