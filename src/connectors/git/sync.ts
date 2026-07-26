@@ -561,37 +561,6 @@ function clearProviderStall(
 }
 
 /**
- * Delete the three `sync_state` rows this pipeline keys to ONE provider container
- * (#262) — the forward cursor ({@link syncStateKey}), the earliest-synced watermark
- * ({@link earliestSyncStateKey}) and the stall counter ({@link stallStateKey}) — so a
- * REMOVED provider does not leave cursors behind for a later provider on the same
- * `type:container` to silently inherit. Returns the number of rows removed.
- *
- * Keys are matched EXACTLY, never by prefix: a `LIKE 'git_last_sync:github:acme%'` scan
- * would also delete `acme-labs`' cursor, stranding a sibling's history.
- *
- * UNGUARDED. These keys are container-scoped, not row-scoped, so they are SHARED state,
- * and the forward cursor is the pipeline's proof that already-imported commit windows
- * are disjoint. Callers must establish both preconditions — no other provider resolves
- * to this container, and re-importing the cursor's window cannot double-count retained
- * `raw_author_daily` rows. See `deleteProviderAndSyncState` in providers/delete.ts,
- * which owns the guard, the hazard analysis and the surrounding transaction.
- */
-export function deleteProviderSyncState(
-    db: Database.Database,
-    providerType: GitProviderType,
-    identifier: string,
-): number {
-    return db
-        .prepare('DELETE FROM sync_state WHERE key IN (?, ?, ?)')
-        .run(
-            syncStateKey(providerType, identifier),
-            earliestSyncStateKey(providerType, identifier),
-            stallStateKey(providerType, identifier),
-        ).changes;
-}
-
-/**
  * A provider that is ADVANCING but is still more than one cap-width behind the
  * present (#235) — a bounded catch-up in progress.
  *

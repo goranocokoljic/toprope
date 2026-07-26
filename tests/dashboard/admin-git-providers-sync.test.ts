@@ -650,10 +650,13 @@ describe('admin git-provider sync-now API (#199)', () => {
     });
 
     // #262 — delete + re-add of the SAME container. Cursors are keyed by
-    // `type:container`, not provider id, so before this fix the "new" provider
-    // inherited the deleted one's forward cursor: the pipeline discarded the admin's
-    // first-sync window and imported only the delta since the old cursor, while the
-    // surviving earliest-synced watermark kept claiming the old window was covered.
+    // `type:container`, not provider id, so the "new" provider inherits the deleted
+    // one's forward cursor and the pipeline discards the admin's first-sync window.
+    // Purging the cursors is deferred to #264 (it needs container attribution of
+    // `raw_author_daily` first, or a re-import double-counts commits). What is fixed
+    // here is the UI-facing half: the create route reports `first_sync_pending` from
+    // the stored cursor set, so a re-added provider on a container that still has a
+    // cursor never offers a window the pipeline would silently ignore.
     describe('delete + re-add of the same container (#262)', () => {
         const FORWARD_KEY = 'git_last_sync:github:db-org';
         const EARLIEST_KEY = 'git_earliest_sync:github:db-org';
@@ -695,9 +698,15 @@ describe('admin git-provider sync-now API (#199)', () => {
             expect((await createGithubDto()).first_sync_pending).toBe(true);
         });
 
-        it('delete clears the container cursors, so the re-added provider honors its window end-to-end', async () => {
+        // KNOWN GAP, pinned deliberately — the cursor purge lands in #264. This asserts
+        // BOTH halves of the current state end-to-end: the re-added provider still
+        // inherits the cursor and its window is still ignored (the bug #264 fixes), AND
+        // the UI is told so truthfully via `first_sync_pending: false` (the fix here), so
+        // the admin is never invited to set a window that gets discarded. When #264 lands,
+        // this expectation flips — deliberately, not silently.
+        it('re-added provider still inherits the cursor and reports first_sync_pending=false (see #264)', async () => {
             const first = await createGithubDto();
-            // What the deleted provider first sync left behind: a forward cursor a few
+            // What the deleted provider's first sync left behind: a forward cursor a few
             // days back and a watermark claiming ~6 months of history is imported.
             db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
                 FORWARD_KEY,
@@ -709,39 +718,33 @@ describe('admin git-provider sync-now API (#199)', () => {
             );
 
             expect(await deleteProviderRoute(first.id)).toBe(200);
-            expect(readState(FORWARD_KEY)).toBeUndefined();
-            expect(readState(EARLIEST_KEY)).toBeUndefined();
+            // The cursors survive the delete: they are keyed by container, and retracting
+            // the data they license is not yet possible (#264).
+            expect(readState(FORWARD_KEY)).toBe('2026-07-20T00:00:00.000Z');
+            expect(readState(EARLIEST_KEY)).toBe('2026-01-20T00:00:00.000Z');
 
-            // Re-add the same workspace: with no cursor left, the window is genuinely
-            // offered again…
+            // Re-add the same workspace. The create response tells the truth: this
+            // provider has already "synced" as far as the pipeline is concerned, so the
+            // UI hides the first-sync window rather than offering an ignored one.
             const second = await createGithubDto();
-            expect(second.first_sync_pending).toBe(true);
+            expect(second.first_sync_pending).toBe(false);
 
-            // …and honored: the fetch starts at now − 6mo, not at the old cursor.
+            // And that is accurate — the fetch resumes at the inherited cursor, not at
+            // now − 6mo, which is exactly why the input must not be offered.
             const getCommits = await armGetCommits();
-            const before = Date.now();
             expect((await triggerSyncBody(second.id, {months: 6})).statusCode).toBe(202);
             await waitForSyncStatus(second.id, 'ok');
-
-            const since = getCommits.mock.calls[0][1] as string;
-            const expected = new Date(before);
-            expected.setUTCMonth(expected.getUTCMonth() - 6);
-            expect(Math.abs(Date.parse(since) - expected.getTime())).toBeLessThan(60_000);
-            // The recorded floor equals the window start — no false claim of coverage.
-            expect(readState(EARLIEST_KEY)).toBe(since);
+            expect(getCommits.mock.calls[0][1]).toBe('2026-07-20T00:00:00.000Z');
         });
 
-        // The config-sibling skip is covered at unit level and in the DELETE CRUD block
-        // of admin-git-providers.test.ts; not re-asserted here.
-
         // An in-flight run applies its cursor/watermark writes at the END of the run, so a
-        // delete accepted mid-run would be silently undone by the settling run.
+        // delete accepted mid-run leaves it writing state for a row that no longer exists.
         it('rejects a delete while a sync is in flight (409), leaving the provider intact', async () => {
             const provider = await createGithubDto();
             // Hold the run open so it is still in flight when the delete arrives.
             let release: (() => void) | undefined;
             const held = new Promise<GitCommit[]>((resolve) => {
-                release = () => resolve([]);
+                release = (): void => resolve([]);
             });
             const createGitProvider = await getCreateGitProvider();
             createGitProvider.mockReturnValue(

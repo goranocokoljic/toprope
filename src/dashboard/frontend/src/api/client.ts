@@ -588,15 +588,8 @@ export const api = {
         return body.data;
     },
 
-    // `sync_state_cleared` is false when the container's pipeline cursors were KEPT
-    // because another provider (a remaining DB row or a config-file entry) still
-    // resolves to the same `type:container` — a re-add will inherit them (#262).
-    async deleteAdminGitProvider(
-        id: string,
-    ): Promise<{id: string; deleted: boolean; sync_state_cleared: boolean}> {
-        const body = await deleteJson<
-            ApiEnvelope<{id: string; deleted: boolean; sync_state_cleared: boolean}>
-        >(
+    async deleteAdminGitProvider(id: string): Promise<{id: string; deleted: boolean}> {
+        const body = await deleteJson<ApiEnvelope<{id: string; deleted: boolean}>>(
             `/api/admin/git/providers/${encodeURIComponent(id)}`,
         );
         return body.data;

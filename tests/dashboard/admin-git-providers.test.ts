@@ -390,7 +390,7 @@ describe('admin git-provider CRUD API (#197)', () => {
                 headers: authHeaders(adminToken),
             });
             expect(del.statusCode).toBe(200);
-            expect(del.json().data).toEqual({id, deleted: true, sync_state_cleared: true});
+            expect(del.json().data).toEqual({id, deleted: true});
             const list = await app.inject({
                 method: 'GET',
                 url: '/api/admin/git/providers',
@@ -420,14 +420,19 @@ describe('admin git-provider CRUD API (#197)', () => {
             expect(res.json().message).toMatch(/not found/);
         });
 
-        // #262 — the pipeline's cursors are keyed by `type:container`, not by provider
-        // id, so a delete that leaves them behind lets a re-added provider inherit them
-        // and silently ignore the admin's first-sync window.
-        it('clears the deleted container pipeline sync-state rows', async () => {
+        // KNOWN GAP, pinned deliberately (#262 → #264). The pipeline's cursors are keyed
+        // by `type:container`, not by provider id, so this delete leaves them behind and
+        // a provider re-added for the same container inherits them. Purging them here in
+        // isolation is unsafe: `raw_author_daily` has no container column, so the deleted
+        // provider's rows cannot be retracted, and `mergeDailyAcrossRuns` ADDS the commit
+        // counters — a re-import over the same window would double-count permanently.
+        // #264 adds container attribution and flips this expectation; this test exists so
+        // that flip is deliberate rather than silent. The UI is protected in the meantime
+        // by `first_sync_pending` (see the create-route test above), which reports false
+        // for such a provider and hides the window input.
+        it('leaves the container pipeline cursors in place (see #264)', async () => {
             const dto = await createGithub();
             const id = dto.id as string;
-            // What a completed first sync leaves: forward cursor, earliest-synced
-            // watermark, and (if it ever stalled) the stall counter.
             for (const key of [
                 'git_last_sync:github:db-org',
                 'git_earliest_sync:github:db-org',
@@ -435,11 +440,6 @@ describe('admin git-provider CRUD API (#197)', () => {
             ]) {
                 db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(key, 'seeded');
             }
-            // A neighbor container that must survive untouched.
-            db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
-                'git_last_sync:github:db-org-legacy',
-                'keep-me',
-            );
 
             const del = await app.inject({
                 method: 'DELETE',
@@ -447,47 +447,17 @@ describe('admin git-provider CRUD API (#197)', () => {
                 headers: authHeaders(adminToken),
             });
             expect(del.statusCode).toBe(200);
-            expect(del.json().data.sync_state_cleared).toBe(true);
 
             const remaining = (
-                db.prepare("SELECT key FROM sync_state WHERE key LIKE 'git_%'").all() as Array<{
-                    key: string;
-                }>
+                db
+                    .prepare("SELECT key FROM sync_state WHERE key LIKE 'git_%' ORDER BY key")
+                    .all() as Array<{key: string}>
             ).map((r) => r.key);
-            expect(remaining).toEqual(['git_last_sync:github:db-org-legacy']);
-        });
-
-        it('leaves sync-state intact when a config-file provider shares the container', async () => {
-            // A DB row for the SAME container as the config-file provider — the
-            // coexistence the resolver allows (DB wins for config, but both drive the
-            // one container-keyed cursor set).
-            const create = await app.inject({
-                method: 'POST',
-                url: '/api/admin/git/providers',
-                headers: authHeaders(adminToken),
-                payload: {type: 'github', container: 'config-org', token: 'ghp_dbSHADOW_1234'},
-            });
-            expect(create.statusCode).toBe(201);
-            const id = create.json().data.id as string;
-            db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
-                'git_last_sync:github:config-org',
-                'still-synced',
-            );
-
-            const del = await app.inject({
-                method: 'DELETE',
-                url: `/api/admin/git/providers/${id}`,
-                headers: authHeaders(adminToken),
-            });
-            expect(del.statusCode).toBe(200);
-            // The delete says what it actually did — the two outcomes are not the same.
-            expect(del.json().data.sync_state_cleared).toBe(false);
-
-            // The config-file provider still syncs this container; its cursor survives.
-            const row = db
-                .prepare('SELECT value FROM sync_state WHERE key = ?')
-                .get('git_last_sync:github:config-org') as {value: string} | undefined;
-            expect(row?.value).toBe('still-synced');
+            expect(remaining).toEqual([
+                'git_earliest_sync:github:db-org',
+                'git_last_sync:github:db-org',
+                'git_stall:github:db-org',
+            ]);
         });
     });
 });

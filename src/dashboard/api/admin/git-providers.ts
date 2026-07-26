@@ -11,6 +11,7 @@ import {
 } from './helpers';
 import {
     createProvider,
+    deleteProvider,
     getDecryptedConfig,
     getProvider,
     listProviders,
@@ -21,7 +22,6 @@ import {
     type PublicGitProvider,
 } from '../../../connectors/git/providers/store';
 import {loadServerKey} from '../../../connectors/git/providers/secret';
-import {deleteProviderAndSyncState} from '../../../connectors/git/providers/delete';
 import {providerContainer, resolveGitProviderConfigs} from '../../../connectors/git/providers/config';
 import {createGitProvider} from '../../../connectors/git/providers/factory';
 import {
@@ -686,42 +686,29 @@ export function registerAdminGitProviderRoutes(
         }
         // Overlap guard, matching the sync routes: an in-flight run applies its cursor
         // and watermark writes at the very END of the run, keyed by container and with no
-        // re-check that the provider row still exists. Deleting mid-run would purge the
-        // cursors and then have them RESURRECTED minutes later by the settling run,
-        // silently restoring the inherited-cursor state this fix removes — and deleting a
+        // re-check that the provider row still exists. Deleting mid-run therefore leaves a
+        // settling run writing cursors for a row that no longer exists — and deleting a
         // provider because its sync is misbehaving is one of the likeliest ways to get
         // here. Typed 409, not a racy success.
         if (activeSyncs.has(id)) {
             return conflict(reply, 'A sync is in progress for this provider; wait for it to finish before deleting');
         }
 
-        // Delete the row AND (unless another provider still claims the same
-        // `type:container`) its pipeline cursors, atomically — #262. Leaving the cursors
-        // behind made a re-added provider inherit them and silently ignore the first-sync
-        // history window.
-        const outcome = deleteProviderAndSyncState(db, id, configProviders());
-        if (!outcome.deleted) {
+        // NOTE (#262/#264): this deletes the `git_providers` row ONLY. The pipeline's
+        // cursors are keyed by `type:container`, so they survive, and a provider later
+        // re-added for the same container inherits them — its first-sync window is
+        // silently ignored. Purging them here is NOT safe on its own: `raw_author_daily`
+        // is keyed by provider FAMILY with no container column, so the deleted
+        // provider's imported rows cannot be retracted, and `mergeDailyAcrossRuns` ADDS
+        // commit counters — re-importing the window would double-count them permanently.
+        // The cursor purge lands in #264 together with container attribution, which lets
+        // the delete retract that container's data instead. Until then the admin UI
+        // correctly reports `first_sync_pending: false` for such a provider (below), so
+        // it never offers a window the pipeline would discard.
+        if (!deleteProvider(db, id)) {
             return notFound(reply, `Git provider not found: ${id}`);
         }
-        // This endpoint now destroys pipeline state, so say what it actually did rather
-        // than reporting one undifferentiated success: "cursors gone, a re-add starts
-        // clean" and "cursors kept because a sibling owns the container, a re-add will
-        // inherit them" are materially different outcomes for the admin.
-        request.log.info(
-            {
-                providerId: id,
-                syncStateRowsCleared: outcome.syncStateRowsCleared,
-                syncStateRetainedReason: outcome.syncStateRetainedReason,
-            },
-            'deleted git provider',
-        );
-        return {
-            data: {
-                id,
-                deleted: true,
-                sync_state_cleared: outcome.syncStateRetainedReason === null,
-            },
-        };
+        return {data: {id, deleted: true}};
     });
 
     // POST /:id/test — probe a SAVED provider (DB or read-only config-file) by
