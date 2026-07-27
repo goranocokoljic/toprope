@@ -1,6 +1,7 @@
 import {describe, it, expect, afterEach} from 'vitest';
 import {
     containerKey,
+    containerKeyOf,
     providerContainer,
     resolveGitProviderConfigs,
 } from '../../../../src/connectors/git/providers/config';
@@ -70,47 +71,46 @@ describe('resolveGitProviderConfigs', () => {
         expect(containerKey(unknown)).toBe('gitea:');
     });
 
-    it('normalizes the container ON THE RESOLVED CONFIG for every provider type (#266)', () => {
-        // Rewriting the container INTO the entry — not just normalizing it on extraction — is what
-        // keeps the two uses of a config-file provider's container in agreement. Attribution and
-        // the cursor keys go through `providerContainer`, while the API clients read
-        // `config.org`/`.workspace`/`.group` VERBATIM to build the request path. Left raw,
-        // `org: '  Acme '` would attribute rows to `acme` while fetching `/orgs/%20Acme%20`.
+    it('leaves the YAML container VERBATIM, so doctor reports what the operator wrote (#266)', () => {
+        // Normalization deliberately does NOT happen here. It happens at the two places the value
+        // is USED — `providerContainer` (attribution, cursors, the stored row) and each provider
+        // client's constructor (the API request path) — both from the same shared helper, so they
+        // cannot disagree. Rewriting the entry here would additionally make `doctor` print a
+        // spelling the operator never typed.
         const resolved = resolveGitProviderConfigs({
             enabled: true,
             providers: [
                 {type: 'github', org: '  Wireless_Media ', auth: {type: 'token', api_token: 't'}},
                 {type: 'bitbucket', workspace: 'ACME-WS', auth: {type: 'oauth', token: 't'}},
-                {type: 'gitlab', group: ' Platform\t', auth: {type: 'oauth', token: 't'}},
+                {type: 'gitlab', group: ' Platform	', auth: {type: 'oauth', token: 't'}},
             ],
         });
+        expect(resolved[0]).toMatchObject({type: 'github', org: '  Wireless_Media '});
+        expect(resolved[1]).toMatchObject({type: 'bitbucket', workspace: 'ACME-WS'});
+        expect(resolved[2]).toMatchObject({type: 'gitlab', group: ' Platform	'});
+        // …while the attribution key every imported row and cursor is keyed by IS normalized.
         expect(resolved.map((c) => providerContainer(c))).toEqual([
             'wireless_media',
             'acme-ws',
             'platform',
         ]);
-        // The field the provider CLIENT reads, not just the extraction.
-        expect(resolved[0]).toMatchObject({type: 'github', org: 'wireless_media'});
-        expect(resolved[1]).toMatchObject({type: 'bitbucket', workspace: 'acme-ws'});
-        expect(resolved[2]).toMatchObject({type: 'gitlab', group: 'platform'});
     });
 
-    it('normalizes the legacy github shorthand container too (#266)', () => {
-        delete process.env.GITHUB_TOKEN;
-        const resolved = resolveGitProviderConfigs({
-            enabled: true,
-            org: '  MyOrg ',
-            api_token: 'mytoken',
-        });
-        expect(resolved).toHaveLength(1);
-        expect(resolved[0]).toMatchObject({type: 'github', org: 'myorg'});
+    it('containerKeyOf does NOT normalize — the key must match the raw stored column', () => {
+        // Its callers pass values already derived from `providerContainer` or from the stored
+        // (canonical) column. Normalizing here would be inert for all of them, and in the one state
+        // where it would fire it makes the delete cascade WORSE: the key would match a config
+        // sibling while the row-level retraction SQL two lines later still compares raw bytes, so
+        // the cascade would be skipped and the rows orphaned instead of retracted.
+        expect(containerKeyOf('github', ' Wireless_Media ')).toBe('github: Wireless_Media ');
+        expect(containerKeyOf('github', 'wireless_media')).toBe('github:wireless_media');
     });
 
     it('passes an entry with an unknown type through untouched, so doctor can still name it', () => {
         // A YAML `type: gitea` is untrusted text this resolver deliberately does not filter (that
-        // is what lets `doctor` report the entry specifically). Normalization must not throw on it
-        // or strip its fields — the pipeline's own `validateGitProviderConfig` is what refuses it,
-        // per-provider, inside `runSync`'s try/catch.
+        // is what lets `doctor` report the entry specifically). It must not throw or strip fields —
+        // the pipeline's own `validateGitProviderConfig` is what refuses it, per-provider, inside
+        // `runSync`'s try/catch.
         const resolved = resolveGitProviderConfigs({
             enabled: true,
             providers: [{type: 'gitea', org: 'Acme', auth: {type: 'token', api_token: 't'}}],
@@ -120,15 +120,6 @@ describe('resolveGitProviderConfigs', () => {
         // …and it resolves to the blank container every write guard refuses by name.
         expect(providerContainer(resolved[0])).toBe('');
         expect(containerKey(resolved[0])).toBe('gitea:');
-    });
-
-    it('does not mutate the caller’s config entry while normalizing', () => {
-        // The YAML object is shared with the config loader (and `doctor` reads it too), so the
-        // resolver must return a copy rather than rewrite the loaded config in place.
-        const entry = {type: 'github', org: '  Wireless_Media ', auth: {type: 'token', api_token: 't'}};
-        const resolved = resolveGitProviderConfigs({enabled: true, providers: [entry]});
-        expect(resolved[0]).not.toBe(entry);
-        expect(entry.org).toBe('  Wireless_Media ');
     });
 
     it('falls back to the github shorthand when org + token are set', () => {

@@ -20,23 +20,18 @@ export function resolveGitProviderConfigs(config: GitConnectorConfig): GitProvid
         // org/workspace/group before any key is built or any row is written. So a malformed entry
         // is skipped with its own surfaced error and its siblings still sync.
         //
-        // It DOES normalize the container it passes through (#266). This is the trust boundary for
-        // YAML, and a config-file provider's container is used two ways that must agree: the
-        // attribution/cursor keys go through `providerContainer` (normalized), while the API
-        // clients read `config.org`/`.workspace`/`.group` verbatim to build the request path. Left
-        // raw, `org: '  Acme '` would attribute rows to `acme` while fetching `/orgs/%20Acme%20` —
-        // one provider, two spellings, and the fetch fails or hits the wrong scope. Normalizing
-        // here makes the config entry itself canonical, so every downstream reader agrees. A
-        // MISSING container is still passed through untouched (as `''`), which is what keeps
-        // doctor's specific "provider with no workspace" diagnostic possible.
-        return (config.providers as unknown[])
-            .filter(
-                (p): p is GitProviderConfig =>
-                    typeof p === 'object' &&
-                    p !== null &&
-                    typeof (p as Record<string, unknown>).type === 'string',
-            )
-            .map(withNormalizedContainer);
+        // The container is left VERBATIM here, so `toprope doctor` reports the spelling the
+        // operator actually wrote in their YAML. Normalization happens at the two places the value
+        // is used: `providerContainer` (attribution, cursors, the stored row) and each provider
+        // client's constructor (the API request path) — see `github.ts`/`bitbucket.ts`/`gitlab.ts`.
+        // Both derive from the same `normalizeContainer`, so `org: '  Acme '` cannot attribute rows
+        // to `acme` while fetching `/orgs/%20Acme%20`.
+        return (config.providers as unknown[]).filter(
+            (p): p is GitProviderConfig =>
+                typeof p === 'object' &&
+                p !== null &&
+                typeof (p as Record<string, unknown>).type === 'string',
+        );
     }
 
     const token = config.api_token ?? process.env.GITHUB_TOKEN ?? '';
@@ -44,30 +39,13 @@ export function resolveGitProviderConfigs(config: GitConnectorConfig): GitProvid
     if (!token || !org) return [];
 
     return [
-        withNormalizedContainer({
+        {
             type: 'github',
             org,
             auth: {type: 'token', api_token: token},
             repos: config.repos,
-        }),
+        },
     ];
-}
-
-// Return a copy of an (untrusted) config entry with its container field rewritten to the
-// canonical spelling. Only the container field is touched; an unknown type is passed through
-// unchanged so `toprope doctor` can still report it by name. Never mutates the input — the
-// caller's YAML object is shared with the config loader.
-function withNormalizedContainer(config: GitProviderConfig): GitProviderConfig {
-    switch (config.type) {
-        case 'github':
-            return {...config, org: normalizeContainer(config.org)};
-        case 'bitbucket':
-            return {...config, workspace: normalizeContainer(config.workspace)};
-        case 'gitlab':
-            return {...config, group: normalizeContainer(config.group)};
-        default:
-            return config;
-    }
 }
 
 /**
@@ -125,11 +103,15 @@ export function providerContainer(config: GitProviderConfig): string {
  * `sync.ts`, so a definition in either of those two would force one of them to clone it.
  */
 export function containerKeyOf(type: GitProviderType, container: string): string {
-    // Normalized here too (#266), not just in `providerContainer`. Every caller today passes an
-    // already-canonical value, so this is idempotent — but this overload takes a BARE string, and
-    // it is the one seam where a future caller handing over raw text would mint a silently
-    // divergent attribution key. Cheap to make structural rather than conventional.
-    return `${type}:${normalizeContainer(container)}`;
+    // Deliberately does NOT normalize (#266). Every caller passes a value already derived from
+    // `providerContainer` or from the stored (canonical) column, so a normalization here would be
+    // inert — and in the one state where it would fire it makes things WORSE, not safer: the delete
+    // cascade compares this key against `configContainerKeys` and then retracts rows with raw
+    // `WHERE container = ?` SQL two lines later. If a non-canonical row ever coexisted with a
+    // config sibling, a normalizing key would match, skip the cascade, drop the provider row, and
+    // orphan its imported rows permanently — where a raw key misses, the cascade runs, and the
+    // rows are retracted correctly. Normalization stays at the one place the docstring names.
+    return `${type}:${container}`;
 }
 
 /** {@link containerKeyOf} for a resolved provider config. */

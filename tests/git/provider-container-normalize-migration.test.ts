@@ -106,29 +106,23 @@ function apply043(db: Database.Database): void {
     ).toBe(1);
 }
 
-/** Re-run the up-to-43 chain and assert nothing was applied a second time. */
-function apply043NoOp(db: Database.Database): void {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'toprope-m043-'));
-    try {
-        for (const f of migrationFilesUpTo(43)) {
-            fs.copyFileSync(path.join(MIGRATIONS_DIR, f), path.join(dir, f));
-        }
-        expect(runMigrations(db, dir)).toBe(0);
-    } finally {
-        fs.rmSync(dir, {recursive: true, force: true});
-    }
-}
-
 function count(db: Database.Database, table: string): number {
     return (db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as {n: number}).n;
 }
 
+/**
+ * `lastSyncAt` defaults to a synced timestamp (the common case), but several tests need it NULL:
+ * `last_sync_at IS NOT NULL` is one of the notice's probe arms, so a helper that always set it
+ * would mask every OTHER arm — including the `changes()` arm that exists precisely for a
+ * never-synced duplicate on an install holding no git data at all.
+ */
 function insertProvider(
     db: Database.Database,
     id: string,
     type: string,
     container: string,
     createdAt: string,
+    lastSyncAt: string | null = '2026-07-20T00:00:00.000Z',
 ): void {
     db.prepare(
         `INSERT INTO git_providers (
@@ -136,8 +130,8 @@ function insertProvider(
             token_ciphertext, token_meta, token_last4, repos_include, repos_exclude,
             enabled, created_at, updated_at, created_by, last_sync_at, last_sync_status, last_sync_error
          ) VALUES (?, ?, ?, NULL, NULL, 'token', NULL, ?, '{}', 'abcd', NULL, NULL, 1, ?, ?, NULL,
-                   '2026-07-20T00:00:00.000Z', 'ok', NULL)`,
-    ).run(id, type, container, Buffer.from('cipher'), createdAt, createdAt);
+                   ?, CASE WHEN ? IS NULL THEN NULL ELSE 'ok' END, NULL)`,
+    ).run(id, type, container, Buffer.from('cipher'), createdAt, createdAt, lastSyncAt, lastSyncAt);
 }
 
 function insertRawAuthorDay(db: Database.Database, container: string, date: string): void {
@@ -360,10 +354,12 @@ describe('migration 043 — container normalization (#266)', () => {
         // cascade keyed on `record.container` would retract nothing and report success — a
         // permanent ghost. Fail closed: the connection must be re-added.
         const db = dbAt042();
-        insertProvider(db, 'p-upper-nonascii', 'github', 'ÄCME', '2026-02-02T00:00:00.000Z');
-        insertProvider(db, 'p-accent', 'bitbucket', 'ACMÉ', '2026-02-03T00:00:00.000Z');
-        insertProvider(db, 'p-blank', 'gitlab', '   ', '2026-02-04T00:00:00.000Z');
-        insertProvider(db, 'p-ok', 'github', 'Fine-Org', '2026-02-05T00:00:00.000Z');
+        // `last_sync_at: null` on every row, so `changes() > 0` is the ONLY notice arm that can
+        // fire — this install holds no data, no cursors, no rollups and no synced provider.
+        insertProvider(db, 'p-upper-nonascii', 'github', 'ÄCME', '2026-02-02T00:00:00.000Z', null);
+        insertProvider(db, 'p-accent', 'bitbucket', 'ACMÉ', '2026-02-03T00:00:00.000Z', null);
+        insertProvider(db, 'p-blank', 'gitlab', '   ', '2026-02-04T00:00:00.000Z', null);
+        insertProvider(db, 'p-ok', 'github', 'Fine-Org', '2026-02-05T00:00:00.000Z', null);
 
         apply043(db);
 
@@ -371,8 +367,9 @@ describe('migration 043 — container normalization (#266)', () => {
             {id: 'p-ok', container: 'fine-org'},
         ]);
         // A deleted connection is never silent: the encrypted credential cannot be recovered, so
-        // the operator has to be told to go looking for the missing provider. This install held
-        // no git data at all, so ONLY the provider-delete arm of the notice can have raised it.
+        // the operator has to be told to go looking for the missing provider. Every other notice
+        // arm is provably false here (no raw rows, no PRs, no projected snapshots, no cursors, no
+        // synced provider, no rollups), so `changes() > 0` is the ONLY arm that can have raised it.
         expect(gitResetNotice(db)).toBe('043');
         db.close();
     });
@@ -500,9 +497,16 @@ describe('migration 043 — container normalization (#266)', () => {
         expect(count(db, 'git_providers')).toBe(0);
         expect(count(db, 'raw_author_daily')).toBe(0);
         expect(gitCursorCount(db)).toBe(0);
-        // Re-running 043 must not re-execute it — the ledger is what makes a destructive
-        // migration safe to leave in the chain.
-        apply043NoOp(db);
+        // Re-running 043 must not re-execute it — the ledger is what makes a destructive migration
+        // safe to leave in the chain. (`runMigrations`' idempotence in general is covered in
+        // tests/storage/db.test.ts; what matters here is that 043 specifically is recorded.)
+        expect(
+            (
+                db.prepare('SELECT COUNT(*) AS n FROM schema_migrations WHERE id = 43').get() as {
+                    n: number;
+                }
+            ).n,
+        ).toBe(1);
         db.close();
     });
 
@@ -586,6 +590,68 @@ describe('migration 043 — container normalization (#266)', () => {
         expect(
             db.prepare('SELECT container, last_sync_at FROM git_providers WHERE id = ?').get('p1'),
         ).toEqual({container: 'wireless_media', last_sync_at: null});
+        db.close();
+    });
+
+    it('raises the signal when a SYNCED provider is the only evidence left (sole-raiser)', () => {
+        // `git_providers.last_sync_at` is one of the two probe arms 042 does not touch, and it is
+        // the one that covers a DB-connected provider whose data 042 already emptied. Every other
+        // arm is false here, so removing this probe from the migration would make the test fail.
+        const db = dbAt042();
+        insertProvider(db, 'p1', 'github', 'wireless_media', '2026-02-01T00:00:00.000Z');
+        apply043(db);
+        expect(gitResetNotice(db)).toBe('043');
+        db.close();
+    });
+
+    it('raises the signal for a CONFIG-FILE-only install where a stale rollup is the last evidence (sole-raiser)', () => {
+        // The pre-042 case with no `git_providers` row at all: a config-file provider has none, so
+        // after 042 empties the raw tables and the cursors, `weekly_aggregates.total_commits` is
+        // the only surviving proof that git data was ever imported and rolled up. Removing that
+        // probe would make this test fail.
+        const db = dbAt042();
+        seedDeveloper(db);
+        db.prepare(
+            `INSERT INTO weekly_aggregates (id, developer_id, week_start, team, total_commits, computed_at)
+             VALUES ('wa-1', 'dev-1', '2026-06-29', 'core', 40, '2026-07-06T00:00:00.000Z')`,
+        ).run();
+        expect(count(db, 'git_providers')).toBe(0);
+        apply043(db);
+        expect(gitResetNotice(db)).toBe('043');
+        db.close();
+    });
+
+    it('raises the signal when a DUPLICATE spelling is deduped away, even with no git data at all', () => {
+        // The state #266 exists for — one workspace connected twice, never synced (the admin is
+        // prompted to narrow repo scope BEFORE the first sync, #211). The dedupe removes the newer
+        // row along with its unrecoverable token and its own repo-scope filter, so that must not be
+        // a silent outcome. Only `changes() > 0` can raise it here.
+        const db = dbAt042();
+        insertProvider(db, 'p-old', 'github', 'Wireless_Media', '2026-02-01T00:00:00.000Z', null);
+        insertProvider(db, 'p-new', 'github', 'wireless_media', '2026-03-01T00:00:00.000Z', null);
+
+        apply043(db);
+
+        expect(db.prepare('SELECT id, container FROM git_providers').all()).toEqual([
+            {id: 'p-old', container: 'wireless_media'},
+        ]);
+        expect(gitResetNotice(db)).toBe('043');
+        db.close();
+    });
+
+    it('keeps a CANONICAL row when its only older sibling is one the same statement deletes', () => {
+        // The dedupe's sibling qualifier: an older row that fails the canonicalization clause is
+        // being deleted in the same breath, so it must not also win the dedupe — otherwise both
+        // rows go and the container is freed entirely, silently un-connecting the workspace.
+        const db = dbAt042();
+        insertProvider(db, 'p-old-bad', 'github', 'ÄCME', '2026-02-01T00:00:00.000Z', null);
+        insertProvider(db, 'p-new-good', 'github', 'acme', '2026-03-01T00:00:00.000Z', null);
+
+        apply043(db);
+
+        expect(db.prepare('SELECT id, container FROM git_providers').all()).toEqual([
+            {id: 'p-new-good', container: 'acme'},
+        ]);
         db.close();
     });
 

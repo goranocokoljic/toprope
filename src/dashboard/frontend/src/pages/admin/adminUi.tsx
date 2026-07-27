@@ -81,7 +81,16 @@ export function TextField({
         // "Organization" to "Organization<the error>" — breaking every accessible-name lookup
         // (and every getByLabelText) exactly when a validation error is showing. It reaches
         // the input through `aria-describedby` instead, which is the description slot.
-        <div className="flex flex-col gap-1">
+        //
+        // `self-start` is what makes the `error` slot safe in ANY parent. The message renders in
+        // normal flow below the input, so the field grows downward — and every admin field row is
+        // `items-end`, where growing downward means the wrapper's BOTTOM stays pinned and the input
+        // is pushed up out of line with its neighbours. Overriding the cross-axis alignment on the
+        // component rather than on each caller's row means a future `error` caller cannot
+        // reintroduce that by forgetting: the invariant is a property of the primitive, not a
+        // convention. It is a no-op for the ~30 existing call sites, whose fields all have a single
+        // same-height control and so occupy the full cross-axis extent either way.
+        <div className="flex flex-col gap-1 self-start">
             <label className="flex flex-col gap-1">
                 <span className="text-xs font-medium text-muted">{label}</span>
                 <input
@@ -99,16 +108,21 @@ export function TextField({
                 />
             </label>
             {/* `max-w-xs` on the MESSAGE, not on the wrapper: the wrapper is the flex item, so its
-                hypothetical main size is its widest child's max-content width — bounding the
-                message therefore bounds the field, while leaving the no-error render byte-identical
-                for all existing call sites and not resizing the input when an error appears.
+                hypothetical main size is its widest child's max-content width, and a `max-width` on
+                a child clamps that child's contribution — so bounding the message bounds the field
+                (measured: 320px, not the message's ~1400px max-content). The wrapper is
+                `align-items: stretch`, so the input does widen to that bound while an error is
+                showing; the row still fits inside the dialog, and a stable field width would mean
+                pinning a width on every call site.
 
-                No `role="alert"`: this is synchronous field validation recomputed on every
-                keystroke, so a live region would re-announce the same message per character. The
-                `aria-describedby` + `aria-invalid` pairing on the input is the conventional form —
-                it is announced as the field's description when focus is there, once. */}
+                `role="alert"` matches the three sibling components that render the same kind of
+                message (`TimeRangeSelector`, `SummaryCard`, `SummariesPanel`) and is what actually
+                announces it: `aria-describedby` is read when focus ARRIVES at the input, so
+                mutating it while the admin is already typing announces nothing. An alert region
+                fires on content mutation, and the message text is stable while the same conflict
+                persists — so it does not re-announce per keystroke. */}
             {error ? (
-                <span id={errorId} className="max-w-xs text-xs text-danger">
+                <span id={errorId} role="alert" className="max-w-xs text-xs text-danger">
                     {error}
                 </span>
             ) : null}

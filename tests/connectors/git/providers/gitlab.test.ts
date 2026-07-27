@@ -226,6 +226,19 @@ describe('GitLabProvider', () => {
     // --- listRepos ---
 
     describe('listRepos()', () => {
+        it('normalizes a padded/mis-cased group into the request path (#266)', async () => {
+            // See the sibling tests: the attribution key and the request path must be the same
+            // spelling, and both derive from the shared `normalizeContainer`.
+            const fetchMock = makeFetchMock([{body: [makeProjectFixture()]}]);
+            vi.stubGlobal('fetch', fetchMock);
+            const p = new GitLabProvider({...CONFIG_PAT, group: ' TEST-Group '});
+
+            await p.listRepos();
+
+            expect(String(fetchMock.mock.calls[0][0])).toContain('test-group');
+            expect(String(fetchMock.mock.calls[0][0])).not.toContain('TEST-Group');
+        });
+
         it('returns repos mapped to GitRepo shape', async () => {
             const fetchMock = makeFetchMock([{body: [makeProjectFixture()]}]);
             vi.stubGlobal('fetch', fetchMock);

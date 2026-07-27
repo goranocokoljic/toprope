@@ -123,6 +123,20 @@ describe('GitHubProvider', () => {
             });
         });
 
+        it('normalizes a padded/mis-cased org into the request path (#266)', async () => {
+            // The org is both the attribution key and the request path. `providerContainer`
+            // normalizes the former; the constructor normalizes the latter from the same shared
+            // helper, so a YAML `org: '  Test-ORG '` cannot attribute rows to `test-org` while
+            // fetching `/orgs/%20%20Test-ORG%20`.
+            const fetchMock = makeFetchMock([{body: [makeRepoFixture()]}]);
+            vi.stubGlobal('fetch', fetchMock);
+            const p = new GitHubProvider({...CONFIG, org: '  Test-ORG '});
+
+            await p.listRepos();
+
+            expect(String(fetchMock.mock.calls[0][0])).toContain('/orgs/test-org/');
+        });
+
         it('excludes archived repos by default', async () => {
             const fetchMock = makeFetchMock([
                 {body: [makeRepoFixture({archived: false}), makeRepoFixture({id: 1002, name: 'archived-repo', archived: true})]},

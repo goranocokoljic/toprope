@@ -3,7 +3,6 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import {runMigrations} from '../../src/storage/migrator';
 import {
-    acknowledgeGitReset,
     clearGitResetNotice,
     gitResetNotice,
     gitResetNoticeMessage,
@@ -56,55 +55,46 @@ describe('git reset notice (#266)', () => {
         bare.close();
     });
 
-    it('clearGitResetNotice removes a pending notice and is a no-op when there is none', () => {
+    it('clearGitResetNotice removes only the notice value it was handed', () => {
         raise();
-        clearGitResetNotice(db);
+        expect(clearGitResetNotice(db, '043')).toBe(true);
         expect(gitResetNotice(db)).toBeNull();
-        expect(() => clearGitResetNotice(db)).not.toThrow();
-        expect(gitResetNotice(db)).toBeNull();
+        // …and reports FALSE rather than a phantom success when there was nothing matching, so a
+        // no-op is never read as an acknowledgement.
+        expect(clearGitResetNotice(db, '043')).toBe(false);
     });
 
-    it('names every step of the rebuild, including the two projections `aggregate backfill` misses', () => {
-        // `toprope aggregate backfill` drives only the four weekly/monthly/quarterly/yearly
-        // levels. If this message stopped saying so, an operator could follow it exactly, clear
-        // the marker, and leave `pr_review_metrics`/`coaching_signals` holding pre-reset rows with
-        // no signal remaining — the #235 false all-clear, one layer out.
+    it('REFUSES to clear a notice whose value changed since it was read', () => {
+        // The hazard the value scoping closes: `runMigrations` runs at server start and at the top
+        // of every scheduled sync, and the marker key is deliberately migration-agnostic — so a
+        // later reset migration re-stamps it. An unconditional `DELETE WHERE key = ?` would
+        // acknowledge a notice the operator never saw, for a rebuild that has not started.
+        raise('043');
+        const observed = gitResetNotice(db);
+        expect(observed).toBe('043');
+        // Another process raises/re-stamps it meanwhile.
+        db.prepare('UPDATE sync_state SET value = ? WHERE key = ?').run('044', KEY);
+        expect(clearGitResetNotice(db, observed as string)).toBe(false);
+        expect(gitResetNotice(db)).toBe('044');
+    });
+
+    it('names every step of the rebuild, including what `aggregate backfill` does NOT cover', () => {
+        // `toprope aggregate backfill` rebuilds only periods inside its --from..--to range, and only
+        // the four aggregate levels. If this message stopped saying so, an operator could follow it
+        // exactly, clear the marker, and leave stale rows behind with no signal remaining — the
+        // #235 false all-clear, one layer out.
         const message = gitResetNoticeMessage('043');
         expect(message).toContain('043');
         expect(message).toContain('Re-sync each provider');
+        expect(message).toContain('toprope sync git');
         expect(message).toContain('aggregate backfill');
+        // The --from caveat migration 042 carried and 043 must not re-lose.
+        expect(message).toContain('NOT merely the start of the window the resync imported');
         expect(message).toContain('pr_review_metrics');
         expect(message).toContain('coaching_signals');
-        // …and that a CONNECTION may have been removed, since its token is unrecoverable.
+        // …and that a CONNECTION may have been removed, for either of the two reasons.
         expect(message).toContain('MISSING provider');
+        expect(message).toContain('duplicated another spelling');
         expect(message).toContain('clear-reset-notice');
-    });
-
-    describe('acknowledgeGitReset', () => {
-        it('clears a notice that predates this run', () => {
-            raise();
-            const before = gitResetNotice(db);
-            expect(acknowledgeGitReset(db, before)).toEqual({kind: 'cleared', migrationId: '043'});
-            expect(gitResetNotice(db)).toBeNull();
-        });
-
-        it('reports nothing_pending instead of a phantom success', () => {
-            expect(acknowledgeGitReset(db, null)).toEqual({kind: 'nothing_pending'});
-        });
-
-        it('REFUSES to clear a notice raised by this same run', () => {
-            // The hazard: `clear-reset-notice` has to run migrations before `sync_state` exists, so
-            // its own invocation can be what performs the reset — and clearing the marker then
-            // acknowledges a rebuild that has definitionally not started, leaving `doctor` green
-            // over stale rollups. Fail closed: the operator re-runs after the rebuild.
-            const before = gitResetNotice(db); // null — nothing pending yet
-            raise(); // …then "the migration ran inside this process"
-            expect(acknowledgeGitReset(db, before)).toEqual({
-                kind: 'raised_by_this_run',
-                migrationId: '043',
-            });
-            // And the marker survives, which is the whole point.
-            expect(gitResetNotice(db)).toBe('043');
-        });
     });
 });

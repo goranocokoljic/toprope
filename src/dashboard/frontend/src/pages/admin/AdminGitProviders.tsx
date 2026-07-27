@@ -367,22 +367,24 @@ export function findContainerConflict(
 
 /**
  * The inline field-level message for a container collision — it NAMES the owner as the table
- * spells it, so the admin can go find it, and says why a second one is refused rather than
- * just "already exists". A config-file owner gets different remediation: it cannot be edited
- * from the UI at all.
+ * spells it, so the admin can go find it, and states the remediation, which differs for a
+ * config-file owner (it cannot be edited from the UI at all).
+ *
+ * Deliberately SHORT. The server's 409 carries the full explanation ("one container is one
+ * independent data set: its imported commits, PRs and sync cursors all belong to that provider…"),
+ * and `FormModal` already renders that inline on a stale list (AC10). Restating it here would be a
+ * second copy of the same prose on the other side of the wire — which is how the two drift, and
+ * #266's whole thesis is that a client and server must not hold two copies of one rule. The
+ * PREDICATE is shared via `container.ts`; the explanation stays server-side.
  */
 function containerConflictMessage(
     conflict: AdminGitProvider,
     containerLabel: string,
 ): string {
     const label = `${PROVIDER_META[conflict.type].label} · ${conflict.container}`;
-    const scope = containerLabel.toLowerCase();
     return conflict.source === 'config'
-        ? `This ${scope} is already covered by a read-only config-file provider (${label}). ` +
-              'One container is one independent data set — change it in the config file instead.'
-        : `${label} is already connected. One container is one independent data set: its ` +
-              'imported commits, PRs and sync cursors belong to that provider. Edit or remove ' +
-              'it instead of adding a second one.';
+        ? `${label} already covers this ${containerLabel.toLowerCase()} — it is defined in the config file, so change it there.`
+        : `${label} is already connected — edit or remove it instead of adding a second one.`;
 }
 
 /**
@@ -524,13 +526,11 @@ function ProviderFormModal({
             testId="git-provider-modal"
         >
             <div className="flex flex-col gap-4">
-                {/* `items-start`, not `items-end` (#266): the container field can grow a
-                    validation message below its input, and bottom-aligning the row would then
-                    lift the input above the two selects beside it by the message's height. Every
-                    control in this row is a label + a same-height box, so top-aligning renders
-                    identically when there is no message and keeps the input in place when there
-                    is. */}
-                <div className="flex flex-wrap items-start gap-4">
+                {/* Stays on the house `items-end`. The container field can grow a validation message
+                    below its input (#266), which under `items-end` would lift the input out of line
+                    — but that is handled inside `TextField` itself (`self-start` on its wrapper), so
+                    it holds for every caller rather than only the one row that remembered. */}
+                <div className="flex flex-wrap items-end gap-4">
                     {/* Type and container are IMMUTABLE after creation (#264): together they
                         key every imported row and every sync cursor, so moving a saved
                         provider to a different pair would orphan the old container's data.

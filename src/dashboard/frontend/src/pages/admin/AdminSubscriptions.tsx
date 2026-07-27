@@ -107,11 +107,20 @@ function AssignSubscriptionModal({onDone}: {onDone: () => void}): JSX.Element {
                     ))}
                 </SelectField>
                 <TextField label="Plan" value={plan} onChange={setPlan} placeholder="business" />
-                <TextField label="Monthly cost ($)" value={cost} onChange={setCost} placeholder="19" type="number" />
+                {/* Through `TextField`'s `error` prop (#266) rather than an unassociated paragraph
+                    after the row: the message now carries `role="alert"` and is wired to this input
+                    via `aria-invalid`/`aria-describedby`, so a screen-reader user hears it as this
+                    field's problem instead of as loose text somewhere in the dialog. One spelling of
+                    "how an admin field reports client-side validation", not two. */}
+                <TextField
+                    label="Monthly cost ($)"
+                    value={cost}
+                    onChange={setCost}
+                    placeholder="19"
+                    type="number"
+                    error={costInvalid ? 'Monthly cost must be a non-negative number.' : null}
+                />
             </div>
-            {costInvalid ? (
-                <p className="mt-2 text-sm text-danger">Monthly cost must be a non-negative number.</p>
-            ) : null}
         </FormModal>
     );
 }

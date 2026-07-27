@@ -275,10 +275,13 @@ describe('GitSync', () => {
             expect(key).not.toContain('Test_Org');
         }
 
-        // And the API client is handed the same canonical value, so attribution and the request
-        // path cannot disagree about which workspace this is.
+        // The factory is handed the config AS CONFIGURED — normalization for the request path
+        // happens one layer down, in each provider client's constructor, so `doctor` can still
+        // report the spelling the operator wrote. That the client normalizes it is asserted in
+        // tests/connectors/git/providers/{github,bitbucket,gitlab}.test.ts; what matters here is
+        // that the ATTRIBUTION side (asserted above) does not depend on the YAML being tidy.
         expect(createGitProvider).toHaveBeenCalledWith(
-            expect.objectContaining({type: 'github', org: 'test_org'}),
+            expect.objectContaining({type: 'github', org: '  Test_Org '}),
         );
     });
 

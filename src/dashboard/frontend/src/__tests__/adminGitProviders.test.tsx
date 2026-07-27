@@ -2451,9 +2451,12 @@ describe('AdminGitProviders — inline duplicate-container validation (#266)', (
         expect(saveButton()).not.toBeDisabled();
 
         fireEvent.change(screen.getByLabelText('Organization'), {target: {value: typed}});
-        // Names the existing provider as the table spells it, and says why.
+        // Names the existing provider as the table spells it, and gives the remediation. The long
+        // explanation deliberately lives ONLY in the server's 409 (see `containerConflictMessage`),
+        // so there is no second copy of that prose on the client.
         expect(containerError()).toContain('GitHub · acme-org');
         expect(containerError()).toContain('already connected');
+        expect(containerError()).toContain('edit or remove it');
         expect(screen.getByLabelText('Organization')).toHaveAttribute('aria-invalid', 'true');
         expect(saveButton()).toBeDisabled();
 
@@ -2465,6 +2468,25 @@ describe('AdminGitProviders — inline duplicate-container validation (#266)', (
 
         // Nothing was ever sent for the colliding value.
         expect(lastCall(/\/git\/providers$/, 'POST')).toBeUndefined();
+    });
+
+    it('SENDS the normalized container, so the value validated is the value transmitted', async () => {
+        // `buildInput` goes through the shared `normalizeContainer`, not a local `.trim()` — the
+        // client's inline check casefolds, so a transmitted value that only trimmed would mean the
+        // client validated one string and sent another. Harmless (the server re-normalizes) but it
+        // is precisely the check/store asymmetry #266 exists to remove.
+        renderPage();
+        await screen.findByText('acme-org');
+        openAddModal();
+        fireEvent.change(screen.getByLabelText('Organization'), {target: {value: '  Brand-NEW '}});
+        fireEvent.change(screen.getByLabelText('Token'), {target: {value: 'ghp_secret'}});
+        fireEvent.click(saveButton());
+
+        await waitFor(() => expect(lastCall(/\/git\/providers$/, 'POST')).toBeDefined());
+        const sent = JSON.parse(
+            String(lastCall(/\/git\/providers$/, 'POST')?.[1]?.body),
+        ) as Record<string, unknown>;
+        expect(sent.container).toBe('brand-new');
     });
 
     it('flags a container owned by a read-only CONFIG-FILE provider, with its own remediation', async () => {
@@ -2481,7 +2503,8 @@ describe('AdminGitProviders — inline duplicate-container validation (#266)', (
         const field = screen.getByLabelText('Group');
         const message = document.getElementById(field.getAttribute('aria-describedby') ?? '')
             ?.textContent;
-        expect(message).toContain('config-file provider');
+        // Remediation differs for a config-file owner: it cannot be edited from the UI at all.
+        expect(message).toContain('config file');
         expect(message).toContain('GitLab · team');
         expect(screen.getByRole('button', {name: 'Add provider'})).toBeDisabled();
     });

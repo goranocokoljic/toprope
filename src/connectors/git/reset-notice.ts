@@ -21,6 +21,11 @@ import type Database from 'better-sqlite3';
  * The notice is deliberately NOT self-clearing on the next sync: re-importing the snapshots
  * is only half the rebuild. The other half is the rollup recompute, which nothing can detect
  * the completion of, so the acknowledgement is explicit ({@link clearGitResetNotice}).
+ *
+ * `toprope doctor` is currently the only surface that reports it. That is a real gap for a
+ * service deployment, where 043 fires inside the Fastify process or the scheduler and nothing
+ * reads the marker — an admin-page banner reading {@link gitResetNoticeMessage} is the missing
+ * half, deferred as a UI change out of #266's scope.
  */
 
 // The `sync_state` key migration 043 writes. Module-local: every read/write goes through the
@@ -46,65 +51,59 @@ export function gitResetNotice(db: Database.Database): string | null {
     return row?.value ?? null;
 }
 
-/** Acknowledge the notice, if one is pending. */
-export function clearGitResetNotice(db: Database.Database): void {
-    db.prepare('DELETE FROM sync_state WHERE key = ?').run(GIT_RESET_NOTICE_KEY);
+/**
+ * Acknowledge a specific pending notice. Returns true when THAT notice was the one removed.
+ *
+ * Value-scoped and transactional on purpose. `runMigrations` executes at server start and at the
+ * top of every scheduled sync, so an acknowledgement can race a process that is raising (or
+ * re-stamping) the marker — and the key is deliberately migration-agnostic, so a later reset
+ * migration will write it too. An unconditional `DELETE … WHERE key = ?` would then acknowledge a
+ * notice the operator never saw, for a rebuild that has not started: the #235 false all-clear,
+ * reached through the command written to close it. Deleting only the exact value that was read,
+ * inside one transaction, makes that impossible rather than unlikely.
+ */
+export function clearGitResetNotice(db: Database.Database, migrationId: string): boolean {
+    return db.transaction((): boolean => {
+        return (
+            db
+                .prepare('DELETE FROM sync_state WHERE key = ? AND value = ?')
+                .run(GIT_RESET_NOTICE_KEY, migrationId).changes > 0
+        );
+    })();
 }
 
 /**
  * The operator-facing text for a pending notice — one wording, shared by every surface.
  *
- * It names the rollup rebuild EXPLICITLY rather than saying "run aggregate backfill", because
- * `toprope aggregate backfill` covers only the four weekly/monthly/quarterly/yearly levels: it
- * does not touch `pr_review_metrics` or `coaching_signals`, which only the next scheduled
- * weekly/monthly job refreshes, and only for its recent trailing window. A notice that
- * prescribed a command narrower than the damage it describes would be exactly the false
- * all-clear it exists to prevent.
- *
- * It also names the possibility that a CONNECTION disappeared. Migration 043 deletes a provider
- * row whose container SQL cannot canonicalize the way the code does, and that row holds the only
- * copy of its encrypted token — so "a provider is missing from the list" has to be a stated
- * outcome, not something the admin discovers and reads as data loss.
+ * Every clause is load-bearing, because a notice that prescribes a remedy narrower than the
+ * damage it describes IS the false all-clear it exists to prevent:
+ *   - `toprope aggregate backfill` only rebuilds periods inside its `--from`..`--to` range, and a
+ *     controlled resync deliberately imports a NARROWER span than the pre-reset data covered. So
+ *     `--from` has to reach the oldest period holding stale totals, not the start of the window
+ *     just imported. Migration 042 said this and it is repeated here rather than re-lost.
+ *   - `aggregate backfill` does not touch `pr_review_metrics` or `coaching_signals` at all; only
+ *     the next scheduled weekly/monthly job refreshes those, and only for its recent trailing
+ *     window, so older periods of those two stay stale permanently.
+ *   - Migration 043 can REMOVE a connection — one whose container it cannot canonicalize, or a
+ *     duplicate spelling of an older one — and that row holds the only copy of its encrypted
+ *     token and its repo include/exclude list. "A provider is missing from the list" has to be a
+ *     stated outcome, not something the admin discovers and reads as data loss.
  */
 export function gitResetNoticeMessage(migrationId: string): string {
     return (
         `Migration ${migrationId} reset the imported git data (commits, PRs, projected ` +
-        'snapshots and sync cursors) — every git provider must be re-synced. (1) Re-sync each ' +
-        'provider. (2) Rebuild the derived rollups, which the reset did NOT clear: run ' +
-        '`toprope aggregate backfill --from <the earliest day the resync imported>` for the ' +
-        'weekly/monthly/quarterly/yearly aggregates — note it does NOT cover pr_review_metrics ' +
-        'or coaching_signals, which only the next scheduled weekly/monthly job refreshes, and ' +
-        'only for its recent trailing window. Until then /api/aggregates serves pre-reset ' +
-        'totals for older periods. (3) Check Admin → Connectors → Git for a MISSING provider: ' +
-        'a connection whose org/workspace/group could not be canonicalized was removed and ' +
-        'must be re-added with its token. (4) Acknowledge with `toprope git clear-reset-notice`.'
+        'snapshots and sync cursors) — every git provider must be re-synced. ' +
+        '(1) Re-sync each provider (config-file providers sync only via `toprope sync git`). ' +
+        '(2) Rebuild the derived rollups, which the reset did NOT clear: `toprope aggregate ' +
+        'backfill --from <the earliest day ANY pre-reset rollup covers — NOT merely the start of ' +
+        'the window the resync imported>`. That covers the weekly/monthly/quarterly/yearly ' +
+        'aggregates only; pr_review_metrics and coaching_signals are not covered by any command, ' +
+        'and only the next scheduled weekly/monthly job refreshes them for its recent trailing ' +
+        'window — older periods of those two stay stale. Until the backfill runs, ' +
+        '/api/aggregates serves pre-reset totals for older periods. ' +
+        '(3) Check Admin → Connectors → Git for a MISSING provider: a connection whose ' +
+        'org/workspace/group could not be canonicalized, or that duplicated another spelling of ' +
+        'the same workspace, was removed and must be re-added with its token and repo scope. ' +
+        '(4) Acknowledge with `toprope git clear-reset-notice`.'
     );
-}
-
-/** What {@link acknowledgeGitReset} did, so the CLI can report it without re-deriving anything. */
-export type AcknowledgeResult =
-    | {kind: 'cleared'; migrationId: string}
-    | {kind: 'nothing_pending'}
-    | {kind: 'raised_by_this_run'; migrationId: string};
-
-/**
- * Acknowledge a pending notice — but refuse to acknowledge one that was raised by the SAME
- * process that is acknowledging it.
- *
- * `noticeBefore` is the notice as it stood before this process applied any migration.
- * `runMigrations` has to run before `sync_state` can be read on an un-migrated database, so the
- * acknowledgement command can be the very thing that performs the reset — and then clear the
- * marker for a rebuild that has definitionally not started, leaving `toprope doctor` green over
- * stale rollups. That is the #235 false all-clear, reached through the command meant to close
- * it. Refusing is the fail-closed choice: the operator re-runs after the rebuild.
- */
-export function acknowledgeGitReset(
-    db: Database.Database,
-    noticeBefore: string | null,
-): AcknowledgeResult {
-    const pending = gitResetNotice(db);
-    if (pending === null) return {kind: 'nothing_pending'};
-    if (noticeBefore === null) return {kind: 'raised_by_this_run', migrationId: pending};
-    clearGitResetNotice(db);
-    return {kind: 'cleared', migrationId: pending};
 }

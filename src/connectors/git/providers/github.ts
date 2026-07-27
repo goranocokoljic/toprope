@@ -11,6 +11,7 @@ import type {
     GitAuthor,
     GitHubProviderConfig,
 } from './types.js';
+import {normalizeContainer} from './container.js';
 
 const BASE_URL = 'https://api.github.com';
 // Pause proactively when remaining requests drops below this threshold
@@ -194,7 +195,11 @@ export class GitHubProvider implements GitProvider {
     private readonly excludeRepos: string[];
 
     constructor(config: GitHubProviderConfig) {
-        this.org = config.org;
+        // Normalized (#266): the org is the attribution key AND the request path, and both have
+        // to be the same spelling. `providerContainer` normalizes the former; this normalizes the
+        // latter, from the same shared helper, so a YAML `org: '  Acme '` cannot attribute rows to
+        // `acme` while fetching `/orgs/%20Acme%20`.
+        this.org = normalizeContainer(config.org);
         this.includeRepos = config.repos ?? [];
         this.excludeRepos = config.exclude_repos ?? [];
         this.authHeaders = {

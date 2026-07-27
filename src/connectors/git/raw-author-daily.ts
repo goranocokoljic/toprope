@@ -373,8 +373,9 @@ function assertValidInput(row: RawAuthorDailyInput, observedAt: string): void {
     // boundary, not just by the schema CHECK, so the caller gets a message naming the
     // problem instead of a raw SQLITE_CONSTRAINT. Blankness goes through the SHARED
     // `isBlankContainer` (#266) rather than a local `.trim()`, so this boundary and the
-    // duplicate guard cannot disagree about what an empty container is.
-    if (typeof row.container !== 'string' || isBlankContainer(row.container)) {
+    // duplicate guard cannot disagree about what an empty container is — and it is total over a
+    // non-string too (`normalizeContainer` yields `''`), so no separate `typeof` disjunct is needed.
+    if (isBlankContainer(row.container)) {
         throw new RawAuthorDailyError(
             'invalid_container',
             `container must be a non-blank string (the provider's org/workspace/group), got: ${String(row.container)}`,
