@@ -236,33 +236,28 @@ describe('provider store — container normalization (#266)', () => {
         expect(listProviders(db)).toHaveLength(1);
     });
 
-    it('resolves and updates a row whose STORED container was never normalized', () => {
-        // The row a pre-#266 install (or migration 043's non-ASCII fail-closed path) could
-        // leave behind. Written directly, bypassing the store, so `existing.container` is raw.
-        // This is what makes the guard structural rather than conventional: if the reader or the
-        // immutability check normalized only the incoming side, this row would be INVISIBLE —
-        // 'wireless_media' would read as free, a second provider would be created for the same
-        // org, and `UNIQUE(type, container)` would not object because the bytes differ.
-        const seeded = createProvider(db, keyOk(), {config: BASE.github('placeholder-org')});
-        db.prepare('UPDATE git_providers SET container = ? WHERE id = ?').run(
-            '  Wireless_Media ',
-            seeded.id,
-        );
-
-        // The canonical reader finds it from the normalized spelling…
-        expect(findProviderByTypeContainer(db, 'github', 'wireless_media')?.id).toBe(seeded.id);
-        // …so a create for that container is refused rather than silently allowed.
-        expect(() => createProvider(db, keyOk(), {config: BASE.github('wireless_media')})).toThrow(
-            /already exists/,
-        );
-        expect(listProviders(db)).toHaveLength(1);
-
-        // And an edit that re-sends the normalized spelling is a no-op, not a refused move —
-        // the stored side of the comparison is normalized too.
-        const updated = updateProvider(db, keyOk(), seeded.id, {
-            config: BASE.github('wireless_media'),
-        });
-        expect(updated.container).toBe('wireless_media');
+    it('is the ONLY writer of the container column, so every stored value is canonical', () => {
+        // The invariant the whole guard rests on, asserted rather than assumed: whatever spelling
+        // a caller hands in, the column ends up canonical — which is what lets the reader stay a
+        // single indexed point-read and keeps it consistent with the other readers of
+        // `record.container` (the delete cascade, `syncStateKey`), which compare raw bytes.
+        // Migration 043 is the other half (it normalizes pre-#266 rows and deletes the ones SQL
+        // cannot canonicalize); the two together are why a non-canonical row cannot exist.
+        for (const spelling of ['Wireless_Media', '  WIRELESS_MEDIA ', '\tWireless_Media\n']) {
+            const rec = createProvider(db, keyOk(), {config: BASE.github(spelling)});
+            expect(rec.container).toBe('wireless_media');
+            // Re-sending any other spelling on the edit path is a no-op, not a refused move.
+            const updated = updateProvider(db, keyOk(), rec.id, {
+                config: BASE.github('wireless_media '),
+            });
+            expect(updated.container).toBe('wireless_media');
+            deleteProvider(db, rec.id);
+        }
+        expect(
+            db
+                .prepare('SELECT COUNT(*) AS n FROM git_providers WHERE container <> lower(container)')
+                .get(),
+        ).toEqual({n: 0});
     });
 
     it('a PATCH onto a genuinely different container is still refused as container_immutable', () => {
@@ -284,12 +279,24 @@ describe('provider store — container normalization (#266)', () => {
         expect(getProvider(db, rec.id)?.container).toBe('wireless_media');
     });
 
-    it('findProviderByTypeContainer misses a blank lookup instead of matching an arbitrary row', () => {
-        const rec = createProvider(db, keyOk(), {config: BASE.github('wireless_media')});
-        expect(rec.container).toBe('wireless_media');
+    it('findProviderByTypeContainer misses a blank lookup even when a blank row exists', () => {
+        // The early return has to be exercised against a row it could otherwise MATCH, or the
+        // test passes for the wrong reason (nothing matches a blank container in a table of
+        // ordinary rows either). Seeded by direct UPDATE, bypassing the store, because the store
+        // refuses to write a blank container — which is exactly why such a row can only come from
+        // outside it, and why answering a blank query with it would let a malformed config entry
+        // claim an existing provider's identity.
+        const blankRow = createProvider(db, keyOk(), {config: BASE.github('placeholder')});
+        db.prepare('UPDATE git_providers SET container = ? WHERE id = ?').run('   ', blankRow.id);
+        createProvider(db, keyOk(), {config: BASE.github('wireless_media')});
+
         for (const blank of ['', '   ', '\t']) {
             expect(findProviderByTypeContainer(db, 'github', blank)).toBeUndefined();
         }
+        // …and a real lookup still resolves.
+        expect(findProviderByTypeContainer(db, 'github', 'WIRELESS_MEDIA')?.container).toBe(
+            'wireless_media',
+        );
     });
 });
 

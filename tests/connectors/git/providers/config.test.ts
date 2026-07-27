@@ -70,7 +70,12 @@ describe('resolveGitProviderConfigs', () => {
         expect(containerKey(unknown)).toBe('gitea:');
     });
 
-    it('normalizes case and surrounding whitespace on every provider type (#266)', () => {
+    it('normalizes the container ON THE RESOLVED CONFIG for every provider type (#266)', () => {
+        // Rewriting the container INTO the entry — not just normalizing it on extraction — is what
+        // keeps the two uses of a config-file provider's container in agreement. Attribution and
+        // the cursor keys go through `providerContainer`, while the API clients read
+        // `config.org`/`.workspace`/`.group` VERBATIM to build the request path. Left raw,
+        // `org: '  Acme '` would attribute rows to `acme` while fetching `/orgs/%20Acme%20`.
         const resolved = resolveGitProviderConfigs({
             enabled: true,
             providers: [
@@ -84,6 +89,46 @@ describe('resolveGitProviderConfigs', () => {
             'acme-ws',
             'platform',
         ]);
+        // The field the provider CLIENT reads, not just the extraction.
+        expect(resolved[0]).toMatchObject({type: 'github', org: 'wireless_media'});
+        expect(resolved[1]).toMatchObject({type: 'bitbucket', workspace: 'acme-ws'});
+        expect(resolved[2]).toMatchObject({type: 'gitlab', group: 'platform'});
+    });
+
+    it('normalizes the legacy github shorthand container too (#266)', () => {
+        delete process.env.GITHUB_TOKEN;
+        const resolved = resolveGitProviderConfigs({
+            enabled: true,
+            org: '  MyOrg ',
+            api_token: 'mytoken',
+        });
+        expect(resolved).toHaveLength(1);
+        expect(resolved[0]).toMatchObject({type: 'github', org: 'myorg'});
+    });
+
+    it('passes an entry with an unknown type through untouched, so doctor can still name it', () => {
+        // A YAML `type: gitea` is untrusted text this resolver deliberately does not filter (that
+        // is what lets `doctor` report the entry specifically). Normalization must not throw on it
+        // or strip its fields — the pipeline's own `validateGitProviderConfig` is what refuses it,
+        // per-provider, inside `runSync`'s try/catch.
+        const resolved = resolveGitProviderConfigs({
+            enabled: true,
+            providers: [{type: 'gitea', org: 'Acme', auth: {type: 'token', api_token: 't'}}],
+        });
+        expect(resolved).toHaveLength(1);
+        expect(resolved[0]).toMatchObject({type: 'gitea', org: 'Acme'});
+        // …and it resolves to the blank container every write guard refuses by name.
+        expect(providerContainer(resolved[0])).toBe('');
+        expect(containerKey(resolved[0])).toBe('gitea:');
+    });
+
+    it('does not mutate the caller’s config entry while normalizing', () => {
+        // The YAML object is shared with the config loader (and `doctor` reads it too), so the
+        // resolver must return a copy rather than rewrite the loaded config in place.
+        const entry = {type: 'github', org: '  Wireless_Media ', auth: {type: 'token', api_token: 't'}};
+        const resolved = resolveGitProviderConfigs({enabled: true, providers: [entry]});
+        expect(resolved[0]).not.toBe(entry);
+        expect(entry.org).toBe('  Wireless_Media ');
     });
 
     it('falls back to the github shorthand when org + token are set', () => {

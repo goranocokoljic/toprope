@@ -2,6 +2,7 @@ import {describe, it, expect} from 'vitest';
 import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 import {runMigrations} from '../../src/storage/migrator';
 import {normalizeContainer} from '../../src/connectors/git/providers/container';
 import {gitResetNotice} from '../../src/connectors/git/reset-notice';
@@ -32,9 +33,13 @@ const MIGRATIONS_DIR = path.resolve(__dirname, '../../src/storage/migrations');
 /**
  * The whitespace charlist and the normalization expression the migration uses, restated here so
  * the equivalence test can run it against a parameter. A separate assertion pins this restatement
- * to the migration file itself, so an edit to either side cannot silently drift.
+ * to EVERY occurrence in the migration file, so an edit to either side cannot silently drift.
+ *
+ * The set is the full one JS `String.prototype.trim` removes: ASCII controls + space, every
+ * Unicode Zs, the two line separators, and U+FEFF.
  */
-const SQL_TRIM_CHARS = "' ' || char(9) || char(10) || char(11) || char(12) || char(13)";
+const SQL_TRIM_CHARS =
+    'char(9,10,11,12,13,32,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288,65279)';
 const SQL_NORMALIZE = `lower(trim(?, ${SQL_TRIM_CHARS}))`;
 
 function migration043Source(): string {
@@ -50,14 +55,14 @@ function migrationFilesUpTo(maxId: number): string[] {
         .sort();
 }
 
-/** A database migrated to 042 exactly — an existing install right before #266. */
-function dbAt042(): Database.Database {
+/** A database migrated to exactly `maxId` — an existing install at that point in history. */
+function dbAt(maxId: number): Database.Database {
     const db = new Database(':memory:');
     db.pragma('foreign_keys = ON');
     db.exec(
         'CREATE TABLE schema_migrations (id INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)',
     );
-    for (const f of migrationFilesUpTo(42)) {
+    for (const f of migrationFilesUpTo(maxId)) {
         db.exec(fs.readFileSync(path.join(MIGRATIONS_DIR, f), 'utf-8'));
         db.prepare('INSERT INTO schema_migrations (id, name, applied_at) VALUES (?, ?, ?)').run(
             parseInt(f.slice(0, 3), 10),
@@ -68,13 +73,30 @@ function dbAt042(): Database.Database {
     return db;
 }
 
+/** A database migrated to 042 exactly — an existing install right before #266. */
+function dbAt042(): Database.Database {
+    return dbAt(42);
+}
+
 /**
- * Apply 043 through the real runner, matching the sibling 042 test. `runMigrations` wraps each
- * file in `db.transaction(...)`, so this also proves 043 applies cleanly under the runner
- * against a POPULATED database and is recorded exactly once.
+ * Apply 043 (and nothing after it) through the real runner. `runMigrations` wraps each file in
+ * `db.transaction(...)`, so this also proves 043 applies cleanly under the runner against a
+ * POPULATED database and is recorded exactly once.
+ *
+ * `runMigrations` is given a directory containing only the files up to 43, rather than the whole
+ * chain: asserting "the runner applied exactly 1" would pin this entire file to 043 being the
+ * newest migration, and once 044 lands its effects would silently fold into every assertion here.
  */
 function apply043(db: Database.Database): void {
-    expect(runMigrations(db, MIGRATIONS_DIR)).toBe(1);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'toprope-m043-'));
+    try {
+        for (const f of migrationFilesUpTo(43)) {
+            fs.copyFileSync(path.join(MIGRATIONS_DIR, f), path.join(dir, f));
+        }
+        expect(runMigrations(db, dir)).toBe(1);
+    } finally {
+        fs.rmSync(dir, {recursive: true, force: true});
+    }
     expect(
         (
             db.prepare('SELECT COUNT(*) AS n FROM schema_migrations WHERE id = 43').get() as {
@@ -82,6 +104,19 @@ function apply043(db: Database.Database): void {
             }
         ).n,
     ).toBe(1);
+}
+
+/** Re-run the up-to-43 chain and assert nothing was applied a second time. */
+function apply043NoOp(db: Database.Database): void {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'toprope-m043-'));
+    try {
+        for (const f of migrationFilesUpTo(43)) {
+            fs.copyFileSync(path.join(MIGRATIONS_DIR, f), path.join(dir, f));
+        }
+        expect(runMigrations(db, dir)).toBe(0);
+    } finally {
+        fs.rmSync(dir, {recursive: true, force: true});
+    }
 }
 
 function count(db: Database.Database, table: string): number {
@@ -300,36 +335,73 @@ describe('migration 043 — container normalization (#266)', () => {
         db.close();
     });
 
-    it('DELETES a provider row whose container SQL cannot canonicalize (non-ASCII), rather than storing an unresolvable value', () => {
+    it('re-spells a container padded with NON-ASCII whitespace rather than deleting the connection', () => {
+        // NBSP / U+FEFF / the ideographic space are the likeliest invisible pastes, and JS
+        // `.trim()` strips all of them — so the charlist must too. Deleting these rows would cost
+        // the admin their encrypted credential for a spelling that IS canonicalizable.
         const db = dbAt042();
-        // NBSP — the single most plausible invisible paste, and one SQLite's ASCII-only
-        // `lower()`/`trim()` cannot strip. Re-spelling it in SQL would store a container no
-        // write path can ever produce, so the delete cascade keyed on `record.container` would
-        // retract nothing and report success. Fail closed: the connection must be re-added.
-        insertProvider(db, 'p-nbsp', 'github', 'acme ', '2026-02-01T00:00:00.000Z');
+        insertProvider(db, 'p-nbsp', 'github', 'Acme ', '2026-02-01T00:00:00.000Z');
+        insertProvider(db, 'p-bom', 'bitbucket', '﻿Acme-WS', '2026-02-02T00:00:00.000Z');
+        insertProvider(db, 'p-ideo', 'gitlab', '　ACME　', '2026-02-03T00:00:00.000Z');
+
+        apply043(db);
+
+        expect(db.prepare('SELECT id, container FROM git_providers ORDER BY id').all()).toEqual([
+            {id: 'p-bom', container: 'acme-ws'},
+            {id: 'p-ideo', container: 'acme'},
+            {id: 'p-nbsp', container: 'acme'},
+        ]);
+        db.close();
+    });
+
+    it('DELETES a provider row whose container is non-ASCII CONTENT or blank, rather than guessing', () => {
+        // Non-ASCII content is the one case SQLite cannot casefold the way JS does. Storing a
+        // guessed spelling would produce a container no write path can ever emit, so the delete
+        // cascade keyed on `record.container` would retract nothing and report success — a
+        // permanent ghost. Fail closed: the connection must be re-added.
+        const db = dbAt042();
         insertProvider(db, 'p-upper-nonascii', 'github', 'ÄCME', '2026-02-02T00:00:00.000Z');
-        insertProvider(db, 'p-blank', 'gitlab', '   ', '2026-02-03T00:00:00.000Z');
-        insertProvider(db, 'p-ok', 'github', 'Fine-Org', '2026-02-04T00:00:00.000Z');
+        insertProvider(db, 'p-accent', 'bitbucket', 'ACMÉ', '2026-02-03T00:00:00.000Z');
+        insertProvider(db, 'p-blank', 'gitlab', '   ', '2026-02-04T00:00:00.000Z');
+        insertProvider(db, 'p-ok', 'github', 'Fine-Org', '2026-02-05T00:00:00.000Z');
 
         apply043(db);
 
         expect(db.prepare('SELECT id, container FROM git_providers').all()).toEqual([
             {id: 'p-ok', container: 'fine-org'},
         ]);
+        // A deleted connection is never silent: the encrypted credential cannot be recovered, so
+        // the operator has to be told to go looking for the missing provider. This install held
+        // no git data at all, so ONLY the provider-delete arm of the notice can have raised it.
+        expect(gitResetNotice(db)).toBe('043');
         db.close();
     });
 
     it('the expression the equivalence test exercises is the one the migration actually uses', () => {
         // Without this, the equivalence test below could keep passing against a stale
-        // restatement while the migration's own charlist drifted.
-        expect(migration043Source()).toContain(`lower(trim(container, ${SQL_TRIM_CHARS}))`);
+        // restatement while the migration's own charlist drifted. SQL has no way to name the
+        // charlist once, so EVERY occurrence is pinned — the dedupe DELETE and the fail-closed
+        // DELETE spell it too, and a drift in either would be caught only indirectly otherwise.
+        const source = migration043Source();
+        expect(source).toContain(`lower(trim(container, ${SQL_TRIM_CHARS}))`);
+        expect(source).toContain(`lower(trim(o.container, ${SQL_TRIM_CHARS}))`);
+        expect(source).toContain(`trim(container, ${SQL_TRIM_CHARS})`);
+        // Every `trim(` in EXECUTABLE SQL uses the shared charlist — no occurrence was missed
+        // (comment lines are dropped: the prose discusses SQLite's bare `trim(X)` on purpose).
+        const sql = source
+            .split('\n')
+            .filter((line) => !line.trimStart().startsWith('--'))
+            .join('\n');
+        expect((sql.match(/trim\(/g) ?? []).length).toBeGreaterThan(0);
+        expect((sql.match(/trim\(/g) ?? []).length).toBe(
+            (sql.match(new RegExp(SQL_TRIM_CHARS.replace(/[()]/g, '\\$&'), 'g')) ?? []).length,
+        );
     });
 
-    it("the migration's SQL normalization equals normalizeContainer for every ASCII spelling", () => {
-        // This is the property the in-place UPDATE rests on: it only normalizes ASCII-only
-        // containers precisely because SQL and JS are provably identical there. Pinning it here
-        // means a future edit to either side that breaks the equivalence fails loudly instead of
-        // silently storing a container the code cannot resolve.
+    it("the migration's SQL normalization equals normalizeContainer, whitespace set included", () => {
+        // This is the property the in-place UPDATE rests on. Pinning it means a future edit to
+        // either side that breaks the equivalence fails loudly instead of silently storing a
+        // container the code cannot resolve.
         const db = dbAt042();
         const sqlNorm = db.prepare(`SELECT ${SQL_NORMALIZE} AS v`);
         const spellings = [
@@ -339,28 +411,48 @@ describe('migration 043 — container normalization (#266)', () => {
             'Wireless_Media ',
             '  wireless_media',
             '\tTabbed\n',
-            '\r\nacme',
+            '\r\nacme',
             'a b',
             ' a b ',
             'Org.With-Dots_And/Slashes',
             'MiXeD123',
             '   ',
             '',
+            // The NON-ASCII whitespace JS `.trim()` also strips: NBSP (U+00A0), U+FEFF, the
+            // ideographic space (U+3000), EM SPACE (U+2003) and the line separator U+2028. The
+            // charlist covers all of them, so the equivalence must hold here too — a container
+            // padded with an invisible pasted out of a rendered page gets re-spelled, not
+            // mistaken for un-normalizable and deleted.
+            'Acme ',
+            ' Acme ',
+            'Acme﻿',
+            '　ACME',
+            ' acme ',
+            ' acme',
+            ' 　﻿',
         ];
         for (const raw of spellings) {
             const viaSql = (sqlNorm.get(raw) as {v: string}).v;
             expect(viaSql, `SQL vs JS for ${JSON.stringify(raw)}`).toBe(normalizeContainer(raw));
         }
-        // …and the ASCII-only predicate the UPDATE uses actually excludes non-ASCII, which is
-        // where the two rules are allowed to differ.
-        const asciiOnly = db.prepare(
-            'SELECT length(?) = length(CAST(? AS BLOB)) AS ascii_only',
+        // U+200B ZWSP is deliberately NOT in the set, because JS does not strip it either — it is
+        // part of the container's name under both rules. Asserted so a future "add every invisible
+        // character" edit has to justify itself against the JS rule rather than drift past it.
+        expect(normalizeContainer('a​b')).toBe('a​b');
+        expect((sqlNorm.get('a​b') as {v: string}).v).toBe(normalizeContainer('a​b'));
+
+        // The ASCII-AFTER-TRIM predicate the fail-closed DELETE keys on: 1 when the trimmed value
+        // is pure ASCII (where SQLite `lower()` == JS `toLowerCase()`), 0 otherwise.
+        const asciiAfterTrim = db.prepare(
+            `SELECT length(trim(?, ${SQL_TRIM_CHARS})) = length(CAST(trim(?, ${SQL_TRIM_CHARS}) AS BLOB)) AS ok`,
         );
         for (const raw of spellings) {
-            expect((asciiOnly.get(raw, raw) as {ascii_only: number}).ascii_only, raw).toBe(1);
+            expect((asciiAfterTrim.get(raw, raw) as {ok: number}).ok, raw).toBe(1);
         }
-        for (const raw of ['acme ', 'ÄCME', 'acme﻿']) {
-            expect((asciiOnly.get(raw, raw) as {ascii_only: number}).ascii_only, raw).toBe(0);
+        // Non-ASCII CONTENT is the one place SQL cannot casefold like JS, so it must FAIL the
+        // predicate and land in the fail-closed DELETE rather than be re-spelled by guesswork.
+        for (const raw of ['ÄCME', 'ACMÉ', 'ＡＣＭＥ']) {
+            expect((asciiAfterTrim.get(raw, raw) as {ok: number}).ok, raw).toBe(0);
         }
         db.close();
     });
@@ -408,8 +500,9 @@ describe('migration 043 — container normalization (#266)', () => {
         expect(count(db, 'git_providers')).toBe(0);
         expect(count(db, 'raw_author_daily')).toBe(0);
         expect(gitCursorCount(db)).toBe(0);
-        // Re-running the runner must not re-execute it.
-        expect(runMigrations(db, MIGRATIONS_DIR)).toBe(0);
+        // Re-running 043 must not re-execute it — the ledger is what makes a destructive
+        // migration safe to leave in the chain.
+        apply043NoOp(db);
         db.close();
     });
 
@@ -422,6 +515,92 @@ describe('migration 043 — container normalization (#266)', () => {
         apply043(db);
         expect(gitResetNotice(db)).toBeNull();
         expect(count(db, 'git_snapshots')).toBe(1);
+        db.close();
+    });
+
+    it('leaves the DERIVED rollups untouched — which is exactly why the notice exists', () => {
+        // The notice's whole second half ("the rollups were NOT reset, so /api/aggregates still
+        // serves pre-reset totals; run aggregate backfill") is a claim about these tables. If a
+        // future edit also cleared them, the notice would be describing a state that no longer
+        // exists and `aggregate backfill` would stop being the right remedy — asserted rather
+        // than left as prose in three files.
+        const db = dbAt042();
+        seedDeveloper(db);
+        insertRawAuthorDay(db, 'wireless_media', '2026-07-01');
+        db.prepare(
+            `INSERT INTO weekly_aggregates (id, developer_id, week_start, team, total_commits, computed_at)
+             VALUES ('wa-1', 'dev-1', '2026-06-29', 'core', 40, '2026-07-06T00:00:00.000Z')`,
+        ).run();
+
+        apply043(db);
+
+        expect(count(db, 'raw_author_daily')).toBe(0);
+        expect(
+            db.prepare('SELECT total_commits FROM weekly_aggregates WHERE id = ?').get('wa-1'),
+        ).toEqual({total_commits: 40});
+        expect(gitResetNotice(db)).toBe('043');
+        db.close();
+    });
+
+    /**
+     * The upgrade path with the MOST to lose: an install that has not yet taken #264. Migration
+     * 042 empties `raw_author_daily`, `pr_records`, `git_snapshots` and the `git_*` cursors — in
+     * the SAME `runMigrations` pass, immediately before 043 — and leaves no marker of its own. A
+     * notice predicate built only from those four tables therefore sees an empty database and
+     * reports "nothing to rebuild" for an install whose rollups still hold months of pre-reset
+     * totals, which `doctor` would then print as a green currency claim.
+     */
+    it('raises the signal on the pre-042 upgrade chain, where 042 has already emptied the evidence', () => {
+        const db = dbAt(41);
+        seedDeveloper(db);
+        // Pre-042 shapes: `raw_author_daily` had no container column, and a synced provider's
+        // `last_sync_at` is set. 042 will drop the table and clear the cursors.
+        db.prepare(
+            `INSERT INTO raw_author_daily (
+                id, provider, raw_author_key, author_login, author_email, author_display_name,
+                date, commits, lines_added, lines_removed, files_changed, prs_opened, prs_merged,
+                review_comments_given, avg_time_to_merge_hours, code_churn_rate,
+                ai_signature_score, avg_commit_size, commit_burst_count, first_seen, last_seen
+             ) VALUES ('r1', 'github', 'github:login:alice', 'alice', 'a@x.dev', NULL,
+                       '2026-07-01', 3, 30, 3, 2, 0, 0, 0, NULL, 0, 0, 10, 0,
+                       '2026-07-02T00:00:00.000Z', '2026-07-02T00:00:00.000Z')`,
+        ).run();
+        insertProvider(db, 'p1', 'github', 'Wireless_Media', '2026-02-01T00:00:00.000Z');
+        insertCursors(db, 'Wireless_Media');
+        db.prepare(
+            `INSERT INTO weekly_aggregates (id, developer_id, week_start, team, total_commits, computed_at)
+             VALUES ('wa-1', 'dev-1', '2026-06-29', 'core', 40, '2026-07-06T00:00:00.000Z')`,
+        ).run();
+
+        // Both 042 and 043 apply in one pass, exactly as a real upgrade would. The full chain is
+        // used deliberately here (this test IS about the two migrations interacting), and the
+        // count is not asserted so a future 044 does not break it.
+        runMigrations(db, MIGRATIONS_DIR);
+
+        expect(count(db, 'raw_author_daily')).toBe(0);
+        expect(gitCursorCount(db)).toBe(0);
+        // The stale rollup that makes the notice necessary is still there…
+        expect(count(db, 'weekly_aggregates')).toBe(1);
+        // …and the notice fired, so `toprope doctor` will not report a green currency claim.
+        expect(gitResetNotice(db)).toBe('043');
+        expect(
+            db.prepare('SELECT container, last_sync_at FROM git_providers WHERE id = ?').get('p1'),
+        ).toEqual({container: 'wireless_media', last_sync_at: null});
+        db.close();
+    });
+
+    it('a tool-only install (rollup rows but no git commits) is not told to rebuild git data', () => {
+        // `weekly_aggregates` is not git-specific — a Copilot-only install has rows here. Probing
+        // its existence rather than `total_commits > 0` would raise a false positive on every
+        // install that has ever aggregated anything.
+        const db = dbAt042();
+        seedDeveloper(db);
+        db.prepare(
+            `INSERT INTO weekly_aggregates (id, developer_id, week_start, team, total_commits, computed_at)
+             VALUES ('wa-0', 'dev-1', '2026-06-29', 'core', 0, '2026-07-06T00:00:00.000Z')`,
+        ).run();
+        apply043(db);
+        expect(gitResetNotice(db)).toBeNull();
         db.close();
     });
 });

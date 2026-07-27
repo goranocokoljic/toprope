@@ -196,56 +196,61 @@ describe('admin git-provider container normalization (#266)', () => {
         expect(configRow?.id).toBe('config:gitlab:config_group');
     });
 
-    it('a PATCH that renames a container onto an existing one is a 409 naming the owner (AC5)', async () => {
-        const a = await create('github', 'wireless_media');
-        const b = await create('github', 'other-org');
-        expect(b.statusCode).toBe(201);
-        const bId = (b.body.data as {id: string}).id;
-        const aId = (a.body.data as {id: string}).id;
+    // AC5 covers the PATCH path for EVERY provider type, not just github: `updateProvider`'s
+    // immutability check is type-agnostic, but "type-agnostic" is the claim, and a per-type codec
+    // branch is exactly where #266's normalization had to be applied three times.
+    for (const type of Object.keys(TYPE_BODY) as GitProviderType[]) {
+        it(`[${type}] a PATCH that renames a container onto an existing one is a 409 naming the owner (AC5)`, async () => {
+            const a = await create(type, 'wireless_media');
+            const b = await create(type, 'other-org');
+            expect(b.statusCode).toBe(201);
+            const bId = (b.body.data as {id: string}).id;
+            const aId = (a.body.data as {id: string}).id;
 
-        // Even spelled differently, the target pair is owned — the collision message wins over
-        // the blanket immutability refusal because it can name who owns it.
-        const res = await app.inject({
-            method: 'PATCH',
-            url: `/api/admin/git/providers/${bId}`,
-            headers: headers(),
-            payload: {type: 'github', container: 'WIRELESS_MEDIA'},
+            // Even spelled differently, the target pair is owned — the collision message wins over
+            // the blanket immutability refusal because it can name who owns it.
+            const res = await app.inject({
+                method: 'PATCH',
+                url: `/api/admin/git/providers/${bId}`,
+                headers: headers(),
+                payload: {...TYPE_BODY[type], container: 'WIRELESS_MEDIA'},
+            });
+            expect(res.statusCode).toBe(409);
+            expect(String((JSON.parse(res.body) as {message: string}).message)).toContain(aId);
+            expect(storedContainer(bId)).toBe('other-org');
         });
-        expect(res.statusCode).toBe(409);
-        expect(String((JSON.parse(res.body) as {message: string}).message)).toContain(aId);
-        expect(storedContainer(bId)).toBe('other-org');
-    });
 
-    it('a PATCH that only re-cases its OWN container succeeds and stays normalized (AC8)', async () => {
-        // The admin edit form re-sends the container on every save, so a re-cased value must
-        // not read as "moving to a different container".
-        const created = await create('github', 'wireless_media');
-        const id = (created.body.data as {id: string}).id;
-        const res = await app.inject({
-            method: 'PATCH',
-            url: `/api/admin/git/providers/${id}`,
-            headers: headers(),
-            payload: {type: 'github', container: '  Wireless_Media ', enabled: false},
+        it(`[${type}] a PATCH that only re-cases its OWN container succeeds and stays normalized (AC8)`, async () => {
+            // The admin edit form re-sends the container on every save, so a re-cased value must
+            // not read as "moving to a different container".
+            const created = await create(type, 'wireless_media');
+            const id = (created.body.data as {id: string}).id;
+            const res = await app.inject({
+                method: 'PATCH',
+                url: `/api/admin/git/providers/${id}`,
+                headers: headers(),
+                payload: {...TYPE_BODY[type], container: '  Wireless_Media ', enabled: false},
+            });
+            expect(res.statusCode).toBe(200);
+            expect((JSON.parse(res.body) as {data: {enabled: boolean}}).data.enabled).toBe(false);
+            expect(storedContainer(id)).toBe('wireless_media');
         });
-        expect(res.statusCode).toBe(200);
-        expect((JSON.parse(res.body) as {data: {enabled: boolean}}).data.enabled).toBe(false);
-        expect(storedContainer(id)).toBe('wireless_media');
-    });
 
-    it('a PATCH cannot blank the container (AC4)', async () => {
-        const created = await create('github', 'wireless_media');
-        const id = (created.body.data as {id: string}).id;
-        const res = await app.inject({
-            method: 'PATCH',
-            url: `/api/admin/git/providers/${id}`,
-            headers: headers(),
-            payload: {type: 'github', container: '   '},
+        it(`[${type}] a PATCH cannot blank the container (AC4)`, async () => {
+            const created = await create(type, 'wireless_media');
+            const id = (created.body.data as {id: string}).id;
+            const res = await app.inject({
+                method: 'PATCH',
+                url: `/api/admin/git/providers/${id}`,
+                headers: headers(),
+                payload: {...TYPE_BODY[type], container: '   '},
+            });
+            // Rejected by the wire parser's non-blank check before it reaches the store — either
+            // way a typed 400, never a raw constraint failure.
+            expect(res.statusCode).toBe(400);
+            expect(storedContainer(id)).toBe('wireless_media');
         });
-        // Rejected by the wire parser's non-blank check before it reaches the store — either
-        // way a typed 400, never a raw constraint failure.
-        expect(res.statusCode).toBe(400);
-        expect(storedContainer(id)).toBe('wireless_media');
-    });
+    }
 
     /**
      * AC3 — the cursor keys and the imported rows must use the SAME normalized form, so a

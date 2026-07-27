@@ -220,25 +220,28 @@ function requireKey(keyResult: ServerKeyResult): Extract<ServerKeyResult, {ok: t
  * guards below and the admin API's 409s all go through it rather than re-deriving the
  * lookup, so "who owns this container" has one definition.
  *
- * The match is NORMALIZED ON BOTH SIDES (#266). SQLite's `=` on TEXT is case-sensitive and
+ * The lookup NORMALIZES ITS ARGUMENT (#266). SQLite's `=` on TEXT is case-sensitive and
  * nothing trims, so a raw comparison answered "free" for `wireless_media` while
  * `Wireless_Media` sat in the table — and since #264 that means two independent data sets
  * for one real workspace, i.e. a permanent double-count through the front door of the guard
  * added to prevent it.
  *
- * Normalizing only the ARGUMENT would leave the whole guard resting on the convention that
- * every stored value is already normalized — which for a pre-#266 row depends on migration
- * 043's SQL normalization matching `normalizeContainer` exactly, and SQL cannot casefold
- * non-ASCII the way JS `toLowerCase()` does. A single row the migration could not re-spell
- * (say `acme` followed by U+00A0, a non-breaking space pasted out of a rendered page)
- * would then be INVISIBLE to this
- * reader: `acme` would read as free, a second provider would be created for the same org,
- * `UNIQUE(type, container)` would not object (different bytes), and both would import the
- * same commits forever. So the comparison is done in JS over the type's rows — one query, an
- * in-memory scan of a table that holds single-digit rows, and no reliance on the column
- * already being canonical. When two stored spellings normalize to the same container (only
- * reachable if a row bypassed this module), the deterministic list order picks the same
- * owner every time rather than an arbitrary one.
+ * Comparing the normalized argument against the raw column is sound because the column is
+ * canonical BY CONSTRUCTION, at both ends:
+ *   - every write goes through `providerConfigToRowFields` → `providerContainer` →
+ *     `normalizeContainer` (this module is the only writer of `git_providers`), and
+ *   - migration 043 brought existing rows to that same spelling, deleting the ones SQLite
+ *     could not canonicalize the way JS does rather than storing a guess.
+ * So a stored container that `normalizeContainer` would change cannot survive, which is what
+ * lets this stay a single indexed point-read on the `UNIQUE(type, container)` index instead of
+ * a scan — and what keeps it consistent with the other readers of `record.container` (the
+ * delete cascade, `syncStateKey`), which compare raw bytes and would silently retract nothing
+ * for a non-canonical row no matter how tolerant this function was.
+ *
+ * A blank lookup returns `undefined` rather than matching: no valid row can hold a blank
+ * container (`validateGitProviderConfig` refuses it and 043 deletes it), so a blank query is a
+ * caller bug, and answering it with "the row whose container is also blank" would let a
+ * malformed config claim an existing provider's identity.
  */
 export function findProviderByTypeContainer(
     db: Database.Database,
@@ -247,10 +250,9 @@ export function findProviderByTypeContainer(
 ): GitProviderRecord | undefined {
     const wanted = normalizeContainer(container);
     if (wanted === '') return undefined;
-    const rows = db
-        .prepare('SELECT * FROM git_providers WHERE type = ? ORDER BY created_at ASC, id ASC')
-        .all(type) as GitProviderRecord[];
-    return rows.find((row) => normalizeContainer(row.container) === wanted);
+    return db
+        .prepare('SELECT * FROM git_providers WHERE type = ? AND container = ?')
+        .get(type, wanted) as GitProviderRecord | undefined;
 }
 
 /**
@@ -425,6 +427,16 @@ export function updateProvider(
         // same workspace in different case" would read as a move and be refused — a lie, since
         // the pair did not change, and one the admin edit form would hit on every save (it
         // re-sends the container verbatim).
+        //
+        // `url` is deliberately still compared RAW, and that asymmetry is out of #266's scope
+        // rather than an oversight. It is not a double-count risk — `UNIQUE(type, container)`
+        // already makes two same-named groups on different instances unconnectable, so no two rows
+        // can disagree only by `url`. It IS a UX wart: a client that re-sent
+        // `https://gitlab.example.com/` where the row stores it without the trailing slash would
+        // get `container_immutable` on a PATCH that changed nothing. The admin form round-trips the
+        // stored value verbatim, so it cannot happen from the UI. Normalizing a URL is a different
+        // rule from normalizing a container (scheme, host case, default port, trailing slash), and
+        // `trimTrailingSlash` in `summaries/model-client.ts` is only a third of it.
         if (
             fields.type !== existing.type ||
             !sameContainer(fields.container, existing.container) ||

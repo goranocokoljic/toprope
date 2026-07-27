@@ -29,7 +29,11 @@ import {CursorSync} from './connectors/cursor/sync';
 import {GitSync} from './connectors/git/sync';
 import {replayDeveloper} from './connectors/git/projection';
 import {setHistoryFloor} from './cli/git-history-floor';
-import {clearGitResetNotice, gitResetNotice, gitResetNoticeMessage} from './connectors/git/reset-notice';
+import {
+    acknowledgeGitReset,
+    gitResetNotice,
+    gitResetNoticeMessage,
+} from './connectors/git/reset-notice';
 import {runPipeline} from './scheduler/sync-pipeline';
 import {importCsv} from './expenses/importer';
 import {listUnmatchedCharges, resolveCharge, findUnmatchedIdByPrefix} from './expenses/resolution-queue';
@@ -875,21 +879,38 @@ gitCommand
         const config = loadConfig(configPath);
         const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
         const db = openDb(dbPath);
+        let failed = false;
         try {
+            // Read the notice BEFORE migrating. `runMigrations` has to run (an un-migrated
+            // database has no `sync_state` at all), but it can also BE the thing that performs
+            // the reset — and `acknowledgeGitReset` needs the before-state to refuse to
+            // acknowledge a notice this very run raised.
+            const before = gitResetNotice(db);
             runMigrations(db, MIGRATIONS_DIR);
-            const pending = gitResetNotice(db);
-            if (pending === null) {
-                // Not an error — but say what was true, rather than reporting a no-op as
-                // "cleared" and leaving the operator thinking they had something to clear.
-                console.log('[git] no reset notice is pending.');
-                return;
+            const result = acknowledgeGitReset(db, before);
+            switch (result.kind) {
+                case 'cleared':
+                    console.log(`[git] reset notice for migration ${result.migrationId} cleared.`);
+                    break;
+                case 'nothing_pending':
+                    // Not an error — but say what was true, rather than reporting a no-op as
+                    // "cleared" and leaving the operator thinking they had something to clear.
+                    console.log('[git] no reset notice is pending.');
+                    break;
+                case 'raised_by_this_run':
+                    console.error(
+                        `[git] this run APPLIED migration ${result.migrationId}, which just reset ` +
+                            'the git data — so there is nothing to acknowledge yet. Do the rebuild ' +
+                            'first, then re-run this command.',
+                    );
+                    console.error(`[git] ${gitResetNoticeMessage(result.migrationId)}`);
+                    failed = true;
+                    break;
             }
-            clearGitResetNotice(db);
-            console.log(`[git] reset notice for migration ${pending} cleared.`);
-            console.log(`[git] it said: ${gitResetNoticeMessage(pending)}`);
         } finally {
             db.close();
         }
+        if (failed) process.exit(1);
     });
 
 const expensesCommand = program.command('expenses').description('Manage expense and subscription data');

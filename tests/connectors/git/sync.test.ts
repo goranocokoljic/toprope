@@ -222,6 +222,66 @@ describe('GitSync', () => {
         expect(countSnapshots(db)).toBeGreaterThan(0);
     });
 
+    /**
+     * #266 AC3, the WRITE direction. `(type, container)` is the attribution key of every imported
+     * row and of the three `git_*` cursors, so the pipeline must persist the CANONICAL container —
+     * not whatever the YAML happened to spell. Without this, a regression to `container: config.org`
+     * (the shape still used to build the API request path) would file a whole span under a second
+     * bucket that `git_snapshots` then sums, and no other test in the repo would notice: every
+     * other fixture here already uses a lowercase, unpadded container.
+     */
+    it('persists the NORMALIZED container in raw_author_daily, pr_records and the cursors (#266)', async () => {
+        const devLogin = 'alice';
+        seedDev(db, devLogin);
+
+        const createGitProvider = await getCreateGitProvider();
+        const provider = makeMockProvider({
+            listRepos: vi.fn().mockResolvedValue([makeRepo('myrepo')]),
+            getCommits: vi.fn().mockResolvedValue([makeProviderCommit(devLogin)]),
+            getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+            getPullRequests: vi.fn().mockResolvedValue([makeProviderPR(devLogin)]),
+        });
+        createGitProvider.mockReturnValue(provider);
+
+        // Padded AND mixed-case, i.e. the spellings #266 exists to collapse.
+        const syncer = new GitSync(
+            makeGithubConfig({
+                providers: [
+                    {
+                        type: 'github',
+                        org: '  Test_Org ',
+                        auth: {type: 'token', api_token: 'test-token'},
+                    },
+                ],
+            }),
+        );
+        await syncer.sync(db);
+
+        const containers = (columns: string): string[] =>
+            (db.prepare(columns).all() as {container: string}[]).map((r) => r.container);
+        expect(containers('SELECT DISTINCT container FROM raw_author_daily')).toEqual(['test_org']);
+        expect(containers('SELECT DISTINCT container FROM pr_records')).toEqual(['test_org']);
+
+        // The cursors key off the same value — a mismatch here is what re-arms the #262
+        // double-count (a cursor with no data behind it, or data with no cursor).
+        const keys = (
+            db
+                .prepare("SELECT key FROM sync_state WHERE key LIKE 'git_%' ORDER BY key")
+                .all() as {key: string}[]
+        ).map((r) => r.key);
+        expect(keys.length).toBeGreaterThan(0);
+        for (const key of keys) {
+            expect(key).toContain(':test_org');
+            expect(key).not.toContain('Test_Org');
+        }
+
+        // And the API client is handed the same canonical value, so attribution and the request
+        // path cannot disagree about which workspace this is.
+        expect(createGitProvider).toHaveBeenCalledWith(
+            expect.objectContaining({type: 'github', org: 'test_org'}),
+        );
+    });
+
     it('skips commits from unknown developers (no matching record)', async () => {
         const createGitProvider = await getCreateGitProvider();
         const commit = makeProviderCommit('unknown-user');

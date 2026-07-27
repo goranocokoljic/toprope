@@ -650,11 +650,16 @@ async function checkGitProviders(
 function checkGitResetNotice(db: Database.Database): CheckResult {
     const migrationId = gitResetNotice(db);
     if (migrationId === null) {
-        return pass('Git data currency', 'no pending migration reset');
+        // The label states what was MEASURED, not a currency claim: the absence of this marker
+        // means no migration is asking for a rebuild, which is NOT evidence that the rollups are
+        // current (migration 042 reset git data with no marker at all). Naming it "Git data
+        // currency · current" would be inferring a positive claim from a narrower check — the
+        // graduated #235 rule.
+        return pass('Git reset notice', 'none pending');
     }
     return fail(
-        'Git data currency',
-        `migration ${migrationId} reset the imported git data — resync + aggregate backfill owed`,
+        'Git reset notice',
+        `migration ${migrationId} reset the imported git data — resync + rollup rebuild owed`,
         gitResetNoticeMessage(migrationId),
     );
 }

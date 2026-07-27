@@ -37,18 +37,23 @@
  * The canonical spelling of a container: surrounding whitespace removed, then
  * casefolded.
  *
- * Casefolding is safe for all three providers' top-level scopes — GitHub org
- * logins are case-insensitive, Bitbucket workspace slugs are lowercase, and GitLab
- * namespace paths are lowercase-enforced — so two spellings that differ only by
- * case always name the same real workspace. `toLowerCase()` (not
- * `toLocaleLowerCase()`) deliberately: the result is persisted and compared across
- * processes, so it must not depend on the host locale (a Turkish locale lowercases
- * `I` to `ı`, which would make the same input normalize differently on two
- * machines).
+ * Casefolding is safe for all three providers' top-level scopes because all three
+ * RESOLVE them case-insensitively: GitHub org logins are case-insensitive, Bitbucket
+ * workspace slugs are lowercase, and GitLab looks a namespace up by lowercased full
+ * path (uniqueness is case-insensitive) even though its path syntax does permit
+ * uppercase. So two spellings differing only by case always name the same real
+ * workspace, and the lowercased form always resolves against the provider's API.
+ * That is the property a fourth provider type has to satisfy before being added —
+ * by then the stored data is permanently keyed by the casefolded value.
+ *
+ * `toLowerCase()` (not `toLocaleLowerCase()`) deliberately: the result is persisted
+ * and compared across processes, so it must not depend on the host locale (a Turkish
+ * locale lowercases `I` to `ı`, which would make the same input normalize
+ * differently on two machines).
  *
  * Idempotent: `normalizeContainer(normalizeContainer(x)) === normalizeContainer(x)`,
- * which is what lets the store re-apply it defensively on a value that already
- * came through here.
+ * which is what lets a downstream boundary re-apply it without having to know
+ * whether the value already came through here.
  *
  * TOTAL over untrusted input, by design. `resolveGitProviderConfigs` deliberately
  * yields config-file entries that have NOT been validated (so `toprope doctor` can

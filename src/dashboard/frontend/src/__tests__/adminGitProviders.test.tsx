@@ -2401,29 +2401,23 @@ describe('findContainerConflict (#266)', () => {
 
     it('matches exact, case-variant and whitespace-padded containers', () => {
         for (const typed of ['acme-org', 'ACME-ORG', 'Acme-Org ', '  acme-org']) {
-            expect(findContainerConflict(rows, 'github', typed, null)?.id).toBe('p-gh');
+            expect(findContainerConflict(rows, 'github', typed)?.id).toBe('p-gh');
         }
     });
 
     it('is scoped to the provider TYPE, and misses a free container', () => {
         // One container NAME under two families is two different data sets — not a conflict.
-        expect(findContainerConflict(rows, 'gitlab', 'acme-org', null)).toBeNull();
-        expect(findContainerConflict(rows, 'github', 'unclaimed', null)).toBeNull();
+        expect(findContainerConflict(rows, 'gitlab', 'acme-org')).toBeNull();
+        expect(findContainerConflict(rows, 'github', 'unclaimed')).toBeNull();
     });
 
     it('matches a read-only config-file provider too', () => {
-        expect(findContainerConflict(rows, 'gitlab', 'TEAM ', null)?.id).toBe('config:gitlab:team');
-    });
-
-    it('excludes the provider being edited, so a row never collides with itself', () => {
-        expect(findContainerConflict(rows, 'github', 'acme-org', 'p-gh')).toBeNull();
-        // …but still catches a DIFFERENT row.
-        expect(findContainerConflict(rows, 'gitlab', 'team', 'p-gh')?.id).toBe('config:gitlab:team');
+        expect(findContainerConflict(rows, 'gitlab', 'TEAM ')?.id).toBe('config:gitlab:team');
     });
 
     it('treats a blank/whitespace-only container as unfinished, not as a conflict', () => {
-        expect(findContainerConflict(rows, 'github', '', null)).toBeNull();
-        expect(findContainerConflict(rows, 'github', '   ', null)).toBeNull();
+        expect(findContainerConflict(rows, 'github', '')).toBeNull();
+        expect(findContainerConflict(rows, 'github', '   ')).toBeNull();
     });
 });
 
@@ -2492,6 +2486,10 @@ describe('AdminGitProviders — inline duplicate-container validation (#266)', (
         expect(screen.getByRole('button', {name: 'Add provider'})).toBeDisabled();
     });
 
+    // AC8 — and note WHERE it is guaranteed: the check does not run on the edit path at all, so
+    // this asserts the `isEdit` gate, not a self-exclusion predicate. The server-side proof that a
+    // PATCH re-sending the provider's own container is a no-op rather than a refused move lives in
+    // `tests/dashboard/admin-git-providers-container.test.ts` and `tests/git/providers-store.test.ts`.
     it('does NOT flag a provider as its own duplicate when editing it (AC8)', async () => {
         renderPage();
         await screen.findByText('acme-org');

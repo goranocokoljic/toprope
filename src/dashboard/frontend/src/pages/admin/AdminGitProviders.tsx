@@ -53,6 +53,7 @@ import {
 // rejects (or blocking what it would allow).
 import {
     isBlankContainer,
+    normalizeContainer,
     sameContainer,
 } from '../../../../../connectors/git/providers/container';
 
@@ -341,9 +342,15 @@ function ProbeResultView({result}: {result: GitProviderProbeResult}): JSX.Elemen
  * `(type, container)` and both appear in this list: a connected DB provider and a read-only
  * config-file one.
  *
- * `excludeId` is the provider being edited — a row never collides with itself (AC8).
  * A blank container is not a collision, just an unfinished field; the empty-field state has
  * its own Save gate.
+ *
+ * There is deliberately no "exclude the row being edited" parameter: the only caller is the ADD
+ * path (on edit the type and container fields are immutable and disabled since #264, so the pair
+ * cannot change from inside the dialog), and a predicate whose only exerciser would be its own
+ * unit test is scope without a caller. AC8 — "editing does not flag itself" — holds structurally
+ * because the check does not run on the edit path at all, and is proven server-side by the PATCH
+ * that only re-cases its own container.
  *
  * THIS IS AN AFFORDANCE, NOT THE ENFORCEMENT (the graduated #228 rule). The list it reads can
  * be stale and another admin can connect a provider between load and submit, so the server's
@@ -353,14 +360,9 @@ export function findContainerConflict(
     providers: AdminGitProvider[],
     type: GitProviderType,
     container: string,
-    excludeId: string | null,
 ): AdminGitProvider | null {
     if (isBlankContainer(container)) return null;
-    return (
-        providers.find(
-            (p) => p.type === type && p.id !== excludeId && sameContainer(p.container, container),
-        ) ?? null
-    );
+    return providers.find((p) => p.type === type && sameContainer(p.container, container)) ?? null;
 }
 
 /**
@@ -444,7 +446,11 @@ function ProviderFormModal({
     function buildInput(): GitProviderInput {
         const input: GitProviderInput = {
             type,
-            container: container.trim(),
+            // Through the SHARED normalizer, not a local `.trim()` (#266 AC9): the value sent must
+            // be the value the inline conflict check compared, or the client is validating one
+            // string and transmitting another — the check/store asymmetry this whole change exists
+            // to remove. The server re-normalizes regardless; this keeps the client honest.
+            container: normalizeContainer(container),
             auth_method: authMethod,
         };
         // Token is write-only: send it only when the admin typed one. On edit a
@@ -479,10 +485,7 @@ function ProviderFormModal({
     // container, this check would permanently disable Save on the connected provider, blocking
     // token rotation and enable/disable, neither of which touches the container. The server's
     // `duplicate_container`/`container_immutable` 409s remain the guard on that path.
-    // `editing` is null on this branch (that is what `isEdit` tests), so there is no id to
-    // exclude — the exclusion still lives in `findContainerConflict` for its unit tests and for
-    // any future caller that does check an existing row.
-    const containerConflict = isEdit ? null : findContainerConflict(providers, type, container, null);
+    const containerConflict = isEdit ? null : findContainerConflict(providers, type, container);
     const containerError = containerConflict
         ? containerConflictMessage(containerConflict, meta.containerLabel)
         : null;
@@ -521,7 +524,13 @@ function ProviderFormModal({
             testId="git-provider-modal"
         >
             <div className="flex flex-col gap-4">
-                <div className="flex flex-wrap items-end gap-4">
+                {/* `items-start`, not `items-end` (#266): the container field can grow a
+                    validation message below its input, and bottom-aligning the row would then
+                    lift the input above the two selects beside it by the message's height. Every
+                    control in this row is a label + a same-height box, so top-aligning renders
+                    identically when there is no message and keeps the input in place when there
+                    is. */}
+                <div className="flex flex-wrap items-start gap-4">
                     {/* Type and container are IMMUTABLE after creation (#264): together they
                         key every imported row and every sync cursor, so moving a saved
                         provider to a different pair would orphan the old container's data.

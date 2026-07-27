@@ -81,14 +81,7 @@ export function TextField({
         // "Organization" to "Organization<the error>" — breaking every accessible-name lookup
         // (and every getByLabelText) exactly when a validation error is showing. It reaches
         // the input through `aria-describedby` instead, which is the description slot.
-        //
-        // The width bound applies ONLY while an error is showing. Without it the wrapper is a
-        // flex item whose hypothetical main size is the message's one-line max-content width, so
-        // a long message would widen this field past its row and (under the callers'
-        // `items-end`) shove the input above its neighbours the moment an error appeared. Making
-        // it conditional keeps every existing call site's classes byte-identical — the primitive
-        // is shared by six admin pages and some of them let the field size to its container.
-        <div className={['flex flex-col gap-1', error ? 'max-w-xs' : ''].join(' ').trim()}>
+        <div className="flex flex-col gap-1">
             <label className="flex flex-col gap-1">
                 <span className="text-xs font-medium text-muted">{label}</span>
                 <input
@@ -105,8 +98,17 @@ export function TextField({
                     ].join(' ')}
                 />
             </label>
+            {/* `max-w-xs` on the MESSAGE, not on the wrapper: the wrapper is the flex item, so its
+                hypothetical main size is its widest child's max-content width — bounding the
+                message therefore bounds the field, while leaving the no-error render byte-identical
+                for all existing call sites and not resizing the input when an error appears.
+
+                No `role="alert"`: this is synchronous field validation recomputed on every
+                keystroke, so a live region would re-announce the same message per character. The
+                `aria-describedby` + `aria-invalid` pairing on the input is the conventional form —
+                it is announced as the field's description when focus is there, once. */}
             {error ? (
-                <span id={errorId} role="alert" className="text-xs text-danger">
+                <span id={errorId} className="max-w-xs text-xs text-danger">
                     {error}
                 </span>
             ) : null}
