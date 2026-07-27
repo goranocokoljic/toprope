@@ -152,6 +152,16 @@ describe('admin git-provider container normalization (#266)', () => {
             expect(dto.container).toBe('wireless_media');
         });
 
+        // AC4 over HTTP. WHICH LAYER ANSWERS is stated rather than left to be inferred: the wire
+        // parser's `requireString` rejects a container that is blank after trimming, so THAT is
+        // what produces this 400 — not the store, and this test would pass unchanged with the
+        // store's container guard removed. #266's own contribution to AC4 is one layer down, at
+        // the factory: pre-#266 `!config.org` accepted '   ' (it is truthy), so a whitespace-only
+        // container from a YAML config provider — which never passes through `requireString` —
+        // reached the pipeline and became a real `(type, '')` attribution key. That half is
+        // covered by `factory.test.ts` and by `providers-store.test.ts`, which drive the store
+        // directly. What this test does prove is that the route answers 400 rather than letting a
+        // constraint failure surface, on all three types and on both write verbs.
         it(`[${type}] a blank or whitespace-only container is a typed 400 (AC4)`, async () => {
             for (const blank of ['', '   ', '\t\n']) {
                 const res = await create(type, blank);
@@ -328,7 +338,10 @@ describe('admin git-provider container normalization (#266)', () => {
             // The cascade found the rows and cursors even though the provider row was created
             // from a differently-cased input — one spelling, one attribution key.
             expect(removed.raw_author_rows).toBe(1);
-            expect(removed.cursor_keys_purged).toBeGreaterThan(0);
+            // Exact, not `> 0`: `seedContainer` wrote the forward cursor AND the earliest-synced
+            // watermark, and a cascade that purged one but missed the other is precisely the
+            // half-retraction the #262 rule forbids — it would pass a `> 0` assertion.
+            expect(removed.cursor_keys_purged).toBe(2);
 
             // Re-added under yet another spelling: nothing survived to be double-counted, and
             // the pipeline correctly treats it as never synced.

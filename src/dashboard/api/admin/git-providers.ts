@@ -34,6 +34,7 @@ import {
     resolveGitProviderConfigs,
 } from '../../../connectors/git/providers/config';
 import {createGitProvider} from '../../../connectors/git/providers/factory';
+import {sameContainer} from '../../../connectors/git/providers/container';
 import {
     GitSync,
     isAdvisoryError,
@@ -396,9 +397,10 @@ function dbProviderToDto(
 
 // Map a typed store error to an HTTP reply. secret_key_unconfigured is a
 // fail-closed server-config condition (503, NOT 500); duplicate_container and
-// container_immutable are state conflicts (409, #264); blank_container is a malformed
-// request (400, #266) — the client sent no usable container, which is its bug, not a
-// conflicting state; not_found is a typed 404.
+// container_immutable are state conflicts (409, #264); not_found is a typed 404.
+// A blank container never arrives here: `requireString` rejects it as a 400 at the wire
+// boundary, and the factory's `isBlankContainer` check (#266) refuses it inside the store's
+// write — whose plain `Error` both write routes already map to a 400.
 function replyStoreError(reply: Parameters<typeof forbidden>[0], err: GitProviderStoreError): void {
     switch (err.code) {
         case 'secret_key_unconfigured':
@@ -407,9 +409,6 @@ function replyStoreError(reply: Parameters<typeof forbidden>[0], err: GitProvide
         case 'duplicate_container':
         case 'container_immutable':
             conflict(reply, err.message);
-            return;
-        case 'blank_container':
-            badRequest(reply, err.message);
             return;
         case 'not_found':
             notFound(reply, err.message);
@@ -748,9 +747,13 @@ export function registerAdminGitProviderRoutes(
             // actionable — message wins; a rename onto a FREE container is refused by the
             // store itself (`container_immutable`), because the old container's data and
             // cursors would otherwise be orphaned.
+            // Same predicate as the store's immutability guard, through the same shared
+            // `sameContainer` (#266) — a re-cased re-send of the provider's OWN container is not
+            // a move, and the two surfaces must not disagree about that.
             const nextContainer = providerContainer(parsed.config);
             const movingContainer =
-                parsed.config.type !== existing.type || nextContainer !== existing.container;
+                parsed.config.type !== existing.type ||
+                !sameContainer(nextContainer, existing.container);
             if (movingContainer) {
                 const owner = containerOwner(parsed.config.type, nextContainer, id);
                 if (owner !== null) {

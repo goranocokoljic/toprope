@@ -369,7 +369,7 @@ export function findContainerConflict(
  * just "already exists". A config-file owner gets different remediation: it cannot be edited
  * from the UI at all.
  */
-export function containerConflictMessage(
+function containerConflictMessage(
     conflict: AdminGitProvider,
     containerLabel: string,
 ): string {
@@ -466,24 +466,28 @@ function ProviderFormModal({
     // server will 400.
     const hasUsername = !isBitbucketAppPassword || username.trim() !== '';
     // A draft test needs a credential (server: tokenRequired). On edit without a
-    // re-entered token, the admin uses the row's "Test" button instead.
-    const canTest = token.trim() !== '' && container.trim() !== '' && hasUsername;
+    // re-entered token, the admin uses the row's "Test" button instead. Blankness goes through
+    // the SHARED predicate, so this component has no second opinion about what "empty" means.
+    const hasContainer = !isBlankContainer(container);
+    const canTest = token.trim() !== '' && hasContainer && hasUsername;
     // The client-side duplicate-container check (#266). Recomputed on every keystroke from
     // the loaded list, so the collision surfaces while typing rather than on Save.
-    const containerConflict = findContainerConflict(
-        providers,
-        type,
-        container,
-        editing?.id ?? null,
-    );
+    //
+    // ADD PATH ONLY. On edit the container is immutable (#264) and the field is disabled, so a
+    // collision here could never be cleared from inside the dialog — and a collision with
+    // ANOTHER row is reachable: if a config-file provider is later added for the same
+    // container, this check would permanently disable Save on the connected provider, blocking
+    // token rotation and enable/disable, neither of which touches the container. The server's
+    // `duplicate_container`/`container_immutable` 409s remain the guard on that path.
+    // `editing` is null on this branch (that is what `isEdit` tests), so there is no id to
+    // exclude — the exclusion still lives in `findContainerConflict` for its unit tests and for
+    // any future caller that does check an existing row.
+    const containerConflict = isEdit ? null : findContainerConflict(providers, type, container, null);
     const containerError = containerConflict
         ? containerConflictMessage(containerConflict, meta.containerLabel)
         : null;
     const canSave =
-        container.trim() !== '' &&
-        hasUsername &&
-        (isEdit || token.trim() !== '') &&
-        containerConflict === null;
+        hasContainer && hasUsername && (isEdit || token.trim() !== '') && containerConflict === null;
     // `isEdit` picks the path, so exactly one of the two mutations is ever in
     // play — select it once rather than testing both at each use.
     const write = isEdit ? update : create;

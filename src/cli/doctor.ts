@@ -8,6 +8,7 @@ import {loadServerKey} from '../connectors/git/providers/secret';
 import {createGitProvider} from '../connectors/git/providers/factory';
 import {GIT_CATCHUP_WINDOW_MAX_DAYS, loadGitSyncHealth} from '../connectors/git/sync';
 import type {GitProvider, GitProviderConfig} from '../connectors/git/providers/types';
+import {gitResetNotice, gitResetNoticeMessage} from '../connectors/git/reset-notice';
 import {trimTrailingSlash} from '../summaries/model-client';
 
 interface CheckResult {
@@ -637,6 +638,27 @@ async function checkGitProviders(
     return results;
 }
 
+/**
+ * Report a pending git-data reset notice (#266). Migration 043 clears the imported git data
+ * and its cursors, but NOT the derived weekly/monthly/quarterly/yearly rollups — so until
+ * both a resync and an `aggregate backfill` have run, `/api/aggregates` serves pre-reset
+ * totals over zero snapshots. Nothing else surfaces that: `runMigrations` prints a count and
+ * every other check would pass (the providers are reachable, the cursors are honestly absent).
+ * This is the graduated #235 rule — a run that completes is not a claim that the data is
+ * current — so the notice FAILS the doctor until an operator acknowledges it.
+ */
+function checkGitResetNotice(db: Database.Database): CheckResult {
+    const migrationId = gitResetNotice(db);
+    if (migrationId === null) {
+        return pass('Git data currency', 'no pending migration reset');
+    }
+    return fail(
+        'Git data currency',
+        `migration ${migrationId} reset the imported git data — resync + aggregate backfill owed`,
+        gitResetNoticeMessage(migrationId),
+    );
+}
+
 async function checkSummaryModel(config: TopropeConfig): Promise<CheckResult> {
     const {summaries} = config;
     if (!summaries?.enabled) {
@@ -764,6 +786,7 @@ export async function runDoctor(
     checks.push(await checkWindsurfKey(config));
     checks.push(await checkCursorKey(config));
     checks.push(...(await checkGitProviders(db, config)));
+    checks.push(checkGitResetNotice(db));
     checks.push(await checkSummaryModel(config));
 
     let allPassed = true;

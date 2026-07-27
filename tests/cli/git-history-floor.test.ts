@@ -121,6 +121,23 @@ describe('toprope git set-history-floor (#233)', () => {
         expect(readState(earliestSyncStateKey('github', 'acme'))).toBe(FLOOR);
     });
 
+    it('CASEFOLDS --container too, through the shared normalizer (#266)', () => {
+        // Every cursor key is built from the casefolded container since #266, so a trim-only
+        // canonicalization here would read `git_last_sync:github:Acme`, find nothing, and report
+        // "has never synced" about a provider that has — the exact false state claim this
+        // canonicalization exists to prevent. Two copies of the container rule is also the AC9
+        // violation #266 closes.
+        markLegacy('github', 'acme');
+        const result = setHistoryFloor(db, {provider: 'github', container: ' ACME ', at: FLOOR}, NOW);
+        expect(result.ok).toBe(true);
+        expect(result.message).toContain('github:acme');
+        expect(readState(earliestSyncStateKey('github', 'acme'))).toBe(FLOOR);
+        expect(getEarliestSyncedWatermark(db, 'github', 'acme', NOW)).toEqual({
+            kind: 'exact',
+            watermark: FLOOR,
+        });
+    });
+
     it('--force corrects a floor that was already declared', () => {
         markLegacy();
         const typo = '2025-06-01T00:00:00.000Z';

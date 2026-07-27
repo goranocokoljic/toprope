@@ -69,11 +69,17 @@ export function providerContainer(config: GitProviderConfig): string {
         case 'gitlab':
             return normalizeContainer(config.group);
     }
-    // Runtime fallback, deliberately OUTSIDE the switch so the compiler still enforces
-    // exhaustiveness over the union: `resolveGitProviderConfigs` yields UNVALIDATED
-    // config-file entries, so `type` here is really untrusted text and may be a value
-    // this build doesn't know. '' is the blank container every write guard refuses —
-    // total rather than `undefined` leaking into a `${type}:${container}` key.
+    // Runtime fallback for a type this build doesn't know: `resolveGitProviderConfigs` yields
+    // UNVALIDATED config-file entries, so `type` here is really untrusted text. '' is the blank
+    // container every write guard refuses — total, rather than `undefined` leaking into a
+    // `${type}:${container}` key.
+    //
+    // The `never` assignment is what keeps compile-time exhaustiveness (matching `factory.ts`
+    // and `codec.ts`): a plain `return ''` after the switch would SILENTLY absorb a newly added
+    // provider type, collapsing its every container and cursor into one blank bucket — the
+    // collapsed attribution bucket #264 exists to remove.
+    const exhaustive: never = config;
+    void exhaustive;
     return '';
 }
 

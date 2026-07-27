@@ -1,9 +1,11 @@
 import {describe, it, expect, afterEach} from 'vitest';
 import {
+    containerKey,
     providerContainer,
     resolveGitProviderConfigs,
 } from '../../../../src/connectors/git/providers/config';
 import type {GitConnectorConfig} from '../../../../src/config/types';
+import type {GitProviderConfig} from '../../../../src/connectors/git/providers/types';
 
 describe('resolveGitProviderConfigs', () => {
     const savedToken = process.env.GITHUB_TOKEN;
@@ -55,6 +57,17 @@ describe('resolveGitProviderConfigs', () => {
         // `${type}:${container}` cursor key (or throwing where sync builds those keys,
         // which is outside its per-provider try/catch).
         expect(providerContainer(resolved[0])).toBe('');
+    });
+
+    it('returns the blank container for a provider type this build does not know (#266)', () => {
+        // `resolveGitProviderConfigs` filters only on `typeof p.type === 'string'`, so a YAML
+        // `type: gitea` reaches `providerContainer` — and `containerKey` on it feeds
+        // `runSync`'s config-owned-keys set, which is built OUTSIDE the per-provider try/catch.
+        // Total, so it yields the blank container every write guard refuses by name rather than
+        // throwing there or leaking `undefined` into a `${type}:${container}` key.
+        const unknown = {type: 'gitea', org: 'Acme'} as unknown as GitProviderConfig;
+        expect(providerContainer(unknown)).toBe('');
+        expect(containerKey(unknown)).toBe('gitea:');
     });
 
     it('normalizes case and surrounding whitespace on every provider type (#266)', () => {

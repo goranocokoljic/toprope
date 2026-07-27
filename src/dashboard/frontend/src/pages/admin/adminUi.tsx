@@ -1,4 +1,4 @@
-import type {ReactNode} from 'react';
+import {useId, type ReactNode} from 'react';
 
 import {Pagination} from '../../components/Pagination';
 import {usePagination, type PageSizeOption} from '../../components/usePagination';
@@ -70,16 +70,25 @@ export function TextField({
      */
     error?: string | null;
 }): JSX.Element {
-    // Derived from the label so two fields in one form get distinct ids without threading an
-    // explicit id prop through every call site.
-    const errorId = `${label.replace(/\s+/g, '-').toLowerCase()}-error`;
+    // `useId`, not a slug derived from the label: `TextField` is shared by every admin form and
+    // two fields can legitimately carry the same label (`AdminIdentities` uses "GitHub username"
+    // in two dialogs), which would emit duplicate DOM ids and point `aria-describedby` at the
+    // wrong message. Matches `SummaryCard`'s existing use of `useId` for the same reason.
+    const errorId = useId();
     return (
         // The message sits OUTSIDE the <label> on purpose: a <label>'s accessible name is its
         // whole text content, so nesting the error inside would rename the field from
         // "Organization" to "Organization<the error>" — breaking every accessible-name lookup
         // (and every getByLabelText) exactly when a validation error is showing. It reaches
         // the input through `aria-describedby` instead, which is the description slot.
-        <div className="flex flex-col gap-1">
+        //
+        // The width bound applies ONLY while an error is showing. Without it the wrapper is a
+        // flex item whose hypothetical main size is the message's one-line max-content width, so
+        // a long message would widen this field past its row and (under the callers'
+        // `items-end`) shove the input above its neighbours the moment an error appeared. Making
+        // it conditional keeps every existing call site's classes byte-identical — the primitive
+        // is shared by six admin pages and some of them let the field size to its container.
+        <div className={['flex flex-col gap-1', error ? 'max-w-xs' : ''].join(' ').trim()}>
             <label className="flex flex-col gap-1">
                 <span className="text-xs font-medium text-muted">{label}</span>
                 <input

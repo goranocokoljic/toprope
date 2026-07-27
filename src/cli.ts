@@ -29,6 +29,7 @@ import {CursorSync} from './connectors/cursor/sync';
 import {GitSync} from './connectors/git/sync';
 import {replayDeveloper} from './connectors/git/projection';
 import {setHistoryFloor} from './cli/git-history-floor';
+import {clearGitResetNotice, gitResetNotice, gitResetNoticeMessage} from './connectors/git/reset-notice';
 import {runPipeline} from './scheduler/sync-pipeline';
 import {importCsv} from './expenses/importer';
 import {listUnmatchedCharges, resolveCharge, findUnmatchedIdByPrefix} from './expenses/resolution-queue';
@@ -857,6 +858,38 @@ gitCommand
             db.close();
         }
         if (failed) process.exit(1);
+    });
+
+gitCommand
+    .command('clear-reset-notice')
+    .description(
+        'Acknowledge the git-data reset a migration performed (#266). Migration 043 cleared ' +
+            'the imported commits/PRs, the projected snapshots and the sync cursors, but NOT the ' +
+            'derived weekly/monthly rollups — so `toprope doctor` keeps failing until you have ' +
+            're-synced every provider AND run `toprope aggregate backfill`. Run this once that ' +
+            'rebuild is done; nothing can detect the backfill\'s completion on your behalf.',
+    )
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
+    .action((options: {config: string}) => {
+        const configPath = path.resolve(process.cwd(), options.config);
+        const config = loadConfig(configPath);
+        const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
+        const db = openDb(dbPath);
+        try {
+            runMigrations(db, MIGRATIONS_DIR);
+            const pending = gitResetNotice(db);
+            if (pending === null) {
+                // Not an error — but say what was true, rather than reporting a no-op as
+                // "cleared" and leaving the operator thinking they had something to clear.
+                console.log('[git] no reset notice is pending.');
+                return;
+            }
+            clearGitResetNotice(db);
+            console.log(`[git] reset notice for migration ${pending} cleared.`);
+            console.log(`[git] it said: ${gitResetNoticeMessage(pending)}`);
+        } finally {
+            db.close();
+        }
     });
 
 const expensesCommand = program.command('expenses').description('Manage expense and subscription data');

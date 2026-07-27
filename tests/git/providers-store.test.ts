@@ -204,17 +204,22 @@ describe('provider store — container normalization (#266)', () => {
             }
         });
 
-        it(`[${type}] refuses a whitespace-only container with a typed error, not SQLITE_CONSTRAINT`, () => {
+        it(`[${type}] refuses a blank or whitespace-only container inside the write, not with SQLITE_CONSTRAINT`, () => {
+            // The refusal comes from `validateGitProviderConfig`, which `createProvider` calls
+            // INSIDE the write and which checks the container FIRST in all three per-type
+            // validators. Pre-#266 it used `!config.org`, and `'   '` is truthy — so a
+            // whitespace-only container reached the row and `(type, '')` became a real
+            // attribution key two workspaces could share.
+            const expected = {
+                github: 'GitHub provider requires org',
+                bitbucket: 'Bitbucket provider requires workspace',
+                gitlab: 'GitLab provider requires group',
+            }[type] as string;
             for (const blank of ['', '   ', '\t\n']) {
-                try {
-                    createProvider(db, keyOk(), {config: make(blank)});
-                    throw new Error(`should have refused blank container ${JSON.stringify(blank)}`);
-                } catch (e) {
-                    expect(e).toBeInstanceOf(GitProviderStoreError);
-                    expect((e as GitProviderStoreError).code).toBe('blank_container');
-                    // Not a raw DB failure leaking through.
-                    expect((e as Error).message).not.toContain('SQLITE_CONSTRAINT');
-                }
+                expect(
+                    () => createProvider(db, keyOk(), {config: make(blank)}),
+                    `container ${JSON.stringify(blank)}`,
+                ).toThrow(expected);
             }
             expect(listProviders(db)).toHaveLength(0);
         });
@@ -231,6 +236,35 @@ describe('provider store — container normalization (#266)', () => {
         expect(listProviders(db)).toHaveLength(1);
     });
 
+    it('resolves and updates a row whose STORED container was never normalized', () => {
+        // The row a pre-#266 install (or migration 043's non-ASCII fail-closed path) could
+        // leave behind. Written directly, bypassing the store, so `existing.container` is raw.
+        // This is what makes the guard structural rather than conventional: if the reader or the
+        // immutability check normalized only the incoming side, this row would be INVISIBLE —
+        // 'wireless_media' would read as free, a second provider would be created for the same
+        // org, and `UNIQUE(type, container)` would not object because the bytes differ.
+        const seeded = createProvider(db, keyOk(), {config: BASE.github('placeholder-org')});
+        db.prepare('UPDATE git_providers SET container = ? WHERE id = ?').run(
+            '  Wireless_Media ',
+            seeded.id,
+        );
+
+        // The canonical reader finds it from the normalized spelling…
+        expect(findProviderByTypeContainer(db, 'github', 'wireless_media')?.id).toBe(seeded.id);
+        // …so a create for that container is refused rather than silently allowed.
+        expect(() => createProvider(db, keyOk(), {config: BASE.github('wireless_media')})).toThrow(
+            /already exists/,
+        );
+        expect(listProviders(db)).toHaveLength(1);
+
+        // And an edit that re-sends the normalized spelling is a no-op, not a refused move —
+        // the stored side of the comparison is normalized too.
+        const updated = updateProvider(db, keyOk(), seeded.id, {
+            config: BASE.github('wireless_media'),
+        });
+        expect(updated.container).toBe('wireless_media');
+    });
+
     it('a PATCH onto a genuinely different container is still refused as container_immutable', () => {
         const rec = createProvider(db, keyOk(), {config: BASE.github('wireless_media')});
         try {
@@ -244,13 +278,18 @@ describe('provider store — container normalization (#266)', () => {
 
     it('a PATCH cannot blank the container', () => {
         const rec = createProvider(db, keyOk(), {config: BASE.github('wireless_media')});
-        try {
-            updateProvider(db, keyOk(), rec.id, {config: BASE.github('   ')});
-            throw new Error('should have thrown');
-        } catch (e) {
-            expect((e as GitProviderStoreError).code).toBe('blank_container');
-        }
+        expect(() =>
+            updateProvider(db, keyOk(), rec.id, {config: BASE.github('   ')}),
+        ).toThrow('GitHub provider requires org');
         expect(getProvider(db, rec.id)?.container).toBe('wireless_media');
+    });
+
+    it('findProviderByTypeContainer misses a blank lookup instead of matching an arbitrary row', () => {
+        const rec = createProvider(db, keyOk(), {config: BASE.github('wireless_media')});
+        expect(rec.container).toBe('wireless_media');
+        for (const blank of ['', '   ', '\t']) {
+            expect(findProviderByTypeContainer(db, 'github', blank)).toBeUndefined();
+        }
     });
 });
 

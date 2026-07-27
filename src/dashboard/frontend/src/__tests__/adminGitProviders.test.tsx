@@ -2508,6 +2508,26 @@ describe('AdminGitProviders — inline duplicate-container validation (#266)', (
         await waitFor(() => expect(lastCall(/\/git\/providers\/[^/]+$/, 'PATCH')).toBeDefined());
     });
 
+    it('never blocks the EDIT path on a container collision the admin cannot clear', async () => {
+        // The container field is disabled on edit (#264 immutability), so a client-side conflict
+        // there is unclearable from inside the dialog. And it is reachable: a config-file provider
+        // added later for the same container would otherwise permanently disable Save on the
+        // connected provider, blocking token rotation and enable/disable — neither of which
+        // touches the container. Seeded here as a DB row that collides with the config row.
+        providers = [
+            {...structuredClone(DB_GITHUB), id: 'p-dbl', type: 'gitlab', container: 'team'},
+            structuredClone(CONFIG_GITLAB),
+        ];
+        renderPage();
+        await screen.findByText('Config');
+        const row = screen.getAllByText('team')[0].closest('tr') as HTMLElement;
+        fireEvent.click(within(row).getByRole('button', {name: 'Edit'}));
+
+        const field = screen.getByLabelText('Group');
+        expect(field).not.toHaveAttribute('aria-invalid');
+        expect(screen.getByRole('button', {name: 'Save changes'})).not.toBeDisabled();
+    });
+
     it('keeps the server 409 authoritative: a STALE list still surfaces it inline (AC10)', async () => {
         // The list the client loaded does NOT contain the provider, so its own check passes —
         // exactly the window where another admin connected it between load and submit. The

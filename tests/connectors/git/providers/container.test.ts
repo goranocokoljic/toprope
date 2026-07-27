@@ -1,4 +1,6 @@
 import {describe, it, expect} from 'vitest';
+import fs from 'fs';
+import path from 'path';
 import {
     isBlankContainer,
     normalizeContainer,
@@ -53,6 +55,21 @@ describe('normalizeContainer (#266)', () => {
         // toLowerCase(), not toLocaleLowerCase(): 'I' must always become 'i', never 'ı'.
         expect(normalizeContainer('INFRA')).toBe('infra');
         expect(normalizeContainer('INFRA')).not.toContain('ı');
+    });
+
+    it('has NO imports, which is what lets the React admin bundle share it (AC9)', () => {
+        // The whole "one normalization rule, not two" property rests on this file being safe to
+        // import from `src/dashboard/frontend/src/**`. A single `import ... from './types.js'`
+        // would either break the Vite build or drag the server graph into the browser bundle —
+        // and the local convention in `providers/` IS `.js`-suffixed relative specifiers, so that
+        // edit is one keystroke away. Only `npm run build:web` would otherwise catch it; this
+        // fails in `npm test`, where the mistake is actually made.
+        const source = fs.readFileSync(
+            path.resolve(__dirname, '../../../../src/connectors/git/providers/container.ts'),
+            'utf-8',
+        );
+        expect(source).not.toMatch(/^\s*import\s/m);
+        expect(source).not.toMatch(/\brequire\s*\(/);
     });
 
     it('treats blank, whitespace-only and absent containers as blank', () => {

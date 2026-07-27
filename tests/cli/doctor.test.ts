@@ -85,6 +85,32 @@ describe('runDoctor', () => {
         expect(combined).toContain('All checks passed');
     });
 
+    // #266: migration 043 resets the imported git data but NOT the derived rollups, so until a
+    // resync + `aggregate backfill` have run, /api/aggregates serves pre-reset totals over zero
+    // snapshots. Every other doctor check passes in that state (the providers are reachable, the
+    // cursors are honestly absent), so without this the operator's only signal is a silently
+    // stale dashboard — the graduated #235 rule.
+    it('passes the git-data currency check when no migration reset is pending', async () => {
+        const result = await runDoctor(db, disabledConfig(), tmpConfigPath, MIGRATIONS_DIR);
+        expect(result).toBe(true);
+        expect(output.join('\n')).toContain('no pending migration reset');
+    });
+
+    it('FAILS the git-data currency check while a migration reset is unacknowledged', async () => {
+        db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+            'git_data_reset_pending',
+            '043',
+        );
+        const result = await runDoctor(db, disabledConfig(), tmpConfigPath, MIGRATIONS_DIR);
+        expect(result).toBe(false);
+        const allOutput = [...output, ...errors].join('\n');
+        expect(allOutput).toContain('Git data currency');
+        // The fix line must name BOTH halves of the rebuild — a resync alone leaves the rollups
+        // stale, which is the condition the notice exists to describe.
+        expect(allOutput).toContain('aggregate backfill');
+        expect(allOutput).toContain('clear-reset-notice');
+    });
+
     it('fails config check when config file missing', async () => {
         const nonExistentPath = path.join(os.tmpdir(), 'toprope-missing-12345.yaml');
         const result = await runDoctor(db, disabledConfig(), nonExistentPath, MIGRATIONS_DIR);

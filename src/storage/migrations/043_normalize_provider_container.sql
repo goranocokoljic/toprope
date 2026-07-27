@@ -19,14 +19,13 @@
 -- that same spelling.
 --
 -- ─── WHAT THIS MIGRATION DOES ────────────────────────────────────────────────────────
---  1. `git_providers.container` is normalized IN PLACE, and rows that collide once
---     normalized are dropped (oldest kept). Provider rows deliberately SURVIVE: they hold
---     the encrypted token, and forcing an admin to re-paste every credential would be a
---     far worse outcome than a resync.
---  2. The container-keyed IMPORTED data (`raw_author_daily`, `pr_records`), the projected
---     `git_snapshots` cells and the `git_*` cursors are RESET — but only when this database
---     actually holds a non-normalized container. On a clean or already-lowercase install
---     every statement below is a no-op.
+--  1. The container-keyed IMPORTED data (`raw_author_daily`, `pr_records`), the projected
+--     `git_snapshots` cells and the `git_*` cursors are RESET — UNCONDITIONALLY, exactly as
+--     042 did one migration ago.
+--  2. `git_providers.container` is normalized IN PLACE for every row SQL can provably
+--     normalize the same way the code does; a row it cannot is DELETED. Provider rows
+--     otherwise survive: they hold the encrypted token, and forcing an admin to re-paste
+--     every credential would be a worse outcome than a resync.
 --
 -- WHY THE DATA IS RESET RATHER THAN RE-KEYED (AC6: "state which"). Two case-variant
 -- containers are, by definition, the same real workspace imported twice — so their rows are
@@ -37,6 +36,18 @@
 -- coexist. `git_snapshots` has already summed both. The project is pre-production and its
 -- data is disposable, so the honest state is empty and rebuilt by resync: the same
 -- reasoning, and the same remedy, as migration 042.
+--
+-- WHY UNCONDITIONALLY, AND NOT ONLY "IF SOMETHING NEEDS NORMALIZING". A conditional reset
+-- makes "the migration ran" stop implying "the data is being rebuilt", and the two outcomes
+-- are indistinguishable from outside: `runMigrations` executes silently at server start and
+-- at the top of every scheduled sync, printing only a count. An operator would have no way
+-- to know whether they owe a resync — and the derived rollups (below) would keep serving
+-- pre-reset totals either way. Detecting "needs normalizing" in SQL is also strictly weaker
+-- than the code's rule (SQLite `lower()` is ASCII-only; bare `trim()` strips spaces only),
+-- so a conditional probe would MISS exactly the invisible rows that matter and leave their
+-- data and cursors in place — re-arming the double-count from inside the migration meant to
+-- end it. 042 reset unconditionally one migration ago; matching it keeps one contract
+-- ("upgrading rebuilds git data") instead of two.
 --
 -- Cursors go WITH the data, never on their own (the graduated #262 rule). A forward cursor
 -- is the only evidence that the next run's window is disjoint from what is already stored,
@@ -51,68 +62,81 @@
 -- bound and only migration 042 was licensed to remove them — and 042 emptied the table, so
 -- after it no legacy cell exists to begin with.
 --
--- AFTERWARDS. If anything was reset, resync (admin UI → per-provider "Sync now" with an
--- explicit months window, for a controlled rebuild) and then run
+-- AFTERWARDS. Resync (admin UI → per-provider "Sync now" with an explicit months window,
+-- for a controlled rebuild) and then run
 --   toprope aggregate backfill --from <the earliest day the resync imported>
--- because the derived weekly/monthly/quarterly/yearly rollups are a SECOND projection that
--- the scheduler only recomputes for the just-closed period — every older period still holds
--- pre-reset totals, and `/api/aggregates` serves them.
+-- because the derived weekly/monthly/quarterly/yearly rollups and `pr_review_metrics` are a
+-- SECOND projection that the scheduler only recomputes for the just-closed period — every
+-- older period still holds pre-reset totals, and `/api/aggregates` serves them. The
+-- `git_data_reset_pending` marker written below is what makes that visible: `toprope doctor`
+-- reports it until an operator clears it with `toprope git clear-reset-notice`, so a silently
+-- stale dashboard is not the only evidence that a rebuild is owed. It is raised only when this
+-- database actually held git data — a fresh install has nothing to rebuild.
 --
 -- NOTE ON IDEMPOTENCE: like 042 this file is DESTRUCTIVE and is not safe to re-execute
 -- against a populated database. The `schema_migrations` ledger runs it exactly once.
 
--- ─── Capture "does anything need normalizing?" BEFORE changing anything ────────
--- Computed once, into a scratch table, because the deletes below would otherwise erase the
--- very evidence the later statements need to test (and because repeating a three-table
--- EXISTS five times invites the two copies to drift).
+-- ─── The operator signal (raised BEFORE the deletes erase its evidence) ────────
+-- A pure-SQL migration cannot print, and `runMigrations` reports only a count — so the one
+-- durable place to leave "you owe a resync + an aggregate backfill" is `sync_state`, which
+-- `toprope doctor` reads. Without it the only evidence of this reset is a dashboard quietly
+-- serving pre-reset rollups over zero snapshots (the graduated #235 rule: a completion signal
+-- is not a currency claim).
 --
--- The normalization expression mirrors `normalizeContainer` in
--- `src/connectors/git/providers/container.ts`: strip surrounding whitespace, then casefold.
--- SQLite's bare `trim(X)` removes ASCII spaces ONLY, so the whitespace set is spelled out
--- to match JS `String.prototype.trim` on the characters that actually occur in a pasted
--- value (tab, LF, VT, FF, CR, space). SQLite's `lower()` is ASCII-only where JS
--- `toLowerCase()` is Unicode-aware; a container with non-ASCII uppercase letters would
--- therefore be normalized by the code but not detected here. Provider org/workspace/group
--- slugs are ASCII in all three platforms, so that gap is theoretical — and the code path is
--- the enforcing one either way.
-CREATE TABLE _m043_reset (needed INTEGER NOT NULL);
-INSERT INTO _m043_reset (needed)
-SELECT CASE WHEN EXISTS (
-    SELECT 1 FROM git_providers
-     WHERE container <> lower(trim(container, ' ' || char(9) || char(10) || char(11) || char(12) || char(13)))
-    UNION ALL
-    SELECT 1 FROM raw_author_daily
-     WHERE container <> lower(trim(container, ' ' || char(9) || char(10) || char(11) || char(12) || char(13)))
-    UNION ALL
-    SELECT 1 FROM pr_records
-     WHERE container <> lower(trim(container, ' ' || char(9) || char(10) || char(11) || char(12) || char(13)))
-) THEN 1 ELSE 0 END;
+-- The RESET below is unconditional; the NOTICE is not. It fires only when there was actually
+-- something to lose, so a fresh install is not told to rebuild data it never had. Note what
+-- the predicate is and is not: "does any git data or cursor exist", which needs no
+-- normalization logic at all — NOT "is any container mis-spelled", which SQL cannot decide the
+-- way the code does and would therefore miss exactly the rows that matter.
+INSERT INTO sync_state (key, value)
+SELECT 'git_data_reset_pending', '043'
+ WHERE EXISTS (SELECT 1 FROM raw_author_daily)
+    OR EXISTS (SELECT 1 FROM pr_records)
+    OR EXISTS (SELECT 1 FROM git_snapshots WHERE is_projected = 1)
+    OR EXISTS (
+        SELECT 1 FROM sync_state
+         WHERE key LIKE 'git_last_sync:%'
+            OR key LIKE 'git_earliest_sync:%'
+            OR key LIKE 'git_stall:%'
+       )
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value;
 
--- ─── Conditional reset of the container-keyed data + its cursors ───────────────
+-- ─── Reset the container-keyed data + its cursors ──────────────────────────────
 -- Projected snapshot cells first: they are derived from the raw rows below, so removing
 -- them before their source keeps the intermediate state readable ("nothing projected yet")
 -- rather than "projected from rows that are gone".
-DELETE FROM git_snapshots
- WHERE is_projected = 1
-   AND (SELECT needed FROM _m043_reset) = 1;
-
-DELETE FROM raw_author_daily WHERE (SELECT needed FROM _m043_reset) = 1;
-DELETE FROM pr_records       WHERE (SELECT needed FROM _m043_reset) = 1;
+DELETE FROM git_snapshots WHERE is_projected = 1;
+DELETE FROM raw_author_daily;
+DELETE FROM pr_records;
 
 DELETE FROM sync_state
- WHERE (SELECT needed FROM _m043_reset) = 1
-   AND (key LIKE 'git_last_sync:%'
-     OR key LIKE 'git_earliest_sync:%'
-     OR key LIKE 'git_stall:%');
+ WHERE key LIKE 'git_last_sync:%'
+    OR key LIKE 'git_earliest_sync:%'
+    OR key LIKE 'git_stall:%';
+
+-- The provider rows' own sync display columns describe a run whose data no longer exists.
+-- Leaving them would make the admin list read "synced 2 hours ago · ok" for a provider with
+-- zero rows and `first_sync_pending: true` — a completion signal read as a currency claim.
+UPDATE git_providers
+   SET last_sync_at = NULL, last_sync_status = NULL, last_sync_error = NULL;
 
 -- ─── git_providers: drop post-normalization duplicates, then normalize ─────────
+-- The normalization expression below mirrors `normalizeContainer` in
+-- `src/connectors/git/providers/container.ts` (strip surrounding whitespace, then casefold),
+-- and the equivalence is PROVABLE — but only for ASCII input. SQLite's `lower()` is
+-- ASCII-only where JS `toLowerCase()` is Unicode-aware, and SQLite's bare `trim(X)` strips
+-- ASCII spaces only, so the whitespace set is spelled out to match the characters JS
+-- `String.prototype.trim` removes from an ASCII string (tab, LF, VT, FF, CR, space). For a
+-- container whose every character is ASCII, those two facts make `sqlNormalize(x)` and
+-- `normalizeContainer(x)` identical strings. For anything non-ASCII they can differ (NBSP,
+-- BOM, a non-ASCII capital), which is what the fail-closed delete further down handles.
+--
 -- Two rows that differ only by case/whitespace are one workspace connected twice. Keep the
 -- OLDEST (`created_at`, then `id` as a total tiebreak — same deterministic keep-rule as
 -- 042): it is the row whose container the operator originally chose, and the newer one's
--- imported data is being reset above anyway. Both `o.*` sides are normalized so the
--- comparison groups the variants; the `IS NOT NULL` guards keep a corrupt NULL row from
--- falling out of the keep-set in both directions and surviving as a duplicate that the
--- UNIQUE index would then reject.
+-- imported data has been reset above anyway. Both sides of the comparison are normalized so
+-- the variants group together. `EXISTS` is total (a row is deleted only when a strictly
+-- older sibling exists), which is why — exactly as in 042 — no NULL guards are needed.
 DELETE FROM git_providers
  WHERE EXISTS (
     SELECT 1 FROM git_providers o
@@ -123,17 +147,30 @@ DELETE FROM git_providers
             o.created_at < git_providers.created_at
             OR (o.created_at = git_providers.created_at AND o.id < git_providers.id)
        )
- )
-   AND type IS NOT NULL
-   AND container IS NOT NULL
-   AND id IS NOT NULL
-   AND created_at IS NOT NULL;
+ );
 
+-- Normalize the survivors. Restricted to ASCII-only containers, where the expression is
+-- provably the same string `normalizeContainer` produces. `length(TEXT)` counts characters
+-- while `length(BLOB)` counts bytes, so they are equal exactly when every character is
+-- single-byte UTF-8, i.e. ASCII.
+--
 -- `updated_at` is deliberately NOT bumped: this is a re-spelling of a value the operator
 -- already chose, not an edit they made, and the column is shown in the admin UI as "when
 -- this connection was last changed".
 UPDATE git_providers
    SET container = lower(trim(container, ' ' || char(9) || char(10) || char(11) || char(12) || char(13)))
- WHERE container <> lower(trim(container, ' ' || char(9) || char(10) || char(11) || char(12) || char(13)));
+ WHERE length(container) = length(CAST(container AS BLOB));
 
-DROP TABLE _m043_reset;
+-- FAIL CLOSED on a container SQL cannot canonicalize the way the code does — a non-ASCII
+-- one, or one whose normalized form is empty. Such a row would be INVISIBLE to the running
+-- system: `findProviderByTypeContainer` normalizes both sides in JS so it would still be
+-- found (that is the code-side guarantee), but the row's stored spelling is one no write
+-- path can ever produce, so the delete cascade keyed on `record.container` would retract
+-- nothing and report success. Its data has already been reset above, so removing the
+-- connection costs the admin one re-add — visible and recoverable — where keeping it costs
+-- a permanent ghost. There is deliberately no attempt to guess a normalized form here: the
+-- one place allowed to spell a container is `normalizeContainer`, and this file cannot call it.
+DELETE FROM git_providers
+ WHERE length(container) <> length(CAST(container AS BLOB))
+    OR length(trim(container, ' ' || char(9) || char(10) || char(11) || char(12) || char(13))) = 0;
+
