@@ -20,6 +20,7 @@
 
 import type Database from 'better-sqlite3';
 import {randomUUID} from 'crypto';
+import {isBlankContainer} from './providers/container.js';
 import type {GitProviderType} from './providers/types.js';
 
 /**
@@ -370,8 +371,11 @@ function assertValidInput(row: RawAuthorDailyInput, observedAt: string): void {
     // provider instances back into one bucket — the exact defect the column removes — and
     // would leave rows that no per-container delete can retract. Refused at the write
     // boundary, not just by the schema CHECK, so the caller gets a message naming the
-    // problem instead of a raw SQLITE_CONSTRAINT.
-    if (typeof row.container !== 'string' || !row.container.trim()) {
+    // problem instead of a raw SQLITE_CONSTRAINT. Blankness goes through the SHARED
+    // `isBlankContainer` (#266) rather than a local `.trim()`, so this boundary and the
+    // duplicate guard cannot disagree about what an empty container is — and it is total over a
+    // non-string too (`normalizeContainer` yields `''`), so no separate `typeof` disjunct is needed.
+    if (isBlankContainer(row.container)) {
         throw new RawAuthorDailyError(
             'invalid_container',
             `container must be a non-blank string (the provider's org/workspace/group), got: ${String(row.container)}`,

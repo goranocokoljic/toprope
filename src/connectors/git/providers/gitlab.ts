@@ -11,6 +11,7 @@ import type {
     GitAuthor,
     GitLabProviderConfig,
 } from './types.js';
+import {normalizeContainer} from './container.js';
 
 const DEFAULT_BASE_URL = 'https://gitlab.com/api/v4';
 const MAX_RETRIES = 3;
@@ -173,7 +174,9 @@ export class GitLabProvider implements GitProvider {
     private readonly includeSubgroups: boolean;
 
     constructor(config: GitLabProviderConfig) {
-        this.group = config.group;
+        // Normalized (#266) — see the note in `github.ts`: the attribution key and the request
+        // path must be the same spelling, and both derive from `normalizeContainer`.
+        this.group = normalizeContainer(config.group);
         // config.url is the base host (e.g. "https://gitlab.example.com"); always append /api/v4
         this.baseUrl = (config.url ?? DEFAULT_BASE_URL).replace(/\/$/, '').replace(/\/api\/v4$/, '') + '/api/v4';
         this.authHeaders = buildAuthHeaders(config.auth);

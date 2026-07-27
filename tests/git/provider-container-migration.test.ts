@@ -45,6 +45,27 @@ function dbAt041(): Database.Database {
     return db;
 }
 
+/**
+ * Apply migration 042 and NOTHING after it.
+ *
+ * Deliberately not `runMigrations(db, MIGRATIONS_DIR)`: migration 043 (#266) performs the SAME
+ * `git_*` cursor purge and the same data reset, so running the whole chain here would let 042's own
+ * purge be deleted without a single assertion failing — and that purge IS 042's #262
+ * "cursors go with the data" invariant. Pinning this block to 042 keeps each migration's test
+ * accountable for its own behavior.
+ */
+function apply042Only(db: Database.Database): void {
+    const file = fs
+        .readdirSync(MIGRATIONS_DIR)
+        .find((f) => /^042_.*\.sql$/.test(f)) as string;
+    db.exec(fs.readFileSync(path.join(MIGRATIONS_DIR, file), 'utf-8'));
+    db.prepare('INSERT INTO schema_migrations (id, name, applied_at) VALUES (?, ?, ?)').run(
+        42,
+        file,
+        '2026-07-02T00:00:00.000Z',
+    );
+}
+
 function columnNames(db: Database.Database, table: string): string[] {
     return (db.prepare(`PRAGMA table_info(${table})`).all() as {name: string}[]).map((r) => r.name);
 }
@@ -230,7 +251,7 @@ describe('migration 042 — reset of a POPULATED pre-042 database (#264)', () =>
         expect(count(db, 'pr_records')).toBe(1);
         expect(count(db, 'git_snapshots')).toBe(2);
 
-        expect(() => runMigrations(db, MIGRATIONS_DIR)).not.toThrow();
+        expect(() => apply042Only(db)).not.toThrow();
 
         expect(count(db, 'raw_author_daily')).toBe(0);
         expect(count(db, 'pr_records')).toBe(0);
@@ -243,7 +264,7 @@ describe('migration 042 — reset of a POPULATED pre-042 database (#264)', () =>
     });
 
     it('clears every git_* cursor kind and nothing else', () => {
-        runMigrations(db, MIGRATIONS_DIR);
+        apply042Only(db);
         const keys = (
             db.prepare('SELECT key FROM sync_state ORDER BY key').all() as {key: string}[]
         ).map((r) => r.key);
@@ -251,7 +272,7 @@ describe('migration 042 — reset of a POPULATED pre-042 database (#264)', () =>
     });
 
     it('records 042 in the ledger and leaves the new shape in place', () => {
-        runMigrations(db, MIGRATIONS_DIR);
+        apply042Only(db);
         expect(db.prepare('SELECT name FROM schema_migrations WHERE id = 42').get()).toEqual({
             name: '042_provider_container_attribution.sql',
         });
@@ -266,7 +287,7 @@ describe('migration 042 — reset of a POPULATED pre-042 database (#264)', () =>
         insertProvider(db, {id: 'newer', container: 'ws-dup', created_at: '2026-06-01T00:00:00.000Z'});
         insertProvider(db, {id: 'solo', container: 'ws-solo', created_at: '2026-03-01T00:00:00.000Z'});
 
-        runMigrations(db, MIGRATIONS_DIR);
+        apply042Only(db);
 
         const ids = (
             db.prepare('SELECT id FROM git_providers ORDER BY id').all() as {id: string}[]

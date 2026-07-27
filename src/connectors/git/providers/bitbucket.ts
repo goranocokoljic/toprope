@@ -10,6 +10,7 @@ import type {
     GitAuthor,
     BitbucketProviderConfig,
 } from './types.js';
+import {normalizeContainer} from './container.js';
 
 const BASE_URL = 'https://api.bitbucket.org/2.0';
 const MAX_RETRIES = 3;
@@ -198,7 +199,9 @@ export class BitbucketProvider implements GitProvider {
     private readonly excludeRepos: string[];
 
     constructor(config: BitbucketProviderConfig) {
-        this.workspace = config.workspace;
+        // Normalized (#266) — see the note in `github.ts`: the attribution key and the request
+        // path must be the same spelling, and both derive from `normalizeContainer`.
+        this.workspace = normalizeContainer(config.workspace);
         this.includeRepos = config.repos ?? [];
         this.excludeRepos = config.exclude_repos ?? [];
         this.authHeaders = {Authorization: buildAuthHeader(config.auth)};

@@ -47,6 +47,15 @@ import {
     TextField,
     Th,
 } from './adminUi';
+// The SERVER's container normalization, imported rather than re-implemented (#266 AC9).
+// `providers/container.ts` is deliberately dependency-free so both bundles can use it: two
+// copies of the trim/casefold rule is exactly how a client starts accepting what the server
+// rejects (or blocking what it would allow).
+import {
+    isBlankContainer,
+    normalizeContainer,
+    sameContainer,
+} from '../../../../../connectors/git/providers/container';
 
 /**
  * Admin → Connectors → Git (GC1.8 / #200). Lets an admin connect, test, edit,
@@ -324,6 +333,61 @@ function ProbeResultView({result}: {result: GitProviderProbeResult}): JSX.Elemen
 }
 
 /**
+ * The already-listed provider that would collide with `(type, container)`, or null when the
+ * pair is free (#266).
+ *
+ * Comparison goes through the SERVER's {@link sameContainer}, so `Wireless_Media`,
+ * `wireless_media` and `Wireless_Media ` all collide with each other exactly as the server's
+ * `duplicate_container` guard says they do. Both sources are checked because both occupy a
+ * `(type, container)` and both appear in this list: a connected DB provider and a read-only
+ * config-file one.
+ *
+ * A blank container is not a collision, just an unfinished field; the empty-field state has
+ * its own Save gate.
+ *
+ * There is deliberately no "exclude the row being edited" parameter: the only caller is the ADD
+ * path (on edit the type and container fields are immutable and disabled since #264, so the pair
+ * cannot change from inside the dialog), and a predicate whose only exerciser would be its own
+ * unit test is scope without a caller. AC8 — "editing does not flag itself" — holds structurally
+ * because the check does not run on the edit path at all, and is proven server-side by the PATCH
+ * that only re-cases its own container.
+ *
+ * THIS IS AN AFFORDANCE, NOT THE ENFORCEMENT (the graduated #228 rule). The list it reads can
+ * be stale and another admin can connect a provider between load and submit, so the server's
+ * 409 stays authoritative and keeps rendering inline in the dialog.
+ */
+export function findContainerConflict(
+    providers: AdminGitProvider[],
+    type: GitProviderType,
+    container: string,
+): AdminGitProvider | null {
+    if (isBlankContainer(container)) return null;
+    return providers.find((p) => p.type === type && sameContainer(p.container, container)) ?? null;
+}
+
+/**
+ * The inline field-level message for a container collision — it NAMES the owner as the table
+ * spells it, so the admin can go find it, and states the remediation, which differs for a
+ * config-file owner (it cannot be edited from the UI at all).
+ *
+ * Deliberately SHORT. The server's 409 carries the full explanation ("one container is one
+ * independent data set: its imported commits, PRs and sync cursors all belong to that provider…"),
+ * and `FormModal` already renders that inline on a stale list (AC10). Restating it here would be a
+ * second copy of the same prose on the other side of the wire — which is how the two drift, and
+ * #266's whole thesis is that a client and server must not hold two copies of one rule. The
+ * PREDICATE is shared via `container.ts`; the explanation stays server-side.
+ */
+function containerConflictMessage(
+    conflict: AdminGitProvider,
+    containerLabel: string,
+): string {
+    const label = `${PROVIDER_META[conflict.type].label} · ${conflict.container}`;
+    return conflict.source === 'config'
+        ? `${label} already covers this ${containerLabel.toLowerCase()} — it is defined in the config file, so change it there.`
+        : `${label} is already connected — edit or remove it instead of adding a second one.`;
+}
+
+/**
  * The add/edit form, rendered as the shared create/edit dialog (#236/#238).
  * `editing` pre-fills the fields for an existing DB provider (token stays blank →
  * keep the stored secret); `null` is the add form (token required). The caller
@@ -338,13 +402,20 @@ function ProbeResultView({result}: {result: GitProviderProbeResult}): JSX.Elemen
  * `onCreated` (#211) fires with the server's created provider on the CREATE path
  * only — the page uses it to auto-open the new row's repo-scope editor so the
  * admin narrows the scope before the first sync. Edits never fire it.
+ *
+ * `providers` is the page's loaded list, used ONLY for the client-side
+ * duplicate-container affordance (#266): a collision shows inline beside the container
+ * input while typing and blocks Save, instead of costing a round-trip to learn it. The
+ * server's 409 remains the guard.
  */
 function ProviderFormModal({
     editing,
+    providers,
     onDone,
     onCreated,
 }: {
     editing: AdminGitProvider | null;
+    providers: AdminGitProvider[];
     onDone: () => void;
     onCreated: (created: AdminGitProvider) => void;
 }): JSX.Element {
@@ -377,7 +448,11 @@ function ProviderFormModal({
     function buildInput(): GitProviderInput {
         const input: GitProviderInput = {
             type,
-            container: container.trim(),
+            // Through the SHARED normalizer, not a local `.trim()` (#266 AC9): the value sent must
+            // be the value the inline conflict check compared, or the client is validating one
+            // string and transmitting another — the check/store asymmetry this whole change exists
+            // to remove. The server re-normalizes regardless; this keeps the client honest.
+            container: normalizeContainer(container),
             auth_method: authMethod,
         };
         // Token is write-only: send it only when the admin typed one. On edit a
@@ -399,9 +474,25 @@ function ProviderFormModal({
     // server will 400.
     const hasUsername = !isBitbucketAppPassword || username.trim() !== '';
     // A draft test needs a credential (server: tokenRequired). On edit without a
-    // re-entered token, the admin uses the row's "Test" button instead.
-    const canTest = token.trim() !== '' && container.trim() !== '' && hasUsername;
-    const canSave = container.trim() !== '' && hasUsername && (isEdit || token.trim() !== '');
+    // re-entered token, the admin uses the row's "Test" button instead. Blankness goes through
+    // the SHARED predicate, so this component has no second opinion about what "empty" means.
+    const hasContainer = !isBlankContainer(container);
+    const canTest = token.trim() !== '' && hasContainer && hasUsername;
+    // The client-side duplicate-container check (#266). Recomputed on every keystroke from
+    // the loaded list, so the collision surfaces while typing rather than on Save.
+    //
+    // ADD PATH ONLY. On edit the container is immutable (#264) and the field is disabled, so a
+    // collision here could never be cleared from inside the dialog — and a collision with
+    // ANOTHER row is reachable: if a config-file provider is later added for the same
+    // container, this check would permanently disable Save on the connected provider, blocking
+    // token rotation and enable/disable, neither of which touches the container. The server's
+    // `duplicate_container`/`container_immutable` 409s remain the guard on that path.
+    const containerConflict = isEdit ? null : findContainerConflict(providers, type, container);
+    const containerError = containerConflict
+        ? containerConflictMessage(containerConflict, meta.containerLabel)
+        : null;
+    const canSave =
+        hasContainer && hasUsername && (isEdit || token.trim() !== '') && containerConflict === null;
     // `isEdit` picks the path, so exactly one of the two mutations is ever in
     // play — select it once rather than testing both at each use.
     const write = isEdit ? update : create;
@@ -435,6 +526,10 @@ function ProviderFormModal({
             testId="git-provider-modal"
         >
             <div className="flex flex-col gap-4">
+                {/* Stays on the house `items-end`. The container field can grow a validation message
+                    below its input (#266), which under `items-end` would lift the input out of line
+                    — but that is handled inside `TextField` itself (`self-start` on its wrapper), so
+                    it holds for every caller rather than only the one row that remembered. */}
                 <div className="flex flex-wrap items-end gap-4">
                     {/* Type and container are IMMUTABLE after creation (#264): together they
                         key every imported row and every sync cursor, so moving a saved
@@ -459,6 +554,8 @@ function ProviderFormModal({
                         onChange={setContainer}
                         placeholder={meta.containerPlaceholder}
                         disabled={isEdit}
+                        // Inline, field-level, and case/whitespace-insensitive (#266).
+                        error={containerError}
                     />
                     {meta.authMethods.length > 1 ? (
                         <SelectField label="Auth method" value={authMethod} onChange={setAuthMethod}>
@@ -1481,6 +1578,9 @@ export function AdminGitProviders(): JSX.Element {
                 <ProviderFormModal
                     key={formModal.editing?.id ?? 'new'}
                     editing={formModal.editing}
+                    // Both sources, so a container owned by a read-only config-file provider
+                    // is flagged the same way a connected one is (#266 AC7).
+                    providers={providerList}
                     onDone={formModal.close}
                     // Creating a second provider deliberately moves the one-shot
                     // prompt to it — the previous provider's prompt is dismissed.

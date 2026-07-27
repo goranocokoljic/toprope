@@ -29,6 +29,7 @@ import {CursorSync} from './connectors/cursor/sync';
 import {GitSync} from './connectors/git/sync';
 import {replayDeveloper} from './connectors/git/projection';
 import {setHistoryFloor} from './cli/git-history-floor';
+import {clearGitResetNotice, gitResetNotice} from './connectors/git/reset-notice';
 import {runPipeline} from './scheduler/sync-pipeline';
 import {importCsv} from './expenses/importer';
 import {listUnmatchedCharges, resolveCharge, findUnmatchedIdByPrefix} from './expenses/resolution-queue';
@@ -857,6 +858,50 @@ gitCommand
             db.close();
         }
         if (failed) process.exit(1);
+    });
+
+gitCommand
+    .command('clear-reset-notice')
+    .description(
+        'Acknowledge the git-data reset a migration performed (#266). Migration 043 cleared the ' +
+            'imported commits/PRs, the projected snapshots and the sync cursors, but NOT the ' +
+            'derived weekly/monthly/quarterly/yearly rollups or pr_review_metrics / ' +
+            'coaching_signals — so `toprope doctor` keeps failing until the rebuild is done. Run ' +
+            '`toprope doctor` to see the full 4-step remedy; nothing can detect its completion on ' +
+            'your behalf, which is why the acknowledgement is manual.',
+    )
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
+    .action((options: {config: string}) => {
+        const configPath = path.resolve(process.cwd(), options.config);
+        const config = loadConfig(configPath);
+        const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
+        const db = openDb(dbPath);
+        try {
+            // Deliberately does NOT run migrations, unlike every sibling command here. This one
+            // only reads and deletes one `sync_state` row, and `gitResetNotice` already tolerates
+            // a database with no `sync_state` table — so migrating first would buy nothing and cost
+            // a real hazard: on a pre-043 database this command would BE the thing that performs
+            // the reset, then acknowledge the notice it had just raised, for a rebuild that has
+            // definitionally not started. Not running them makes that state unreachable rather than
+            // merely handled. `runDoctor` sets the same precedent (it reports migration status
+            // without applying anything).
+            const pending = gitResetNotice(db);
+            if (pending === null) {
+                // Not an error — but say what was true, rather than reporting a no-op as
+                // "cleared" and leaving the operator thinking they had something to clear.
+                console.log('[git] no reset notice is pending.');
+            } else if (clearGitResetNotice(db, pending)) {
+                console.log(`[git] reset notice for migration ${pending} cleared.`);
+            } else {
+                // The value changed between the read and the delete — another process raised or
+                // re-stamped the marker. Report it rather than silently acknowledging the new one.
+                console.log(
+                    `[git] the pending notice changed while clearing (was ${pending}); re-run to see the current one.`,
+                );
+            }
+        } finally {
+            db.close();
+        }
     });
 
 const expensesCommand = program.command('expenses').description('Manage expense and subscription data');

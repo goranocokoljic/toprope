@@ -1,4 +1,4 @@
-import type {ReactNode} from 'react';
+import {useId, type ReactNode} from 'react';
 
 import {Pagination} from '../../components/Pagination';
 import {usePagination, type PageSizeOption} from '../../components/usePagination';
@@ -42,6 +42,7 @@ export function TextField({
     placeholder,
     type = 'text',
     disabled = false,
+    error = null,
 }: {
     label: string;
     value: string;
@@ -55,19 +56,77 @@ export function TextField({
      * exactly the state that needs the explanation — and it is not an accessible surface.
      */
     disabled?: boolean;
+    /**
+     * A FIELD-LEVEL validation message rendered directly beneath the input (#266) — for a
+     * problem the client can see in the entered value itself, like a container that collides
+     * with an already-connected provider. Optional and defaulting to `null`, so every
+     * existing call site renders exactly what it did before.
+     *
+     * Wired to the input via `aria-invalid` + `aria-describedby` so the message is announced
+     * as part of the field rather than as unrelated text somewhere in the dialog. A
+     * server-side write error stays where it has always been — `FormModal`'s error slot;
+     * this is for validation the client performs itself, and it never replaces the server's
+     * authoritative answer.
+     */
+    error?: string | null;
 }): JSX.Element {
+    // `useId`, not a slug derived from the label: `TextField` is shared by every admin form and
+    // two fields can legitimately carry the same label (`AdminIdentities` uses "GitHub username"
+    // in two dialogs), which would emit duplicate DOM ids and point `aria-describedby` at the
+    // wrong message. Matches `SummaryCard`'s existing use of `useId` for the same reason.
+    const errorId = useId();
     return (
-        <label className="flex flex-col gap-1">
-            <span className="text-xs font-medium text-muted">{label}</span>
-            <input
-                type={type}
-                value={value}
-                placeholder={placeholder}
-                disabled={disabled}
-                onChange={(e) => onChange(e.target.value)}
-                className="rounded-md border border-border bg-surface px-3 py-1.5 text-sm text-foreground disabled:opacity-50"
-            />
-        </label>
+        // The message sits OUTSIDE the <label> on purpose: a <label>'s accessible name is its
+        // whole text content, so nesting the error inside would rename the field from
+        // "Organization" to "Organization<the error>" — breaking every accessible-name lookup
+        // (and every getByLabelText) exactly when a validation error is showing. It reaches
+        // the input through `aria-describedby` instead, which is the description slot.
+        //
+        // `self-start` is what makes the `error` slot safe in ANY parent. The message renders in
+        // normal flow below the input, so the field grows downward — and every admin field row is
+        // `items-end`, where growing downward means the wrapper's BOTTOM stays pinned and the input
+        // is pushed up out of line with its neighbours. Overriding the cross-axis alignment on the
+        // component rather than on each caller's row means a future `error` caller cannot
+        // reintroduce that by forgetting: the invariant is a property of the primitive, not a
+        // convention. It is a no-op for the ~30 existing call sites, whose fields all have a single
+        // same-height control and so occupy the full cross-axis extent either way.
+        <div className="flex flex-col gap-1 self-start">
+            <label className="flex flex-col gap-1">
+                <span className="text-xs font-medium text-muted">{label}</span>
+                <input
+                    type={type}
+                    value={value}
+                    placeholder={placeholder}
+                    disabled={disabled}
+                    aria-invalid={error ? true : undefined}
+                    aria-describedby={error ? errorId : undefined}
+                    onChange={(e) => onChange(e.target.value)}
+                    className={[
+                        'rounded-md border bg-surface px-3 py-1.5 text-sm text-foreground disabled:opacity-50',
+                        error ? 'border-danger' : 'border-border',
+                    ].join(' ')}
+                />
+            </label>
+            {/* `max-w-xs` on the MESSAGE, not on the wrapper: the wrapper is the flex item, so its
+                hypothetical main size is its widest child's max-content width, and a `max-width` on
+                a child clamps that child's contribution — so bounding the message bounds the field
+                (measured: 320px, not the message's ~1400px max-content). The wrapper is
+                `align-items: stretch`, so the input does widen to that bound while an error is
+                showing; the row still fits inside the dialog, and a stable field width would mean
+                pinning a width on every call site.
+
+                `role="alert"` matches the three sibling components that render the same kind of
+                message (`TimeRangeSelector`, `SummaryCard`, `SummariesPanel`) and is what actually
+                announces it: `aria-describedby` is read when focus ARRIVES at the input, so
+                mutating it while the admin is already typing announces nothing. An alert region
+                fires on content mutation, and the message text is stable while the same conflict
+                persists — so it does not re-announce per keystroke. */}
+            {error ? (
+                <span id={errorId} role="alert" className="max-w-xs text-xs text-danger">
+                    {error}
+                </span>
+            ) : null}
+        </div>
     );
 }
 

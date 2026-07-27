@@ -28,6 +28,7 @@ import {randomUUID} from 'crypto';
 import {validateGitProviderConfig} from './factory.js';
 import {providerConfigToRowFields, rowToProviderConfig, type GitProviderRow} from './codec.js';
 import {decryptSecret, encryptSecret, type SecretMeta, type ServerKeyResult} from './secret.js';
+import {normalizeContainer, sameContainer} from './container.js';
 import type {GitProviderConfig, GitProviderType} from './types.js';
 
 /** The mask shown in place of a secret — a fixed run of bullets, never key material. */
@@ -53,6 +54,11 @@ export type GitProviderStoreErrorCode =
  * {@link updateProvider}). Typed so the API layer maps it to a real status instead of
  * leaking a raw DB error (data-integrity review-rule: validate existence + return a
  * typed error).
+ *
+ * A blank container is NOT a code here: `validateGitProviderConfig` — which every write below
+ * calls, inside the write function, before the row is built — rejects it via
+ * `isBlankContainer` (#266). One refusal, at the canonical validation seam that
+ * `createGitProvider` shares, rather than a second store-only code the routes can never reach.
  */
 export class GitProviderStoreError extends Error {
     readonly code: GitProviderStoreErrorCode;
@@ -213,15 +219,40 @@ function requireKey(keyResult: ServerKeyResult): Extract<ServerKeyResult, {ok: t
  * `UNIQUE(type, container)`. This is the canonical reader for that pair — the create/update
  * guards below and the admin API's 409s all go through it rather than re-deriving the
  * lookup, so "who owns this container" has one definition.
+ *
+ * The lookup NORMALIZES ITS ARGUMENT (#266). SQLite's `=` on TEXT is case-sensitive and
+ * nothing trims, so a raw comparison answered "free" for `wireless_media` while
+ * `Wireless_Media` sat in the table — and since #264 that means two independent data sets
+ * for one real workspace, i.e. a permanent double-count through the front door of the guard
+ * added to prevent it.
+ *
+ * Comparing the normalized argument against the raw column is sound because the column is
+ * canonical BY CONSTRUCTION, at both ends:
+ *   - every write goes through `providerConfigToRowFields` → `providerContainer` →
+ *     `normalizeContainer` (this module is the only writer of `git_providers`), and
+ *   - migration 043 brought existing rows to that same spelling, deleting the ones SQLite
+ *     could not canonicalize the way JS does rather than storing a guess.
+ * So a stored container that `normalizeContainer` would change cannot survive, which is what
+ * lets this stay a single indexed point-read on the `UNIQUE(type, container)` index instead of
+ * a scan — and what keeps it consistent with the other readers of `record.container` (the
+ * delete cascade, `syncStateKey`), which compare raw bytes and would silently retract nothing
+ * for a non-canonical row no matter how tolerant this function was.
+ *
+ * A blank lookup returns `undefined` rather than matching: no valid row can hold a blank
+ * container (`validateGitProviderConfig` refuses it and 043 deletes it), so a blank query is a
+ * caller bug, and answering it with "the row whose container is also blank" would let a
+ * malformed config claim an existing provider's identity.
  */
 export function findProviderByTypeContainer(
     db: Database.Database,
     type: GitProviderType,
     container: string,
 ): GitProviderRecord | undefined {
+    const wanted = normalizeContainer(container);
+    if (wanted === '') return undefined;
     return db
         .prepare('SELECT * FROM git_providers WHERE type = ? AND container = ?')
-        .get(type, container) as GitProviderRecord | undefined;
+        .get(type, wanted) as GitProviderRecord | undefined;
 }
 
 /**
@@ -233,6 +264,9 @@ export function findProviderByTypeContainer(
  * `duplicate_container` (#264), so the caller can name the owner instead of surfacing a raw
  * `SQLITE_CONSTRAINT`. The check-then-insert runs in ONE transaction: the UNIQUE index is a
  * fail-fast backstop against a race, it does not serialize one.
+ *
+ * The container the guard compares IS the container the INSERT writes — one
+ * `fields.container`, produced once by the codec's normalizing extraction (#266/#255).
  */
 export function createProvider(
     db: Database.Database,
@@ -241,7 +275,10 @@ export function createProvider(
 ): GitProviderRecord {
     const key = requireKey(keyResult);
     // Validate BEFORE encrypting so a bad shape / missing token surfaces the
-    // factory's clear message, not the crypto layer's empty-secret guard.
+    // factory's clear message, not the crypto layer's empty-secret guard. This is also the
+    // blank-container refusal (#266): `validateGitProviderConfig` checks the container FIRST
+    // in all three per-type validators, via `isBlankContainer` — so a whitespace-only
+    // org/workspace/group is refused here, inside the write function, before any row is built.
     validateGitProviderConfig(input.config);
 
     const fields = providerConfigToRowFields(input.config);
@@ -383,9 +420,26 @@ export function updateProvider(
         // exists to refuse. (The converse — two instances that both have a group named
         // `platform` — is not connectable under `UNIQUE(type, container)`; that limitation is
         // stated in the 409 rather than worked around here.)
+        //
+        // The container comparison goes through the shared `sameContainer` (#266), so BOTH
+        // sides are normalized and the predicate has one definition here, in the admin route's
+        // collision pre-check, and in the client's inline check. Without it, "re-typing the
+        // same workspace in different case" would read as a move and be refused — a lie, since
+        // the pair did not change, and one the admin edit form would hit on every save (it
+        // re-sends the container verbatim).
+        //
+        // `url` is deliberately still compared RAW, and that asymmetry is out of #266's scope
+        // rather than an oversight. It is not a double-count risk — `UNIQUE(type, container)`
+        // already makes two same-named groups on different instances unconnectable, so no two rows
+        // can disagree only by `url`. It IS a UX wart: a client that re-sent
+        // `https://gitlab.example.com/` where the row stores it without the trailing slash would
+        // get `container_immutable` on a PATCH that changed nothing. The admin form round-trips the
+        // stored value verbatim, so it cannot happen from the UI. Normalizing a URL is a different
+        // rule from normalizing a container (scheme, host case, default port, trailing slash), and
+        // `trimTrailingSlash` in `summaries/model-client.ts` is only a third of it.
         if (
             fields.type !== existing.type ||
-            fields.container !== existing.container ||
+            !sameContainer(fields.container, existing.container) ||
             fields.url !== existing.url
         ) {
             throw new GitProviderStoreError(

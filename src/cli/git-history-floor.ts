@@ -1,5 +1,6 @@
 import type Database from 'better-sqlite3';
 import {declareEarliestSyncedFloor} from '../connectors/git/sync';
+import {normalizeContainer} from '../connectors/git/providers/container';
 import {GIT_PROVIDER_TYPES} from '../connectors/git/providers/types';
 
 /**
@@ -51,7 +52,13 @@ export function setHistoryFloor(
     // Canonicalize before the key is built: '--container " acme "' would otherwise key
     // a provider that cannot exist, and the miss would be reported as a state fact
     // ("floor already recorded") rather than as the typo it is.
-    const container = input.container.trim();
+    //
+    // Through the SHARED `normalizeContainer` (#266), not a local `.trim()`: every
+    // `git_last_sync:`/`git_earliest_sync:` key is built from the casefolded container, so a
+    // trim-only canonicalization here would read `…:Wireless_Media`, find nothing, and report
+    // "has never synced" about a provider that has — the exact false state claim this
+    // canonicalization exists to prevent, and a second copy of the container rule (#266 AC9).
+    const container = normalizeContainer(input.container);
     if (container === '') {
         return {ok: false, message: '--container must not be empty'};
     }

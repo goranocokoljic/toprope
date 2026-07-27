@@ -85,6 +85,38 @@ describe('runDoctor', () => {
         expect(combined).toContain('All checks passed');
     });
 
+    // #266: migration 043 resets the imported git data but NOT the derived rollups, so until a
+    // resync + `aggregate backfill` have run, /api/aggregates serves pre-reset totals over zero
+    // snapshots. Every other doctor check passes in that state (the providers are reachable, the
+    // cursors are honestly absent), so without this the operator's only signal is a silently
+    // stale dashboard — the graduated #235 rule.
+    it('reports no pending git reset notice on a clean install', async () => {
+        const result = await runDoctor(db, disabledConfig(), tmpConfigPath, MIGRATIONS_DIR);
+        expect(result).toBe(true);
+        // The label states what was MEASURED. It deliberately does NOT claim the git data is
+        // current: migration 042 reset git data with no marker at all, so the marker's absence is
+        // not evidence of currency (the graduated #235 rule).
+        expect(output.join('\n')).toContain('Git reset notice');
+        expect(output.join('\n')).toContain('none pending');
+    });
+
+    it('FAILS while a migration reset is unacknowledged', async () => {
+        db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+            'git_data_reset_pending',
+            '043',
+        );
+        const result = await runDoctor(db, disabledConfig(), tmpConfigPath, MIGRATIONS_DIR);
+        expect(result).toBe(false);
+        const allOutput = [...output, ...errors].join('\n');
+        expect(allOutput).toContain('Git reset notice');
+        // The fix line must name EVERY part of the rebuild — a resync alone leaves the rollups
+        // stale, and `aggregate backfill` alone leaves two projections stale, which is exactly the
+        // condition the notice exists to describe.
+        expect(allOutput).toContain('aggregate backfill');
+        expect(allOutput).toContain('pr_review_metrics');
+        expect(allOutput).toContain('clear-reset-notice');
+    });
+
     it('fails config check when config file missing', async () => {
         const nonExistentPath = path.join(os.tmpdir(), 'toprope-missing-12345.yaml');
         const result = await runDoctor(db, disabledConfig(), nonExistentPath, MIGRATIONS_DIR);

@@ -41,6 +41,13 @@ No proxy, no traffic interception. Pure API-pull + git analysis.
   licensed only as a pre-production reset, and it is what makes the cascade *complete*: a
   legacy cell can never be retracted by the projection, so leaving any behind would make every
   later provider delete silently partial. No runtime path may do this.
+  **Migration 043 (#266)** also drops projected cells — unconditionally, like 042, but strictly
+  WITHIN the `is_projected` bound (legacy cells are left untouched, unlike 042). It is
+  unconditional deliberately: "needs normalizing" is not decidable in SQL the way the code
+  decides it, so a conditional probe would miss exactly the rows that matter and leave their
+  cursors behind. The raw rows it clears cannot be honestly re-attributed to one spelling, so
+  the days they fed are re-projected by a resync — and 043 leaves a `git_data_reset_pending`
+  marker that `toprope doctor` fails on until the rebuild is acknowledged.
   `tool_snapshots` and every other snapshot table remain strictly append-only.
 - Waste detection: subscription with zero activity for 14+ days = unused
 - Data quality tracked per data point: high (API), medium (git), low (expense only)

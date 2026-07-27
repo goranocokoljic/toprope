@@ -172,6 +172,20 @@ describe('BitbucketProvider', () => {
     // --- listRepos ---
 
     describe('listRepos()', () => {
+        it('normalizes a padded/mis-cased workspace into the request path (#266)', async () => {
+            // The workspace is both the attribution key and the request path. `providerContainer`
+            // normalizes the former; the constructor normalizes the latter from the same shared
+            // helper, so a YAML `workspace: ' ACME-WS '` cannot attribute rows to `acme-ws` while
+            // fetching `/repositories/%20ACME-WS%20`.
+            const fetchMock = makeFetchMock([{body: pagedResponse([makeRepoFixture()])}]);
+            vi.stubGlobal('fetch', fetchMock);
+            const p = new BitbucketProvider({...CONFIG_APP_PASSWORD, workspace: ' ACME-WS '});
+
+            await p.listRepos();
+
+            expect(String(fetchMock.mock.calls[0][0])).toContain('/repositories/acme-ws');
+        });
+
         it('returns repos mapped to GitRepo shape', async () => {
             const fetchMock = makeFetchMock([{body: pagedResponse([makeRepoFixture()])}]);
             vi.stubGlobal('fetch', fetchMock);
