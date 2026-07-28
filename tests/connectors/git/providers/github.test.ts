@@ -1,5 +1,6 @@
 import {describe, it, expect, beforeEach, afterEach, vi} from 'vitest';
 import {GitHubProvider} from '../../../../src/connectors/git/providers/github';
+import {MAX_SERVER_ERROR_RETRIES} from '../../../../src/connectors/git/providers/http-retry';
 import type {GitHubProviderConfig} from '../../../../src/connectors/git/providers/types';
 
 const CONFIG: GitHubProviderConfig = {
@@ -869,6 +870,70 @@ describe('GitHubProvider', () => {
             await vi.runAllTimersAsync();
 
             await expect(listPromise).rejects.toThrow('Rate limit exceeded');
+        });
+    });
+
+    // --- Transient server-error handling (#272) ---
+    //
+    // GitHub shared Bitbucket's ~6-second 5xx fuse exactly, so it shares the fix. Only the
+    // 5xx/transport branch changed here — the 403 secondary-rate-limit branch and the
+    // pre-emptive x-ratelimit-remaining pause are GitHub-only and untouched.
+
+    describe('server error handling', () => {
+        function serverError(status: number): Response {
+            return {
+                ok: false,
+                status,
+                headers: new Headers(),
+                json: () => Promise.resolve({}),
+                text: () => Promise.resolve('upstream failure'),
+            } as unknown as Response;
+        }
+
+        it('survives a 503 blip that outlasts the old six-second budget', async () => {
+            let calls = 0;
+            vi.stubGlobal('fetch', vi.fn().mockImplementation(() => {
+                calls++;
+                if (calls <= 4) return Promise.resolve(serverError(503));
+                return Promise.resolve({
+                    ok: true,
+                    status: 200,
+                    headers: new Headers(),
+                    json: () => Promise.resolve([]),
+                    text: () => Promise.resolve(''),
+                } as unknown as Response);
+            }));
+
+            const listPromise = provider.listRepos();
+            await vi.runAllTimersAsync();
+
+            await expect(listPromise).resolves.toEqual([]);
+            expect(calls).toBe(5);
+        });
+
+        it('spends the shared 5xx budget and throws a typed error', async () => {
+            vi.stubGlobal('fetch', vi.fn().mockResolvedValue(serverError(500)));
+
+            const listPromise = provider.listRepos();
+            void listPromise.catch(() => {});
+            await vi.runAllTimersAsync();
+
+            await expect(listPromise).rejects.toThrow('GitHub API server error 500');
+            await expect(listPromise).rejects.toMatchObject({status: 500});
+            expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(
+                1 + MAX_SERVER_ERROR_RETRIES,
+            );
+        });
+
+        it('does NOT retry a 4xx, and reports it as non-retryable', async () => {
+            vi.stubGlobal('fetch', vi.fn().mockResolvedValue(serverError(404)));
+
+            const listPromise = provider.listRepos();
+            void listPromise.catch(() => {});
+            await vi.runAllTimersAsync();
+
+            await expect(listPromise).rejects.toThrow('GitHub API error 404');
+            expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
         });
     });
 

@@ -24,6 +24,7 @@ import {
     resolveGitProviderConfigs,
 } from './providers/config.js';
 import {resolveAllGitProviders} from './providers/resolve.js';
+import {isRetryableGitFetchError} from './providers/http-retry.js';
 import {findProviderByTypeContainer} from './providers/store.js';
 import {loadServerKey} from './providers/secret.js';
 import type {
@@ -320,6 +321,33 @@ export const EARLIEST_SYNC_EPOCH = new Date(0).toISOString();
  *     chunked recovery re-pages HEAD→since once per chunk.
  */
 export const GIT_CATCHUP_WINDOW_MAX_DAYS = 30;
+
+/**
+ * Pauses before each IN-RUN retry of a repo whose commit fetch threw (#272) — so
+ * `[5min, 15min]` means "attempt, +5min, +15min", three attempts in total.
+ *
+ * This is the second layer of the same defence as `providers/http-retry.ts`. That layer
+ * retries the failing REQUEST over ~2.5 minutes; this one retries the whole REPO after the
+ * request layer has already given up, because the alternative is catastrophically
+ * asymmetric: a repo's commit fetch failing leaves the provider's `[since, until]` window
+ * incompletely covered, which correctly holds the cursor and discards EVERY provider's
+ * partial data for the run (see `ProviderFetchResult.complete`). An initial full-history
+ * sync makes thousands of per-commit requests over hours, so the chance of at least one
+ * blip somewhere is high — and each one used to cost the entire run. On a multi-hour run
+ * these pauses are free; losing the run is not.
+ *
+ * The all-or-nothing rule is deliberately untouched. This makes reaching it rare, not
+ * cheap: after these retries are exhausted the behavior is exactly as before.
+ *
+ * Only faults that could plausibly heal are retried ({@link isRetryableGitFetchError}) —
+ * a 401 or a 404 is a deterministic answer, and pausing 20 minutes per repo to re-ask it
+ * would turn one bad credential into a run that never finishes.
+ */
+export const GIT_REPO_RETRY_DELAYS_MS: readonly number[] = [5 * 60_000, 15 * 60_000];
+
+async function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 /**
  * The upper bound a forward run should actually fetch to, given the cursor it is
@@ -1341,17 +1369,40 @@ async function fetchProviderData(
         // the previous explicit clear here, since it overwrites all three fields.
         reportStep('commits', 0, null);
         let rawCommits: GitCommit[] = [];
-        try {
-            // getCommits pages the commit list AND does the per-commit detail/diff
-            // fetch internally; its onProgress reports both so the indicator advances
-            // during that work instead of jumping only once the repo returns (#270).
-            // Since #271 that internal fetch is the ONLY per-commit diff request a run
-            // makes — the loop below reuses its result off `GitCommit.diffs`.
-            rawCommits = await provider.getCommits(repoName, since, until, onCommitProgress);
-        } catch (err) {
-            errors.push(
-                `[${providerType}/${repoName}] Failed to fetch commits: ${err instanceof Error ? err.message : String(err)}`,
-            );
+        // The message of the last commit-fetch failure, or null once a fetch succeeded.
+        // Set on every attempt so an exhausted retry sequence reports the LAST fault, which
+        // is the one that actually ended the repo.
+        let commitFetchError: string | null = null;
+        // Attempt, then up to GIT_REPO_RETRY_DELAYS_MS.length more after long pauses (#272).
+        // `rawCommits` is ASSIGNED, never appended to, so a retry that re-pages the same
+        // window replaces the previous attempt's partial list rather than doubling it — the
+        // whole-window re-fetch is idempotent for this run's accumulators, and nothing has
+        // been pushed into `allCommits` yet.
+        for (let attempt = 0; ; attempt++) {
+            try {
+                // getCommits pages the commit list AND does the per-commit detail/diff
+                // fetch internally; its onProgress reports both so the indicator advances
+                // during that work instead of jumping only once the repo returns (#270).
+                // Since #271 that internal fetch is the ONLY per-commit diff request a run
+                // makes — the loop below reuses its result off `GitCommit.diffs`.
+                rawCommits = await provider.getCommits(repoName, since, until, onCommitProgress);
+                commitFetchError = null;
+                break;
+            } catch (err) {
+                commitFetchError = err instanceof Error ? err.message : String(err);
+                if (attempt >= GIT_REPO_RETRY_DELAYS_MS.length || !isRetryableGitFetchError(err)) {
+                    break;
+                }
+                // Re-enter the commits step before the pause, not after it: the counter the
+                // failed attempt left behind is stale the moment it threw, and leaving it
+                // frozen through a 15-minute wait is exactly the "reads as hung" symptom
+                // #270 exists to remove.
+                reportStep('commits', 0, null);
+                await sleep(GIT_REPO_RETRY_DELAYS_MS[attempt]);
+            }
+        }
+        if (commitFetchError !== null) {
+            errors.push(`[${providerType}/${repoName}] Failed to fetch commits: ${commitFetchError}`);
             // This repo's commit window is now un-covered — hold the provider's cursor
             // back so the whole window is re-fetched next run rather than skipped (#231).
             commitsComplete = false;

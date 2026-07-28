@@ -12,6 +12,11 @@ import type {
     GitFetchProgressListener,
 } from './types.js';
 import {normalizeContainer} from './container.js';
+import {
+    GitProviderFetchError,
+    MAX_SERVER_ERROR_RETRIES,
+    serverErrorDelayMs,
+} from './http-retry.js';
 
 const BASE_URL = 'https://api.bitbucket.org/2.0';
 const MAX_RETRIES = 3;
@@ -44,18 +49,29 @@ function buildAuthHeader(auth: BitbucketProviderConfig['auth']): string {
 
 async function fetchBitbucket(url: string, headers: Record<string, string>): Promise<Response> {
     let attempt = 0;
+    // Transient faults (5xx, transport) get their OWN, much longer budget than the 429
+    // path — see http-retry.ts. Counted separately so a run does not spend its 5xx
+    // allowance on rate limiting, or vice versa.
+    let transientRetries = 0;
 
     while (attempt <= MAX_RETRIES) {
         let res: Response;
         try {
             res = await fetch(url, {headers});
         } catch (err) {
-            if (attempt < MAX_RETRIES) {
-                await sleep(1_000 * (attempt + 1));
-                attempt++;
+            // A transport fault is the same outage as a 503, seen one layer down — same
+            // budget, same backoff. Wrapped so the in-run repo retry (#272) can classify
+            // it; the message is preserved verbatim.
+            if (transientRetries < MAX_SERVER_ERROR_RETRIES) {
+                await sleep(serverErrorDelayMs(transientRetries, null));
+                transientRetries++;
                 continue;
             }
-            throw err instanceof Error ? err : new Error(String(err));
+            throw new GitProviderFetchError(
+                err instanceof Error ? err.message : String(err),
+                null,
+                {cause: err},
+            );
         }
 
         if (res.status === 429) {
@@ -66,26 +82,32 @@ async function fetchBitbucket(url: string, headers: Record<string, string>): Pro
                 attempt++;
                 continue;
             }
-            throw new Error(`Rate limit exceeded after ${MAX_RETRIES} retries: ${url}`);
+            throw new GitProviderFetchError(
+                `Rate limit exceeded after ${MAX_RETRIES} retries: ${url}`,
+                429,
+            );
         }
 
         if (res.status >= 500) {
-            if (attempt < MAX_RETRIES) {
-                await sleep(1_000 * (attempt + 1));
-                attempt++;
+            if (transientRetries < MAX_SERVER_ERROR_RETRIES) {
+                await sleep(serverErrorDelayMs(transientRetries, res.headers.get('retry-after')));
+                transientRetries++;
                 continue;
             }
-            throw new Error(`Bitbucket API server error ${res.status}: ${url}`);
+            throw new GitProviderFetchError(
+                `Bitbucket API server error ${res.status}: ${url}`,
+                res.status,
+            );
         }
 
         if (!res.ok) {
-            throw new Error(`Bitbucket API error ${res.status}: ${url}`);
+            throw new GitProviderFetchError(`Bitbucket API error ${res.status}: ${url}`, res.status);
         }
 
         return res;
     }
 
-    throw new Error(`Request failed after ${MAX_RETRIES} retries: ${url}`);
+    throw new GitProviderFetchError(`Request failed after ${MAX_RETRIES} retries: ${url}`, null);
 }
 
 // --- Raw API shapes ---
@@ -316,9 +338,11 @@ export class BitbucketProvider implements GitProvider {
                 diffs = await this.getCommitDiff(repo, raw.hash);
             } catch (err) {
                 // 404 means diffstat absent for this commit (e.g. merge commits) — record with zero stats
-                // Re-throw anything else (auth failure, server error) so systemic problems surface
-                const msg = err instanceof Error ? err.message : String(err);
-                if (!msg.includes(' 404:')) throw err;
+                // Re-throw anything else (auth failure, server error) so systemic problems surface.
+                // Keyed on the typed status rather than a ' 404:' substring (#272): the substring
+                // also matched a URL that merely CONTAINED it, and swallowing a real failure here
+                // silently understates the commit's churn.
+                if (!(err instanceof GitProviderFetchError) || err.status !== 404) throw err;
             }
             commits.push({
                 sha: raw.hash,

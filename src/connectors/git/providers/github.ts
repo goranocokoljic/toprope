@@ -13,6 +13,11 @@ import type {
     GitFetchProgressListener,
 } from './types.js';
 import {normalizeContainer} from './container.js';
+import {
+    GitProviderFetchError,
+    MAX_SERVER_ERROR_RETRIES,
+    serverErrorDelayMs,
+} from './http-retry.js';
 
 const BASE_URL = 'https://api.github.com';
 // Pause proactively when remaining requests drops below this threshold
@@ -37,18 +42,29 @@ async function sleep(ms: number): Promise<void> {
 
 async function fetchGitHub(url: string, headers: Record<string, string>): Promise<Response> {
     let attempt = 0;
+    // Transient faults (5xx, transport) get their own, much longer budget than the rate-limit
+    // paths below — see http-retry.ts. Counted separately so one class of fault cannot spend
+    // the other's allowance.
+    let transientRetries = 0;
 
     while (attempt <= MAX_RETRIES) {
         let res: Response;
         try {
             res = await fetch(url, {headers});
         } catch (err) {
-            if (attempt < MAX_RETRIES) {
-                await sleep(1_000 * (attempt + 1));
-                attempt++;
+            // A transport fault is the same outage as a 503, seen one layer down — same budget,
+            // same backoff. Wrapped so the in-run repo retry (#272) can classify it; the message
+            // is preserved verbatim.
+            if (transientRetries < MAX_SERVER_ERROR_RETRIES) {
+                await sleep(serverErrorDelayMs(transientRetries, null));
+                transientRetries++;
                 continue;
             }
-            throw err instanceof Error ? err : new Error(String(err));
+            throw new GitProviderFetchError(
+                err instanceof Error ? err.message : String(err),
+                null,
+                {cause: err},
+            );
         }
 
         if (res.status === 429) {
@@ -61,7 +77,10 @@ async function fetchGitHub(url: string, headers: Record<string, string>): Promis
                 attempt++;
                 continue;
             }
-            throw new Error(`Rate limit exceeded after ${MAX_RETRIES} retries: ${url}`);
+            throw new GitProviderFetchError(
+                `Rate limit exceeded after ${MAX_RETRIES} retries: ${url}`,
+                429,
+            );
         }
 
         if (res.status === 403) {
@@ -85,20 +104,26 @@ async function fetchGitHub(url: string, headers: Record<string, string>): Promis
                     continue;
                 }
             }
-            throw new Error(`GitHub API forbidden (403): ${url}: ${await res.text()}`);
+            throw new GitProviderFetchError(
+                `GitHub API forbidden (403): ${url}: ${await res.text()}`,
+                403,
+            );
         }
 
         if (res.status >= 500) {
-            if (attempt < MAX_RETRIES) {
-                await sleep(1_000 * (attempt + 1));
-                attempt++;
+            if (transientRetries < MAX_SERVER_ERROR_RETRIES) {
+                await sleep(serverErrorDelayMs(transientRetries, res.headers.get('retry-after')));
+                transientRetries++;
                 continue;
             }
-            throw new Error(`GitHub API server error ${res.status}: ${url}`);
+            throw new GitProviderFetchError(
+                `GitHub API server error ${res.status}: ${url}`,
+                res.status,
+            );
         }
 
         if (!res.ok) {
-            throw new Error(`GitHub API error ${res.status}: ${url}`);
+            throw new GitProviderFetchError(`GitHub API error ${res.status}: ${url}`, res.status);
         }
 
         // Proactively pause when approaching rate limit
@@ -112,7 +137,7 @@ async function fetchGitHub(url: string, headers: Record<string, string>): Promis
         return res;
     }
 
-    throw new Error(`Request failed after ${MAX_RETRIES} retries: ${url}`);
+    throw new GitProviderFetchError(`Request failed after ${MAX_RETRIES} retries: ${url}`, null);
 }
 
 // Raw GitHub API response shapes

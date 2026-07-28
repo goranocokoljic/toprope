@@ -1,5 +1,6 @@
 import {describe, it, expect, beforeEach, afterEach, vi} from 'vitest';
 import {GitLabProvider} from '../../../../src/connectors/git/providers/gitlab';
+import {MAX_SERVER_ERROR_RETRIES} from '../../../../src/connectors/git/providers/http-retry';
 import type {GitLabProviderConfig} from '../../../../src/connectors/git/providers/types';
 
 const CONFIG_PAT: GitLabProviderConfig = {
@@ -1115,6 +1116,76 @@ describe('GitLabProvider', () => {
 
             expect(repos).toEqual([]);
             expect(callCount).toBe(2);
+        });
+
+        // #272 — GitLab shared the same ~6-second 5xx fuse as the other two, so it shares
+        // the fix: the 5xx branch now spends the shared, minutes-long budget and throws a
+        // typed error the in-run repo retry can classify.
+
+        it('survives a 503 blip that outlasts the old six-second budget', async () => {
+            let callCount = 0;
+            vi.stubGlobal('fetch', vi.fn().mockImplementation(() => {
+                callCount++;
+                if (callCount <= 4) {
+                    return Promise.resolve({
+                        ok: false,
+                        status: 503,
+                        headers: new Headers(),
+                        json: () => Promise.resolve([]),
+                        text: () => Promise.resolve('server error'),
+                    } as unknown as Response);
+                }
+                return Promise.resolve({
+                    ok: true,
+                    status: 200,
+                    headers: new Headers(),
+                    json: () => Promise.resolve([]),
+                    text: () => Promise.resolve(''),
+                } as unknown as Response);
+            }));
+
+            const listPromise = provider.listRepos();
+            await vi.runAllTimersAsync();
+
+            await expect(listPromise).resolves.toEqual([]);
+            expect(callCount).toBe(5);
+        });
+
+        it('spends the shared 5xx budget and throws a typed error', async () => {
+            vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+                ok: false,
+                status: 502,
+                headers: new Headers(),
+                json: () => Promise.resolve([]),
+                text: () => Promise.resolve('server error'),
+            } as unknown as Response));
+
+            const listPromise = provider.listRepos();
+            void listPromise.catch(() => {});
+            await vi.runAllTimersAsync();
+
+            await expect(listPromise).rejects.toThrow('GitLab API server error 502');
+            await expect(listPromise).rejects.toMatchObject({status: 502});
+            expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(
+                1 + MAX_SERVER_ERROR_RETRIES,
+            );
+        });
+
+        it('does NOT retry a 4xx — a deterministic answer is not an outage', async () => {
+            vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+                ok: false,
+                status: 401,
+                headers: new Headers(),
+                json: () => Promise.resolve([]),
+                text: () => Promise.resolve('unauthorized'),
+            } as unknown as Response));
+
+            const listPromise = provider.listRepos();
+            void listPromise.catch(() => {});
+            await vi.runAllTimersAsync();
+
+            await expect(listPromise).rejects.toThrow('GitLab API error 401');
+            expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
         });
     });
 

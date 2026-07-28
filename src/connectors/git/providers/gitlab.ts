@@ -13,6 +13,11 @@ import type {
     GitFetchProgressListener,
 } from './types.js';
 import {normalizeContainer} from './container.js';
+import {
+    GitProviderFetchError,
+    MAX_SERVER_ERROR_RETRIES,
+    serverErrorDelayMs,
+} from './http-retry.js';
 
 const DEFAULT_BASE_URL = 'https://gitlab.com/api/v4';
 const MAX_RETRIES = 3;
@@ -34,18 +39,29 @@ function buildAuthHeaders(auth: GitLabProviderConfig['auth']): Record<string, st
 
 async function fetchGitLab(url: string, headers: Record<string, string>): Promise<Response> {
     let attempt = 0;
+    // Transient faults (5xx, transport) get their own, much longer budget than the 429 path —
+    // see http-retry.ts. Counted separately so one class of fault cannot spend the other's
+    // allowance.
+    let transientRetries = 0;
 
     while (attempt <= MAX_RETRIES) {
         let res: Response;
         try {
             res = await fetch(url, {headers});
         } catch (err) {
-            if (attempt < MAX_RETRIES) {
-                await sleep(1_000 * (attempt + 1));
-                attempt++;
+            // A transport fault is the same outage as a 503, seen one layer down — same budget,
+            // same backoff. Wrapped so the in-run repo retry (#272) can classify it; the message
+            // is preserved verbatim.
+            if (transientRetries < MAX_SERVER_ERROR_RETRIES) {
+                await sleep(serverErrorDelayMs(transientRetries, null));
+                transientRetries++;
                 continue;
             }
-            throw err instanceof Error ? err : new Error(String(err));
+            throw new GitProviderFetchError(
+                err instanceof Error ? err.message : String(err),
+                null,
+                {cause: err},
+            );
         }
 
         if (res.status === 429) {
@@ -56,26 +72,32 @@ async function fetchGitLab(url: string, headers: Record<string, string>): Promis
                 attempt++;
                 continue;
             }
-            throw new Error(`Rate limit exceeded after ${MAX_RETRIES} retries: ${url}`);
+            throw new GitProviderFetchError(
+                `Rate limit exceeded after ${MAX_RETRIES} retries: ${url}`,
+                429,
+            );
         }
 
         if (res.status >= 500) {
-            if (attempt < MAX_RETRIES) {
-                await sleep(1_000 * (attempt + 1));
-                attempt++;
+            if (transientRetries < MAX_SERVER_ERROR_RETRIES) {
+                await sleep(serverErrorDelayMs(transientRetries, res.headers.get('retry-after')));
+                transientRetries++;
                 continue;
             }
-            throw new Error(`GitLab API server error ${res.status}: ${url}`);
+            throw new GitProviderFetchError(
+                `GitLab API server error ${res.status}: ${url}`,
+                res.status,
+            );
         }
 
         if (!res.ok) {
-            throw new Error(`GitLab API error ${res.status}: ${url}`);
+            throw new GitProviderFetchError(`GitLab API error ${res.status}: ${url}`, res.status);
         }
 
         return res;
     }
 
-    throw new Error(`Request failed after ${MAX_RETRIES} retries: ${url}`);
+    throw new GitProviderFetchError(`Request failed after ${MAX_RETRIES} retries: ${url}`, null);
 }
 
 function parseDiffHunks(diff: string): {additions: number; deletions: number} {
@@ -287,10 +309,12 @@ export class GitLabProvider implements GitProvider {
             try {
                 diffs = await this.getCommitDiff(repo, c.id);
             } catch (err) {
-                const msg = err instanceof Error ? err.message : String(err);
                 // Re-throw systemic errors (auth failure, server error); silently swallow 404
-                // (GitLab may return 404 for diffs on certain commits, e.g. initial commits)
-                if (!msg.includes(' 404:')) throw err;
+                // (GitLab may return 404 for diffs on certain commits, e.g. initial commits).
+                // Keyed on the typed status rather than a ' 404:' substring (#272): the substring
+                // also matched a URL that merely CONTAINED it, and swallowing a real failure here
+                // silently understates the commit's churn.
+                if (!(err instanceof GitProviderFetchError) || err.status !== 404) throw err;
             }
 
             commits.push({
