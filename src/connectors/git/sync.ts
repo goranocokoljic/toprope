@@ -26,7 +26,15 @@ import {
 import {resolveAllGitProviders} from './providers/resolve.js';
 import {findProviderByTypeContainer} from './providers/store.js';
 import {loadServerKey} from './providers/secret.js';
-import type {GitProviderConfig, GitProviderType, GitCommit, GitFileDiff, GitPR} from './providers/types.js';
+import type {
+    GitProviderConfig,
+    GitProviderType,
+    GitCommit,
+    GitFetchProgress,
+    GitFetchProgressListener,
+    GitFileDiff,
+    GitPR,
+} from './providers/types.js';
 import {promoteAllCandidates} from './onboarding.js';
 import {ensureTeam} from '../../registry/teams.js';
 import {resolveAutoCreateSettings, type AutoCreateSettings} from '../../config/git-auto-create.js';
@@ -133,6 +141,20 @@ export function autoCreateFailureLine(failed: number, detail: string): string {
 export type GitSyncStage = 'listing_repos' | 'fetching' | 'analyzing' | 'writing';
 
 /**
+ * Which O(N) fan-out inside `current_repo` the run is working through (#270).
+ *
+ * The `fetching` stage's run-level `commits_fetched`/`prs_fetched` only move when a
+ * whole repo finishes, so on a large repo they sit unchanged for minutes and read as
+ * a hang. These name the three unbounded loops a single repo passes through, in
+ * order, so a progress consumer can show motion *within* one repo:
+ *   - `commits` — the provider's commit list paging, then its per-commit detail fetch
+ *   - `diffs`   — this loop's own per-commit `getCommitDiff` fan-out
+ *   - `prs`     — the provider's PR list paging, then this loop's per-PR
+ *                 review-comment/verdict fan-out
+ */
+export type GitSyncRepoStep = 'commits' | 'diffs' | 'prs';
+
+/**
  * A live progress snapshot of an in-flight sync run, emitted through the
  * optional listener {@link GitSync.syncProviders} accepts (GC#209). Field names
  * are wire-shaped (snake_case) because the admin API serves each snapshot
@@ -152,7 +174,29 @@ export interface GitSyncProgress {
     prs_fetched: number;
     /** Distinct developers resolved from the fetched activity (analyzing stage on). */
     developers_matched: number;
+    /**
+     * Which within-repo fan-out is in flight, and how far it has advanced (#270).
+     * All three are reset to (null, 0, null) whenever a repo starts or finishes, so
+     * a consumer never shows a finished repo's stale counter.
+     *
+     * `repo_step_total` is null while the set is still being *discovered* (a list
+     * endpoint paging in) — its size genuinely is not knowable until the last page,
+     * so `repo_step_done` then reads as "found so far", not "done out of total".
+     * Once the set is in hand the total is real and both read as done/total. There
+     * is deliberately no percentage or ETA anywhere: the pipeline cannot compute an
+     * honest one for the listing phase.
+     */
+    repo_step: GitSyncRepoStep | null;
+    repo_step_done: number;
+    repo_step_total: number | null;
 }
+
+/** The idle within-repo indicator: no fan-out in flight. */
+const NO_REPO_STEP = {
+    repo_step: null,
+    repo_step_done: 0,
+    repo_step_total: null,
+} as const satisfies Pick<GitSyncProgress, 'repo_step' | 'repo_step_done' | 'repo_step_total'>;
 
 /**
  * Listener for progress snapshots. Called synchronously between pipeline steps
@@ -393,6 +437,28 @@ export function subtractUtcMonths(now: string, months: number): string | null {
 // can never mutate pipeline state. Undefined when no listener was passed, so
 // the scheduled path pays nothing.
 type ProgressReporter = (mutate: (progress: GitSyncProgress) => void) => void;
+
+/**
+ * Fold one provider fetch report into the run's within-repo indicator (#270).
+ *
+ * Shared by the commit and PR steps so both read the discriminant identically:
+ * a `listing` report always leaves `repo_step_total` null (the honest value while
+ * a list is still paging in), a `fetching` report always carries a real total.
+ */
+function applyFetchProgress(
+    p: GitSyncProgress,
+    step: GitSyncRepoStep,
+    progress: GitFetchProgress,
+): void {
+    p.repo_step = step;
+    if (progress.phase === 'listing') {
+        p.repo_step_done = progress.discovered;
+        p.repo_step_total = null;
+    } else {
+        p.repo_step_done = progress.done;
+        p.repo_step_total = progress.total;
+    }
+}
 
 export function syncStateKey(providerType: GitProviderType, identifier: string): string {
     return `git_last_sync:${providerType}:${identifier}`;
@@ -1222,13 +1288,31 @@ async function fetchProviderData(
     // the provider's [since, until] window incompletely covered, so runSync must hold
     // the whole provider's cursor and drop its partial snapshots (#231).
     let commitsComplete = true;
+
+    // Undefined when nobody is observing, so the observer-free scheduled path hands
+    // the providers no listener at all and their `onProgress?.(…)` short-circuits —
+    // not one progress object allocated across a full sync (#270). Hoisted out of the
+    // repo loop: neither closure captures the repo.
+    const onCommitProgress: GitFetchProgressListener | undefined = report
+        ? (progress): void => report((p) => applyFetchProgress(p, 'commits', progress))
+        : undefined;
+    const onPRProgress: GitFetchProgressListener | undefined = report
+        ? (progress): void => report((p) => applyFetchProgress(p, 'prs', progress))
+        : undefined;
+
     for (const repoName of reposToSync) {
         report?.((p) => {
             p.current_repo = repoName;
+            // Starting a fresh repo — drop the previous repo's within-repo counter
+            // rather than letting it linger until the first fan-out reports (#270).
+            Object.assign(p, NO_REPO_STEP);
         });
         let rawCommits: GitCommit[] = [];
         try {
-            rawCommits = await provider.getCommits(repoName, since, until);
+            // getCommits pages the commit list AND does the per-commit detail/diff
+            // fetch internally; its onProgress reports both so the indicator advances
+            // during that work instead of jumping only once the repo returns (#270).
+            rawCommits = await provider.getCommits(repoName, since, until, onCommitProgress);
         } catch (err) {
             errors.push(
                 `[${providerType}/${repoName}] Failed to fetch commits: ${err instanceof Error ? err.message : String(err)}`,
@@ -1240,6 +1324,7 @@ async function fetchProviderData(
             report?.((p) => {
                 p.repos_processed += 1;
                 p.current_repo = null;
+                Object.assign(p, NO_REPO_STEP);
             });
             continue;
         }
@@ -1247,6 +1332,16 @@ async function fetchProviderData(
             p.commits_fetched += rawCommits.length;
         });
 
+        // This loop's own per-commit diff fan-out — a second O(commits) network cost
+        // after getCommits, and just as silent without a per-commit report (#270).
+        if (rawCommits.length > 0) {
+            report?.((p) => {
+                p.repo_step = 'diffs';
+                p.repo_step_done = 0;
+                p.repo_step_total = rawCommits.length;
+            });
+        }
+        let diffsProcessed = 0;
         for (const rawCommit of rawCommits) {
             let diffs: GitFileDiff[] = [];
             try {
@@ -1257,11 +1352,19 @@ async function fetchProviderData(
             // Namespace file paths by repo to prevent false churn collisions
             const namespacedDiffs = diffs.map((d) => ({...d, path: `${repoName}/${d.path}`}));
             allCommits.push(toAnalysisCommit(rawCommit, namespacedDiffs));
+            // Incremented outside the optional call so the count is identical
+            // whether or not a listener is attached.
+            diffsProcessed++;
+            report?.((p) => {
+                p.repo_step = 'diffs';
+                p.repo_step_done = diffsProcessed;
+                p.repo_step_total = rawCommits.length;
+            });
         }
 
         let rawPRs: GitPR[] = [];
         try {
-            rawPRs = await provider.getPullRequests(repoName, 'all', since);
+            rawPRs = await provider.getPullRequests(repoName, 'all', since, onPRProgress);
         } catch (err) {
             errors.push(
                 `[${providerType}/${repoName}] Failed to fetch PRs: ${err instanceof Error ? err.message : String(err)}`,
@@ -1269,10 +1372,21 @@ async function fetchProviderData(
         }
         report?.((p) => {
             p.prs_fetched += rawPRs.length;
+            // The list is in hand, so the PR step's total is now real — switch the
+            // indicator from "N found" to done/total for the per-PR fan-out below.
+            // An empty list has no fan-out to report, so leave the step idle.
+            if (rawPRs.length > 0) {
+                p.repo_step = 'prs';
+                p.repo_step_done = 0;
+                p.repo_step_total = rawPRs.length;
+            } else {
+                Object.assign(p, NO_REPO_STEP);
+            }
         });
 
         let commentFetchFailures = 0;
         let reviewFetchFailures = 0;
+        let prsProcessed = 0;
         for (const pr of rawPRs) {
             // EVERY listed PR feeds allPRs / prRecords unconditionally — the list row is
             // already in hand and cheap, and the per-day open/merge aggregate is combined
@@ -1349,6 +1463,16 @@ async function fetchProviderData(
                 commentsOk,
                 reviewsOk,
             });
+
+            // The comment/verdict fetches above are 2 API calls per PR — the O(PRs)
+            // cost of this repo. Incremented outside the optional call so the count
+            // is identical whether or not a listener is attached.
+            prsProcessed++;
+            report?.((p) => {
+                p.repo_step = 'prs';
+                p.repo_step_done = prsProcessed;
+                p.repo_step_total = rawPRs.length;
+            });
         }
 
         // Surface fetch failures (aggregated per repo so a rate-limited run
@@ -1368,6 +1492,9 @@ async function fetchProviderData(
         report?.((p) => {
             p.repos_processed += 1;
             p.current_repo = null;
+            // This repo is done — clear its indicator so a later stage (or the final
+            // snapshot) never displays a finished repo's stale "PR 40/40" (#270).
+            Object.assign(p, NO_REPO_STEP);
         });
     }
 
@@ -1664,6 +1791,7 @@ export class GitSync implements ConnectorInterface {
             commits_fetched: 0,
             prs_fetched: 0,
             developers_matched: 0,
+            ...NO_REPO_STEP,
         };
         const report: ProgressReporter | undefined = onProgress
             ? (mutate): void => {

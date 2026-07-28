@@ -18,6 +18,7 @@ import type {
     GitProviderDeleteImpact,
     GitProviderDeleteResult,
     GitSyncProgress,
+    GitSyncRepoStep,
     GitSyncStage,
 } from '../api/types';
 
@@ -1321,6 +1322,9 @@ describe('syncProgressLabel (#209)', () => {
         commits_fetched: 34,
         prs_fetched: 5,
         developers_matched: 0,
+        repo_step: null,
+        repo_step_done: 0,
+        repo_step_total: null,
     };
 
     it('falls back to a starting line before the first pipeline emission', () => {
@@ -1376,6 +1380,105 @@ describe('syncProgressLabel (#209)', () => {
     });
 });
 
+describe('syncProgressLabel — within-repo progress (#270)', () => {
+    // Deliberately frozen run-level counters: the whole point of #270 is that these
+    // do NOT move while one repo is being fetched, so every assertion below proves
+    // the line advances on the within-repo fields instead.
+    const base: GitSyncProgress = {
+        stage: 'fetching',
+        repos_total: 12,
+        repos_processed: 2,
+        current_repo: 'web',
+        commits_fetched: 34,
+        prs_fetched: 5,
+        developers_matched: 0,
+        repo_step: null,
+        repo_step_done: 0,
+        repo_step_total: null,
+    };
+
+    it('counts commits discovered while the commit list is still paging in', () => {
+        // No total exists yet (the list has not finished paging), so the honest
+        // signal is a running found-count — never a percentage.
+        expect(
+            syncProgressLabel({
+                started_at: 't',
+                progress: {...base, repo_step: 'commits', repo_step_done: 300, repo_step_total: null},
+            }),
+        ).toBe('Fetching activity — repo 3/12 (web) · 300 commits found');
+    });
+
+    it('singularizes the found-count at one item', () => {
+        expect(
+            syncProgressLabel({
+                started_at: 't',
+                progress: {...base, repo_step: 'commits', repo_step_done: 1, repo_step_total: null},
+            }),
+        ).toBe('Fetching activity — repo 3/12 (web) · 1 commit found');
+    });
+
+    it('shows commit done/total during the per-commit detail fetch', () => {
+        expect(
+            syncProgressLabel({
+                started_at: 't',
+                progress: {...base, repo_step: 'commits', repo_step_done: 1240, repo_step_total: 5000},
+            }),
+        ).toBe('Fetching activity — repo 3/12 (web) · commit 1240/5000');
+    });
+
+    it('shows the diff fan-out as its own counter', () => {
+        expect(
+            syncProgressLabel({
+                started_at: 't',
+                progress: {...base, repo_step: 'diffs', repo_step_done: 12, repo_step_total: 5000},
+            }),
+        ).toBe('Fetching activity — repo 3/12 (web) · diff 12/5000');
+    });
+
+    it('shows the PR fan-out as its own counter, pluralized as PRs while listing', () => {
+        expect(
+            syncProgressLabel({
+                started_at: 't',
+                progress: {...base, repo_step: 'prs', repo_step_done: 12, repo_step_total: 40},
+            }),
+        ).toBe('Fetching activity — repo 3/12 (web) · PR 12/40');
+        expect(
+            syncProgressLabel({
+                started_at: 't',
+                progress: {...base, repo_step: 'prs', repo_step_done: 12, repo_step_total: null},
+            }),
+        ).toBe('Fetching activity — repo 3/12 (web) · 12 PRs found');
+    });
+
+    it('degrades an unknown wire step to the cumulative counters (backend/bundle skew)', () => {
+        // A newer backend adds a step this bundle does not know: fall back to the
+        // #209 line rather than rendering a broken "undefined 3/9".
+        expect(
+            syncProgressLabel({
+                started_at: 't',
+                progress: {
+                    ...base,
+                    repo_step: 'reviews' as GitSyncRepoStep,
+                    repo_step_done: 3,
+                    repo_step_total: 9,
+                },
+            }),
+        ).toBe('Fetching activity — repo 3/12 (web) · 34 commits · 5 PRs');
+    });
+
+    it('leaves the other stages untouched by the within-repo fields', () => {
+        // repo_step is only meaningful during `fetching`; a stale value must not
+        // leak into the analyzing/writing lines.
+        const mid = {...base, repo_step: 'commits' as GitSyncRepoStep, repo_step_done: 7, repo_step_total: 9};
+        expect(
+            syncProgressLabel({started_at: 't', progress: {...mid, stage: 'analyzing', developers_matched: 4}}),
+        ).toBe('Matching developers — 4 matched');
+        expect(
+            syncProgressLabel({started_at: 't', progress: {...mid, stage: 'listing_repos'}}),
+        ).toBe('Listing repositories…');
+    });
+});
+
 describe('AdminGitProviders — live sync progress (#209)', () => {
     const RUNNING_SYNC = {
         started_at: '2026-07-13T10:00:00.000Z',
@@ -1387,6 +1490,9 @@ describe('AdminGitProviders — live sync progress (#209)', () => {
             commits_fetched: 34,
             prs_fetched: 5,
             developers_matched: 0,
+            repo_step: 'commits',
+            repo_step_done: 1240,
+            repo_step_total: 5000,
         },
     } as const;
 
@@ -1394,7 +1500,9 @@ describe('AdminGitProviders — live sync progress (#209)', () => {
         providers = [{...structuredClone(DB_GITHUB), active_sync: structuredClone(RUNNING_SYNC)}];
         renderPage();
         const progress = await screen.findByTestId('sync-progress');
-        expect(progress).toHaveTextContent('Fetching activity — repo 3/12 (web) · 34 commits · 5 PRs');
+        // Rendered from the real server field names on the fixture — a within-repo
+        // counter, not the frozen run-level totals (#270).
+        expect(progress).toHaveTextContent('Fetching activity — repo 3/12 (web) · commit 1240/5000');
         expect(screen.getByRole('button', {name: 'Syncing…'})).toBeDisabled();
         expect(screen.queryByRole('button', {name: 'Sync now'})).not.toBeInTheDocument();
     });

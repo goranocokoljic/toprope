@@ -35,6 +35,7 @@ import type {
     GitProviderProbeResult,
     GitProviderRepo,
     GitProviderType,
+    GitSyncProgress,
 } from '../../api/types';
 import {
     AdminBanner,
@@ -276,6 +277,42 @@ function syncTone(status: string | null): 'success' | 'danger' | 'neutral' {
 }
 
 /**
+ * The counter shown after the repo position on the `fetching` line (#270).
+ *
+ * `commits_fetched`/`prs_fetched` only move when a whole repo finishes, so on a
+ * large repo they sit unchanged for minutes and the line reads as hung. When the
+ * pipeline says which within-repo fan-out it is inside, show that instead:
+ * `commit 1240/5000` while it works a known set, or `1240 commits found` while the
+ * list is still paging in and no total exists yet. No percentage either way — the
+ * pipeline cannot compute an honest one before the last page lands.
+ */
+function repoStepDetail(p: GitSyncProgress): string {
+    switch (p.repo_step) {
+        case 'commits':
+            return repoStepCount('commit', p);
+        case 'diffs':
+            return repoStepCount('diff', p);
+        case 'prs':
+            return repoStepCount('PR', p);
+        case null:
+            break;
+    }
+    // Runtime fallback, deliberately OUTSIDE the switch (same pattern as the stage
+    // switch below) so the compiler still enforces exhaustiveness over the union
+    // while an unknown step from a newer backend degrades to the cumulative
+    // counters instead of rendering a broken "undefined 3/9".
+    return `${p.commits_fetched} commits · ${p.prs_fetched} PRs`;
+}
+
+/** `commit 12/40` once the set size is known, `12 commits found` while it isn't. */
+function repoStepCount(noun: string, p: GitSyncProgress): string {
+    if (p.repo_step_total === null) {
+        return `${p.repo_step_done} ${noun}${p.repo_step_done === 1 ? '' : 's'} found`;
+    }
+    return `${noun} ${p.repo_step_done}/${p.repo_step_total}`;
+}
+
+/**
  * Human-readable line for an in-flight sync's progress snapshot (#209) — stage
  * plus the counters that stage has meaningfully advanced. Exported for tests.
  */
@@ -291,7 +328,7 @@ export function syncProgressLabel(active: GitProviderActiveSync): string {
             // clamped so the label never overshoots (12/12, not 13/12; 0/0).
             const position = Math.min(p.repos_processed + 1, total);
             const repo = p.current_repo ? ` (${p.current_repo})` : '';
-            return `Fetching activity — repo ${position}/${total}${repo} · ${p.commits_fetched} commits · ${p.prs_fetched} PRs`;
+            return `Fetching activity — repo ${position}/${total}${repo} · ${repoStepDetail(p)}`;
         }
         case 'analyzing':
             return `Matching developers — ${p.developers_matched} matched`;

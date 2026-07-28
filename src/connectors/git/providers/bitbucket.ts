@@ -9,6 +9,7 @@ import type {
     GitFileDiff,
     GitAuthor,
     BitbucketProviderConfig,
+    GitFetchProgressListener,
 } from './types.js';
 import {normalizeContainer} from './container.js';
 
@@ -255,7 +256,12 @@ export class BitbucketProvider implements GitProvider {
             }));
     }
 
-    async getCommits(repo: string, since: string, until: string): Promise<GitCommit[]> {
+    async getCommits(
+        repo: string,
+        since: string,
+        until: string,
+        onProgress?: GitFetchProgressListener,
+    ): Promise<GitCommit[]> {
         const sinceDate = since ? new Date(since) : null;
         const untilDate = until ? new Date(until) : null;
 
@@ -263,24 +269,38 @@ export class BitbucketProvider implements GitProvider {
         let nextUrl: string | null =
             `${BASE_URL}/repositories/${this.workspace}/${repo}/commits?pagelen=100`;
 
-        paging: while (nextUrl) {
+        while (nextUrl) {
             const res = await fetchBitbucket(nextUrl, this.authHeaders);
             const page = (await res.json()) as RawPagedResponse<RawCommit>;
 
+            // The since-cutoff used to `break paging` straight out of both loops;
+            // it now flags instead (matching getPullRequests below) so the page's
+            // discovered count is still reported before the walk stops (#270).
+            let reachedSince = false;
             for (const c of page.values) {
                 const commitDate = new Date(c.date);
                 if (sinceDate && commitDate < sinceDate) {
-                    break paging;
+                    reachedSince = true;
+                    break;
                 }
                 if (!untilDate || commitDate <= untilDate) {
                     collected.push(c);
                 }
             }
 
+            onProgress?.({phase: 'listing', discovered: collected.length});
+            if (reachedSince) break;
             nextUrl = page.next ?? null;
         }
 
+        // The per-commit diffstat fetch is the O(commits) cost of this call — report
+        // each one so an observer's counter ticks instead of jumping 0 → N when the
+        // whole loop returns.
         const commits: GitCommit[] = [];
+        let processed = 0;
+        if (collected.length > 0) {
+            onProgress?.({phase: 'fetching', done: 0, total: collected.length});
+        }
         for (const raw of collected) {
             const {name, email} = parseRawAuthor(raw.author.raw);
             const username = raw.author.user?.nickname ?? raw.author.user?.account_id ?? '';
@@ -302,12 +322,21 @@ export class BitbucketProvider implements GitProvider {
                 deletions: diffs.reduce((s, d) => s + d.deletions, 0),
                 filesChanged: diffs.map((d) => d.path),
             });
+            // Incremented outside the optional call so the count is identical
+            // whether or not a listener is attached.
+            processed++;
+            onProgress?.({phase: 'fetching', done: processed, total: collected.length});
         }
 
         return commits;
     }
 
-    async getPullRequests(repo: string, state: string, since: string): Promise<GitPR[]> {
+    async getPullRequests(
+        repo: string,
+        state: string,
+        since: string,
+        onProgress?: GitFetchProgressListener,
+    ): Promise<GitPR[]> {
         const bbStates = bbStatesFromNormalized(state);
         const stateParams = bbStates.map((s) => `state=${encodeURIComponent(s)}`).join('&');
         const sinceDate = since ? new Date(since) : null;
@@ -347,6 +376,7 @@ export class BitbucketProvider implements GitProvider {
                 });
             }
 
+            onProgress?.({phase: 'listing', discovered: prs.length});
             nextUrl = reachedSince ? null : (page.next ?? null);
         }
 

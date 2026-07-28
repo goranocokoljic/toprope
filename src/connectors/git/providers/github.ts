@@ -10,6 +10,7 @@ import type {
     GitFileDiff,
     GitAuthor,
     GitHubProviderConfig,
+    GitFetchProgressListener,
 } from './types.js';
 import {normalizeContainer} from './container.js';
 
@@ -250,7 +251,12 @@ export class GitHubProvider implements GitProvider {
         return repos;
     }
 
-    async getCommits(repo: string, since: string, until: string): Promise<GitCommit[]> {
+    async getCommits(
+        repo: string,
+        since: string,
+        until: string,
+        onProgress?: GitFetchProgressListener,
+    ): Promise<GitCommit[]> {
         const params = new URLSearchParams({per_page: '100'});
         if (since) params.set('since', since);
         if (until) params.set('until', until);
@@ -263,11 +269,22 @@ export class GitHubProvider implements GitProvider {
             const res = await fetchGitHub(nextUrl, this.authHeaders);
             const page = (await res.json()) as RawCommitListItem[];
             summaries.push(...page);
+            // One report per page — the only granularity available here, since the
+            // commit total is unknown until the last page (#270).
+            onProgress?.({phase: 'listing', discovered: summaries.length});
             nextUrl = parseNextLink(res.headers.get('link'));
         }
 
         const commits: GitCommit[] = [];
         let lastDetailError: Error | null = null;
+        // The per-commit detail fetch below is the O(commits) network cost that
+        // dominates a full sync. Seed the phase so an observer switches to done/total
+        // immediately, then tick every commit — including the ones that fail or carry
+        // no author date, so the counter always reaches `total`.
+        let processed = 0;
+        if (summaries.length > 0) {
+            onProgress?.({phase: 'fetching', done: 0, total: summaries.length});
+        }
         for (const summary of summaries) {
             try {
                 const detailRes = await fetchGitHub(
@@ -292,6 +309,11 @@ export class GitHubProvider implements GitProvider {
                 });
             } catch (err) {
                 lastDetailError = err instanceof Error ? err : new Error(String(err));
+            } finally {
+                // Incremented outside the optional call so the count is identical
+                // whether or not a listener is attached.
+                processed++;
+                onProgress?.({phase: 'fetching', done: processed, total: summaries.length});
             }
         }
 
@@ -304,7 +326,12 @@ export class GitHubProvider implements GitProvider {
         return commits;
     }
 
-    async getPullRequests(repo: string, state: string, since: string): Promise<GitPR[]> {
+    async getPullRequests(
+        repo: string,
+        state: string,
+        since: string,
+        onProgress?: GitFetchProgressListener,
+    ): Promise<GitPR[]> {
         const params = new URLSearchParams({
             per_page: '100',
             state: state || 'all',
@@ -365,6 +392,7 @@ export class GitHubProvider implements GitProvider {
                 });
             }
 
+            onProgress?.({phase: 'listing', discovered: prs.length});
             nextUrl = reachedSince ? null : parseNextLink(res.headers.get('link'));
         }
 

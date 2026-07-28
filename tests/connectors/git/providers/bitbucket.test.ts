@@ -395,6 +395,67 @@ describe('BitbucketProvider', () => {
             });
         });
 
+        // --- onProgress (#270) ---
+
+        it('reports one listing tick per commit page, then one per diffstat fetch', async () => {
+            const fetchMock = makeFetchMock([
+                {body: pagedResponse([makeCommitFixture('aaa')], 'https://api.bitbucket.org/2.0/next')},
+                {body: pagedResponse([makeCommitFixture('bbb')])},
+                {body: pagedResponse(makeDiffstatFixture())}, // diffstat for aaa
+                {body: pagedResponse(makeDiffstatFixture())}, // diffstat for bbb
+            ]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            const onProgress = vi.fn();
+            await provider.getCommits('my-repo', '', '', onProgress);
+
+            // Listing has no total (unknown until the last page); the per-commit
+            // diffstat fan-out — where nearly all of a big repo's wall time goes —
+            // then reports real done/total.
+            expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
+                {phase: 'listing', discovered: 1},
+                {phase: 'listing', discovered: 2},
+                {phase: 'fetching', done: 0, total: 2},
+                {phase: 'fetching', done: 1, total: 2},
+                {phase: 'fetching', done: 2, total: 2},
+            ]);
+        });
+
+        it('still reports the page that hits the since cutoff (#270)', async () => {
+            // The cutoff used to break straight out of both loops; the page's
+            // discovered count must be reported before the walk stops.
+            const fetchMock = makeFetchMock([
+                {
+                    body: pagedResponse(
+                        [
+                            makeCommitFixture('aaa', {date: '2024-01-20T00:00:00+00:00'}),
+                            makeCommitFixture('bbb', {date: '2023-12-01T00:00:00+00:00'}),
+                        ],
+                        'https://api.bitbucket.org/2.0/next',
+                    ),
+                },
+                {body: pagedResponse([])}, // diffstat for aaa
+            ]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            const onProgress = vi.fn();
+            const commits = await provider.getCommits(
+                'my-repo',
+                '2024-01-01T00:00:00Z',
+                '2024-12-31T23:59:59Z',
+                onProgress,
+            );
+
+            // Cutoff behavior is unchanged (only 'aaa' survives), and the truncated
+            // page still reported the one commit it collected.
+            expect(commits.map((c) => c.sha)).toEqual(['aaa']);
+            expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
+                {phase: 'listing', discovered: 1},
+                {phase: 'fetching', done: 0, total: 1},
+                {phase: 'fetching', done: 1, total: 1},
+            ]);
+        });
+
         it('stops pagination when commit date is before since', async () => {
             const recent = makeCommitFixture('aaa', {date: '2024-01-20T00:00:00+00:00'});
             const old = makeCommitFixture('bbb', {date: '2023-12-01T00:00:00+00:00'});
@@ -570,6 +631,28 @@ describe('BitbucketProvider', () => {
     // --- getPullRequests ---
 
     describe('getPullRequests()', () => {
+        it('reports one listing tick per PR page (#270)', async () => {
+            const fetchMock = makeFetchMock([
+                {
+                    body: pagedResponse(
+                        [makePRFixture({id: 1})],
+                        'https://api.bitbucket.org/2.0/next',
+                    ),
+                },
+                {body: pagedResponse([makePRFixture({id: 2})])},
+            ]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            const onProgress = vi.fn();
+            const prs = await provider.getPullRequests('my-repo', 'all', '', onProgress);
+
+            expect(prs).toHaveLength(2);
+            expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
+                {phase: 'listing', discovered: 1},
+                {phase: 'listing', discovered: 2},
+            ]);
+        });
+
         it('returns PRs mapped to GitPR shape', async () => {
             const fetchMock = makeFetchMock([{body: pagedResponse([makePRFixture()])}]);
             vi.stubGlobal('fetch', fetchMock);
