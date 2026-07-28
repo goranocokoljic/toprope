@@ -30,7 +30,6 @@ import {loadServerKey} from './providers/secret.js';
 import type {
     GitProviderConfig,
     GitProviderType,
-    GitCommit,
     GitFetchProgressListener,
     GitFileDiff,
     GitPR,
