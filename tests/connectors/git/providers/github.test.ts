@@ -32,7 +32,10 @@ function makeCommitListFixture(sha: string): Record<string, unknown> {
     };
 }
 
-function makeCommitDetailFixture(sha: string): Record<string, unknown> {
+function makeCommitDetailFixture(
+    sha: string,
+    overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
     return {
         sha,
         commit: {
@@ -45,6 +48,7 @@ function makeCommitDetailFixture(sha: string): Record<string, unknown> {
             {filename: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'},
             {filename: 'src/bar.ts', additions: 10, deletions: 5, status: 'added'},
         ],
+        ...overrides,
     };
 }
 
@@ -235,7 +239,75 @@ describe('GitHubProvider', () => {
                 additions: 40,
                 deletions: 10,
                 filesChanged: ['src/foo.ts', 'src/bar.ts'],
+                // The detail response's file list, carried out so the sync loop does not
+                // re-request the identical /commits/{sha} URL (#271).
+                diffs: [
+                    {path: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'},
+                    {path: 'src/bar.ts', additions: 10, deletions: 5, status: 'added'},
+                ],
             });
+        });
+
+        // --- diff reuse (#271) ---
+
+        it('exposes diffs byte-identical to what getCommitDiff would return for the same sha', async () => {
+            // getCommits and getCommitDiff read the SAME endpoint, so they must map it
+            // through the same helper — if they diverged, reusing one for the other would
+            // silently change churn.
+            const sha = 'abc123';
+            vi.stubGlobal(
+                'fetch',
+                makeFetchMock([{body: [makeCommitListFixture(sha)]}, {body: makeCommitDetailFixture(sha)}]),
+            );
+            const commits = await provider.getCommits('my-repo', '', '');
+
+            vi.stubGlobal('fetch', makeFetchMock([{body: makeCommitDetailFixture(sha)}]));
+            const viaFallback = await provider.getCommitDiff('my-repo', sha);
+
+            expect(commits[0].diffs).toEqual(viaFallback);
+        });
+
+        it('sets diffs to [] — not undefined — when the detail carries no files', async () => {
+            // `[]` is the true answer ("touched no files"); undefined would send the sync
+            // loop back to the same endpoint for nothing (#271).
+            const sha = 'nofiles';
+            vi.stubGlobal(
+                'fetch',
+                makeFetchMock([
+                    {body: [makeCommitListFixture(sha)]},
+                    {body: makeCommitDetailFixture(sha, {files: undefined})},
+                ]),
+            );
+
+            const commits = await provider.getCommits('my-repo', '', '');
+
+            expect(commits).toHaveLength(1);
+            expect(commits[0].diffs).toEqual([]);
+            expect(commits[0].diffs).not.toBeUndefined();
+        });
+
+        it('keeps additions/deletions from stats, not summed from the (300-file-capped) file list', async () => {
+            // GitHub truncates `files` at 300 but `stats` covers the whole commit, so the
+            // totals must NOT be re-derived from `diffs` now that it is exposed (#271).
+            const sha = 'truncated';
+            vi.stubGlobal(
+                'fetch',
+                makeFetchMock([
+                    {body: [makeCommitListFixture(sha)]},
+                    {
+                        body: makeCommitDetailFixture(sha, {
+                            stats: {additions: 9999, deletions: 8888, total: 18887},
+                        }),
+                    },
+                ]),
+            );
+
+            const commits = await provider.getCommits('my-repo', '', '');
+
+            expect(commits[0].additions).toBe(9999);
+            expect(commits[0].deletions).toBe(8888);
+            // …while the exposed diffs remain just the (partial) file list.
+            expect(commits[0].diffs?.reduce((s, d) => s + d.additions, 0)).toBe(40);
         });
 
         it('follows Link header pagination for commit list', async () => {

@@ -147,7 +147,10 @@ export type GitSyncStage = 'listing_repos' | 'fetching' | 'analyzing' | 'writing
  * a hang. These name the three unbounded loops a single repo passes through, in
  * order, so a progress consumer can show motion *within* one repo:
  *   - `commits` — the provider's commit list paging, then its per-commit detail fetch
- *   - `diffs`   — this loop's own per-commit `getCommitDiff` fan-out
+ *   - `diffs`   — this loop's per-commit diff pass. Since #271 it reuses the diff the
+ *                 provider already returned on `GitCommit.diffs`, so on all three in-tree
+ *                 providers it is an in-memory walk that completes ~instantly; it is a
+ *                 `getCommitDiff` fan-out only for a provider that supplied none.
  *   - `prs`     — the provider's PR list paging, then this loop's per-PR
  *                 review-comment/verdict fan-out
  */
@@ -199,13 +202,13 @@ export interface GitSyncProgress {
      *     lists exactly what it returns, and Bitbucket's total is commits RETAINED
      *     after its in-memory `until` filter (see #276), so on those two the `diffs`
      *     total always equals the `commits` total.
-     *   - The `commits` and `diffs` steps re-walk the same per-commit endpoint on ALL
-     *     THREE providers, so they are the same N requests twice rather than two
-     *     distinct phases of work: every provider's getCommits fetches per-commit diff
-     *     data internally, then this loop calls getCommitDiff again — GitHub and GitLab
-     *     against the identical URL/method, Bitbucket against its diffstat endpoint.
-     *     That double fetch is pre-existing and out of scope here; this indicator only
-     *     makes it visible. See #277.
+     *   - The `diffs` step no longer re-walks the per-commit endpoint (#271). All three
+     *     providers now return each commit's diff on `GitCommit.diffs` from the fetch
+     *     they already made during the `commits` step, so `diffs` is a synchronous reuse
+     *     pass: expect it to jump 0 → N in a single tick and never to be the step a run
+     *     appears stuck on. It still reports per commit because a provider that supplies
+     *     no diffs falls back to `getCommitDiff`, and that IS an N-request fan-out. (The
+     *     doubled per-commit cost this used to document is what #271 removed.)
      */
     repo_step: GitSyncRepoStep | null;
     repo_step_done: number;
@@ -228,7 +231,10 @@ const NO_REPO_STEP = {
  * indicator reports roughly `2 × commits + prs` times per repo (each provider page,
  * each commit detail, each diff, each PR), each allocating one shallow copy. A
  * listener that does I/O per call — an SSE frame, a DB write — must coalesce; the
- * only in-tree listener assigns the snapshot to a field and is safe.
+ * only in-tree listener assigns the snapshot to a field and is safe. Since #271 the
+ * `diffs` share of those calls arrives as one SYNCHRONOUS burst of N (the reuse pass
+ * awaits nothing), so a poller simply observes the last of them — one more reason a
+ * per-call I/O listener must coalesce rather than fan out.
  *
  * A throw from this listener is swallowed at every report site — it loses that one
  * update and nothing else. It must be: the per-item reports run INSIDE
@@ -266,7 +272,7 @@ export const EARLIEST_SYNC_EPOCH = new Date(0).toISOString();
  * span still to re-cover is `[storedCursor, now]` — which GROWS every run the
  * provider stays broken. Left uncapped, a provider stalled for months eventually
  * asks each run to walk a months-long commit window across every repo (and one
- * `getCommitDiff` call PER commit), so the cost of a stall compounds into the very
+ * per-commit diff request PER commit), so the cost of a stall compounds into the very
  * rate-limit drain the first-sync window cap exists to prevent.
  *
  * Capping `until` (never `since`) is what keeps this gap-free: the window is
@@ -283,8 +289,9 @@ export const EARLIEST_SYNC_EPOCH = new Date(0).toISOString();
  * WHAT THIS DOES AND DOES NOT BOUND — the honest scope, because "a stalled run costs
  * a constant amount" is NOT true in general:
  *   - BOUNDED everywhere: the commit walk's `[since, until]` span, and with it the
- *     per-commit `getCommitDiff` fan-out (one API call PER COMMIT — usually the
- *     largest single cost of a catch-up).
+ *     per-commit detail/diff fan-out inside `getCommits` (one API call PER COMMIT —
+ *     usually the largest single cost of a catch-up; since #271 that is ONE call per
+ *     commit rather than two, which halves this term but does not change what bounds it).
  *   - BOUNDED since #247: the per-PR review FAN-OUT. `getPullRequests(repo, state,
  *     since)` still takes no `until` (see GitProvider), so a run lists every PR touched
  *     since the cursor — the list rows all still feed the snapshot (prs_opened/prs_merged
@@ -1232,7 +1239,7 @@ async function fetchProviderData(
     //   - First sync (no cursor): `now`. The cap deliberately does NOT apply — the
     //     window is already bounded by firstSyncWindowMonths, and capping it would
     //     silently turn a requested 6-month import into a 30-day one.
-    // `until` bounds BOTH the commit walk (with its per-commit getCommitDiff fan-out)
+    // `until` bounds BOTH the commit walk (with its per-commit detail/diff fan-out)
     // and — since #247 — the per-PR review fan-out below, which is filtered to
     // `updatedAt <= until` (prWithinFetchWindow). See GIT_CATCHUP_WINDOW_MAX_DAYS for the
     // full scope of what is and is not bounded.
@@ -1338,6 +1345,8 @@ async function fetchProviderData(
             // getCommits pages the commit list AND does the per-commit detail/diff
             // fetch internally; its onProgress reports both so the indicator advances
             // during that work instead of jumping only once the repo returns (#270).
+            // Since #271 that internal fetch is the ONLY per-commit diff request a run
+            // makes — the loop below reuses its result off `GitCommit.diffs`.
             rawCommits = await provider.getCommits(repoName, since, until, onCommitProgress);
         } catch (err) {
             errors.push(
@@ -1358,15 +1367,24 @@ async function fetchProviderData(
             p.commits_fetched += rawCommits.length;
         });
 
-        // This loop's own per-commit diff fan-out — a second O(commits) network cost
-        // after getCommits, and just as silent without a per-commit report (#270).
+        // The per-commit diff pass. Since #271 this is normally NOT a second network
+        // fan-out: every in-tree provider already fetched each commit's diff to compute
+        // its additions/deletions and hands it back on `GitCommit.diffs`, so this pass
+        // reuses that and the sync makes ~N per-commit requests instead of ~2N. It still
+        // reports per commit — the fallback below IS network work, and a provider that
+        // supplies no diffs makes this pass exactly as slow as it used to be.
         reportStep('diffs', 0, rawCommits.length);
         for (const [i, rawCommit] of rawCommits.entries()) {
-            let diffs: GitFileDiff[] = [];
-            try {
-                diffs = await provider.getCommitDiff(repoName, rawCommit.sha);
-            } catch {
-                // Diff fetch failed — use empty diffs; commit still counts
+            // `undefined`, not falsy/empty, is what selects the fallback: `[]` is a real
+            // answer ("this commit touched no files" — a merge commit whose diffstat
+            // 404'd) and re-requesting it would restore the very duplicate #271 removes.
+            let diffs: GitFileDiff[] = rawCommit.diffs ?? [];
+            if (rawCommit.diffs === undefined) {
+                try {
+                    diffs = await provider.getCommitDiff(repoName, rawCommit.sha);
+                } catch {
+                    // Diff fetch failed — use empty diffs; commit still counts
+                }
             }
             // Namespace file paths by repo to prevent false churn collisions
             const namespacedDiffs = diffs.map((d) => ({...d, path: `${repoName}/${d.path}`}));

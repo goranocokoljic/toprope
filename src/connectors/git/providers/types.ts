@@ -53,6 +53,24 @@ export interface GitCommit {
     additions: number;
     deletions: number;
     filesChanged: string[];
+    /**
+     * The file-level diff this commit's `additions`/`deletions`/`filesChanged` were
+     * derived from, carried out of `getCommits` so the consumer does not have to fetch
+     * it a second time (#271). All three in-tree providers supply it — each one already
+     * walks a per-commit endpoint to compute the totals above — which is what makes a
+     * sync cost ~N per-commit requests instead of ~2N.
+     *
+     * `undefined` and `[]` are NOT interchangeable. `undefined` means "this provider
+     * supplied nothing — fetch it via `getCommitDiff`"; `[]` means "already fetched, and
+     * this commit genuinely touched no files" (a Bitbucket/GitLab merge commit whose
+     * diffstat 404s, a GitHub commit whose detail carries no `files`). Collapsing the two
+     * would send exactly those commits back down the fallback path — the duplicate
+     * request this field exists to remove.
+     *
+     * Paths are the provider's own, NOT repo-namespaced — the same contract
+     * `getCommitDiff` returns, so a consumer namespaces both identically.
+     */
+    diffs?: GitFileDiff[];
 }
 
 export interface GitPR {
@@ -143,6 +161,10 @@ export interface GitProvider {
     // commit during the per-commit detail/diff fan-out. Both are unbounded network
     // work — without it the whole call is one opaque await and an observer's
     // counter jumps 0 → N only when the repo is finished (#270).
+    //
+    // An implementation that fetches per-commit diff data to compute the returned
+    // additions/deletions MUST also expose it on `GitCommit.diffs`, so the caller reuses
+    // that one fetch instead of re-requesting the same endpoint per commit (#271).
     getCommits(
         repo: string,
         since: string,
@@ -162,6 +184,9 @@ export interface GitProvider {
     // commented) for one PR, in submission order. Task 5.2 uses these to count
     // review rounds and send-backs identically across providers.
     getPRReviews(repo: string, prId: string): Promise<GitPRReview[]>;
+    // One commit's file-level diff. Since #271 the sync loop only calls this as a
+    // FALLBACK, for a commit whose `GitCommit.diffs` is `undefined` — it stays on the
+    // interface for that fallback and for callers holding only a sha.
     getCommitDiff(repo: string, commitSha: string): Promise<GitFileDiff[]>;
     // Cheap reachability/auth probe — fetches a single page, resolves on success
     // and throws on auth/network failure. Used by `toprope doctor` to validate

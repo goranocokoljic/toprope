@@ -448,7 +448,42 @@ describe('GitLabProvider', () => {
                 additions: 2,
                 deletions: 1,
                 filesChanged: ['src/foo.ts'],
+                // The diff this call already fetched, carried out so the sync loop does
+                // not request it a second time (#271).
+                diffs: [{path: 'src/foo.ts', additions: 2, deletions: 1, status: 'modified'}],
             });
+        });
+
+        // --- diff reuse (#271) ---
+
+        it('exposes diffs byte-identical to what getCommitDiff would return for the same sha', async () => {
+            const sha = 'abc123def456';
+            vi.stubGlobal(
+                'fetch',
+                makeFetchMock([{body: [makeCommitFixture(sha)]}, {body: [makeDiffEntryFixture()]}]),
+            );
+            const commits = await provider.getCommits('test-group/my-repo', '', '');
+
+            vi.stubGlobal('fetch', makeFetchMock([{body: [makeDiffEntryFixture()]}]));
+            const viaFallback = await provider.getCommitDiff('test-group/my-repo', sha);
+
+            expect(commits[0].diffs).toEqual(viaFallback);
+        });
+
+        it('sets diffs to [] — not undefined — when the diff endpoint 404s, so the caller does not re-request', async () => {
+            vi.stubGlobal(
+                'fetch',
+                makeFetchMock([
+                    {body: [makeCommitFixture('initial')]},
+                    {body: {message: '404 Not Found'}, status: 404},
+                ]),
+            );
+
+            const commits = await provider.getCommits('test-group/my-repo', '', '');
+
+            expect(commits).toHaveLength(1);
+            expect(commits[0].diffs).toEqual([]);
+            expect(commits[0].diffs).not.toBeUndefined();
         });
 
         // --- onProgress (#270) ---
