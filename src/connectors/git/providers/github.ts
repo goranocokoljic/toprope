@@ -178,7 +178,14 @@ interface RawCommitListItem {
 
 interface RawCommitDetail {
     sha: string;
-    commit: {
+    /**
+     * OPTIONAL for the same reason `RawCommitListItem.commit` is, and it must stay in step with
+     * it: the two endpoints return the identical embedded object, so a shape the list can omit
+     * the detail can omit too. Dereferencing it unguarded would raise a TypeError out of
+     * `getCommits`, which #231 reads as an incompletely-covered window — the whole provider's
+     * run discarded by one malformed commit.
+     */
+    commit?: {
         author: {name: string; email: string; date: string} | null;
         message: string;
     };
@@ -420,8 +427,11 @@ export class GitHubProvider implements GitProvider {
                 const additions = detail.stats?.additions ?? 0;
                 const deletions = detail.stats?.deletions ?? 0;
 
-                // Cached AFTER the author-date guard, so the write is gated on exactly the
-                // condition the hit path reads on (#273). Writing before it would let a
+                const detailCommit = detail.commit;
+                if (!detailCommit?.author?.date) continue;
+
+                // Cached AFTER the author-date guard above, so the write is gated on exactly
+                // the condition the hit path reads on (#273). Writing before it would let a
                 // commit the un-cached path DROPS be pushed by a later warm run — the
                 // opposite divergence to the one the hit gate prevents, and just as much a
                 // break of "a hit produces what a fetch produces".
@@ -432,10 +442,9 @@ export class GitHubProvider implements GitProvider {
                 // `absent: false` always. Unlike Bitbucket/GitLab, a 404 here is NOT an
                 // answer: the sha came from GitHub's own commit list, and the endpoint is the
                 // commit itself rather than a separate diffstat resource — so a 404 is an
-                // anomaly that must surface, and `fetchGitHub` throws it (#272). No failure
-                // of any kind reaches this line, which is also why GitHub does not use the
-                // shared `resolveCommitDiffstat` helper the other two providers share.
-                if (!detail.commit.author?.date) continue;
+                // anomaly that must surface, and `fetchGitHub` throws it (#272). No FETCH
+                // failure of any kind reaches this line, which is also why GitHub does not use
+                // the shared `resolveCommitDiffstat` helper the other two providers share.
                 this.diffstatCache?.put(repo, summary.sha, {
                     additions,
                     deletions,
@@ -446,12 +455,12 @@ export class GitHubProvider implements GitProvider {
                 commits.push({
                     sha: detail.sha,
                     author: {
-                        name: detail.commit.author.name,
-                        email: detail.commit.author.email,
+                        name: detailCommit.author.name,
+                        email: detailCommit.author.email,
                         username: detail.author?.login ?? '',
                     },
-                    date: detail.commit.author.date,
-                    message: detail.commit.message,
+                    date: detailCommit.author.date,
+                    message: detailCommit.message,
                     additions,
                     deletions,
                     filesChanged: diffs.map((d) => d.path),

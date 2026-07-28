@@ -303,6 +303,14 @@ export function deleteProviderWithCascade(
         // what a fresh provider should do. Deliberately NOT reported on
         // {@link ProviderDeleteResult}: the admin confirmation enumerates what history is being
         // destroyed, and a re-derivable fetch cache is not history.
+        //
+        // This one NORMALIZES `container` while the two statements above use it verbatim, and
+        // the asymmetry is deliberate. The rows above were written under whatever spelling the
+        // pipeline used and must be matched byte-for-byte (see `containerKeyOf`'s note on why a
+        // normalizing key would be actively worse for the cascade); the diffstat rows are always
+        // written through `createCommitDiffstatCache`, which normalizes, so matching them means
+        // normalizing here too. Same rule — "compare the value that was stored" — reaching two
+        // different spellings because the two writers differ.
         deleteContainerDiffstats(db, type, container);
 
         // 4. Rebuild the affected days WHOLE from what survives: a day another container

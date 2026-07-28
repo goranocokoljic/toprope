@@ -103,6 +103,22 @@ function decodeRow(row: DiffstatRow): CommitDiffstat | null {
 }
 
 /**
+ * A cache the sync pipeline OWNS, as opposed to the two-method view the providers get.
+ *
+ * The extra method exists because "never throws" and "never says anything" are separable, and
+ * only the second is a bug. A read-only database, a schema drift, sustained `SQLITE_BUSY`
+ * against the dashboard's connection or a full disk makes every call fail — the deployment
+ * then reverts to pre-#273 behaviour and stays there, paying full price on every commit of
+ * every run, while reporting a perfectly clean sync. That is the project's own graduated rule
+ * ("never infer a positive health claim from narrower checks returning empty"): a run that
+ * could not use the ratchet must say so.
+ */
+export interface OwnedCommitDiffstatCache extends CommitDiffstatCache {
+    /** How many cache operations this instance has silently swallowed a fault from. */
+    faults(): number;
+}
+
+/**
  * The diffstat cache for ONE provider instance, i.e. one `(providerType, container)`.
  *
  * `container` is normalized here with the same {@link normalizeContainer} every other
@@ -111,41 +127,47 @@ function decodeRow(row: DiffstatRow): CommitDiffstat | null {
  * pipeline does) is already canonical and this is inert; a caller passing raw config text is
  * still keyed identically to the rows the cascade will retract.
  *
- * @throws when `container` normalizes to blank. This is the ONE thing this module throws, and
- * it happens at CONSTRUCTION — before any provider loop exists to be broken by it. A blank
- * container is not an attribution key, so a cache scoped to one could never be retracted by a
- * per-provider delete. Unreachable through the pipeline — `validateGitProviderConfig` rejects
- * a blank org/workspace/group first — so this is the invariant stated where it is relied on.
+ * TOTAL — nothing here throws, including construction. A blank container (or a bogus provider
+ * type) is refused by the table's own `CHECK (length(container) > 0)`, which lands in `put`'s
+ * guard and degrades to "no rows cached", exactly like every other fault. There is deliberately
+ * no constructor-time rejection: it would be the one unguarded call in a module whose whole
+ * contract is that it cannot break a sync, and the pipeline's canonical
+ * `validateGitProviderConfig` already refuses a blank org/workspace/group one line later with
+ * a far better message.
  */
 export function createCommitDiffstatCache(
     db: Database.Database,
     providerType: GitProviderType,
     container: string,
-): CommitDiffstatCache {
+): OwnedCommitDiffstatCache {
     const scope = normalizeContainer(container);
-    if (scope === '') {
-        throw new Error(
-            `Cannot cache commit diffstats for ${providerType}: container is blank`,
-        );
-    }
+    let faults = 0;
 
     // Prepared ONCE and reused for the whole run: `put` fires per commit — thousands of times
-    // on a full-history sync — and re-preparing the same SQL each time is pure waste. The
-    // batched READ prepares inline instead (its SQL varies with the chunk length), matching
-    // what `projection.ts` does at the equivalent site.
-    const insert = db.prepare(
-        `INSERT INTO commit_diffstats
-             (provider, container, repo, sha, additions, deletions, absent, entries, fetched_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(provider, container, repo, sha) DO UPDATE SET
-             additions  = excluded.additions,
-             deletions  = excluded.deletions,
-             absent     = excluded.absent,
-             entries    = excluded.entries,
-             fetched_at = excluded.fetched_at`,
-    );
+    // on a full-history sync — and re-preparing the same SQL each time is pure waste. LAZILY,
+    // and from inside `put`'s guard: `db.prepare` throws on an unknown table or a schema
+    // mismatch, and doing it eagerly here would put that throw outside every catch — on the
+    // sync's per-provider handler, which reports an infrastructure fault in a disposable memo
+    // as "this provider could not be used" and skips the provider's entire sync.
+    // The batched READ prepares inline instead (its SQL varies with the chunk length),
+    // matching what `projection.ts` does at the equivalent site.
+    let insert: Database.Statement | null = null;
+    const insertStatement = (): Database.Statement =>
+        (insert ??= db.prepare(
+            `INSERT INTO commit_diffstats
+                 (provider, container, repo, sha, additions, deletions, absent, entries, fetched_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(provider, container, repo, sha) DO UPDATE SET
+                 additions  = excluded.additions,
+                 deletions  = excluded.deletions,
+                 absent     = excluded.absent,
+                 entries    = excluded.entries,
+                 fetched_at = excluded.fetched_at`,
+        ));
 
     return {
+        faults: () => faults,
+
         load(repo: string, shas: readonly string[]): Map<string, CommitDiffstat> {
             const hits = new Map<string, CommitDiffstat>();
             if (repo === '') return hits;
@@ -178,6 +200,7 @@ export function createCommitDiffstatCache(
             } catch {
                 // See the module header: a read fault must cost re-fetching, never the run.
                 // Partial hits already collected stay — they are individually valid rows.
+                faults++;
             }
             return hits;
         },
@@ -189,8 +212,22 @@ export function createCommitDiffstatCache(
             const entries = absent ? [] : value.entries;
             const additions = absent ? 0 : value.additions;
             const deletions = absent ? 0 : value.deletions;
+            const serialized = JSON.stringify(entries);
+            // WRITE ONLY WHAT THE READER WILL ACCEPT. `decodeEntries` is stricter than the
+            // table's CHECK constraints (which cannot inspect JSON), and a provider can
+            // legitimately produce a value it rejects — Bitbucket maps an entry with neither
+            // `new` nor `old` to `path: ''`, GitLab to `undefined`, which `JSON.stringify`
+            // then drops entirely. Storing such a row makes the ratchet a silent no-op for
+            // exactly those commits FOREVER: every run writes it, every next run rejects it
+            // on read and re-fetches. Refusing the write costs the same re-fetch and one
+            // decision instead of one UPSERT per run — and it makes the two boundaries agree,
+            // which is the graduated "check and store the same normalized value" rule.
+            if (decodeEntries(serialized) === null) {
+                faults++;
+                return;
+            }
             try {
-                insert.run(
+                insertStatement().run(
                     providerType,
                     scope,
                     repo,
@@ -198,14 +235,15 @@ export function createCommitDiffstatCache(
                     additions,
                     deletions,
                     absent ? 1 : 0,
-                    JSON.stringify(entries),
+                    serialized,
                     new Date().toISOString(),
                 );
             } catch {
                 // See the module header. Every argument-level defect the table's CHECK
-                // constraints reject (a blank repo/sha, a negative count) lands here too, so
-                // there is one guard rather than a pre-check per column that would still
-                // leave `SQLITE_BUSY` and a full disk uncovered.
+                // constraints reject (a blank container/repo/sha, a negative count) lands here
+                // too, so there is one guard rather than a pre-check per column that would
+                // still leave `SQLITE_BUSY` and a full disk uncovered.
+                faults++;
             }
         },
     };

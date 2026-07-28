@@ -16,7 +16,7 @@ import {
     resolveRawAuthor,
     type SnapshotCell,
 } from './projection.js';
-import {createGitProvider, validateGitProviderConfig} from './providers/factory.js';
+import {createGitProvider} from './providers/factory.js';
 import {createCommitDiffstatCache, deleteContainerDiffstats} from './diffstat-cache.js';
 import {
     containerKey,
@@ -104,6 +104,24 @@ export const PROVIDER_DELETED_MID_RUN_PREFIX = 'Provider changed during this run
  */
 export const RETRY_HEALED_PREFIX = 'Recovered after retry:';
 
+/**
+ * Prefix of the advisory pushed when the per-commit diffstat cache (#273) swallowed one or more
+ * faults during this provider's fetch.
+ *
+ * Deliberately NOT a failure: the cache is a memo of an idempotent remote read, every fault
+ * degrades to exactly one re-fetch, and turning a provider red because a disposable optimisation
+ * misfired would hold its cursor and discard a perfectly good window — the precise outcome the
+ * cache's never-throw contract exists to prevent.
+ *
+ * But it must be SAID, and this is the only place that can say it. A read-only database, a
+ * schema drift, sustained `SQLITE_BUSY` against the dashboard's connection or a full disk makes
+ * EVERY cache call fail; the ratchet is then completely dead, the deployment silently reverts to
+ * paying full price on every commit of every run, and the sole symptom is "the sync is still
+ * slow". Without this line, a permanently broken feature and a working one produce byte-identical
+ * output.
+ */
+export const DIFFSTAT_CACHE_DEGRADED_PREFIX = 'Diffstat cache degraded:';
+
 /** Every sentinel that marks an `errors` entry as advisory rather than a failure. */
 const ADVISORY_PREFIXES: readonly string[] = [
     UNMATCHED_AUTHORS_PREFIX,
@@ -111,6 +129,7 @@ const ADVISORY_PREFIXES: readonly string[] = [
     LEGACY_CELLS_SKIPPED_PREFIX,
     PROVIDER_DELETED_MID_RUN_PREFIX,
     RETRY_HEALED_PREFIX,
+    DIFFSTAT_CACHE_DEGRADED_PREFIX,
 ];
 
 /**
@@ -1280,22 +1299,20 @@ async function fetchProviderData(
     const allReviewComments: AnalysisReviewComment[] = [];
     const allPRRecords: PRRecordInput[] = [];
 
-    // Validated FIRST, before the cache scope is derived (#273). `validateGitProviderConfig` is
-    // the canonical seam — the very same one `createGitProvider` runs on the next line — and it
-    // is what rejects a blank org/workspace/group. Running it here keeps the rejection message
-    // identical while guaranteeing the container the diffstat cache is keyed by is a real
-    // attribution key, not the blank one no per-provider delete could ever retract.
-    validateGitProviderConfig(providerConfig);
     const identifier = providerIdentifier(providerConfig);
     // The persistent per-commit diffstat cache (#273), scoped to this provider instance. It is
     // what turns a failed run from "lost every fetch" into "lost only the uncached tail": the
     // provider writes each commit's diffstat through as it goes, OUTSIDE this run's write
     // transaction, so the rows survive the #231 drop-partials rule that discards everything
     // else. Supplied only here — probe paths (`doctor`, test-connection) never walk commits.
-    const provider = createGitProvider(
-        providerConfig,
-        createCommitDiffstatCache(db, providerConfig.type, identifier),
-    );
+    //
+    // Built BEFORE the config is validated, which is safe because the cache is total: an
+    // invalid config (blank org/workspace/group, bogus type) yields a cache whose every write
+    // the table's CHECK constraints refuse and whose guard swallows — and `createGitProvider`
+    // rejects that config with the canonical message on the very next line, before a single
+    // commit is fetched.
+    const diffstatCache = createCommitDiffstatCache(db, providerConfig.type, identifier);
+    const provider = createGitProvider(providerConfig, diffstatCache);
     const providerType = provider.name;
     const stateKey = syncStateKey(providerType, identifier);
     // Window selection:
@@ -1759,6 +1776,19 @@ async function fetchProviderData(
             // snapshot) never displays a finished repo's stale "PR 40/40" (#270).
             Object.assign(p, NO_REPO_STEP);
         });
+    }
+
+    // The cache never throws, so this line is the ONLY trace a broken one leaves. An advisory,
+    // not a failure — see DIFFSTAT_CACHE_DEGRADED_PREFIX. Reported once per provider with a
+    // count rather than per commit: a dead cache fails on every one of thousands of commits,
+    // and an error list that long is unreadable in the sync log and in the admin UI alike.
+    if (diffstatCache.faults() > 0) {
+        errors.push(
+            `${DIFFSTAT_CACHE_DEGRADED_PREFIX} [${providerType}] ${diffstatCache.faults()} commit ` +
+                'diffstat cache operation(s) failed and were skipped. Nothing was lost — every ' +
+                'affected commit was fetched from the provider — but this run made no permanent ' +
+                'progress for them, so a failure part-way through will re-fetch them next run.',
+        );
     }
 
     return {
@@ -2590,6 +2620,12 @@ export class GitSync implements ConnectorInterface {
         // on this (the rows are an immutable memo of a remote read), so a failure to tidy a
         // cache must neither roll back a committed sync nor — via the guard — replace a
         // successful `SyncResult` with a throw.
+        //
+        // Retracts the container's WHOLE cache, not just this run's rows. Equivalent today —
+        // the cascade emptied the table for this container, so everything present was written
+        // after it by this run — and that equivalence is the reason, not an accident: if a
+        // second concurrent writer for one container ever becomes possible, this would discard
+        // its work too and would need scoping to the shas this run fetched.
         for (const pc of providerConfigs) {
             const container = providerIdentifier(pc);
             if (!containerLostOwner(pc.type, container)) continue;

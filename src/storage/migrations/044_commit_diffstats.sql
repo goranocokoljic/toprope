@@ -52,20 +52,35 @@
 -- the server's health, not about the commit, and the fetch sites rethrow them so no row is
 -- written. Only a successful response or a deterministic 404 reaches a write.
 --
--- THE RESIDUAL, STATED PLAINLY. Two answers are recorded as facts that in rare circumstances
+-- THE RESIDUAL, STATED PLAINLY. Three answers are recorded as facts that in rare circumstances
 -- are not facts about the commit:
 --   * a 404 that means "you may not see this" rather than "this has no diffstat". Reaching the
 --     diffstat call requires that repo's COMMIT LIST to have already succeeded on the same
---     credential, so this needs access to be revoked between the list and the per-commit walk;
+--     credential, so this needs access to be revoked between the list and the per-commit walk —
+--     which on a multi-hour full-history sync is a window measured in hours, not seconds;
+--   * a 404 on page >= 2 of a PAGED diff. Both `fetchPaged` (Bitbucket) and the `x-next-page`
+--     loop (GitLab) discard the pages already collected and throw, so a commit whose first page
+--     listed 500 files is recorded as having none;
 --   * a 200 that is silently truncated — e.g. a proxy stripping GitLab's `x-next-page` or
 --     Bitbucket's `next`, so a paged diff ends early and its re-summed totals under-report.
--- Neither is new in KIND: both already produced an understated commit, and on a run that
+-- None is new in KIND: all three already produced an understated commit, and on a run that
 -- COMPLETED the cursor advanced past it, so the understatement was already permanent. What
 -- changes is the one case where it used to self-heal — a run that later FAILED re-covered its
 -- whole window and re-asked. The remedy is that this table is disposable: deleting the
 -- affected rows (or the container's whole set) makes the next sync re-fetch them.
 --     DELETE FROM commit_diffstats WHERE provider = ? AND container = ?;   -- and/or AND repo = ?
 -- The provider delete cascade (#264) issues exactly that statement for its container.
+--
+-- THIS TABLE IS PART OF THE GIT-DATA RESET CONTRACT — a future reset MUST clear it. Migrations
+-- 042 and 043 established the project's remedy for wrong git data: empty `git_snapshots` /
+-- `raw_author_daily`, clear the `git_*` cursors, and resync. That remedy works because the
+-- resync re-asks the provider for everything. A resync that reads this table does NOT re-ask;
+-- it replays whatever is cached, including any of the three answers above. So any future
+-- migration or command that resets git data must add
+--     DELETE FROM commit_diffstats;
+-- or the reset will silently converge on the same numbers it was run to discard. (Nothing needs
+-- adding to 042/043 themselves: both predate this table, so on any store that has run them the
+-- table is empty or absent.)
 --
 -- DATA SCOPE — READ BEFORE ADDING A COLUMN. `entries` is the FIRST place this schema persists
 -- actual source-tree paths from a customer's private repositories; every prior git table stored

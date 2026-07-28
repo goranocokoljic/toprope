@@ -22,12 +22,21 @@ import path from 'path';
 import {runMigrations} from '../../../src/storage/migrator';
 import {addTeam} from '../../../src/registry/teams';
 import {addDeveloper} from '../../../src/registry/developers';
-import {GitSync, syncStateKey} from '../../../src/connectors/git/sync';
+import {
+    DIFFSTAT_CACHE_DEGRADED_PREFIX,
+    GitSync,
+    isAdvisoryError,
+    syncStateKey,
+} from '../../../src/connectors/git/sync';
 import {
     createCommitDiffstatCache,
     deleteContainerDiffstats,
 } from '../../../src/connectors/git/diffstat-cache';
-import {MAX_SERVER_ERROR_RETRIES} from '../../../src/connectors/git/providers/http-retry';
+import {resolveCommitDiffstat} from '../../../src/connectors/git/providers/diffstat';
+import {
+    GitProviderFetchError,
+    MAX_SERVER_ERROR_RETRIES,
+} from '../../../src/connectors/git/providers/http-retry';
 import type {
     GitFileDiff,
     GitProviderConfig,
@@ -146,6 +155,17 @@ const FILES = Array.from({length: 5}, (_, i) => ({
 const TOTAL_ADDITIONS = FILES.reduce((s, f) => s + f.additions, 0);
 const TOTAL_DELETIONS = FILES.reduce((s, f) => s + f.deletions, 0);
 
+/**
+ * GitHub's commit-level totals, deliberately NOT equal to the sum of {@link FILES}.
+ *
+ * GitHub caps a commit's `files` array at 300 while `stats` covers the whole commit, which is
+ * why `CommitDiffstat` stores the totals rather than re-deriving them — and why the warm path
+ * reads `hit.additions` instead of summing `hit.entries`. If the fixture made the two equal,
+ * that single most GitHub-specific line in the diff would be unfalsifiable: replacing it with a
+ * re-sum would keep every assertion green.
+ */
+const GITHUB_STATS = {additions: 9999, deletions: 8888};
+
 /** A unified-diff hunk that parses to exactly `additions`/`deletions` changed lines (GitLab). */
 function hunk(additions: number, deletions: number): string {
     return (
@@ -213,10 +233,17 @@ function bitbucketFetch(log: DiffstatLog, shas: string[] = SHAS): ReturnType<typ
  * the input the author-date guard exists for.
  */
 function githubListRow(sha: string, malformed = false): Record<string, unknown> {
+    if (malformed) {
+        // No embedded `commit` object AT ALL — the shape the optional-chaining guards on both
+        // the hit path and the detail path exist for. A missing key is strictly harder than a
+        // null author: it is what would raise a TypeError out of `getCommits` and, via #231,
+        // hold the cursor and discard the provider's whole window.
+        return {sha, author: {login: 'alice-gh'}};
+    }
     return {
         sha,
         commit: {
-            author: malformed ? null : {name: 'Alice', email: AUTHOR_EMAIL, date: COMMIT_DATE},
+            author: {name: 'Alice', email: AUTHOR_EMAIL, date: COMMIT_DATE},
             message: COMMIT_MESSAGE,
         },
         author: {login: 'alice-gh'},
@@ -245,9 +272,8 @@ function githubFetch(
             return jsonResponse(200, {
                 ...githubListRow(sha, malformed.has(sha)),
                 stats: {
-                    additions: TOTAL_ADDITIONS,
-                    deletions: TOTAL_DELETIONS,
-                    total: TOTAL_ADDITIONS + TOTAL_DELETIONS,
+                    ...GITHUB_STATS,
+                    total: GITHUB_STATS.additions + GITHUB_STATS.deletions,
                 },
                 files: FILES.map((f) => ({
                     filename: f.path,
@@ -343,6 +369,12 @@ interface ProviderCase {
     config: GitProviderConfig;
     fetchFor: (log: DiffstatLog) => ReturnType<typeof vi.fn>;
     /**
+     * The COMMIT-LEVEL totals this provider reports per commit. Equal to the sum of
+     * {@link FILES} on Bitbucket and GitLab, where the diffstat entries ARE the commit; not
+     * equal on GitHub, whose `stats` covers the whole commit while `files` is capped at 300.
+     */
+    totals: {additions: number; deletions: number};
+    /**
      * Does a 404 on this provider's per-commit endpoint MEAN something ("no diffstat exists")
      * or is it an anomaly? Bitbucket/GitLab: an answer, cached. GitHub: the endpoint is the
      * commit itself and the sha came from its own list, so a 404 must propagate uncached.
@@ -357,6 +389,7 @@ const PROVIDERS: ProviderCase[] = [
         container: 'test-ws',
         config: BITBUCKET_CONFIG,
         fetchFor: bitbucketFetch,
+        totals: {additions: TOTAL_ADDITIONS, deletions: TOTAL_DELETIONS},
         fourOhFourIsAnAnswer: true,
     },
     {
@@ -365,6 +398,7 @@ const PROVIDERS: ProviderCase[] = [
         container: 'test-org',
         config: GITHUB_CONFIG,
         fetchFor: githubFetch,
+        totals: GITHUB_STATS,
         fourOhFourIsAnAnswer: false,
     },
     {
@@ -373,6 +407,7 @@ const PROVIDERS: ProviderCase[] = [
         container: 'test-group',
         config: GITLAB_CONFIG,
         fetchFor: gitlabFetch,
+        totals: {additions: TOTAL_ADDITIONS, deletions: TOTAL_DELETIONS},
         fourOhFourIsAnAnswer: true,
     },
 ];
@@ -438,6 +473,23 @@ function copyDiffstats(from: Database.Database, to: Database.Database): number {
     );
     for (const row of rows) insert.run(row);
     return rows.length;
+}
+
+/** The admin-connected (DB-owned) provider row for `bitbucket/test-ws`. */
+function insertBitbucketProviderRow(db: Database.Database): void {
+    db.prepare(
+        `INSERT INTO git_providers
+         (id, type, container, url, include_subgroups, auth_method, auth_username,
+          token_ciphertext, token_meta, token_last4, repos_include, repos_exclude,
+          enabled, created_at, updated_at, created_by, last_sync_at, last_sync_status, last_sync_error)
+         VALUES ('p1', 'bitbucket', 'test-ws', NULL, NULL, 'access_token', NULL, ?, ?, '1234',
+                 NULL, NULL, 1, ?, ?, NULL, NULL, NULL, NULL)`,
+    ).run(
+        Buffer.from('cipher'),
+        '{"algo":"AES-256-GCM","iv":"x","auth_tag":"y","key_id":"k1"}',
+        NOW,
+        NOW,
+    );
 }
 
 function countRows(db: Database.Database, table: string): number {
@@ -523,6 +575,15 @@ describe('#273 per-commit diffstat ratchet cache', () => {
             expect(cachedRows(db).map((r) => r.sha)).toEqual([SHAS[0], SHAS[1]]);
             // A 5xx is a statement about the server, not about the commit — never cached.
             expect(cachedRows(db).some((r) => r.sha === SHAS[2])).toBe(false);
+            // The row holds the COMMIT-LEVEL totals the provider reported, and the file
+            // entries separately. On GitHub those legitimately differ (`stats` covers the
+            // whole commit, `files` is capped at 300), so re-deriving either from the other
+            // would silently under-report exactly the largest commits.
+            expect(cachedRows(db)[0]).toMatchObject({
+                additions: provider.totals.additions,
+                deletions: provider.totals.deletions,
+            });
+            expect(JSON.parse(cachedRows(db)[0].entries)).toHaveLength(FILES.length);
             // The in-run repo retry (#272) re-attempts the whole repo twice more; because the
             // first two shas are already cached, neither is re-requested even WITHIN the run.
             expect(log.countAll(SHAS[0])).toBe(1);
@@ -546,8 +607,8 @@ describe('#273 per-commit diffstat ratchet cache', () => {
                     .get(),
             ).toEqual({
                 commits: SHAS.length,
-                lines_added: SHAS.length * TOTAL_ADDITIONS,
-                lines_removed: SHAS.length * TOTAL_DELETIONS,
+                lines_added: SHAS.length * provider.totals.additions,
+                lines_removed: SHAS.length * provider.totals.deletions,
                 files_changed: SHAS.length * FILES.length,
             });
             expect(
@@ -744,11 +805,12 @@ describe('#273 per-commit diffstat ratchet cache', () => {
 
     // --- GitHub's malformed-commit branches ------------------------------------------------
 
-    it('GitHub: a commit with no author date is dropped, uncached, on both the cold and the warm run', async () => {
+    it('GitHub: a commit with no embedded `commit` object is dropped, uncached, on both the cold and the warm run', async () => {
         // The hit path and the write are gated on the SAME condition (a usable author date), so
         // the cache can neither drop a commit the un-cached path kept nor add one it dropped.
-        // A list row with no `commit` object also must not throw — GitHub omits it for a
-        // commit whose git author cannot be parsed.
+        // The fixture omits the `commit` object entirely on BOTH the list row and the detail
+        // response, so an unguarded dereference on either side raises a TypeError out of
+        // `getCommits` — which #231 turns into "hold the cursor, discard the whole provider".
         const db = makeDb();
         const devId = seedAlice(db);
         const log = makeLog();
@@ -798,12 +860,76 @@ describe('#273 per-commit diffstat ratchet cache', () => {
         expect(cache.load('repo1', SHAS).size).toBe(SHAS.length);
         // A different workspace whose API happens to serve the same repo/sha names, likewise.
         expect(createCommitDiffstatCache(db, 'bitbucket', 'other-ws').load('repo1', SHAS).size).toBe(0);
+        // …and a different PROVIDER FAMILY with a colliding container/repo/sha. Mirrored repos
+        // really do share shas across providers, so `provider = ?` in the WHERE clause is load
+        // bearing, not decorative.
+        const mirrored = createCommitDiffstatCache(db, 'github', 'test-ws');
+        expect(mirrored.load('repo1', SHAS).size).toBe(0);
+        mirrored.put('repo1', SHAS[0], {additions: 1, deletions: 0, entries: [], absent: false});
+        expect(cache.load('repo1', [SHAS[0]]).get(SHAS[0])?.additions).not.toBe(1);
         // …and the same workspace spelled differently resolves to the SAME rows (#266
         // normalization — the value compared is the value persisted).
         expect(
             createCommitDiffstatCache(db, 'bitbucket', '  TEST-WS ').load('repo1', SHAS).size,
         ).toBe(SHAS.length);
 
+        db.close();
+    });
+
+    // --- A DB-connected provider that SURVIVES its run -------------------------------------
+
+    it('keeps the cache of an admin-connected provider that is still there when the run ends', async () => {
+        // The production shape, and the only one in which the mid-run purge's ownership guard
+        // is evaluated on its happy path: every other test here passes an ad-hoc config with no
+        // `git_providers` row, which short-circuits the guard before it compares anything. A
+        // regression that inverted the comparison would purge the cache after every scheduled
+        // sync — the ratchet dead in production, suite green.
+        const db = makeDb();
+        seedAlice(db);
+        insertBitbucketProviderRow(db);
+        const log = makeLog();
+        vi.stubGlobal('fetch', bitbucketFetch(log));
+
+        const first = await runSync(db, BITBUCKET_CONFIG);
+
+        expect(first.errors.filter((e) => e.includes('Failed to fetch'))).toEqual([]);
+        expect(
+            first.errors.some((e) => e.startsWith('Provider changed during this run:')),
+        ).toBe(false);
+        expect(countDiffstats(db, 'bitbucket', 'test-ws')).toBe(SHAS.length);
+
+        // …and it is actually reused: reset the cursor so the same window is re-walked, and no
+        // per-commit request is made.
+        db.prepare('DELETE FROM sync_state WHERE key = ?').run(syncStateKey('bitbucket', 'test-ws'));
+        log.reset();
+        await runSync(db, BITBUCKET_CONFIG);
+        expect(log.all).toEqual([]);
+        expect(countDiffstats(db, 'bitbucket', 'test-ws')).toBe(SHAS.length);
+
+        db.close();
+    });
+
+    // --- A degraded cache is reported, never silent ------------------------------------------
+
+    it('reports an ADVISORY when the cache is unusable, and still completes the run', async () => {
+        // The cache never throws, so without this line a permanently dead ratchet and a working
+        // one produce byte-identical output. It must be an advisory, not a failure: turning the
+        // provider red would hold its cursor and discard a perfectly good window.
+        const db = makeDb();
+        const devId = seedAlice(db);
+        const log = makeLog();
+        vi.stubGlobal('fetch', bitbucketFetch(log));
+        db.exec('DROP TABLE commit_diffstats');
+
+        const result = await runSync(db, BITBUCKET_CONFIG);
+
+        const advisory = result.errors.find((e) => e.startsWith(DIFFSTAT_CACHE_DEGRADED_PREFIX));
+        expect(advisory).toBeDefined();
+        expect(isAdvisoryError(advisory!)).toBe(true);
+        // The run itself is untouched: every commit was fetched and the data landed.
+        expect(result.errors.filter((e) => e.includes('Failed to fetch'))).toEqual([]);
+        expect(fullSnapshot(db, devId).commits).toBe(SHAS.length);
+        expect(log.ok).toHaveLength(SHAS.length);
         db.close();
     });
 
@@ -815,14 +941,7 @@ describe('#273 per-commit diffstat ratchet cache', () => {
         // inherit file-level detail its credentials may no longer justify.
         const db = makeDb();
         seedAlice(db);
-        db.prepare(
-            `INSERT INTO git_providers
-             (id, type, container, url, include_subgroups, auth_method, auth_username,
-              token_ciphertext, token_meta, token_last4, repos_include, repos_exclude,
-              enabled, created_at, updated_at, created_by, last_sync_at, last_sync_status, last_sync_error)
-             VALUES ('p1', 'bitbucket', 'test-ws', NULL, NULL, 'access_token', NULL, ?, ?, '1234',
-                     NULL, NULL, 1, ?, ?, NULL, NULL, NULL, NULL)`,
-        ).run(Buffer.from('cipher'), '{"algo":"AES-256-GCM","iv":"x","auth_tag":"y","key_id":"k1"}', NOW, NOW);
+        insertBitbucketProviderRow(db);
 
         const log = makeLog();
         // Delete the owning row on the repo's commit-list request — i.e. after the run
@@ -845,6 +964,30 @@ describe('#273 per-commit diffstat ratchet cache', () => {
         db.close();
     });
 
+    it('a purge that itself fails does not replace a committed run’s result with a throw', async () => {
+        // The purge runs AFTER the write transaction commits, so an exception escaping it would
+        // lose the whole `SyncResult` of a run whose data is already durable — strictly worse
+        // than a rollback, because the state and the report would then disagree.
+        const db = makeDb();
+        seedAlice(db);
+        insertBitbucketProviderRow(db);
+        const log = makeLog();
+        log.onListRequest = (): void => {
+            db.prepare("DELETE FROM git_providers WHERE id = 'p1'").run();
+            db.exec('DROP TABLE commit_diffstats');
+        };
+        vi.stubGlobal('fetch', bitbucketFetch(log));
+
+        const result = await runSync(db, BITBUCKET_CONFIG);
+
+        expect(result.errors.some((e) => e.startsWith('Provider changed during this run:'))).toBe(
+            true,
+        );
+        // …and the cache's own faults were reported rather than swallowed into silence.
+        expect(result.errors.some((e) => e.startsWith(DIFFSTAT_CACHE_DEGRADED_PREFIX))).toBe(true);
+        db.close();
+    });
+
     it('purges them on a FAILED BACKFILL too — the path the ownership gate never reaches', async () => {
         // The gate that records an orphan only runs from inside the write transaction, driven
         // by rows/cursors/stall updates. A backfill run whose fetch was incomplete pushes NONE
@@ -855,14 +998,7 @@ describe('#273 per-commit diffstat ratchet cache', () => {
         // the state that leaves the MOST stray rows behind.
         const db = makeDb();
         seedAlice(db);
-        db.prepare(
-            `INSERT INTO git_providers
-             (id, type, container, url, include_subgroups, auth_method, auth_username,
-              token_ciphertext, token_meta, token_last4, repos_include, repos_exclude,
-              enabled, created_at, updated_at, created_by, last_sync_at, last_sync_status, last_sync_error)
-             VALUES ('p1', 'bitbucket', 'test-ws', NULL, NULL, 'access_token', NULL, ?, ?, '1234',
-                     NULL, NULL, 1, ?, ?, NULL, NULL, NULL, NULL)`,
-        ).run(Buffer.from('cipher'), '{"algo":"AES-256-GCM","iv":"x","auth_tag":"y","key_id":"k1"}', NOW, NOW);
+        insertBitbucketProviderRow(db);
 
         const log = makeLog();
         log.failing.add(SHAS[2]);
@@ -886,6 +1022,69 @@ describe('#273 per-commit diffstat ratchet cache', () => {
         db.close();
     });
 
+    // --- The shared helper's 404-ONLY rule ---------------------------------------------------
+
+    describe('resolveCommitDiffstat (the shared Bitbucket/GitLab fetch site)', () => {
+        let db: Database.Database;
+
+        beforeEach(() => {
+            db = makeDb();
+        });
+        afterEach(() => db.close());
+
+        const ENTRIES: GitFileDiff[] = [
+            {path: 'src/a.ts', additions: 3, deletions: 1, status: 'modified'},
+        ];
+
+        it('caches a success and a 404, and NOTHING else — including a transport fault', async () => {
+            // The 404-is-an-answer rule has two disjuncts, and only one of them is a status
+            // test. A transport fault surfaces as `GitProviderFetchError` with `status: null`
+            // (no response was ever produced) and a bug in our own adapter is not a
+            // `GitProviderFetchError` at all — both must rethrow, or an outage is frozen as a
+            // commit's churn.
+            const cache = createCommitDiffstatCache(db, 'gitlab', 'grp');
+            const cached = new Map<string, never>();
+
+            await expect(
+                resolveCommitDiffstat(cache, cached, 'repo1', 'ok', async () => ENTRIES),
+            ).resolves.toEqual({additions: 3, deletions: 1, entries: ENTRIES, absent: false});
+            await expect(
+                resolveCommitDiffstat(cache, cached, 'repo1', 'gone', async () => {
+                    throw new GitProviderFetchError('GitLab API error 404: /diff', 404);
+                }),
+            ).resolves.toEqual({additions: 0, deletions: 0, entries: [], absent: true});
+
+            for (const fault of [
+                new GitProviderFetchError('GitLab API server error 503: /diff', 503),
+                new GitProviderFetchError('ECONNRESET', null),
+                new TypeError('adapter bug'),
+            ]) {
+                await expect(
+                    resolveCommitDiffstat(cache, cached, 'repo1', `bad-${fault.name}`, async () => {
+                        throw fault;
+                    }),
+                ).rejects.toBe(fault);
+            }
+
+            expect(cachedRows(db).map((r) => r.sha)).toEqual(['gone', 'ok']);
+        });
+
+        it('serves a hit without calling the fetcher at all', async () => {
+            const hit = {additions: 9, deletions: 4, entries: ENTRIES, absent: false};
+            const fetcher = vi.fn();
+            await expect(
+                resolveCommitDiffstat(
+                    undefined,
+                    new Map([['sha1', hit]]),
+                    'repo1',
+                    'sha1',
+                    fetcher as unknown as () => Promise<GitFileDiff[]>,
+                ),
+            ).resolves.toBe(hit);
+            expect(fetcher).not.toHaveBeenCalled();
+        });
+    });
+
     // --- The cache module's own contract ----------------------------------------------------
 
     describe('createCommitDiffstatCache', () => {
@@ -896,8 +1095,34 @@ describe('#273 per-commit diffstat ratchet cache', () => {
         });
         afterEach(() => db.close());
 
-        it('refuses a blank container — it is not an attribution key', () => {
-            expect(() => createCommitDiffstatCache(db, 'github', '   ')).toThrow(/container is blank/);
+        it('is TOTAL — a blank container degrades to a dead cache rather than throwing', () => {
+            // A blank container is not an attribution key, so nothing may be stored under one.
+            // But refusing it by THROWING would be the single unguarded call in a module whose
+            // contract is that it cannot break a sync: the throw lands on the pipeline's
+            // per-provider handler and skips that provider's entire run. The table's
+            // `CHECK (length(container) > 0)` refuses the write instead, and it is counted.
+            const cache = createCommitDiffstatCache(db, 'github', '   ');
+            expect(() =>
+                cache.put('repo1', 'sha1', {additions: 1, deletions: 0, entries: [], absent: false}),
+            ).not.toThrow();
+            expect(countRows(db, 'commit_diffstats')).toBe(0);
+            expect(cache.load('repo1', ['sha1']).size).toBe(0);
+            expect(cache.faults()).toBe(1);
+        });
+
+        it('refuses to store an entries value its own reader would reject', () => {
+            // The two boundaries must agree, or the ratchet silently no-ops for those commits
+            // forever: every run writes the row, every next run rejects it on read and
+            // re-fetches. Bitbucket maps an entry with neither `new` nor `old` to `path: ''`,
+            // which `decodeEntries` refuses — so this is a value a provider really can emit.
+            const cache = createCommitDiffstatCache(db, 'github', 'org');
+            const unreadable: GitFileDiff[] = [
+                {path: '', additions: 1, deletions: 0, status: 'modified'},
+            ];
+            cache.put('repo1', 'sha1', {additions: 1, deletions: 0, entries: unreadable, absent: false});
+
+            expect(countDiffstats(db, 'github', 'org')).toBe(0);
+            expect(cache.faults()).toBe(1);
         });
 
         it('round-trips a diffstat, whole and idempotently', () => {
@@ -997,17 +1222,23 @@ describe('#273 per-commit diffstat ratchet cache', () => {
             expect(countDiffstats(db, 'github', 'org')).toBe(0);
         });
 
-        it('neither method throws when the table itself is gone', () => {
+        it('neither method throws when the table itself is gone — including at construction', () => {
             // The general form of the guarantee above: SQLITE_BUSY against a second connection,
             // a full disk, a schema the process did not expect. A missing table is the
             // reproducible stand-in — before #273 the fetch phase issued no DB calls at all, so
             // any of these would be a NEW way to lose a multi-hour sync.
-            const cache = createCommitDiffstatCache(db, 'github', 'org');
+            //
+            // The cache is CONSTRUCTED after the drop, which is the case an eagerly-prepared
+            // INSERT statement would fail on — outside every catch, on the pipeline's
+            // per-provider handler, reporting a disposable memo's fault as "this provider could
+            // not be used" and skipping its whole sync.
             db.exec('DROP TABLE commit_diffstats');
+            const cache = createCommitDiffstatCache(db, 'github', 'org');
             expect(() =>
                 cache.put('repo1', 'sha1', {additions: 1, deletions: 0, entries: [], absent: false}),
             ).not.toThrow();
             expect(cache.load('repo1', ['sha1']).size).toBe(0);
+            expect(cache.faults()).toBe(2);
         });
 
         it('load short-circuits on an empty request instead of issuing a query', () => {
