@@ -302,7 +302,10 @@ export class BitbucketProvider implements GitProvider {
 
         // The per-commit diffstat fetch is the O(commits) cost of this call — report
         // each one so an observer's counter ticks instead of jumping 0 → N when the
-        // whole loop returns.
+        // whole loop returns. It is also the ONLY diffstat walk a sync makes per commit
+        // (the walk is itself paged, so a very wide commit still costs >1 request):
+        // `diffs` below hands this exact result to the caller so it does not re-walk the
+        // same endpoint (#271).
         const commits: GitCommit[] = [];
         onProgress?.({done: 0, total: collected.length});
         for (const raw of collected) {
@@ -325,6 +328,9 @@ export class BitbucketProvider implements GitProvider {
                 additions: diffs.reduce((s, d) => s + d.additions, 0),
                 deletions: diffs.reduce((s, d) => s + d.deletions, 0),
                 filesChanged: diffs.map((d) => d.path),
+                // `[]`, never undefined — including via the 404 branch above, where `[]`
+                // is the true answer. See `GitCommit.diffs` for why that matters (#271).
+                diffs,
             });
             // Every iteration pushes, so the commit count IS the processed count —
             // no separate counter to keep in step.

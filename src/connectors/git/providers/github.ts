@@ -141,8 +141,31 @@ interface RawCommitDetail {
         message: string;
     };
     author: {login: string} | null;
-    stats: {additions: number; deletions: number; total: number};
-    files: Array<{filename: string; additions: number; deletions: number; status: string}>;
+    // Both OPTIONAL: GitHub omits them on some commits, which is why every reader here
+    // guards (`detail.stats?.additions ?? 0`, `detail.files ?? []`). Typed to match what
+    // the readers actually assume, so nobody writes `detail.files.map(...)` on the strength
+    // of the declaration.
+    stats?: {additions: number; deletions: number; total: number};
+    files?: Array<{filename: string; additions: number; deletions: number; status: string}>;
+}
+
+/**
+ * The single mapping from GitHub's commit-detail `files` to `GitFileDiff[]`, shared by
+ * `getCommits` (which attaches it to `GitCommit.diffs`) and `getCommitDiff` (which is the
+ * caller's fallback). One function so the two can never disagree — they read the SAME
+ * endpoint, and if they mapped it differently the reuse in #271 would change churn.
+ *
+ * Returns `[]` for a detail with no `files` (GitHub omits the key on some commits) — an
+ * answer, not "unknown": re-requesting the same endpoint would return the same thing. See
+ * `GitCommit.diffs` on why `[]` must never be treated as "go fetch it".
+ */
+function toFileDiffs(detail: RawCommitDetail): GitFileDiff[] {
+    return (detail.files ?? []).map((f) => ({
+        path: f.filename,
+        additions: f.additions,
+        deletions: f.deletions,
+        status: f.status,
+    }));
 }
 
 interface RawPR {
@@ -300,6 +323,11 @@ export class GitHubProvider implements GitProvider {
                 const detail = (await detailRes.json()) as RawCommitDetail;
                 if (!detail.commit.author?.date) continue;
 
+                // This detail response IS what `getCommitDiff` would re-request for the
+                // same sha, so carry its file list out on `diffs` and let the caller skip
+                // that second identical request (#271). `[]`, never undefined — a detail
+                // with no `files` means "no files". See `GitCommit.diffs`.
+                const diffs = toFileDiffs(detail);
                 commits.push({
                     sha: detail.sha,
                     author: {
@@ -309,9 +337,13 @@ export class GitHubProvider implements GitProvider {
                     },
                     date: detail.commit.author.date,
                     message: detail.commit.message,
+                    // NOT summed from `diffs`: GitHub caps `files` at 300 per commit while
+                    // `stats` covers the whole commit, so the totals stay authoritative
+                    // even where the file list is truncated. Unchanged by #271.
                     additions: detail.stats?.additions ?? 0,
                     deletions: detail.stats?.deletions ?? 0,
-                    filesChanged: (detail.files ?? []).map((f) => f.filename),
+                    filesChanged: diffs.map((d) => d.path),
+                    diffs,
                 });
             } catch (err) {
                 lastDetailError = err instanceof Error ? err : new Error(String(err));
@@ -474,11 +506,6 @@ export class GitHubProvider implements GitProvider {
         );
         const detail = (await res.json()) as RawCommitDetail;
 
-        return (detail.files ?? []).map((f) => ({
-            path: f.filename,
-            additions: f.additions,
-            deletions: f.deletions,
-            status: f.status,
-        }));
+        return toFileDiffs(detail);
     }
 }

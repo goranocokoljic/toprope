@@ -392,7 +392,57 @@ describe('BitbucketProvider', () => {
                 additions: 40,
                 deletions: 5,
                 filesChanged: ['src/foo.ts', 'src/bar.ts'],
+                // The diffstat this call already fetched, carried out so the sync loop
+                // does not request it a second time (#271).
+                diffs: [
+                    {path: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'},
+                    {path: 'src/bar.ts', additions: 10, deletions: 0, status: 'added'},
+                ],
             });
+        });
+
+        // --- diff reuse (#271) ---
+
+        it('exposes diffs byte-identical to what getCommitDiff would return for the same sha', async () => {
+            // The whole point of the reuse: the value handed to the caller must be the
+            // same value the fallback path would have produced, or churn changes.
+            // `getCommits` builds it by CALLING `this.getCommitDiff`, so today there is one
+            // implementation and this can only fail if someone forks it — a regression
+            // guard against exactly that, not an independent check.
+            const hash = 'abc123';
+            vi.stubGlobal(
+                'fetch',
+                makeFetchMock([
+                    {body: pagedResponse([makeCommitFixture(hash)])},
+                    {body: pagedResponse(makeDiffstatFixture())},
+                ]),
+            );
+            const commits = await provider.getCommits('my-repo', '', '');
+
+            // Fresh provider + fresh mock so the second call is genuinely independent.
+            vi.stubGlobal('fetch', makeFetchMock([{body: pagedResponse(makeDiffstatFixture())}]));
+            const viaFallback = await provider.getCommitDiff('my-repo', hash);
+
+            expect(commits[0].diffs).toEqual(viaFallback);
+        });
+
+        it('sets diffs to [] — not undefined — when the diffstat 404s, so the caller does not re-request', async () => {
+            // undefined would send the sync loop back to the endpoint that just 404'd,
+            // restoring exactly the duplicate request #271 removes for merge commits.
+            vi.stubGlobal(
+                'fetch',
+                makeFetchMock([
+                    {body: pagedResponse([makeCommitFixture('merge1')])},
+                    {body: {type: 'error'}, status: 404},
+                ]),
+            );
+
+            const commits = await provider.getCommits('my-repo', '', '');
+
+            expect(commits).toHaveLength(1);
+            // `toEqual([])` is the whole assertion: it fails on undefined too, which is
+            // precisely the distinction the sync loop branches on.
+            expect(commits[0].diffs).toEqual([]);
         });
 
         // --- onProgress (#270) ---
