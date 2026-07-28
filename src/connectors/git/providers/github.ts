@@ -1,5 +1,4 @@
 import type {
-    CommitDiffstat,
     CommitDiffstatCache,
     GitProvider,
     GitProviderType,
@@ -15,6 +14,7 @@ import type {
     GitFetchProgressListener,
 } from './types.js';
 import {normalizeContainer} from './container.js';
+import {loadDiffstats} from './diffstat.js';
 import {
     GitProviderFetchError,
     MAX_RATE_LIMIT_RETRIES,
@@ -173,7 +173,7 @@ interface RawCommitListItem {
         author: {name: string; email: string; date: string} | null;
         message: string;
     };
-    author?: {login: string} | null;
+    author: {login: string} | null;
 }
 
 interface RawCommitDetail {
@@ -361,16 +361,15 @@ export class GitHubProvider implements GitProvider {
         // The whole repo's already-known commit stats, resolved in ONE batched query rather
         // than a point read per commit (#273). Empty map when no cache was supplied — every
         // probe path (doctor, test-connection) omits it, and behaves exactly as before.
-        const cached: Map<string, CommitDiffstat> =
-            this.diffstatCache?.load(repo, summaries.map((s) => s.sha)) ?? new Map();
+        const cached = loadDiffstats(this.diffstatCache, repo, summaries.map((s) => s.sha));
         for (const summary of summaries) {
             try {
-                // A list row with no author date does NOT take the hit path — it falls
-                // through to the detail fetch exactly as it always did. The two endpoints
-                // embed the same `commit` object so they agree in practice, but making the
-                // hit conditional on the field being present is what guarantees the cache can
-                // never DROP a commit the un-cached path would have kept: the worst case is
-                // one re-request for a malformed commit that is skipped either way.
+                // THE HIT AND THE WRITE ARE GATED ON THE SAME CONDITION — a usable author
+                // date — so the cache can neither DROP a commit the un-cached path kept nor
+                // ADD one it dropped. A list row with no author date simply falls through to
+                // the detail fetch exactly as it always did; that commit is discarded either
+                // way (see the guard below), and the cost is one re-request for a data-shape
+                // anomaly no retry can fix (the remaining half of #275).
                 const listCommit = summary.commit;
                 if (listCommit?.author?.date) {
                     const hit = cached.get(summary.sha);
@@ -420,25 +419,29 @@ export class GitHubProvider implements GitProvider {
                 // even where the file list is truncated. Unchanged by #271.
                 const additions = detail.stats?.additions ?? 0;
                 const deletions = detail.stats?.deletions ?? 0;
-                // Cached BEFORE the author-date guard below (#273): the fetch succeeded and
-                // the fact is immutable, so it is worth keeping even for a commit this run
-                // then skips — otherwise exactly the malformed commits are re-requested every
-                // run. Keyed on `summary.sha`, the same spelling `load` was asked for, so a
-                // write is guaranteed to be found by the next run's read.
+
+                // Cached AFTER the author-date guard, so the write is gated on exactly the
+                // condition the hit path reads on (#273). Writing before it would let a
+                // commit the un-cached path DROPS be pushed by a later warm run — the
+                // opposite divergence to the one the hit gate prevents, and just as much a
+                // break of "a hit produces what a fetch produces".
+                //
+                // Keyed on `summary.sha`, the same spelling `load` was asked for, so a write
+                // is guaranteed to be found by the next run's read.
                 //
                 // `absent: false` always. Unlike Bitbucket/GitLab, a 404 here is NOT an
                 // answer: the sha came from GitHub's own commit list, and the endpoint is the
                 // commit itself rather than a separate diffstat resource — so a 404 is an
                 // anomaly that must surface, and `fetchGitHub` throws it (#272). No failure
-                // of any kind reaches this line.
+                // of any kind reaches this line, which is also why GitHub does not use the
+                // shared `resolveCommitDiffstat` helper the other two providers share.
+                if (!detail.commit.author?.date) continue;
                 this.diffstatCache?.put(repo, summary.sha, {
                     additions,
                     deletions,
                     entries: diffs,
                     absent: false,
                 });
-
-                if (!detail.commit.author?.date) continue;
 
                 commits.push({
                     sha: detail.sha,

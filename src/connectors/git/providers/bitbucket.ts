@@ -1,5 +1,4 @@
 import type {
-    CommitDiffstat,
     CommitDiffstatCache,
     GitProvider,
     GitProviderType,
@@ -14,6 +13,7 @@ import type {
     GitFetchProgressListener,
 } from './types.js';
 import {normalizeContainer} from './container.js';
+import {loadDiffstats, resolveCommitDiffstat} from './diffstat.js';
 import {
     GitProviderFetchError,
     MAX_RATE_LIMIT_RETRIES,
@@ -345,46 +345,20 @@ export class BitbucketProvider implements GitProvider {
         // The whole repo's already-known diffstats, resolved in ONE batched query rather than
         // a point read per commit (#273). Empty map when no cache was supplied — every probe
         // path (doctor, test-connection) omits it, and behaves exactly as before.
-        const cached: Map<string, CommitDiffstat> =
-            this.diffstatCache?.load(repo, collected.map((c) => c.hash)) ?? new Map();
+        const cached = loadDiffstats(this.diffstatCache, repo, collected.map((c) => c.hash));
         for (const raw of collected) {
             const {name, email} = parseRawAuthor(raw.author.raw);
             const username = raw.author.user?.nickname ?? raw.author.user?.account_id ?? '';
-            const hit = cached.get(raw.hash);
-            let diffs: GitFileDiff[];
-            let additions: number;
-            let deletions: number;
-            if (hit !== undefined) {
-                // A diffstat never changes, so a hit is the same answer the endpoint would
-                // give — including the `absent` (404) case, whose cached form is `[]`/0/0,
-                // byte-identical to what the catch below produces.
-                diffs = hit.entries;
-                additions = hit.additions;
-                deletions = hit.deletions;
-            } else {
-                diffs = [];
-                let absent = false;
-                try {
-                    diffs = await this.getCommitDiff(repo, raw.hash);
-                } catch (err) {
-                    // 404 means diffstat absent for this commit (e.g. merge commits) — record with zero stats
-                    // Re-throw anything else (auth failure, server error) so systemic problems surface.
-                    // Keyed on the typed status rather than a ' 404:' substring (#272): the substring
-                    // also matched a URL that merely CONTAINED it, and swallowing a real failure here
-                    // silently understates the commit's churn.
-                    if (!(err instanceof GitProviderFetchError) || err.status !== 404) throw err;
-                    // Deterministic per commit — cacheable, and it MUST be cached or these are
-                    // the very commits re-asked on every run forever (#273).
-                    absent = true;
-                }
-                additions = diffs.reduce((s, d) => s + d.additions, 0);
-                deletions = diffs.reduce((s, d) => s + d.deletions, 0);
-                // Reached only on a success or a 404 — every other fault rethrew above, so no
-                // 5xx/rate-limit/transport failure is ever recorded as an answer. Written
-                // per-commit and OUTSIDE the run's write transaction, which is the whole point:
-                // the row survives a run that later fails and drops all its partial data.
-                this.diffstatCache?.put(repo, raw.hash, {additions, deletions, entries: diffs, absent});
-            }
+            // Cache-or-fetch, including the 404-is-an-answer rule and the write-through, lives
+            // in the shared helper — GitLab reaches its diff the same way and the two must not
+            // drift on WHICH faults are cacheable (#273).
+            const {entries: diffs, additions, deletions} = await resolveCommitDiffstat(
+                this.diffstatCache,
+                cached,
+                repo,
+                raw.hash,
+                () => this.getCommitDiff(repo, raw.hash),
+            );
             commits.push({
                 sha: raw.hash,
                 author: {name, email, username},
@@ -393,7 +367,7 @@ export class BitbucketProvider implements GitProvider {
                 additions,
                 deletions,
                 filesChanged: diffs.map((d) => d.path),
-                // `[]`, never undefined — including via the 404 branch above, where `[]`
+                // `[]`, never undefined — including via the helper's 404 branch, where `[]`
                 // is the true answer. See `GitCommit.diffs` for why that matters (#271).
                 diffs,
             });

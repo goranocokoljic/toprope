@@ -48,6 +48,13 @@ No proxy, no traffic interception. Pure API-pull + git analysis.
   cursors behind. The raw rows it clears cannot be honestly re-attributed to one spelling, so
   the days they fed are re-projected by a resync — and 043 leaves a `git_data_reset_pending`
   marker that `toprope doctor` fails on until the rebuild is acknowledged.
+  **`commit_diffstats` (#273) is NOT a snapshot table and the rule does not reach it.** It is a
+  MEMO of an idempotent remote read — `(provider, container, repo, sha) → file stats` — of a
+  fact that is immutable by construction (a commit is named by the hash of its own content), so
+  it has no history to rewrite and no staleness to invalidate. It is written per commit DURING
+  the fetch, outside the run's write transaction, which is the entire feature: those rows must
+  survive the #231 rule that discards a failed run's partial data. Deleting the whole table
+  costs nothing but re-fetching. Every other table's append-only reasoning is unaffected.
   `tool_snapshots` and every other snapshot table remain strictly append-only.
 - Waste detection: subscription with zero activity for 14+ days = unused
 - Data quality tracked per data point: high (API), medium (git), low (expense only)

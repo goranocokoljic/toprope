@@ -10,26 +10,29 @@
  * The DB dependency lives here and NOT in `providers/*`: the three providers are plain HTTP
  * clients, and they consult the cache through the two-method interface declared beside them
  * in `providers/types.ts`.
+ *
+ * ── NEITHER METHOD MAY EVER THROW ─────────────────────────────────────────────
+ * This is the module's load-bearing property, and it is enforced by a `try/catch` around the
+ * SQLite call itself, not merely by validating arguments. Both methods run INSIDE the
+ * provider's per-commit loop, and a throw there escapes `getCommits`, which #231 reads as an
+ * incompletely-covered window: the provider's forward cursor is held and the WHOLE run's data
+ * is discarded. Before #273 the fetch phase issued no database calls at all, so every fault
+ * mode this module can raise — `SQLITE_BUSY` against a second connection, a full disk, a
+ * CHECK violation from a future column — would be a NEW way to lose a multi-hour sync, and it
+ * would be caused by the optimisation that exists to make losing one cheaper. A memo that can
+ * kill the run it is accelerating is worse than no memo. Every failure here degrades to
+ * exactly one re-fetch on the next run.
  */
 
 import type Database from 'better-sqlite3';
 import {normalizeContainer} from './providers/container.js';
+import {chunk, READ_CHUNK_SIZE} from './raw-author-daily.js';
 import type {
     CommitDiffstat,
     CommitDiffstatCache,
     GitFileDiff,
     GitProviderType,
 } from './providers/types.js';
-
-/**
- * How many shas one batch-read statement binds.
- *
- * SQLite's compiled parameter limit is 32,766 on modern builds and 999 on older ones; 400 is
- * comfortably under both and still collapses a 5,000-commit repo from 5,000 point reads to 13
- * queries. The number is not load-bearing — larger chunks would be marginally faster and
- * smaller ones marginally slower; only "one query per commit" is actually wrong.
- */
-const SHA_CHUNK = 400;
 
 interface DiffstatRow {
     sha: string;
@@ -39,15 +42,25 @@ interface DiffstatRow {
     entries: string;
 }
 
+/** A non-negative integer, as every stored count must be. Narrows `unknown`. */
+function isCount(value: unknown): value is number {
+    return typeof value === 'number' && Number.isInteger(value) && value >= 0;
+}
+
 /**
  * Decode one stored `entries` blob, or null when it is not a usable file-diff list.
  *
  * `entries` is an unconstrained TEXT column, so its contents are validated at read time
- * rather than cast — every field is shape-checked, and one bad element rejects the whole row.
+ * rather than cast — every field is shape- AND domain-checked, and one bad element rejects
+ * the whole row. Domain, not just shape: these per-file numbers are the only input to
+ * `code_churn_rate` and `ai_signature_score`, so a negative or fractional value would flow
+ * straight into the derived metrics (the row totals get the same treatment in
+ * {@link decodeRow}).
+ *
  * A rejected row degrades to a cache MISS, which re-fetches and overwrites it: self-healing
  * is the right failure mode for a memo of an idempotent remote read, where the alternative
- * (trusting the shape) would let a truncated or hand-edited value corrupt a commit's churn
- * permanently, and failing closed would strand the row forever.
+ * (trusting the shape) would corrupt a commit's churn permanently, and failing closed would
+ * strand the row forever.
  */
 function decodeEntries(raw: string): GitFileDiff[] | null {
     let parsed: unknown;
@@ -61,17 +74,10 @@ function decodeEntries(raw: string): GitFileDiff[] | null {
     for (const item of parsed) {
         if (typeof item !== 'object' || item === null) return null;
         const {path, additions, deletions, status} = item as Record<string, unknown>;
-        if (typeof path !== 'string') return null;
+        if (typeof path !== 'string' || path === '') return null;
         if (typeof status !== 'string') return null;
-        // Finite numbers only: a NaN/Infinity that survived a JSON round-trip as `null`
-        // would flow straight into the churn and AI-signature maths.
-        if (!Number.isFinite(additions) || !Number.isFinite(deletions)) return null;
-        entries.push({
-            path,
-            additions: additions as number,
-            deletions: deletions as number,
-            status,
-        });
+        if (!isCount(additions) || !isCount(deletions)) return null;
+        entries.push({path, additions, deletions, status});
     }
     return entries;
 }
@@ -79,15 +85,17 @@ function decodeEntries(raw: string): GitFileDiff[] | null {
 /**
  * Decode a whole stored row, or null when it cannot be trusted.
  *
- * The `absent` invariant is re-checked in code as well as by the table's CHECK constraint: a
- * row claiming both "no diffstat exists" and "here are its changed lines" is incoherent, and
- * the honest answer is to re-fetch rather than to pick one half to believe.
+ * The numeric and `absent` invariants are re-checked in code as well as by the table's CHECK
+ * constraints. That is not pure belt-and-braces: SQLite's INTEGER *affinity* stores a
+ * non-lossless REAL as a REAL, so `additions = 1.5` satisfies `CHECK (additions >= 0)` and
+ * still reaches a reader. And a row claiming both "no diffstat exists" and "here are its
+ * changed lines" is incoherent whichever constraint let it in — the honest answer is to
+ * re-fetch rather than to pick one half to believe.
  */
 function decodeRow(row: DiffstatRow): CommitDiffstat | null {
     const entries = decodeEntries(row.entries);
     if (entries === null) return null;
-    if (!Number.isInteger(row.additions) || row.additions < 0) return null;
-    if (!Number.isInteger(row.deletions) || row.deletions < 0) return null;
+    if (!isCount(row.additions) || !isCount(row.deletions)) return null;
     if (row.absent !== 0 && row.absent !== 1) return null;
     const absent = row.absent === 1;
     if (absent && (entries.length > 0 || row.additions !== 0 || row.deletions !== 0)) return null;
@@ -103,10 +111,11 @@ function decodeRow(row: DiffstatRow): CommitDiffstat | null {
  * pipeline does) is already canonical and this is inert; a caller passing raw config text is
  * still keyed identically to the rows the cascade will retract.
  *
- * @throws when `container` normalizes to blank. Not a degradation: a blank container is not
- * an attribution key, so a cache scoped to one could never be retracted by a per-provider
- * delete. Unreachable through the pipeline — `validateGitProviderConfig` rejects a blank
- * org/workspace/group first — so this is the invariant stated where it is relied on.
+ * @throws when `container` normalizes to blank. This is the ONE thing this module throws, and
+ * it happens at CONSTRUCTION — before any provider loop exists to be broken by it. A blank
+ * container is not an attribution key, so a cache scoped to one could never be retracted by a
+ * per-provider delete. Unreachable through the pipeline — `validateGitProviderConfig` rejects
+ * a blank org/workspace/group first — so this is the invariant stated where it is relied on.
  */
 export function createCommitDiffstatCache(
     db: Database.Database,
@@ -121,7 +130,9 @@ export function createCommitDiffstatCache(
     }
 
     // Prepared ONCE and reused for the whole run: `put` fires per commit — thousands of times
-    // on a full-history sync — and re-preparing the same SQL each time is pure waste.
+    // on a full-history sync — and re-preparing the same SQL each time is pure waste. The
+    // batched READ prepares inline instead (its SQL varies with the chunk length), matching
+    // what `projection.ts` does at the equivalent site.
     const insert = db.prepare(
         `INSERT INTO commit_diffstats
              (provider, container, repo, sha, additions, deletions, absent, entries, fetched_at)
@@ -133,71 +144,69 @@ export function createCommitDiffstatCache(
              entries    = excluded.entries,
              fetched_at = excluded.fetched_at`,
     );
-    // One statement per distinct chunk SIZE, so a run that pages repos of similar size
-    // prepares a handful of statements in total rather than one per batch.
-    const selects = new Map<number, Database.Statement>();
-    const selectFor = (size: number): Database.Statement => {
-        let stmt = selects.get(size);
-        if (stmt === undefined) {
-            stmt = db.prepare(
-                `SELECT sha, additions, deletions, absent, entries
-                   FROM commit_diffstats
-                  WHERE provider = ? AND container = ? AND repo = ?
-                    AND sha IN (${new Array(size).fill('?').join(', ')})`,
-            );
-            selects.set(size, stmt);
-        }
-        return stmt;
-    };
 
     return {
         load(repo: string, shas: readonly string[]): Map<string, CommitDiffstat> {
             const hits = new Map<string, CommitDiffstat>();
-            if (repo === '' || shas.length === 0) return hits;
+            if (repo === '') return hits;
             // De-duped so a repeated sha cannot inflate a chunk past the parameter limit, and
-            // so the binding list matches what the caller will look up.
-            const distinct = [...new Set(shas)].filter((sha) => sha !== '');
-            for (let i = 0; i < distinct.length; i += SHA_CHUNK) {
-                const chunk = distinct.slice(i, i + SHA_CHUNK);
-                const rows = selectFor(chunk.length).all(
-                    providerType,
-                    scope,
-                    repo,
-                    ...chunk,
-                ) as DiffstatRow[];
-                for (const row of rows) {
-                    const decoded = decodeRow(row);
-                    // An undecodable row is simply omitted — the caller sees a miss, re-fetches,
-                    // and `put` overwrites it.
-                    if (decoded !== null) hits.set(row.sha, decoded);
+            // TYPE-filtered rather than merely `!== ''`: these values come straight off an
+            // unchecked cast of a provider's JSON list payload, and better-sqlite3 refuses to
+            // bind an `undefined`. Batched by the canonical splitter (`raw-author-daily.ts`)
+            // so this module cannot drift from the chunk rule the projection uses.
+            const distinct = [...new Set(shas)].filter(
+                (sha): sha is string => typeof sha === 'string' && sha !== '',
+            );
+            if (distinct.length === 0) return hits;
+            try {
+                for (const part of chunk(distinct, READ_CHUNK_SIZE)) {
+                    const rows = db
+                        .prepare(
+                            `SELECT sha, additions, deletions, absent, entries
+                               FROM commit_diffstats
+                              WHERE provider = ? AND container = ? AND repo = ?
+                                AND sha IN (${part.map(() => '?').join(', ')})`,
+                        )
+                        .all(providerType, scope, repo, ...part) as DiffstatRow[];
+                    for (const row of rows) {
+                        const decoded = decodeRow(row);
+                        // An undecodable row is simply omitted — the caller sees a miss,
+                        // re-fetches, and `put` overwrites it.
+                        if (decoded !== null) hits.set(row.sha, decoded);
+                    }
                 }
+            } catch {
+                // See the module header: a read fault must cost re-fetching, never the run.
+                // Partial hits already collected stay — they are individually valid rows.
             }
             return hits;
         },
 
         put(repo: string, sha: string, value: CommitDiffstat): void {
-            // A cache write must never be able to fail a sync. Everything below is either
-            // already true by construction at the call sites or a defect in them; skipping the
-            // write costs one re-fetch next run, while throwing would abort a repo's commit
-            // fetch and — via #231 — discard the whole run's data.
-            if (repo === '' || sha === '') return;
             const absent = value.absent;
+            // An absent diffstat carries nothing, so normalize rather than trust the caller:
+            // the row must never claim both "no diffstat exists" and "here are its lines".
             const entries = absent ? [] : value.entries;
             const additions = absent ? 0 : value.additions;
             const deletions = absent ? 0 : value.deletions;
-            if (!Number.isInteger(additions) || additions < 0) return;
-            if (!Number.isInteger(deletions) || deletions < 0) return;
-            insert.run(
-                providerType,
-                scope,
-                repo,
-                sha,
-                additions,
-                deletions,
-                absent ? 1 : 0,
-                JSON.stringify(entries),
-                new Date().toISOString(),
-            );
+            try {
+                insert.run(
+                    providerType,
+                    scope,
+                    repo,
+                    sha,
+                    additions,
+                    deletions,
+                    absent ? 1 : 0,
+                    JSON.stringify(entries),
+                    new Date().toISOString(),
+                );
+            } catch {
+                // See the module header. Every argument-level defect the table's CHECK
+                // constraints reject (a blank repo/sha, a negative count) lands here too, so
+                // there is one guard rather than a pre-check per column that would still
+                // leave `SQLITE_BUSY` and a full disk uncovered.
+            }
         },
     };
 }
@@ -212,7 +221,9 @@ export function createCommitDiffstatCache(
  * re-added with narrower credentials must not silently inherit file-level detail those
  * credentials no longer justify.
  *
- * Returns the number of rows removed.
+ * Returns the number of rows removed. Unlike the cache methods this one is allowed to throw:
+ * its cascade caller runs inside a transaction that must roll back as a unit if any step
+ * fails, and its other caller guards it (see `runSync`).
  */
 export function deleteContainerDiffstats(
     db: Database.Database,
@@ -222,23 +233,4 @@ export function deleteContainerDiffstats(
     return db
         .prepare('DELETE FROM commit_diffstats WHERE provider = ? AND container = ?')
         .run(providerType, normalizeContainer(container)).changes;
-}
-
-/**
- * How many diffstats are cached for one `(providerType, container)`. Read-only; exists for
- * the delete-cascade and ratchet tests, which must be able to assert on the cache's contents
- * without hand-writing the table name in three places.
- */
-export function countContainerDiffstats(
-    db: Database.Database,
-    providerType: GitProviderType,
-    container: string,
-): number {
-    return (
-        db
-            .prepare(
-                'SELECT COUNT(*) AS n FROM commit_diffstats WHERE provider = ? AND container = ?',
-            )
-            .get(providerType, normalizeContainer(container)) as {n: number}
-    ).n;
 }

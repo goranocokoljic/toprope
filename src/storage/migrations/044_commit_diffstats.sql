@@ -51,6 +51,33 @@
 -- WHAT IS NEVER CACHED: a 5xx, a rate limit, or a transport fault. Those are statements about
 -- the server's health, not about the commit, and the fetch sites rethrow them so no row is
 -- written. Only a successful response or a deterministic 404 reaches a write.
+--
+-- THE RESIDUAL, STATED PLAINLY. Two answers are recorded as facts that in rare circumstances
+-- are not facts about the commit:
+--   * a 404 that means "you may not see this" rather than "this has no diffstat". Reaching the
+--     diffstat call requires that repo's COMMIT LIST to have already succeeded on the same
+--     credential, so this needs access to be revoked between the list and the per-commit walk;
+--   * a 200 that is silently truncated — e.g. a proxy stripping GitLab's `x-next-page` or
+--     Bitbucket's `next`, so a paged diff ends early and its re-summed totals under-report.
+-- Neither is new in KIND: both already produced an understated commit, and on a run that
+-- COMPLETED the cursor advanced past it, so the understatement was already permanent. What
+-- changes is the one case where it used to self-heal — a run that later FAILED re-covered its
+-- whole window and re-asked. The remedy is that this table is disposable: deleting the
+-- affected rows (or the container's whole set) makes the next sync re-fetch them.
+--     DELETE FROM commit_diffstats WHERE provider = ? AND container = ?;   -- and/or AND repo = ?
+-- The provider delete cascade (#264) issues exactly that statement for its container.
+--
+-- DATA SCOPE — READ BEFORE ADDING A COLUMN. `entries` is the FIRST place this schema persists
+-- actual source-tree paths from a customer's private repositories; every prior git table stored
+-- counts only (`files_changed INTEGER`). The paths are unencrypted, in the same database as
+-- `git_providers.token_ciphertext`, and are retained for as long as the row is — which is
+-- forever, unless a provider is deleted. Nothing reads the table outside the sync fetch path
+-- (no endpoint, no serializer, no aggregate), so the privacy model — individual data to that
+-- developer only, managers to team aggregates — is untouched. But this IS a retention decision,
+-- taken deliberately: the file-level entries are what `code_churn_rate` and `ai_signature_score`
+-- are computed from, and a deployment that cannot accept storing them should not enable git
+-- analysis at all. Excluding a repo after the fact stops it being listed; it does NOT retract
+-- rows already cached — use the DELETE above.
 
 CREATE TABLE IF NOT EXISTS commit_diffstats (
     -- Provider family. Closed set, DB-enforced — same vocabulary as git_providers.

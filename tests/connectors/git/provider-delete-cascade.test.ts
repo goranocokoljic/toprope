@@ -16,10 +16,7 @@ import {
     providerDeleteImpact,
 } from '../../../src/connectors/git/providers/delete-cascade';
 import {containerKeyOf} from '../../../src/connectors/git/providers/config';
-import {
-    countContainerDiffstats,
-    createCommitDiffstatCache,
-} from '../../../src/connectors/git/diffstat-cache';
+import {createCommitDiffstatCache} from '../../../src/connectors/git/diffstat-cache';
 import {getProvider, GitProviderStoreError} from '../../../src/connectors/git/providers/store';
 import type {GitProviderType} from '../../../src/connectors/git/providers/types';
 
@@ -106,6 +103,17 @@ function setCursors(db: Database.Database, container: string): void {
     ]) {
         db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(key, value);
     }
+}
+
+/** Cached per-commit diffstats (#273) for one container. Local: the module exports no counter. */
+function diffstatsFor(db: Database.Database, container: string): number {
+    return (
+        db
+            .prepare(
+                "SELECT COUNT(*) AS n FROM commit_diffstats WHERE provider = 'bitbucket' AND container = ?",
+            )
+            .get(container) as {n: number}
+    ).n;
 }
 
 function rawRowsFor(db: Database.Database, container: string): unknown[] {
@@ -318,12 +326,12 @@ describe('deleteProviderWithCascade (#264)', () => {
     // provider re-added with narrower credentials must not inherit file-level detail those
     // credentials no longer justify.
     it('drops the deleted container’s cached diffstats and keeps the sibling’s', () => {
-        expect(countContainerDiffstats(db, 'bitbucket', 'ws-a')).toBe(2);
+        expect(diffstatsFor(db, 'ws-a')).toBe(2);
 
         deleteProviderWithCascade(db, providerA, new Set());
 
-        expect(countContainerDiffstats(db, 'bitbucket', 'ws-a')).toBe(0);
-        expect(countContainerDiffstats(db, 'bitbucket', 'ws-b')).toBe(2);
+        expect(diffstatsFor(db, 'ws-a')).toBe(0);
+        expect(diffstatsFor(db, 'ws-b')).toBe(2);
     });
 
     it('keeps the cached diffstats when the cascade is SKIPPED for a config-owned container', () => {
@@ -331,7 +339,7 @@ describe('deleteProviderWithCascade (#264)', () => {
         // and a purged cache would silently cost that live owner a full re-fetch.
         deleteProviderWithCascade(db, providerA, new Set([containerKeyOf('bitbucket', 'ws-a')]));
 
-        expect(countContainerDiffstats(db, 'bitbucket', 'ws-a')).toBe(2);
+        expect(diffstatsFor(db, 'ws-a')).toBe(2);
     });
 
     it('never touches developers, their identities, or their team membership', () => {

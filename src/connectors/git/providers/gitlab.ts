@@ -1,5 +1,4 @@
 import type {
-    CommitDiffstat,
     CommitDiffstatCache,
     GitProvider,
     GitProviderType,
@@ -15,6 +14,7 @@ import type {
     GitFetchProgressListener,
 } from './types.js';
 import {normalizeContainer} from './container.js';
+import {loadDiffstats, resolveCommitDiffstat} from './diffstat.js';
 import {
     GitProviderFetchError,
     MAX_RATE_LIMIT_RETRIES,
@@ -329,44 +329,19 @@ export class GitLabProvider implements GitProvider {
         // The whole repo's already-known diffs, resolved in ONE batched query rather than a
         // point read per commit (#273). Empty map when no cache was supplied — every probe
         // path (doctor, test-connection) omits it, and behaves exactly as before.
-        const cached: Map<string, CommitDiffstat> =
-            this.diffstatCache?.load(repo, raw.map((c) => c.id)) ?? new Map();
+        const cached = loadDiffstats(this.diffstatCache, repo, raw.map((c) => c.id));
         for (const c of raw) {
-            const hit = cached.get(c.id);
-            let diffs: GitFileDiff[];
-            let additions: number;
-            let deletions: number;
-            if (hit !== undefined) {
-                // A commit's diff never changes, so a hit is the same answer the endpoint
-                // would give — including the `absent` (404) case, whose cached form is
-                // `[]`/0/0, byte-identical to what the catch below produces.
-                diffs = hit.entries;
-                additions = hit.additions;
-                deletions = hit.deletions;
-            } else {
-                diffs = [];
-                let absent = false;
-                try {
-                    diffs = await this.getCommitDiff(repo, c.id);
-                } catch (err) {
-                    // Re-throw systemic errors (auth failure, server error); silently swallow 404
-                    // (GitLab may return 404 for diffs on certain commits, e.g. initial commits).
-                    // Keyed on the typed status rather than a ' 404:' substring (#272): the substring
-                    // also matched a URL that merely CONTAINED it, and swallowing a real failure here
-                    // silently understates the commit's churn.
-                    if (!(err instanceof GitProviderFetchError) || err.status !== 404) throw err;
-                    // Deterministic per commit — cacheable, and it MUST be cached or these are
-                    // the very commits re-asked on every run forever (#273).
-                    absent = true;
-                }
-                additions = diffs.reduce((s, d) => s + d.additions, 0);
-                deletions = diffs.reduce((s, d) => s + d.deletions, 0);
-                // Reached only on a success or a 404 — every other fault rethrew above, so no
-                // 5xx/rate-limit/transport failure is ever recorded as an answer. Written
-                // per-commit and OUTSIDE the run's write transaction, which is the whole point:
-                // the row survives a run that later fails and drops all its partial data.
-                this.diffstatCache?.put(repo, c.id, {additions, deletions, entries: diffs, absent});
-            }
+            // Cache-or-fetch, including the 404-is-an-answer rule (GitLab 404s the diff of an
+            // initial commit) and the write-through, lives in the shared helper — Bitbucket
+            // reaches its diffstat the same way and the two must not drift on WHICH faults
+            // are cacheable (#273).
+            const {entries: diffs, additions, deletions} = await resolveCommitDiffstat(
+                this.diffstatCache,
+                cached,
+                repo,
+                c.id,
+                () => this.getCommitDiff(repo, c.id),
+            );
 
             commits.push({
                 sha: c.id,
