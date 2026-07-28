@@ -1785,9 +1785,12 @@ async function fetchProviderData(
     if (diffstatCache.faults() > 0) {
         errors.push(
             `${DIFFSTAT_CACHE_DEGRADED_PREFIX} [${providerType}] ${diffstatCache.faults()} commit ` +
-                'diffstat cache operation(s) failed and were skipped. Nothing was lost — every ' +
-                'affected commit was fetched from the provider — but this run made no permanent ' +
-                'progress for them, so a failure part-way through will re-fetch them next run.',
+                'diffstat cache operation(s) hit a database error and were skipped. No data was ' +
+                'lost — every commit was fetched from the provider and every metric is complete ' +
+                '— but the ratchet did not fully apply, so this run may have re-fetched commits ' +
+                'it already had and a later failure may re-fetch these again. A count comparable ' +
+                'to the commit total means the cache is unusable (check disk space and database ' +
+                'permissions); one or two means transient lock contention.',
         );
     }
 
@@ -2217,10 +2220,12 @@ export class GitSync implements ConnectorInterface {
                 );
             } catch (err) {
                 // One unusable provider must not sink the run (the resolver's own contract).
-                // `fetchProviderData`'s first statement is the CANONICAL
-                // `validateGitProviderConfig` seam (the same one `createGitProvider` runs) — so
-                // this catches a missing org/workspace/group, a missing token and a malformed
-                // GitLab url alike, rather than re-implementing one of those checks here. A
+                // `fetchProviderData` reaches `createGitProvider` — and with it the CANONICAL
+                // `validateGitProviderConfig` seam — before it issues a single request, so this
+                // catches a missing org/workspace/group, a missing token and a malformed GitLab
+                // url alike, rather than re-implementing one of those checks here. (The two
+                // statements that precede it, `providerContainer` and the diffstat cache
+                // constructor, are both TOTAL by design, so nothing else can land here.) A
                 // genuine error, not an advisory: the operator configured a provider that
                 // cannot be synced at all.
                 errors.push(
@@ -2598,10 +2603,6 @@ export class GitSync implements ConnectorInterface {
             errors.push(`${UNMATCHED_AUTHORS_PREFIX} ${[...allUnmatched].join(', ')}`);
         }
 
-        // Say that a whole provider's window was discarded, and why. Silent would be the
-        // wrong choice twice over: the operator's own delete caused it (so it is not a
-        // failure), but a run that fetched a provider and wrote none of it must not read as a
-        // clean full run.
         // Retract the diffstat rows this run wrote for a container whose owning provider was
         // deleted while we were fetching (#273). The cascade cleared the table for that
         // container when it ran, but the fetch loop kept writing through for minutes
@@ -2636,6 +2637,10 @@ export class GitSync implements ConnectorInterface {
             }
         }
 
+        // Say that a whole provider's window was discarded, and why. Silent would be the
+        // wrong choice twice over: the operator's own delete caused it (so it is not a
+        // failure), but a run that fetched a provider and wrote none of it must not read as a
+        // clean full run.
         if (orphanedContainers.size > 0) {
             errors.push(
                 `${PROVIDER_DELETED_MID_RUN_PREFIX} ${[...orphanedContainers].sort().join(', ')} — ` +

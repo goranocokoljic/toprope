@@ -34,12 +34,20 @@ import type {
     GitProviderType,
 } from './providers/types.js';
 
+/**
+ * A row as it comes back from SQLite, typed to what the COLUMNS actually guarantee rather than
+ * to what a well-behaved writer puts in them. `entries` is unconstrained TEXT; `additions` and
+ * `deletions` have INTEGER *affinity*, which stores a non-lossless REAL as a REAL. Declaring
+ * them `unknown` is what stops a future reader writing `row.entries.slice(...)` with the
+ * compiler's blessing — the graduated rule to type a wire field with the same breadth its
+ * source guarantees. {@link decodeRow} is the only narrowing.
+ */
 interface DiffstatRow {
     sha: string;
-    additions: number;
-    deletions: number;
-    absent: number;
-    entries: string;
+    additions: unknown;
+    deletions: unknown;
+    absent: unknown;
+    entries: unknown;
 }
 
 /** A non-negative integer, as every stored count must be. Narrows `unknown`. */
@@ -48,21 +56,40 @@ function isCount(value: unknown): value is number {
 }
 
 /**
+ * Is this one usable file-diff entry?
+ *
+ * THE single predicate both boundaries use — {@link decodeEntries} on the way in from the
+ * column, and `put` on the way out to it. Keeping one definition is what makes "we only store
+ * what we can read back" a property rather than a convention: a stricter reader than writer
+ * means the row is written every run and rejected every next one, which is the ratchet
+ * silently no-opping forever for exactly those commits.
+ *
+ * Domain-checked, not merely shape-checked: these per-file numbers are the only input to
+ * `code_churn_rate` and `ai_signature_score`, so a negative or fractional value would flow
+ * straight into the derived metrics.
+ */
+function isFileDiff(item: unknown): item is GitFileDiff {
+    if (typeof item !== 'object' || item === null) return false;
+    const {path, additions, deletions, status} = item as Record<string, unknown>;
+    // A blank path is not a path. Both non-GitHub providers can produce one — Bitbucket maps
+    // an entry with neither `new` nor `old` to `''`, GitLab to `undefined` — and the churn
+    // window keys on it, so an entry that names no file cannot contribute honestly.
+    if (typeof path !== 'string' || path === '') return false;
+    if (typeof status !== 'string') return false;
+    return isCount(additions) && isCount(deletions);
+}
+
+/**
  * Decode one stored `entries` blob, or null when it is not a usable file-diff list.
  *
- * `entries` is an unconstrained TEXT column, so its contents are validated at read time
- * rather than cast — every field is shape- AND domain-checked, and one bad element rejects
- * the whole row. Domain, not just shape: these per-file numbers are the only input to
- * `code_churn_rate` and `ai_signature_score`, so a negative or fractional value would flow
- * straight into the derived metrics (the row totals get the same treatment in
- * {@link decodeRow}).
- *
- * A rejected row degrades to a cache MISS, which re-fetches and overwrites it: self-healing
- * is the right failure mode for a memo of an idempotent remote read, where the alternative
- * (trusting the shape) would corrupt a commit's churn permanently, and failing closed would
- * strand the row forever.
+ * One bad element rejects the whole row: a partially-decoded diff would understate a commit's
+ * churn, which is indistinguishable downstream from a real answer. A rejected row degrades to
+ * a cache MISS, which re-fetches and overwrites it — self-healing is the right failure mode
+ * for a memo of an idempotent remote read, where trusting the shape would corrupt a commit's
+ * churn permanently and failing closed would strand the row forever.
  */
-function decodeEntries(raw: string): GitFileDiff[] | null {
+function decodeEntries(raw: unknown): GitFileDiff[] | null {
+    if (typeof raw !== 'string') return null;
     let parsed: unknown;
     try {
         parsed = JSON.parse(raw);
@@ -70,14 +97,17 @@ function decodeEntries(raw: string): GitFileDiff[] | null {
         return null;
     }
     if (!Array.isArray(parsed)) return null;
+    // Rebuilt onto fresh literals rather than passed through, so a stored object carrying
+    // extra keys (or `__proto__`) cannot reach the analysis.
     const entries: GitFileDiff[] = [];
     for (const item of parsed) {
-        if (typeof item !== 'object' || item === null) return null;
-        const {path, additions, deletions, status} = item as Record<string, unknown>;
-        if (typeof path !== 'string' || path === '') return null;
-        if (typeof status !== 'string') return null;
-        if (!isCount(additions) || !isCount(deletions)) return null;
-        entries.push({path, additions, deletions, status});
+        if (!isFileDiff(item)) return null;
+        entries.push({
+            path: item.path,
+            additions: item.additions,
+            deletions: item.deletions,
+            status: item.status,
+        });
     }
     return entries;
 }
@@ -114,7 +144,16 @@ function decodeRow(row: DiffstatRow): CommitDiffstat | null {
  * could not use the ratchet must say so.
  */
 export interface OwnedCommitDiffstatCache extends CommitDiffstatCache {
-    /** How many cache operations this instance has silently swallowed a fault from. */
+    /**
+     * How many cache operations this instance has silently swallowed a FAULT from — a database
+     * error it could not act on.
+     *
+     * Deliberately NOT incremented by the deterministic refusal in `put` (a value the reader
+     * would reject). That refusal is a correct, permanent decision about one commit's data, not
+     * a statement about the cache's health, and a single un-nameable file entry anywhere in a
+     * repo's history would otherwise make the advisory fire on every run forever — training the
+     * operator to skim past the one line that is supposed to mean "the ratchet is dead".
+     */
     faults(): number;
 }
 
@@ -212,20 +251,23 @@ export function createCommitDiffstatCache(
             const entries = absent ? [] : value.entries;
             const additions = absent ? 0 : value.additions;
             const deletions = absent ? 0 : value.deletions;
-            const serialized = JSON.stringify(entries);
-            // WRITE ONLY WHAT THE READER WILL ACCEPT. `decodeEntries` is stricter than the
-            // table's CHECK constraints (which cannot inspect JSON), and a provider can
-            // legitimately produce a value it rejects — Bitbucket maps an entry with neither
-            // `new` nor `old` to `path: ''`, GitLab to `undefined`, which `JSON.stringify`
-            // then drops entirely. Storing such a row makes the ratchet a silent no-op for
-            // exactly those commits FOREVER: every run writes it, every next run rejects it
-            // on read and re-fetches. Refusing the write costs the same re-fetch and one
-            // decision instead of one UPSERT per run — and it makes the two boundaries agree,
-            // which is the graduated "check and store the same normalized value" rule.
-            if (decodeEntries(serialized) === null) {
-                faults++;
-                return;
-            }
+            // WRITE ONLY WHAT THE READER WILL ACCEPT — every field the reader checks, not just
+            // the entries. The table's CHECK constraints cannot inspect JSON, and INTEGER
+            // affinity lets a fractional total past `CHECK (additions >= 0)`, so SQLite alone
+            // does not make the two boundaries agree. A value the reader would reject is
+            // written on every run and rejected on every next one: the ratchet a silent no-op
+            // for exactly those commits, forever. Refusing costs the same re-fetch and one
+            // decision instead of an UPSERT per run.
+            //
+            // Both are reachable from real provider data, not just hand-edited rows: Bitbucket
+            // maps a diffstat entry with neither `new` nor `old` to `path: ''` and GitLab to
+            // `undefined`; GitHub's commit-level totals come from `detail.stats`, unvalidated
+            // JSON. This is the graduated "check and store the same normalized value" rule.
+            //
+            // NOT counted as a fault (see `OwnedCommitDiffstatCache.faults`): it is a correct
+            // permanent decision about this commit's data, not a sign the cache is unhealthy.
+            if (!isCount(additions) || !isCount(deletions)) return;
+            if (!entries.every(isFileDiff)) return;
             try {
                 insertStatement().run(
                     providerType,
@@ -235,7 +277,10 @@ export function createCommitDiffstatCache(
                     additions,
                     deletions,
                     absent ? 1 : 0,
-                    serialized,
+                    // Inside the guard: `JSON.stringify` throws on a BigInt or a circular
+                    // structure, and the never-throw contract covers the whole method, not
+                    // only the SQLite call.
+                    JSON.stringify(entries),
                     new Date().toISOString(),
                 );
             } catch {

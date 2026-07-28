@@ -896,6 +896,10 @@ describe('#273 per-commit diffstat ratchet cache', () => {
         expect(
             first.errors.some((e) => e.startsWith('Provider changed during this run:')),
         ).toBe(false);
+        // A HEALTHY run must not report a degraded cache. Without this, a counter that fired
+        // on a success (or a refusal) would make the advisory permanently true in production
+        // and no test would notice — the operator signal dead in the opposite direction.
+        expect(first.errors.some((e) => e.startsWith(DIFFSTAT_CACHE_DEGRADED_PREFIX))).toBe(false);
         expect(countDiffstats(db, 'bitbucket', 'test-ws')).toBe(SHAS.length);
 
         // …and it is actually reused: reset the cursor so the same window is re-walked, and no
@@ -926,10 +930,18 @@ describe('#273 per-commit diffstat ratchet cache', () => {
         const advisory = result.errors.find((e) => e.startsWith(DIFFSTAT_CACHE_DEGRADED_PREFIX));
         expect(advisory).toBeDefined();
         expect(isAdvisoryError(advisory!)).toBe(true);
-        // The run itself is untouched: every commit was fetched and the data landed.
+        // The run itself is untouched: every commit was fetched, the data landed, and — the
+        // consequence the advisory classification exists to prevent — the cursor ADVANCED.
+        // Classified as a failure instead, this would hold the cursor and discard a window
+        // that synced perfectly, which is worse than the degradation it reports.
         expect(result.errors.filter((e) => e.includes('Failed to fetch'))).toEqual([]);
         expect(fullSnapshot(db, devId).commits).toBe(SHAS.length);
         expect(log.ok).toHaveLength(SHAS.length);
+        expect(
+            db
+                .prepare('SELECT value FROM sync_state WHERE key = ?')
+                .get(syncStateKey('bitbucket', 'test-ws')),
+        ).toEqual({value: result.lastSyncTime});
         db.close();
     });
 
@@ -1107,22 +1119,40 @@ describe('#273 per-commit diffstat ratchet cache', () => {
             ).not.toThrow();
             expect(countRows(db, 'commit_diffstats')).toBe(0);
             expect(cache.load('repo1', ['sha1']).size).toBe(0);
+            // A CHECK violation IS a swallowed database fault, unlike the deterministic
+            // refusals below — the write was attempted and the database rejected it.
             expect(cache.faults()).toBe(1);
         });
 
-        it('refuses to store an entries value its own reader would reject', () => {
+        it('refuses to store any value its own reader would reject — entries AND totals', () => {
             // The two boundaries must agree, or the ratchet silently no-ops for those commits
             // forever: every run writes the row, every next run rejects it on read and
-            // re-fetches. Bitbucket maps an entry with neither `new` nor `old` to `path: ''`,
-            // which `decodeEntries` refuses — so this is a value a provider really can emit.
+            // re-fetches. Both cases are reachable from real provider data — Bitbucket maps an
+            // entry with neither `new` nor `old` to `path: ''`, and GitHub's commit totals come
+            // straight from unvalidated `detail.stats`, which INTEGER affinity would let past
+            // the table's own CHECK.
             const cache = createCommitDiffstatCache(db, 'github', 'org');
             const unreadable: GitFileDiff[] = [
                 {path: '', additions: 1, deletions: 0, status: 'modified'},
             ];
-            cache.put('repo1', 'sha1', {additions: 1, deletions: 0, entries: unreadable, absent: false});
+            cache.put('repo1', 'bad-entry', {
+                additions: 1,
+                deletions: 0,
+                entries: unreadable,
+                absent: false,
+            });
+            cache.put('repo1', 'bad-total', {
+                additions: 1.5,
+                deletions: 0,
+                entries: [...FILES],
+                absent: false,
+            });
 
             expect(countDiffstats(db, 'github', 'org')).toBe(0);
-            expect(cache.faults()).toBe(1);
+            // A deterministic refusal is NOT a cache fault: it says this commit's data cannot
+            // be stored, not that the cache is unhealthy. Counting it would make the operator
+            // advisory fire on every run forever for one un-nameable file entry.
+            expect(cache.faults()).toBe(0);
         });
 
         it('round-trips a diffstat, whole and idempotently', () => {
@@ -1133,6 +1163,11 @@ describe('#273 per-commit diffstat ratchet cache', () => {
             expect(countDiffstats(db, 'github', 'org')).toBe(1);
             const decoded = cache.load('repo1', ['sha1']).get('sha1');
             expect(decoded).toEqual(value);
+            // Nothing here failed, so the counter that drives the operator advisory must be
+            // ZERO. Without this the counter could be moved out of its `catch` (or added to
+            // the success path) and every healthy sync would report a degraded cache — the
+            // signal permanently false, and every existing assertion still green.
+            expect(cache.faults()).toBe(0);
             // Pin the ENTRY shape explicitly: the decoder rebuilds `GitFileDiff` field by
             // field, so a new optional field on that type would silently stop round-tripping
             // and AC6 ("byte-identical analysis input") would quietly stop holding for it.
@@ -1245,6 +1280,19 @@ describe('#273 per-commit diffstat ratchet cache', () => {
             const cache = createCommitDiffstatCache(db, 'github', 'org');
             expect(cache.load('repo1', []).size).toBe(0);
             expect(cache.load('', ['sha1']).size).toBe(0);
+            expect(cache.faults()).toBe(0);
+        });
+
+        it('load survives a non-string sha without blanking the rest of the repo', () => {
+            // The shas come off an unchecked cast of the provider's commit-list JSON, so a row
+            // missing `sha` yields `undefined` — which better-sqlite3 refuses to bind. Without
+            // the type filter that throw lands in `load`'s catch and returns an EMPTY map, so
+            // one malformed list row costs the whole repo its cache for the run.
+            const cache = createCommitDiffstatCache(db, 'github', 'org');
+            cache.put('repo1', 'good', {additions: 1, deletions: 0, entries: [], absent: false});
+            const shas = ['good', undefined, 42, ''] as unknown as string[];
+            expect([...cache.load('repo1', shas).keys()]).toEqual(['good']);
+            expect(cache.faults()).toBe(0);
         });
 
         it('deleteContainerDiffstats removes exactly one container’s rows', () => {
