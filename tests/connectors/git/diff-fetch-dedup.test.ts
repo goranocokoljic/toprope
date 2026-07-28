@@ -54,7 +54,7 @@ function seedAlice(db: Database.Database): string {
     return addDeveloper(db, 'alice', 'eng', AUTHOR_EMAIL, 'Alice').id;
 }
 
-async function getCreateGitProvider() {
+async function getCreateGitProvider(): Promise<ReturnType<typeof vi.fn>> {
     const {createGitProvider} = await import('../../../src/connectors/git/providers/factory');
     return createGitProvider as ReturnType<typeof vi.fn>;
 }
@@ -64,20 +64,26 @@ async function getCreateGitProvider() {
  * resolve to an empty page rather than throwing, so a provider's unrelated paging (PR
  * lists) does not have to be modelled.
  */
-type Route = {match: RegExp; body: unknown | ((url: string) => unknown); status?: number};
+// `body` for a fixed payload, `bodyFor` when the response must echo something from the URL
+// (GitHub's commit-detail endpoint has to return the sha it was asked for). Two fields
+// rather than a `unknown | fn` union, which collapses to plain `unknown` and needs a cast.
+type Route = {match: RegExp; body?: unknown; bodyFor?: (url: string) => unknown; status?: number};
 
-function makeCountingFetch(routes: Route[]) {
+interface CountingFetch {
+    fetchMock: ReturnType<typeof vi.fn>;
+    /** How many requests hit URLs matching `pattern`, counted from the request log. */
+    hits: (pattern: RegExp) => number;
+    urls: string[];
+}
+
+function makeCountingFetch(routes: Route[]): CountingFetch {
     const urls: string[] = [];
     const fetchMock = vi.fn().mockImplementation((url: string) => {
         const u = String(url);
         urls.push(u);
         const route = routes.find((r) => r.match.test(u));
         const status = route?.status ?? 200;
-        const body = route
-            ? typeof route.body === 'function'
-              ? (route.body as (url: string) => unknown)(u)
-              : route.body
-            : {values: []};
+        const body = route ? (route.bodyFor ? route.bodyFor(u) : route.body) : {values: []};
         return Promise.resolve({
             ok: status >= 200 && status < 300,
             status,
@@ -88,20 +94,24 @@ function makeCountingFetch(routes: Route[]) {
     });
     return {
         fetchMock,
-        /** How many requests hit URLs matching `pattern`, counted from the request log. */
         hits: (pattern: RegExp): number => urls.filter((u) => pattern.test(u)).length,
         urls,
     };
 }
 
-function readSnapshot(db: Database.Database, devId: string) {
+interface SnapshotCounts {
+    lines_added: number;
+    lines_removed: number;
+    files_changed: number;
+    commits: number;
+}
+
+function readSnapshot(db: Database.Database, devId: string): SnapshotCounts | undefined {
     return db
         .prepare(
             'SELECT lines_added, lines_removed, files_changed, commits FROM git_snapshots WHERE developer_id = ?',
         )
-        .get(devId) as
-        | {lines_added: number; lines_removed: number; files_changed: number; commits: number}
-        | undefined;
+        .get(devId) as SnapshotCounts | undefined;
 }
 
 /**
@@ -116,7 +126,11 @@ function readFullSnapshot(db: Database.Database, devId: string): Record<string, 
     const row = db
         .prepare('SELECT * FROM git_snapshots WHERE developer_id = ?')
         .get(devId) as Record<string, unknown>;
-    const {id: _id, developer_id: _devId, ...rest} = row;
+    const rest = {...row};
+    // `git_snapshots` carries no timestamp column, so these two are the only per-run
+    // nondeterminism and everything left is safely comparable across databases.
+    delete rest.id;
+    delete rest.developer_id;
     return rest;
 }
 
@@ -140,7 +154,7 @@ const GITLAB_CONFIG: GitProviderConfig = {
     auth: {type: 'personal_access_token', token: 'tok'},
 };
 
-function bitbucketRoutes(diffstatStatus = 200) {
+function bitbucketRoutes(diffstatStatus = 200): Route[] {
     return [
         {
             match: /\/repositories\/test-ws\?/,
@@ -192,7 +206,7 @@ function bitbucketRoutes(diffstatStatus = 200) {
     ];
 }
 
-function githubRoutes() {
+function githubRoutes(): Route[] {
     return [
         {
             match: /\/orgs\/test-org\/repos\?/,
@@ -214,7 +228,7 @@ function githubRoutes() {
             // Detail endpoint — no `?`, which is what distinguishes it from the list URL.
             // Echoes the requested sha so the three commits stay distinct.
             match: /\/repos\/test-org\/repo1\/commits\/[^?]+$/,
-            body: (url: string) => ({
+            bodyFor: (url: string): Record<string, unknown> => ({
                 sha: url.split('/').pop(),
                 commit: {
                     author: {name: 'Alice', email: AUTHOR_EMAIL, date: COMMIT_DATE},
@@ -232,7 +246,7 @@ function githubRoutes() {
     ];
 }
 
-function gitlabRoutes() {
+function gitlabRoutes(): Route[] {
     return [
         {
             match: /\/groups\/test-group\/projects\?/,
@@ -294,9 +308,12 @@ function makeCommit(
         filesChanged: (diffs ?? [{path: 'src/foo.ts'}, {path: 'src/bar.ts'}]).map((d) => d.path),
     };
     // Deliberately only assigned when supplied, so the "not supplied" case really is an
-    // ABSENT property rather than an explicit `diffs: undefined`. Copied per commit, the
-    // way a real provider's own `getCommitDiff` call returns a fresh array — sharing one
-    // instance across commits would hide an in-place mutation of the reused array.
+    // ABSENT property rather than an explicit `diffs: undefined`. Copied per commit because
+    // that is what a real provider does (each internal `getCommitDiff` call returns a fresh
+    // array) — NOT because it helps catch an in-place mutation of the reused array; it does
+    // the opposite, since a per-commit copy gets namespaced exactly once either way. The
+    // read-only contract is pinned directly instead, by the test that re-checks the array
+    // the provider handed over after the sync returns.
     if (diffs !== undefined) commit.diffs = diffs.map((d) => ({...d}));
     return commit;
 }
@@ -376,7 +393,7 @@ describe('#271 one diff request per commit per sync run', () => {
     });
 
     it('GitHub: fetches each commit detail exactly ONCE across a whole sync run', async () => {
-        seedAlice(db);
+        const devId = seedAlice(db);
         const {fetchMock, urls} = makeCountingFetch(githubRoutes());
         vi.stubGlobal('fetch', fetchMock);
         (await getCreateGitProvider()).mockReturnValue(new GitHubProvider(GITHUB_CONFIG));
@@ -388,10 +405,19 @@ describe('#271 one diff request per commit per sync run', () => {
         for (const sha of SHAS) {
             expect(urls.filter((u) => u.endsWith(`/commits/${sha}`))).toHaveLength(1);
         }
+        // Positive control: the ONE request was actually USED. Without this, a reuse that
+        // yielded nothing would satisfy the count above trivially. 3 × (40 added / 5
+        // removed / 2 files) from the detail fixture.
+        expect(readSnapshot(db, devId)).toEqual({
+            commits: 3,
+            lines_added: 120,
+            lines_removed: 15,
+            files_changed: 6,
+        });
     });
 
     it('GitLab: fetches each commit diff exactly ONCE across a whole sync run', async () => {
-        seedAlice(db);
+        const devId = seedAlice(db);
         const {fetchMock, hits, urls} = makeCountingFetch(gitlabRoutes());
         vi.stubGlobal('fetch', fetchMock);
         (await getCreateGitProvider()).mockReturnValue(new GitLabProvider(GITLAB_CONFIG));
@@ -399,6 +425,14 @@ describe('#271 one diff request per commit per sync run', () => {
         await new GitSync({enabled: false}).syncProviders(db, [GITLAB_CONFIG]);
 
         expect(hits(/\/repository\/commits\/[^/]+\/diff\?/)).toBe(SHAS.length);
+        // Positive control, as above — and here it also proves the hunk parser's output
+        // survived the reuse (2 added / 1 removed per commit, over one file).
+        expect(readSnapshot(db, devId)).toEqual({
+            commits: 3,
+            lines_added: 6,
+            lines_removed: 3,
+            files_changed: 3,
+        });
         for (const sha of SHAS) {
             expect(urls.filter((u) => u.includes(`/commits/${sha}/diff`))).toHaveLength(1);
         }
@@ -434,7 +468,7 @@ describe('#271 one diff request per commit per sync run', () => {
         // the reused array; `code_churn_rate` and `ai_signature_score` are the columns
         // actually computed from the file-level entries, so they are what makes this
         // comparison able to fail. RICH_DIFFS exists to keep them non-zero.
-        const run = async (supplyDiffs: boolean) => {
+        const run = async (supplyDiffs: boolean): Promise<Record<string, unknown>> => {
             const localDb = makeDb();
             const devId = seedAlice(localDb);
             const commits = SHAS.map((sha) =>
@@ -557,6 +591,58 @@ describe('#271 one diff request per commit per sync run', () => {
         expect(getCommitDiff).toHaveBeenCalledTimes(1);
         expect(getCommitDiff).toHaveBeenCalledWith('repo1', 'sha-1');
         expect(readSnapshot(db, devId)).toMatchObject({lines_added: 40, files_changed: 2});
+    });
+
+    it('falls back when a provider supplies a non-array, instead of reading it as "no detail"', async () => {
+        // This is what makes the guard a SHAPE test rather than `!== undefined`. Without
+        // this case the hardening is invisible to CI: absent / `[]` / populated all behave
+        // identically under `!== undefined`, so a future "simplification" back to it — or
+        // worse, to a truthiness check, which would re-introduce the `[]` re-fetch — would
+        // pass every other test in this file.
+        const devId = seedAlice(db);
+        const getCommitDiff = vi.fn().mockResolvedValue(FALLBACK_DIFFS);
+        const bogus = makeCommit('sha-bogus');
+        // Only reachable by a provider lying about its own type — which is exactly what an
+        // adapter over a live API response can do.
+        (bogus as {diffs?: unknown}).diffs = null;
+        (await getCreateGitProvider()).mockReturnValue(
+            makeMockProvider({
+                getCommits: vi.fn().mockResolvedValue([bogus]),
+                getCommitDiff,
+            }),
+        );
+
+        await new GitSync({enabled: false}).syncProviders(db, [GITHUB_CONFIG]);
+
+        expect(getCommitDiff).toHaveBeenCalledWith('repo1', 'sha-bogus');
+        // …and the fetched churn landed, rather than a zero-file commit.
+        expect(readSnapshot(db, devId)).toMatchObject({commits: 1, files_changed: 2});
+    });
+
+    it('does not mutate the array the provider handed over (the read-only contract)', async () => {
+        // `GitCommit.diffs` is documented read-only because it is the provider's own array,
+        // passed by reference. The namespacing map at the reuse site must therefore produce
+        // new objects — an in-place `d.path = ...` would corrupt provider state, and on a
+        // real provider that shares one array across a page it would double-prefix.
+        seedAlice(db);
+        const supplied: GitFileDiff[] = [
+            {path: 'src/index.ts', additions: 10, deletions: 1, status: 'modified'},
+        ];
+        const commit = makeCommit('sha-1');
+        commit.diffs = supplied; // assigned directly, NOT through makeCommit's per-commit copy
+        (await getCreateGitProvider()).mockReturnValue(
+            makeMockProvider({
+                getCommits: vi.fn().mockResolvedValue([commit]),
+                getCommitDiff: vi.fn(),
+            }),
+        );
+
+        await new GitSync({enabled: false}).syncProviders(db, [GITHUB_CONFIG]);
+
+        // Unchanged — in particular NOT prefixed with the repo name.
+        expect(supplied).toEqual([
+            {path: 'src/index.ts', additions: 10, deletions: 1, status: 'modified'},
+        ]);
     });
 
     it('decides per commit, not per batch, when a batch mixes supplied and missing diffs', async () => {

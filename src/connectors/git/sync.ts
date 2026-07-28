@@ -148,9 +148,9 @@ export type GitSyncStage = 'listing_repos' | 'fetching' | 'analyzing' | 'writing
  * order, so a progress consumer can show motion *within* one repo:
  *   - `commits` — the provider's commit list paging, then its per-commit detail fetch
  *   - `diffs`   — this loop's per-commit diff pass. Since #271 it reuses the diff the
- *                 provider already returned on `GitCommit.diffs`, so on all three in-tree
- *                 providers it is an in-memory walk that completes ~instantly; it is a
- *                 `getCommitDiff` fan-out only for a provider that supplied none.
+ *                 provider already returned on `GitCommit.diffs`; it is a `getCommitDiff`
+ *                 fan-out only for a provider that supplied none. See `repo_step` below
+ *                 for what that means for an observer.
  *   - `prs`     — the provider's PR list paging, then this loop's per-PR
  *                 review-comment/verdict fan-out
  */
@@ -203,11 +203,15 @@ export interface GitSyncProgress {
      *     after its in-memory `until` filter (see #276), so on those two the `diffs`
      *     total always equals the `commits` total.
      *   - The `diffs` step no longer re-walks the per-commit endpoint (#271). All three
-     *     providers now return each commit's diff on `GitCommit.diffs` from the fetch
-     *     they already made during the `commits` step, so `diffs` is a synchronous reuse
-     *     pass: expect it to jump 0 → N in a single tick and never to be the step a run
-     *     appears stuck on. It still reports per commit because a provider that supplies
-     *     no diffs falls back to `getCommitDiff`, and that IS an N-request fan-out.
+     *     providers now return each commit's diff on `GitCommit.diffs` from the fetch they
+     *     already made during the `commits` step, so on any such provider `diffs` is a
+     *     synchronous pass with no `await` in it — which means a POLLING consumer never
+     *     observes it at all. Node cannot run the poll handler between the reports, so
+     *     `repo_step: 'diffs'` is written and then overwritten by `'prs'` within one tick.
+     *     Treat `diff N/M` as a FALLBACK-ONLY surface: seeing it never appear is correct
+     *     and does not mean the run skipped diffs. The step still reports per commit
+     *     because a provider that supplies no diffs falls back to `getCommitDiff`, and
+     *     that IS an N-request fan-out a poller does see.
      */
     repo_step: GitSyncRepoStep | null;
     repo_step_done: number;
@@ -230,9 +234,7 @@ const NO_REPO_STEP = {
  * indicator reports roughly `2 × commits + prs` times per repo (each provider page,
  * each commit detail, each diff, each PR), each allocating one shallow copy. A
  * listener that does I/O per call — an SSE frame, a DB write — must coalesce; the
- * only in-tree listener assigns the snapshot to a field and is safe. Since #271 the
- * `diffs` share of those calls arrives as one SYNCHRONOUS burst of N (the reuse pass
- * awaits nothing), so a poller simply observes the last of them.
+ * only in-tree listener assigns the snapshot to a field and is safe.
  *
  * A throw from this listener is swallowed at every report site — it loses that one
  * update and nothing else. It must be: the per-item reports run INSIDE
@@ -1365,20 +1367,19 @@ async function fetchProviderData(
             p.commits_fetched += rawCommits.length;
         });
 
-        // The per-commit diff pass. Since #271 this is normally NOT a second network
-        // fan-out: every in-tree provider already fetched each commit's diff to compute
-        // its additions/deletions and hands it back on `GitCommit.diffs`, so this pass
-        // reuses that and the sync makes ~N per-commit requests instead of ~2N. It still
-        // reports per commit — the fallback below IS network work, and a provider that
-        // supplies no diffs makes this pass exactly as slow as it used to be.
+        // The per-commit diff pass — normally NOT a second network fan-out (#271): the
+        // provider already fetched each commit's diff to compute its additions/deletions
+        // and hands it back on `GitCommit.diffs`. See `GitSyncProgress.repo_step` for what
+        // that does to this step's observability.
         reportStep('diffs', 0, rawCommits.length);
         for (const [i, rawCommit] of rawCommits.entries()) {
             // An ARRAY — including an empty one — is an answer and is reused; anything
-            // else falls back. `[]` must not fall back (see `GitCommit.diffs`), and the
-            // shape test rather than `!== undefined` keeps this total: a provider is an
-            // adapter over an untrusted API response, so a `null`/garbage `diffs` gets
-            // fetched properly instead of silently reading as "this commit touched
-            // nothing".
+            // else falls back (see `GitCommit.diffs` for why `[]` must NOT fall back).
+            // A shape test rather than `!== undefined` so a non-array from a provider
+            // adapter is fetched properly instead of silently reading as "no detail". It
+            // checks the CONTAINER only: element shapes are trusted here exactly as
+            // `getCommitDiff`'s return is trusted on the fallback path, so this is not a
+            // validation boundary and does not pretend to be one.
             let diffs: GitFileDiff[];
             if (Array.isArray(rawCommit.diffs)) {
                 diffs = rawCommit.diffs;

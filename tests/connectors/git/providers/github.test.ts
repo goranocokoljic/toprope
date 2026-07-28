@@ -283,9 +283,9 @@ describe('GitHubProvider', () => {
             const commits = await provider.getCommits('my-repo', '', '');
 
             expect(commits).toHaveLength(1);
+            // `toEqual([])` fails on undefined too — the distinction the sync loop
+            // branches on is fully covered by this one assertion.
             expect(commits[0].diffs).toEqual([]);
-            // The property is PRESENT — the distinction the sync loop branches on.
-            expect('diffs' in commits[0]).toBe(true);
         });
 
         it('keeps additions/deletions from stats, not summed from the (300-file-capped) file list', async () => {

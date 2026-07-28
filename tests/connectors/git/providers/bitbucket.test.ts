@@ -406,6 +406,9 @@ describe('BitbucketProvider', () => {
         it('exposes diffs byte-identical to what getCommitDiff would return for the same sha', async () => {
             // The whole point of the reuse: the value handed to the caller must be the
             // same value the fallback path would have produced, or churn changes.
+            // `getCommits` builds it by CALLING `this.getCommitDiff`, so today there is one
+            // implementation and this can only fail if someone forks it — a regression
+            // guard against exactly that, not an independent check.
             const hash = 'abc123';
             vi.stubGlobal(
                 'fetch',
@@ -437,10 +440,9 @@ describe('BitbucketProvider', () => {
             const commits = await provider.getCommits('my-repo', '', '');
 
             expect(commits).toHaveLength(1);
+            // `toEqual([])` is the whole assertion: it fails on undefined too, which is
+            // precisely the distinction the sync loop branches on.
             expect(commits[0].diffs).toEqual([]);
-            // The property is PRESENT — `toEqual([])` above would already fail on
-            // undefined, but this pins the distinction the sync loop branches on.
-            expect('diffs' in commits[0]).toBe(true);
         });
 
         // --- onProgress (#270) ---

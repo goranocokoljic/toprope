@@ -141,8 +141,12 @@ interface RawCommitDetail {
         message: string;
     };
     author: {login: string} | null;
-    stats: {additions: number; deletions: number; total: number};
-    files: Array<{filename: string; additions: number; deletions: number; status: string}>;
+    // Both OPTIONAL: GitHub omits them on some commits, which is why every reader here
+    // guards (`detail.stats?.additions ?? 0`, `detail.files ?? []`). Typed to match what
+    // the readers actually assume, so nobody writes `detail.files.map(...)` on the strength
+    // of the declaration.
+    stats?: {additions: number; deletions: number; total: number};
+    files?: Array<{filename: string; additions: number; deletions: number; status: string}>;
 }
 
 /**
@@ -151,8 +155,9 @@ interface RawCommitDetail {
  * caller's fallback). One function so the two can never disagree — they read the SAME
  * endpoint, and if they mapped it differently the reuse in #271 would change churn.
  *
- * Returns `[]` for a detail with no `files` (GitHub omits the key on some commits), which
- * is a real "touched no files" answer, not "unknown".
+ * Returns `[]` for a detail with no `files` (GitHub omits the key on some commits) — an
+ * answer, not "unknown": re-requesting the same endpoint would return the same thing. See
+ * `GitCommit.diffs` on why `[]` must never be treated as "go fetch it".
  */
 function toFileDiffs(detail: RawCommitDetail): GitFileDiff[] {
     return (detail.files ?? []).map((f) => ({

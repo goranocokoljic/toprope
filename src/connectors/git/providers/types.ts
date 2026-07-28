@@ -52,13 +52,21 @@ export interface GitCommit {
     message: string;
     additions: number;
     deletions: number;
+    /**
+     * Since #271 this is DERIVED — all three providers set it to `diffs.map(d => d.path)`
+     * — and it has no production reader (`toAnalysisCommit` builds `AnalysisCommit.fileDiffs`
+     * from the diffs the sync loop passes it, and `scoreAiSignature` counts those). Do not
+     * treat it as independent input, and do not add a reader: use `diffs` and derive. Kept
+     * only because removing it is a test-wide rename that #271 does not need.
+     */
     filesChanged: string[];
     /**
      * The file-level diff already fetched for this commit, carried out of `getCommits` so
      * the consumer does not request it a second time (#271). All three in-tree providers
      * supply it — each already walks a per-commit endpoint while building this row — which
-     * is what makes a sync cost ~N per-commit diff walks instead of ~2N. It is guaranteed
-     * to be the SAME value `getCommitDiff(repo, sha)` would return for this commit.
+     * is what makes a sync cost ~N per-commit diff walks instead of ~2N. It is the SAME
+     * value `getCommitDiff(repo, sha)` would return for this commit — with one deliberate
+     * exception: where `getCommitDiff` would THROW a 404, this is `[]` (see below).
      *
      * NOT a source for the totals above, and do NOT re-derive them from it. On Bitbucket
      * and GitLab `additions`/`deletions` are in fact the sum of these entries, but on
@@ -68,18 +76,20 @@ export interface GitCommit {
      * under-reports exactly the largest GitHub commits.
      *
      * `undefined` and `[]` are NOT interchangeable. `undefined` means "this provider
-     * supplied nothing — fetch it via `getCommitDiff`"; `[]` means "already fetched, and
-     * this commit genuinely touched no files" (a Bitbucket/GitLab merge commit whose
-     * diffstat 404s, a GitHub commit whose detail carries no `files`). Collapsing the two
-     * would send exactly those commits back down the fallback path — the duplicate
-     * request this field exists to remove.
+     * supplied nothing — fetch it via `getCommitDiff`". `[]` means "the walk finished and
+     * no further request will help" — which is EITHER a commit that genuinely touched no
+     * files, OR a lossy degradation: Bitbucket and GitLab swallow a 404 from the
+     * diffstat/diff endpoint into `[]`, and GitLab's 404 case is initial commits, which do
+     * touch files. So do not read `diffs.length === 0` as "empty commit"; read it as "no
+     * file-level detail is obtainable". Either way it must not fall back — collapsing `[]`
+     * into `undefined` would send exactly these commits back to an endpoint that just
+     * refused them, the duplicate request this field exists to remove.
      *
-     * Optional deliberately, and NOT because the in-tree providers are unreliable about
-     * it (they all set it unconditionally). `getCommitDiff` stays on the interface for
-     * callers holding only a sha, so an implementation that legitimately cannot pre-fetch
-     * the diff — one whose commit-list endpoint already carries the totals, say — must be
-     * able to say "I have none" and be served correctly rather than be forced to fabricate
-     * an empty array that would read as "no files".
+     * Optional deliberately: `getCommitDiff` stays on the interface for callers holding
+     * only a sha, so an implementation that legitimately cannot pre-fetch the diff — one
+     * whose commit-list endpoint already carries the totals, say — must be able to say "I
+     * have none" and be served correctly rather than be forced to fabricate an empty array
+     * that would read as "no detail obtainable".
      *
      * Paths are the provider's own, NOT repo-namespaced — the same contract
      * `getCommitDiff` returns, so a consumer namespaces both identically. Treat the array
