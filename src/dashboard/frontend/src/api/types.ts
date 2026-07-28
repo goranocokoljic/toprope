@@ -1070,6 +1070,14 @@ export interface GitProviderDeleteResult {
 export type GitSyncStage = 'listing_repos' | 'fetching' | 'analyzing' | 'writing';
 
 /**
+ * Which O(N) fan-out inside `current_repo` the run is working through (#270) —
+ * mirrors the server's `GitSyncRepoStep`. Both the value and the null are wire
+ * data, so consumers must degrade on an unrecognized member rather than assume
+ * this union is closed at runtime.
+ */
+export type GitSyncRepoStep = 'commits' | 'diffs' | 'prs';
+
+/**
  * The pipeline's latest progress snapshot for an in-flight sync — mirrors the
  * server's `GitSyncProgress` exactly. Counters are cumulative over the run.
  */
@@ -1082,6 +1090,16 @@ export interface GitSyncProgress {
     commits_fetched: number;
     prs_fetched: number;
     developers_matched: number;
+    /**
+     * The within-repo fan-out in flight and how far it has advanced (#270). Null /
+     * (0, null) whenever no fan-out is running. `repo_step_total` is null while the
+     * set is still being discovered (a list endpoint paging in), in which case
+     * `repo_step_done` reads as "found so far" — the server cannot know the total
+     * yet, so there is deliberately no percentage to render.
+     */
+    repo_step: GitSyncRepoStep | null;
+    repo_step_done: number;
+    repo_step_total: number | null;
 }
 
 /**

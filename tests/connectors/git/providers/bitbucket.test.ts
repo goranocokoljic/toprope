@@ -395,6 +395,149 @@ describe('BitbucketProvider', () => {
             });
         });
 
+        // --- onProgress (#270) ---
+
+        it('reports one listing tick per commit page, then one per diffstat fetch', async () => {
+            const fetchMock = makeFetchMock([
+                {body: pagedResponse([makeCommitFixture('aaa')], 'https://api.bitbucket.org/2.0/next')},
+                {body: pagedResponse([makeCommitFixture('bbb')])},
+                {body: pagedResponse(makeDiffstatFixture())}, // diffstat for aaa
+                {body: pagedResponse(makeDiffstatFixture())}, // diffstat for bbb
+            ]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            const onProgress = vi.fn();
+            await provider.getCommits('my-repo', '', '', onProgress);
+
+            // Listing has no total (unknown until the last page); the per-commit
+            // diffstat fan-out — where nearly all of a big repo's wall time goes —
+            // then reports real done/total.
+            expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
+                {done: 1, total: null},
+                {done: 2, total: null},
+                {done: 0, total: 2},
+                {done: 1, total: 2},
+                {done: 2, total: 2},
+            ]);
+        });
+
+        it('reports an empty repo as a real zero total, not a suppressed step', async () => {
+            vi.stubGlobal('fetch', makeFetchMock([{body: pagedResponse([])}]));
+
+            const onProgress = vi.fn();
+            await provider.getCommits('empty-repo', '', '', onProgress);
+
+            // `total: 0` is reported truthfully here as on the other two providers;
+            // suppressing the meaningless "commit 0/0" is the consumer's job.
+            expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
+                {done: 0, total: null},
+                {done: 0, total: 0},
+            ]);
+        });
+
+        it('reports every page of a walk that retains nothing, though the count cannot move', async () => {
+            // Bitbucket's commit endpoint takes no date bounds, so an `until` in the
+            // past is filtered in memory: each page before the window retains nothing
+            // and reports an unchanging 0. Pinned deliberately — this is the known
+            // stationary-counter case on the backfill/catch-up path (#276), and the
+            // assertion fails if a future change stops reporting these pages at all.
+            const fetchMock = makeFetchMock([
+                {
+                    body: pagedResponse(
+                        [makeCommitFixture('newer1', {date: '2024-06-01T00:00:00+00:00'})],
+                        'https://api.bitbucket.org/2.0/next',
+                    ),
+                },
+                {
+                    body: pagedResponse([
+                        makeCommitFixture('newer2', {date: '2024-05-01T00:00:00+00:00'}),
+                    ]),
+                },
+            ]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            const onProgress = vi.fn();
+            const commits = await provider.getCommits(
+                'my-repo',
+                '2024-01-01T00:00:00Z',
+                '2024-02-01T00:00:00Z',
+                onProgress,
+            );
+
+            expect(commits).toEqual([]);
+            // Assert the PROPERTY (every page reports, in the listing phase), not the
+            // `done: 0` value itself — #276 is expected to change that value, and this
+            // test should not have to be rewritten to let the fix land.
+            const listingTicks = onProgress.mock.calls
+                .map((c) => c[0] as {done: number; total: number | null})
+                .filter((p) => p.total === null);
+            expect(listingTicks).toHaveLength(2);
+        });
+
+        it('does not report the page that hits the since cutoff — that tick is unobservable', async () => {
+            // `break paging` skips the listing report on the cutoff page, deliberately:
+            // the fan-out seed below it runs in the same synchronous block and would
+            // overwrite the tick before any poller could read it, so restructuring the
+            // walk to reach it would be churn for nothing (#270 review OR-1). What must
+            // hold is that the cutoff BEHAVIOR is unchanged and the fan-out still ticks.
+            const fetchMock = makeFetchMock([
+                {
+                    body: pagedResponse(
+                        [
+                            makeCommitFixture('aaa', {date: '2024-01-20T00:00:00+00:00'}),
+                            makeCommitFixture('bbb', {date: '2023-12-01T00:00:00+00:00'}),
+                        ],
+                        'https://api.bitbucket.org/2.0/next',
+                    ),
+                },
+                {body: pagedResponse([])}, // diffstat for aaa
+            ]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            const onProgress = vi.fn();
+            const commits = await provider.getCommits(
+                'my-repo',
+                '2024-01-01T00:00:00Z',
+                '2024-12-31T23:59:59Z',
+                onProgress,
+            );
+
+            expect(commits.map((c) => c.sha)).toEqual(['aaa']);
+            expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
+                {done: 0, total: 1},
+                {done: 1, total: 1},
+            ]);
+        });
+
+        it('reports the PR-list page that hits the since cutoff', async () => {
+            // Unlike the commit walk, getPullRequests reports BEFORE deciding whether to
+            // stop, and there is a real `await` on the next iteration for a non-final
+            // page — so this tick is observable and must not be moved into a break.
+            const fetchMock = makeFetchMock([
+                {
+                    body: pagedResponse(
+                        [
+                            makePRFixture({id: 1, updated_on: '2024-02-01T00:00:00+00:00'}),
+                            makePRFixture({id: 2, updated_on: '2023-01-01T00:00:00+00:00'}),
+                        ],
+                        'https://api.bitbucket.org/2.0/next',
+                    ),
+                },
+            ]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            const onProgress = vi.fn();
+            const prs = await provider.getPullRequests(
+                'my-repo',
+                'all',
+                '2024-01-01T00:00:00Z',
+                onProgress,
+            );
+
+            expect(prs.map((p) => p.id)).toEqual(['1']);
+            expect(onProgress.mock.calls.map((c) => c[0])).toEqual([{done: 1, total: null}]);
+        });
+
         it('stops pagination when commit date is before since', async () => {
             const recent = makeCommitFixture('aaa', {date: '2024-01-20T00:00:00+00:00'});
             const old = makeCommitFixture('bbb', {date: '2023-12-01T00:00:00+00:00'});
@@ -570,6 +713,28 @@ describe('BitbucketProvider', () => {
     // --- getPullRequests ---
 
     describe('getPullRequests()', () => {
+        it('reports one listing tick per PR page (#270)', async () => {
+            const fetchMock = makeFetchMock([
+                {
+                    body: pagedResponse(
+                        [makePRFixture({id: 1})],
+                        'https://api.bitbucket.org/2.0/next',
+                    ),
+                },
+                {body: pagedResponse([makePRFixture({id: 2})])},
+            ]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            const onProgress = vi.fn();
+            const prs = await provider.getPullRequests('my-repo', 'all', '', onProgress);
+
+            expect(prs).toHaveLength(2);
+            expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
+                {done: 1, total: null},
+                {done: 2, total: null},
+            ]);
+        });
+
         it('returns PRs mapped to GitPR shape', async () => {
             const fetchMock = makeFetchMock([{body: pagedResponse([makePRFixture()])}]);
             vi.stubGlobal('fetch', fetchMock);

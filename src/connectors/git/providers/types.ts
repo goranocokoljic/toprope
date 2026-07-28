@@ -109,11 +109,54 @@ export interface GitFileDiff {
     status: string;
 }
 
+/**
+ * How far a long-running provider fetch has advanced (#270).
+ *
+ * `total` is null while a list endpoint is still paging in — the size of the result
+ * set genuinely is not knowable until the last page arrives — and `done` then reads
+ * as "rows seen so far". Once the set is in hand `total` is real and the pair reads
+ * as done-out-of-total.
+ *
+ * Those are the same SEMANTICS `GitSyncProgress.repo_step_done`/`repo_step_total`
+ * carry on the wire (the sync loop renames the fields but does not reinterpret them),
+ * which is why neither side needs a percentage or ETA: see the invariants documented
+ * on `GitSyncProgress.repo_step`.
+ */
+export interface GitFetchProgress {
+    done: number;
+    total: number | null;
+}
+
+/**
+ * Optional progress listener a caller may hand to the provider calls that do
+ * unbounded network work. Always invoked through `?.()` with an inline argument,
+ * so on a path that supplies no listener (the scheduled sync, `toprope doctor`)
+ * neither the call nor the argument object is ever constructed — optional-call
+ * short-circuiting does not evaluate its arguments.
+ */
+export type GitFetchProgressListener = (progress: GitFetchProgress) => void;
+
 export interface GitProvider {
     name: GitProviderType;
     listRepos(): Promise<GitRepo[]>;
-    getCommits(repo: string, since: string, until: string): Promise<GitCommit[]>;
-    getPullRequests(repo: string, state: string, since: string): Promise<GitPR[]>;
+    // `onProgress` (optional) is called as the commit list pages in and again per
+    // commit during the per-commit detail/diff fan-out. Both are unbounded network
+    // work — without it the whole call is one opaque await and an observer's
+    // counter jumps 0 → N only when the repo is finished (#270).
+    getCommits(
+        repo: string,
+        since: string,
+        until: string,
+        onProgress?: GitFetchProgressListener,
+    ): Promise<GitCommit[]>;
+    // `onProgress` (optional) reports the PR list paging in. The per-PR
+    // comment/review fan-out lives in the sync loop, which reports that itself.
+    getPullRequests(
+        repo: string,
+        state: string,
+        since: string,
+        onProgress?: GitFetchProgressListener,
+    ): Promise<GitPR[]>;
     getReviewComments(repo: string, prId: string): Promise<GitReviewComment[]>;
     // Normalized review verdict events (approved / changes_requested /
     // commented) for one PR, in submission order. Task 5.2 uses these to count

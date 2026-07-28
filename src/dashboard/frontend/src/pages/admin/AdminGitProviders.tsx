@@ -35,6 +35,8 @@ import type {
     GitProviderProbeResult,
     GitProviderRepo,
     GitProviderType,
+    GitSyncProgress,
+    GitSyncRepoStep,
 } from '../../api/types';
 import {
     AdminBanner,
@@ -276,6 +278,59 @@ function syncTone(status: string | null): 'success' | 'danger' | 'neutral' {
 }
 
 /**
+ * The noun each within-repo step counts (#270). A `Record` over the union, matching
+ * `PROVIDER_META` above: adding a `GitSyncRepoStep` member without a noun is a BUILD
+ * error, and an unrecognized wire value from a newer backend reads `undefined` at
+ * runtime — both properties, without a switch.
+ */
+const REPO_STEP_NOUN: Record<GitSyncRepoStep, string> = {
+    commits: 'commit',
+    diffs: 'diff',
+    prs: 'PR',
+};
+
+/**
+ * The counters shown after the repo position on the `fetching` line (#270): the
+ * within-repo counter, then the run-level totals it supplements.
+ *
+ * The within-repo counter is PREPENDED, not substituted — `commits_fetched`/
+ * `prs_fetched` only move when a whole repo finishes, so substituting would have
+ * hidden how much data the run has actually pulled for essentially the whole stage.
+ * The two are at different scopes and use the same nouns, so the run-level pair is
+ * labelled to keep `commit 1240/5000 · run total 34 commits` from reading as one
+ * broken number (the within-repo count is routinely the larger of the two).
+ */
+function repoStepDetail(p: GitSyncProgress): string {
+    const commits = `${p.commits_fetched} commit${p.commits_fetched === 1 ? '' : 's'}`;
+    const prs = `${p.prs_fetched} PR${p.prs_fetched === 1 ? '' : 's'}`;
+    const runTotal = `run total ${commits} · ${prs}`;
+    const step = repoStepCount(p);
+    return step === null ? runTotal : `${step} · ${runTotal}`;
+}
+
+/**
+ * `commit 12/40` once the set size is known, `12 commits found` while it isn't, or
+ * null when there is nothing honest to show: no step in flight, a step that ran over
+ * an empty set (a total of 0 would render as the meaningless "commit 0/0"), or a step
+ * name a newer backend emits that this bundle cannot name. This is the single place
+ * that decision is made — providers deliberately do not pre-filter empty steps.
+ */
+function repoStepCount(p: GitSyncProgress): string | null {
+    // `Object.hasOwn`, not a bare lookup: `repo_step` is wire data, and a plain object
+    // literal would resolve an inherited key ("toString", "constructor") to a function
+    // that passes an `undefined` check and renders as source text.
+    const noun: string | undefined =
+        p.repo_step !== null && Object.hasOwn(REPO_STEP_NOUN, p.repo_step)
+            ? REPO_STEP_NOUN[p.repo_step]
+            : undefined;
+    if (noun === undefined || p.repo_step_total === 0) return null;
+    if (p.repo_step_total === null) {
+        return `${p.repo_step_done} ${noun}${p.repo_step_done === 1 ? '' : 's'} found`;
+    }
+    return `${noun} ${p.repo_step_done}/${p.repo_step_total}`;
+}
+
+/**
  * Human-readable line for an in-flight sync's progress snapshot (#209) — stage
  * plus the counters that stage has meaningfully advanced. Exported for tests.
  */
@@ -291,18 +346,24 @@ export function syncProgressLabel(active: GitProviderActiveSync): string {
             // clamped so the label never overshoots (12/12, not 13/12; 0/0).
             const position = Math.min(p.repos_processed + 1, total);
             const repo = p.current_repo ? ` (${p.current_repo})` : '';
-            return `Fetching activity — repo ${position}/${total}${repo} · ${p.commits_fetched} commits · ${p.prs_fetched} PRs`;
+            return `Fetching activity — repo ${position}/${total}${repo} · ${repoStepDetail(p)}`;
         }
         case 'analyzing':
             return `Matching developers — ${p.developers_matched} matched`;
         case 'writing':
             return `Writing snapshots — ${p.developers_matched} developer${p.developers_matched === 1 ? '' : 's'} matched`;
+        default: {
+            // Exhaustiveness witness: adding a GitSyncStage member without a case here
+            // is a BUILD error. (A bare `return` after the switch does NOT give this —
+            // the compiler is satisfied by the return and never checks coverage, which
+            // is what the comment here used to claim incorrectly.) At runtime `p.stage`
+            // is wire data, so a newer backend's stage lands here too and degrades to a
+            // generic label rather than a blank line.
+            const exhaustive: never = p.stage;
+            void exhaustive;
+            return 'Syncing…';
+        }
     }
-    // Runtime fallback, deliberately OUTSIDE the switch so the compiler still
-    // enforces exhaustiveness over the union: p.stage is wire data, and a newer
-    // backend can emit a stage this cached bundle doesn't know. Degrade to a
-    // generic label, never a blank line.
-    return 'Syncing…';
 }
 
 /** Small indeterminate spinner shown next to live sync progress. */
@@ -1425,9 +1486,27 @@ function ProviderRow({
             {provider.active_sync ? (
                 <tr>
                     <td colSpan={7} className="px-3 pb-3">
+                        {/*
+                          * NOT a live region (#270 review DUP-1). It used to be
+                          * role="status", which was tolerable only because the old label
+                          * was byte-identical for minutes at a time. The within-repo
+                          * counter now changes on nearly every 1s poll for the whole
+                          * fetching stage, so a polite live region would announce a
+                          * ~70-character line once per second for the length of a
+                          * multi-hour first sync — and the digit is the least useful part
+                          * to hear.
+                          *
+                          * What a screen reader still gets: the disabled "Syncing…"
+                          * button conveys in-flight state. What it does NOT get is a
+                          * completion announcement — the status cell's <Badge> is a plain
+                          * span with no role (components/Badge.tsx), so the ok/error flip
+                          * is silent. That gap is pre-existing for every other admin
+                          * table and is tracked in #278; the right fix is a live region
+                          * on a low-churn element (the stage, or the badge), never on
+                          * this counter line.
+                          */}
                         <span
                             className="flex items-center gap-2 text-sm text-muted"
-                            role="status"
                             data-testid="sync-progress"
                         >
                             <Spinner />

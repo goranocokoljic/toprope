@@ -10,6 +10,7 @@ import type {
     GitFileDiff,
     GitAuthor,
     GitLabProviderConfig,
+    GitFetchProgressListener,
 } from './types.js';
 import {normalizeContainer} from './container.js';
 
@@ -245,7 +246,12 @@ export class GitLabProvider implements GitProvider {
         return repos;
     }
 
-    async getCommits(repo: string, since: string, until: string): Promise<GitCommit[]> {
+    async getCommits(
+        repo: string,
+        since: string,
+        until: string,
+        onProgress?: GitFetchProgressListener,
+    ): Promise<GitCommit[]> {
         const params = new URLSearchParams({ per_page: String(PER_PAGE) });
         if (since) params.set('since', since);
         if (until) params.set('until', until);
@@ -260,13 +266,19 @@ export class GitLabProvider implements GitProvider {
             const res = await fetchGitLab(url, this.authHeaders);
             const data = (await res.json()) as RawCommit[];
             raw.push(...data);
+            // One report per page — the commit total is unknown until the last
+            // page, so a running seen-so-far count is all that is honest (#270).
+            onProgress?.({done: raw.length, total: null});
 
             const nextPage = res.headers.get('x-next-page');
             hasNextPage = !!nextPage && nextPage !== '';
             if (hasNextPage) page = parseInt(nextPage!, 10);
         }
 
+        // The per-commit diff fetch is the O(commits) cost of this call — report each
+        // one so an observer's counter ticks during it, not only once it returns.
         const commits: GitCommit[] = [];
+        onProgress?.({done: 0, total: raw.length});
         for (const c of raw) {
             let diffs: GitFileDiff[] = [];
             try {
@@ -292,12 +304,20 @@ export class GitLabProvider implements GitProvider {
                 deletions: diffs.reduce((s, d) => s + d.deletions, 0),
                 filesChanged: diffs.map((d) => d.path),
             });
+            // Every iteration pushes, so the commit count IS the processed count —
+            // no separate counter to keep in step.
+            onProgress?.({done: commits.length, total: raw.length});
         }
 
         return commits;
     }
 
-    async getPullRequests(repo: string, state: string, since: string): Promise<GitPR[]> {
+    async getPullRequests(
+        repo: string,
+        state: string,
+        since: string,
+        onProgress?: GitFetchProgressListener,
+    ): Promise<GitPR[]> {
         let glState: string;
         switch (state) {
             case 'open':
@@ -358,6 +378,8 @@ export class GitLabProvider implements GitProvider {
                     deletions: 0,
                 });
             }
+
+            onProgress?.({done: prs.length, total: null});
 
             const nextPage = res.headers.get('x-next-page');
             if (!nextPage || nextPage === '') break;

@@ -9,6 +9,7 @@ import type {
     GitFileDiff,
     GitAuthor,
     BitbucketProviderConfig,
+    GitFetchProgressListener,
 } from './types.js';
 import {normalizeContainer} from './container.js';
 
@@ -255,7 +256,12 @@ export class BitbucketProvider implements GitProvider {
             }));
     }
 
-    async getCommits(repo: string, since: string, until: string): Promise<GitCommit[]> {
+    async getCommits(
+        repo: string,
+        since: string,
+        until: string,
+        onProgress?: GitFetchProgressListener,
+    ): Promise<GitCommit[]> {
         const sinceDate = since ? new Date(since) : null;
         const untilDate = until ? new Date(until) : null;
 
@@ -277,10 +283,28 @@ export class BitbucketProvider implements GitProvider {
                 }
             }
 
+            // Reports rows RETAINED, not rows scanned. Bitbucket's commit endpoint takes
+            // no date bounds (see the URL above), so this walk pages from HEAD and
+            // filters `until` in memory — on a backfill or catch-up chunk whose `until`
+            // is in the past, every page before the window retains nothing and this
+            // reports an unchanging 0. The counter is honest but stationary there; a
+            // scanned-vs-found signal is a wire/label change tracked separately in #276.
+            // On a normal forward run (`until` = now) nothing is filtered and it
+            // advances per page as intended.
+            //
+            // Deliberately NOT reported on the page that trips the `since` cutoff: the
+            // `break paging` skips it, and the seed below would overwrite it in the same
+            // synchronous block anyway, so restructuring the walk to reach it would buy
+            // an emission no consumer can ever observe (#270 review OR-1).
+            onProgress?.({done: collected.length, total: null});
             nextUrl = page.next ?? null;
         }
 
+        // The per-commit diffstat fetch is the O(commits) cost of this call — report
+        // each one so an observer's counter ticks instead of jumping 0 → N when the
+        // whole loop returns.
         const commits: GitCommit[] = [];
+        onProgress?.({done: 0, total: collected.length});
         for (const raw of collected) {
             const {name, email} = parseRawAuthor(raw.author.raw);
             const username = raw.author.user?.nickname ?? raw.author.user?.account_id ?? '';
@@ -302,12 +326,20 @@ export class BitbucketProvider implements GitProvider {
                 deletions: diffs.reduce((s, d) => s + d.deletions, 0),
                 filesChanged: diffs.map((d) => d.path),
             });
+            // Every iteration pushes, so the commit count IS the processed count —
+            // no separate counter to keep in step.
+            onProgress?.({done: commits.length, total: collected.length});
         }
 
         return commits;
     }
 
-    async getPullRequests(repo: string, state: string, since: string): Promise<GitPR[]> {
+    async getPullRequests(
+        repo: string,
+        state: string,
+        since: string,
+        onProgress?: GitFetchProgressListener,
+    ): Promise<GitPR[]> {
         const bbStates = bbStatesFromNormalized(state);
         const stateParams = bbStates.map((s) => `state=${encodeURIComponent(s)}`).join('&');
         const sinceDate = since ? new Date(since) : null;
@@ -347,6 +379,7 @@ export class BitbucketProvider implements GitProvider {
                 });
             }
 
+            onProgress?.({done: prs.length, total: null});
             nextUrl = reachedSince ? null : (page.next ?? null);
         }
 

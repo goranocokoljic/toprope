@@ -451,6 +451,45 @@ describe('GitLabProvider', () => {
             });
         });
 
+        // --- onProgress (#270) ---
+
+        it('reports one listing tick per commit page, then one per diff fetch', async () => {
+            const fetchMock = makeFetchMock([
+                {body: [makeCommitFixture('aaa')], headers: {'x-next-page': '2'}},
+                {body: [makeCommitFixture('bbb')]},
+                {body: [makeDiffEntryFixture()]}, // diff for aaa
+                {body: [makeDiffEntryFixture()]}, // diff for bbb
+            ]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            const onProgress = vi.fn();
+            await provider.getCommits('test-group/my-repo', '', '', onProgress);
+
+            // Listing carries no total (unknown until the last page); the per-commit
+            // diff fan-out then reports real done/total.
+            expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
+                {done: 1, total: null},
+                {done: 2, total: null},
+                {done: 0, total: 2},
+                {done: 1, total: 2},
+                {done: 2, total: 2},
+            ]);
+        });
+
+        it('reports an empty repo as a real zero total, not a suppressed step', async () => {
+            vi.stubGlobal('fetch', makeFetchMock([{body: []}]));
+
+            const onProgress = vi.fn();
+            await provider.getCommits('test-group/my-repo', '', '', onProgress);
+
+            // `total: 0` is reported truthfully; suppressing the meaningless
+            // "commit 0/0" is the consumer's single responsibility.
+            expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
+                {done: 0, total: null},
+                {done: 0, total: 0},
+            ]);
+        });
+
         it('URL-encodes project path for API call', async () => {
             const fetchMock = makeFetchMock([
                 {body: []},
@@ -585,6 +624,23 @@ describe('GitLabProvider', () => {
     // --- getPullRequests ---
 
     describe('getPullRequests()', () => {
+        it('reports one listing tick per MR page (#270)', async () => {
+            const fetchMock = makeFetchMock([
+                {body: [makeMRFixture({iid: 1})], headers: {'x-next-page': '2'}},
+                {body: [makeMRFixture({iid: 2})]},
+            ]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            const onProgress = vi.fn();
+            const prs = await provider.getPullRequests('test-group/my-repo', 'all', '', onProgress);
+
+            expect(prs).toHaveLength(2);
+            expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
+                {done: 1, total: null},
+                {done: 2, total: null},
+            ]);
+        });
+
         it('returns PRs mapped to GitPR shape', async () => {
             const fetchMock = makeFetchMock([{body: [makeMRFixture()]}]);
             vi.stubGlobal('fetch', fetchMock);

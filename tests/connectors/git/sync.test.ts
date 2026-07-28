@@ -26,6 +26,7 @@ import {
     PROVIDER_DELETED_MID_RUN_PREFIX,
     isAdvisoryError,
     type GitSyncProgress,
+    type GitSyncRepoStep,
     type GitSyncStage,
 } from '../../../src/connectors/git/sync';
 import {projectSnapshots, replayDeveloper} from '../../../src/connectors/git/projection';
@@ -34,7 +35,7 @@ import {createProvider} from '../../../src/connectors/git/providers/store';
 import {validateGitProviderConfig} from '../../../src/connectors/git/providers/factory';
 import {loadServerKey} from '../../../src/connectors/git/providers/secret';
 import type {GitConnectorConfig} from '../../../src/config/types';
-import type {GitProvider, GitProviderConfig, GitRepo, GitCommit, GitPR, GitReviewComment, GitFileDiff} from '../../../src/connectors/git/providers/types';
+import type {GitProvider, GitProviderConfig, GitRepo, GitCommit, GitFetchProgress, GitPR, GitReviewComment, GitFileDiff} from '../../../src/connectors/git/providers/types';
 
 // Stub createGitProvider (so no network) but keep validateGitProviderConfig real,
 // so the store/codec that seed DB providers in the integration tests below work.
@@ -2045,6 +2046,481 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
             expect(result.errors.some((e) => /bad-repo.*Failed to fetch commits/.test(e))).toBe(true);
         });
     });
+
+    describe('syncProviders — within-repo progress (#270)', () => {
+        const CONFIG: GitProviderConfig = {
+            type: 'github',
+            org: 'test-org',
+            auth: {type: 'token', api_token: 'test-token'},
+        };
+
+        /** The (step, done, total) triples a listener observed, in order. */
+        function steps(
+            snapshots: GitSyncProgress[],
+        ): Array<[GitSyncRepoStep | null, number, number | null]> {
+            return snapshots.map((s) => [s.repo_step, s.repo_step_done, s.repo_step_total]);
+        }
+
+        /**
+         * The indicator triples in order, with consecutive duplicates collapsed —
+         * emissions that changed some OTHER field (a stage flip, a cumulative counter)
+         * repeat the current triple, and those repeats are noise here.
+         *
+         * Order is the thing worth asserting: the VALUES this feature emits are
+         * trivially correct, so the only way it can regress is by emitting them in the
+         * wrong sequence (a seed landing after its ticks, a completed counter left
+         * standing across the next await). A `toContainEqual` membership check cannot
+         * fail on any of that.
+         */
+        function stepSequence(
+            snapshots: GitSyncProgress[],
+        ): Array<[GitSyncRepoStep | null, number, number | null]> {
+            const out: Array<[GitSyncRepoStep | null, number, number | null]> = [];
+            for (const triple of steps(snapshots)) {
+                const last = out[out.length - 1];
+                if (!last || last[0] !== triple[0] || last[1] !== triple[1] || last[2] !== triple[2]) {
+                    out.push(triple);
+                }
+            }
+            return out;
+        }
+
+        /**
+         * A provider that drives the onProgress callback the sync loop hands it in the
+         * SAME sequence the three real providers do: one null-total report per list
+         * page, then a `done: 0` seed carrying the now-known total, then one report per
+         * item. `repos` lets a test span more than one repo.
+         */
+        function makeTickingProvider(
+            commits: GitCommit[],
+            prs: GitPR[],
+            repos: string[] = ['repo1'],
+        ): GitProvider {
+            return makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue(repos.map(makeRepo)),
+                getCommits: vi
+                    .fn()
+                    .mockImplementation(
+                        async (
+                            _repo: string,
+                            _since: string,
+                            _until: string,
+                            onProgress?: (p: GitFetchProgress) => void,
+                        ) => {
+                            onProgress?.({done: commits.length, total: null});
+                            onProgress?.({done: 0, total: commits.length});
+                            for (let i = 1; i <= commits.length; i++) {
+                                onProgress?.({done: i, total: commits.length});
+                            }
+                            return commits;
+                        },
+                    ),
+                getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+                getPullRequests: vi
+                    .fn()
+                    .mockImplementation(
+                        async (
+                            _repo: string,
+                            _state: string,
+                            _since: string,
+                            onProgress?: (p: GitFetchProgress) => void,
+                        ) => {
+                            onProgress?.({done: prs.length, total: null});
+                            return prs;
+                        },
+                    ),
+            });
+        }
+
+        it('advances the commit counter while the list pages in and through the detail fetch', async () => {
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            const commits = [
+                makeProviderCommit('alice', '2024-01-15T10:00:00Z', 's1'),
+                makeProviderCommit('alice', '2024-01-15T11:00:00Z', 's2'),
+                makeProviderCommit('alice', '2024-01-15T12:00:00Z', 's3'),
+            ];
+            createGitProvider.mockReturnValue(makeTickingProvider(commits, []));
+
+            const snapshots: GitSyncProgress[] = [];
+            await new GitSync({enabled: false}).syncProviders(db, [CONFIG], (p) => snapshots.push(p));
+
+            // The EXACT ordered sequence for the whole repo, not just membership: a
+            // null-total listing count, then the detail fan-out seeded at 0 and passing
+            // through every intermediate value (the whole point of #270 is that it does
+            // not jump 0 → 3), then the diff fan-out, then the PR step entered before
+            // its list request, then the idle clear when the repo finishes.
+            expect(stepSequence(snapshots)).toEqual([
+                [null, 0, null],
+                // Step entered before the list request, so the label is never blank
+                // while that (possibly rate-limited) request is in flight.
+                ['commits', 0, null],
+                ['commits', 3, null],
+                ['commits', 0, 3],
+                ['commits', 1, 3],
+                ['commits', 2, 3],
+                ['commits', 3, 3],
+                ['diffs', 0, 3],
+                ['diffs', 1, 3],
+                ['diffs', 2, 3],
+                ['diffs', 3, 3],
+                ['prs', 0, null],
+                ['prs', 0, 0],
+                [null, 0, null],
+            ]);
+            // Meanwhile the run-level counter stayed frozen at 0 across every
+            // still-in-flight emission — proving the motion came from the within-repo
+            // fields and not from something the #209 label already showed. (It only
+            // moves once, after the whole repo's commits are in hand; that is exactly
+            // the granularity this issue exists to fix.)
+            const inFlight = snapshots.filter(
+                (s) =>
+                    s.repo_step === 'commits' &&
+                    s.repo_step_total !== null &&
+                    s.repo_step_done < s.repo_step_total,
+            );
+            expect(inFlight.length).toBeGreaterThan(1);
+            expect(inFlight.every((s) => s.commits_fetched === 0)).toBe(true);
+        });
+
+        it('advances a diff counter through the per-commit diff fan-out', async () => {
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            const commits = [
+                makeProviderCommit('alice', '2024-01-15T10:00:00Z', 's1'),
+                makeProviderCommit('alice', '2024-01-15T11:00:00Z', 's2'),
+            ];
+            createGitProvider.mockReturnValue(makeTickingProvider(commits, []));
+
+            const snapshots: GitSyncProgress[] = [];
+            await new GitSync({enabled: false}).syncProviders(db, [CONFIG], (p) => snapshots.push(p));
+
+            // The sync loop's OWN getCommitDiff fan-out reports separately from the
+            // provider's commit step, seeded at 0 then ticking to the total — and it
+            // starts only AFTER the commit step has finished, never interleaved.
+            const diffPhase = stepSequence(snapshots).filter(([step]) => step === 'diffs');
+            expect(diffPhase).toEqual([
+                ['diffs', 0, 2],
+                ['diffs', 1, 2],
+                ['diffs', 2, 2],
+            ]);
+            const order = stepSequence(snapshots).map(([step]) => step);
+            expect(order.lastIndexOf('commits')).toBeLessThan(order.indexOf('diffs'));
+        });
+
+        it('advances the PR counter during listing and the per-PR review fan-out', async () => {
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            const prs: GitPR[] = [
+                {...makeProviderPR('alice'), id: '1'},
+                {...makeProviderPR('alice'), id: '2'},
+            ];
+            createGitProvider.mockReturnValue(makeTickingProvider([], prs));
+
+            const snapshots: GitSyncProgress[] = [];
+            await new GitSync({enabled: false}).syncProviders(db, [CONFIG], (p) => snapshots.push(p));
+
+            // Ordered: the step is entered with an unknown total BEFORE the list
+            // request, the provider's listing count lands, the total becomes real once
+            // the list is in hand, then the comment/verdict fan-out ticks per PR.
+            const prPhase = stepSequence(snapshots).filter(([step]) => step === 'prs');
+            expect(prPhase).toEqual([
+                ['prs', 0, null],
+                ['prs', 2, null],
+                ['prs', 0, 2],
+                ['prs', 1, 2],
+                ['prs', 2, 2],
+            ]);
+        });
+
+        it('enters the PR step before the list request, so no completed diff counter is left standing', async () => {
+            // The diff fan-out ends at N/N and the PR list request can then run for
+            // minutes under a rate-limit backoff. If the PR step were only entered
+            // AFTER that request returned, the label would show a finished counter for
+            // the whole wait — the exact "reads as hung" symptom #270 removes (SO-3).
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            const commits = [makeProviderCommit('alice', '2024-01-15T10:00:00Z', 's1')];
+            const snapshots: GitSyncProgress[] = [];
+            let atListRequest: Array<[GitSyncRepoStep | null, number, number | null]> = [];
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits: vi.fn().mockResolvedValue(commits),
+                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+                    // Capture what a 1s poll would have seen at the instant the PR list
+                    // request is in flight.
+                    getPullRequests: vi.fn().mockImplementation(async () => {
+                        atListRequest = steps(snapshots);
+                        return [];
+                    }),
+                }),
+            );
+
+            await new GitSync({enabled: false}).syncProviders(db, [CONFIG], (p) => snapshots.push(p));
+
+            expect(atListRequest[atListRequest.length - 1]).toEqual(['prs', 0, null]);
+        });
+
+        it('retracts a partial PR listing count when the PR fetch fails', async () => {
+            // Page 1 lists 5 PRs, page 2 throws. Without a post-fetch report the label
+            // would sit on a frozen "5 PRs found" for the rest of the repo.
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits: vi.fn().mockResolvedValue([]),
+                    getPullRequests: vi
+                        .fn()
+                        .mockImplementation(
+                            async (
+                                _repo: string,
+                                _state: string,
+                                _since: string,
+                                onProgress?: (p: GitFetchProgress) => void,
+                            ) => {
+                                onProgress?.({done: 5, total: null});
+                                throw new Error('GitHub API error 429');
+                            },
+                        ),
+                }),
+            );
+
+            const snapshots: GitSyncProgress[] = [];
+            const result = await new GitSync({enabled: false}).syncProviders(db, [CONFIG], (p) =>
+                snapshots.push(p),
+            );
+
+            const observed = stepSequence(snapshots);
+            // The partial count was seen…
+            expect(observed).toContainEqual(['prs', 5, null]);
+            // …and the very next indicator change retracts it to a zero total, which
+            // the label renders as no counter rather than a stale "5 PRs found".
+            const afterPartial = observed.slice(observed.findIndex((t) => t[1] === 5 && t[2] === null) + 1);
+            expect(afterPartial[0]).toEqual(['prs', 0, 0]);
+            expect(result.errors.some((e) => /repo1.*Failed to fetch PRs/.test(e))).toBe(true);
+        });
+
+        it('clears the indicator when a repo finishes and between repos', async () => {
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            const commits = [makeProviderCommit('alice', '2024-01-15T10:00:00Z', 's1')];
+            createGitProvider.mockReturnValue(
+                makeTickingProvider(commits, [makeProviderPR('alice')], ['repo1', 'repo2']),
+            );
+
+            const snapshots: GitSyncProgress[] = [];
+            await new GitSync({enabled: false}).syncProviders(db, [CONFIG], (p) => snapshots.push(p));
+
+            // Every emission that completes a repo (repos_processed just advanced) has
+            // an idle indicator, so a finished repo's "PR 1/1" is never left on screen.
+            const repoDone = snapshots.filter((s, i) => i > 0 && s.repos_processed > snapshots[i - 1].repos_processed);
+            expect(repoDone).toHaveLength(2);
+            for (const s of repoDone) {
+                expect([s.repo_step, s.repo_step_done, s.repo_step_total]).toEqual([null, 0, null]);
+            }
+            // …and the final snapshot (analyzing/writing, long past any repo) is idle too.
+            const final = snapshots[snapshots.length - 1];
+            expect([final.repo_step, final.repo_step_done, final.repo_step_total]).toEqual([null, 0, null]);
+        });
+
+        it('clears the indicator when a repo\'s commit fetch fails mid-step', async () => {
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('bad-repo')]),
+                    // Ticks partway, then throws — the failure path must not leave a
+                    // half-finished "commit 2/9" frozen on the label forever.
+                    getCommits: vi
+                        .fn()
+                        .mockImplementation(
+                            async (
+                                _repo: string,
+                                _since: string,
+                                _until: string,
+                                onProgress?: (p: GitFetchProgress) => void,
+                            ) => {
+                                onProgress?.({done: 2, total: 9});
+                                throw new Error('GitHub API error 500');
+                            },
+                        ),
+                }),
+            );
+
+            const snapshots: GitSyncProgress[] = [];
+            const result = await new GitSync({enabled: false}).syncProviders(db, [CONFIG], (p) =>
+                snapshots.push(p),
+            );
+
+            // The partial tick was observed…
+            expect(steps(snapshots)).toContainEqual(['commits', 2, 9]);
+            // …and then cleared by the failure branch, which still counts the repo.
+            const final = snapshots[snapshots.length - 1];
+            expect([final.repo_step, final.repo_step_done, final.repo_step_total]).toEqual([null, 0, null]);
+            expect(final.repos_processed).toBe(1);
+            expect(result.errors.some((e) => /bad-repo.*Failed to fetch commits/.test(e))).toBe(true);
+        });
+
+        it('reports an empty repo as zero totals, leaving the "no 0/0 counter" call to the consumer', async () => {
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(makeTickingProvider([], []));
+
+            const snapshots: GitSyncProgress[] = [];
+            await new GitSync({enabled: false}).syncProviders(db, [CONFIG], (p) => snapshots.push(p));
+
+            // The pipeline reports what actually happened — steps that ran over an
+            // empty set — rather than suppressing them here. Suppressing "commit 0/0"
+            // is one decision in one place (repoStepCount, covered in
+            // adminGitProviders.test.tsx); duplicating it across every producer is how
+            // a fourth provider ends up forgetting it.
+            expect(stepSequence(snapshots)).toEqual([
+                [null, 0, null],
+                ['commits', 0, null],
+                ['commits', 0, 0],
+                ['diffs', 0, 0],
+                ['prs', 0, null],
+                ['prs', 0, 0],
+                [null, 0, null],
+            ]);
+        });
+
+        it('enters both steps before their list requests, so the label is never blank mid-request', async () => {
+            // Symmetric guarantee for commits and PRs: at the instant each list request
+            // is in flight, a poll sees that step with an unknown total — not the
+            // previous step's finished counter, and not an idle indicator.
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            const snapshots: GitSyncProgress[] = [];
+            let atCommitList: Array<[GitSyncRepoStep | null, number, number | null]> = [];
+            let atPRList: Array<[GitSyncRepoStep | null, number, number | null]> = [];
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits: vi.fn().mockImplementation(async () => {
+                        atCommitList = steps(snapshots);
+                        return [makeProviderCommit('alice', '2024-01-15T10:00:00Z', 's1')];
+                    }),
+                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+                    getPullRequests: vi.fn().mockImplementation(async () => {
+                        atPRList = steps(snapshots);
+                        return [];
+                    }),
+                }),
+            );
+
+            await new GitSync({enabled: false}).syncProviders(db, [CONFIG], (p) => snapshots.push(p));
+
+            expect(atCommitList[atCommitList.length - 1]).toEqual(['commits', 0, null]);
+            expect(atPRList[atPRList.length - 1]).toEqual(['prs', 0, null]);
+        });
+
+        it('restarts the per-repo counters on the second repo instead of accumulating', async () => {
+            // diffsProcessed/prsProcessed are per-repo `let`s inside the repo loop.
+            // Hoisting either (they sit beside loop-scoped failure counters, so it is a
+            // plausible refactor) would make repo2 report `diff 2/1` — a done greater
+            // than its total. The full sequence across BOTH repos is the only assertion
+            // that catches it; repo-boundary snapshots are idle either way.
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1'), makeRepo('repo2')]),
+                    getCommits: vi
+                        .fn()
+                        .mockResolvedValue([makeProviderCommit('alice', '2024-01-15T10:00:00Z', 's1')]),
+                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+                    getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+                }),
+            );
+
+            const snapshots: GitSyncProgress[] = [];
+            await new GitSync({enabled: false}).syncProviders(db, [CONFIG], (p) => snapshots.push(p));
+
+            const perRepo: Array<[GitSyncRepoStep | null, number, number | null]> = [
+                ['commits', 0, null],
+                ['diffs', 0, 1],
+                ['diffs', 1, 1],
+                ['prs', 0, null],
+                ['prs', 0, 1],
+                ['prs', 1, 1],
+                [null, 0, null],
+            ];
+            expect(stepSequence(snapshots)).toEqual([[null, 0, null], ...perRepo, ...perRepo]);
+            // Stated as an invariant too, since it is the property that actually matters.
+            for (const s of snapshots) {
+                if (s.repo_step_total !== null) {
+                    expect(s.repo_step_done).toBeLessThanOrEqual(s.repo_step_total);
+                }
+            }
+        });
+
+        it('a throwing listener loses its update and nothing else — no phantom fetch error, no held cursor', async () => {
+            // The guard in syncProviders' `report` closure is load-bearing, not defensive
+            // habit. These reports fire from INSIDE provider.getCommits/getPullRequests,
+            // whose per-repo catch would read an escaping throw as a failed fetch — which
+            // sets commitsComplete = false, holds the provider's forward cursor and drops
+            // its snapshots (#231) — and other report sites sit outside those try blocks
+            // entirely, where the provider-level handler would discard the whole
+            // provider's results. Delete the try/catch and this test fails on all three
+            // assertions; without it, a cosmetic listener bug becomes silent data loss
+            // three releases later with no visible connection.
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeTickingProvider(
+                    [makeProviderCommit('alice', '2024-01-15T10:00:00Z', 's1')],
+                    [makeProviderPR('alice')],
+                ),
+            );
+
+            let calls = 0;
+            const result = await new GitSync({enabled: false}).syncProviders(db, [CONFIG], () => {
+                // Throws on every emission — the worst case, and it covers both the
+                // guarded-await sites and the ones outside them.
+                calls++;
+                throw new Error('listener bug');
+            });
+
+            expect(calls).toBeGreaterThan(1);
+            // No fetch failed, so no fetch error may be reported…
+            expect(result.errors.filter((e) => !/Unmatched authors/.test(e))).toEqual([]);
+            // …the provider was not skipped wholesale…
+            expect(result.errors.some((e) => /could not be used/.test(e))).toBe(false);
+            // …the snapshots were written…
+            expect(countSnapshots(db)).toBeGreaterThan(0);
+            // …and the forward cursor advanced, i.e. the window is not re-covered.
+            const cursor = db
+                .prepare('SELECT value FROM sync_state WHERE key = ?')
+                .get(syncStateKey('github', 'test-org')) as {value: string} | undefined;
+            expect(cursor?.value).toBe(result.lastSyncTime);
+        });
+
+        it('passes no listener to the provider on the observer-free scheduled path', async () => {
+            // AC: the scheduled sync is unchanged — `onProgress` stays undefined all
+            // the way down, so a provider pays nothing (not even an allocated object).
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            const getCommits = vi.fn().mockResolvedValue([]);
+            const getPullRequests = vi.fn().mockResolvedValue([]);
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits,
+                    getPullRequests,
+                }),
+            );
+
+            await new GitSync({enabled: false}).syncProviders(db, [CONFIG]);
+
+            expect(getCommits).toHaveBeenCalledTimes(1);
+            expect(getCommits.mock.calls[0][3]).toBeUndefined();
+            expect(getPullRequests).toHaveBeenCalledTimes(1);
+            expect(getPullRequests.mock.calls[0][3]).toBeUndefined();
+        });
+    });
 });
 
 describe('firstSyncSince — first-sync window math (#228)', () => {
@@ -2484,7 +2960,8 @@ describe('GitSync.syncProviders — sync-older-history backfill plumbing (#229)'
         );
         const backfill = {since: '2024-01-01T00:00:00.000Z', until: '2024-07-01T00:00:00.000Z'};
         const getCommits = await runBackfill(backfill);
-        expect(getCommits).toHaveBeenCalledWith('repo1', backfill.since, backfill.until);
+        // Trailing `undefined` is the optional #270 progress listener: absent here.
+        expect(getCommits).toHaveBeenCalledWith('repo1', backfill.since, backfill.until, undefined);
     });
 
     it('LOWERS the earliest watermark to `since` and leaves the forward cursor untouched', async () => {
@@ -3728,7 +4205,8 @@ describe('GitSync — stalled-provider detection (#235)', () => {
 
             // The commit walk (and its per-commit diff fetches) is bounded to one cap
             // width instead of the full 90 days — the point of the cap.
-            expect(getCommits).toHaveBeenCalledWith('repo1', cursor, expectedUntil);
+            // Trailing `undefined` is the optional #270 progress listener: absent here.
+            expect(getCommits).toHaveBeenCalledWith('repo1', cursor, expectedUntil, undefined);
             // …and CRUCIALLY the cursor advances only to what was actually covered.
             // Advancing to `now` here would silently skip the remaining 60 days — the
             // permanent gap #231 exists to prevent, reintroduced by the cap itself.
@@ -3754,7 +4232,8 @@ describe('GitSync — stalled-provider detection (#235)', () => {
             const result = await new GitSync({enabled: false}).syncProviders(db, [CONFIG]);
 
             // The normal daily path must be exactly what it was before the cap existed.
-            expect(getCommits).toHaveBeenCalledWith('repo1', cursor, result.lastSyncTime);
+            // Trailing `undefined` is the optional #270 progress listener: absent here.
+            expect(getCommits).toHaveBeenCalledWith('repo1', cursor, result.lastSyncTime, undefined);
             expect(readState(FORWARD_KEY)).toBe(result.lastSyncTime);
         });
 
@@ -4102,7 +4581,8 @@ describe('GitSync — stalled-provider detection (#235)', () => {
 
             // The backfill route already computed and overlap-guarded this exact slice;
             // narrowing it here would silently import less than the guard cleared.
-            expect(getCommits).toHaveBeenCalledWith('repo1', backfill.since, backfill.until);
+            // Trailing `undefined` is the optional #270 progress listener: absent here.
+            expect(getCommits).toHaveBeenCalledWith('repo1', backfill.since, backfill.until, undefined);
         });
     });
 });

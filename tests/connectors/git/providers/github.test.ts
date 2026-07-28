@@ -272,6 +272,100 @@ describe('GitHubProvider', () => {
             expect(commits).toEqual([]);
         });
 
+        // --- onProgress (#270) ---
+
+        it('reports one listing tick per commit-list page, then one per detail fetch', async () => {
+            const fetchMock = makeFetchMock([
+                {
+                    body: [makeCommitListFixture('aaa111')],
+                    headers: {link: '<https://api.github.com/repos/test-org/my-repo/commits?page=2>; rel="next"'},
+                },
+                {body: [makeCommitListFixture('bbb222')]},
+                {body: makeCommitDetailFixture('aaa111')},
+                {body: makeCommitDetailFixture('bbb222')},
+            ]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            const onProgress = vi.fn();
+            await provider.getCommits('my-repo', '', '', onProgress);
+
+            // Listing reports a running discovered count (1 after page 1, 2 after page
+            // 2) with NO total — it isn't knowable until the last page. Then the
+            // detail fan-out reports real done/total, seeded at 0 so an observer
+            // switches to done/total before the first (slow) request.
+            expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
+                {done: 1, total: null},
+                {done: 2, total: null},
+                {done: 0, total: 2},
+                {done: 1, total: 2},
+                {done: 2, total: 2},
+            ]);
+        });
+
+        it('still reaches total when a commit is skipped or its detail fetch fails', async () => {
+            // aaa111 maps normally, bbb222's detail carries no author date (skipped by
+            // a `continue`), ccc333's detail 500s until retries are exhausted. Only one
+            // GitCommit comes back, but the counter must still reach 3/3 — a counter
+            // that stops short of its total is exactly the "hung" symptom of #270.
+            const fetchMock = vi.fn().mockImplementation((url: string) => {
+                const ok = (body: unknown): Response =>
+                    ({
+                        ok: true,
+                        status: 200,
+                        headers: new Headers(),
+                        json: () => Promise.resolve(body),
+                        text: () => Promise.resolve(''),
+                    }) as unknown as Response;
+                if (url.includes('/commits/aaa111')) {
+                    return Promise.resolve(ok(makeCommitDetailFixture('aaa111')));
+                }
+                if (url.includes('/commits/bbb222')) {
+                    return Promise.resolve(ok({sha: 'bbb222', commit: {author: null, message: 'm'}}));
+                }
+                if (url.includes('/commits/ccc333')) {
+                    return Promise.resolve({
+                        ok: false,
+                        status: 500,
+                        headers: new Headers(),
+                        json: () => Promise.resolve({}),
+                        text: () => Promise.resolve('boom'),
+                    } as unknown as Response);
+                }
+                return Promise.resolve(
+                    ok([
+                        makeCommitListFixture('aaa111'),
+                        makeCommitListFixture('bbb222'),
+                        makeCommitListFixture('ccc333'),
+                    ]),
+                );
+            });
+            vi.stubGlobal('fetch', fetchMock);
+
+            const onProgress = vi.fn();
+            const pending = provider.getCommits('my-repo', '', '', onProgress);
+            await vi.runAllTimersAsync();
+            const commits = await pending;
+
+            expect(commits.map((c) => c.sha)).toEqual(['aaa111']);
+            expect(onProgress).toHaveBeenLastCalledWith({done: 3, total: 3});
+        });
+
+        it('reports an empty repo as a real zero total, not a suppressed step', async () => {
+            vi.stubGlobal('fetch', makeFetchMock([{body: []}]));
+
+            const onProgress = vi.fn();
+            await provider.getCommits('empty-repo', '', '', onProgress);
+
+            // Providers do NOT pre-filter an empty set — they report `total: 0`
+            // truthfully and the consumer decides not to render a counter for it
+            // (repoStepCount in AdminGitProviders). Keeping the guard here as well
+            // would be two places to forget it.
+            expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
+                {done: 0, total: null},
+                {done: 0, total: 0},
+            ]);
+        });
+
         it('skips commits where author date is missing', async () => {
             const sha = 'abc123';
             const detailWithNoDate = {
@@ -441,6 +535,28 @@ describe('GitHubProvider', () => {
                 additions: 0,
                 deletions: 0,
             });
+        });
+
+        it('reports one listing tick per PR page, including the page that hits the cutoff (#270)', async () => {
+            const fetchMock = makeFetchMock([
+                {
+                    body: [makePRFixture({number: 1, updated_at: '2024-02-01T00:00:00Z'})],
+                    headers: {link: '<https://api.github.com/repos/test-org/my-repo/pulls?page=2>; rel="next"'},
+                },
+                // Page 2's PR predates `since`, so the walk stops here — but the page
+                // must still report, otherwise the last observed count is stale.
+                {body: [makePRFixture({number: 2, updated_at: '2023-01-01T00:00:00Z'})]},
+            ]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            const onProgress = vi.fn();
+            const prs = await provider.getPullRequests('my-repo', 'all', '2024-01-01T00:00:00Z', onProgress);
+
+            expect(prs).toHaveLength(1);
+            expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
+                {done: 1, total: null},
+                {done: 1, total: null},
+            ]);
         });
 
         it('normalizes merged PR state: closed + merged_at → merged', async () => {

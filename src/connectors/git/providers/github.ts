@@ -10,6 +10,7 @@ import type {
     GitFileDiff,
     GitAuthor,
     GitHubProviderConfig,
+    GitFetchProgressListener,
 } from './types.js';
 import {normalizeContainer} from './container.js';
 
@@ -250,7 +251,12 @@ export class GitHubProvider implements GitProvider {
         return repos;
     }
 
-    async getCommits(repo: string, since: string, until: string): Promise<GitCommit[]> {
+    async getCommits(
+        repo: string,
+        since: string,
+        until: string,
+        onProgress?: GitFetchProgressListener,
+    ): Promise<GitCommit[]> {
         const params = new URLSearchParams({per_page: '100'});
         if (since) params.set('since', since);
         if (until) params.set('until', until);
@@ -263,11 +269,28 @@ export class GitHubProvider implements GitProvider {
             const res = await fetchGitHub(nextUrl, this.authHeaders);
             const page = (await res.json()) as RawCommitListItem[];
             summaries.push(...page);
+            // One report per page — the only granularity available here, since the
+            // commit total is unknown until the last page (#270).
+            onProgress?.({done: summaries.length, total: null});
             nextUrl = parseNextLink(res.headers.get('link'));
         }
 
         const commits: GitCommit[] = [];
         let lastDetailError: Error | null = null;
+        // The per-commit detail fetch below is the O(commits) network cost that
+        // dominates a full sync. Seed the known total so an observer switches to
+        // done/total immediately, then tick every commit.
+        //
+        // The tick counts commits PROCESSED, not commits returned, so it also advances
+        // over the two lossy branches below (a detail fetch that fails, a detail with
+        // no author date). That keeps the counter moving, but it does NOT report the
+        // loss — a partial detail failure returns fewer commits without throwing, and
+        // the caller cannot currently tell. That is a pre-existing gap in this
+        // function's contract, not something this counter fixes; see #275. The
+        // per-repo symptom it leaves visible is `commit N/N` followed by `diff 0/M`
+        // with M < N (documented on GitSyncProgress.repo_step).
+        let processed = 0;
+        onProgress?.({done: 0, total: summaries.length});
         for (const summary of summaries) {
             try {
                 const detailRes = await fetchGitHub(
@@ -292,6 +315,13 @@ export class GitHubProvider implements GitProvider {
                 });
             } catch (err) {
                 lastDetailError = err instanceof Error ? err : new Error(String(err));
+            } finally {
+                // Its own counter, unlike the other two providers: the `continue` above
+                // and this `catch` both skip the push, so `commits.length` would stall
+                // while the loop kept working. Incremented outside the optional call so
+                // the count is identical whether or not a listener is attached.
+                processed++;
+                onProgress?.({done: processed, total: summaries.length});
             }
         }
 
@@ -304,7 +334,12 @@ export class GitHubProvider implements GitProvider {
         return commits;
     }
 
-    async getPullRequests(repo: string, state: string, since: string): Promise<GitPR[]> {
+    async getPullRequests(
+        repo: string,
+        state: string,
+        since: string,
+        onProgress?: GitFetchProgressListener,
+    ): Promise<GitPR[]> {
         const params = new URLSearchParams({
             per_page: '100',
             state: state || 'all',
@@ -365,6 +400,7 @@ export class GitHubProvider implements GitProvider {
                 });
             }
 
+            onProgress?.({done: prs.length, total: null});
             nextUrl = reachedSince ? null : parseNextLink(res.headers.get('link'));
         }
 
