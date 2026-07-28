@@ -190,10 +190,13 @@ export interface GitSyncProgress {
      * is the single place that decides this; producers do not pre-filter it).
      *
      * Two caveats a reader of these numbers needs:
-     *   - The `commits` total counts commits LISTED, while the `diffs` total counts
-     *     commits RETURNED, so `commit N/N` followed by `diff 0/M` with M < N is
-     *     normal (a commit with no author date is skipped). It is also the only
-     *     visible trace of a partial per-commit detail failure — see #275.
+     *   - On GitHub the `commits` total counts commits LISTED while the `diffs` total
+     *     counts commits RETURNED, so `commit N/N` followed by `diff 0/M` with M < N
+     *     is normal (a commit with no author date is skipped) and is also the only
+     *     visible trace of a partial per-commit detail failure — see #275. GitLab
+     *     lists exactly what it returns, and Bitbucket's total is commits RETAINED
+     *     after its in-memory `until` filter (see #276), so on those two the `diffs`
+     *     total always equals the `commits` total.
      *   - On Bitbucket the `commits` and `diffs` steps walk the same network calls
      *     twice (its getCommits fetches a diffstat per commit, then this loop calls
      *     getCommitDiff again). That double fetch is pre-existing and out of scope
@@ -221,6 +224,12 @@ const NO_REPO_STEP = {
  * each commit detail, each diff, each PR), each allocating one shallow copy. A
  * listener that does I/O per call — an SSE frame, a DB write — must coalesce; the
  * only in-tree listener assigns the snapshot to a field and is safe.
+ *
+ * A throw from this listener is swallowed (see `reportStep`). It must be: the
+ * per-item reports now run INSIDE `provider.getCommits`/`getPullRequests`, whose
+ * per-repo try/catch would otherwise read a listener bug as a fetch failure — which
+ * holds the provider's forward cursor and drops its snapshots (#231). Telemetry must
+ * never be able to make that call.
  */
 export type GitSyncProgressListener = (progress: GitSyncProgress) => void;
 
@@ -1288,12 +1297,24 @@ async function fetchProviderData(
 
     // The ONE place the within-repo indicator is written (#270) — every producer
     // below routes through it, so the three fields have a single source of truth.
+    //
+    // The try/catch is load-bearing, not defensive habit: these reports fire from
+    // INSIDE provider.getCommits/getPullRequests, which the repo loop wraps in a
+    // try/catch that treats a throw as a failed fetch — holding the provider's
+    // forward cursor and dropping its snapshots (#231). Without this, a listener that
+    // threw would turn a display bug into a data-completeness decision and report a
+    // fetch error that never happened. Progress telemetry cannot be allowed to do
+    // that, so a throwing listener loses its update and nothing else.
     const reportStep = (step: GitSyncRepoStep, done: number, total: number | null): void => {
-        report?.((p) => {
-            p.repo_step = step;
-            p.repo_step_done = done;
-            p.repo_step_total = total;
-        });
+        try {
+            report?.((p) => {
+                p.repo_step = step;
+                p.repo_step_done = done;
+                p.repo_step_total = total;
+            });
+        } catch {
+            // Listener fault — the run is unaffected by design (see above).
+        }
     };
 
     // Undefined when nobody is observing, so the observer-free scheduled path hands
@@ -1308,12 +1329,13 @@ async function fetchProviderData(
     for (const repoName of reposToSync) {
         report?.((p) => {
             p.current_repo = repoName;
-            // Belt-and-braces: both exit paths below already clear the indicator, so
-            // it is provably idle on entry. Kept so the invariant "a repo starts with
-            // no step in flight" holds locally rather than by reading two other
-            // branches — deliberately not covered by a test of its own (#270).
-            Object.assign(p, NO_REPO_STEP);
         });
+        // Enter the commits step BEFORE the list request, symmetric with the PR step
+        // below: the first page request can sleep until the rate-limit reset, and
+        // during that window the label would otherwise carry no within-repo segment at
+        // all. Total is null — the commit count is not known yet. This also supersedes
+        // the previous explicit clear here, since it overwrites all three fields.
+        reportStep('commits', 0, null);
         let rawCommits: GitCommit[] = [];
         try {
             // getCommits pages the commit list AND does the per-commit detail/diff
@@ -1894,6 +1916,12 @@ export class GitSync implements ConnectorInterface {
         report?.((p) => {
             p.stage = 'analyzing';
             p.current_repo = null;
+            // Leaving the fetching stage — clear the within-repo indicator here too, so
+            // the "no stage past fetching carries a stale step" invariant is owned by
+            // the producer. The repo loop clears on both of its exits, but a throw from
+            // fetchProviderData outside those two guarded awaits skips them, and the
+            // outer handler just continues to the next provider (#270 review SEC-3).
+            Object.assign(p, NO_REPO_STEP);
         });
 
         // Every author's daily facts this run observed, matched AND unmatched, ready to

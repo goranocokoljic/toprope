@@ -465,20 +465,21 @@ describe('BitbucketProvider', () => {
             );
 
             expect(commits).toEqual([]);
-            // One report per page — present, but stationary at 0 because nothing
-            // inside the window has been reached yet.
-            expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
-                {done: 0, total: null},
-                {done: 0, total: null},
-                {done: 0, total: 0},
-            ]);
+            // Assert the PROPERTY (every page reports, in the listing phase), not the
+            // `done: 0` value itself — #276 is expected to change that value, and this
+            // test should not have to be rewritten to let the fix land.
+            const listingTicks = onProgress.mock.calls
+                .map((c) => c[0] as {done: number; total: number | null})
+                .filter((p) => p.total === null);
+            expect(listingTicks).toHaveLength(2);
         });
 
-        it('still reports the page that hits the since cutoff (#270)', async () => {
-            // The cutoff used to break straight out of both loops; the page's
-            // retained count must be reported before the walk stops — and when that
-            // page retains nothing it is the ONLY signal, since the fan-out seed then
-            // carries a zero total the consumer renders as no counter.
+        it('does not report the page that hits the since cutoff — that tick is unobservable', async () => {
+            // `break paging` skips the listing report on the cutoff page, deliberately:
+            // the fan-out seed below it runs in the same synchronous block and would
+            // overwrite the tick before any poller could read it, so restructuring the
+            // walk to reach it would be churn for nothing (#270 review OR-1). What must
+            // hold is that the cutoff BEHAVIOR is unchanged and the fan-out still ticks.
             const fetchMock = makeFetchMock([
                 {
                     body: pagedResponse(
@@ -501,14 +502,40 @@ describe('BitbucketProvider', () => {
                 onProgress,
             );
 
-            // Cutoff behavior is unchanged (only 'aaa' survives), and the truncated
-            // page still reported the one commit it collected.
             expect(commits.map((c) => c.sha)).toEqual(['aaa']);
             expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
-                {done: 1, total: null},
                 {done: 0, total: 1},
                 {done: 1, total: 1},
             ]);
+        });
+
+        it('reports the PR-list page that hits the since cutoff', async () => {
+            // Unlike the commit walk, getPullRequests reports BEFORE deciding whether to
+            // stop, and there is a real `await` on the next iteration for a non-final
+            // page — so this tick is observable and must not be moved into a break.
+            const fetchMock = makeFetchMock([
+                {
+                    body: pagedResponse(
+                        [
+                            makePRFixture({id: 1, updated_on: '2024-02-01T00:00:00+00:00'}),
+                            makePRFixture({id: 2, updated_on: '2023-01-01T00:00:00+00:00'}),
+                        ],
+                        'https://api.bitbucket.org/2.0/next',
+                    ),
+                },
+            ]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            const onProgress = vi.fn();
+            const prs = await provider.getPullRequests(
+                'my-repo',
+                'all',
+                '2024-01-01T00:00:00Z',
+                onProgress,
+            );
+
+            expect(prs.map((p) => p.id)).toEqual(['1']);
+            expect(onProgress.mock.calls.map((c) => c[0])).toEqual([{done: 1, total: null}]);
         });
 
         it('stops pagination when commit date is before since', async () => {

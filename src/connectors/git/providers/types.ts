@@ -115,11 +115,12 @@ export interface GitFileDiff {
  * `total` is null while a list endpoint is still paging in — the size of the result
  * set genuinely is not knowable until the last page arrives — and `done` then reads
  * as "rows seen so far". Once the set is in hand `total` is real and the pair reads
- * as done-out-of-total. There is deliberately no percentage or ETA field: the
- * pipeline cannot compute an honest one for the listing phase.
+ * as done-out-of-total.
  *
- * This is the same shape `GitSyncProgress` puts on the wire, so the sync loop folds
- * a report in without translating vocabularies.
+ * Those are the same SEMANTICS `GitSyncProgress.repo_step_done`/`repo_step_total`
+ * carry on the wire (the sync loop renames the fields but does not reinterpret them),
+ * which is why neither side needs a percentage or ETA: see the invariants documented
+ * on `GitSyncProgress.repo_step`.
  */
 export interface GitFetchProgress {
     done: number;

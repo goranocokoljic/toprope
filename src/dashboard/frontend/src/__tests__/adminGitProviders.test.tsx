@@ -1336,7 +1336,7 @@ describe('syncProgressLabel (#209)', () => {
             'Listing repositories…',
         );
         expect(syncProgressLabel({started_at: 't', progress: base})).toBe(
-            'Fetching activity — repo 3/12 (web) · 34 commits · 5 PRs',
+            'Fetching activity — repo 3/12 (web) · run total 34 commits · 5 PRs',
         );
         expect(
             syncProgressLabel({
@@ -1368,7 +1368,7 @@ describe('syncProgressLabel (#209)', () => {
                 started_at: 't',
                 progress: {...base, repos_processed: 11, current_repo: 'infra'},
             }),
-        ).toBe('Fetching activity — repo 12/12 (infra) · 34 commits · 5 PRs');
+        ).toBe('Fetching activity — repo 12/12 (infra) · run total 34 commits · 5 PRs');
         // Zero repos selected: 0/0, no phantom first repo — and no repo-name
         // suffix when current_repo is null (full equality pins its absence).
         expect(
@@ -1376,7 +1376,7 @@ describe('syncProgressLabel (#209)', () => {
                 started_at: 't',
                 progress: {...base, repos_total: 0, repos_processed: 0, current_repo: null},
             }),
-        ).toBe('Fetching activity — repo 0/0 · 34 commits · 5 PRs');
+        ).toBe('Fetching activity — repo 0/0 · run total 34 commits · 5 PRs');
     });
 });
 
@@ -1405,7 +1405,7 @@ describe('syncProgressLabel — within-repo progress (#270)', () => {
                 started_at: 't',
                 progress: {...base, repo_step: 'commits', repo_step_done: 300, repo_step_total: null},
             }),
-        ).toBe('Fetching activity — repo 3/12 (web) · 300 commits found · 34 commits · 5 PRs');
+        ).toBe('Fetching activity — repo 3/12 (web) · 300 commits found · run total 34 commits · 5 PRs');
     });
 
     it('singularizes the found-count at one item', () => {
@@ -1414,7 +1414,7 @@ describe('syncProgressLabel — within-repo progress (#270)', () => {
                 started_at: 't',
                 progress: {...base, repo_step: 'commits', repo_step_done: 1, repo_step_total: null},
             }),
-        ).toBe('Fetching activity — repo 3/12 (web) · 1 commit found · 34 commits · 5 PRs');
+        ).toBe('Fetching activity — repo 3/12 (web) · 1 commit found · run total 34 commits · 5 PRs');
     });
 
     it('shows commit done/total during the per-commit detail fetch', () => {
@@ -1423,7 +1423,7 @@ describe('syncProgressLabel — within-repo progress (#270)', () => {
                 started_at: 't',
                 progress: {...base, repo_step: 'commits', repo_step_done: 1240, repo_step_total: 5000},
             }),
-        ).toBe('Fetching activity — repo 3/12 (web) · commit 1240/5000 · 34 commits · 5 PRs');
+        ).toBe('Fetching activity — repo 3/12 (web) · commit 1240/5000 · run total 34 commits · 5 PRs');
     });
 
     it('shows the diff fan-out as its own counter', () => {
@@ -1432,7 +1432,7 @@ describe('syncProgressLabel — within-repo progress (#270)', () => {
                 started_at: 't',
                 progress: {...base, repo_step: 'diffs', repo_step_done: 12, repo_step_total: 5000},
             }),
-        ).toBe('Fetching activity — repo 3/12 (web) · diff 12/5000 · 34 commits · 5 PRs');
+        ).toBe('Fetching activity — repo 3/12 (web) · diff 12/5000 · run total 34 commits · 5 PRs');
     });
 
     it('shows the PR fan-out as its own counter, pluralized as PRs while listing', () => {
@@ -1441,13 +1441,13 @@ describe('syncProgressLabel — within-repo progress (#270)', () => {
                 started_at: 't',
                 progress: {...base, repo_step: 'prs', repo_step_done: 12, repo_step_total: 40},
             }),
-        ).toBe('Fetching activity — repo 3/12 (web) · PR 12/40 · 34 commits · 5 PRs');
+        ).toBe('Fetching activity — repo 3/12 (web) · PR 12/40 · run total 34 commits · 5 PRs');
         expect(
             syncProgressLabel({
                 started_at: 't',
                 progress: {...base, repo_step: 'prs', repo_step_done: 12, repo_step_total: null},
             }),
-        ).toBe('Fetching activity — repo 3/12 (web) · 12 PRs found · 34 commits · 5 PRs');
+        ).toBe('Fetching activity — repo 3/12 (web) · 12 PRs found · run total 34 commits · 5 PRs');
     });
 
     it('keeps the run-level totals on the line at every step, never replacing them', () => {
@@ -1461,9 +1461,43 @@ describe('syncProgressLabel — within-repo progress (#270)', () => {
                         started_at: 't',
                         progress: {...base, repo_step: step, repo_step_done: 12, repo_step_total: total},
                     }),
-                ).toContain('· 34 commits · 5 PRs');
+                ).toContain('· run total 34 commits · 5 PRs');
             }
         }
+    });
+
+    it('still shows a counter at zero-with-unknown-total, the state every repo passes through', () => {
+        // The pipeline emits (step, 0, null) deliberately on entering a step, BEFORE its
+        // list request — the live state for that whole request, which under a rate-limit
+        // backoff is minutes. Suppressing a zero `done` (an easy-looking tidy-up next to
+        // the zero-TOTAL rule below) would blank the within-repo signal for exactly that
+        // window on every repo, so pin it.
+        expect(
+            syncProgressLabel({
+                started_at: 't',
+                progress: {...base, repo_step: 'prs', repo_step_done: 0, repo_step_total: null},
+            }),
+        ).toBe('Fetching activity — repo 3/12 (web) · 0 PRs found · run total 34 commits · 5 PRs');
+        expect(
+            syncProgressLabel({
+                started_at: 't',
+                progress: {...base, repo_step: 'commits', repo_step_done: 0, repo_step_total: null},
+            }),
+        ).toBe('Fetching activity — repo 3/12 (web) · 0 commits found · run total 34 commits · 5 PRs');
+    });
+
+    it('labels the run-level pair so the two scopes are not read as one broken number', () => {
+        // The within-repo count is routinely LARGER than the run total (the run total
+        // only advances when a whole repo finishes), so an unlabelled
+        // "commit 1240/5000 · 34 commits" reads as a bug (review SO-1).
+        const label = syncProgressLabel({
+            started_at: 't',
+            progress: {...base, repo_step: 'commits', repo_step_done: 1240, repo_step_total: 5000},
+        });
+        expect(label).toContain('commit 1240/5000');
+        expect(label).toContain('run total 34 commits');
+        // The bare, ambiguous form must not appear.
+        expect(label).not.toMatch(/\d+\/\d+ · \d+ commits/);
     });
 
     it('renders no counter for a step that ran over an empty set', () => {
@@ -1475,7 +1509,7 @@ describe('syncProgressLabel — within-repo progress (#270)', () => {
                     started_at: 't',
                     progress: {...base, repo_step: step, repo_step_done: 0, repo_step_total: 0},
                 }),
-            ).toBe('Fetching activity — repo 3/12 (web) · 34 commits · 5 PRs');
+            ).toBe('Fetching activity — repo 3/12 (web) · run total 34 commits · 5 PRs');
         }
     });
 
@@ -1492,16 +1526,19 @@ describe('syncProgressLabel — within-repo progress (#270)', () => {
                     repo_step_total: 9,
                 },
             }),
-        ).toBe('Fetching activity — repo 3/12 (web) · 34 commits · 5 PRs');
+        ).toBe('Fetching activity — repo 3/12 (web) · run total 34 commits · 5 PRs');
     });
 
-    it('leaves the other stages untouched by the within-repo fields', () => {
+    it('leaves every other stage untouched by the within-repo fields', () => {
         // repo_step is only meaningful during `fetching`; a stale value must not
-        // leak into the analyzing/writing lines.
+        // leak into any other stage's line.
         const mid = {...base, repo_step: 'commits' as GitSyncRepoStep, repo_step_done: 7, repo_step_total: 9};
         expect(
             syncProgressLabel({started_at: 't', progress: {...mid, stage: 'analyzing', developers_matched: 4}}),
         ).toBe('Matching developers — 4 matched');
+        expect(
+            syncProgressLabel({started_at: 't', progress: {...mid, stage: 'writing', developers_matched: 4}}),
+        ).toBe('Writing snapshots — 4 developers matched');
         expect(
             syncProgressLabel({started_at: 't', progress: {...mid, stage: 'listing_repos'}}),
         ).toBe('Listing repositories…');
@@ -1532,7 +1569,7 @@ describe('AdminGitProviders — live sync progress (#209)', () => {
         // Rendered from the real server field names on the fixture: the within-repo
         // counter leads and the run-level totals are kept, not replaced (#270).
         expect(progress).toHaveTextContent(
-            'Fetching activity — repo 3/12 (web) · commit 1240/5000 · 34 commits · 5 PRs',
+            'Fetching activity — repo 3/12 (web) · commit 1240/5000 · run total 34 commits · 5 PRs',
         );
         expect(screen.getByRole('button', {name: 'Syncing…'})).toBeDisabled();
         expect(screen.queryByRole('button', {name: 'Sync now'})).not.toBeInTheDocument();

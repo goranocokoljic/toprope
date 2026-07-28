@@ -316,8 +316,10 @@ export class GitHubProvider implements GitProvider {
             } catch (err) {
                 lastDetailError = err instanceof Error ? err : new Error(String(err));
             } finally {
-                // Incremented outside the optional call so the count is identical
-                // whether or not a listener is attached.
+                // Its own counter, unlike the other two providers: the `continue` above
+                // and this `catch` both skip the push, so `commits.length` would stall
+                // while the loop kept working. Incremented outside the optional call so
+                // the count is identical whether or not a listener is attached.
                 processed++;
                 onProgress?.({done: processed, total: summaries.length});
             }

@@ -278,7 +278,6 @@ export class GitLabProvider implements GitProvider {
         // The per-commit diff fetch is the O(commits) cost of this call — report each
         // one so an observer's counter ticks during it, not only once it returns.
         const commits: GitCommit[] = [];
-        let processed = 0;
         onProgress?.({done: 0, total: raw.length});
         for (const c of raw) {
             let diffs: GitFileDiff[] = [];
@@ -305,10 +304,9 @@ export class GitLabProvider implements GitProvider {
                 deletions: diffs.reduce((s, d) => s + d.deletions, 0),
                 filesChanged: diffs.map((d) => d.path),
             });
-            // Incremented outside the optional call so the count is identical
-            // whether or not a listener is attached.
-            processed++;
-            onProgress?.({done: processed, total: raw.length});
+            // Every iteration pushes, so the commit count IS the processed count —
+            // no separate counter to keep in step.
+            onProgress?.({done: commits.length, total: raw.length});
         }
 
         return commits;

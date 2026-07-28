@@ -269,19 +269,14 @@ export class BitbucketProvider implements GitProvider {
         let nextUrl: string | null =
             `${BASE_URL}/repositories/${this.workspace}/${repo}/commits?pagelen=100`;
 
-        while (nextUrl) {
+        paging: while (nextUrl) {
             const res = await fetchBitbucket(nextUrl, this.authHeaders);
             const page = (await res.json()) as RawPagedResponse<RawCommit>;
 
-            // The since-cutoff used to `break paging` straight out of both loops;
-            // it now flags instead (matching getPullRequests below) so the page's
-            // discovered count is still reported before the walk stops (#270).
-            let reachedSince = false;
             for (const c of page.values) {
                 const commitDate = new Date(c.date);
                 if (sinceDate && commitDate < sinceDate) {
-                    reachedSince = true;
-                    break;
+                    break paging;
                 }
                 if (!untilDate || commitDate <= untilDate) {
                     collected.push(c);
@@ -296,8 +291,12 @@ export class BitbucketProvider implements GitProvider {
             // scanned-vs-found signal is a wire/label change tracked separately in #276.
             // On a normal forward run (`until` = now) nothing is filtered and it
             // advances per page as intended.
+            //
+            // Deliberately NOT reported on the page that trips the `since` cutoff: the
+            // `break paging` skips it, and the seed below would overwrite it in the same
+            // synchronous block anyway, so restructuring the walk to reach it would buy
+            // an emission no consumer can ever observe (#270 review OR-1).
             onProgress?.({done: collected.length, total: null});
-            if (reachedSince) break;
             nextUrl = page.next ?? null;
         }
 
@@ -305,7 +304,6 @@ export class BitbucketProvider implements GitProvider {
         // each one so an observer's counter ticks instead of jumping 0 → N when the
         // whole loop returns.
         const commits: GitCommit[] = [];
-        let processed = 0;
         onProgress?.({done: 0, total: collected.length});
         for (const raw of collected) {
             const {name, email} = parseRawAuthor(raw.author.raw);
@@ -328,10 +326,9 @@ export class BitbucketProvider implements GitProvider {
                 deletions: diffs.reduce((s, d) => s + d.deletions, 0),
                 filesChanged: diffs.map((d) => d.path),
             });
-            // Incremented outside the optional call so the count is identical
-            // whether or not a listener is attached.
-            processed++;
-            onProgress?.({done: processed, total: collected.length});
+            // Every iteration pushes, so the commit count IS the processed count —
+            // no separate counter to keep in step.
+            onProgress?.({done: commits.length, total: collected.length});
         }
 
         return commits;

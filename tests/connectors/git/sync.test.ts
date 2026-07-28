@@ -2152,6 +2152,9 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
             // its list request, then the idle clear when the repo finishes.
             expect(stepSequence(snapshots)).toEqual([
                 [null, 0, null],
+                // Step entered before the list request, so the label is never blank
+                // while that (possibly rate-limited) request is in flight.
+                ['commits', 0, null],
                 ['commits', 3, null],
                 ['commits', 0, 3],
                 ['commits', 1, 3],
@@ -2382,7 +2385,71 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
                 ['prs', 0, 0],
                 [null, 0, null],
             ]);
-            // Whatever the totals, `done` can never exceed a known total.
+        });
+
+        it('enters both steps before their list requests, so the label is never blank mid-request', async () => {
+            // Symmetric guarantee for commits and PRs: at the instant each list request
+            // is in flight, a poll sees that step with an unknown total — not the
+            // previous step's finished counter, and not an idle indicator.
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            const snapshots: GitSyncProgress[] = [];
+            let atCommitList: Array<[GitSyncRepoStep | null, number, number | null]> = [];
+            let atPRList: Array<[GitSyncRepoStep | null, number, number | null]> = [];
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits: vi.fn().mockImplementation(async () => {
+                        atCommitList = steps(snapshots);
+                        return [makeProviderCommit('alice', '2024-01-15T10:00:00Z', 's1')];
+                    }),
+                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+                    getPullRequests: vi.fn().mockImplementation(async () => {
+                        atPRList = steps(snapshots);
+                        return [];
+                    }),
+                }),
+            );
+
+            await new GitSync({enabled: false}).syncProviders(db, [CONFIG], (p) => snapshots.push(p));
+
+            expect(atCommitList[atCommitList.length - 1]).toEqual(['commits', 0, null]);
+            expect(atPRList[atPRList.length - 1]).toEqual(['prs', 0, null]);
+        });
+
+        it('restarts the per-repo counters on the second repo instead of accumulating', async () => {
+            // diffsProcessed/prsProcessed are per-repo `let`s inside the repo loop.
+            // Hoisting either (they sit beside loop-scoped failure counters, so it is a
+            // plausible refactor) would make repo2 report `diff 2/1` — a done greater
+            // than its total. The full sequence across BOTH repos is the only assertion
+            // that catches it; repo-boundary snapshots are idle either way.
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1'), makeRepo('repo2')]),
+                    getCommits: vi
+                        .fn()
+                        .mockResolvedValue([makeProviderCommit('alice', '2024-01-15T10:00:00Z', 's1')]),
+                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+                    getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+                }),
+            );
+
+            const snapshots: GitSyncProgress[] = [];
+            await new GitSync({enabled: false}).syncProviders(db, [CONFIG], (p) => snapshots.push(p));
+
+            const perRepo: Array<[GitSyncRepoStep | null, number, number | null]> = [
+                ['commits', 0, null],
+                ['diffs', 0, 1],
+                ['diffs', 1, 1],
+                ['prs', 0, null],
+                ['prs', 0, 1],
+                ['prs', 1, 1],
+                [null, 0, null],
+            ];
+            expect(stepSequence(snapshots)).toEqual([[null, 0, null], ...perRepo, ...perRepo]);
+            // Stated as an invariant too, since it is the property that actually matters.
             for (const s of snapshots) {
                 if (s.repo_step_total !== null) {
                     expect(s.repo_step_done).toBeLessThanOrEqual(s.repo_step_total);
