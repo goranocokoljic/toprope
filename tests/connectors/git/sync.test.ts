@@ -2457,6 +2457,47 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
             }
         });
 
+        it('a throwing listener loses its update and nothing else — no phantom fetch error, no held cursor', async () => {
+            // The guard in syncProviders' `report` closure is load-bearing, not defensive
+            // habit. These reports fire from INSIDE provider.getCommits/getPullRequests,
+            // whose per-repo catch would read an escaping throw as a failed fetch — which
+            // sets commitsComplete = false, holds the provider's forward cursor and drops
+            // its snapshots (#231) — and other report sites sit outside those try blocks
+            // entirely, where the provider-level handler would discard the whole
+            // provider's results. Delete the try/catch and this test fails on all three
+            // assertions; without it, a cosmetic listener bug becomes silent data loss
+            // three releases later with no visible connection.
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeTickingProvider(
+                    [makeProviderCommit('alice', '2024-01-15T10:00:00Z', 's1')],
+                    [makeProviderPR('alice')],
+                ),
+            );
+
+            let calls = 0;
+            const result = await new GitSync({enabled: false}).syncProviders(db, [CONFIG], () => {
+                // Throws on every emission — the worst case, and it covers both the
+                // guarded-await sites and the ones outside them.
+                calls++;
+                throw new Error('listener bug');
+            });
+
+            expect(calls).toBeGreaterThan(1);
+            // No fetch failed, so no fetch error may be reported…
+            expect(result.errors.filter((e) => !/Unmatched authors/.test(e))).toEqual([]);
+            // …the provider was not skipped wholesale…
+            expect(result.errors.some((e) => /could not be used/.test(e))).toBe(false);
+            // …the snapshots were written…
+            expect(countSnapshots(db)).toBeGreaterThan(0);
+            // …and the forward cursor advanced, i.e. the window is not re-covered.
+            const cursor = db
+                .prepare('SELECT value FROM sync_state WHERE key = ?')
+                .get(syncStateKey('github', 'test-org')) as {value: string} | undefined;
+            expect(cursor?.value).toBe(result.lastSyncTime);
+        });
+
         it('passes no listener to the provider on the observer-free scheduled path', async () => {
             // AC: the scheduled sync is unchanged — `onProgress` stays undefined all
             // the way down, so a provider pays nothing (not even an allocated object).

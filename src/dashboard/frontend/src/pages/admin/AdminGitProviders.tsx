@@ -301,7 +301,9 @@ const REPO_STEP_NOUN: Record<GitSyncRepoStep, string> = {
  * broken number (the within-repo count is routinely the larger of the two).
  */
 function repoStepDetail(p: GitSyncProgress): string {
-    const runTotal = `run total ${p.commits_fetched} commits · ${p.prs_fetched} PRs`;
+    const commits = `${p.commits_fetched} commit${p.commits_fetched === 1 ? '' : 's'}`;
+    const prs = `${p.prs_fetched} PR${p.prs_fetched === 1 ? '' : 's'}`;
+    const runTotal = `run total ${commits} · ${prs}`;
     const step = repoStepCount(p);
     return step === null ? runTotal : `${step} · ${runTotal}`;
 }
@@ -314,7 +316,13 @@ function repoStepDetail(p: GitSyncProgress): string {
  * that decision is made — providers deliberately do not pre-filter empty steps.
  */
 function repoStepCount(p: GitSyncProgress): string | null {
-    const noun: string | undefined = p.repo_step ? REPO_STEP_NOUN[p.repo_step] : undefined;
+    // `Object.hasOwn`, not a bare lookup: `repo_step` is wire data, and a plain object
+    // literal would resolve an inherited key ("toString", "constructor") to a function
+    // that passes an `undefined` check and renders as source text.
+    const noun: string | undefined =
+        p.repo_step !== null && Object.hasOwn(REPO_STEP_NOUN, p.repo_step)
+            ? REPO_STEP_NOUN[p.repo_step]
+            : undefined;
     if (noun === undefined || p.repo_step_total === 0) return null;
     if (p.repo_step_total === null) {
         return `${p.repo_step_done} ${noun}${p.repo_step_done === 1 ? '' : 's'} found`;
@@ -1486,9 +1494,16 @@ function ProviderRow({
                           * fetching stage, so a polite live region would announce a
                           * ~70-character line once per second for the length of a
                           * multi-hour first sync — and the digit is the least useful part
-                          * to hear. The disabled "Syncing…" button already conveys
-                          * in-flight state to a screen reader, and the terminal states
-                          * (ok/error) are announced by the status badge.
+                          * to hear.
+                          *
+                          * What a screen reader still gets: the disabled "Syncing…"
+                          * button conveys in-flight state. What it does NOT get is a
+                          * completion announcement — the status cell's <Badge> is a plain
+                          * span with no role (components/Badge.tsx), so the ok/error flip
+                          * is silent. That gap is pre-existing for every other admin
+                          * table and is tracked in #278; the right fix is a live region
+                          * on a low-churn element (the stage, or the badge), never on
+                          * this counter line.
                           */}
                         <span
                             className="flex items-center gap-2 text-sm text-muted"

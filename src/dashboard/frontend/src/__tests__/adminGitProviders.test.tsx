@@ -1529,6 +1529,35 @@ describe('syncProgressLabel — within-repo progress (#270)', () => {
         ).toBe('Fetching activity — repo 3/12 (web) · run total 34 commits · 5 PRs');
     });
 
+    it('degrades an inherited-key wire step too, not just an unknown one', () => {
+        // repo_step is wire data. A bare object-literal lookup resolves 'toString' to a
+        // FUNCTION, which passes an `undefined` check and renders as source text — so
+        // the noun map must be probed with Object.hasOwn. A plain unknown string cannot
+        // catch this class of value.
+        for (const key of ['toString', 'constructor', 'valueOf']) {
+            const label = syncProgressLabel({
+                started_at: 't',
+                progress: {
+                    ...base,
+                    repo_step: key as GitSyncRepoStep,
+                    repo_step_done: 3,
+                    repo_step_total: 9,
+                },
+            });
+            expect(label).toBe('Fetching activity — repo 3/12 (web) · run total 34 commits · 5 PRs');
+            expect(label).not.toMatch(/function|native code|\[object/);
+        }
+    });
+
+    it('singularizes the run-level nouns at one', () => {
+        expect(
+            syncProgressLabel({
+                started_at: 't',
+                progress: {...base, commits_fetched: 1, prs_fetched: 1},
+            }),
+        ).toBe('Fetching activity — repo 3/12 (web) · run total 1 commit · 1 PR');
+    });
+
     it('leaves every other stage untouched by the within-repo fields', () => {
         // repo_step is only meaningful during `fetching`; a stale value must not
         // leak into any other stage's line.
@@ -1571,6 +1600,11 @@ describe('AdminGitProviders — live sync progress (#209)', () => {
         expect(progress).toHaveTextContent(
             'Fetching activity — repo 3/12 (web) · commit 1240/5000 · run total 34 commits · 5 PRs',
         );
+        // Deliberately NOT a live region: this line changes on nearly every 1s poll, so
+        // role="status" would announce it once per second for a multi-hour sync. Pinned
+        // so a future "accessibility improvement" cannot silently reinstate it — the
+        // missing completion announcement is tracked in #278 instead.
+        expect(progress).not.toHaveAttribute('role');
         expect(screen.getByRole('button', {name: 'Syncing…'})).toBeDisabled();
         expect(screen.queryByRole('button', {name: 'Sync now'})).not.toBeInTheDocument();
     });
