@@ -17,6 +17,7 @@
  *   1. collect the affected dates            — BEFORE the delete; afterwards they are unknowable
  *   2. delete the container's raw_author_daily rows
  *   3. delete the container's pr_records rows
+ *  3b. delete the container's commit_diffstats cache rows (#273)
  *   4. projectSnapshots(db, {dates})         — rewrites survivors, retracts orphans
  *   5. purge the container's git_* cursors
  *   6. delete the git_providers row
@@ -64,6 +65,7 @@ import {
     summarizeContainerRawDaily,
 } from '../raw-author-daily.js';
 import {buildDevLookupMap, projectSnapshots, resolveRawAuthor} from '../projection.js';
+import {deleteContainerDiffstats} from '../diffstat-cache.js';
 import {earliestSyncStateKey, stallStateKey, syncStateKey} from '../sync.js';
 import {deleteProvider, getProvider, GitProviderStoreError, type GitProviderRecord} from './store.js';
 import {containerKeyOf} from './config.js';
@@ -291,6 +293,17 @@ export function deleteProviderWithCascade(
         const prRows = db
             .prepare('DELETE FROM pr_records WHERE provider = ? AND container = ?')
             .run(type, container).changes;
+
+        // 3b. The per-commit diffstat cache (#273). Not imported DATA — an immutable memo of a
+        // remote read, so nothing about the retraction's correctness depends on it and nothing
+        // downstream reads it. It is dropped so the cascade's claim ("this container's
+        // contribution is gone") stays literally true: a container re-added later must not
+        // inherit file-level detail its credentials may no longer justify. The cost of being
+        // wrong in the other direction is only that the next sync re-fetches, which is exactly
+        // what a fresh provider should do. Deliberately NOT reported on
+        // {@link ProviderDeleteResult}: the admin confirmation enumerates what history is being
+        // destroyed, and a re-derivable fetch cache is not history.
+        deleteContainerDiffstats(db, type, container);
 
         // 4. Rebuild the affected days WHOLE from what survives: a day another container
         // also contributed to keeps that contribution (recomputed), and a day that had only

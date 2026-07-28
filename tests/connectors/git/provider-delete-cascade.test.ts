@@ -16,6 +16,10 @@ import {
     providerDeleteImpact,
 } from '../../../src/connectors/git/providers/delete-cascade';
 import {containerKeyOf} from '../../../src/connectors/git/providers/config';
+import {
+    countContainerDiffstats,
+    createCommitDiffstatCache,
+} from '../../../src/connectors/git/diffstat-cache';
 import {getProvider, GitProviderStoreError} from '../../../src/connectors/git/providers/store';
 import type {GitProviderType} from '../../../src/connectors/git/providers/types';
 
@@ -151,6 +155,20 @@ describe('deleteProviderWithCascade (#264)', () => {
 
         insertPR(db, devId, 'ws-a', 'a-1');
         insertPR(db, devId, 'ws-b', 'b-1');
+        // Both workspaces have ratcheted per-commit diffstats (#273) — including for the SAME
+        // repo/sha names, which is what makes "retracts exactly one container's rows" a real
+        // assertion rather than a coincidence of distinct keys.
+        for (const container of ['ws-a', 'ws-b']) {
+            const cache = createCommitDiffstatCache(db, 'bitbucket', container);
+            for (const sha of ['sha-1', 'sha-2']) {
+                cache.put('repo1', sha, {
+                    additions: 10,
+                    deletions: 2,
+                    entries: [{path: 'src/a.ts', additions: 10, deletions: 2, status: 'modified'}],
+                    absent: false,
+                });
+            }
+        }
         setCursors(db, 'ws-a');
         setCursors(db, 'ws-b');
 
@@ -293,6 +311,27 @@ describe('deleteProviderWithCascade (#264)', () => {
             'git_last_sync:bitbucket:ws-b',
             'git_stall:bitbucket:ws-b',
         ]);
+    });
+
+    // #273: the per-commit diffstat cache is not imported data — it is an immutable memo of a
+    // remote read — but the cascade's claim is "this container's contribution is gone", and a
+    // provider re-added with narrower credentials must not inherit file-level detail those
+    // credentials no longer justify.
+    it('drops the deleted container’s cached diffstats and keeps the sibling’s', () => {
+        expect(countContainerDiffstats(db, 'bitbucket', 'ws-a')).toBe(2);
+
+        deleteProviderWithCascade(db, providerA, new Set());
+
+        expect(countContainerDiffstats(db, 'bitbucket', 'ws-a')).toBe(0);
+        expect(countContainerDiffstats(db, 'bitbucket', 'ws-b')).toBe(2);
+    });
+
+    it('keeps the cached diffstats when the cascade is SKIPPED for a config-owned container', () => {
+        // The config sibling still owns and syncs this container, so nothing of its may go —
+        // and a purged cache would silently cost that live owner a full re-fetch.
+        deleteProviderWithCascade(db, providerA, new Set([containerKeyOf('bitbucket', 'ws-a')]));
+
+        expect(countContainerDiffstats(db, 'bitbucket', 'ws-a')).toBe(2);
     });
 
     it('never touches developers, their identities, or their team membership', () => {

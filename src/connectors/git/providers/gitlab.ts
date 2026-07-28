@@ -1,4 +1,6 @@
 import type {
+    CommitDiffstat,
+    CommitDiffstatCache,
     GitProvider,
     GitProviderType,
     GitRepo,
@@ -211,8 +213,9 @@ export class GitLabProvider implements GitProvider {
     private readonly authHeaders: Record<string, string>;
     private readonly includeRepos: string[];
     private readonly includeSubgroups: boolean;
+    private readonly diffstatCache?: CommitDiffstatCache;
 
-    constructor(config: GitLabProviderConfig) {
+    constructor(config: GitLabProviderConfig, diffstatCache?: CommitDiffstatCache) {
         // Normalized (#266) — see the note in `github.ts`: the attribution key and the request
         // path must be the same spelling, and both derive from `normalizeContainer`.
         this.group = normalizeContainer(config.group);
@@ -221,6 +224,7 @@ export class GitLabProvider implements GitProvider {
         this.authHeaders = buildAuthHeaders(config.auth);
         this.includeRepos = config.repos ?? [];
         this.includeSubgroups = config.include_subgroups ?? false;
+        this.diffstatCache = diffstatCache;
     }
 
     private shouldInclude(pathWithNamespace: string): boolean {
@@ -322,17 +326,46 @@ export class GitLabProvider implements GitProvider {
         // to the caller so it does not re-walk the same endpoint (#271).
         const commits: GitCommit[] = [];
         onProgress?.({done: 0, total: raw.length});
+        // The whole repo's already-known diffs, resolved in ONE batched query rather than a
+        // point read per commit (#273). Empty map when no cache was supplied — every probe
+        // path (doctor, test-connection) omits it, and behaves exactly as before.
+        const cached: Map<string, CommitDiffstat> =
+            this.diffstatCache?.load(repo, raw.map((c) => c.id)) ?? new Map();
         for (const c of raw) {
-            let diffs: GitFileDiff[] = [];
-            try {
-                diffs = await this.getCommitDiff(repo, c.id);
-            } catch (err) {
-                // Re-throw systemic errors (auth failure, server error); silently swallow 404
-                // (GitLab may return 404 for diffs on certain commits, e.g. initial commits).
-                // Keyed on the typed status rather than a ' 404:' substring (#272): the substring
-                // also matched a URL that merely CONTAINED it, and swallowing a real failure here
-                // silently understates the commit's churn.
-                if (!(err instanceof GitProviderFetchError) || err.status !== 404) throw err;
+            const hit = cached.get(c.id);
+            let diffs: GitFileDiff[];
+            let additions: number;
+            let deletions: number;
+            if (hit !== undefined) {
+                // A commit's diff never changes, so a hit is the same answer the endpoint
+                // would give — including the `absent` (404) case, whose cached form is
+                // `[]`/0/0, byte-identical to what the catch below produces.
+                diffs = hit.entries;
+                additions = hit.additions;
+                deletions = hit.deletions;
+            } else {
+                diffs = [];
+                let absent = false;
+                try {
+                    diffs = await this.getCommitDiff(repo, c.id);
+                } catch (err) {
+                    // Re-throw systemic errors (auth failure, server error); silently swallow 404
+                    // (GitLab may return 404 for diffs on certain commits, e.g. initial commits).
+                    // Keyed on the typed status rather than a ' 404:' substring (#272): the substring
+                    // also matched a URL that merely CONTAINED it, and swallowing a real failure here
+                    // silently understates the commit's churn.
+                    if (!(err instanceof GitProviderFetchError) || err.status !== 404) throw err;
+                    // Deterministic per commit — cacheable, and it MUST be cached or these are
+                    // the very commits re-asked on every run forever (#273).
+                    absent = true;
+                }
+                additions = diffs.reduce((s, d) => s + d.additions, 0);
+                deletions = diffs.reduce((s, d) => s + d.deletions, 0);
+                // Reached only on a success or a 404 — every other fault rethrew above, so no
+                // 5xx/rate-limit/transport failure is ever recorded as an answer. Written
+                // per-commit and OUTSIDE the run's write transaction, which is the whole point:
+                // the row survives a run that later fails and drops all its partial data.
+                this.diffstatCache?.put(repo, c.id, {additions, deletions, entries: diffs, absent});
             }
 
             commits.push({
@@ -345,8 +378,8 @@ export class GitLabProvider implements GitProvider {
                 },
                 date: c.authored_date,
                 message: c.message,
-                additions: diffs.reduce((s, d) => s + d.additions, 0),
-                deletions: diffs.reduce((s, d) => s + d.deletions, 0),
+                additions,
+                deletions,
                 filesChanged: diffs.map((d) => d.path),
                 // `[]`, never undefined — including via the 404 branch above, where `[]`
                 // is the true answer. See `GitCommit.diffs` for why that matters (#271).

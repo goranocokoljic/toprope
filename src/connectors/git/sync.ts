@@ -16,7 +16,8 @@ import {
     resolveRawAuthor,
     type SnapshotCell,
 } from './projection.js';
-import {createGitProvider} from './providers/factory.js';
+import {createGitProvider, validateGitProviderConfig} from './providers/factory.js';
+import {createCommitDiffstatCache, deleteContainerDiffstats} from './diffstat-cache.js';
 import {
     containerKey,
     containerKeyOf,
@@ -1279,9 +1280,23 @@ async function fetchProviderData(
     const allReviewComments: AnalysisReviewComment[] = [];
     const allPRRecords: PRRecordInput[] = [];
 
-    const provider = createGitProvider(providerConfig);
-    const providerType = provider.name;
+    // Validated FIRST, before the cache scope is derived (#273). `validateGitProviderConfig` is
+    // the canonical seam — the very same one `createGitProvider` runs on the next line — and it
+    // is what rejects a blank org/workspace/group. Running it here keeps the rejection message
+    // identical while guaranteeing the container the diffstat cache is keyed by is a real
+    // attribution key, not the blank one no per-provider delete could ever retract.
+    validateGitProviderConfig(providerConfig);
     const identifier = providerIdentifier(providerConfig);
+    // The persistent per-commit diffstat cache (#273), scoped to this provider instance. It is
+    // what turns a failed run from "lost every fetch" into "lost only the uncached tail": the
+    // provider writes each commit's diffstat through as it goes, OUTSIDE this run's write
+    // transaction, so the rows survive the #231 drop-partials rule that discards everything
+    // else. Supplied only here — probe paths (`doctor`, test-connection) never walk commits.
+    const provider = createGitProvider(
+        providerConfig,
+        createCommitDiffstatCache(db, providerConfig.type, identifier),
+    );
+    const providerType = provider.name;
     const stateKey = syncStateKey(providerType, identifier);
     // Window selection:
     //   - Backfill (#229): a fixed, strictly-older slice [since, until] the caller
@@ -2090,7 +2105,12 @@ export class GitSync implements ConnectorInterface {
         }
         // Containers whose owner disappeared or changed while this run was fetching. Filled by
         // the gate below and reported after the write transaction commits.
-        const orphanedContainers = new Set<string>();
+        //
+        // A MAP, not a set, since #273: the report needs the `${type}:${container}` key, and the
+        // post-commit diffstat-cache purge needs the two components back. Re-splitting the key
+        // on ':' would work today only because no provider type contains one — carrying the
+        // parts is the version that cannot rot.
+        const orphanedContainers = new Map<string, {type: GitProviderType; container: string}>();
         // Memoized per container: one owner lookup each, however many rows reference it.
         const ownerNow = new Map<string, string | null>();
         /**
@@ -2114,7 +2134,7 @@ export class GitSync implements ConnectorInterface {
             if (current === undefined) {
                 current = containerOwner(db, providerType, container);
                 ownerNow.set(key, current);
-                if (current !== startOwner) orphanedContainers.add(key);
+                if (current !== startOwner) orphanedContainers.set(key, {type: providerType, container});
             }
             return current === startOwner;
         };
@@ -2527,8 +2547,19 @@ export class GitSync implements ConnectorInterface {
         // failure), but a run that fetched a provider and wrote none of it must not read as a
         // clean full run.
         if (orphanedContainers.size > 0) {
+            // Retract the diffstat rows this run wrote for a container the cascade emptied
+            // while we were fetching (#273). The cascade cleared the table for this container
+            // when it ran, but the fetch loop kept writing through for minutes afterwards, so
+            // without this a delete + re-add leaves the new provider inheriting file-level
+            // detail its credentials may no longer justify. Correctness is unaffected either
+            // way — the rows are an immutable memo of a remote read — so this runs AFTER the
+            // transaction, deliberately outside it: a failure to tidy a cache must never roll
+            // back a committed sync.
+            for (const {type, container} of orphanedContainers.values()) {
+                deleteContainerDiffstats(db, type, container);
+            }
             errors.push(
-                `${PROVIDER_DELETED_MID_RUN_PREFIX} ${[...orphanedContainers].sort().join(', ')} — ` +
+                `${PROVIDER_DELETED_MID_RUN_PREFIX} ${[...orphanedContainers.keys()].sort().join(', ')} — ` +
                     'their fetched activity was discarded and no cursor advanced, because the provider ' +
                     'that owned them (and its imported data) was removed while this run was fetching. ' +
                     'If the container was re-added, sync it again to import it under the new provider.',

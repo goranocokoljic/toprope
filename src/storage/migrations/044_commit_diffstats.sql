@@ -1,0 +1,91 @@
+-- #273: a permanent, immutable cache of per-commit diffstats — the "ratchet" that makes a
+-- failed git sync run keep the expensive work it already did.
+--
+-- THE PROBLEM. The dominant cost of a git sync is the per-commit diffstat fan-out: one API
+-- call per commit, thousands of calls over hours on a full-history window. And it is
+-- all-or-nothing — per #231 a repo failure holds the provider's forward cursor and discards
+-- every partial result, because commit counts are ADDED across runs and persisting a
+-- half-covered window would double-count. So a 503 on commit 4,900 of 5,000 throws away
+-- 4,899 successful fetches, and the next run starts from zero. #272 made hitting a failure
+-- rare; this table makes hitting one cheap.
+--
+-- WHY CACHING IS SOUND HERE, AND WHY THIS IS NOT AN APPEND-ONLY SNAPSHOT TABLE. A commit's
+-- diffstat is IMMUTABLE: `(repo, sha) -> file stats` is a property of an object identified by
+-- the hash of its own content and history. It can never go stale, so there is no invalidation
+-- policy to get wrong. This table is therefore not a source of record and not a snapshot: it
+-- is a memo of an idempotent remote read, sitting strictly UPSTREAM of the accumulator. It
+-- changes nothing about cursor semantics, nothing about #231's drop-partials rule, and nothing
+-- about the additive-merge proof in `raw-author-daily.ts` — deleting the whole table only
+-- costs the next run some re-fetching. The project's append-only constraint governs
+-- `tool_snapshots` and the other snapshot tables; its rationale (never rewrite observed
+-- history) has no purchase on a derived, re-derivable memo, which is exactly why rows here may
+-- be written per-commit as a run progresses, OUTSIDE the run's final write transaction. That
+-- placement IS the feature: rows have to survive a run that later fails and rolls back.
+--
+-- ATTRIBUTION KEY. `(provider, container, repo, sha)` — the same `(provider, container)` pair
+-- #264 made the attribution key of `raw_author_daily` and `pr_records`, and the same pair the
+-- pipeline's cursors are keyed by. That is what lets the provider delete cascade retract this
+-- container's rows alongside the rest, so "this container's contribution is gone" stays a true
+-- statement. Correctness would survive a shared cache (the same sha in the same repo has the
+-- same diffstat whoever fetched it), but a re-added provider must not silently inherit rows
+-- its credentials no longer justify.
+--
+-- WHAT IS STORED, AND WHY BOTH THE TOTALS AND THE ENTRIES.
+--   * `additions`/`deletions` are the COMMIT-LEVEL totals the provider reported, not a sum of
+--     `entries`. On Bitbucket and GitLab those happen to be the same number, but GitHub takes
+--     the totals from the commit's `stats` while truncating its `files` array at 300 — so
+--     re-deriving the totals from the entries would silently under-report exactly the largest
+--     GitHub commits. Both are stored so a cache hit reproduces what the fetch produced.
+--   * `entries` is the file-level list as JSON (`[{path, additions, deletions, status}]`) — the
+--     full list, uncapped. `code_churn_rate` and `ai_signature_score` are computed from the
+--     per-file shape, so a cap would silently alter stats; and the same array already lives in
+--     memory for the whole run today, so capping buys nothing at the point it would cost
+--     accuracy. The growth characteristic is accepted: rows are small, bounded by distinct
+--     commits ever synced, and the table can be emptied at any time with no data loss.
+--   * `absent = 1` is the explicit 404 marker: the provider answered "no diffstat exists for
+--     this commit" (Bitbucket merge commits, GitLab initial commits). That is a DETERMINISTIC
+--     per-commit answer, so it is cacheable and must be — those are precisely the commits a
+--     naive cache would re-ask forever. It is deliberately NOT the same statement as "this
+--     commit touched no files", even though both produce a zero-stat commit downstream.
+--
+-- WHAT IS NEVER CACHED: a 5xx, a rate limit, or a transport fault. Those are statements about
+-- the server's health, not about the commit, and the fetch sites rethrow them so no row is
+-- written. Only a successful response or a deterministic 404 reaches a write.
+
+CREATE TABLE IF NOT EXISTS commit_diffstats (
+    -- Provider family. Closed set, DB-enforced — same vocabulary as git_providers.
+    provider TEXT NOT NULL CHECK (provider IN ('github', 'bitbucket', 'gitlab')),
+    -- The provider INSTANCE (org/workspace/group), normalized by `normalizeContainer` at the
+    -- write boundary. Never blank: a blank container would pool two workspaces into one cache
+    -- bucket that no per-provider delete could retract.
+    container TEXT NOT NULL CHECK (length(container) > 0),
+    -- Repo identifier as the provider's fetch path spells it (GitHub name, Bitbucket slug,
+    -- GitLab path_with_namespace) — NOT repo-namespaced the way the sync loop namespaces diff
+    -- paths downstream.
+    repo TEXT NOT NULL CHECK (length(repo) > 0),
+    sha TEXT NOT NULL CHECK (length(sha) > 0),
+    -- Commit-level totals as reported by the provider. See the header note on why these are
+    -- stored rather than re-derived from `entries`.
+    additions INTEGER NOT NULL CHECK (additions >= 0),
+    deletions INTEGER NOT NULL CHECK (deletions >= 0),
+    -- 1 iff the provider returned 404 for this commit's diffstat — a deterministic answer.
+    absent INTEGER NOT NULL CHECK (absent IN (0, 1)),
+    -- JSON array of {path, additions, deletions, status}. Read back through a shape check,
+    -- never trusted: this is TEXT, so a hand-edited or truncated value must degrade to a cache
+    -- MISS (re-fetch), not to a corrupted commit.
+    entries TEXT NOT NULL,
+    -- When this memo was recorded (UTC ISO). Provenance only — it is never consulted to decide
+    -- freshness, because an immutable fact has none.
+    fetched_at TEXT NOT NULL,
+    -- An absent diffstat carries nothing: pinning that here stops a future writer inventing a
+    -- row that claims both "no diffstat exists" and "here are its 40 changed lines".
+    CHECK (absent = 0 OR (additions = 0 AND deletions = 0 AND entries = '[]')),
+    PRIMARY KEY (provider, container, repo, sha)
+);
+
+-- NO SECONDARY INDEX, deliberately. Both access patterns are left-prefix seeks on the PRIMARY
+-- KEY index SQLite creates for the declaration above:
+--   * the batch read — `provider = ? AND container = ? AND repo = ? AND sha IN (...)` — uses all
+--     four columns;
+--   * the delete cascade (#264) — `provider = ? AND container = ?` — uses the leading two.
+-- A second index on the same prefix would cost every per-commit write and buy nothing.
