@@ -8,6 +8,15 @@
  * empty or clean `sync_logs` is not evidence that no manual run died, and the reaping below
  * cannot repair what was never written. Widening the table to those paths would change what
  * `computeConnectors` reports as a connector's last sync, which is a separate decision.
+ *
+ * WHO READS THIS TABLE (#272 review cycle 2, SO-6) — worth knowing before investing in it. The
+ * only production reader is `computeConnectors`' own inline query in `dashboard/api/coverage.ts`,
+ * which takes the newest row per connector and reads `status`/`finished_at` — not `errors`.
+ * `getRecentSyncLogs` and `getLastSuccessfulSync` below currently have no `src/` caller at all.
+ * So the reaping's practical value is that the table reads honestly to a human running SQL
+ * against it, which is exactly how the 2026-07-28 incident had to be investigated, and that
+ * `computeConnectors` stops reporting a long-dead run as still `running`. It is deliberately NOT
+ * claimed to surface the reason anywhere in the UI — nothing reads `errors`.
  */
 import type Database from 'better-sqlite3';
 import {randomUUID} from 'crypto';
@@ -58,6 +67,12 @@ export const ABANDONED_RUN_ERROR =
  * finished, so `toprope doctor` and `/api/coverage` report a false red until the run's own
  * `finishSyncLog` overwrites it.
  *
+ * Do not read this bound as making overlap SAFE — it only stops the log from lying about it.
+ * Two concurrent git runs read the same forward cursor, fetch non-disjoint windows, and
+ * `mergeDailyAcrossRuns`/`upsertRawAuthorDaily` add commit metrics with no dedup guard, so the
+ * overlap itself is a permanent double-count in `git_snapshots` (the hazard #262 documents).
+ * Nothing serializes the two entry points today; that gap is not this function's to close.
+ *
  * 24 h is chosen against what a run can legitimately take: a git sync walking a full
  * repository history is the longest thing in this system, measured in hours. A row older than
  * a day is not a slow run, it is a dead one. The cost is that a run which died an hour ago
@@ -87,7 +102,19 @@ export const ABANDONED_RUN_MIN_AGE_MS = 24 * 60 * 60 * 1000;
  * `getRecentSyncLogs` already owns.
  */
 function reapAbandonedSyncLogs(db: Database.Database, connector: string, at: string): void {
-    const cutoff = new Date(Date.parse(at) - ABANDONED_RUN_MIN_AGE_MS).toISOString();
+    const atMs = Date.parse(at);
+    // Total, not merely correct-in-practice: an unparseable `at` would make `new Date(NaN)`
+    // throw a RangeError out of `startSyncLog`, which the pipeline calls OUTSIDE the try that
+    // turns a fault into an error-carrying SyncResult — so it would escape the whole run rather
+    // than be recorded. Unreachable while every caller passes a locally-generated instant;
+    // skipping the reap is the right degradation if that ever stops being true.
+    if (Number.isNaN(atMs)) return;
+    // Compared LEXICALLY by the SQL below, which is total here only because `started_at` has a
+    // single writer — the INSERT in this file, always `new Date().toISOString()` — so every row
+    // and this cutoff share one fixed shape. If a path ever inserts `started_at` from an
+    // external value, pin its shape at that boundary or switch this to a parsed comparison:
+    // an ISO expanded-year value sorts below every ordinary year and would invert the test.
+    const cutoff = new Date(atMs - ABANDONED_RUN_MIN_AGE_MS).toISOString();
     db.prepare(
         `UPDATE sync_logs
          SET finished_at = ?, error_count = 1, errors = ?, status = 'error'
@@ -140,10 +167,12 @@ export function finishSyncLog(
 }
 
 /**
- * The `errors` column as an array, or `null`.
+ * The `errors` column as an array, or `null`. The single decoder — every reader below goes
+ * through it.
  *
- * Tolerant on purpose: `errors` is plain TEXT with no CHECK constraint, and this is the only
- * decoder, so a single hand-edited or legacy row must not make the whole log unreadable.
+ * Tolerant on purpose: `errors` is plain TEXT with no CHECK constraint, so one hand-edited or
+ * legacy row must not make the whole log unreadable, and an unparseable blob is surfaced as its
+ * raw text rather than silently dropped.
  */
 function decodeErrors(raw: string | null): string[] | null {
     if (!raw) return null;
@@ -176,8 +205,11 @@ export function getLastSuccessfulSync(db: Database.Database, connector: string):
         .get(connector) as SyncLogRow | undefined;
     if (!row) return null;
     return {
+        // Decoded, not dropped: `finishSyncLog` classifies a run `success` when every entry is an
+        // ADVISORY yet still persists the array, so a successful row genuinely can carry text —
+        // returning `null` here discarded it (#272 review cycle 2, DUP-2).
         ...row,
-        errors: null,
+        errors: decodeErrors(row.errors),
         status: 'success',
     };
 }

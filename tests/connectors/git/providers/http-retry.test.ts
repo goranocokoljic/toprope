@@ -11,6 +11,7 @@ import {describe, it, expect, afterEach, vi} from 'vitest';
 import {
     GitProviderFetchError,
     MAX_RATE_LIMIT_DELAY_MS,
+    MAX_RATE_LIMIT_RETRIES,
     MAX_SERVER_ERROR_RETRIES,
     PROBE_SERVER_ERROR_RETRIES,
     SERVER_ERROR_BASE_DELAY_MS,
@@ -19,6 +20,7 @@ import {
     parseEpochResetMs,
     parseRetryAfterMs,
     rateLimitDelayMs,
+    rateLimitFallbackMs,
     serverErrorDelayMs,
 } from '../../../../src/connectors/git/providers/http-retry';
 
@@ -38,9 +40,12 @@ describe('policy constants', () => {
         expect(SERVER_ERROR_BASE_DELAY_MS).toBe(5_000);
         expect(SERVER_ERROR_MAX_DELAY_MS).toBe(120_000);
         expect(MAX_RATE_LIMIT_DELAY_MS).toBe(3_600_000);
-        // A probe answers a waiting human — it must NOT inherit the sync's budget.
-        expect(PROBE_SERVER_ERROR_RETRIES).toBe(1);
-        expect(PROBE_SERVER_ERROR_RETRIES).toBeLessThan(MAX_SERVER_ERROR_RETRIES);
+        expect(MAX_RATE_LIMIT_RETRIES).toBe(3);
+        expect(rateLimitFallbackMs(0)).toBe(60_000);
+        expect(rateLimitFallbackMs(2)).toBe(180_000);
+        // A probe answers a waiting human — it must NOT retry at all, because even one retry is
+        // worth up to SERVER_ERROR_MAX_DELAY_MS once Retry-After acts as a floor.
+        expect(PROBE_SERVER_ERROR_RETRIES).toBe(0);
     });
 });
 
@@ -107,13 +112,22 @@ describe('parseEpochResetMs', () => {
         expect(parseEpochResetMs(String(Math.floor(Date.now() / 1_000) - 60))).toBe(0);
     });
 
-    it('returns null for absent or non-integer headers', () => {
+    it('returns null for absent or non-numeric headers', () => {
         expect(parseEpochResetMs(null)).toBeNull();
         expect(parseEpochResetMs(undefined)).toBeNull();
         expect(parseEpochResetMs('')).toBeNull();
         expect(parseEpochResetMs('later')).toBeNull();
         expect(parseEpochResetMs('-1')).toBeNull();
-        expect(parseEpochResetMs('1785283320.5')).toBeNull();
+    });
+
+    it('floors a fractional epoch rather than rejecting it', () => {
+        // Rejecting it would be a behaviour REGRESSION: the `parseInt` this replaced read it
+        // fine, and GitHub's primary-rate-limit branch guards on `resetMs !== null`, so a null
+        // makes it fall through to an immediate throw with no retry at all.
+        vi.useFakeTimers();
+        vi.setSystemTime(new Date('2026-07-28T10:00:00.000Z'));
+        const inThirty = Math.floor(Date.parse('2026-07-28T10:00:30.000Z') / 1_000);
+        expect(parseEpochResetMs(`${inThirty}.5`)).toBe(30_000);
     });
 });
 
@@ -129,13 +143,18 @@ describe('rateLimitDelayMs', () => {
     });
 
     it('uses the fallback when the header is absent or unusable', () => {
-        expect(rateLimitDelayMs(null, 30_000)).toBe(30_000);
-        // The regression: `parseFloat` turned each of these into NaN, and setTimeout(NaN)
+        // The regression: `parseFloat` turned each unusable form into NaN, and setTimeout(NaN)
         // fires on the next tick — so the client hammered the provider three times in one
         // tick WHILE being rate limited, which is how a primary limit becomes an abuse block.
-        expect(rateLimitDelayMs('Tue, 28 Jul 2026 10:02:00 GMT', 30_000)).not.toBeNaN();
+        expect(rateLimitDelayMs(null, 30_000)).toBe(30_000);
         expect(rateLimitDelayMs('garbage', 30_000)).toBe(30_000);
         expect(rateLimitDelayMs('30s', 30_000)).toBe(30_000);
+    });
+
+    it('honors an HTTP-date Retry-After as a real interval', () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(new Date('2026-07-28T10:00:00.000Z'));
+        expect(rateLimitDelayMs('Tue, 28 Jul 2026 10:02:00 GMT', 30_000)).toBe(120_000);
     });
 
     it('never returns an instant retry, even for Retry-After: 0', () => {
@@ -240,9 +259,22 @@ describe('serverErrorDelayMs', () => {
 });
 
 describe('isRetryableGitFetchError', () => {
-    it('treats 5xx and 429 as worth a longer pause', () => {
-        for (const status of [500, 502, 503, 504, 429]) {
+    it('treats 5xx as worth a longer pause', () => {
+        for (const status of [500, 502, 503, 504]) {
             expect(isRetryableGitFetchError(new GitProviderFetchError('boom', status))).toBe(true);
+        }
+    });
+
+    it('does NOT repo-retry a rate limit — the request layer owns that', () => {
+        // The request layer already waited out the server's OWN reset instant
+        // MAX_RATE_LIMIT_RETRIES times, up to an hour each. A blind 5-minute repo pause cannot
+        // improve on that, re-paging a whole repo into a limit the provider just said is still up
+        // is how a primary limit becomes an abuse block, and the repo retry would MULTIPLY the
+        // request-level waiting by three while GIT_RUN_RETRY_SLEEP_BUDGET_MS bounds none of it.
+        for (const status of [429, 403]) {
+            expect(isRetryableGitFetchError(new GitProviderFetchError('limited', status))).toBe(
+                false,
+            );
         }
     });
 
@@ -255,7 +287,7 @@ describe('isRetryableGitFetchError', () => {
     it('treats a deterministic 4xx answer as permanent', () => {
         // A 20-minute in-run pause per repo to re-ask a 401 would turn one bad credential
         // into a run that never finishes.
-        for (const status of [400, 401, 403, 404, 422]) {
+        for (const status of [400, 401, 404, 422]) {
             expect(isRetryableGitFetchError(new GitProviderFetchError('nope', status))).toBe(false);
         }
     });

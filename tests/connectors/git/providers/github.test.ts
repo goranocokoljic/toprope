@@ -1045,6 +1045,104 @@ describe('GitHubProvider', () => {
             expect(setTimeoutSpy.mock.calls.map((c) => Number(c[1]))).toContain(45_000);
         });
 
+        it('waits out the PRIMARY rate limit on a 403 with remaining=0', async () => {
+            // GitHub's main throttle. Distinct from the secondary-limit branch above: there is no
+            // Retry-After, only x-ratelimit-remaining=0 plus an epoch reset.
+            vi.useFakeTimers();
+            vi.setSystemTime(new Date('2026-07-28T10:00:00.000Z'));
+            const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+            const resetEpoch = Math.floor(Date.parse('2026-07-28T10:00:30.000Z') / 1_000);
+            let calls = 0;
+            vi.stubGlobal('fetch', vi.fn().mockImplementation(() => {
+                calls++;
+                if (calls === 1) {
+                    return Promise.resolve({
+                        ok: false,
+                        status: 403,
+                        headers: new Headers({
+                            'x-ratelimit-remaining': '0',
+                            'x-ratelimit-reset': String(resetEpoch),
+                        }),
+                        json: () => Promise.resolve({}),
+                        text: () => Promise.resolve('rate limit exceeded'),
+                    } as unknown as Response);
+                }
+                return Promise.resolve({
+                    ok: true,
+                    status: 200,
+                    headers: new Headers(),
+                    json: () => Promise.resolve([]),
+                    text: () => Promise.resolve(''),
+                } as unknown as Response);
+            }));
+
+            const listPromise = provider.listRepos();
+            await vi.runAllTimersAsync();
+
+            await expect(listPromise).resolves.toEqual([]);
+            // 30s to the reset, +1s so the retry lands just after it rather than exactly on it.
+            expect(setTimeoutSpy.mock.calls.map((c) => Number(c[1]))).toContain(31_000);
+            expect(calls).toBe(2);
+        });
+
+        it('tolerates a fractional x-ratelimit-reset rather than failing the 403 outright', async () => {
+            // `parseInt` (pre-#272) read '….5' fine. If parseEpochResetMs rejected it, the
+            // primary-limit guard `resetMs !== null` would fall through both 403 branches and
+            // throw with NO retry — a regression on GitHub's main throttle.
+            vi.useFakeTimers();
+            vi.setSystemTime(new Date('2026-07-28T10:00:00.000Z'));
+            const resetEpoch = Math.floor(Date.parse('2026-07-28T10:00:30.000Z') / 1_000);
+            let calls = 0;
+            vi.stubGlobal('fetch', vi.fn().mockImplementation(() => {
+                calls++;
+                if (calls === 1) {
+                    return Promise.resolve({
+                        ok: false,
+                        status: 403,
+                        headers: new Headers({
+                            'x-ratelimit-remaining': '0',
+                            'x-ratelimit-reset': `${resetEpoch}.5`,
+                        }),
+                        json: () => Promise.resolve({}),
+                        text: () => Promise.resolve('rate limit exceeded'),
+                    } as unknown as Response);
+                }
+                return Promise.resolve({
+                    ok: true,
+                    status: 200,
+                    headers: new Headers(),
+                    json: () => Promise.resolve([]),
+                    text: () => Promise.resolve(''),
+                } as unknown as Response);
+            }));
+
+            const listPromise = provider.listRepos();
+            await vi.runAllTimersAsync();
+
+            await expect(listPromise).resolves.toEqual([]);
+            expect(calls).toBe(2);
+        });
+
+        it('throws a non-retryable 403 when it carries no rate-limit information at all', async () => {
+            // A permissions 403: neither branch applies, so it fails immediately — and the repo
+            // layer must not spend 20 minutes re-asking a question with a fixed answer.
+            vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+                ok: false,
+                status: 403,
+                headers: new Headers(),
+                json: () => Promise.resolve({}),
+                text: () => Promise.resolve('resource not accessible'),
+            } as unknown as Response));
+
+            const listPromise = provider.listRepos();
+            void listPromise.catch(() => {});
+            await vi.runAllTimersAsync();
+
+            await expect(listPromise).rejects.toThrow('GitHub API forbidden (403)');
+            expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
+            expect(isRetryableGitFetchError(await listPromise.catch((e) => e))).toBe(false);
+        });
+
         it('caps the pre-emptive rate-limit pause when the reset header is absurd', async () => {
             // A garbage x-ratelimit-reset used to be trusted verbatim: `reset * 1000 - now`
             // could park the sync for years.
@@ -1066,7 +1164,11 @@ describe('GitHubProvider', () => {
             await vi.runAllTimersAsync();
             await listPromise;
 
-            expect(setTimeoutSpy.mock.calls.every((c) => Number(c[1]) <= 3_600_000)).toBe(true);
+            const delays = setTimeoutSpy.mock.calls.map((c) => Number(c[1]));
+            // Positive control FIRST: `every` on an empty array is true, so without this the test
+            // would stay green if the pre-emptive pause were deleted outright.
+            expect(delays).toContain(3_600_000);
+            expect(delays.every((d) => d <= 3_600_000)).toBe(true);
         });
 
         it('checkAccess fails fast on a 5xx instead of inheriting the sync budget', async () => {
@@ -1077,9 +1179,13 @@ describe('GitHubProvider', () => {
             await vi.runAllTimersAsync();
 
             await expect(pending).rejects.toThrow('GitHub API server error 503');
+            // One request, full stop: PROBE_SERVER_ERROR_RETRIES is 0 because even a single
+            // retry is worth up to SERVER_ERROR_MAX_DELAY_MS once Retry-After acts as a floor,
+            // and a human is waiting on this answer inside one HTTP request.
             expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(
                 1 + PROBE_SERVER_ERROR_RETRIES,
             );
+            expect(PROBE_SERVER_ERROR_RETRIES).toBe(0);
         });
     });
 

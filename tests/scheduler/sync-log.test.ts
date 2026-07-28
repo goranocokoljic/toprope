@@ -143,6 +143,14 @@ describe('sync-log', () => {
 
         const OLD = ABANDONED_RUN_MIN_AGE_MS + 60_000;
 
+        it('pins the liveness bound as a literal, not against itself', () => {
+            // The other assertions in this block probe ±60s around the constant, so they move with
+            // it. Shrinking it to 2h would keep them all green while making the documented failure
+            // mode reachable: a live multi-hour git sync's row flipped to `error`, and doctor /
+            // /api/coverage reporting a false red for a run that is still working.
+            expect(ABANDONED_RUN_MIN_AGE_MS).toBe(24 * 60 * 60 * 1000);
+        });
+
         it('closes a row left running by a run that never returned', () => {
             seedOpenRow('abandoned', 'git', OLD);
 

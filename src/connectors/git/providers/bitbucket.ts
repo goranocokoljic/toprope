@@ -14,15 +14,16 @@ import type {
 import {normalizeContainer} from './container.js';
 import {
     GitProviderFetchError,
+    MAX_RATE_LIMIT_RETRIES,
     MAX_SERVER_ERROR_RETRIES,
     PROBE_SERVER_ERROR_RETRIES,
     rateLimitDelayMs,
+    rateLimitFallbackMs,
     serverErrorDelayMs,
     sleep,
 } from './http-retry.js';
 
 const BASE_URL = 'https://api.bitbucket.org/2.0';
-const MAX_RETRIES = 3;
 
 function parseRawAuthor(raw: string): {name: string; email: string} {
     const match = raw.match(/^(.*?)\s*<([^>]+)>$/);
@@ -59,10 +60,8 @@ async function fetchBitbucket(
     // allowance on rate limiting, or vice versa.
     let transientRetries = 0;
 
-    // `for (;;)`, not `while (attempt <= MAX_RETRIES)`: every branch below either `continue`s
-    // or throws, so the guard could never end the loop and the post-loop throw it implied was
-    // unreachable. Since #272 the two budgets are counted separately anyway, so one guard
-    // cannot express both.
+    // `for (;;)`: the two budgets above are counted separately, so no single loop guard can
+    // express both, and every branch below either `continue`s or throws (#272).
     for (;;) {
         let res: Response;
         try {
@@ -84,15 +83,15 @@ async function fetchBitbucket(
         }
 
         if (res.status === 429) {
-            if (attempt < MAX_RETRIES) {
+            if (attempt < MAX_RATE_LIMIT_RETRIES) {
                 await sleep(
-                    rateLimitDelayMs(res.headers.get('retry-after'), 60_000 * (attempt + 1)),
+                    rateLimitDelayMs(res.headers.get('retry-after'), rateLimitFallbackMs(attempt)),
                 );
                 attempt++;
                 continue;
             }
             throw new GitProviderFetchError(
-                `Rate limit exceeded after ${MAX_RETRIES} retries: ${url}`,
+                `Rate limit exceeded after ${MAX_RATE_LIMIT_RETRIES} retries: ${url}`,
                 429,
             );
         }

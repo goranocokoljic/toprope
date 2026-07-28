@@ -15,10 +15,12 @@ import type {
 import {normalizeContainer} from './container.js';
 import {
     GitProviderFetchError,
+    MAX_RATE_LIMIT_RETRIES,
     MAX_SERVER_ERROR_RETRIES,
     PROBE_SERVER_ERROR_RETRIES,
     parseEpochResetMs,
     rateLimitDelayMs,
+    rateLimitFallbackMs,
     serverErrorDelayMs,
     sleep,
 } from './http-retry.js';
@@ -26,7 +28,6 @@ import {
 const BASE_URL = 'https://api.github.com';
 // Pause proactively when remaining requests drops below this threshold
 const RATE_LIMIT_PAUSE_THRESHOLD = 100;
-const MAX_RETRIES = 3;
 
 function parseNextLink(header: string | null): string | null {
     if (!header) return null;
@@ -53,10 +54,8 @@ async function fetchGitHub(
     // the other's allowance.
     let transientRetries = 0;
 
-    // `for (;;)`, not `while (attempt <= MAX_RETRIES)`: every branch below either `continue`s
-    // or throws, so the guard could never end the loop and the post-loop throw it implied was
-    // unreachable. Since #272 the two budgets are counted separately anyway, so one guard
-    // cannot express both.
+    // `for (;;)`: the two budgets above are counted separately, so no single loop guard can
+    // express both, and every branch below either `continue`s or throws (#272).
     for (;;) {
         let res: Response;
         try {
@@ -78,15 +77,15 @@ async function fetchGitHub(
         }
 
         if (res.status === 429) {
-            if (attempt < MAX_RETRIES) {
+            if (attempt < MAX_RATE_LIMIT_RETRIES) {
                 await sleep(
-                    rateLimitDelayMs(res.headers.get('retry-after'), 60_000 * (attempt + 1)),
+                    rateLimitDelayMs(res.headers.get('retry-after'), rateLimitFallbackMs(attempt)),
                 );
                 attempt++;
                 continue;
             }
             throw new GitProviderFetchError(
-                `Rate limit exceeded after ${MAX_RETRIES} retries: ${url}`,
+                `Rate limit exceeded after ${MAX_RATE_LIMIT_RETRIES} retries: ${url}`,
                 429,
             );
         }
@@ -98,15 +97,15 @@ async function fetchGitHub(
             // Primary rate limit: x-ratelimit-remaining=0 with reset time. `+ 1_000` so the
             // retry lands just AFTER the reset instant rather than exactly on it.
             if (remaining === '0' && resetMs !== null) {
-                if (attempt < MAX_RETRIES) {
+                if (attempt < MAX_RATE_LIMIT_RETRIES) {
                     await sleep(rateLimitDelayMs(null, resetMs + 1_000));
                     attempt++;
                     continue;
                 }
             // Secondary rate limit (abuse detection): Retry-After present, no ratelimit headers
             } else if (retryAfter403 !== null) {
-                if (attempt < MAX_RETRIES) {
-                    await sleep(rateLimitDelayMs(retryAfter403, 60_000 * (attempt + 1)));
+                if (attempt < MAX_RATE_LIMIT_RETRIES) {
+                    await sleep(rateLimitDelayMs(retryAfter403, rateLimitFallbackMs(attempt)));
                     attempt++;
                     continue;
                 }

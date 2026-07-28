@@ -15,16 +15,17 @@ import type {
 import {normalizeContainer} from './container.js';
 import {
     GitProviderFetchError,
+    MAX_RATE_LIMIT_RETRIES,
     MAX_SERVER_ERROR_RETRIES,
     PROBE_SERVER_ERROR_RETRIES,
     parseEpochResetMs,
     rateLimitDelayMs,
+    rateLimitFallbackMs,
     serverErrorDelayMs,
     sleep,
 } from './http-retry.js';
 
 const DEFAULT_BASE_URL = 'https://gitlab.com/api/v4';
-const MAX_RETRIES = 3;
 const PER_PAGE = 100;
 
 function buildAuthHeaders(auth: GitLabProviderConfig['auth']): Record<string, string> {
@@ -50,10 +51,8 @@ async function fetchGitLab(
     // allowance.
     let transientRetries = 0;
 
-    // `for (;;)`, not `while (attempt <= MAX_RETRIES)`: every branch below either `continue`s
-    // or throws, so the guard could never end the loop and the post-loop throw it implied was
-    // unreachable. Since #272 the two budgets are counted separately anyway, so one guard
-    // cannot express both.
+    // `for (;;)`: the two budgets above are counted separately, so no single loop guard can
+    // express both, and every branch below either `continue`s or throws (#272).
     for (;;) {
         let res: Response;
         try {
@@ -81,18 +80,18 @@ async function fetchGitLab(
             // 1 ms. The pause meant to outlast the limit became an instant retry, and GitLab
             // was hammered while already rate-limiting us. Parsed by kind now.
             const resetMs = parseEpochResetMs(res.headers.get('ratelimit-reset'));
-            if (attempt < MAX_RETRIES) {
+            if (attempt < MAX_RATE_LIMIT_RETRIES) {
                 await sleep(
                     rateLimitDelayMs(
                         res.headers.get('retry-after'),
-                        resetMs ?? 60_000 * (attempt + 1),
+                        resetMs ?? rateLimitFallbackMs(attempt),
                     ),
                 );
                 attempt++;
                 continue;
             }
             throw new GitProviderFetchError(
-                `Rate limit exceeded after ${MAX_RETRIES} retries: ${url}`,
+                `Rate limit exceeded after ${MAX_RATE_LIMIT_RETRIES} retries: ${url}`,
                 429,
             );
         }

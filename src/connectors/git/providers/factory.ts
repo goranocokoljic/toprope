@@ -59,6 +59,17 @@ function validateGitLab(config: GitLabProviderConfig): void {
         if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
             throw new Error('GitLab provider url must use http or https scheme');
         }
+        // Reject userinfo (#272 review cycle 2, SEC-5). `GitLabProvider` keeps `config.url`
+        // verbatim as `this.baseUrl` and interpolates it into every error message it throws —
+        // and those messages are persisted to `sync_logs.errors` / `git_providers.last_sync_error`
+        // and returned verbatim to any admin by the test-connection route. A token embedded as
+        // `https://oauth2:glpat-xxx@gitlab.internal` would therefore leak to admins who never
+        // supplied it. Credentials belong in `auth`, which is encrypted at rest.
+        if (parsed.username !== '' || parsed.password !== '') {
+            throw new Error(
+                'GitLab provider url must not embed credentials — put the token in auth.token',
+            );
+        }
     }
 }
 

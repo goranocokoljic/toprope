@@ -24,8 +24,11 @@ import {addDeveloper} from '../../../src/registry/developers';
 import {
     GitSync,
     GIT_REPO_RETRY_DELAYS_MS,
+    GIT_RUN_BEST_EFFORT_RETRY_SLEEP_BUDGET_MS,
     GIT_RUN_RETRY_SLEEP_BUDGET_MS,
+    RETRY_HEALED_PREFIX,
     getProviderStall,
+    isAdvisoryError,
     syncStateKey,
     type GitSyncProgress,
 } from '../../../src/connectors/git/sync';
@@ -166,7 +169,8 @@ describe('in-run repo retry (#272)', () => {
         // Attempt + both retries, i.e. the whole budget was available and used.
         expect(calls).toBe(1 + GIT_REPO_RETRY_DELAYS_MS.length);
         // The heal is invisible to the run's outcome: no error, data written…
-        expect(result.errors).toHaveLength(0);
+        // Advisories excluded: a heal now reports itself (RETRY_HEALED_PREFIX) without going red.
+        expect(result.errors.filter((e) => !isAdvisoryError(e))).toHaveLength(0);
         expect(result.snapshotsWritten).toBeGreaterThan(0);
         // …the commit landed EXACTLY once. Note what this does and does not prove: the failing
         // attempts THROW, so they never yield a partial list, and assign-vs-append at the call
@@ -186,6 +190,11 @@ describe('in-run repo retry (#272)', () => {
         // exists to survive — and the whole suite would stay green.
         expect(GIT_REPO_RETRY_DELAYS_MS).toEqual([5 * 60_000, 15 * 60_000]);
         expect(GIT_RUN_RETRY_SLEEP_BUDGET_MS).toBe(40 * 60_000);
+        // Strictly smaller, so a best-effort fetch can never leave the commit fetch with nothing.
+        expect(GIT_RUN_BEST_EFFORT_RETRY_SLEEP_BUDGET_MS).toBe(20 * 60_000);
+        expect(GIT_RUN_BEST_EFFORT_RETRY_SLEEP_BUDGET_MS).toBeLessThan(
+            GIT_RUN_RETRY_SLEEP_BUDGET_MS,
+        );
     });
 
     it('waits the documented 5-then-15-minute pauses, in that order', async () => {
@@ -406,7 +415,8 @@ describe('in-run repo retry (#272)', () => {
         const result = await runSync(db);
 
         expect(prCalls).toBe(1 + GIT_REPO_RETRY_DELAYS_MS.length);
-        expect(result.errors).toHaveLength(0);
+        // Advisories excluded: a heal now reports itself (RETRY_HEALED_PREFIX) without going red.
+        expect(result.errors.filter((e) => !isAdvisoryError(e))).toHaveLength(0);
     });
 
     it('a PR fetch that stays broken is still best-effort — it does not hold the cursor', async () => {
@@ -433,6 +443,183 @@ describe('in-run repo retry (#272)', () => {
         expect(readState(db, FORWARD_KEY)).toBe(result.lastSyncTime);
     });
 
+    it('does not double-count across runs when a run healed and advanced the cursor', async () => {
+        // The double-count vector that actually matters. Commit metrics are ADDED across runs on
+        // the premise that the cursor makes each run's window disjoint. If a healed run advanced
+        // the cursor to the wrong instant, run 2 re-covers the same window and permanently doubles
+        // every commit metric — and comparing the cursor to `result.lastSyncTime` cannot catch
+        // that, because both come from the same code. This drives a `since`-aware mock instead.
+        seedAlice(db);
+        const createGitProvider = await getCreateGitProvider();
+        const COMMIT_AT = '2024-01-15T10:00:00Z';
+        const sinceSeen: string[] = [];
+        let calls = 0;
+        const getCommits = vi
+            .fn()
+            .mockImplementation(async (_repo: string, since: string): Promise<GitCommit[]> => {
+                calls++;
+                if (calls === 1) throw new GitProviderFetchError('server error 503', 503);
+                sinceSeen.push(since);
+                // A real provider only returns commits at or after `since`.
+                if (since !== '' && Date.parse(since) > Date.parse(COMMIT_AT)) return [];
+                return [makeCommit('c-1', COMMIT_AT)];
+            });
+        createGitProvider.mockReturnValue(
+            makeMockProvider({listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]), getCommits}),
+        );
+
+        const run1 = await runSync(db);
+        expect(run1.errors.filter((e) => !isAdvisoryError(e))).toHaveLength(0);
+        expect(dayRow(db, '2024-01-15')?.commits).toBe(1);
+        const cursorAfterRun1 = readState(db, FORWARD_KEY);
+        expect(cursorAfterRun1).toBe(run1.lastSyncTime);
+
+        const run2 = await runSync(db);
+
+        // Run 2 resumed from exactly where run 1 stopped — no re-covered span…
+        expect(sinceSeen[sinceSeen.length - 1]).toBe(cursorAfterRun1);
+        // …so the commit is still counted ONCE. `2` here is the permanent double-count.
+        expect(dayRow(db, '2024-01-15')?.commits).toBe(1);
+        expect(readState(db, FORWARD_KEY)).toBe(run2.lastSyncTime);
+    });
+
+    it('reports a healed retry as an advisory, so it is neither silent nor red', async () => {
+        // Without this the recovery is invisible: no error, and the only trace is a run that took
+        // up to 20 minutes longer per repo with the progress counter sitting at 0 — which reads
+        // exactly like a hang. It must be an ADVISORY, or the pipeline would re-fetch the whole
+        // connector every time a blip was survived.
+        seedAlice(db);
+        const createGitProvider = await getCreateGitProvider();
+        let calls = 0;
+        createGitProvider.mockReturnValue(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                getCommits: vi.fn().mockImplementation(async (): Promise<GitCommit[]> => {
+                    calls++;
+                    if (calls === 1) throw new GitProviderFetchError('503 from /commits', 503);
+                    return [makeCommit('c-1')];
+                }),
+            }),
+        );
+
+        const result = await runSync(db);
+
+        const healed = result.errors.filter((e) => e.startsWith(RETRY_HEALED_PREFIX));
+        expect(healed).toHaveLength(1);
+        expect(healed[0]).toContain('repo1');
+        expect(healed[0]).toContain('503 from /commits');
+        // Advisory, so the provider stays green and the pipeline does not retry the connector.
+        expect(result.errors.every((e) => isAdvisoryError(e))).toBe(true);
+        // And the data still landed.
+        expect(dayRow(db, '2024-01-15')?.commits).toBe(1);
+    });
+
+    it('retries listRepos, whose failure discards the provider before any repo is attempted', async () => {
+        seedAlice(db);
+        const createGitProvider = await getCreateGitProvider();
+        let calls = 0;
+        const listRepos = vi.fn().mockImplementation(async () => {
+            calls++;
+            if (calls <= 2) throw new GitProviderFetchError('server error 503', 503);
+            return [makeRepo('repo1')];
+        });
+        createGitProvider.mockReturnValue(
+            makeMockProvider({
+                listRepos,
+                getCommits: vi.fn().mockResolvedValue([makeCommit('c-1')]),
+            }),
+        );
+
+        const result = await runSync(db);
+
+        expect(calls).toBe(1 + GIT_REPO_RETRY_DELAYS_MS.length);
+        expect(result.errors.filter((e) => !isAdvisoryError(e))).toHaveLength(0);
+        expect(dayRow(db, '2024-01-15')?.commits).toBe(1);
+        expect(readState(db, FORWARD_KEY)).toBe(result.lastSyncTime);
+    });
+
+    it('retries the per-PR review fan-out — the largest request population in a run', async () => {
+        seedAlice(db);
+        const createGitProvider = await getCreateGitProvider();
+        let commentCalls = 0;
+        const getReviewComments = vi.fn().mockImplementation(async () => {
+            commentCalls++;
+            if (commentCalls <= 2) throw new GitProviderFetchError('server error 503', 503);
+            return [];
+        });
+        createGitProvider.mockReturnValue(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                getCommits: vi.fn().mockResolvedValue([makeCommit('c-1')]),
+                getPullRequests: vi.fn().mockResolvedValue([
+                    {
+                        id: 'pr-1',
+                        title: 'feat',
+                        author: {name: 'alice', email: 'alice@example.com', username: 'alice'},
+                        state: 'merged',
+                        createdAt: '2024-01-15T08:00:00Z',
+                        mergedAt: '2024-01-15T09:00:00Z',
+                        closedAt: '2024-01-15T09:00:00Z',
+                        updatedAt: '2024-01-15T09:00:00Z',
+                        reviewers: [],
+                        additions: 1,
+                        deletions: 0,
+                    },
+                ]),
+                getReviewComments,
+            }),
+        );
+
+        const result = await runSync(db);
+
+        expect(commentCalls).toBe(1 + GIT_REPO_RETRY_DELAYS_MS.length);
+        // It healed, so no "Failed to fetch review comments" line — which is the whole point:
+        // that failure would have frozen this PR's review counts at zero forever, because the
+        // fan-out is gated by prWithinFetchWindow and never revisits a PR behind the cursor.
+        expect(result.errors.some((e) => /review comments/i.test(e) && !isAdvisoryError(e))).toBe(
+            false,
+        );
+    });
+
+    it('reserves budget for the commit fetch so a best-effort retry cannot starve it', async () => {
+        // The starvation shape: repo1's PR list fails and heals (spending pauses), then repo2's
+        // COMMIT fetch fails transiently. If both drew from one pool, repo1 could exhaust it and
+        // repo2's commit fetch would get no pause at all — losing the whole run's data to a fault
+        // a five-minute wait would have healed.
+        seedAlice(db);
+        const createGitProvider = await getCreateGitProvider();
+        let prCalls = 0;
+        let commitCalls = 0;
+        createGitProvider.mockReturnValue(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('r1'), makeRepo('r2')]),
+                getCommits: vi.fn().mockImplementation(async (repo: string): Promise<GitCommit[]> => {
+                    if (repo !== 'r2') return [makeCommit('c-r1')];
+                    commitCalls++;
+                    if (commitCalls <= 2) throw new GitProviderFetchError('503', 503);
+                    return [makeCommit('c-r2', '2024-01-15T11:00:00Z')];
+                }),
+                getPullRequests: vi.fn().mockImplementation(async (repo: string) => {
+                    if (repo !== 'r1') return [];
+                    prCalls++;
+                    if (prCalls <= 2) throw new GitProviderFetchError('503', 503);
+                    return [];
+                }),
+            }),
+        );
+
+        const result = await runSync(db);
+
+        // r1's PR list spent its full best-effort sequence…
+        expect(prCalls).toBe(1 + GIT_REPO_RETRY_DELAYS_MS.length);
+        // …and r2's commit fetch STILL got its full sequence, because the best-effort share is
+        // capped below the run budget.
+        expect(commitCalls).toBe(1 + GIT_REPO_RETRY_DELAYS_MS.length);
+        expect(result.errors.filter((e) => !isAdvisoryError(e))).toHaveLength(0);
+        expect(dayRow(db, '2024-01-15')?.commits).toBe(2);
+        expect(readState(db, FORWARD_KEY)).toBe(result.lastSyncTime);
+    });
+
     it('bounds total retry sleep per run, so a provider-wide outage is not 20min x N repos', async () => {
         // A 5xx usually means the provider is unhealthy, not that one repo is cursed — so the
         // per-repo budget multiplies. At 30 repos that is 10 hours of pure sleeping, the
@@ -455,9 +642,20 @@ describe('in-run repo retry (#272)', () => {
             .map((c) => Number(c[1]))
             .filter((d) => GIT_REPO_RETRY_DELAYS_MS.includes(d))
             .reduce((a, b) => a + b, 0);
-        expect(sleptMs).toBeLessThanOrEqual(GIT_RUN_RETRY_SLEEP_BUDGET_MS);
+        // EXACTLY the budget, not merely under it. `<=` alone would also pass if the retry never
+        // fired at all (slept = 0), i.e. with the whole feature switched off.
+        expect(sleptMs).toBe(GIT_RUN_RETRY_SLEEP_BUDGET_MS);
         // Unbounded, five repos would each pay the full 20 minutes.
         expect(sleptMs).toBeLessThan(5 * 20 * 60_000);
+        // The boundary, per repo: the first two spend full sequences (5+15, 5+15 = 40 min), and
+        // the third's first pause would exceed the budget, so it and the rest fail on attempt 1.
+        const attempts = (repo: string): number =>
+            getCommits.mock.calls.filter((c) => c[0] === repo).length;
+        expect(attempts('r1')).toBe(1 + GIT_REPO_RETRY_DELAYS_MS.length);
+        expect(attempts('r2')).toBe(1 + GIT_REPO_RETRY_DELAYS_MS.length);
+        expect(attempts('r3')).toBe(1);
+        expect(attempts('r4')).toBe(1);
+        expect(attempts('r5')).toBe(1);
         // Every repo is still ATTEMPTED — the budget caps the pauses, not the coverage…
         expect(new Set(getCommits.mock.calls.map((c) => c[0])).size).toBe(repos.length);
         // …and every one still reports its error and holds the cursor, exactly as before.
@@ -485,7 +683,8 @@ describe('in-run repo retry (#272)', () => {
 
         const result = await runSync(db);
 
-        expect(result.errors).toHaveLength(0);
+        // Advisories excluded: a heal now reports itself (RETRY_HEALED_PREFIX) without going red.
+        expect(result.errors.filter((e) => !isAdvisoryError(e))).toHaveLength(0);
         // Exactly the two distinct commits — 3 would mean the steady repo's commit was
         // counted twice, 1 would mean the healed repo's was dropped.
         expect(dayRow(db, '2024-01-15')?.commits).toBe(2);

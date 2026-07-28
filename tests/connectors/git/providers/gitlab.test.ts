@@ -1310,9 +1310,13 @@ describe('GitLabProvider', () => {
             await vi.runAllTimersAsync();
 
             await expect(pending).rejects.toThrow('GitLab API server error 503');
+            // One request, full stop: PROBE_SERVER_ERROR_RETRIES is 0 because even a single
+            // retry is worth up to SERVER_ERROR_MAX_DELAY_MS once Retry-After acts as a floor,
+            // and a human is waiting on this answer inside one HTTP request.
             expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(
                 1 + PROBE_SERVER_ERROR_RETRIES,
             );
+            expect(PROBE_SERVER_ERROR_RETRIES).toBe(0);
         });
     });
 
