@@ -24,7 +24,7 @@ import {
     resolveGitProviderConfigs,
 } from './providers/config.js';
 import {resolveAllGitProviders} from './providers/resolve.js';
-import {isRetryableGitFetchError} from './providers/http-retry.js';
+import {isRetryableGitFetchError, sleep} from './providers/http-retry.js';
 import {findProviderByTypeContainer} from './providers/store.js';
 import {loadServerKey} from './providers/secret.js';
 import type {
@@ -345,9 +345,23 @@ export const GIT_CATCHUP_WINDOW_MAX_DAYS = 30;
  */
 export const GIT_REPO_RETRY_DELAYS_MS: readonly number[] = [5 * 60_000, 15 * 60_000];
 
-async function sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-}
+/**
+ * Total time ONE provider's run may spend asleep in {@link GIT_REPO_RETRY_DELAYS_MS} pauses,
+ * across all of its repos (#272).
+ *
+ * Without this the retry budget is per repo, so a provider-wide outage — which is the common
+ * shape, since a 5xx is usually the provider being unhealthy rather than one repo being
+ * cursed — costs `20 min × repos`. At 30 repos that is 10 hours of pure sleeping, the
+ * pipeline's connector-level retry then doubles it, and the daily cron starts the next run on
+ * top of the previous one. All to reach exactly the pre-#272 outcome: cursor held, partials
+ * dropped.
+ *
+ * 40 minutes lets the first two repos spend their full sequence — enough to ride out the
+ * multi-minute blip this is for — and then stops paying. Repos after that fail immediately
+ * with the same recorded error, which is the honest answer once two repos in a row have
+ * proved the provider is down rather than flaky.
+ */
+export const GIT_RUN_RETRY_SLEEP_BUDGET_MS = 40 * 60_000;
 
 /**
  * The upper bound a forward run should actually fetch to, given the cursor it is
@@ -1358,6 +1372,55 @@ async function fetchProviderData(
     const onCommitProgress = stepListener('commits');
     const onPRProgress = stepListener('prs');
 
+    // Time this provider's run has already spent asleep in in-run retry pauses, against
+    // GIT_RUN_RETRY_SLEEP_BUDGET_MS. Shared by every repo AND both fetch kinds, so a
+    // provider-wide outage cannot cost `pauses × repos × fetches`.
+    let retrySleepSpentMs = 0;
+
+    /**
+     * Run `fetch` for one repo, retrying it in-run on a fault that could plausibly heal
+     * (#272). Returns the value on success, or the LAST fault's message on failure — the one
+     * that actually ended the repo, which is what an operator needs.
+     *
+     * Used for BOTH `getCommits` and `getPullRequests`. Hardening only the commit fetch would
+     * have made things worse, not better, for PRs: the two used to fail together (a blip long
+     * enough to blow one 6-second budget blew the other's too), so an incomplete commit fetch
+     * held the cursor and the failed PR window was re-covered next run as a side effect. Retry
+     * the commit fetch alone and that coupling breaks — commits heal, `complete` stays true,
+     * the cursor advances past a PR window whose fetch failed, and since `getPullRequests` is
+     * bounded below by the advanced cursor a PR never touched again is never re-listed. The PR
+     * fields are max()-merged on the premise that each run delivers the full per-day set, so
+     * that loss does not self-heal. Retrying both keeps them coupled.
+     *
+     * `onRetry` fires before each pause so the caller can reset its progress counter: the
+     * count the failed attempt left behind is stale the moment it threw, and leaving it frozen
+     * through a 15-minute wait is exactly the "reads as hung" symptom #270 exists to remove.
+     */
+    const fetchRepoWithRetry = async <T>(
+        fetch: () => Promise<T>,
+        onRetry: () => void,
+    ): Promise<{value: T; error: null} | {value: null; error: string}> => {
+        for (let attempt = 0; ; attempt++) {
+            try {
+                return {value: await fetch(), error: null};
+            } catch (err) {
+                const message = err instanceof Error ? err.message : String(err);
+                if (attempt >= GIT_REPO_RETRY_DELAYS_MS.length || !isRetryableGitFetchError(err)) {
+                    return {value: null, error: message};
+                }
+                const delay = GIT_REPO_RETRY_DELAYS_MS[attempt];
+                // Check the budget BEFORE sleeping, and count the pause we are about to take —
+                // so the budget bounds time actually spent, not time attempted.
+                if (retrySleepSpentMs + delay > GIT_RUN_RETRY_SLEEP_BUDGET_MS) {
+                    return {value: null, error: message};
+                }
+                retrySleepSpentMs += delay;
+                onRetry();
+                await sleep(delay);
+            }
+        }
+    };
+
     for (const repoName of reposToSync) {
         report?.((p) => {
             p.current_repo = repoName;
@@ -1368,41 +1431,21 @@ async function fetchProviderData(
         // all. Total is null — the commit count is not known yet. This also supersedes
         // the previous explicit clear here, since it overwrites all three fields.
         reportStep('commits', 0, null);
-        let rawCommits: GitCommit[] = [];
-        // The message of the last commit-fetch failure, or null once a fetch succeeded.
-        // Set on every attempt so an exhausted retry sequence reports the LAST fault, which
-        // is the one that actually ended the repo.
-        let commitFetchError: string | null = null;
-        // Attempt, then up to GIT_REPO_RETRY_DELAYS_MS.length more after long pauses (#272).
-        // `rawCommits` is ASSIGNED, never appended to, so a retry that re-pages the same
-        // window replaces the previous attempt's partial list rather than doubling it — the
-        // whole-window re-fetch is idempotent for this run's accumulators, and nothing has
-        // been pushed into `allCommits` yet.
-        for (let attempt = 0; ; attempt++) {
-            try {
-                // getCommits pages the commit list AND does the per-commit detail/diff
-                // fetch internally; its onProgress reports both so the indicator advances
-                // during that work instead of jumping only once the repo returns (#270).
-                // Since #271 that internal fetch is the ONLY per-commit diff request a run
-                // makes — the loop below reuses its result off `GitCommit.diffs`.
-                rawCommits = await provider.getCommits(repoName, since, until, onCommitProgress);
-                commitFetchError = null;
-                break;
-            } catch (err) {
-                commitFetchError = err instanceof Error ? err.message : String(err);
-                if (attempt >= GIT_REPO_RETRY_DELAYS_MS.length || !isRetryableGitFetchError(err)) {
-                    break;
-                }
-                // Re-enter the commits step before the pause, not after it: the counter the
-                // failed attempt left behind is stale the moment it threw, and leaving it
-                // frozen through a 15-minute wait is exactly the "reads as hung" symptom
-                // #270 exists to remove.
-                reportStep('commits', 0, null);
-                await sleep(GIT_REPO_RETRY_DELAYS_MS[attempt]);
-            }
-        }
-        if (commitFetchError !== null) {
-            errors.push(`[${providerType}/${repoName}] Failed to fetch commits: ${commitFetchError}`);
+        // getCommits pages the commit list AND does the per-commit detail/diff fetch
+        // internally; its onProgress reports both so the indicator advances during that work
+        // instead of jumping only once the repo returns (#270). Since #271 that internal fetch
+        // is the ONLY per-commit diff request a run makes — the loop below reuses its result
+        // off `GitCommit.diffs`.
+        //
+        // Retried in-run on a healable fault (#272). The result is ASSIGNED, never appended
+        // to, so a retry that re-pages the same window replaces the previous attempt's partial
+        // list rather than doubling it — and nothing has been pushed into `allCommits` yet.
+        const commitFetch = await fetchRepoWithRetry(
+            () => provider.getCommits(repoName, since, until, onCommitProgress),
+            () => reportStep('commits', 0, null),
+        );
+        if (commitFetch.error !== null) {
+            errors.push(`[${providerType}/${repoName}] Failed to fetch commits: ${commitFetch.error}`);
             // This repo's commit window is now un-covered — hold the provider's cursor
             // back so the whole window is re-fetched next run rather than skipped (#231).
             commitsComplete = false;
@@ -1414,6 +1457,7 @@ async function fetchProviderData(
             });
             continue;
         }
+        const rawCommits = commitFetch.value;
         report?.((p) => {
             p.commits_fetched += rawCommits.length;
         });
@@ -1455,13 +1499,20 @@ async function fetchProviderData(
         // finished counter, i.e. exactly the "reads as hung" symptom #270 exists to
         // remove (#270 review SO-3). Total is null: the list size is not known yet.
         reportStep('prs', 0, null);
-        let rawPRs: GitPR[] = [];
-        try {
-            rawPRs = await provider.getPullRequests(repoName, 'all', since, onPRProgress);
-        } catch (err) {
-            errors.push(
-                `[${providerType}/${repoName}] Failed to fetch PRs: ${err instanceof Error ? err.message : String(err)}`,
-            );
+        // Retried in-run on the same terms and out of the same run budget as the commit fetch
+        // above (#272) — see fetchRepoWithRetry for why retrying only commits would have made
+        // the PR path WORSE than before. Still best-effort on exhaustion: a failed PR list does
+        // NOT clear `commitsComplete`, because holding the cursor for it would force an
+        // additive commit re-fetch, which #231 weighed and rejected (see the note on
+        // `ProviderFetchResult.complete`). The retry narrows the window in which that
+        // best-effort answer is reached; it does not change what happens when it is.
+        const prFetch = await fetchRepoWithRetry(
+            () => provider.getPullRequests(repoName, 'all', since, onPRProgress),
+            () => reportStep('prs', 0, null),
+        );
+        const rawPRs: GitPR[] = prFetch.value ?? [];
+        if (prFetch.error !== null) {
+            errors.push(`[${providerType}/${repoName}] Failed to fetch PRs: ${prFetch.error}`);
         }
         report?.((p) => {
             p.prs_fetched += rawPRs.length;

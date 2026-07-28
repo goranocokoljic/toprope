@@ -16,16 +16,16 @@ import {normalizeContainer} from './container.js';
 import {
     GitProviderFetchError,
     MAX_SERVER_ERROR_RETRIES,
+    PROBE_SERVER_ERROR_RETRIES,
+    parseEpochResetMs,
+    rateLimitDelayMs,
     serverErrorDelayMs,
+    sleep,
 } from './http-retry.js';
 
 const DEFAULT_BASE_URL = 'https://gitlab.com/api/v4';
 const MAX_RETRIES = 3;
 const PER_PAGE = 100;
-
-async function sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 function buildAuthHeaders(auth: GitLabProviderConfig['auth']): Record<string, string> {
     if (auth.type === 'personal_access_token') {
@@ -37,14 +37,24 @@ function buildAuthHeaders(auth: GitLabProviderConfig['auth']): Record<string, st
     return {Authorization: `Bearer ${auth.token}`};
 }
 
-async function fetchGitLab(url: string, headers: Record<string, string>): Promise<Response> {
+async function fetchGitLab(
+    url: string,
+    headers: Record<string, string>,
+    // Overridden only by checkAccess, which is an interactive probe rather than a data fetch
+    // and must fail fast — see PROBE_SERVER_ERROR_RETRIES.
+    maxTransientRetries: number = MAX_SERVER_ERROR_RETRIES,
+): Promise<Response> {
     let attempt = 0;
     // Transient faults (5xx, transport) get their own, much longer budget than the 429 path —
     // see http-retry.ts. Counted separately so one class of fault cannot spend the other's
     // allowance.
     let transientRetries = 0;
 
-    while (attempt <= MAX_RETRIES) {
+    // `for (;;)`, not `while (attempt <= MAX_RETRIES)`: every branch below either `continue`s
+    // or throws, so the guard could never end the loop and the post-loop throw it implied was
+    // unreachable. Since #272 the two budgets are counted separately anyway, so one guard
+    // cannot express both.
+    for (;;) {
         let res: Response;
         try {
             res = await fetch(url, {headers});
@@ -52,7 +62,7 @@ async function fetchGitLab(url: string, headers: Record<string, string>): Promis
             // A transport fault is the same outage as a 503, seen one layer down — same budget,
             // same backoff. Wrapped so the in-run repo retry (#272) can classify it; the message
             // is preserved verbatim.
-            if (transientRetries < MAX_SERVER_ERROR_RETRIES) {
+            if (transientRetries < maxTransientRetries) {
                 await sleep(serverErrorDelayMs(transientRetries, null));
                 transientRetries++;
                 continue;
@@ -65,10 +75,19 @@ async function fetchGitLab(url: string, headers: Record<string, string>): Promis
         }
 
         if (res.status === 429) {
-            const retryAfter = res.headers.get('retry-after') ?? res.headers.get('ratelimit-reset');
-            const delayMs = retryAfter ? parseFloat(retryAfter) * 1_000 : 60_000 * (attempt + 1);
+            // `RateLimit-Reset` is an absolute EPOCH instant, not a delta like `Retry-After`
+            // (#272). Both were previously fed to the same `parseFloat(…) * 1_000`, so the
+            // reset became ~1.8e12 ms — past setTimeout's 32-bit limit, which Node clamps to
+            // 1 ms. The pause meant to outlast the limit became an instant retry, and GitLab
+            // was hammered while already rate-limiting us. Parsed by kind now.
+            const resetMs = parseEpochResetMs(res.headers.get('ratelimit-reset'));
             if (attempt < MAX_RETRIES) {
-                await sleep(delayMs);
+                await sleep(
+                    rateLimitDelayMs(
+                        res.headers.get('retry-after'),
+                        resetMs ?? 60_000 * (attempt + 1),
+                    ),
+                );
                 attempt++;
                 continue;
             }
@@ -79,7 +98,7 @@ async function fetchGitLab(url: string, headers: Record<string, string>): Promis
         }
 
         if (res.status >= 500) {
-            if (transientRetries < MAX_SERVER_ERROR_RETRIES) {
+            if (transientRetries < maxTransientRetries) {
                 await sleep(serverErrorDelayMs(transientRetries, res.headers.get('retry-after')));
                 transientRetries++;
                 continue;
@@ -96,8 +115,6 @@ async function fetchGitLab(url: string, headers: Record<string, string>): Promis
 
         return res;
     }
-
-    throw new GitProviderFetchError(`Request failed after ${MAX_RETRIES} retries: ${url}`, null);
 }
 
 function parseDiffHunks(diff: string): {additions: number; deletions: number} {
@@ -227,6 +244,8 @@ export class GitLabProvider implements GitProvider {
         await fetchGitLab(
             `${this.baseUrl}/groups/${encodeURIComponent(this.group)}/projects?per_page=1`,
             this.authHeaders,
+            // An interactive probe, not a data fetch — a human is waiting on it (#272).
+            PROBE_SERVER_ERROR_RETRIES,
         );
     }
 

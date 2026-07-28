@@ -8,6 +8,7 @@ import {
     getRecentSyncLogs,
     getLastSuccessfulSync,
     ABANDONED_RUN_ERROR,
+    ABANDONED_RUN_MIN_AGE_MS,
 } from '../../src/scheduler/sync-log';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../src/storage/migrations');
@@ -132,35 +133,69 @@ describe('sync-log', () => {
             };
         }
 
-        it('closes a still-running row when the next run of the same connector starts', () => {
-            const abandoned = startSyncLog(db, 'git');
-            expect(row(db, abandoned).status).toBe('running');
+        /** A `running` row left behind `ageMs` ago, as a dead run's would be. */
+        function seedOpenRow(id: string, connector: string, ageMs: number): void {
+            db.prepare(
+                `INSERT INTO sync_logs (id, connector, started_at, records_written, records_skipped, error_count, status)
+                 VALUES (?, ?, ?, 0, 0, 0, 'running')`,
+            ).run(id, connector, new Date(Date.now() - ageMs).toISOString());
+        }
+
+        const OLD = ABANDONED_RUN_MIN_AGE_MS + 60_000;
+
+        it('closes a row left running by a run that never returned', () => {
+            seedOpenRow('abandoned', 'git', OLD);
 
             startSyncLog(db, 'git');
 
-            const reaped = row(db, abandoned);
+            const reaped = row(db, 'abandoned');
             expect(reaped.status).toBe('error');
             expect(reaped.finished_at).not.toBeNull();
             expect(JSON.parse(reaped.errors!)).toEqual([ABANDONED_RUN_ERROR]);
             expect(reaped.error_count).toBe(1);
         });
 
-        it('does not close the row it just opened', () => {
+        it('does NOT touch a row young enough to belong to a live run', () => {
+            // The reaper sees rows, not processes. Overlap is reachable — the cron fires
+            // unconditionally, and `toprope sync all` can run against the same file while the
+            // scheduler is mid-sync — so without an age bound a later run would flip a LIVE
+            // run's row to error, and doctor / /api/coverage would report a false red.
+            seedOpenRow('in-flight', 'git', 60 * 60_000);
+
             startSyncLog(db, 'git');
+
+            expect(row(db, 'in-flight').status).toBe('running');
+            expect(row(db, 'in-flight').finished_at).toBeNull();
+        });
+
+        it('holds the line exactly at the age boundary', () => {
+            seedOpenRow('just-under', 'git', ABANDONED_RUN_MIN_AGE_MS - 60_000);
+            seedOpenRow('just-over', 'git', ABANDONED_RUN_MIN_AGE_MS + 60_000);
+
+            startSyncLog(db, 'git');
+
+            expect(row(db, 'just-under').status).toBe('running');
+            expect(row(db, 'just-over').status).toBe('error');
+        });
+
+        it('does not close the row it just opened', () => {
+            seedOpenRow('abandoned', 'git', OLD);
             const current = startSyncLog(db, 'git');
             expect(row(db, current).status).toBe('running');
             expect(row(db, current).finished_at).toBeNull();
         });
 
-        it('leaves another connector"s in-flight row alone', () => {
-            const copilot = startSyncLog(db, 'copilot');
+        it("leaves another connector's abandoned row alone", () => {
+            seedOpenRow('copilot-old', 'copilot', OLD);
             startSyncLog(db, 'git');
-            expect(row(db, copilot).status).toBe('running');
+            expect(row(db, 'copilot-old').status).toBe('running');
         });
 
         it('never re-opens or overwrites an already-finalized row', () => {
             const done = startSyncLog(db, 'git');
             finishSyncLog(db, done, {records_written: 7, records_skipped: 1, errors: []});
+            seedOpenRow('abandoned', 'git', OLD);
+
             startSyncLog(db, 'git');
 
             const after = row(db, done);
@@ -169,46 +204,58 @@ describe('sync-log', () => {
         });
 
         it('closes SEVERAL abandoned rows, not just the newest', () => {
-            const first = startSyncLog(db, 'git');
-            // Simulate the real shape: a second run also died, so two rows are open at once.
-            db.prepare(
-                `INSERT INTO sync_logs (id, connector, started_at, records_written, records_skipped, error_count, status)
-                 VALUES ('second-open', 'git', '2026-07-27T03:00:00.000Z', 0, 0, 0, 'running')`,
-            ).run();
+            // The real shape: four consecutive git runs left rows open.
+            seedOpenRow('open-a', 'git', OLD);
+            seedOpenRow('open-b', 'git', OLD + 86_400_000);
+            seedOpenRow('open-c', 'git', OLD + 2 * 86_400_000);
 
             startSyncLog(db, 'git');
 
-            expect(row(db, first).status).toBe('error');
-            expect(row(db, 'second-open').status).toBe('error');
-        });
-
-        it('preserves errors the abandoned run had already recorded', () => {
-            db.prepare(
-                `INSERT INTO sync_logs (id, connector, started_at, records_written, records_skipped, error_count, errors, status)
-                 VALUES ('partial', 'git', '2026-07-27T03:00:00.000Z', 0, 0, 1, '["repo1 fetch failed"]', 'running')`,
-            ).run();
-
-            startSyncLog(db, 'git');
-
-            const reaped = row(db, 'partial');
-            expect(JSON.parse(reaped.errors!)).toEqual(['repo1 fetch failed', ABANDONED_RUN_ERROR]);
-            expect(reaped.error_count).toBe(2);
-        });
-
-        it('survives a malformed errors blob rather than throwing', () => {
-            db.prepare(
-                `INSERT INTO sync_logs (id, connector, started_at, records_written, records_skipped, error_count, errors, status)
-                 VALUES ('garbled', 'git', '2026-07-27T03:00:00.000Z', 0, 0, 1, 'not json', 'running')`,
-            ).run();
-
-            expect(() => startSyncLog(db, 'git')).not.toThrow();
-            expect(JSON.parse(row(db, 'garbled').errors!)).toEqual([ABANDONED_RUN_ERROR]);
+            for (const id of ['open-a', 'open-b', 'open-c']) {
+                expect(row(db, id).status).toBe('error');
+                expect(row(db, id).finished_at).not.toBeNull();
+            }
         });
 
         it('an abandoned run is never counted as the last successful sync', () => {
-            startSyncLog(db, 'git');
+            seedOpenRow('abandoned', 'git', OLD);
             startSyncLog(db, 'git');
             expect(getLastSuccessfulSync(db, 'git')).toBeNull();
+        });
+
+        it('a reaped row reads back through getRecentSyncLogs with its reason', () => {
+            seedOpenRow('abandoned', 'git', OLD);
+            startSyncLog(db, 'git');
+
+            const log = getRecentSyncLogs(db).find((l) => l.id === 'abandoned');
+            expect(log?.status).toBe('error');
+            expect(log?.errors).toEqual([ABANDONED_RUN_ERROR]);
+        });
+    });
+
+    describe('errors column decoding', () => {
+        it('surfaces a malformed errors blob instead of throwing', () => {
+            // `errors` is plain TEXT with no CHECK constraint, and this is the only decoder — a
+            // single hand-edited or legacy row must not make the whole log unreadable. It used
+            // to be a bare JSON.parse.
+            db.prepare(
+                `INSERT INTO sync_logs (id, connector, started_at, records_written, records_skipped, error_count, errors, status)
+                 VALUES ('garbled', 'git', '2026-07-27T03:00:00.000Z', 0, 0, 1, 'not json', 'error')`,
+            ).run();
+
+            expect(() => getRecentSyncLogs(db)).not.toThrow();
+            expect(getRecentSyncLogs(db)[0].errors).toEqual(['not json']);
+        });
+
+        it('surfaces valid JSON that is not an array rather than dropping it', () => {
+            db.prepare(
+                `INSERT INTO sync_logs (id, connector, started_at, records_written, records_skipped, error_count, errors, status)
+                 VALUES ('objish', 'git', '2026-07-27T03:00:00.000Z', 0, 0, 1, '{"repo1":"failed"}', 'error')`,
+            ).run();
+
+            // Returning [] here would silently discard a recorded failure — the opposite of what
+            // an operator reading this column needs.
+            expect(getRecentSyncLogs(db)[0].errors).toEqual(['{"repo1":"failed"}']);
         });
     });
 });

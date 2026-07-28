@@ -15,7 +15,10 @@ import {normalizeContainer} from './container.js';
 import {
     GitProviderFetchError,
     MAX_SERVER_ERROR_RETRIES,
+    PROBE_SERVER_ERROR_RETRIES,
+    rateLimitDelayMs,
     serverErrorDelayMs,
+    sleep,
 } from './http-retry.js';
 
 const BASE_URL = 'https://api.bitbucket.org/2.0';
@@ -35,10 +38,6 @@ function globMatch(pattern: string, str: string): boolean {
     return new RegExp(`^${regexStr}$`, 'i').test(str);
 }
 
-async function sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 function buildAuthHeader(auth: BitbucketProviderConfig['auth']): string {
     if (auth.type === 'app_password') {
         const encoded = Buffer.from(`${auth.username}:${auth.app_password}`).toString('base64');
@@ -47,14 +46,24 @@ function buildAuthHeader(auth: BitbucketProviderConfig['auth']): string {
     return `Bearer ${auth.token}`;
 }
 
-async function fetchBitbucket(url: string, headers: Record<string, string>): Promise<Response> {
+async function fetchBitbucket(
+    url: string,
+    headers: Record<string, string>,
+    // Overridden only by checkAccess, which is an interactive probe rather than a data fetch
+    // and must fail fast — see PROBE_SERVER_ERROR_RETRIES.
+    maxTransientRetries: number = MAX_SERVER_ERROR_RETRIES,
+): Promise<Response> {
     let attempt = 0;
     // Transient faults (5xx, transport) get their OWN, much longer budget than the 429
     // path — see http-retry.ts. Counted separately so a run does not spend its 5xx
     // allowance on rate limiting, or vice versa.
     let transientRetries = 0;
 
-    while (attempt <= MAX_RETRIES) {
+    // `for (;;)`, not `while (attempt <= MAX_RETRIES)`: every branch below either `continue`s
+    // or throws, so the guard could never end the loop and the post-loop throw it implied was
+    // unreachable. Since #272 the two budgets are counted separately anyway, so one guard
+    // cannot express both.
+    for (;;) {
         let res: Response;
         try {
             res = await fetch(url, {headers});
@@ -62,7 +71,7 @@ async function fetchBitbucket(url: string, headers: Record<string, string>): Pro
             // A transport fault is the same outage as a 503, seen one layer down — same
             // budget, same backoff. Wrapped so the in-run repo retry (#272) can classify
             // it; the message is preserved verbatim.
-            if (transientRetries < MAX_SERVER_ERROR_RETRIES) {
+            if (transientRetries < maxTransientRetries) {
                 await sleep(serverErrorDelayMs(transientRetries, null));
                 transientRetries++;
                 continue;
@@ -75,10 +84,10 @@ async function fetchBitbucket(url: string, headers: Record<string, string>): Pro
         }
 
         if (res.status === 429) {
-            const retryAfter = res.headers.get('retry-after');
-            const delayMs = retryAfter ? parseFloat(retryAfter) * 1_000 : 60_000 * (attempt + 1);
             if (attempt < MAX_RETRIES) {
-                await sleep(delayMs);
+                await sleep(
+                    rateLimitDelayMs(res.headers.get('retry-after'), 60_000 * (attempt + 1)),
+                );
                 attempt++;
                 continue;
             }
@@ -89,7 +98,7 @@ async function fetchBitbucket(url: string, headers: Record<string, string>): Pro
         }
 
         if (res.status >= 500) {
-            if (transientRetries < MAX_SERVER_ERROR_RETRIES) {
+            if (transientRetries < maxTransientRetries) {
                 await sleep(serverErrorDelayMs(transientRetries, res.headers.get('retry-after')));
                 transientRetries++;
                 continue;
@@ -106,8 +115,6 @@ async function fetchBitbucket(url: string, headers: Record<string, string>): Pro
 
         return res;
     }
-
-    throw new GitProviderFetchError(`Request failed after ${MAX_RETRIES} retries: ${url}`, null);
 }
 
 // --- Raw API shapes ---
@@ -258,6 +265,8 @@ export class BitbucketProvider implements GitProvider {
         await fetchBitbucket(
             `${BASE_URL}/repositories/${this.workspace}?role=member&pagelen=1`,
             this.authHeaders,
+            // An interactive probe, not a data fetch — a human is waiting on it (#272).
+            PROBE_SERVER_ERROR_RETRIES,
         );
     }
 

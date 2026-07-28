@@ -16,7 +16,11 @@ import {normalizeContainer} from './container.js';
 import {
     GitProviderFetchError,
     MAX_SERVER_ERROR_RETRIES,
+    PROBE_SERVER_ERROR_RETRIES,
+    parseEpochResetMs,
+    rateLimitDelayMs,
     serverErrorDelayMs,
+    sleep,
 } from './http-retry.js';
 
 const BASE_URL = 'https://api.github.com';
@@ -36,18 +40,24 @@ function globMatch(pattern: string, str: string): boolean {
     return new RegExp(`^${regexStr}$`, 'i').test(str);
 }
 
-async function sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function fetchGitHub(url: string, headers: Record<string, string>): Promise<Response> {
+async function fetchGitHub(
+    url: string,
+    headers: Record<string, string>,
+    // Overridden only by checkAccess, which is an interactive probe rather than a data fetch
+    // and must fail fast — see PROBE_SERVER_ERROR_RETRIES.
+    maxTransientRetries: number = MAX_SERVER_ERROR_RETRIES,
+): Promise<Response> {
     let attempt = 0;
     // Transient faults (5xx, transport) get their own, much longer budget than the rate-limit
     // paths below — see http-retry.ts. Counted separately so one class of fault cannot spend
     // the other's allowance.
     let transientRetries = 0;
 
-    while (attempt <= MAX_RETRIES) {
+    // `for (;;)`, not `while (attempt <= MAX_RETRIES)`: every branch below either `continue`s
+    // or throws, so the guard could never end the loop and the post-loop throw it implied was
+    // unreachable. Since #272 the two budgets are counted separately anyway, so one guard
+    // cannot express both.
+    for (;;) {
         let res: Response;
         try {
             res = await fetch(url, {headers});
@@ -55,7 +65,7 @@ async function fetchGitHub(url: string, headers: Record<string, string>): Promis
             // A transport fault is the same outage as a 503, seen one layer down — same budget,
             // same backoff. Wrapped so the in-run repo retry (#272) can classify it; the message
             // is preserved verbatim.
-            if (transientRetries < MAX_SERVER_ERROR_RETRIES) {
+            if (transientRetries < maxTransientRetries) {
                 await sleep(serverErrorDelayMs(transientRetries, null));
                 transientRetries++;
                 continue;
@@ -68,12 +78,10 @@ async function fetchGitHub(url: string, headers: Record<string, string>): Promis
         }
 
         if (res.status === 429) {
-            const retryAfter = res.headers.get('retry-after');
-            const delayMs = retryAfter
-                ? parseFloat(retryAfter) * 1_000
-                : 60_000 * (attempt + 1);
             if (attempt < MAX_RETRIES) {
-                await sleep(delayMs);
+                await sleep(
+                    rateLimitDelayMs(res.headers.get('retry-after'), 60_000 * (attempt + 1)),
+                );
                 attempt++;
                 continue;
             }
@@ -85,21 +93,20 @@ async function fetchGitHub(url: string, headers: Record<string, string>): Promis
 
         if (res.status === 403) {
             const remaining = res.headers.get('x-ratelimit-remaining');
-            const reset = res.headers.get('x-ratelimit-reset');
+            const resetMs = parseEpochResetMs(res.headers.get('x-ratelimit-reset'));
             const retryAfter403 = res.headers.get('retry-after');
-            // Primary rate limit: x-ratelimit-remaining=0 with reset time
-            if (remaining === '0' && reset) {
-                const delayMs = Math.max(parseInt(reset, 10) * 1_000 - Date.now(), 0) + 1_000;
+            // Primary rate limit: x-ratelimit-remaining=0 with reset time. `+ 1_000` so the
+            // retry lands just AFTER the reset instant rather than exactly on it.
+            if (remaining === '0' && resetMs !== null) {
                 if (attempt < MAX_RETRIES) {
-                    await sleep(delayMs);
+                    await sleep(rateLimitDelayMs(null, resetMs + 1_000));
                     attempt++;
                     continue;
                 }
             // Secondary rate limit (abuse detection): Retry-After present, no ratelimit headers
-            } else if (retryAfter403) {
-                const delayMs = parseFloat(retryAfter403) * 1_000;
+            } else if (retryAfter403 !== null) {
                 if (attempt < MAX_RETRIES) {
-                    await sleep(delayMs);
+                    await sleep(rateLimitDelayMs(retryAfter403, 60_000 * (attempt + 1)));
                     attempt++;
                     continue;
                 }
@@ -111,7 +118,7 @@ async function fetchGitHub(url: string, headers: Record<string, string>): Promis
         }
 
         if (res.status >= 500) {
-            if (transientRetries < MAX_SERVER_ERROR_RETRIES) {
+            if (transientRetries < maxTransientRetries) {
                 await sleep(serverErrorDelayMs(transientRetries, res.headers.get('retry-after')));
                 transientRetries++;
                 continue;
@@ -126,18 +133,20 @@ async function fetchGitHub(url: string, headers: Record<string, string>): Promis
             throw new GitProviderFetchError(`GitHub API error ${res.status}: ${url}`, res.status);
         }
 
-        // Proactively pause when approaching rate limit
+        // Proactively pause when approaching rate limit. Capped like every other rate-limit
+        // wait (#272): a garbage reset header must not park the sync for a decade.
         const remaining = res.headers.get('x-ratelimit-remaining');
-        const reset = res.headers.get('x-ratelimit-reset');
-        if (remaining !== null && parseInt(remaining, 10) < RATE_LIMIT_PAUSE_THRESHOLD && reset) {
-            const delayMs = Math.max(parseInt(reset, 10) * 1_000 - Date.now(), 0) + 1_000;
-            await sleep(delayMs);
+        const resetMs = parseEpochResetMs(res.headers.get('x-ratelimit-reset'));
+        if (
+            remaining !== null &&
+            parseInt(remaining, 10) < RATE_LIMIT_PAUSE_THRESHOLD &&
+            resetMs !== null
+        ) {
+            await sleep(rateLimitDelayMs(null, resetMs + 1_000));
         }
 
         return res;
     }
-
-    throw new GitProviderFetchError(`Request failed after ${MAX_RETRIES} retries: ${url}`, null);
 }
 
 // Raw GitHub API response shapes
@@ -269,7 +278,12 @@ export class GitHubProvider implements GitProvider {
     }
 
     async checkAccess(): Promise<void> {
-        await fetchGitHub(`${BASE_URL}/orgs/${this.org}/repos?per_page=1`, this.authHeaders);
+        await fetchGitHub(
+            `${BASE_URL}/orgs/${this.org}/repos?per_page=1`,
+            this.authHeaders,
+            // An interactive probe, not a data fetch — a human is waiting on it (#272).
+            PROBE_SERVER_ERROR_RETRIES,
+        );
     }
 
     async listRepos(): Promise<GitRepo[]> {
@@ -384,6 +398,16 @@ export class GitHubProvider implements GitProvider {
 
         // If every single detail fetch failed on a non-empty commit list, the error
         // is systemic (auth failure, network outage) — surface it rather than returning [].
+        //
+        // #272 NOTE: because a PARTIAL detail failure does not throw, neither of #272's two
+        // hardening layers reaches it. The request-level 5xx budget in `fetchGitHub` does
+        // apply to each detail request, but the in-run REPO retry cannot: it only fires on a
+        // throw out of `getCommits`, so a 5xx that outlasts the request budget on some commits
+        // still returns a silently short list with `commitsComplete` left true. That is #275,
+        // filed deliberately — deciding whether a partial loss holds the whole provider cursor
+        // is a data-integrity call of the same weight as #231/#235 and gets its own review.
+        // Unlike Bitbucket and GitLab, which re-throw anything that is not a typed 404 and so
+        // do reach the repo retry.
         if (commits.length === 0 && summaries.length > 0 && lastDetailError) {
             throw lastDetailError;
         }

@@ -1,6 +1,10 @@
 import {describe, it, expect, beforeEach, afterEach, vi} from 'vitest';
 import {GitLabProvider} from '../../../../src/connectors/git/providers/gitlab';
-import {MAX_SERVER_ERROR_RETRIES} from '../../../../src/connectors/git/providers/http-retry';
+import {
+    MAX_SERVER_ERROR_RETRIES,
+    PROBE_SERVER_ERROR_RETRIES,
+    isRetryableGitFetchError,
+} from '../../../../src/connectors/git/providers/http-retry';
 import type {GitLabProviderConfig} from '../../../../src/connectors/git/providers/types';
 
 const CONFIG_PAT: GitLabProviderConfig = {
@@ -1186,6 +1190,129 @@ describe('GitLabProvider', () => {
 
             await expect(listPromise).rejects.toThrow('GitLab API error 401');
             expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
+        });
+
+        it('retries a transport fault on the same budget as a 5xx', async () => {
+            // A socket reset is the same outage as a 503, one layer down, and it is the ONLY
+            // path where `status` must be null for the in-run repo retry to fire.
+            let calls = 0;
+            vi.stubGlobal('fetch', vi.fn().mockImplementation(() => {
+                calls++;
+                if (calls <= 4) return Promise.reject(new Error('socket hang up'));
+                return Promise.resolve({
+                    ok: true,
+                    status: 200,
+                    headers: new Headers(),
+                    json: () => Promise.resolve([]),
+                    text: () => Promise.resolve(''),
+                } as unknown as Response);
+            }));
+
+            const listPromise = provider.listRepos();
+            await vi.runAllTimersAsync();
+
+            await expect(listPromise).resolves.toEqual([]);
+            expect(calls).toBe(5);
+        });
+
+        it('an exhausted transport fault keeps its message and reports no status', async () => {
+            vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('ECONNRESET')));
+
+            const listPromise = provider.listRepos();
+            void listPromise.catch(() => {});
+            await vi.runAllTimersAsync();
+
+            await expect(listPromise).rejects.toThrow('ECONNRESET');
+            await expect(listPromise).rejects.toMatchObject({status: null});
+            await expect(listPromise).rejects.toSatisfy(isRetryableGitFetchError);
+        });
+
+        it('propagates an exhausted 5xx OUT of getCommits as a retryable typed error', async () => {
+            // The seam the in-run repo retry depends on: isRetryableGitFetchError fails CLOSED,
+            // so a plain Error escaping getCommits would silently disable the retry entirely.
+            vi.stubGlobal('fetch', vi.fn().mockImplementation((url: string) => {
+                if (url.includes('/diff')) {
+                    return Promise.resolve({
+                        ok: false,
+                        status: 503,
+                        headers: new Headers(),
+                        json: () => Promise.resolve([]),
+                        text: () => Promise.resolve('boom'),
+                    } as unknown as Response);
+                }
+                return Promise.resolve({
+                    ok: true,
+                    status: 200,
+                    headers: new Headers(),
+                    json: () => Promise.resolve([makeCommitFixture('abc123')]),
+                    text: () => Promise.resolve(''),
+                } as unknown as Response);
+            }));
+
+            const pending = provider.getCommits('my-project', '', '');
+            void pending.catch(() => {});
+            await vi.runAllTimersAsync();
+
+            await expect(pending).rejects.toMatchObject({status: 503});
+            await expect(pending).rejects.toSatisfy(isRetryableGitFetchError);
+        });
+
+        it('parses RateLimit-Reset as an epoch instant, not a delta', async () => {
+            // Both headers used to go through `parseFloat(…) * 1_000`, so GitLab's epoch reset
+            // became ~1.8e12 ms — past setTimeout's 32-bit limit, which Node clamps to 1 ms.
+            // The pause meant to outlast the limit became an instant retry.
+            vi.useFakeTimers();
+            vi.setSystemTime(new Date('2026-07-28T10:00:00.000Z'));
+            const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+            const resetEpoch = Math.floor(Date.parse('2026-07-28T10:00:30.000Z') / 1_000);
+            let calls = 0;
+            vi.stubGlobal('fetch', vi.fn().mockImplementation(() => {
+                calls++;
+                if (calls === 1) {
+                    return Promise.resolve({
+                        ok: false,
+                        status: 429,
+                        headers: new Headers({'ratelimit-reset': String(resetEpoch)}),
+                        json: () => Promise.resolve([]),
+                        text: () => Promise.resolve('rate limited'),
+                    } as unknown as Response);
+                }
+                return Promise.resolve({
+                    ok: true,
+                    status: 200,
+                    headers: new Headers(),
+                    json: () => Promise.resolve([]),
+                    text: () => Promise.resolve(''),
+                } as unknown as Response);
+            }));
+
+            const listPromise = provider.listRepos();
+            await vi.runAllTimersAsync();
+            await listPromise;
+
+            const delays = setTimeoutSpy.mock.calls.map((c) => Number(c[1]));
+            // 30s until the reset — not 1.78e12, and not the 1ms Node would have clamped it to.
+            expect(delays).toContain(30_000);
+            expect(delays.every((d) => d < 1e12)).toBe(true);
+        });
+
+        it('checkAccess fails fast on a 5xx instead of inheriting the sync budget', async () => {
+            vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+                ok: false,
+                status: 503,
+                headers: new Headers(),
+                json: () => Promise.resolve([]),
+                text: () => Promise.resolve('boom'),
+            } as unknown as Response));
+
+            const pending = provider.checkAccess();
+            void pending.catch(() => {});
+            await vi.runAllTimersAsync();
+
+            await expect(pending).rejects.toThrow('GitLab API server error 503');
+            expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(
+                1 + PROBE_SERVER_ERROR_RETRIES,
+            );
         });
     });
 

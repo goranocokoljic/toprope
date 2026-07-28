@@ -320,11 +320,14 @@ describe('runPipeline', () => {
         });
 
         it('closes out a previous run that never finished', async () => {
-            // The observed state: a scheduled git run that never returned.
+            // The observed state: four scheduled git runs, days old, still 'running'. Seeded old
+            // enough to be past the liveness bound — a fresh row could still belong to a run
+            // that is genuinely mid-fetch.
+            const longAgo = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString();
             db.prepare(
                 `INSERT INTO sync_logs (id, connector, started_at, records_written, records_skipped, error_count, status)
-                 VALUES ('abandoned', 'git', '2026-07-28T03:00:00.000Z', 0, 0, 0, 'running')`,
-            ).run();
+                 VALUES ('abandoned', 'git', ?, 0, 0, 0, 'running')`,
+            ).run(longAgo);
 
             const promise = runPipeline(db, [makeConnector('git', {snapshotsWritten: 1})], 0);
             await vi.runAllTimersAsync();
@@ -334,6 +337,22 @@ describe('runPipeline', () => {
             expect(abandoned?.status).toBe('error');
             expect(abandoned?.finished_at).not.toBeNull();
             expect(abandoned?.errors?.[0]).toContain('Run did not finish');
+        });
+
+        it('does not mark a concurrent in-flight run as abandoned', async () => {
+            // Two runs can overlap: the cron fires unconditionally and `toprope sync all` shares
+            // the file. The pipeline's own startSyncLog must not accuse the other one.
+            const recent = new Date(Date.now() - 30 * 60_000).toISOString();
+            db.prepare(
+                `INSERT INTO sync_logs (id, connector, started_at, records_written, records_skipped, error_count, status)
+                 VALUES ('in-flight', 'git', ?, 0, 0, 0, 'running')`,
+            ).run(recent);
+
+            const promise = runPipeline(db, [makeConnector('git', {snapshotsWritten: 1})], 0);
+            await vi.runAllTimersAsync();
+            await promise;
+
+            expect(getRecentSyncLogs(db).find((l) => l.id === 'in-flight')?.status).toBe('running');
         });
     });
 
