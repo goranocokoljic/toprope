@@ -1,5 +1,11 @@
 import {describe, it, expect, beforeEach, afterEach, vi} from 'vitest';
 import {BitbucketProvider} from '../../../../src/connectors/git/providers/bitbucket';
+import {
+    GitProviderFetchError,
+    MAX_SERVER_ERROR_RETRIES,
+    PROBE_SERVER_ERROR_RETRIES,
+    isRetryableGitFetchError,
+} from '../../../../src/connectors/git/providers/http-retry';
 import type {BitbucketProviderConfig} from '../../../../src/connectors/git/providers/types';
 
 const CONFIG_APP_PASSWORD: BitbucketProviderConfig = {
@@ -1139,6 +1145,317 @@ describe('BitbucketProvider', () => {
             await vi.runAllTimersAsync();
 
             await expect(listPromise).rejects.toThrow('Rate limit exceeded');
+        });
+
+        it('an exhausted 429 throws a typed, retryable error', async () => {
+            vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+                ok: false,
+                status: 429,
+                headers: new Headers({'retry-after': '0'}),
+                text: () => Promise.resolve('rate limited'),
+            } as unknown as Response));
+
+            const listPromise = provider.listRepos();
+            void listPromise.catch(() => {});
+            await vi.runAllTimersAsync();
+
+            await expect(listPromise).rejects.toBeInstanceOf(GitProviderFetchError);
+            await expect(listPromise).rejects.toMatchObject({status: 429});
+        });
+
+        it('waits a real interval for an HTTP-date Retry-After on a 429, not zero', async () => {
+            // The pre-#272 429 branch ran the header through parseFloat, so a date became NaN
+            // and setTimeout(NaN) fired on the next tick: three "retries" burned in one tick
+            // WHILE rate limited, which is how a primary limit escalates into an abuse block.
+            vi.useFakeTimers();
+            vi.setSystemTime(new Date('2026-07-28T10:00:00.000Z'));
+            const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+            let calls = 0;
+            vi.stubGlobal('fetch', vi.fn().mockImplementation(() => {
+                calls++;
+                if (calls === 1) {
+                    return Promise.resolve({
+                        ok: false,
+                        status: 429,
+                        headers: new Headers({
+                            'retry-after': 'Tue, 28 Jul 2026 10:01:00 GMT',
+                        }),
+                        json: () => Promise.resolve(pagedResponse([])),
+                        text: () => Promise.resolve('rate limited'),
+                    } as unknown as Response);
+                }
+                return Promise.resolve({
+                    ok: true,
+                    status: 200,
+                    headers: new Headers(),
+                    json: () => Promise.resolve(pagedResponse([])),
+                    text: () => Promise.resolve(''),
+                } as unknown as Response);
+            }));
+
+            const listPromise = provider.listRepos();
+            await vi.runAllTimersAsync();
+            await listPromise;
+
+            const delays = setTimeoutSpy.mock.calls.map((c) => c[1]);
+            expect(delays).toContain(60_000);
+            expect(delays.some((d) => Number.isNaN(d))).toBe(false);
+        });
+
+        it('never retries a 429 instantly, even on Retry-After: 0', async () => {
+            const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+            let calls = 0;
+            vi.stubGlobal('fetch', vi.fn().mockImplementation(() => {
+                calls++;
+                if (calls === 1) {
+                    return Promise.resolve({
+                        ok: false,
+                        status: 429,
+                        headers: new Headers({'retry-after': '0'}),
+                        json: () => Promise.resolve(pagedResponse([])),
+                        text: () => Promise.resolve('rate limited'),
+                    } as unknown as Response);
+                }
+                return Promise.resolve({
+                    ok: true,
+                    status: 200,
+                    headers: new Headers(),
+                    json: () => Promise.resolve(pagedResponse([])),
+                    text: () => Promise.resolve(''),
+                } as unknown as Response);
+            }));
+
+            const listPromise = provider.listRepos();
+            await vi.runAllTimersAsync();
+            await listPromise;
+
+            expect(setTimeoutSpy.mock.calls.every((c) => Number(c[1]) > 0)).toBe(true);
+        });
+    });
+
+    // --- Transient server-error handling (#272) ---
+    //
+    // The 2026-07-28 incident: ONE transient 503 on a per-commit diffstat killed a
+    // multi-hour initial sync, twice. The same request replayed hours later returned 200 in
+    // 734ms — the retry budget (three linear pauses, ~6s total) was simply shorter than the
+    // outage.
+
+    describe('server error handling', () => {
+        function serverError(status: number, headers: Headers = new Headers()): Response {
+            return {
+                ok: false,
+                status,
+                headers,
+                json: () => Promise.resolve({}),
+                text: () => Promise.resolve('upstream failure'),
+            } as unknown as Response;
+        }
+
+        function okPage(): Response {
+            return {
+                ok: true,
+                status: 200,
+                headers: new Headers(),
+                json: () => Promise.resolve(pagedResponse([])),
+                text: () => Promise.resolve(''),
+            } as unknown as Response;
+        }
+
+        it('survives a 503 blip that outlasts the old six-second budget', async () => {
+            // Four consecutive 503s: under the pre-#272 three-retry budget this threw.
+            let calls = 0;
+            vi.stubGlobal('fetch', vi.fn().mockImplementation(() => {
+                calls++;
+                return Promise.resolve(calls <= 4 ? serverError(503) : okPage());
+            }));
+
+            const listPromise = provider.listRepos();
+            await vi.runAllTimersAsync();
+
+            await expect(listPromise).resolves.toEqual([]);
+            expect(calls).toBe(5);
+        });
+
+        it('sizes the 5xx budget separately from the 429 budget', async () => {
+            vi.stubGlobal('fetch', vi.fn().mockResolvedValue(serverError(503)));
+
+            const listPromise = provider.listRepos();
+            void listPromise.catch(() => {});
+            await vi.runAllTimersAsync();
+
+            await expect(listPromise).rejects.toThrow('Bitbucket API server error 503');
+            // Initial attempt + MAX_SERVER_ERROR_RETRIES, NOT the 429 path's 3.
+            expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(
+                1 + MAX_SERVER_ERROR_RETRIES,
+            );
+        });
+
+        it('counts the two budgets independently when a run hits both statuses', async () => {
+            // Sizing is not independence: only a MIXED sequence can show that rate limiting
+            // early in a request does not eat the 5xx allowance it needs later.
+            let calls = 0;
+            vi.stubGlobal('fetch', vi.fn().mockImplementation(() => {
+                calls++;
+                if (calls <= 2) {
+                    return Promise.resolve({
+                        ok: false,
+                        status: 429,
+                        headers: new Headers({'retry-after': '1'}),
+                        json: () => Promise.resolve(pagedResponse([])),
+                        text: () => Promise.resolve('rate limited'),
+                    } as unknown as Response);
+                }
+                return Promise.resolve(serverError(503));
+            }));
+
+            const listPromise = provider.listRepos();
+            void listPromise.catch(() => {});
+            await vi.runAllTimersAsync();
+
+            await expect(listPromise).rejects.toThrow('Bitbucket API server error 503');
+            // 2 rate-limited attempts, then a FULL 1 + MAX_SERVER_ERROR_RETRIES worth of 5xx —
+            // a shared counter would have cut the 5xx budget short by the two 429s.
+            expect(calls).toBe(2 + 1 + MAX_SERVER_ERROR_RETRIES);
+        });
+
+        it('checkAccess fails fast on a 5xx instead of inheriting the sync budget', async () => {
+            // A probe answers `toprope doctor` and the admin test-connection route, where a
+            // human (and an HTTP request) is waiting. Spending the full budget there would turn
+            // a mistyped host into a ~2.5-minute hang.
+            vi.stubGlobal('fetch', vi.fn().mockResolvedValue(serverError(503)));
+
+            const pending = provider.checkAccess();
+            void pending.catch(() => {});
+            await vi.runAllTimersAsync();
+
+            await expect(pending).rejects.toThrow('Bitbucket API server error 503');
+            // One request, full stop: PROBE_SERVER_ERROR_RETRIES is 0 because even a single
+            // retry is worth up to SERVER_ERROR_MAX_DELAY_MS once Retry-After acts as a floor,
+            // and a human is waiting on this answer inside one HTTP request.
+            expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(
+                1 + PROBE_SERVER_ERROR_RETRIES,
+            );
+            expect(PROBE_SERVER_ERROR_RETRIES).toBe(0);
+        });
+
+        it('an exhausted 5xx throws a typed error carrying the status', async () => {
+            vi.stubGlobal('fetch', vi.fn().mockResolvedValue(serverError(502)));
+
+            const listPromise = provider.listRepos();
+            void listPromise.catch(() => {});
+            await vi.runAllTimersAsync();
+
+            await expect(listPromise).rejects.toBeInstanceOf(GitProviderFetchError);
+            await expect(listPromise).rejects.toMatchObject({status: 502});
+        });
+
+        it('honors Retry-After on a 5xx the way the 429 path already did', async () => {
+            const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+            let calls = 0;
+            vi.stubGlobal('fetch', vi.fn().mockImplementation(() => {
+                calls++;
+                return Promise.resolve(
+                    calls === 1 ? serverError(503, new Headers({'retry-after': '90'})) : okPage(),
+                );
+            }));
+
+            const listPromise = provider.listRepos();
+            await vi.runAllTimersAsync();
+            await listPromise;
+
+            // 90s exactly — not the ~5s the exponential schedule would have chosen, and not
+            // jittered downward below what the server asked for.
+            const delays = setTimeoutSpy.mock.calls.map((c) => c[1]);
+            expect(delays).toContain(90_000);
+        });
+
+        it('retries a transport fault on the same budget as a 5xx', async () => {
+            // The 503 and the reset socket are the same outage seen at two layers; handling
+            // them differently would leave half the incident un-hardened.
+            let calls = 0;
+            vi.stubGlobal('fetch', vi.fn().mockImplementation(() => {
+                calls++;
+                if (calls <= 4) return Promise.reject(new Error('socket hang up'));
+                return Promise.resolve(okPage());
+            }));
+
+            const listPromise = provider.listRepos();
+            await vi.runAllTimersAsync();
+
+            await expect(listPromise).resolves.toEqual([]);
+            expect(calls).toBe(5);
+        });
+
+        it('an exhausted transport fault keeps its message and reports no status', async () => {
+            vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('ECONNRESET')));
+
+            const listPromise = provider.listRepos();
+            void listPromise.catch(() => {});
+            await vi.runAllTimersAsync();
+
+            await expect(listPromise).rejects.toThrow('ECONNRESET');
+            await expect(listPromise).rejects.toMatchObject({status: null});
+        });
+
+        it('does NOT retry a 4xx — a deterministic answer is not an outage', async () => {
+            vi.stubGlobal('fetch', vi.fn().mockResolvedValue(serverError(401)));
+
+            const listPromise = provider.listRepos();
+            void listPromise.catch(() => {});
+            await vi.runAllTimersAsync();
+
+            await expect(listPromise).rejects.toThrow('Bitbucket API error 401');
+            expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
+        });
+
+        it('propagates an exhausted 5xx OUT of getCommits as a retryable typed error', async () => {
+            // THE incident path, end to end: getCommits → per-commit diffstat → 503. The whole
+            // in-run repo retry hangs on this, because isRetryableGitFetchError fails CLOSED —
+            // if this ever surfaced as a plain Error (say someone wrapped it with repo context)
+            // the retry would silently never fire and #272 would be fully regressed, with every
+            // mock-provider test still green.
+            vi.stubGlobal('fetch', vi.fn().mockImplementation((url: string) => {
+                if (url.includes('/diffstat/')) return Promise.resolve(serverError(503));
+                return Promise.resolve({
+                    ok: true,
+                    status: 200,
+                    headers: new Headers(),
+                    json: () => Promise.resolve(pagedResponse([makeCommitFixture('abc123')])),
+                    text: () => Promise.resolve(''),
+                } as unknown as Response);
+            }));
+
+            const pending = provider.getCommits('my-repo', '', '');
+            void pending.catch(() => {});
+            await vi.runAllTimersAsync();
+
+            await expect(pending).rejects.toBeInstanceOf(GitProviderFetchError);
+            await expect(pending).rejects.toMatchObject({status: 503});
+            await expect(pending).rejects.toSatisfy(isRetryableGitFetchError);
+        });
+
+        it('still records zero stats for a commit whose diffstat 404s', async () => {
+            // The 404 tolerance is now keyed on the typed status rather than a ' 404:'
+            // substring of the message — this pins that it still tolerates.
+            const hash = 'abc123';
+            vi.stubGlobal('fetch', vi.fn().mockImplementation((url: string) => {
+                if (url.includes('/diffstat/')) return Promise.resolve(serverError(404));
+                return Promise.resolve({
+                    ok: true,
+                    status: 200,
+                    headers: new Headers(),
+                    json: () => Promise.resolve(pagedResponse([makeCommitFixture(hash)])),
+                    text: () => Promise.resolve(''),
+                } as unknown as Response);
+            }));
+
+            const pending = provider.getCommits('my-repo', '', '');
+            await vi.runAllTimersAsync();
+            const commits = await pending;
+
+            expect(commits).toHaveLength(1);
+            expect(commits[0].additions).toBe(0);
+            expect(commits[0].diffs).toEqual([]);
         });
     });
 

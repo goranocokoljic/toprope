@@ -12,9 +12,18 @@ import type {
     GitFetchProgressListener,
 } from './types.js';
 import {normalizeContainer} from './container.js';
+import {
+    GitProviderFetchError,
+    MAX_RATE_LIMIT_RETRIES,
+    MAX_SERVER_ERROR_RETRIES,
+    PROBE_SERVER_ERROR_RETRIES,
+    rateLimitDelayMs,
+    rateLimitFallbackMs,
+    serverErrorDelayMs,
+    sleep,
+} from './http-retry.js';
 
 const BASE_URL = 'https://api.bitbucket.org/2.0';
-const MAX_RETRIES = 3;
 
 function parseRawAuthor(raw: string): {name: string; email: string} {
     const match = raw.match(/^(.*?)\s*<([^>]+)>$/);
@@ -30,10 +39,6 @@ function globMatch(pattern: string, str: string): boolean {
     return new RegExp(`^${regexStr}$`, 'i').test(str);
 }
 
-async function sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 function buildAuthHeader(auth: BitbucketProviderConfig['auth']): string {
     if (auth.type === 'app_password') {
         const encoded = Buffer.from(`${auth.username}:${auth.app_password}`).toString('base64');
@@ -42,50 +47,73 @@ function buildAuthHeader(auth: BitbucketProviderConfig['auth']): string {
     return `Bearer ${auth.token}`;
 }
 
-async function fetchBitbucket(url: string, headers: Record<string, string>): Promise<Response> {
+async function fetchBitbucket(
+    url: string,
+    headers: Record<string, string>,
+    // Overridden only by checkAccess, which is an interactive probe rather than a data fetch
+    // and must fail fast — see PROBE_SERVER_ERROR_RETRIES.
+    maxTransientRetries: number = MAX_SERVER_ERROR_RETRIES,
+): Promise<Response> {
     let attempt = 0;
+    // Transient faults (5xx, transport) get their OWN, much longer budget than the 429
+    // path — see http-retry.ts. Counted separately so a run does not spend its 5xx
+    // allowance on rate limiting, or vice versa.
+    let transientRetries = 0;
 
-    while (attempt <= MAX_RETRIES) {
+    // `for (;;)`: the two budgets above are counted separately, so no single loop guard can
+    // express both, and every branch below either `continue`s or throws (#272).
+    for (;;) {
         let res: Response;
         try {
             res = await fetch(url, {headers});
         } catch (err) {
-            if (attempt < MAX_RETRIES) {
-                await sleep(1_000 * (attempt + 1));
-                attempt++;
+            // A transport fault is the same outage as a 503, seen one layer down — same
+            // budget, same backoff. Wrapped so the in-run repo retry (#272) can classify
+            // it; the message is preserved verbatim.
+            if (transientRetries < maxTransientRetries) {
+                await sleep(serverErrorDelayMs(transientRetries, null));
+                transientRetries++;
                 continue;
             }
-            throw err instanceof Error ? err : new Error(String(err));
+            throw new GitProviderFetchError(
+                err instanceof Error ? err.message : String(err),
+                null,
+                {cause: err},
+            );
         }
 
         if (res.status === 429) {
-            const retryAfter = res.headers.get('retry-after');
-            const delayMs = retryAfter ? parseFloat(retryAfter) * 1_000 : 60_000 * (attempt + 1);
-            if (attempt < MAX_RETRIES) {
-                await sleep(delayMs);
+            if (attempt < MAX_RATE_LIMIT_RETRIES) {
+                await sleep(
+                    rateLimitDelayMs(res.headers.get('retry-after'), rateLimitFallbackMs(attempt)),
+                );
                 attempt++;
                 continue;
             }
-            throw new Error(`Rate limit exceeded after ${MAX_RETRIES} retries: ${url}`);
+            throw new GitProviderFetchError(
+                `Rate limit exceeded after ${MAX_RATE_LIMIT_RETRIES} retries: ${url}`,
+                429,
+            );
         }
 
         if (res.status >= 500) {
-            if (attempt < MAX_RETRIES) {
-                await sleep(1_000 * (attempt + 1));
-                attempt++;
+            if (transientRetries < maxTransientRetries) {
+                await sleep(serverErrorDelayMs(transientRetries, res.headers.get('retry-after')));
+                transientRetries++;
                 continue;
             }
-            throw new Error(`Bitbucket API server error ${res.status}: ${url}`);
+            throw new GitProviderFetchError(
+                `Bitbucket API server error ${res.status}: ${url}`,
+                res.status,
+            );
         }
 
         if (!res.ok) {
-            throw new Error(`Bitbucket API error ${res.status}: ${url}`);
+            throw new GitProviderFetchError(`Bitbucket API error ${res.status}: ${url}`, res.status);
         }
 
         return res;
     }
-
-    throw new Error(`Request failed after ${MAX_RETRIES} retries: ${url}`);
 }
 
 // --- Raw API shapes ---
@@ -236,6 +264,8 @@ export class BitbucketProvider implements GitProvider {
         await fetchBitbucket(
             `${BASE_URL}/repositories/${this.workspace}?role=member&pagelen=1`,
             this.authHeaders,
+            // An interactive probe, not a data fetch — a human is waiting on it (#272).
+            PROBE_SERVER_ERROR_RETRIES,
         );
     }
 
@@ -316,9 +346,11 @@ export class BitbucketProvider implements GitProvider {
                 diffs = await this.getCommitDiff(repo, raw.hash);
             } catch (err) {
                 // 404 means diffstat absent for this commit (e.g. merge commits) — record with zero stats
-                // Re-throw anything else (auth failure, server error) so systemic problems surface
-                const msg = err instanceof Error ? err.message : String(err);
-                if (!msg.includes(' 404:')) throw err;
+                // Re-throw anything else (auth failure, server error) so systemic problems surface.
+                // Keyed on the typed status rather than a ' 404:' substring (#272): the substring
+                // also matched a URL that merely CONTAINED it, and swallowing a real failure here
+                // silently understates the commit's churn.
+                if (!(err instanceof GitProviderFetchError) || err.status !== 404) throw err;
             }
             commits.push({
                 sha: raw.hash,

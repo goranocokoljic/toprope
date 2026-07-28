@@ -184,6 +184,28 @@ describe('createGitProvider', () => {
                 }),
             ).toThrow('GitLab provider url must use http or https scheme');
         });
+
+        it('rejects a url embedding credentials (#272)', () => {
+            // The provider keeps `url` verbatim as its baseUrl and interpolates it into every
+            // error it throws — and those messages are persisted to sync_logs / last_sync_error
+            // and returned verbatim to any admin by the test-connection route. A token in the URL
+            // would leak to admins who never supplied it.
+            expect(() =>
+                createGitProvider({
+                    ...validGitLab,
+                    url: 'https://oauth2:glpat-secret@gitlab.internal',
+                }),
+            ).toThrow('must not embed credentials');
+            expect(() =>
+                createGitProvider({...validGitLab, url: 'https://someuser@gitlab.internal'}),
+            ).toThrow('must not embed credentials');
+        });
+
+        it('still accepts a plain self-managed url', () => {
+            expect(
+                createGitProvider({...validGitLab, url: 'https://gitlab.internal:8443/'}).name,
+            ).toBe('gitlab');
+        });
     });
 
     describe('invalid provider type', () => {

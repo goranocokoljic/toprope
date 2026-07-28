@@ -13,14 +13,20 @@ import type {
     GitFetchProgressListener,
 } from './types.js';
 import {normalizeContainer} from './container.js';
+import {
+    GitProviderFetchError,
+    MAX_RATE_LIMIT_RETRIES,
+    MAX_SERVER_ERROR_RETRIES,
+    PROBE_SERVER_ERROR_RETRIES,
+    parseEpochResetMs,
+    rateLimitDelayMs,
+    rateLimitFallbackMs,
+    serverErrorDelayMs,
+    sleep,
+} from './http-retry.js';
 
 const DEFAULT_BASE_URL = 'https://gitlab.com/api/v4';
-const MAX_RETRIES = 3;
 const PER_PAGE = 100;
-
-async function sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 function buildAuthHeaders(auth: GitLabProviderConfig['auth']): Record<string, string> {
     if (auth.type === 'personal_access_token') {
@@ -32,50 +38,82 @@ function buildAuthHeaders(auth: GitLabProviderConfig['auth']): Record<string, st
     return {Authorization: `Bearer ${auth.token}`};
 }
 
-async function fetchGitLab(url: string, headers: Record<string, string>): Promise<Response> {
+async function fetchGitLab(
+    url: string,
+    headers: Record<string, string>,
+    // Overridden only by checkAccess, which is an interactive probe rather than a data fetch
+    // and must fail fast — see PROBE_SERVER_ERROR_RETRIES.
+    maxTransientRetries: number = MAX_SERVER_ERROR_RETRIES,
+): Promise<Response> {
     let attempt = 0;
+    // Transient faults (5xx, transport) get their own, much longer budget than the 429 path —
+    // see http-retry.ts. Counted separately so one class of fault cannot spend the other's
+    // allowance.
+    let transientRetries = 0;
 
-    while (attempt <= MAX_RETRIES) {
+    // `for (;;)`: the two budgets above are counted separately, so no single loop guard can
+    // express both, and every branch below either `continue`s or throws (#272).
+    for (;;) {
         let res: Response;
         try {
             res = await fetch(url, {headers});
         } catch (err) {
-            if (attempt < MAX_RETRIES) {
-                await sleep(1_000 * (attempt + 1));
-                attempt++;
+            // A transport fault is the same outage as a 503, seen one layer down — same budget,
+            // same backoff. Wrapped so the in-run repo retry (#272) can classify it; the message
+            // is preserved verbatim.
+            if (transientRetries < maxTransientRetries) {
+                await sleep(serverErrorDelayMs(transientRetries, null));
+                transientRetries++;
                 continue;
             }
-            throw err instanceof Error ? err : new Error(String(err));
+            throw new GitProviderFetchError(
+                err instanceof Error ? err.message : String(err),
+                null,
+                {cause: err},
+            );
         }
 
         if (res.status === 429) {
-            const retryAfter = res.headers.get('retry-after') ?? res.headers.get('ratelimit-reset');
-            const delayMs = retryAfter ? parseFloat(retryAfter) * 1_000 : 60_000 * (attempt + 1);
-            if (attempt < MAX_RETRIES) {
-                await sleep(delayMs);
+            // `RateLimit-Reset` is an absolute EPOCH instant, not a delta like `Retry-After`
+            // (#272). Both were previously fed to the same `parseFloat(…) * 1_000`, so the
+            // reset became ~1.8e12 ms — past setTimeout's 32-bit limit, which Node clamps to
+            // 1 ms. The pause meant to outlast the limit became an instant retry, and GitLab
+            // was hammered while already rate-limiting us. Parsed by kind now.
+            const resetMs = parseEpochResetMs(res.headers.get('ratelimit-reset'));
+            if (attempt < MAX_RATE_LIMIT_RETRIES) {
+                await sleep(
+                    rateLimitDelayMs(
+                        res.headers.get('retry-after'),
+                        resetMs ?? rateLimitFallbackMs(attempt),
+                    ),
+                );
                 attempt++;
                 continue;
             }
-            throw new Error(`Rate limit exceeded after ${MAX_RETRIES} retries: ${url}`);
+            throw new GitProviderFetchError(
+                `Rate limit exceeded after ${MAX_RATE_LIMIT_RETRIES} retries: ${url}`,
+                429,
+            );
         }
 
         if (res.status >= 500) {
-            if (attempt < MAX_RETRIES) {
-                await sleep(1_000 * (attempt + 1));
-                attempt++;
+            if (transientRetries < maxTransientRetries) {
+                await sleep(serverErrorDelayMs(transientRetries, res.headers.get('retry-after')));
+                transientRetries++;
                 continue;
             }
-            throw new Error(`GitLab API server error ${res.status}: ${url}`);
+            throw new GitProviderFetchError(
+                `GitLab API server error ${res.status}: ${url}`,
+                res.status,
+            );
         }
 
         if (!res.ok) {
-            throw new Error(`GitLab API error ${res.status}: ${url}`);
+            throw new GitProviderFetchError(`GitLab API error ${res.status}: ${url}`, res.status);
         }
 
         return res;
     }
-
-    throw new Error(`Request failed after ${MAX_RETRIES} retries: ${url}`);
 }
 
 function parseDiffHunks(diff: string): {additions: number; deletions: number} {
@@ -205,6 +243,8 @@ export class GitLabProvider implements GitProvider {
         await fetchGitLab(
             `${this.baseUrl}/groups/${encodeURIComponent(this.group)}/projects?per_page=1`,
             this.authHeaders,
+            // An interactive probe, not a data fetch — a human is waiting on it (#272).
+            PROBE_SERVER_ERROR_RETRIES,
         );
     }
 
@@ -287,10 +327,12 @@ export class GitLabProvider implements GitProvider {
             try {
                 diffs = await this.getCommitDiff(repo, c.id);
             } catch (err) {
-                const msg = err instanceof Error ? err.message : String(err);
                 // Re-throw systemic errors (auth failure, server error); silently swallow 404
-                // (GitLab may return 404 for diffs on certain commits, e.g. initial commits)
-                if (!msg.includes(' 404:')) throw err;
+                // (GitLab may return 404 for diffs on certain commits, e.g. initial commits).
+                // Keyed on the typed status rather than a ' 404:' substring (#272): the substring
+                // also matched a URL that merely CONTAINED it, and swallowing a real failure here
+                // silently understates the commit's churn.
+                if (!(err instanceof GitProviderFetchError) || err.status !== 404) throw err;
             }
 
             commits.push({

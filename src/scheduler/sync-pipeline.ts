@@ -20,22 +20,45 @@ async function runConnectorWithRetry(
     connector: ConnectorInterface,
     retryDelayMs: number,
 ): Promise<{result: SyncResult; retried: boolean}> {
-    const logId = startSyncLog(db, connector.getName());
+    // A throw is an outcome, not an escape: it becomes an error-carrying SyncResult so the
+    // caller below can always finalize the log row.
+    const attempt = async (): Promise<SyncResult> => {
+        try {
+            return await connector.sync(db);
+        } catch (err) {
+            return {
+                connector: connector.getName(),
+                snapshotsWritten: 0,
+                snapshotsSkipped: 0,
+                errors: [err instanceof Error ? err.message : String(err)],
+                lastSyncTime: new Date().toISOString(),
+            };
+        }
+    };
 
-    let result: SyncResult;
+    /**
+     * One attempt, wrapped in its OWN sync_logs row (#272).
+     *
+     * The row used to span both attempts, so it stayed `running` across the first fetch, the
+     * retry pause and the second fetch — for a git sync that walks a full history, hours. If
+     * the process ended anywhere in there the first attempt's collected errors were lost even
+     * though the attempt had finished and reported them. One row per attempt makes each
+     * attempt's outcome durable the moment it is known, and makes `retried` visible in the
+     * log as two rows rather than being inferable only from the pipeline's return value.
+     */
+    const runLogged = async (): Promise<SyncResult> => {
+        const logId = startSyncLog(db, connector.getName());
+        const result = await attempt();
+        finishSyncLog(db, logId, {
+            records_written: result.snapshotsWritten,
+            records_skipped: result.snapshotsSkipped,
+            errors: result.errors,
+        });
+        return result;
+    };
+
+    let result = await runLogged();
     let retried = false;
-
-    try {
-        result = await connector.sync(db);
-    } catch (err) {
-        result = {
-            connector: connector.getName(),
-            snapshotsWritten: 0,
-            snapshotsSkipped: 0,
-            errors: [err instanceof Error ? err.message : String(err)],
-            lastSyncTime: new Date().toISOString(),
-        };
-    }
 
     // Retry on genuine FAILURES only. `errors` also carries advisories — unmatched CI bots
     // and external contributors are the steady state of a healthy repo, so a run reporting
@@ -44,24 +67,8 @@ async function runConnectorWithRetry(
     if (result.errors.some((e) => !isAdvisoryError(e))) {
         await sleep(retryDelayMs);
         retried = true;
-        try {
-            result = await connector.sync(db);
-        } catch (err) {
-            result = {
-                connector: connector.getName(),
-                snapshotsWritten: 0,
-                snapshotsSkipped: 0,
-                errors: [err instanceof Error ? err.message : String(err)],
-                lastSyncTime: new Date().toISOString(),
-            };
-        }
+        result = await runLogged();
     }
-
-    finishSyncLog(db, logId, {
-        records_written: result.snapshotsWritten,
-        records_skipped: result.snapshotsSkipped,
-        errors: result.errors,
-    });
 
     return {result, retried};
 }

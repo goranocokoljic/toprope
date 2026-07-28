@@ -279,6 +279,83 @@ describe('runPipeline', () => {
         expect(logs).toHaveLength(2);
     });
 
+    // --- Terminal log rows (#272) ---
+    //
+    // The git connector's rows sat at status 'running' with finished_at: null forever, so the
+    // one place an operator looks for a failed run's collected errors was empty. Two causes:
+    // a single row spanned both attempts (staying open across the retry pause and a second
+    // multi-hour fetch), and nothing ever closed a row whose run did not return.
+
+    describe('log row finalization', () => {
+        it('gives each attempt its own finalized row', async () => {
+            const connector = makeFailThenSucceedConnector('git', 4);
+            const promise = runPipeline(db, [connector], 100);
+            await vi.runAllTimersAsync();
+            const results = await promise;
+
+            expect(results[0].retried).toBe(true);
+            const logs = getRecentSyncLogs(db).filter((l) => l.connector === 'git');
+            expect(logs).toHaveLength(2);
+            // Both terminal — neither is left 'running' while the other runs.
+            expect(logs.every((l) => l.status !== 'running')).toBe(true);
+            expect(logs.every((l) => l.finished_at !== null)).toBe(true);
+            // Newest first: the successful retry, then the failed first attempt WITH its
+            // errors durably recorded (they used to be lost if the process died mid-retry).
+            expect(logs[0].status).toBe('success');
+            expect(logs[0].records_written).toBe(4);
+            expect(logs[1].status).toBe('error');
+            expect(logs[1].errors).toEqual(['transient error']);
+        });
+
+        it('finalizes the row even when the connector throws on both attempts', async () => {
+            const connector = makeConnector('git', {throws: true});
+            const promise = runPipeline(db, [connector], 0);
+            await vi.runAllTimersAsync();
+            await promise;
+
+            const logs = getRecentSyncLogs(db).filter((l) => l.connector === 'git');
+            expect(logs).toHaveLength(2);
+            expect(logs.every((l) => l.status === 'error' && l.finished_at !== null)).toBe(true);
+            expect(logs[0].errors).toEqual(['git threw unexpectedly']);
+        });
+
+        it('closes out a previous run that never finished', async () => {
+            // The observed state: four scheduled git runs, days old, still 'running'. Seeded old
+            // enough to be past the liveness bound — a fresh row could still belong to a run
+            // that is genuinely mid-fetch.
+            const longAgo = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString();
+            db.prepare(
+                `INSERT INTO sync_logs (id, connector, started_at, records_written, records_skipped, error_count, status)
+                 VALUES ('abandoned', 'git', ?, 0, 0, 0, 'running')`,
+            ).run(longAgo);
+
+            const promise = runPipeline(db, [makeConnector('git', {snapshotsWritten: 1})], 0);
+            await vi.runAllTimersAsync();
+            await promise;
+
+            const abandoned = getRecentSyncLogs(db).find((l) => l.id === 'abandoned');
+            expect(abandoned?.status).toBe('error');
+            expect(abandoned?.finished_at).not.toBeNull();
+            expect(abandoned?.errors?.[0]).toContain('Run did not finish');
+        });
+
+        it('does not mark a concurrent in-flight run as abandoned', async () => {
+            // Two runs can overlap: the cron fires unconditionally and `toprope sync all` shares
+            // the file. The pipeline's own startSyncLog must not accuse the other one.
+            const recent = new Date(Date.now() - 30 * 60_000).toISOString();
+            db.prepare(
+                `INSERT INTO sync_logs (id, connector, started_at, records_written, records_skipped, error_count, status)
+                 VALUES ('in-flight', 'git', ?, 0, 0, 0, 'running')`,
+            ).run(recent);
+
+            const promise = runPipeline(db, [makeConnector('git', {snapshotsWritten: 1})], 0);
+            await vi.runAllTimersAsync();
+            await promise;
+
+            expect(getRecentSyncLogs(db).find((l) => l.id === 'in-flight')?.status).toBe('running');
+        });
+    });
+
     it('non-retried success sets retried to false', async () => {
         const connectors = [makeConnector('windsurf', {snapshotsWritten: 3})];
         const promise = runPipeline(db, connectors, 0);

@@ -24,12 +24,12 @@ import {
     resolveGitProviderConfigs,
 } from './providers/config.js';
 import {resolveAllGitProviders} from './providers/resolve.js';
+import {isRetryableGitFetchError, sleep} from './providers/http-retry.js';
 import {findProviderByTypeContainer} from './providers/store.js';
 import {loadServerKey} from './providers/secret.js';
 import type {
     GitProviderConfig,
     GitProviderType,
-    GitCommit,
     GitFetchProgressListener,
     GitFileDiff,
     GitPR,
@@ -90,12 +90,26 @@ export const LEGACY_CELLS_SKIPPED_PREFIX = 'Legacy snapshot cells left untouched
  */
 export const PROVIDER_DELETED_MID_RUN_PREFIX = 'Provider changed during this run:';
 
+/**
+ * Prefix of the advisory pushed when an in-run retry HEALED a fetch that had failed (#272).
+ *
+ * Deliberately NOT a failure: the run recovered, which is the entire point of the retry, and
+ * classifying it otherwise would turn every survived blip red and make the pipeline re-fetch
+ * the whole connector. But it must be SAID. Without it a healed retry is completely invisible —
+ * the run reports no error, and the only trace is that it took up to 20 minutes longer per repo
+ * while the progress indicator sat at `0 / null`, which reads exactly like a hang. An operator
+ * asking "why was last night's sync 90 minutes long and why did the dashboard look frozen"
+ * needs this line to exist.
+ */
+export const RETRY_HEALED_PREFIX = 'Recovered after retry:';
+
 /** Every sentinel that marks an `errors` entry as advisory rather than a failure. */
 const ADVISORY_PREFIXES: readonly string[] = [
     UNMATCHED_AUTHORS_PREFIX,
     AUTO_CREATE_SUMMARY_PREFIX,
     LEGACY_CELLS_SKIPPED_PREFIX,
     PROVIDER_DELETED_MID_RUN_PREFIX,
+    RETRY_HEALED_PREFIX,
 ];
 
 /**
@@ -320,6 +334,61 @@ export const EARLIEST_SYNC_EPOCH = new Date(0).toISOString();
  *     chunked recovery re-pages HEAD→since once per chunk.
  */
 export const GIT_CATCHUP_WINDOW_MAX_DAYS = 30;
+
+/**
+ * Pauses before each IN-RUN retry of a repo whose commit fetch threw (#272) — so
+ * `[5min, 15min]` means "attempt, +5min, +15min", three attempts in total.
+ *
+ * This is the second layer of the same defence as `providers/http-retry.ts`. That layer
+ * retries the failing REQUEST over ~2.5 minutes; this one retries the whole REPO after the
+ * request layer has already given up, because the alternative is catastrophically
+ * asymmetric: a repo's commit fetch failing leaves the provider's `[since, until]` window
+ * incompletely covered, which correctly holds the cursor and discards EVERY provider's
+ * partial data for the run (see `ProviderFetchResult.complete`). An initial full-history
+ * sync makes thousands of per-commit requests over hours, so the chance of at least one
+ * blip somewhere is high — and each one used to cost the entire run. On a multi-hour run
+ * these pauses are free; losing the run is not.
+ *
+ * The all-or-nothing rule is deliberately untouched. This makes reaching it rare, not
+ * cheap: after these retries are exhausted the behavior is exactly as before.
+ *
+ * Only faults that could plausibly heal are retried ({@link isRetryableGitFetchError}) —
+ * a 401 or a 404 is a deterministic answer, and pausing 20 minutes per repo to re-ask it
+ * would turn one bad credential into a run that never finishes.
+ */
+export const GIT_REPO_RETRY_DELAYS_MS: readonly number[] = [5 * 60_000, 15 * 60_000];
+
+/**
+ * Total time ONE provider's run may spend asleep in {@link GIT_REPO_RETRY_DELAYS_MS} pauses,
+ * across all of its repos (#272).
+ *
+ * Without this the retry budget is per repo, so a provider-wide outage — which is the common
+ * shape, since a 5xx is usually the provider being unhealthy rather than one repo being
+ * cursed — costs `20 min × repos`. At 30 repos that is 10 hours of pure sleeping, the
+ * pipeline's connector-level retry then doubles it, and the daily cron starts the next run on
+ * top of the previous one. All to reach exactly the pre-#272 outcome: cursor held, partials
+ * dropped.
+ *
+ * 40 minutes lets the first two repos spend their full sequence — enough to ride out the
+ * multi-minute blip this is for — and then stops paying. Repos after that fail immediately
+ * with the same recorded error, which is the honest answer once two repos in a row have
+ * proved the provider is down rather than flaky.
+ */
+export const GIT_RUN_RETRY_SLEEP_BUDGET_MS = 40 * 60_000;
+
+/**
+ * The share of {@link GIT_RUN_RETRY_SLEEP_BUDGET_MS} a BEST-EFFORT fetch may draw to (#272) —
+ * the PR list and the per-PR review fan-out, whose failure is recorded but does NOT hold the
+ * provider's cursor.
+ *
+ * A reserve, not a second pool. Both kinds spend from the same counter; capping the best-effort
+ * one lower guarantees at least `GIT_RUN_RETRY_SLEEP_BUDGET_MS - this` is still available to the
+ * commit fetch, whose failure discards every provider's data for the whole run. Without it the
+ * cheap failure spends the expensive failure's insurance: repo 1's PR retries exhaust the pool,
+ * repo 2's commit fetch is then refused its pause, and the run is lost to a fault a five-minute
+ * wait would have healed.
+ */
+export const GIT_RUN_BEST_EFFORT_RETRY_SLEEP_BUDGET_MS = 20 * 60_000;
 
 /**
  * The upper bound a forward run should actually fetch to, given the cursor it is
@@ -1199,6 +1268,7 @@ async function fetchProviderData(
     providerConfig: GitProviderConfig,
     now: string,
     db: Database.Database,
+    runRetrySleep: {spentMs: number},
     report?: ProgressReporter,
     firstSyncWindowMonths?: number,
     backfill?: {since: string; until: string},
@@ -1257,18 +1327,121 @@ async function fetchProviderData(
     const {include: includeRepos, exclude: excludeFromList} = parseRepoFilters(rawRepos);
     const allExclude = [...excludeFromList, ...(excludeRepos ?? [])];
 
+    // Time the RUN has already spent asleep in in-run retry pauses, against
+    // GIT_RUN_RETRY_SLEEP_BUDGET_MS. Owned by the caller and shared by every PROVIDER as well as
+    // every repo and every fetch kind, so a wide outage cannot cost
+    // `pauses × providers × repos × fetches` (#272, review cycle 3). It was per-provider first,
+    // which made the documented 40-minute ceiling really `40 min × providers` — and
+    // `runConnectorWithRetry` doubles whatever that is again. Run length is not a cosmetic
+    // concern here: `scheduler.ts` fires the git cron with no in-flight guard, and two
+    // overlapping git runs read the same forward cursor and fetch non-disjoint windows into an
+    // additive commit merge, which is a permanent double-count (see `sync-log.ts`).
+
+    /**
+     * Run one repo fetch, retrying it in-run on a fault that could plausibly heal (#272).
+     * Returns the value on success, or the LAST fault's message on failure — the one that
+     * actually ended the fetch, which is what an operator needs.
+     *
+     * Used for EVERY per-repo fetch: `getCommits`, `getPullRequests`, and the per-PR review
+     * fan-out. Hardening only the commit fetch would have made things WORSE for the others, not
+     * better: the fetches used to fail together (a blip long enough to blow one 6-second budget
+     * blew the rest too), so an incomplete commit fetch held the cursor and every other failed
+     * window was re-covered next run as a side effect. Retry commits alone and that coupling
+     * breaks — commits heal, `complete` stays true, the cursor advances past a window whose
+     * fetch failed, and since `getPullRequests` is bounded below by the advanced cursor (and the
+     * fan-out additionally by `prWithinFetchWindow`) a PR never touched again is never re-listed
+     * and never re-fanned-out. Those fields are max()-merged, or carried forward, on the premise
+     * that each run delivers the full per-day set, so the loss does not self-heal. Retrying them
+     * all keeps them coupled.
+     *
+     * The budget bounds only these repo-level PAUSES. It does not bound the request layer's own
+     * 5xx/rate-limit sleeping inside each attempt, and there is no run-level wall-clock deadline —
+     * so a provider that answers every request with `503 Retry-After` can still make a run much
+     * longer than 40 minutes, and a retry re-issues the repo's whole O(commits) detail fan-out
+     * rather than resuming it. That is a real residual, tracked separately: it needs a deadline
+     * threaded into the providers (or a resumable `getCommits`), which is a wider change than
+     * #272. What is bounded here is the part that would otherwise multiply per provider.
+     *
+     * `budgetMs` is the share of {@link GIT_RUN_RETRY_SLEEP_BUDGET_MS} this fetch kind may draw
+     * to. It is what stops a BEST-EFFORT fetch from starving the cursor-critical one: a failed
+     * PR list or fan-out is recorded and the run continues, while a failed commit fetch discards
+     * every provider's data for the run. With one shared pool the cheap failure could spend the
+     * expensive failure's insurance — repo 1's PR retries burn the budget, then repo 2's commit
+     * fetch gets no pause at all and the run is lost. Best-effort callers pass the smaller
+     * {@link GIT_RUN_BEST_EFFORT_RETRY_SLEEP_BUDGET_MS}, which reserves the remainder for commits.
+     *
+     * `onRetry` fires before each pause so the caller can reset its progress counter: the
+     * count the failed attempt left behind is stale the moment it threw, and leaving it frozen
+     * through a 15-minute wait is exactly the "reads as hung" symptom #270 exists to remove.
+     */
+    const fetchRepoWithRetry = async <T>(
+        run: () => Promise<T>,
+        onRetry: () => void,
+        budgetMs: number = GIT_RUN_RETRY_SLEEP_BUDGET_MS,
+        what: string = 'fetch',
+    ): Promise<{value: T; error: null} | {value: null; error: string}> => {
+        let healed: string | null = null;
+        // THIS call's own sleep, not the run's. Reporting `runRetrySleep.spentMs` here overstated
+        // every heal after the first — the second repo to heal claimed the whole run's wait as its
+        // own, and an operator reading "after waiting 40 min" would go looking for a 40-minute
+        // outage that never happened (#272, review cycle 3).
+        let sleptMs = 0;
+        for (let attempt = 0; ; attempt++) {
+            try {
+                const value = await run();
+                // A heal is reported as an ADVISORY, not a failure: the run recovered, so it must
+                // not go red, but it must not be silent either — see RETRY_HEALED_PREFIX.
+                if (healed !== null) {
+                    errors.push(
+                        `${RETRY_HEALED_PREFIX} ${what} succeeded on attempt ${attempt + 1} ` +
+                            `after waiting ${Math.round(sleptMs / 60_000)} min — ${healed}`,
+                    );
+                }
+                return {value, error: null};
+            } catch (err) {
+                const message = err instanceof Error ? err.message : String(err);
+                if (attempt >= GIT_REPO_RETRY_DELAYS_MS.length || !isRetryableGitFetchError(err)) {
+                    return {value: null, error: message};
+                }
+                const delay = GIT_REPO_RETRY_DELAYS_MS[attempt];
+                // Check the budget BEFORE sleeping, and count the pause we are about to take —
+                // so the budget bounds time actually spent, not time attempted.
+                if (runRetrySleep.spentMs + delay > budgetMs) {
+                    return {value: null, error: message};
+                }
+                runRetrySleep.spentMs += delay;
+                sleptMs += delay;
+                healed = message;
+                onRetry();
+                await sleep(delay);
+            }
+        }
+    };
+
     report?.((p) => {
         p.stage = 'listing_repos';
         p.current_repo = null;
     });
+    // Retried in-run out of the FULL budget (#272 review cycle 2, SO-4): this is the single
+    // highest-leverage request in the run, because its failure returns `complete: false`
+    // immediately and discards the provider's whole window before any repo is even attempted.
+    // It is also the first request a first sync makes, so on the incident's shape a 503 here
+    // defers hours of import by a full cron day.
+    const repoList = await fetchRepoWithRetry(
+        () => provider.listRepos(),
+        () =>
+            report?.((p) => {
+                p.stage = 'listing_repos';
+                p.current_repo = null;
+            }),
+        GIT_RUN_RETRY_SLEEP_BUDGET_MS,
+        `[${providerType}] listing repos`,
+    );
     let repoNames: string[] = [];
-    try {
-        const repos = await provider.listRepos();
-        repoNames = repos.filter((r) => !r.isArchived).map((r) => r.name);
-    } catch (err) {
-        errors.push(
-            `[${providerType}] Failed to list repos: ${err instanceof Error ? err.message : String(err)}`,
-        );
+    if (repoList.error === null) {
+        repoNames = repoList.value.filter((r) => !r.isArchived).map((r) => r.name);
+    } else {
+        errors.push(`[${providerType}] Failed to list repos: ${repoList.error}`);
         return {
             commits: allCommits,
             prs: allPRs,
@@ -1340,18 +1513,23 @@ async function fetchProviderData(
         // all. Total is null — the commit count is not known yet. This also supersedes
         // the previous explicit clear here, since it overwrites all three fields.
         reportStep('commits', 0, null);
-        let rawCommits: GitCommit[] = [];
-        try {
-            // getCommits pages the commit list AND does the per-commit detail/diff
-            // fetch internally; its onProgress reports both so the indicator advances
-            // during that work instead of jumping only once the repo returns (#270).
-            // Since #271 that internal fetch is the ONLY per-commit diff request a run
-            // makes — the loop below reuses its result off `GitCommit.diffs`.
-            rawCommits = await provider.getCommits(repoName, since, until, onCommitProgress);
-        } catch (err) {
-            errors.push(
-                `[${providerType}/${repoName}] Failed to fetch commits: ${err instanceof Error ? err.message : String(err)}`,
-            );
+        // getCommits pages the commit list AND does the per-commit detail/diff fetch
+        // internally; its onProgress reports both so the indicator advances during that work
+        // instead of jumping only once the repo returns (#270). Since #271 that internal fetch
+        // is the ONLY per-commit diff request a run makes — the loop below reuses its result
+        // off `GitCommit.diffs`.
+        //
+        // Retried in-run on a healable fault (#272). The result is ASSIGNED, never appended
+        // to, so a retry that re-pages the same window replaces the previous attempt's partial
+        // list rather than doubling it — and nothing has been pushed into `allCommits` yet.
+        const commitFetch = await fetchRepoWithRetry(
+            () => provider.getCommits(repoName, since, until, onCommitProgress),
+            () => reportStep('commits', 0, null),
+            GIT_RUN_RETRY_SLEEP_BUDGET_MS,
+            `[${providerType}/${repoName}] commit fetch`,
+        );
+        if (commitFetch.error !== null) {
+            errors.push(`[${providerType}/${repoName}] Failed to fetch commits: ${commitFetch.error}`);
             // This repo's commit window is now un-covered — hold the provider's cursor
             // back so the whole window is re-fetched next run rather than skipped (#231).
             commitsComplete = false;
@@ -1363,6 +1541,7 @@ async function fetchProviderData(
             });
             continue;
         }
+        const rawCommits = commitFetch.value;
         report?.((p) => {
             p.commits_fetched += rawCommits.length;
         });
@@ -1404,14 +1583,24 @@ async function fetchProviderData(
         // finished counter, i.e. exactly the "reads as hung" symptom #270 exists to
         // remove (#270 review SO-3). Total is null: the list size is not known yet.
         reportStep('prs', 0, null);
-        let rawPRs: GitPR[] = [];
-        try {
-            rawPRs = await provider.getPullRequests(repoName, 'all', since, onPRProgress);
-        } catch (err) {
-            errors.push(
-                `[${providerType}/${repoName}] Failed to fetch PRs: ${err instanceof Error ? err.message : String(err)}`,
-            );
+        // Retried in-run on the same terms and out of the same run budget as the commit fetch
+        // above (#272) — see fetchRepoWithRetry for why retrying only commits would have made
+        // the PR path WORSE than before. Still best-effort on exhaustion: a failed PR list does
+        // NOT clear `commitsComplete`, because holding the cursor for it would force an
+        // additive commit re-fetch, which #231 weighed and rejected (see the note on
+        // `ProviderFetchResult.complete`). The retry narrows the window in which that
+        // best-effort answer is reached; it does not change what happens when it is.
+        const prFetch = await fetchRepoWithRetry(
+            () => provider.getPullRequests(repoName, 'all', since, onPRProgress),
+            () => reportStep('prs', 0, null),
+            GIT_RUN_BEST_EFFORT_RETRY_SLEEP_BUDGET_MS,
+            `[${providerType}/${repoName}] PR list fetch`,
+        );
+        // Discriminant first, same as the commit site — one way of asking "did it fail".
+        if (prFetch.error !== null) {
+            errors.push(`[${providerType}/${repoName}] Failed to fetch PRs: ${prFetch.error}`);
         }
+        const rawPRs: GitPR[] = prFetch.value ?? [];
         report?.((p) => {
             p.prs_fetched += rawPRs.length;
         });
@@ -1447,19 +1636,32 @@ async function fetchProviderData(
             // so commentsOk/reviewsOk are false and upsertPRRecord carries forward the
             // previously-observed review counts instead of clobbering them with zeros. It
             // is NOT a fetch FAILURE, so it is not counted toward the error advisories.
+            // Retried in-run out of the best-effort reserve (#272 review cycle 2, SO-2). This is
+            // the LARGEST request population in a run — 2 calls per PR — and it was the last
+            // fetch still on a bare catch. Leaving it there while the commit fetch gained 20
+            // minutes of healing is what would have made the diff a net regression here: the
+            // commit fetch heals, `complete` stays true, the cursor advances, and because the
+            // fan-out is gated by `prWithinFetchWindow` a PR touched only during the outage is
+            // never fanned out again. `upsertPRRecord` then carries forward a count that was
+            // never observed — i.e. zero — permanently.
             let prCommentCount = 0;
             let commentsOk = fanOut;
             if (fanOut) {
-                try {
-                    const comments = await provider.getReviewComments(repoName, pr.id);
-                    prCommentCount = comments.length;
-                    for (const c of comments) {
-                        allReviewComments.push(toAnalysisReviewComment(c));
-                    }
-                } catch {
+                const fetched = await fetchRepoWithRetry(
+                    () => provider.getReviewComments(repoName, pr.id),
+                    () => reportStep('prs', prIndex, rawPRs.length),
+                    GIT_RUN_BEST_EFFORT_RETRY_SLEEP_BUDGET_MS,
+                    `[${providerType}/${repoName}] review comments for PR ${pr.id}`,
+                );
+                if (fetched.error !== null) {
                     // Review comment fetch failed — counted and surfaced below
                     commentsOk = false;
                     commentFetchFailures++;
+                } else {
+                    prCommentCount = fetched.value.length;
+                    for (const c of fetched.value) {
+                        allReviewComments.push(toAnalysisReviewComment(c));
+                    }
                 }
             }
 
@@ -1470,15 +1672,20 @@ async function fetchProviderData(
             let reviewEventCount = 0;
             let reviewsOk = fanOut;
             if (fanOut) {
-                try {
-                    const reviews = await provider.getPRReviews(repoName, pr.id);
-                    reviewEventCount = reviews.length;
-                    changesRequestedCount = reviews.filter(
-                        (r) => r.state === 'changes_requested',
-                    ).length;
-                } catch {
+                const fetched = await fetchRepoWithRetry(
+                    () => provider.getPRReviews(repoName, pr.id),
+                    () => reportStep('prs', prIndex, rawPRs.length),
+                    GIT_RUN_BEST_EFFORT_RETRY_SLEEP_BUDGET_MS,
+                    `[${providerType}/${repoName}] review verdicts for PR ${pr.id}`,
+                );
+                if (fetched.error !== null) {
                     reviewsOk = false;
                     reviewFetchFailures++;
+                } else {
+                    reviewEventCount = fetched.value.length;
+                    changesRequestedCount = fetched.value.filter(
+                        (r) => r.state === 'changes_requested',
+                    ).length;
                 }
             }
 
@@ -1917,6 +2124,10 @@ export class GitSync implements ConnectorInterface {
         // (developer_id, date) are accumulated rather than overwritten.
         const fetchResults: Array<{result: ProviderFetchResult; providerType: GitProviderType}> = [];
 
+        // ONE in-run retry sleep budget for the whole run, shared across providers — see the
+        // declaration comment in `fetchProviderData` for why it is not per-provider (#272).
+        const runRetrySleep = {spentMs: 0};
+
         for (const pc of providerConfigs) {
             let result: ProviderFetchResult;
             try {
@@ -1924,6 +2135,7 @@ export class GitSync implements ConnectorInterface {
                     pc,
                     now,
                     db,
+                    runRetrySleep,
                     report,
                     options?.firstSyncWindowMonths,
                     options?.backfill,
