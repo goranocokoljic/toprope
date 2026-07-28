@@ -155,6 +155,66 @@ export interface GitFileDiff {
 }
 
 /**
+ * One commit's cached diffstat — everything the per-commit fetch produces that the sync
+ * pipeline consumes (#273).
+ *
+ * `additions`/`deletions` are the COMMIT-LEVEL totals the provider reported and are NOT a
+ * sum of `entries`: GitHub takes them from the commit's `stats` while truncating `files` at
+ * 300, so re-deriving them would under-report exactly the largest GitHub commits. Store and
+ * read both; never recompute one from the other.
+ *
+ * `absent` marks the deterministic 404 case — the provider says no diffstat exists for this
+ * commit (Bitbucket merge commits, GitLab initial commits). It is a real answer and must be
+ * cached, or those commits are re-asked on every run forever. It is deliberately distinct
+ * from "this commit touched no files", even though both yield an identical zero-stat commit
+ * downstream: when `absent` is true, `entries` is `[]` and both totals are 0.
+ */
+export interface CommitDiffstat {
+    additions: number;
+    deletions: number;
+    entries: GitFileDiff[];
+    absent: boolean;
+}
+
+/**
+ * The persistent per-commit diffstat cache a provider consults instead of re-fetching (#273).
+ *
+ * A commit's diffstat is IMMUTABLE — `(repo, sha) -> file stats` is a property of an object
+ * named by the hash of its own content — so there is no staleness, no invalidation, and no
+ * integrity concern. The cache sits strictly UPSTREAM of the accumulator: it changes nothing
+ * about cursor semantics, #231's drop-partials rule, or the additive-merge proof. Its whole
+ * purpose is that a run which dies at commit 4,900 of 5,000 keeps those 4,899 fetches.
+ *
+ * Declared HERE, next to the provider interface, rather than beside its SQLite implementation
+ * (`../diffstat-cache.ts`): the providers are plain HTTP clients with no database dependency,
+ * and this keeps it that way — they depend on a two-method interface, and the sync pipeline
+ * supplies the DB-backed one. It is also what makes a counting fake trivial in tests.
+ *
+ * Scoped to ONE `(providerType, container)` by construction, so a provider never passes — and
+ * can never get wrong — the attribution half of the key.
+ *
+ * IMPLEMENTATIONS MUST NEVER CACHE A FAILURE. Only a successful response or a deterministic
+ * 404 may be `put`; a 5xx, a rate limit or a transport fault is a statement about the server,
+ * not about the commit, and caching one would make an outage permanent.
+ */
+export interface CommitDiffstatCache {
+    /**
+     * Every cached diffstat among `shas`, keyed by sha — resolved in ONE query (chunked), not
+     * one per commit. Callers load the repo's whole set before their per-commit loop and do
+     * in-memory lookups inside it. Missing/undecodable rows are simply absent from the map,
+     * which reads as a MISS and re-fetches.
+     */
+    load(repo: string, shas: readonly string[]): Map<string, CommitDiffstat>;
+    /**
+     * Record one commit's diffstat, immediately and durably — outside any run-level
+     * transaction. That is the ratchet: the row must survive a run that later fails and drops
+     * every partial result. Idempotent (upsert): re-recording the same immutable fact is a
+     * no-op in effect.
+     */
+    put(repo: string, sha: string, value: CommitDiffstat): void;
+}
+
+/**
  * How far a long-running provider fetch has advanced (#270).
  *
  * `total` is null while a list endpoint is still paging in — the size of the result

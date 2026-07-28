@@ -17,6 +17,7 @@ import {
     type SnapshotCell,
 } from './projection.js';
 import {createGitProvider} from './providers/factory.js';
+import {createCommitDiffstatCache, deleteContainerDiffstats} from './diffstat-cache.js';
 import {
     containerKey,
     containerKeyOf,
@@ -103,6 +104,24 @@ export const PROVIDER_DELETED_MID_RUN_PREFIX = 'Provider changed during this run
  */
 export const RETRY_HEALED_PREFIX = 'Recovered after retry:';
 
+/**
+ * Prefix of the advisory pushed when the per-commit diffstat cache (#273) swallowed one or more
+ * faults during this provider's fetch.
+ *
+ * Deliberately NOT a failure: the cache is a memo of an idempotent remote read, every fault
+ * degrades to exactly one re-fetch, and turning a provider red because a disposable optimisation
+ * misfired would hold its cursor and discard a perfectly good window — the precise outcome the
+ * cache's never-throw contract exists to prevent.
+ *
+ * But it must be SAID, and this is the only place that can say it. A read-only database, a
+ * schema drift, sustained `SQLITE_BUSY` against the dashboard's connection or a full disk makes
+ * EVERY cache call fail; the ratchet is then completely dead, the deployment silently reverts to
+ * paying full price on every commit of every run, and the sole symptom is "the sync is still
+ * slow". Without this line, a permanently broken feature and a working one produce byte-identical
+ * output.
+ */
+export const DIFFSTAT_CACHE_DEGRADED_PREFIX = 'Diffstat cache degraded:';
+
 /** Every sentinel that marks an `errors` entry as advisory rather than a failure. */
 const ADVISORY_PREFIXES: readonly string[] = [
     UNMATCHED_AUTHORS_PREFIX,
@@ -110,6 +129,7 @@ const ADVISORY_PREFIXES: readonly string[] = [
     LEGACY_CELLS_SKIPPED_PREFIX,
     PROVIDER_DELETED_MID_RUN_PREFIX,
     RETRY_HEALED_PREFIX,
+    DIFFSTAT_CACHE_DEGRADED_PREFIX,
 ];
 
 /**
@@ -1279,9 +1299,21 @@ async function fetchProviderData(
     const allReviewComments: AnalysisReviewComment[] = [];
     const allPRRecords: PRRecordInput[] = [];
 
-    const provider = createGitProvider(providerConfig);
-    const providerType = provider.name;
     const identifier = providerIdentifier(providerConfig);
+    // The persistent per-commit diffstat cache (#273), scoped to this provider instance. It is
+    // what turns a failed run from "lost every fetch" into "lost only the uncached tail": the
+    // provider writes each commit's diffstat through as it goes, OUTSIDE this run's write
+    // transaction, so the rows survive the #231 drop-partials rule that discards everything
+    // else. Supplied only here — probe paths (`doctor`, test-connection) never walk commits.
+    //
+    // Built BEFORE the config is validated, which is safe because the cache is total: an
+    // invalid config (blank org/workspace/group, bogus type) yields a cache whose every write
+    // the table's CHECK constraints refuse and whose guard swallows — and `createGitProvider`
+    // rejects that config with the canonical message on the very next line, before a single
+    // commit is fetched.
+    const diffstatCache = createCommitDiffstatCache(db, providerConfig.type, identifier);
+    const provider = createGitProvider(providerConfig, diffstatCache);
+    const providerType = provider.name;
     const stateKey = syncStateKey(providerType, identifier);
     // Window selection:
     //   - Backfill (#229): a fixed, strictly-older slice [since, until] the caller
@@ -1569,6 +1601,14 @@ async function fetchProviderData(
                 } catch {
                     // Diff fetch failed — use empty diffs; commit still counts
                 }
+                // NOT ratcheted (#273). The diffstat cache lives inside each provider, at the
+                // single per-commit fetch site #271 consolidated; this is the fallback for a
+                // provider that supplied no `diffs` at all, which no in-tree provider does.
+                // Caching here would need the sync loop to know the provider's container and
+                // to duplicate the "which faults are cacheable" rule that `providers/diffstat.ts`
+                // owns — a second source of truth for one unreachable branch. If a real
+                // diff-less provider ever lands, give IT the cache rather than instrumenting
+                // this site.
             }
             // Namespace file paths by repo to prevent false churn collisions
             const namespacedDiffs = diffs.map((d) => ({...d, path: `${repoName}/${d.path}`}));
@@ -1736,6 +1776,22 @@ async function fetchProviderData(
             // snapshot) never displays a finished repo's stale "PR 40/40" (#270).
             Object.assign(p, NO_REPO_STEP);
         });
+    }
+
+    // The cache never throws, so this line is the ONLY trace a broken one leaves. An advisory,
+    // not a failure — see DIFFSTAT_CACHE_DEGRADED_PREFIX. Reported once per provider with a
+    // count rather than per commit: a dead cache fails on every one of thousands of commits,
+    // and an error list that long is unreadable in the sync log and in the admin UI alike.
+    if (diffstatCache.faults() > 0) {
+        errors.push(
+            `${DIFFSTAT_CACHE_DEGRADED_PREFIX} [${providerType}] ${diffstatCache.faults()} commit ` +
+                'diffstat cache operation(s) hit a database error and were skipped. No data was ' +
+                'lost — every commit was fetched from the provider and every metric is complete ' +
+                '— but the ratchet did not fully apply, so this run may have re-fetched commits ' +
+                'it already had and a later failure may re-fetch these again. A count comparable ' +
+                'to the commit total means the cache is unusable (check disk space and database ' +
+                'permissions); one or two means transient lock contention.',
+        );
     }
 
     return {
@@ -2088,11 +2144,40 @@ export class GitSync implements ConnectorInterface {
             const owner = containerOwner(db, pc.type, providerIdentifier(pc));
             if (owner !== null) ownerAtStart.set(key, owner);
         }
-        // Containers whose owner disappeared or changed while this run was fetching. Filled by
-        // the gate below and reported after the write transaction commits.
+        // Containers the WRITE PATH found orphaned — i.e. `isWritable` refused them, so a
+        // provider's fetched window was discarded. This is the REPORTING set only (it is
+        // deliberately cleared on rollback, where nothing was discarded because nothing was
+        // written); the diffstat purge below uses `containerLostOwner` directly so it is not
+        // hostage to which write closures happened to run.
         const orphanedContainers = new Set<string>();
         // Memoized per container: one owner lookup each, however many rows reference it.
         const ownerNow = new Map<string, string | null>();
+        /**
+         * Did `(providerType, container)`'s owning `git_providers` row change since this run
+         * started fetching?
+         *
+         * `false` for a container that had no owner at start — a config-file provider (excluded
+         * from `ownerAtStart` by design; its ownership cannot change mid-process) or an ad-hoc
+         * config from an embedder or a test. Neither was predicated on a row, so nothing can
+         * have been retracted underneath it.
+         *
+         * Split out of {@link isWritable} so the post-transaction cache tidy-up can ask the same
+         * question — off the same memo, with the same normalization — WITHOUT recording a
+         * reporting-set entry. The two readers must not be one function: the report describes
+         * discarded writes, the purge describes rows to retract, and a rolled-back run has the
+         * second without the first.
+         */
+        const containerLostOwner = (providerType: GitProviderType, container: string): boolean => {
+            const key = containerKeyOf(providerType, container);
+            const startOwner = ownerAtStart.get(key);
+            if (startOwner === undefined) return false;
+            let current = ownerNow.get(key);
+            if (current === undefined) {
+                current = containerOwner(db, providerType, container);
+                ownerNow.set(key, current);
+            }
+            return current !== startOwner;
+        };
         /**
          * May this run write for `(providerType, container)`?
          *
@@ -2107,16 +2192,9 @@ export class GitSync implements ConnectorInterface {
          * requires the transaction, only over where it is *invoked*.
          */
         const isWritable = (providerType: GitProviderType, container: string): boolean => {
-            const key = containerKeyOf(providerType, container);
-            const startOwner = ownerAtStart.get(key);
-            if (startOwner === undefined) return true;
-            let current = ownerNow.get(key);
-            if (current === undefined) {
-                current = containerOwner(db, providerType, container);
-                ownerNow.set(key, current);
-                if (current !== startOwner) orphanedContainers.add(key);
-            }
-            return current === startOwner;
+            if (!containerLostOwner(providerType, container)) return true;
+            orphanedContainers.add(containerKeyOf(providerType, container));
+            return false;
         };
 
         // Fetch data from all providers separately (for per-provider sync state),
@@ -2142,11 +2220,14 @@ export class GitSync implements ConnectorInterface {
                 );
             } catch (err) {
                 // One unusable provider must not sink the run (the resolver's own contract).
-                // `fetchProviderData`'s first statement is `createGitProvider`, which runs the
-                // CANONICAL `validateGitProviderConfig` seam — so this catches a missing
-                // org/workspace/group, a missing token and a malformed GitLab url alike, rather
-                // than re-implementing one of those checks here. A genuine error, not an
-                // advisory: the operator configured a provider that cannot be synced at all.
+                // `fetchProviderData` reaches `createGitProvider` — and with it the CANONICAL
+                // `validateGitProviderConfig` seam — before it issues a single request, so this
+                // catches a missing org/workspace/group, a missing token and a malformed GitLab
+                // url alike, rather than re-implementing one of those checks here. (The two
+                // statements that precede it, `providerContainer` and the diffstat cache
+                // constructor, are both TOTAL by design, so nothing else can land here.) A
+                // genuine error, not an advisory: the operator configured a provider that
+                // cannot be synced at all.
                 errors.push(
                     `[${pc.type}] Skipped — this provider could not be used: ` +
                         `${err instanceof Error ? err.message : String(err)}`,
@@ -2520,6 +2601,40 @@ export class GitSync implements ConnectorInterface {
 
         if (allUnmatched.size > 0) {
             errors.push(`${UNMATCHED_AUTHORS_PREFIX} ${[...allUnmatched].join(', ')}`);
+        }
+
+        // Retract the diffstat rows this run wrote for a container whose owning provider was
+        // deleted while we were fetching (#273). The cascade cleared the table for that
+        // container when it ran, but the fetch loop kept writing through for minutes
+        // afterwards, so without this a delete + re-add leaves the new provider inheriting
+        // file-level detail its credentials may no longer justify.
+        //
+        // Driven off `containerLostOwner` over the run's OWN provider set, not off
+        // `orphanedContainers`: the reporting set is populated only by write closures that
+        // actually ran, and three reachable paths skip every one of them — a rolled-back
+        // transaction (which clears it), a provider whose `fetchProviderData` threw outright,
+        // and a BACKFILL run with an incomplete fetch (no stall update, no cursor advance).
+        // Those are precisely the failing runs whose partial diffstats the ratchet preserves,
+        // i.e. the cases that leave the MOST rows behind.
+        //
+        // Runs AFTER the transaction and deliberately outside it: correctness never depended
+        // on this (the rows are an immutable memo of a remote read), so a failure to tidy a
+        // cache must neither roll back a committed sync nor — via the guard — replace a
+        // successful `SyncResult` with a throw.
+        //
+        // Retracts the container's WHOLE cache, not just this run's rows. Equivalent today —
+        // the cascade emptied the table for this container, so everything present was written
+        // after it by this run — and that equivalence is the reason, not an accident: if a
+        // second concurrent writer for one container ever becomes possible, this would discard
+        // its work too and would need scoping to the shas this run fetched.
+        for (const pc of providerConfigs) {
+            const container = providerIdentifier(pc);
+            if (!containerLostOwner(pc.type, container)) continue;
+            try {
+                deleteContainerDiffstats(db, pc.type, container);
+            } catch {
+                // Best-effort by construction; see above.
+            }
         }
 
         // Say that a whole provider's window was discarded, and why. Silent would be the

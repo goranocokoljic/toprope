@@ -1,4 +1,5 @@
 import type {
+    CommitDiffstatCache,
     GitProvider,
     GitProviderConfig,
     GitHubProviderConfig,
@@ -97,15 +98,28 @@ export function validateGitProviderConfig(config: GitProviderConfig): void {
     }
 }
 
-export function createGitProvider(config: GitProviderConfig): GitProvider {
+/**
+ * Build the provider client for a config.
+ *
+ * `diffstatCache` (#273) is the persistent per-commit diffstat memo the client consults
+ * instead of re-fetching. OPTIONAL, and omitted by every non-sync caller on purpose: `toprope
+ * doctor`, the admin test-connection route and the repo-listing route are probes that never
+ * walk commits, so handing them a cache would be dead weight. Only the sync pipeline supplies
+ * one — it is also the only caller that has resolved the `(type, container)` scope the cache
+ * must be keyed by.
+ */
+export function createGitProvider(
+    config: GitProviderConfig,
+    diffstatCache?: CommitDiffstatCache,
+): GitProvider {
     validateGitProviderConfig(config);
     switch (config.type) {
         case 'github':
-            return new GitHubProvider(config);
+            return new GitHubProvider(config, diffstatCache);
         case 'bitbucket':
-            return new BitbucketProvider(config);
+            return new BitbucketProvider(config, diffstatCache);
         case 'gitlab':
-            return new GitLabProvider(config);
+            return new GitLabProvider(config, diffstatCache);
         default: {
             const exhaustive: never = config;
             throw new Error(

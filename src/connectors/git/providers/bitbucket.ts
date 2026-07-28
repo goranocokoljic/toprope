@@ -1,4 +1,5 @@
 import type {
+    CommitDiffstatCache,
     GitProvider,
     GitProviderType,
     GitRepo,
@@ -12,6 +13,7 @@ import type {
     GitFetchProgressListener,
 } from './types.js';
 import {normalizeContainer} from './container.js';
+import {loadDiffstats, resolveCommitDiffstat} from './diffstat.js';
 import {
     GitProviderFetchError,
     MAX_RATE_LIMIT_RETRIES,
@@ -226,14 +228,16 @@ export class BitbucketProvider implements GitProvider {
     private readonly authHeaders: Record<string, string>;
     private readonly includeRepos: string[];
     private readonly excludeRepos: string[];
+    private readonly diffstatCache?: CommitDiffstatCache;
 
-    constructor(config: BitbucketProviderConfig) {
+    constructor(config: BitbucketProviderConfig, diffstatCache?: CommitDiffstatCache) {
         // Normalized (#266) — see the note in `github.ts`: the attribution key and the request
         // path must be the same spelling, and both derive from `normalizeContainer`.
         this.workspace = normalizeContainer(config.workspace);
         this.includeRepos = config.repos ?? [];
         this.excludeRepos = config.exclude_repos ?? [];
         this.authHeaders = {Authorization: buildAuthHeader(config.auth)};
+        this.diffstatCache = diffstatCache;
     }
 
     private shouldInclude(repoSlug: string): boolean {
@@ -338,29 +342,32 @@ export class BitbucketProvider implements GitProvider {
         // same endpoint (#271).
         const commits: GitCommit[] = [];
         onProgress?.({done: 0, total: collected.length});
+        // The whole repo's already-known diffstats, resolved in ONE batched query rather than
+        // a point read per commit (#273). Empty map when no cache was supplied — every probe
+        // path (doctor, test-connection) omits it, and behaves exactly as before.
+        const cached = loadDiffstats(this.diffstatCache, repo, collected.map((c) => c.hash));
         for (const raw of collected) {
             const {name, email} = parseRawAuthor(raw.author.raw);
             const username = raw.author.user?.nickname ?? raw.author.user?.account_id ?? '';
-            let diffs: GitFileDiff[] = [];
-            try {
-                diffs = await this.getCommitDiff(repo, raw.hash);
-            } catch (err) {
-                // 404 means diffstat absent for this commit (e.g. merge commits) — record with zero stats
-                // Re-throw anything else (auth failure, server error) so systemic problems surface.
-                // Keyed on the typed status rather than a ' 404:' substring (#272): the substring
-                // also matched a URL that merely CONTAINED it, and swallowing a real failure here
-                // silently understates the commit's churn.
-                if (!(err instanceof GitProviderFetchError) || err.status !== 404) throw err;
-            }
+            // Cache-or-fetch, including the 404-is-an-answer rule and the write-through, lives
+            // in the shared helper — GitLab reaches its diff the same way and the two must not
+            // drift on WHICH faults are cacheable (#273).
+            const {entries: diffs, additions, deletions} = await resolveCommitDiffstat(
+                this.diffstatCache,
+                cached,
+                repo,
+                raw.hash,
+                () => this.getCommitDiff(repo, raw.hash),
+            );
             commits.push({
                 sha: raw.hash,
                 author: {name, email, username},
                 date: raw.date,
                 message: raw.message,
-                additions: diffs.reduce((s, d) => s + d.additions, 0),
-                deletions: diffs.reduce((s, d) => s + d.deletions, 0),
+                additions,
+                deletions,
                 filesChanged: diffs.map((d) => d.path),
-                // `[]`, never undefined — including via the 404 branch above, where `[]`
+                // `[]`, never undefined — including via the helper's 404 branch, where `[]`
                 // is the true answer. See `GitCommit.diffs` for why that matters (#271).
                 diffs,
             });

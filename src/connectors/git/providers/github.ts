@@ -1,4 +1,5 @@
 import type {
+    CommitDiffstatCache,
     GitProvider,
     GitProviderType,
     GitRepo,
@@ -13,6 +14,7 @@ import type {
     GitFetchProgressListener,
 } from './types.js';
 import {normalizeContainer} from './container.js';
+import {loadDiffstats} from './diffstat.js';
 import {
     GitProviderFetchError,
     MAX_RATE_LIMIT_RETRIES,
@@ -160,7 +162,14 @@ interface RawRepo {
 
 interface RawCommitListItem {
     sha: string;
-    commit: {
+    /**
+     * OPTIONAL, like `RawCommitDetail`'s `stats`/`files` and for the same reason: typed to
+     * match what the readers actually assume rather than to what the endpoint usually sends.
+     * GitHub embeds the identical `commit` object on the list and the detail responses, and
+     * since #273 the diffstat cache-hit path builds the whole `GitCommit` from THIS row
+     * instead of re-requesting the detail — so it is now read, and it guards.
+     */
+    commit?: {
         author: {name: string; email: string; date: string} | null;
         message: string;
     };
@@ -169,7 +178,14 @@ interface RawCommitListItem {
 
 interface RawCommitDetail {
     sha: string;
-    commit: {
+    /**
+     * OPTIONAL for the same reason `RawCommitListItem.commit` is, and it must stay in step with
+     * it: the two endpoints return the identical embedded object, so a shape the list can omit
+     * the detail can omit too. Dereferencing it unguarded would raise a TypeError out of
+     * `getCommits`, which #231 reads as an incompletely-covered window — the whole provider's
+     * run discarded by one malformed commit.
+     */
+    commit?: {
         author: {name: string; email: string; date: string} | null;
         message: string;
     };
@@ -250,8 +266,9 @@ export class GitHubProvider implements GitProvider {
     private readonly authHeaders: Record<string, string>;
     private readonly includeRepos: string[];
     private readonly excludeRepos: string[];
+    private readonly diffstatCache?: CommitDiffstatCache;
 
-    constructor(config: GitHubProviderConfig) {
+    constructor(config: GitHubProviderConfig, diffstatCache?: CommitDiffstatCache) {
         // Normalized (#266): the org is the attribution key AND the request path, and both have
         // to be the same spelling. `providerContainer` normalizes the former; this normalizes the
         // latter, from the same shared helper, so a YAML `org: '  Acme '` cannot attribute rows to
@@ -264,6 +281,7 @@ export class GitHubProvider implements GitProvider {
             Accept: 'application/vnd.github+json',
             'X-GitHub-Api-Version': '2022-11-28',
         };
+        this.diffstatCache = diffstatCache;
     }
 
     private shouldInclude(repoName: string): boolean {
@@ -347,34 +365,104 @@ export class GitHubProvider implements GitProvider {
         // that now throws (#272, review cycle 3), see the catch below.
         let processed = 0;
         onProgress?.({done: 0, total: summaries.length});
+        // The whole repo's already-known commit stats, resolved in ONE batched query rather
+        // than a point read per commit (#273). Empty map when no cache was supplied — every
+        // probe path (doctor, test-connection) omits it, and behaves exactly as before.
+        const cached = loadDiffstats(this.diffstatCache, repo, summaries.map((s) => s.sha));
         for (const summary of summaries) {
             try {
+                // THE HIT AND THE WRITE ARE GATED ON THE SAME CONDITION — a usable author
+                // date — so the cache can neither DROP a commit the un-cached path kept nor
+                // ADD one it dropped. A list row with no author date simply falls through to
+                // the detail fetch exactly as it always did; that commit is discarded either
+                // way (see the guard below), and the cost is one re-request for a data-shape
+                // anomaly no retry can fix (the remaining half of #275).
+                const listCommit = summary.commit;
+                if (listCommit?.author?.date) {
+                    const hit = cached.get(summary.sha);
+                    if (hit !== undefined) {
+                        // A cache hit skips the DETAIL request entirely, not just a diff
+                        // request. That is sound because the LIST row already carries every
+                        // commit field the detail response would supply — sha,
+                        // `commit.author` (name/email/date), `commit.message` and
+                        // `author.login` are the same embedded objects on both endpoints —
+                        // and the only things the detail adds are `stats` and `files`, which
+                        // is exactly what the cache holds. So the row built here is the row
+                        // the detail fetch would have built, for a fact (a commit's
+                        // diffstat) that is immutable by construction.
+                        commits.push({
+                            sha: summary.sha,
+                            author: {
+                                name: listCommit.author.name,
+                                email: listCommit.author.email,
+                                username: summary.author?.login ?? '',
+                            },
+                            date: listCommit.author.date,
+                            message: listCommit.message,
+                            // Read back, never re-summed from `entries` — see the note on the
+                            // miss path below for why the two legitimately differ on GitHub.
+                            additions: hit.additions,
+                            deletions: hit.deletions,
+                            filesChanged: hit.entries.map((d) => d.path),
+                            diffs: hit.entries,
+                        });
+                        continue;
+                    }
+                }
+
                 const detailRes = await fetchGitHub(
                     `${BASE_URL}/repos/${this.org}/${repo}/commits/${summary.sha}`,
                     this.authHeaders,
                 );
                 const detail = (await detailRes.json()) as RawCommitDetail;
-                if (!detail.commit.author?.date) continue;
 
                 // This detail response IS what `getCommitDiff` would re-request for the
                 // same sha, so carry its file list out on `diffs` and let the caller skip
                 // that second identical request (#271). `[]`, never undefined — a detail
                 // with no `files` means "no files". See `GitCommit.diffs`.
                 const diffs = toFileDiffs(detail);
+                // NOT summed from `diffs`: GitHub caps `files` at 300 per commit while
+                // `stats` covers the whole commit, so the totals stay authoritative
+                // even where the file list is truncated. Unchanged by #271.
+                const additions = detail.stats?.additions ?? 0;
+                const deletions = detail.stats?.deletions ?? 0;
+
+                const detailCommit = detail.commit;
+                if (!detailCommit?.author?.date) continue;
+
+                // Cached AFTER the author-date guard above, so the write is gated on exactly
+                // the condition the hit path reads on (#273). Writing before it would let a
+                // commit the un-cached path DROPS be pushed by a later warm run — the
+                // opposite divergence to the one the hit gate prevents, and just as much a
+                // break of "a hit produces what a fetch produces".
+                //
+                // Keyed on `summary.sha`, the same spelling `load` was asked for, so a write
+                // is guaranteed to be found by the next run's read.
+                //
+                // `absent: false` always. Unlike Bitbucket/GitLab, a 404 here is NOT an
+                // answer: the sha came from GitHub's own commit list, and the endpoint is the
+                // commit itself rather than a separate diffstat resource — so a 404 is an
+                // anomaly that must surface, and `fetchGitHub` throws it (#272). No FETCH
+                // failure of any kind reaches this line, which is also why GitHub does not use
+                // the shared `resolveCommitDiffstat` helper the other two providers share.
+                this.diffstatCache?.put(repo, summary.sha, {
+                    additions,
+                    deletions,
+                    entries: diffs,
+                    absent: false,
+                });
+
                 commits.push({
                     sha: detail.sha,
                     author: {
-                        name: detail.commit.author.name,
-                        email: detail.commit.author.email,
+                        name: detailCommit.author.name,
+                        email: detailCommit.author.email,
                         username: detail.author?.login ?? '',
                     },
-                    date: detail.commit.author.date,
-                    message: detail.commit.message,
-                    // NOT summed from `diffs`: GitHub caps `files` at 300 per commit while
-                    // `stats` covers the whole commit, so the totals stay authoritative
-                    // even where the file list is truncated. Unchanged by #271.
-                    additions: detail.stats?.additions ?? 0,
-                    deletions: detail.stats?.deletions ?? 0,
+                    date: detailCommit.author.date,
+                    message: detailCommit.message,
+                    additions,
+                    deletions,
                     filesChanged: diffs.map((d) => d.path),
                     diffs,
                 });

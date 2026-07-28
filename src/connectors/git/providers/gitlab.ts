@@ -1,4 +1,5 @@
 import type {
+    CommitDiffstatCache,
     GitProvider,
     GitProviderType,
     GitRepo,
@@ -13,6 +14,7 @@ import type {
     GitFetchProgressListener,
 } from './types.js';
 import {normalizeContainer} from './container.js';
+import {loadDiffstats, resolveCommitDiffstat} from './diffstat.js';
 import {
     GitProviderFetchError,
     MAX_RATE_LIMIT_RETRIES,
@@ -211,8 +213,9 @@ export class GitLabProvider implements GitProvider {
     private readonly authHeaders: Record<string, string>;
     private readonly includeRepos: string[];
     private readonly includeSubgroups: boolean;
+    private readonly diffstatCache?: CommitDiffstatCache;
 
-    constructor(config: GitLabProviderConfig) {
+    constructor(config: GitLabProviderConfig, diffstatCache?: CommitDiffstatCache) {
         // Normalized (#266) — see the note in `github.ts`: the attribution key and the request
         // path must be the same spelling, and both derive from `normalizeContainer`.
         this.group = normalizeContainer(config.group);
@@ -221,6 +224,7 @@ export class GitLabProvider implements GitProvider {
         this.authHeaders = buildAuthHeaders(config.auth);
         this.includeRepos = config.repos ?? [];
         this.includeSubgroups = config.include_subgroups ?? false;
+        this.diffstatCache = diffstatCache;
     }
 
     private shouldInclude(pathWithNamespace: string): boolean {
@@ -322,18 +326,22 @@ export class GitLabProvider implements GitProvider {
         // to the caller so it does not re-walk the same endpoint (#271).
         const commits: GitCommit[] = [];
         onProgress?.({done: 0, total: raw.length});
+        // The whole repo's already-known diffs, resolved in ONE batched query rather than a
+        // point read per commit (#273). Empty map when no cache was supplied — every probe
+        // path (doctor, test-connection) omits it, and behaves exactly as before.
+        const cached = loadDiffstats(this.diffstatCache, repo, raw.map((c) => c.id));
         for (const c of raw) {
-            let diffs: GitFileDiff[] = [];
-            try {
-                diffs = await this.getCommitDiff(repo, c.id);
-            } catch (err) {
-                // Re-throw systemic errors (auth failure, server error); silently swallow 404
-                // (GitLab may return 404 for diffs on certain commits, e.g. initial commits).
-                // Keyed on the typed status rather than a ' 404:' substring (#272): the substring
-                // also matched a URL that merely CONTAINED it, and swallowing a real failure here
-                // silently understates the commit's churn.
-                if (!(err instanceof GitProviderFetchError) || err.status !== 404) throw err;
-            }
+            // Cache-or-fetch, including the 404-is-an-answer rule (GitLab 404s the diff of an
+            // initial commit) and the write-through, lives in the shared helper — Bitbucket
+            // reaches its diffstat the same way and the two must not drift on WHICH faults
+            // are cacheable (#273).
+            const {entries: diffs, additions, deletions} = await resolveCommitDiffstat(
+                this.diffstatCache,
+                cached,
+                repo,
+                c.id,
+                () => this.getCommitDiff(repo, c.id),
+            );
 
             commits.push({
                 sha: c.id,
@@ -345,8 +353,8 @@ export class GitLabProvider implements GitProvider {
                 },
                 date: c.authored_date,
                 message: c.message,
-                additions: diffs.reduce((s, d) => s + d.additions, 0),
-                deletions: diffs.reduce((s, d) => s + d.deletions, 0),
+                additions,
+                deletions,
                 filesChanged: diffs.map((d) => d.path),
                 // `[]`, never undefined — including via the 404 branch above, where `[]`
                 // is the true answer. See `GitCommit.diffs` for why that matters (#271).
