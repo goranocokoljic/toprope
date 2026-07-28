@@ -413,17 +413,72 @@ describe('BitbucketProvider', () => {
             // diffstat fan-out — where nearly all of a big repo's wall time goes —
             // then reports real done/total.
             expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
-                {phase: 'listing', discovered: 1},
-                {phase: 'listing', discovered: 2},
-                {phase: 'fetching', done: 0, total: 2},
-                {phase: 'fetching', done: 1, total: 2},
-                {phase: 'fetching', done: 2, total: 2},
+                {done: 1, total: null},
+                {done: 2, total: null},
+                {done: 0, total: 2},
+                {done: 1, total: 2},
+                {done: 2, total: 2},
+            ]);
+        });
+
+        it('reports an empty repo as a real zero total, not a suppressed step', async () => {
+            vi.stubGlobal('fetch', makeFetchMock([{body: pagedResponse([])}]));
+
+            const onProgress = vi.fn();
+            await provider.getCommits('empty-repo', '', '', onProgress);
+
+            // `total: 0` is reported truthfully here as on the other two providers;
+            // suppressing the meaningless "commit 0/0" is the consumer's job.
+            expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
+                {done: 0, total: null},
+                {done: 0, total: 0},
+            ]);
+        });
+
+        it('reports every page of a walk that retains nothing, though the count cannot move', async () => {
+            // Bitbucket's commit endpoint takes no date bounds, so an `until` in the
+            // past is filtered in memory: each page before the window retains nothing
+            // and reports an unchanging 0. Pinned deliberately — this is the known
+            // stationary-counter case on the backfill/catch-up path (#276), and the
+            // assertion fails if a future change stops reporting these pages at all.
+            const fetchMock = makeFetchMock([
+                {
+                    body: pagedResponse(
+                        [makeCommitFixture('newer1', {date: '2024-06-01T00:00:00+00:00'})],
+                        'https://api.bitbucket.org/2.0/next',
+                    ),
+                },
+                {
+                    body: pagedResponse([
+                        makeCommitFixture('newer2', {date: '2024-05-01T00:00:00+00:00'}),
+                    ]),
+                },
+            ]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            const onProgress = vi.fn();
+            const commits = await provider.getCommits(
+                'my-repo',
+                '2024-01-01T00:00:00Z',
+                '2024-02-01T00:00:00Z',
+                onProgress,
+            );
+
+            expect(commits).toEqual([]);
+            // One report per page — present, but stationary at 0 because nothing
+            // inside the window has been reached yet.
+            expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
+                {done: 0, total: null},
+                {done: 0, total: null},
+                {done: 0, total: 0},
             ]);
         });
 
         it('still reports the page that hits the since cutoff (#270)', async () => {
             // The cutoff used to break straight out of both loops; the page's
-            // discovered count must be reported before the walk stops.
+            // retained count must be reported before the walk stops — and when that
+            // page retains nothing it is the ONLY signal, since the fan-out seed then
+            // carries a zero total the consumer renders as no counter.
             const fetchMock = makeFetchMock([
                 {
                     body: pagedResponse(
@@ -450,9 +505,9 @@ describe('BitbucketProvider', () => {
             // page still reported the one commit it collected.
             expect(commits.map((c) => c.sha)).toEqual(['aaa']);
             expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
-                {phase: 'listing', discovered: 1},
-                {phase: 'fetching', done: 0, total: 1},
-                {phase: 'fetching', done: 1, total: 1},
+                {done: 1, total: null},
+                {done: 0, total: 1},
+                {done: 1, total: 1},
             ]);
         });
 
@@ -648,8 +703,8 @@ describe('BitbucketProvider', () => {
 
             expect(prs).toHaveLength(2);
             expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
-                {phase: 'listing', discovered: 1},
-                {phase: 'listing', discovered: 2},
+                {done: 1, total: null},
+                {done: 2, total: null},
             ]);
         });
 

@@ -271,20 +271,26 @@ export class GitHubProvider implements GitProvider {
             summaries.push(...page);
             // One report per page — the only granularity available here, since the
             // commit total is unknown until the last page (#270).
-            onProgress?.({phase: 'listing', discovered: summaries.length});
+            onProgress?.({done: summaries.length, total: null});
             nextUrl = parseNextLink(res.headers.get('link'));
         }
 
         const commits: GitCommit[] = [];
         let lastDetailError: Error | null = null;
         // The per-commit detail fetch below is the O(commits) network cost that
-        // dominates a full sync. Seed the phase so an observer switches to done/total
-        // immediately, then tick every commit — including the ones that fail or carry
-        // no author date, so the counter always reaches `total`.
+        // dominates a full sync. Seed the known total so an observer switches to
+        // done/total immediately, then tick every commit.
+        //
+        // The tick counts commits PROCESSED, not commits returned, so it also advances
+        // over the two lossy branches below (a detail fetch that fails, a detail with
+        // no author date). That keeps the counter moving, but it does NOT report the
+        // loss — a partial detail failure returns fewer commits without throwing, and
+        // the caller cannot currently tell. That is a pre-existing gap in this
+        // function's contract, not something this counter fixes; see #275. The
+        // per-repo symptom it leaves visible is `commit N/N` followed by `diff 0/M`
+        // with M < N (documented on GitSyncProgress.repo_step).
         let processed = 0;
-        if (summaries.length > 0) {
-            onProgress?.({phase: 'fetching', done: 0, total: summaries.length});
-        }
+        onProgress?.({done: 0, total: summaries.length});
         for (const summary of summaries) {
             try {
                 const detailRes = await fetchGitHub(
@@ -313,7 +319,7 @@ export class GitHubProvider implements GitProvider {
                 // Incremented outside the optional call so the count is identical
                 // whether or not a listener is attached.
                 processed++;
-                onProgress?.({phase: 'fetching', done: processed, total: summaries.length});
+                onProgress?.({done: processed, total: summaries.length});
             }
         }
 
@@ -392,7 +398,7 @@ export class GitHubProvider implements GitProvider {
                 });
             }
 
-            onProgress?.({phase: 'listing', discovered: prs.length});
+            onProgress?.({done: prs.length, total: null});
             nextUrl = reachedSince ? null : parseNextLink(res.headers.get('link'));
         }
 

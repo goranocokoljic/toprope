@@ -110,24 +110,21 @@ export interface GitFileDiff {
 }
 
 /**
- * How far a long-running provider fetch has advanced (#270). Discriminated on
- * `phase` rather than passed as a bare `(done, total)` pair because the two
- * phases answer different questions and only one of them can know a total:
+ * How far a long-running provider fetch has advanced (#270).
  *
- *   - `listing`  — paging a list endpoint. The size of the result set is genuinely
- *                  unknown until the last page arrives, so a running discovered
- *                  count is the only honest signal (the issue's non-goal: never
- *                  display a percentage the pipeline cannot compute).
- *   - `fetching` — the O(N) per-item detail fan-out over a now-known set, where
- *                  `done`/`total` is real.
+ * `total` is null while a list endpoint is still paging in — the size of the result
+ * set genuinely is not knowable until the last page arrives — and `done` then reads
+ * as "rows seen so far". Once the set is in hand `total` is real and the pair reads
+ * as done-out-of-total. There is deliberately no percentage or ETA field: the
+ * pipeline cannot compute an honest one for the listing phase.
  *
- * Collapsing both into one nullable-total pair would overload `done` to mean
- * "discovered" in one phase and "completed" in the other; the caller would have
- * to infer which from the total being null.
+ * This is the same shape `GitSyncProgress` puts on the wire, so the sync loop folds
+ * a report in without translating vocabularies.
  */
-export type GitFetchProgress =
-    | {phase: 'listing'; discovered: number}
-    | {phase: 'fetching'; done: number; total: number};
+export interface GitFetchProgress {
+    done: number;
+    total: number | null;
+}
 
 /**
  * Optional progress listener a caller may hand to the provider calls that do

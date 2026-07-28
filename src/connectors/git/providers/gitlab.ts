@@ -267,8 +267,8 @@ export class GitLabProvider implements GitProvider {
             const data = (await res.json()) as RawCommit[];
             raw.push(...data);
             // One report per page — the commit total is unknown until the last
-            // page, so a running discovered count is all that is honest (#270).
-            onProgress?.({phase: 'listing', discovered: raw.length});
+            // page, so a running seen-so-far count is all that is honest (#270).
+            onProgress?.({done: raw.length, total: null});
 
             const nextPage = res.headers.get('x-next-page');
             hasNextPage = !!nextPage && nextPage !== '';
@@ -279,9 +279,7 @@ export class GitLabProvider implements GitProvider {
         // one so an observer's counter ticks during it, not only once it returns.
         const commits: GitCommit[] = [];
         let processed = 0;
-        if (raw.length > 0) {
-            onProgress?.({phase: 'fetching', done: 0, total: raw.length});
-        }
+        onProgress?.({done: 0, total: raw.length});
         for (const c of raw) {
             let diffs: GitFileDiff[] = [];
             try {
@@ -310,7 +308,7 @@ export class GitLabProvider implements GitProvider {
             // Incremented outside the optional call so the count is identical
             // whether or not a listener is attached.
             processed++;
-            onProgress?.({phase: 'fetching', done: processed, total: raw.length});
+            onProgress?.({done: processed, total: raw.length});
         }
 
         return commits;
@@ -383,7 +381,7 @@ export class GitLabProvider implements GitProvider {
                 });
             }
 
-            onProgress?.({phase: 'listing', discovered: prs.length});
+            onProgress?.({done: prs.length, total: null});
 
             const nextPage = res.headers.get('x-next-page');
             if (!nextPage || nextPage === '') break;

@@ -288,7 +288,15 @@ export class BitbucketProvider implements GitProvider {
                 }
             }
 
-            onProgress?.({phase: 'listing', discovered: collected.length});
+            // Reports rows RETAINED, not rows scanned. Bitbucket's commit endpoint takes
+            // no date bounds (see the URL above), so this walk pages from HEAD and
+            // filters `until` in memory — on a backfill or catch-up chunk whose `until`
+            // is in the past, every page before the window retains nothing and this
+            // reports an unchanging 0. The counter is honest but stationary there; a
+            // scanned-vs-found signal is a wire/label change tracked separately in #276.
+            // On a normal forward run (`until` = now) nothing is filtered and it
+            // advances per page as intended.
+            onProgress?.({done: collected.length, total: null});
             if (reachedSince) break;
             nextUrl = page.next ?? null;
         }
@@ -298,9 +306,7 @@ export class BitbucketProvider implements GitProvider {
         // whole loop returns.
         const commits: GitCommit[] = [];
         let processed = 0;
-        if (collected.length > 0) {
-            onProgress?.({phase: 'fetching', done: 0, total: collected.length});
-        }
+        onProgress?.({done: 0, total: collected.length});
         for (const raw of collected) {
             const {name, email} = parseRawAuthor(raw.author.raw);
             const username = raw.author.user?.nickname ?? raw.author.user?.account_id ?? '';
@@ -325,7 +331,7 @@ export class BitbucketProvider implements GitProvider {
             // Incremented outside the optional call so the count is identical
             // whether or not a listener is attached.
             processed++;
-            onProgress?.({phase: 'fetching', done: processed, total: collected.length});
+            onProgress?.({done: processed, total: collected.length});
         }
 
         return commits;
@@ -376,7 +382,7 @@ export class BitbucketProvider implements GitProvider {
                 });
             }
 
-            onProgress?.({phase: 'listing', discovered: prs.length});
+            onProgress?.({done: prs.length, total: null});
             nextUrl = reachedSince ? null : (page.next ?? null);
         }
 

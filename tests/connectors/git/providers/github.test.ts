@@ -294,11 +294,11 @@ describe('GitHubProvider', () => {
             // detail fan-out reports real done/total, seeded at 0 so an observer
             // switches to done/total before the first (slow) request.
             expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
-                {phase: 'listing', discovered: 1},
-                {phase: 'listing', discovered: 2},
-                {phase: 'fetching', done: 0, total: 2},
-                {phase: 'fetching', done: 1, total: 2},
-                {phase: 'fetching', done: 2, total: 2},
+                {done: 1, total: null},
+                {done: 2, total: null},
+                {done: 0, total: 2},
+                {done: 1, total: 2},
+                {done: 2, total: 2},
             ]);
         });
 
@@ -347,19 +347,22 @@ describe('GitHubProvider', () => {
             const commits = await pending;
 
             expect(commits.map((c) => c.sha)).toEqual(['aaa111']);
-            expect(onProgress).toHaveBeenLastCalledWith({phase: 'fetching', done: 3, total: 3});
+            expect(onProgress).toHaveBeenLastCalledWith({done: 3, total: 3});
         });
 
-        it('reports nothing at all on an empty repo (no phantom 0/0 counter)', async () => {
+        it('reports an empty repo as a real zero total, not a suppressed step', async () => {
             vi.stubGlobal('fetch', makeFetchMock([{body: []}]));
 
             const onProgress = vi.fn();
             await provider.getCommits('empty-repo', '', '', onProgress);
 
-            // The single list page still reports its (zero) discovered count; the
-            // fan-out phase is skipped entirely so no consumer renders "commit 0/0".
+            // Providers do NOT pre-filter an empty set — they report `total: 0`
+            // truthfully and the consumer decides not to render a counter for it
+            // (repoStepCount in AdminGitProviders). Keeping the guard here as well
+            // would be two places to forget it.
             expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
-                {phase: 'listing', discovered: 0},
+                {done: 0, total: null},
+                {done: 0, total: 0},
             ]);
         });
 
@@ -551,8 +554,8 @@ describe('GitHubProvider', () => {
 
             expect(prs).toHaveLength(1);
             expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
-                {phase: 'listing', discovered: 1},
-                {phase: 'listing', discovered: 1},
+                {done: 1, total: null},
+                {done: 1, total: null},
             ]);
         });
 

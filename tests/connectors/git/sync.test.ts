@@ -2062,16 +2062,42 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
         }
 
         /**
-         * A provider that drives the onProgress callback the sync loop hands it, the
-         * way a real one ticks through list paging and its per-commit detail fetch.
+         * The indicator triples in order, with consecutive duplicates collapsed —
+         * emissions that changed some OTHER field (a stage flip, a cumulative counter)
+         * repeat the current triple, and those repeats are noise here.
+         *
+         * Order is the thing worth asserting: the VALUES this feature emits are
+         * trivially correct, so the only way it can regress is by emitting them in the
+         * wrong sequence (a seed landing after its ticks, a completed counter left
+         * standing across the next await). A `toContainEqual` membership check cannot
+         * fail on any of that.
+         */
+        function stepSequence(
+            snapshots: GitSyncProgress[],
+        ): Array<[GitSyncRepoStep | null, number, number | null]> {
+            const out: Array<[GitSyncRepoStep | null, number, number | null]> = [];
+            for (const triple of steps(snapshots)) {
+                const last = out[out.length - 1];
+                if (!last || last[0] !== triple[0] || last[1] !== triple[1] || last[2] !== triple[2]) {
+                    out.push(triple);
+                }
+            }
+            return out;
+        }
+
+        /**
+         * A provider that drives the onProgress callback the sync loop hands it in the
+         * SAME sequence the three real providers do: one null-total report per list
+         * page, then a `done: 0` seed carrying the now-known total, then one report per
+         * item. `repos` lets a test span more than one repo.
          */
         function makeTickingProvider(
             commits: GitCommit[],
             prs: GitPR[],
-            overrides: Partial<GitProvider> = {},
+            repos: string[] = ['repo1'],
         ): GitProvider {
             return makeMockProvider({
-                listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                listRepos: vi.fn().mockResolvedValue(repos.map(makeRepo)),
                 getCommits: vi
                     .fn()
                     .mockImplementation(
@@ -2081,10 +2107,10 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
                             _until: string,
                             onProgress?: (p: GitFetchProgress) => void,
                         ) => {
-                            onProgress?.({phase: 'listing', discovered: commits.length});
-                            onProgress?.({phase: 'fetching', done: 0, total: commits.length});
+                            onProgress?.({done: commits.length, total: null});
+                            onProgress?.({done: 0, total: commits.length});
                             for (let i = 1; i <= commits.length; i++) {
-                                onProgress?.({phase: 'fetching', done: i, total: commits.length});
+                                onProgress?.({done: i, total: commits.length});
                             }
                             return commits;
                         },
@@ -2099,11 +2125,10 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
                             _since: string,
                             onProgress?: (p: GitFetchProgress) => void,
                         ) => {
-                            onProgress?.({phase: 'listing', discovered: prs.length});
+                            onProgress?.({done: prs.length, total: null});
                             return prs;
                         },
                     ),
-                ...overrides,
             });
         }
 
@@ -2120,15 +2145,26 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
             const snapshots: GitSyncProgress[] = [];
             await new GitSync({enabled: false}).syncProviders(db, [CONFIG], (p) => snapshots.push(p));
 
-            const observed = steps(snapshots);
-            // Listing: a running found-count with NO total (nothing else is honest).
-            expect(observed).toContainEqual(['commits', 3, null]);
-            // Detail fetch: real done/total, passing through EVERY intermediate value —
-            // the whole point of #270 is that it does not jump 0 → 3.
-            expect(observed).toContainEqual(['commits', 0, 3]);
-            expect(observed).toContainEqual(['commits', 1, 3]);
-            expect(observed).toContainEqual(['commits', 2, 3]);
-            expect(observed).toContainEqual(['commits', 3, 3]);
+            // The EXACT ordered sequence for the whole repo, not just membership: a
+            // null-total listing count, then the detail fan-out seeded at 0 and passing
+            // through every intermediate value (the whole point of #270 is that it does
+            // not jump 0 → 3), then the diff fan-out, then the PR step entered before
+            // its list request, then the idle clear when the repo finishes.
+            expect(stepSequence(snapshots)).toEqual([
+                [null, 0, null],
+                ['commits', 3, null],
+                ['commits', 0, 3],
+                ['commits', 1, 3],
+                ['commits', 2, 3],
+                ['commits', 3, 3],
+                ['diffs', 0, 3],
+                ['diffs', 1, 3],
+                ['diffs', 2, 3],
+                ['diffs', 3, 3],
+                ['prs', 0, null],
+                ['prs', 0, 0],
+                [null, 0, null],
+            ]);
             // Meanwhile the run-level counter stayed frozen at 0 across every
             // still-in-flight emission — proving the motion came from the within-repo
             // fields and not from something the #209 label already showed. (It only
@@ -2157,11 +2193,16 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
             await new GitSync({enabled: false}).syncProviders(db, [CONFIG], (p) => snapshots.push(p));
 
             // The sync loop's OWN getCommitDiff fan-out reports separately from the
-            // provider's commit step, seeded at 0 then ticking to the total.
-            const observed = steps(snapshots);
-            expect(observed).toContainEqual(['diffs', 0, 2]);
-            expect(observed).toContainEqual(['diffs', 1, 2]);
-            expect(observed).toContainEqual(['diffs', 2, 2]);
+            // provider's commit step, seeded at 0 then ticking to the total — and it
+            // starts only AFTER the commit step has finished, never interleaved.
+            const diffPhase = stepSequence(snapshots).filter(([step]) => step === 'diffs');
+            expect(diffPhase).toEqual([
+                ['diffs', 0, 2],
+                ['diffs', 1, 2],
+                ['diffs', 2, 2],
+            ]);
+            const order = stepSequence(snapshots).map(([step]) => step);
+            expect(order.lastIndexOf('commits')).toBeLessThan(order.indexOf('diffs'));
         });
 
         it('advances the PR counter during listing and the per-PR review fan-out', async () => {
@@ -2176,12 +2217,86 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
             const snapshots: GitSyncProgress[] = [];
             await new GitSync({enabled: false}).syncProviders(db, [CONFIG], (p) => snapshots.push(p));
 
-            const observed = steps(snapshots);
-            // Listing (no total yet), then the comment/verdict fan-out done/total.
-            expect(observed).toContainEqual(['prs', 2, null]);
-            expect(observed).toContainEqual(['prs', 0, 2]);
-            expect(observed).toContainEqual(['prs', 1, 2]);
-            expect(observed).toContainEqual(['prs', 2, 2]);
+            // Ordered: the step is entered with an unknown total BEFORE the list
+            // request, the provider's listing count lands, the total becomes real once
+            // the list is in hand, then the comment/verdict fan-out ticks per PR.
+            const prPhase = stepSequence(snapshots).filter(([step]) => step === 'prs');
+            expect(prPhase).toEqual([
+                ['prs', 0, null],
+                ['prs', 2, null],
+                ['prs', 0, 2],
+                ['prs', 1, 2],
+                ['prs', 2, 2],
+            ]);
+        });
+
+        it('enters the PR step before the list request, so no completed diff counter is left standing', async () => {
+            // The diff fan-out ends at N/N and the PR list request can then run for
+            // minutes under a rate-limit backoff. If the PR step were only entered
+            // AFTER that request returned, the label would show a finished counter for
+            // the whole wait — the exact "reads as hung" symptom #270 removes (SO-3).
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            const commits = [makeProviderCommit('alice', '2024-01-15T10:00:00Z', 's1')];
+            const snapshots: GitSyncProgress[] = [];
+            let atListRequest: Array<[GitSyncRepoStep | null, number, number | null]> = [];
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits: vi.fn().mockResolvedValue(commits),
+                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+                    // Capture what a 1s poll would have seen at the instant the PR list
+                    // request is in flight.
+                    getPullRequests: vi.fn().mockImplementation(async () => {
+                        atListRequest = steps(snapshots);
+                        return [];
+                    }),
+                }),
+            );
+
+            await new GitSync({enabled: false}).syncProviders(db, [CONFIG], (p) => snapshots.push(p));
+
+            expect(atListRequest[atListRequest.length - 1]).toEqual(['prs', 0, null]);
+        });
+
+        it('retracts a partial PR listing count when the PR fetch fails', async () => {
+            // Page 1 lists 5 PRs, page 2 throws. Without a post-fetch report the label
+            // would sit on a frozen "5 PRs found" for the rest of the repo.
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits: vi.fn().mockResolvedValue([]),
+                    getPullRequests: vi
+                        .fn()
+                        .mockImplementation(
+                            async (
+                                _repo: string,
+                                _state: string,
+                                _since: string,
+                                onProgress?: (p: GitFetchProgress) => void,
+                            ) => {
+                                onProgress?.({done: 5, total: null});
+                                throw new Error('GitHub API error 429');
+                            },
+                        ),
+                }),
+            );
+
+            const snapshots: GitSyncProgress[] = [];
+            const result = await new GitSync({enabled: false}).syncProviders(db, [CONFIG], (p) =>
+                snapshots.push(p),
+            );
+
+            const observed = stepSequence(snapshots);
+            // The partial count was seen…
+            expect(observed).toContainEqual(['prs', 5, null]);
+            // …and the very next indicator change retracts it to a zero total, which
+            // the label renders as no counter rather than a stale "5 PRs found".
+            const afterPartial = observed.slice(observed.findIndex((t) => t[1] === 5 && t[2] === null) + 1);
+            expect(afterPartial[0]).toEqual(['prs', 0, 0]);
+            expect(result.errors.some((e) => /repo1.*Failed to fetch PRs/.test(e))).toBe(true);
         });
 
         it('clears the indicator when a repo finishes and between repos', async () => {
@@ -2189,10 +2304,7 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
             const createGitProvider = await getCreateGitProvider();
             const commits = [makeProviderCommit('alice', '2024-01-15T10:00:00Z', 's1')];
             createGitProvider.mockReturnValue(
-                makeMockProvider({
-                    ...makeTickingProvider(commits, [makeProviderPR('alice')]),
-                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1'), makeRepo('repo2')]),
-                }),
+                makeTickingProvider(commits, [makeProviderPR('alice')], ['repo1', 'repo2']),
             );
 
             const snapshots: GitSyncProgress[] = [];
@@ -2227,7 +2339,7 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
                                 _until: string,
                                 onProgress?: (p: GitFetchProgress) => void,
                             ) => {
-                                onProgress?.({phase: 'fetching', done: 2, total: 9});
+                                onProgress?.({done: 2, total: 9});
                                 throw new Error('GitHub API error 500');
                             },
                         ),
@@ -2248,7 +2360,7 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
             expect(result.errors.some((e) => /bad-repo.*Failed to fetch commits/.test(e))).toBe(true);
         });
 
-        it('leaves the PR step idle for a repo with no PRs (no phantom 0/0)', async () => {
+        it('reports an empty repo as zero totals, leaving the "no 0/0 counter" call to the consumer', async () => {
             seedDev(db, 'alice');
             const createGitProvider = await getCreateGitProvider();
             createGitProvider.mockReturnValue(makeTickingProvider([], []));
@@ -2256,10 +2368,26 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
             const snapshots: GitSyncProgress[] = [];
             await new GitSync({enabled: false}).syncProviders(db, [CONFIG], (p) => snapshots.push(p));
 
-            // A zero-length PR list has no fan-out to report; nothing may claim a
-            // 'prs' step with a total of 0 (which a label would render as "PR 0/0").
-            expect(snapshots.some((s) => s.repo_step === 'prs' && s.repo_step_total === 0)).toBe(false);
-            expect(snapshots.some((s) => s.repo_step === 'diffs' && s.repo_step_total === 0)).toBe(false);
+            // The pipeline reports what actually happened — steps that ran over an
+            // empty set — rather than suppressing them here. Suppressing "commit 0/0"
+            // is one decision in one place (repoStepCount, covered in
+            // adminGitProviders.test.tsx); duplicating it across every producer is how
+            // a fourth provider ends up forgetting it.
+            expect(stepSequence(snapshots)).toEqual([
+                [null, 0, null],
+                ['commits', 0, null],
+                ['commits', 0, 0],
+                ['diffs', 0, 0],
+                ['prs', 0, null],
+                ['prs', 0, 0],
+                [null, 0, null],
+            ]);
+            // Whatever the totals, `done` can never exceed a known total.
+            for (const s of snapshots) {
+                if (s.repo_step_total !== null) {
+                    expect(s.repo_step_done).toBeLessThanOrEqual(s.repo_step_total);
+                }
+            }
         });
 
         it('passes no listener to the provider on the observer-free scheduled path', async () => {

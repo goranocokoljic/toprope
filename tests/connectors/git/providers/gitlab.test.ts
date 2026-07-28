@@ -468,22 +468,25 @@ describe('GitLabProvider', () => {
             // Listing carries no total (unknown until the last page); the per-commit
             // diff fan-out then reports real done/total.
             expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
-                {phase: 'listing', discovered: 1},
-                {phase: 'listing', discovered: 2},
-                {phase: 'fetching', done: 0, total: 2},
-                {phase: 'fetching', done: 1, total: 2},
-                {phase: 'fetching', done: 2, total: 2},
+                {done: 1, total: null},
+                {done: 2, total: null},
+                {done: 0, total: 2},
+                {done: 1, total: 2},
+                {done: 2, total: 2},
             ]);
         });
 
-        it('reports nothing past listing on an empty repo (no phantom 0/0)', async () => {
+        it('reports an empty repo as a real zero total, not a suppressed step', async () => {
             vi.stubGlobal('fetch', makeFetchMock([{body: []}]));
 
             const onProgress = vi.fn();
             await provider.getCommits('test-group/my-repo', '', '', onProgress);
 
+            // `total: 0` is reported truthfully; suppressing the meaningless
+            // "commit 0/0" is the consumer's single responsibility.
             expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
-                {phase: 'listing', discovered: 0},
+                {done: 0, total: null},
+                {done: 0, total: 0},
             ]);
         });
 
@@ -633,8 +636,8 @@ describe('GitLabProvider', () => {
 
             expect(prs).toHaveLength(2);
             expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
-                {phase: 'listing', discovered: 1},
-                {phase: 'listing', discovered: 2},
+                {done: 1, total: null},
+                {done: 2, total: null},
             ]);
         });
 

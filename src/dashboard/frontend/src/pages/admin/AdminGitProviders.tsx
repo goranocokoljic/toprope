@@ -277,35 +277,56 @@ function syncTone(status: string | null): 'success' | 'danger' | 'neutral' {
 }
 
 /**
- * The counter shown after the repo position on the `fetching` line (#270).
+ * The counters shown after the repo position on the `fetching` line (#270).
  *
- * `commits_fetched`/`prs_fetched` only move when a whole repo finishes, so on a
- * large repo they sit unchanged for minutes and the line reads as hung. When the
- * pipeline says which within-repo fan-out it is inside, show that instead:
- * `commit 1240/5000` while it works a known set, or `1240 commits found` while the
- * list is still paging in and no total exists yet. No percentage either way — the
- * pipeline cannot compute an honest one before the last page lands.
+ * `commits_fetched`/`prs_fetched` only move when a whole repo finishes, so on a large
+ * repo they sit unchanged for minutes and the line reads as hung. The within-repo
+ * counter is therefore PREPENDED to them, not substituted for them: the run-level
+ * totals are the only measure of how much data the run has actually pulled, and
+ * replacing them would have hidden that for essentially the entire `fetching` stage
+ * (the step is non-null nearly the whole time), as well as making the line's shape
+ * flip between two formats.
  */
 function repoStepDetail(p: GitSyncProgress): string {
-    switch (p.repo_step) {
-        case 'commits':
-            return repoStepCount('commit', p);
-        case 'diffs':
-            return repoStepCount('diff', p);
-        case 'prs':
-            return repoStepCount('PR', p);
-        case null:
-            break;
-    }
-    // Runtime fallback, deliberately OUTSIDE the switch (same pattern as the stage
-    // switch below) so the compiler still enforces exhaustiveness over the union
-    // while an unknown step from a newer backend degrades to the cumulative
-    // counters instead of rendering a broken "undefined 3/9".
-    return `${p.commits_fetched} commits · ${p.prs_fetched} PRs`;
+    const cumulative = `${p.commits_fetched} commits · ${p.prs_fetched} PRs`;
+    const step = repoStepCount(p);
+    return step === null ? cumulative : `${step} · ${cumulative}`;
 }
 
-/** `commit 12/40` once the set size is known, `12 commits found` while it isn't. */
-function repoStepCount(noun: string, p: GitSyncProgress): string {
+/**
+ * `commit 12/40` once the set size is known, `12 commits found` while it isn't, or
+ * null when there is nothing honest to show: no step in flight, a step that ran over
+ * an empty set (a total of 0 would render as the meaningless "commit 0/0"), or a step
+ * name a newer backend emits that this bundle cannot name. This is the single place
+ * that decision is made — providers deliberately do not pre-filter empty steps.
+ */
+function repoStepCount(p: GitSyncProgress): string | null {
+    let noun: string;
+    switch (p.repo_step) {
+        case 'commits':
+            noun = 'commit';
+            break;
+        case 'diffs':
+            noun = 'diff';
+            break;
+        case 'prs':
+            noun = 'PR';
+            break;
+        case null:
+            return null;
+        default: {
+            // Real compile-time exhaustiveness over GitSyncRepoStep: adding a member
+            // without a case here is a BUILD error, not a silent degradation. (A bare
+            // `return` after the switch would NOT give this — the compiler is satisfied
+            // by the return and never checks coverage.) At runtime an unrecognized wire
+            // value from a newer backend also lands here and degrades to "no counter",
+            // which is the honest rendering for a step this bundle cannot name.
+            const exhaustive: never = p.repo_step;
+            void exhaustive;
+            return null;
+        }
+    }
+    if (p.repo_step_total === 0) return null;
     if (p.repo_step_total === null) {
         return `${p.repo_step_done} ${noun}${p.repo_step_done === 1 ? '' : 's'} found`;
     }
