@@ -104,6 +104,22 @@ function readSnapshot(db: Database.Database, devId: string) {
         | undefined;
 }
 
+/**
+ * The WHOLE projected row minus the two identity columns (`id` is a random UUID and
+ * `developer_id` differs per database). `SELECT *` deliberately, not a column list: the
+ * columns most sensitive to a corrupted reuse are `code_churn_rate` and
+ * `ai_signature_score` (the only readers of `GitFileDiff.status` and of the per-file
+ * additions distribution), and a future diff-derived column should join the comparison
+ * without anyone remembering to add it here.
+ */
+function readFullSnapshot(db: Database.Database, devId: string): Record<string, unknown> {
+    const row = db
+        .prepare('SELECT * FROM git_snapshots WHERE developer_id = ?')
+        .get(devId) as Record<string, unknown>;
+    const {id: _id, developer_id: _devId, ...rest} = row;
+    return rest;
+}
+
 // --- Provider fixtures -------------------------------------------------------------
 
 const BITBUCKET_CONFIG: GitProviderConfig = {
@@ -260,19 +276,28 @@ function gitlabRoutes() {
 
 // --- Mock-provider helpers (for the reuse/fallback branches) -----------------------
 
-function makeCommit(sha: string, diffs?: GitFileDiff[]): GitCommit {
+function makeCommit(
+    sha: string,
+    diffs?: GitFileDiff[],
+    totals: {additions: number; deletions: number} = {additions: 40, deletions: 5},
+): GitCommit {
     const commit: GitCommit = {
         sha,
         author: {name: 'Alice', email: AUTHOR_EMAIL, username: 'alice'},
         date: COMMIT_DATE,
         message: 'feat: work',
-        additions: 40,
-        deletions: 5,
-        filesChanged: ['src/foo.ts', 'src/bar.ts'],
+        additions: totals.additions,
+        deletions: totals.deletions,
+        // A diff-less provider still lists file names, so keep this populated either way —
+        // nothing downstream of `toAnalysisCommit` reads it, but a fixture that empties it
+        // for the fallback case would misrepresent what such a provider returns.
+        filesChanged: (diffs ?? [{path: 'src/foo.ts'}, {path: 'src/bar.ts'}]).map((d) => d.path),
     };
     // Deliberately only assigned when supplied, so the "not supplied" case really is an
-    // ABSENT property rather than an explicit `diffs: undefined`.
-    if (diffs !== undefined) commit.diffs = diffs;
+    // ABSENT property rather than an explicit `diffs: undefined`. Copied per commit, the
+    // way a real provider's own `getCommitDiff` call returns a fresh array — sharing one
+    // instance across commits would hide an in-place mutation of the reused array.
+    if (diffs !== undefined) commit.diffs = diffs.map((d) => ({...d}));
     return commit;
 }
 
@@ -280,6 +305,22 @@ const FALLBACK_DIFFS: GitFileDiff[] = [
     {path: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'},
     {path: 'src/bar.ts', additions: 10, deletions: 0, status: 'added'},
 ];
+
+/**
+ * A diff shaped so that the snapshot columns computed FROM the file-level entries carry
+ * real signal — `code_churn_rate` (keyed on `path` + `additions`/`deletions`) and
+ * `ai_signature_score`, whose "bulk new boilerplate files" and "uniform file sizes"
+ * signals are the only readers of `status` and of the per-file additions distribution.
+ * With the thin 2-file fixture both columns sit at 0, so a reuse that dropped `status`
+ * or collapsed the per-file shape would be invisible to a snapshot comparison.
+ */
+const RICH_DIFFS: GitFileDiff[] = Array.from({length: 5}, (_, i) => ({
+    path: `src/gen${i}.ts`,
+    additions: 60,
+    deletions: 2,
+    status: 'added',
+}));
+const RICH_TOTALS = {additions: 300, deletions: 10};
 
 function makeRepo(name: string): GitRepo {
     return {id: name, name, fullName: `test-org/${name}`, defaultBranch: 'main', isArchived: false};
@@ -310,6 +351,9 @@ describe('#271 one diff request per commit per sync run', () => {
     afterEach(() => {
         db.close();
         vi.restoreAllMocks();
+        // `restoreAllMocks` does NOT undo `stubGlobal`, and `unstubGlobals` is not set in
+        // vitest.config.ts — without this the last counting `fetch` leaks into the next test.
+        vi.unstubAllGlobals();
     });
 
     // --- AC1: request volume, measured against the real providers ------------------
@@ -384,19 +428,26 @@ describe('#271 one diff request per commit per sync run', () => {
     it('reused diffs and fallback-fetched diffs write byte-identical snapshots', async () => {
         // The strongest form of "unchanged for the same input data": run the same commit
         // set twice — once with the provider supplying diffs (the new path), once
-        // supplying none so the sync loop fetches them (the old path) — and compare.
+        // supplying none so the sync loop fetches them (the old path) — and compare the
+        // WHOLE projected row, not just the line counts. `lines_added`/`lines_removed`
+        // come from the commit's own totals and would survive almost any corruption of
+        // the reused array; `code_churn_rate` and `ai_signature_score` are the columns
+        // actually computed from the file-level entries, so they are what makes this
+        // comparison able to fail. RICH_DIFFS exists to keep them non-zero.
         const run = async (supplyDiffs: boolean) => {
             const localDb = makeDb();
             const devId = seedAlice(localDb);
-            const commits = SHAS.map((sha) => makeCommit(sha, supplyDiffs ? FALLBACK_DIFFS : undefined));
+            const commits = SHAS.map((sha) =>
+                makeCommit(sha, supplyDiffs ? RICH_DIFFS : undefined, RICH_TOTALS),
+            );
             (await getCreateGitProvider()).mockReturnValue(
                 makeMockProvider({
                     getCommits: vi.fn().mockResolvedValue(commits),
-                    getCommitDiff: vi.fn().mockResolvedValue(FALLBACK_DIFFS),
+                    getCommitDiff: vi.fn().mockResolvedValue(RICH_DIFFS),
                 }),
             );
             await new GitSync({enabled: false}).syncProviders(localDb, [GITHUB_CONFIG]);
-            const snapshot = readSnapshot(localDb, devId);
+            const snapshot = readFullSnapshot(localDb, devId);
             localDb.close();
             return snapshot;
         };
@@ -405,7 +456,16 @@ describe('#271 one diff request per commit per sync run', () => {
         const fetched = await run(false);
 
         expect(reused).toEqual(fetched);
-        expect(reused).toEqual({commits: 3, lines_added: 120, lines_removed: 15, files_changed: 6});
+        // Positive controls — without these, two all-zero rows would compare equal and
+        // this test would pass while proving nothing.
+        expect(reused).toMatchObject({
+            commits: 3,
+            lines_added: 900,
+            lines_removed: 30,
+            files_changed: 15,
+        });
+        expect(reused.code_churn_rate as number).toBeGreaterThan(0);
+        expect(reused.ai_signature_score as number).toBeGreaterThan(0);
     });
 
     it('namespaces reused diff paths by repo, so two repos’ same-named file are not re-churn', async () => {
@@ -497,6 +557,61 @@ describe('#271 one diff request per commit per sync run', () => {
         expect(getCommitDiff).toHaveBeenCalledTimes(1);
         expect(getCommitDiff).toHaveBeenCalledWith('repo1', 'sha-1');
         expect(readSnapshot(db, devId)).toMatchObject({lines_added: 40, files_changed: 2});
+    });
+
+    it('decides per commit, not per batch, when a batch mixes supplied and missing diffs', async () => {
+        // The guard reads `rawCommits[i].diffs`. A refactor that hoisted it to the batch
+        // (`rawCommits.every(c => c.diffs === undefined)`) would pass every other test here,
+        // because every other fixture is uniform.
+        const devId = seedAlice(db);
+        const getCommitDiff = vi.fn().mockResolvedValue(FALLBACK_DIFFS);
+        (await getCreateGitProvider()).mockReturnValue(
+            makeMockProvider({
+                getCommits: vi
+                    .fn()
+                    .mockResolvedValue([makeCommit('has-diffs', FALLBACK_DIFFS), makeCommit('no-diffs')]),
+                getCommitDiff,
+            }),
+        );
+
+        await new GitSync({enabled: false}).syncProviders(db, [GITHUB_CONFIG]);
+
+        // Exactly one fetch, for exactly the commit that supplied nothing.
+        expect(getCommitDiff.mock.calls).toEqual([['repo1', 'no-diffs']]);
+        // …and both commits contributed their two files, so neither path dropped one.
+        expect(readSnapshot(db, devId)).toMatchObject({commits: 2, files_changed: 4});
+    });
+
+    // --- The reuse path is the one production takes: keep it on the progress contract ---
+
+    it('still ticks the diffs progress step per commit on the reuse path', async () => {
+        // Every pre-existing sync test builds commits WITHOUT `diffs`, so the whole legacy
+        // suite — including the `diffs` step-sequence assertions — exercises only the
+        // fallback branch. This pins the same contract for the branch a real provider
+        // actually takes: seeded at 0/N, one tick per commit, ending at N/N.
+        seedAlice(db);
+        (await getCreateGitProvider()).mockReturnValue(
+            makeMockProvider({
+                getCommits: vi
+                    .fn()
+                    .mockResolvedValue([
+                        makeCommit('s1', FALLBACK_DIFFS),
+                        makeCommit('s2', FALLBACK_DIFFS),
+                    ]),
+                getCommitDiff: vi.fn(),
+            }),
+        );
+
+        const steps: Array<[string | null, number, number | null]> = [];
+        await new GitSync({enabled: false}).syncProviders(db, [GITHUB_CONFIG], (p) =>
+            steps.push([p.repo_step, p.repo_step_done, p.repo_step_total]),
+        );
+
+        expect(steps.filter(([step]) => step === 'diffs')).toEqual([
+            ['diffs', 0, 2],
+            ['diffs', 1, 2],
+            ['diffs', 2, 2],
+        ]);
     });
 
     it('degrades one commit to empty diffs when the fallback fetch throws, without failing the repo', async () => {

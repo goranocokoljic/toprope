@@ -207,8 +207,7 @@ export interface GitSyncProgress {
      *     they already made during the `commits` step, so `diffs` is a synchronous reuse
      *     pass: expect it to jump 0 → N in a single tick and never to be the step a run
      *     appears stuck on. It still reports per commit because a provider that supplies
-     *     no diffs falls back to `getCommitDiff`, and that IS an N-request fan-out. (The
-     *     doubled per-commit cost this used to document is what #271 removed.)
+     *     no diffs falls back to `getCommitDiff`, and that IS an N-request fan-out.
      */
     repo_step: GitSyncRepoStep | null;
     repo_step_done: number;
@@ -233,8 +232,7 @@ const NO_REPO_STEP = {
  * listener that does I/O per call — an SSE frame, a DB write — must coalesce; the
  * only in-tree listener assigns the snapshot to a field and is safe. Since #271 the
  * `diffs` share of those calls arrives as one SYNCHRONOUS burst of N (the reuse pass
- * awaits nothing), so a poller simply observes the last of them — one more reason a
- * per-call I/O listener must coalesce rather than fan out.
+ * awaits nothing), so a poller simply observes the last of them.
  *
  * A throw from this listener is swallowed at every report site — it loses that one
  * update and nothing else. It must be: the per-item reports run INSIDE
@@ -1375,11 +1373,17 @@ async function fetchProviderData(
         // supplies no diffs makes this pass exactly as slow as it used to be.
         reportStep('diffs', 0, rawCommits.length);
         for (const [i, rawCommit] of rawCommits.entries()) {
-            // `undefined`, not falsy/empty, is what selects the fallback: `[]` is a real
-            // answer ("this commit touched no files" — a merge commit whose diffstat
-            // 404'd) and re-requesting it would restore the very duplicate #271 removes.
-            let diffs: GitFileDiff[] = rawCommit.diffs ?? [];
-            if (rawCommit.diffs === undefined) {
+            // An ARRAY — including an empty one — is an answer and is reused; anything
+            // else falls back. `[]` must not fall back (see `GitCommit.diffs`), and the
+            // shape test rather than `!== undefined` keeps this total: a provider is an
+            // adapter over an untrusted API response, so a `null`/garbage `diffs` gets
+            // fetched properly instead of silently reading as "this commit touched
+            // nothing".
+            let diffs: GitFileDiff[];
+            if (Array.isArray(rawCommit.diffs)) {
+                diffs = rawCommit.diffs;
+            } else {
+                diffs = [];
                 try {
                     diffs = await provider.getCommitDiff(repoName, rawCommit.sha);
                 } catch {

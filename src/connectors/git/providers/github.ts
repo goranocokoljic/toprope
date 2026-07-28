@@ -320,8 +320,8 @@ export class GitHubProvider implements GitProvider {
 
                 // This detail response IS what `getCommitDiff` would re-request for the
                 // same sha, so carry its file list out on `diffs` and let the caller skip
-                // that second identical request (#271). Always set, never undefined — a
-                // detail with no `files` means "no files", not "unknown".
+                // that second identical request (#271). `[]`, never undefined — a detail
+                // with no `files` means "no files". See `GitCommit.diffs`.
                 const diffs = toFileDiffs(detail);
                 commits.push({
                     sha: detail.sha,

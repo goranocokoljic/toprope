@@ -251,9 +251,10 @@ describe('GitHubProvider', () => {
         // --- diff reuse (#271) ---
 
         it('exposes diffs byte-identical to what getCommitDiff would return for the same sha', async () => {
-            // getCommits and getCommitDiff read the SAME endpoint, so they must map it
-            // through the same helper — if they diverged, reusing one for the other would
-            // silently change churn.
+            // Both paths now go through `toFileDiffs`, so this is a REGRESSION guard, not
+            // an independent check: it fails if someone re-inlines a divergent mapping in
+            // either function. The other divergence vector — the two paths' URLs drifting
+            // apart — is covered by the request-URL count in diff-fetch-dedup.test.ts.
             const sha = 'abc123';
             vi.stubGlobal(
                 'fetch',
@@ -283,7 +284,8 @@ describe('GitHubProvider', () => {
 
             expect(commits).toHaveLength(1);
             expect(commits[0].diffs).toEqual([]);
-            expect(commits[0].diffs).not.toBeUndefined();
+            // The property is PRESENT — the distinction the sync loop branches on.
+            expect('diffs' in commits[0]).toBe(true);
         });
 
         it('keeps additions/deletions from stats, not summed from the (300-file-capped) file list', async () => {

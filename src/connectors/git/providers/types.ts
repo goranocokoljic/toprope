@@ -54,11 +54,18 @@ export interface GitCommit {
     deletions: number;
     filesChanged: string[];
     /**
-     * The file-level diff this commit's `additions`/`deletions`/`filesChanged` were
-     * derived from, carried out of `getCommits` so the consumer does not have to fetch
-     * it a second time (#271). All three in-tree providers supply it — each one already
-     * walks a per-commit endpoint to compute the totals above — which is what makes a
-     * sync cost ~N per-commit requests instead of ~2N.
+     * The file-level diff already fetched for this commit, carried out of `getCommits` so
+     * the consumer does not request it a second time (#271). All three in-tree providers
+     * supply it — each already walks a per-commit endpoint while building this row — which
+     * is what makes a sync cost ~N per-commit diff walks instead of ~2N. It is guaranteed
+     * to be the SAME value `getCommitDiff(repo, sha)` would return for this commit.
+     *
+     * NOT a source for the totals above, and do NOT re-derive them from it. On Bitbucket
+     * and GitLab `additions`/`deletions` are in fact the sum of these entries, but on
+     * GitHub they come from the commit's whole-commit `stats` while this list is the
+     * `files` array GitHub truncates at 300 — so there the totals can legitimately EXCEED
+     * what these entries sum to. Summing this to get a commit's line counts silently
+     * under-reports exactly the largest GitHub commits.
      *
      * `undefined` and `[]` are NOT interchangeable. `undefined` means "this provider
      * supplied nothing — fetch it via `getCommitDiff`"; `[]` means "already fetched, and
@@ -67,8 +74,18 @@ export interface GitCommit {
      * would send exactly those commits back down the fallback path — the duplicate
      * request this field exists to remove.
      *
+     * Optional deliberately, and NOT because the in-tree providers are unreliable about
+     * it (they all set it unconditionally). `getCommitDiff` stays on the interface for
+     * callers holding only a sha, so an implementation that legitimately cannot pre-fetch
+     * the diff — one whose commit-list endpoint already carries the totals, say — must be
+     * able to say "I have none" and be served correctly rather than be forced to fabricate
+     * an empty array that would read as "no files".
+     *
      * Paths are the provider's own, NOT repo-namespaced — the same contract
-     * `getCommitDiff` returns, so a consumer namespaces both identically.
+     * `getCommitDiff` returns, so a consumer namespaces both identically. Treat the array
+     * and its entries as READ-ONLY: it is the provider's own array, handed over by
+     * reference rather than copied, so a consumer that normalizes must map to new objects
+     * (as `fetchProviderData` does when namespacing).
      */
     diffs?: GitFileDiff[];
 }
@@ -162,9 +179,9 @@ export interface GitProvider {
     // work — without it the whole call is one opaque await and an observer's
     // counter jumps 0 → N only when the repo is finished (#270).
     //
-    // An implementation that fetches per-commit diff data to compute the returned
-    // additions/deletions MUST also expose it on `GitCommit.diffs`, so the caller reuses
-    // that one fetch instead of re-requesting the same endpoint per commit (#271).
+    // An implementation that fetches per-commit diff data while building its result MUST
+    // also expose it on `GitCommit.diffs`, so the caller reuses that one fetch instead of
+    // walking the same endpoint again per commit (#271).
     getCommits(
         repo: string,
         since: string,

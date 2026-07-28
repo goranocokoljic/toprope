@@ -438,7 +438,9 @@ describe('BitbucketProvider', () => {
 
             expect(commits).toHaveLength(1);
             expect(commits[0].diffs).toEqual([]);
-            expect(commits[0].diffs).not.toBeUndefined();
+            // The property is PRESENT — `toEqual([])` above would already fail on
+            // undefined, but this pins the distinction the sync loop branches on.
+            expect('diffs' in commits[0]).toBe(true);
         });
 
         // --- onProgress (#270) ---
