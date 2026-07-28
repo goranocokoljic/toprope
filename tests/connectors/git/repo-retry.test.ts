@@ -581,6 +581,75 @@ describe('in-run repo retry (#272)', () => {
         );
     });
 
+    it('retries the per-PR review VERDICT fan-out and persists the healed counts', async () => {
+        // The verdict half of the fan-out (`getPRReviews`) is a separate fetch from the comment
+        // half, with its own reviewsOk/reviewFetchFailures bookkeeping — and it is the worse of
+        // the two to leave un-retried: on failure `upsertPRRecord` PRESERVES previously-observed
+        // verdict data, which for a PR first seen during the outage is zero. Once the cursor
+        // advances past it, `prWithinFetchWindow` never re-fans it out, so "0 changes requested"
+        // becomes permanent. Assert the healed VALUES land, not just that the calls happened.
+        seedAlice(db);
+        const createGitProvider = await getCreateGitProvider();
+        let reviewCalls = 0;
+        const getPRReviews = vi.fn().mockImplementation(async () => {
+            reviewCalls++;
+            if (reviewCalls <= 2) throw new GitProviderFetchError('server error 503', 503);
+            return [
+                {
+                    id: 'rev-1',
+                    prId: 'pr-1',
+                    reviewer: {name: 'bob', email: 'bob@example.com', username: 'bob'},
+                    state: 'changes_requested',
+                    submittedAt: '2024-01-15T09:30:00Z',
+                },
+                {
+                    id: 'rev-2',
+                    prId: 'pr-1',
+                    reviewer: {name: 'bob', email: 'bob@example.com', username: 'bob'},
+                    state: 'approved',
+                    submittedAt: '2024-01-15T09:40:00Z',
+                },
+            ];
+        });
+        createGitProvider.mockReturnValue(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                getCommits: vi.fn().mockResolvedValue([makeCommit('c-1')]),
+                getPullRequests: vi.fn().mockResolvedValue([
+                    {
+                        id: 'pr-1',
+                        title: 'feat',
+                        author: {name: 'alice', email: 'alice@example.com', username: 'alice'},
+                        state: 'merged',
+                        createdAt: '2024-01-15T08:00:00Z',
+                        mergedAt: '2024-01-15T09:00:00Z',
+                        closedAt: '2024-01-15T09:00:00Z',
+                        updatedAt: '2024-01-15T09:00:00Z',
+                        reviewers: [],
+                        additions: 1,
+                        deletions: 0,
+                    },
+                ]),
+                getPRReviews,
+            }),
+        );
+
+        const result = await runSync(db);
+
+        expect(reviewCalls).toBe(1 + GIT_REPO_RETRY_DELAYS_MS.length);
+        // Healed, so the run does not go red over it.
+        expect(result.errors.filter((e) => !isAdvisoryError(e))).toHaveLength(0);
+        // And the verdicts the retry recovered are what got stored: two review events, one of
+        // them a send-back, so `review_rounds` is 1 + 1. A run that gave up here would have
+        // written 0/0 (no verdicts observed, no comments either) and frozen them there.
+        const rec = db
+            .prepare(
+                `SELECT review_rounds, changes_requested_count FROM pr_records WHERE pr_id = 'pr-1'`,
+            )
+            .get() as {review_rounds: number; changes_requested_count: number} | undefined;
+        expect(rec).toEqual({review_rounds: 2, changes_requested_count: 1});
+    });
+
     it('reserves budget for the commit fetch so a best-effort retry cannot starve it', async () => {
         // The starvation shape: repo1's PR list fails and heals (spending pauses), then repo2's
         // COMMIT fetch fails transiently. If both drew from one pool, repo1 could exhaust it and
@@ -689,5 +758,76 @@ describe('in-run repo retry (#272)', () => {
         // counted twice, 1 would mean the healed repo's was dropped.
         expect(dayRow(db, '2024-01-15')?.commits).toBe(2);
         expect(readState(db, FORWARD_KEY)).toBe(result.lastSyncTime);
+    });
+
+    it('shares ONE retry sleep budget across providers, not one budget each', async () => {
+        // The budget was per-provider first (#272, review cycle 3), which made the documented
+        // 40-minute ceiling really `40 min × providers`, and `runConnectorWithRetry` doubles
+        // whatever that is again. Run length is not cosmetic: the git cron fires with no
+        // in-flight guard, and two overlapping runs read the same forward cursor and fetch
+        // non-disjoint windows into an ADDITIVE commit merge — a permanent double-count.
+        seedAlice(db);
+        const createGitProvider = await getCreateGitProvider();
+        const getCommits = vi
+            .fn()
+            .mockRejectedValue(new GitProviderFetchError('server error 503', 503));
+        const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+        createGitProvider.mockImplementation((pc: GitProviderConfig) =>
+            makeMockProvider({
+                name: pc.type,
+                listRepos: vi.fn().mockResolvedValue([makeRepo('r1'), makeRepo('r2')]),
+                getCommits,
+            }),
+        );
+
+        const pending = new GitSync({enabled: false}).syncProviders(db, [
+            CONFIG,
+            {type: 'gitlab', group: 'g', auth: {type: 'token', api_token: 't'}},
+        ]);
+        await vi.runAllTimersAsync();
+        await pending;
+
+        const sleptMs = setTimeoutSpy.mock.calls
+            .map((c) => Number(c[1]))
+            .filter((d) => GIT_REPO_RETRY_DELAYS_MS.includes(d))
+            .reduce((a, b) => a + b, 0);
+        // ONE budget for the whole run. Per-provider, this would be 2 × the budget.
+        expect(sleptMs).toBe(GIT_RUN_RETRY_SLEEP_BUDGET_MS);
+        expect(sleptMs).toBeLessThan(2 * GIT_RUN_RETRY_SLEEP_BUDGET_MS);
+        // The first provider spent it all, so the second's repos fail on attempt 1 with no pause —
+        // and are still ATTEMPTED, so coverage and the cursor hold are unchanged.
+        expect(getCommits.mock.calls.length).toBeGreaterThanOrEqual(4);
+    });
+
+    it('reports each healed fetch\'s OWN wait, not the run\'s cumulative sleep', async () => {
+        // Two repos heal in one run. Reporting the shared counter made the second claim the
+        // first's wait as well ("after waiting 40 min" for a fetch that waited 20) — sending an
+        // operator to look for an outage that never happened.
+        seedAlice(db);
+        const createGitProvider = await getCreateGitProvider();
+        const calls: Record<string, number> = {r1: 0, r2: 0};
+        createGitProvider.mockReturnValue(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('r1'), makeRepo('r2')]),
+                getCommits: vi.fn().mockImplementation(async (repo: string): Promise<GitCommit[]> => {
+                    calls[repo]++;
+                    // Each repo fails once, so each waits exactly the FIRST pause — 5 min.
+                    if (calls[repo] === 1) throw new GitProviderFetchError('503', 503);
+                    return [makeCommit(`c-${repo}`, repo === 'r1' ? '2024-01-15T10:00:00Z' : '2024-01-15T11:00:00Z')];
+                }),
+            }),
+        );
+
+        const result = await runSync(db);
+
+        const healed = result.errors.filter((e) => e.startsWith(RETRY_HEALED_PREFIX));
+        expect(healed).toHaveLength(2);
+        const expectedMin = Math.round(GIT_REPO_RETRY_DELAYS_MS[0] / 60_000);
+        // BOTH report 5 min. The run spent 10 in total, so a cumulative counter would have made
+        // the second say 10 — this assertion fails if the per-call accumulator is removed.
+        for (const line of healed) {
+            expect(line).toContain(`after waiting ${expectedMin} min`);
+        }
+        expect(result.errors.filter((e) => !isAdvisoryError(e))).toHaveLength(0);
     });
 });

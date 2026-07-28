@@ -337,19 +337,14 @@ export class GitHubProvider implements GitProvider {
         }
 
         const commits: GitCommit[] = [];
-        let lastDetailError: Error | null = null;
         // The per-commit detail fetch below is the O(commits) network cost that
         // dominates a full sync. Seed the known total so an observer switches to
         // done/total immediately, then tick every commit.
         //
         // The tick counts commits PROCESSED, not commits returned, so it also advances
-        // over the two lossy branches below (a detail fetch that fails, a detail with
-        // no author date). That keeps the counter moving, but it does NOT report the
-        // loss — a partial detail failure returns fewer commits without throwing, and
-        // the caller cannot currently tell. That is a pre-existing gap in this
-        // function's contract, not something this counter fixes; see #275. The
-        // per-repo symptom it leaves visible is `commit N/N` followed by `diff 0/M`
-        // with M < N (documented on GitSyncProgress.repo_step).
+        // over the one lossy branch below (a detail with no author date — a data-shape
+        // problem no retry can fix). It no longer advances over a FAILED detail fetch:
+        // that now throws (#272, review cycle 3), see the catch below.
         let processed = 0;
         onProgress?.({done: 0, total: summaries.length});
         for (const summary of summaries) {
@@ -383,32 +378,40 @@ export class GitHubProvider implements GitProvider {
                     filesChanged: diffs.map((d) => d.path),
                     diffs,
                 });
-            } catch (err) {
-                lastDetailError = err instanceof Error ? err : new Error(String(err));
+                // Deliberately NO `catch` (#272, review cycle 3) — every detail failure now
+                // propagates out of `getCommits`. This used to record the error and carry on,
+                // which is what made the in-run repo retry unsafe here. Two things forced it:
+                //
+                //   1. Unlike Bitbucket/GitLab, where the per-commit fetch is a DIFFSTAT and a
+                //      failure only understates one commit's churn, on GitHub the detail response
+                //      IS the commit — its author date, message and stats. A swallowed failure
+                //      dropped the commit entirely, so `raw_author_daily` (and the `git_snapshots`
+                //      projection over it) silently lost it.
+                //   2. Swallowing left `commits.length > 0`, so `getCommits` returned normally,
+                //      `commitsComplete` stayed true and the cursor advanced past the gap — making
+                //      the loss permanent. The repo retry made that MORE likely, not less: the
+                //      retry exists for a healing outage, and a healing outage's most probable
+                //      outcome is a PARTIAL second attempt. The run then recorded
+                //      `Recovered after retry` over a lossy result.
+                //
+                // Throwing routes the loss through the same path as every other fetch fault: the
+                // request layer's own 5xx budget first, then the in-run repo retry, then — if it
+                // never heals — `commitsComplete = false`, the cursor held, and the whole window
+                // re-covered next run (#231). Loud and recoverable rather than a silent, permanent
+                // snapshot gap. NOT narrowed to non-404 the way Bitbucket and GitLab are: a sha
+                // GitHub's own commit list just returned is not legitimately absent, so a 404 here
+                // is an anomaly to surface, not a "this commit has no diff" answer.
+                //
+                // This closes the half of #275 that #272 could reach. What remains for #275 is the
+                // OTHER lossy branch — the `continue` above, a data-shape problem no retry fixes.
             } finally {
-                // Its own counter, unlike the other two providers: the `continue` above
-                // and this `catch` both skip the push, so `commits.length` would stall
-                // while the loop kept working. Incremented outside the optional call so
-                // the count is identical whether or not a listener is attached.
+                // Its own counter, unlike the other two providers: the `continue` above skips the
+                // push, so `commits.length` would stall while the loop kept working. In a `finally`
+                // so the tick is not lost on the throwing path either. Incremented outside the
+                // optional call so the count is identical whether or not a listener is attached.
                 processed++;
                 onProgress?.({done: processed, total: summaries.length});
             }
-        }
-
-        // If every single detail fetch failed on a non-empty commit list, the error
-        // is systemic (auth failure, network outage) — surface it rather than returning [].
-        //
-        // #272 NOTE: because a PARTIAL detail failure does not throw, neither of #272's two
-        // hardening layers reaches it. The request-level 5xx budget in `fetchGitHub` does
-        // apply to each detail request, but the in-run REPO retry cannot: it only fires on a
-        // throw out of `getCommits`, so a 5xx that outlasts the request budget on some commits
-        // still returns a silently short list with `commitsComplete` left true. That is #275,
-        // filed deliberately — deciding whether a partial loss holds the whole provider cursor
-        // is a data-integrity call of the same weight as #231/#235 and gets its own review.
-        // Unlike Bitbucket and GitLab, which re-throw anything that is not a typed 404 and so
-        // do reach the repo retry.
-        if (commits.length === 0 && summaries.length > 0 && lastDetailError) {
-            throw lastDetailError;
         }
 
         return commits;

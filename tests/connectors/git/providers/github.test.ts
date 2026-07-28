@@ -381,11 +381,15 @@ describe('GitHubProvider', () => {
             ]);
         });
 
-        it('still reaches total when a commit is skipped or its detail fetch fails', async () => {
-            // aaa111 maps normally, bbb222's detail carries no author date (skipped by
-            // a `continue`), ccc333's detail 500s until retries are exhausted. Only one
-            // GitCommit comes back, but the counter must still reach 3/3 — a counter
-            // that stops short of its total is exactly the "hung" symptom of #270.
+        it('still reaches total when a commit is skipped for having no author date', async () => {
+            // aaa111 and ccc333 map normally; bbb222's detail carries no author date and is
+            // skipped by a `continue`. Two GitCommits come back, but the counter must still reach
+            // 3/3 — a counter that stops short of its total is exactly the "hung" symptom of #270.
+            //
+            // The `continue` is now the ONLY lossy branch left in this loop: a failed detail fetch
+            // throws (#272, review cycle 3) rather than being swallowed, so it no longer reaches
+            // the counter at all. It is also what remains of #275 — a data-shape problem no retry
+            // can fix, unlike a fetch fault.
             const fetchMock = vi.fn().mockImplementation((url: string) => {
                 const ok = (body: unknown): Response =>
                     ({
@@ -402,6 +406,44 @@ describe('GitHubProvider', () => {
                     return Promise.resolve(ok({sha: 'bbb222', commit: {author: null, message: 'm'}}));
                 }
                 if (url.includes('/commits/ccc333')) {
+                    return Promise.resolve(ok(makeCommitDetailFixture('ccc333')));
+                }
+                return Promise.resolve(
+                    ok([
+                        makeCommitListFixture('aaa111'),
+                        makeCommitListFixture('bbb222'),
+                        makeCommitListFixture('ccc333'),
+                    ]),
+                );
+            });
+            vi.stubGlobal('fetch', fetchMock);
+
+            const onProgress = vi.fn();
+            const pending = provider.getCommits('my-repo', '', '', onProgress);
+            await vi.runAllTimersAsync();
+            const commits = await pending;
+
+            expect(commits.map((c) => c.sha)).toEqual(['aaa111', 'ccc333']);
+            expect(onProgress).toHaveBeenLastCalledWith({done: 3, total: 3});
+        });
+
+        it('ticks the counter for a commit whose detail fetch throws, before propagating', async () => {
+            // The tick lives in a `finally`, so the observer is not left one short of the commit
+            // that failed — it sees `2/3` and then the fetch rejects, rather than freezing at 1/3
+            // with no explanation (#270 + #272 review cycle 3).
+            const fetchMock = vi.fn().mockImplementation((url: string) => {
+                const ok = (body: unknown): Response =>
+                    ({
+                        ok: true,
+                        status: 200,
+                        headers: new Headers(),
+                        json: () => Promise.resolve(body),
+                        text: () => Promise.resolve(''),
+                    }) as unknown as Response;
+                if (url.includes('/commits/aaa111')) {
+                    return Promise.resolve(ok(makeCommitDetailFixture('aaa111')));
+                }
+                if (url.includes('/commits/bbb222')) {
                     return Promise.resolve({
                         ok: false,
                         status: 500,
@@ -422,11 +464,13 @@ describe('GitHubProvider', () => {
 
             const onProgress = vi.fn();
             const pending = provider.getCommits('my-repo', '', '', onProgress);
+            const settled = expect(pending).rejects.toThrow('GitHub API server error 500');
             await vi.runAllTimersAsync();
-            const commits = await pending;
+            await settled;
 
-            expect(commits.map((c) => c.sha)).toEqual(['aaa111']);
-            expect(onProgress).toHaveBeenLastCalledWith({done: 3, total: 3});
+            // ccc333 was never reached, so the counter stops at the failing commit — not at its
+            // predecessor, which is what the `finally` buys.
+            expect(onProgress).toHaveBeenLastCalledWith({done: 2, total: 3});
         });
 
         it('reports an empty repo as a real zero total, not a suppressed step', async () => {
@@ -495,7 +539,15 @@ describe('GitHubProvider', () => {
             ).rejects.toThrow('GitHub API error 404');
         });
 
-        it('skips individual failing commits when some succeed', async () => {
+        it('throws on a PARTIAL detail failure instead of returning a silently short list', async () => {
+            // Was "skips individual failing commits when some succeed" (#272, review cycle 3).
+            // On GitHub the detail response IS the commit, so a swallowed failure dropped the
+            // commit outright — and because `getCommits` then returned normally, `commitsComplete`
+            // stayed true and the cursor advanced past the gap, making the loss permanent. The
+            // in-run repo retry made partial success the LIKELY outcome of a healing outage, so
+            // the swallow had to go: the fault must reach the retry, and if it never heals it must
+            // reach #231's cursor hold. A 404 is included deliberately — a sha GitHub's own commit
+            // list just returned is not legitimately absent.
             const sha1 = 'aaa111';
             const sha2 = 'bbb222';
             let callCount = 0;
@@ -521,7 +573,7 @@ describe('GitHubProvider', () => {
                         text: () => Promise.resolve(''),
                     } as unknown as Response);
                 }
-                // Second detail fails — but first succeeded, so no throw
+                // Second detail fails, even though the first succeeded.
                 return Promise.resolve({
                     ok: false,
                     status: 404,
@@ -530,11 +582,9 @@ describe('GitHubProvider', () => {
                 } as unknown as Response);
             }));
 
-            const commits = await provider.getCommits('my-repo', '2024-01-01T00:00:00Z', '2024-01-31T23:59:59Z');
-
-            // sha1 succeeded, sha2 was silently skipped
-            expect(commits).toHaveLength(1);
-            expect(commits[0].sha).toBe(sha1);
+            await expect(
+                provider.getCommits('my-repo', '2024-01-01T00:00:00Z', '2024-01-31T23:59:59Z'),
+            ).rejects.toThrow('GitHub API error 404');
         });
 
         it('throws when all per-commit detail fetches fail (systemic error)', async () => {

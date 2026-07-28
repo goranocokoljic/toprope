@@ -101,8 +101,14 @@ export const SERVER_ERROR_BASE_DELAY_MS = 5_000;
 
 /**
  * Ceiling for a single 5xx pause. With {@link MAX_SERVER_ERROR_RETRIES} the un-jittered
- * schedule is 5s → 10s → 20s → 40s → 80s, so the total budget is ~2.5 minutes (~1.3
- * minutes at minimum jitter) instead of the pre-#272 six seconds.
+ * schedule is 5s → 10s → 20s → 40s → 80s, so the budget is ~2.5 minutes (~1.3 minutes at
+ * minimum jitter) instead of the pre-#272 six seconds — but that figure is the NO-header case
+ * only. `Retry-After` is a floor (see {@link serverErrorDelayMs}), so a server answering
+ * `503 Retry-After: 3600` pins every pause to this cap and the real worst case is
+ * `MAX_SERVER_ERROR_RETRIES × 120s = 10 minutes` PER REQUEST. Quote the 10-minute number, not
+ * the 2.5-minute one, whenever reasoning about how long a whole run can take: the per-commit
+ * detail/diffstat fetch is an O(commits) population and each member carries this budget
+ * independently, with no run-level deadline consulting it (#272, review cycle 3).
  *
  * Note the exponential term therefore tops out at 80s and never actually meets this cap — the
  * cap is live only on the `Retry-After` clamp in {@link serverErrorDelayMs}, and on the
@@ -273,8 +279,9 @@ export function parseEpochResetMs(header: string | null | undefined): number | n
  * - `null` status — a transport fault: no response was ever produced, which is transient by
  *   nature (the outage that returns 503 to one request resets the socket on the next).
  * - 5xx — the server said it failed and told us nothing about when to come back. By the time
- *   this surfaces the request-level budget is spent, so the outage outlived ~2.5 minutes and a
- *   longer, blind pause is the only remaining move.
+ *   this surfaces the request-level budget is spent, so the outage outlived at least ~2.5 minutes
+ *   (up to 10, if it was advertising a `Retry-After` — see {@link SERVER_ERROR_MAX_DELAY_MS}) and
+ *   a longer, blind pause is the only remaining move.
  *
  * NOT retryable — and 429 belongs here, which is a change of mind from this module's first
  * cut (#272 review cycle 2, SEC-2):

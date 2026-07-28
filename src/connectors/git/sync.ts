@@ -1268,6 +1268,7 @@ async function fetchProviderData(
     providerConfig: GitProviderConfig,
     now: string,
     db: Database.Database,
+    runRetrySleep: {spentMs: number},
     report?: ProgressReporter,
     firstSyncWindowMonths?: number,
     backfill?: {since: string; until: string},
@@ -1326,10 +1327,15 @@ async function fetchProviderData(
     const {include: includeRepos, exclude: excludeFromList} = parseRepoFilters(rawRepos);
     const allExclude = [...excludeFromList, ...(excludeRepos ?? [])];
 
-    // Time this provider's run has already spent asleep in in-run retry pauses, against
-    // GIT_RUN_RETRY_SLEEP_BUDGET_MS. Shared by every repo AND every fetch kind, so a
-    // provider-wide outage cannot cost `pauses × repos × fetches`.
-    let retrySleepSpentMs = 0;
+    // Time the RUN has already spent asleep in in-run retry pauses, against
+    // GIT_RUN_RETRY_SLEEP_BUDGET_MS. Owned by the caller and shared by every PROVIDER as well as
+    // every repo and every fetch kind, so a wide outage cannot cost
+    // `pauses × providers × repos × fetches` (#272, review cycle 3). It was per-provider first,
+    // which made the documented 40-minute ceiling really `40 min × providers` — and
+    // `runConnectorWithRetry` doubles whatever that is again. Run length is not a cosmetic
+    // concern here: `scheduler.ts` fires the git cron with no in-flight guard, and two
+    // overlapping git runs read the same forward cursor and fetch non-disjoint windows into an
+    // additive commit merge, which is a permanent double-count (see `sync-log.ts`).
 
     /**
      * Run one repo fetch, retrying it in-run on a fault that could plausibly heal (#272).
@@ -1347,6 +1353,14 @@ async function fetchProviderData(
      * and never re-fanned-out. Those fields are max()-merged, or carried forward, on the premise
      * that each run delivers the full per-day set, so the loss does not self-heal. Retrying them
      * all keeps them coupled.
+     *
+     * The budget bounds only these repo-level PAUSES. It does not bound the request layer's own
+     * 5xx/rate-limit sleeping inside each attempt, and there is no run-level wall-clock deadline —
+     * so a provider that answers every request with `503 Retry-After` can still make a run much
+     * longer than 40 minutes, and a retry re-issues the repo's whole O(commits) detail fan-out
+     * rather than resuming it. That is a real residual, tracked separately: it needs a deadline
+     * threaded into the providers (or a resumable `getCommits`), which is a wider change than
+     * #272. What is bounded here is the part that would otherwise multiply per provider.
      *
      * `budgetMs` is the share of {@link GIT_RUN_RETRY_SLEEP_BUDGET_MS} this fetch kind may draw
      * to. It is what stops a BEST-EFFORT fetch from starving the cursor-critical one: a failed
@@ -1367,6 +1381,11 @@ async function fetchProviderData(
         what: string = 'fetch',
     ): Promise<{value: T; error: null} | {value: null; error: string}> => {
         let healed: string | null = null;
+        // THIS call's own sleep, not the run's. Reporting `runRetrySleep.spentMs` here overstated
+        // every heal after the first — the second repo to heal claimed the whole run's wait as its
+        // own, and an operator reading "after waiting 40 min" would go looking for a 40-minute
+        // outage that never happened (#272, review cycle 3).
+        let sleptMs = 0;
         for (let attempt = 0; ; attempt++) {
             try {
                 const value = await run();
@@ -1375,7 +1394,7 @@ async function fetchProviderData(
                 if (healed !== null) {
                     errors.push(
                         `${RETRY_HEALED_PREFIX} ${what} succeeded on attempt ${attempt + 1} ` +
-                            `after waiting ${Math.round(retrySleepSpentMs / 60_000)} min — ${healed}`,
+                            `after waiting ${Math.round(sleptMs / 60_000)} min — ${healed}`,
                     );
                 }
                 return {value, error: null};
@@ -1387,10 +1406,11 @@ async function fetchProviderData(
                 const delay = GIT_REPO_RETRY_DELAYS_MS[attempt];
                 // Check the budget BEFORE sleeping, and count the pause we are about to take —
                 // so the budget bounds time actually spent, not time attempted.
-                if (retrySleepSpentMs + delay > budgetMs) {
+                if (runRetrySleep.spentMs + delay > budgetMs) {
                     return {value: null, error: message};
                 }
-                retrySleepSpentMs += delay;
+                runRetrySleep.spentMs += delay;
+                sleptMs += delay;
                 healed = message;
                 onRetry();
                 await sleep(delay);
@@ -2104,6 +2124,10 @@ export class GitSync implements ConnectorInterface {
         // (developer_id, date) are accumulated rather than overwritten.
         const fetchResults: Array<{result: ProviderFetchResult; providerType: GitProviderType}> = [];
 
+        // ONE in-run retry sleep budget for the whole run, shared across providers — see the
+        // declaration comment in `fetchProviderData` for why it is not per-provider (#272).
+        const runRetrySleep = {spentMs: 0};
+
         for (const pc of providerConfigs) {
             let result: ProviderFetchResult;
             try {
@@ -2111,6 +2135,7 @@ export class GitSync implements ConnectorInterface {
                     pc,
                     now,
                     db,
+                    runRetrySleep,
                     report,
                     options?.firstSyncWindowMonths,
                     options?.backfill,
