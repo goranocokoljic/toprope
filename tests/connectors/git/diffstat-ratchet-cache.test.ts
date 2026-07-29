@@ -815,9 +815,9 @@ describe('#273 per-commit diffstat ratchet cache', () => {
         // Since #275 a detail whose `commit` is unusable is RECOVERED from the list row, so this
         // commit is dropped only because BOTH copies are missing it — which is what the fixture
         // builds, and what keeps this test about the cache rather than about the fallback. The
-        // "uncached" half is load-bearing in a second way now: on the recovery path the write is
-        // skipped deliberately, because caching a malformed body's zeros would freeze them as
-        // that commit's immutable answer (see the `put` guard in `github.ts`).
+        // "uncached" half is load-bearing in a second way now: this fixture's detail carries no
+        // `stats` either, and #275 routes a body with neither a usable `commit` nor `stats` to a
+        // THROW rather than caching its zeros — so nothing is memoized for it on any run.
         const db = makeDb();
         const devId = seedAlice(db);
         const log = makeLog();

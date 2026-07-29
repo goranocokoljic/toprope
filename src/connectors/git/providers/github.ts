@@ -52,19 +52,24 @@ const RATE_LIMIT_PAUSE_THRESHOLD = 100;
  * NOT stricter than the store:
  *   - `typeof` first, because `.test()` COERCES — an array from an odd JSON body would
  *     stringify into a matching value and sail through.
- *   - `[10] === 'T'` so a bare day with no time is rejected: `Date.parse` reads that as UTC
- *     midnight, but every other reader here expects an instant.
- *   - `Date.parse` finite, because the shape check alone accepts `9999-99-99T00:00:00Z`.
+ *   - `isUtcDay` on the sliced day, so this asks the SAME question the store asks.
+ *   - `Date.parse` finite, because the shape check alone accepts `9999-99-99T00:00:00Z`. This
+ *     one conjunct IS stricter than the store, on purpose: `analyzer.ts` orders commits by
+ *     `new Date(c.date).getTime()`, and a NaN there makes the comparator non-total — the
+ *     graduated determinism rule. A day the store accepts is worth nothing if the sort that
+ *     reads it is undefined.
  * Calendar validity (`2024-02-30`) and UTC-ness (an `-05:00` offset attributes to the
  * offset-local day) are NOT pinned, because the store accepts both: rejecting them here would
  * DROP commits the store would have stored, trading a small mis-attribution for a real loss.
- * Both are pre-existing and shared by all three providers; fixing them belongs at the write
- * boundary, for every provider at once.
+ * A bare day with no time (`2024-01-15`) is accepted for the same reason — no reader in this
+ * pipeline consumes the time component (every one of them is `slice(0, 10)` or a parsed
+ * instant), so rejecting it would lose a commit the store would have keyed correctly.
+ * Both remaining gaps are pre-existing and shared by all three providers; fixing them belongs
+ * at the write boundary, for every provider at once.
  */
 function isAttributableDate(date: string | undefined): boolean {
     return (
         typeof date === 'string' &&
-        date[10] === 'T' &&
         isUtcDay(date.slice(0, 10)) &&
         Number.isFinite(Date.parse(date))
     );
@@ -501,8 +506,9 @@ export class GitHubProvider implements GitProvider {
                     // because the operator's next step differs: absent on both copies means a
                     // truncated response, while present-but-unusable means a real commit whose
                     // timestamp this pipeline cannot key on. Critically, the unusable case must
-                    // be caught here and not left to pass — see `ATTRIBUTABLE_DATE_RE` for what
-                    // it does one frame down if it escapes.
+                    // be caught here and not left to pass — see `isAttributableDate` above, and
+                    // `UTC_DAY_RE` in `raw-author-daily.ts`, for what it does one frame down if
+                    // it escapes.
                     // `typeof … === 'string' && !== ''`, not `!== undefined`: `date: null` and
                     // `date: ''` are what a truncated or garbled body actually yields, and
                     // calling those "present but unattributable" sends the operator looking for
@@ -533,11 +539,28 @@ export class GitHubProvider implements GitProvider {
                 // diffstat memo does not help: the memo is trivially re-fetchable, the snapshot
                 // is not, so guarding only the memo protected the cheap side.
                 //
-                // Throwing routes it to the request layer's 5xx budget, then the in-run repo
-                // retry — where a transient bad body actually heals — and then #231's cursor
-                // hold. `status: null` marks it retryable, like a transport fault, which is what
-                // a truncated body is. So the surviving recovery path always has real `stats`,
-                // and nothing downstream is ever handed fabricated churn.
+                // Throwing routes it to `fetchRepoWithRetry` — the in-run repo retry, where a
+                // transient bad body heals — and then, if it never heals, #231's cursor hold.
+                // NOT to the request layer's 5xx budget: `fetchGitHub` already returned 200 and
+                // unwound, so the repo retry is the first and only hop, i.e. 1 attempt + 2
+                // retries, not 1 + 5 + 2. `status: null` is what marks it retryable.
+                //
+                // SCOPE, precisely, because the adjacent `put` depends on it: this fires only
+                // when the identity ALSO had to come from the list row. A detail whose `commit`
+                // is usable but whose `stats` is absent does NOT throw — it keeps the commit
+                // with `0`/`0`/`[]` churn and memoizes that. This is deliberate and it is
+                // PRE-EXISTING #273 behaviour, not something #275 introduced: `RawCommitDetail`
+                // declares `stats` optional because "GitHub omits them on some commits", so on
+                // that path zero IS the documented answer, and throwing instead would stall a
+                // provider on an ordinary commit. The two shapes are distinguished only because
+                // one of them has independent evidence the BODY is broken — it failed to carry
+                // a usable `commit` object, which GitHub's commit-detail endpoint always sends.
+                //
+                // The residual is real and bounded: if GitHub in fact never omits `stats`, then
+                // an absent `stats` is always a malformed body and this guard is too narrow.
+                // Deciding that needs evidence about the endpoint that this codebase does not
+                // have, so it is tracked in #288 rather than guessed at here. What matters for
+                // #275 is that the guard's scope is stated rather than overclaimed.
                 if (source !== detailCommit && detail.stats === undefined) {
                     throw new GitProviderFetchError(
                         `GitHub commit detail for ${summary.sha} in ${this.org}/${repo} carried ` +
@@ -546,14 +569,16 @@ export class GitHubProvider implements GitProvider {
                     );
                 }
 
-                // Reached only with real `stats` in hand, on BOTH the normal and the recovery
-                // path — the throw above is what guarantees it, and it is why this is a bare
-                // `put` again rather than one guarded on which copy supplied the identity.
-                // `commit_diffstats` has NO invalidation, so a row written here is served on
-                // every later run forever; memoizing an outage's zeros as a commit's immutable
-                // answer is exactly what `providers/diffstat.ts` forbids ("ONLY a successful
-                // response or a deterministic 404 is ever recorded"). The recovery path is not
-                // an exception to that rule because it no longer carries zeros.
+                // On the RECOVERY path this is reached only with real `stats` in hand, because
+                // the throw above sends the alternative away — which is what makes the recovery
+                // safe to memoize and why this is a bare `put` rather than one guarded on which
+                // copy supplied the identity. It is NOT a claim about the normal path: there, a
+                // detail with no `stats` still memoizes `0`/`0`/`[]`, exactly as it did before
+                // #275, because GitHub is documented to omit `stats` on some commits (see the
+                // throw's SCOPE note above). `commit_diffstats` has NO invalidation, so any row
+                // written here is served on every later run forever — which is why the recovery
+                // path had to be prevented from contributing zeros, and why widening the throw
+                // is the follow-up rather than something to be assumed here.
                 //
                 // Cached AFTER the date guard, so a commit the un-cached path DROPS can never be
                 // pushed by a later warm run (#273) — the opposite divergence to the one the hit

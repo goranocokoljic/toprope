@@ -30,6 +30,7 @@ import {
     COMMITS_DROPPED_PREFIX,
     RETRY_HEALED_PREFIX,
     isAdvisoryError,
+    stallStateKey,
     syncStateKey,
 } from '../../../src/connectors/git/sync';
 import {
@@ -313,25 +314,18 @@ describe('unreturned commits are never silent (#275)', () => {
             expect(dayCommits(db)).toBeUndefined();
         });
 
-        it('names a bounded sample of shas, counts the rest, and states each reason once', async () => {
-            // The whole aggregation half of the advisory (#275 review TST-2): seven drops
-            // across BOTH reason classes. With one drop per test, `slice(0, 5)` was
-            // indistinguishable from `slice(0, 1)`, the `(+N more)` branch never ran, and the
-            // reason de-duplication was indistinguishable from a plain join that would repeat
-            // one sentence seven times.
+        it('caps the named shas per reason group and counts the remainder', async () => {
+            // The aggregation half of the advisory (#275 review cycle 1, TST-2). With one drop
+            // per test, `slice(0, DROPPED_COMMIT_SAMPLE_SIZE)` was indistinguishable from
+            // `slice(0, 1)` and the `(+N more)` branch never ran. Seven drops of ONE class, so
+            // the per-group cap actually bites.
             seedAlice(db);
-            // Four dateless + three present-but-unattributable, so both reasons appear.
-            // Hex, like a real git object name — `sanitizeSha` renders anything else as invalid.
-            const shas = ['da1', 'da2', 'da3', 'da4', 'bad1', 'bad2', 'bad3'];
-            const rows = shas.map((s) => listRow(s, s.startsWith('da') ? NO_DATE_EMBEDDED : BAD_DATE_EMBEDDED));
+            // >= 4 hex chars, like a real (abbreviated) git object name — `sanitizeSha` renders
+            // anything that is not a plausible object name as invalid rather than pasting it.
+            const shas = ['da01', 'da02', 'da03', 'da04', 'da05', 'da06', 'da07'];
             stubGitHub(
-                rows,
-                Object.fromEntries(
-                    shas.map((s) => [
-                        s,
-                        {body: detailBody(s, s.startsWith('da') ? NO_DATE_EMBEDDED : BAD_DATE_EMBEDDED)},
-                    ]),
-                ),
+                shas.map((s) => listRow(s, NO_DATE_EMBEDDED)),
+                Object.fromEntries(shas.map((s) => [s, {body: detailBody(s, NO_DATE_EMBEDDED)}])),
             );
 
             const result = await runSync(db);
@@ -341,24 +335,54 @@ describe('unreturned commits are never silent (#275)', () => {
             // ONE line for the repo, not one per commit — the point of aggregating.
             expect(result.errors.filter((e) => e.startsWith(COMMITS_DROPPED_PREFIX))).toHaveLength(1);
             expect(dropLine).toContain('7 commit(s)');
-            // Exactly the first five shas are named, and the remainder is counted.
-            for (const named of ['da1', 'da2', 'da3', 'da4', 'bad1']) {
+            // Exactly the first five are named…
+            for (const named of ['da01', 'da02', 'da03', 'da04', 'da05']) {
                 expect(dropLine).toContain(named);
             }
-            expect(dropLine).not.toContain('bad2');
-            expect(dropLine).not.toContain('bad3');
+            // …and the rest are counted, not listed.
+            expect(dropLine).not.toContain('da06');
+            expect(dropLine).not.toContain('da07');
             expect(dropLine).toContain('(+2 more)');
-            // Both reasons stated, each exactly once — four dateless commits must not repeat
-            // their sentence four times.
+            // The reason is stated ONCE for the group, not repeated per commit.
             expect(dropLine!.split(NO_AUTHOR_DATE_DROP_REASON)).toHaveLength(2);
-            expect(dropLine!.split(UNATTRIBUTABLE_DATE_DROP_REASON)).toHaveLength(2);
-            // Asserted against LITERALS too, not only the imported constants (#275 review
-            // cycle 2, TST-2/SEC-7): every other assertion compares a reason to the same
-            // constant the code emits, which cannot fail if the two sentences are swapped —
-            // and a swap tells an operator with a truncated response to go inspect a commit
-            // whose timestamp is fine, the exact opposite of the intended next step.
+        });
+
+        it('groups shas UNDER their reason so each carries an actionable next step', async () => {
+            // The two reasons exist only because the operator's next step differs (#275 review
+            // cycle 3, SO-4). Listing every sha beside a merged reason set said nothing about
+            // which step applied to which sha, so shas are grouped by reason.
+            //
+            // Asserted against LITERALS as well as the imported constants (review cycle 2,
+            // TST-2/SEC-7): comparing a reason only to the constant the code emits cannot fail
+            // if the two sentences are swapped — and a swap sends an operator with a truncated
+            // response to inspect a commit whose timestamp is fine.
+            seedAlice(db);
+            const shas = ['dead01', 'dead02', 'beef01'];
+            const embeddedFor = (s: string): unknown =>
+                s.startsWith('dead') ? NO_DATE_EMBEDDED : BAD_DATE_EMBEDDED;
+            stubGitHub(
+                shas.map((s) => listRow(s, embeddedFor(s))),
+                Object.fromEntries(shas.map((s) => [s, {body: detailBody(s, embeddedFor(s))}])),
+            );
+
+            const result = await runSync(db);
+
+            const dropLine = dropLineOf(result.errors);
+            expect(dropLine).toBeDefined();
+            expect(dropLine).toContain('3 commit(s)');
+            // Each group states its own count, its own reason and its own shas — so a reader can
+            // tell which two commits need the transport checked and which one needs the commit
+            // itself inspected.
+            expect(dropLine).toContain(`2 because ${NO_AUTHOR_DATE_DROP_REASON}`);
+            expect(dropLine).toContain(`1 because ${UNATTRIBUTABLE_DATE_DROP_REASON}`);
             expect(dropLine).toContain('no author date on either');
             expect(dropLine).toContain('the author date is present but');
+            // The dateless shas sit inside the dateless group, not the other one.
+            const datelessAt = dropLine!.indexOf(NO_AUTHOR_DATE_DROP_REASON);
+            const unattributableAt = dropLine!.indexOf(UNATTRIBUTABLE_DATE_DROP_REASON);
+            expect(dropLine!.indexOf('dead01')).toBeGreaterThan(datelessAt);
+            expect(dropLine!.indexOf('dead01')).toBeLessThan(unattributableAt);
+            expect(dropLine!.indexOf('beef01')).toBeGreaterThan(unattributableAt);
         });
 
         it('reports each affected repo separately, with its own shas', async () => {
@@ -371,14 +395,14 @@ describe('unreturned commits are never silent (#275)', () => {
                 // Default rows are unused; each repo gets its own list below.
                 [],
                 {
-                    aa1: {body: detailBody('aa1', NO_DATE_EMBEDDED)},
-                    aa2: {body: detailBody('aa2')},
-                    bb1: {body: detailBody('bb1', NO_DATE_EMBEDDED)},
+                    aa01: {body: detailBody('aa01', NO_DATE_EMBEDDED)},
+                    aa02: {body: detailBody('aa02')},
+                    bb01: {body: detailBody('bb01', NO_DATE_EMBEDDED)},
                 },
                 ['repo1', 'repo2'],
                 {
-                    repo1: {body: [listRow('aa1', NO_DATE_EMBEDDED), listRow('aa2')]},
-                    repo2: {body: [listRow('bb1', NO_DATE_EMBEDDED)]},
+                    repo1: {body: [listRow('aa01', NO_DATE_EMBEDDED), listRow('aa02')]},
+                    repo2: {body: [listRow('bb01', NO_DATE_EMBEDDED)]},
                 },
             );
 
@@ -392,10 +416,10 @@ describe('unreturned commits are never silent (#275)', () => {
             expect(forRepo2).toBeDefined();
             // Each line names ONLY its own repo's dropped sha — a shared accumulator would
             // leak repo1's shas into repo2's line.
-            expect(forRepo1).toContain('aa1');
-            expect(forRepo1).not.toContain('bb1');
-            expect(forRepo2).toContain('bb1');
-            expect(forRepo2).not.toContain('aa1');
+            expect(forRepo1).toContain('aa01');
+            expect(forRepo1).not.toContain('bb01');
+            expect(forRepo2).toContain('bb01');
+            expect(forRepo2).not.toContain('aa01');
             // repo1's healthy commit still landed.
             expect(dayCommits(db)).toBe(1);
         });
@@ -421,6 +445,85 @@ describe('unreturned commits are never silent (#275)', () => {
             expect(dropLine).not.toContain('[31m');
             // A newline would break the one-line-per-finding shape the sync log and CLI assume.
             expect(dropLine!.split('\n')).toHaveLength(1);
+        });
+
+        it('rejects an over-long hex sha rather than truncating it into a plausible one', async () => {
+            // #275 review cycle 3, SO-8/TST-6. Truncating a 64-char hex blob to 40 would
+            // manufacture a well-formed-looking sha that resolves to nothing, sending the
+            // operator to look up a commit that never existed. The bound lives in the allowlist,
+            // so an implausible object name is NAMED as invalid instead.
+            seedAlice(db);
+            const tooLong = 'a'.repeat(64);
+            stubGitHub([listRow(tooLong, NO_DATE_EMBEDDED)], {
+                [tooLong]: {body: detailBody(tooLong, NO_DATE_EMBEDDED)},
+            });
+
+            const result = await runSync(db);
+
+            const dropLine = dropLineOf(result.errors);
+            expect(dropLine).toBeDefined();
+            expect(dropLine).toContain('1 commit(s)');
+            expect(dropLine).toContain('<invalid sha>');
+            // Neither the whole blob nor a 40-char prefix of it appears.
+            expect(dropLine).not.toContain('a'.repeat(41));
+            expect(dropLine).not.toContain('a'.repeat(40));
+        });
+
+        it('survives a non-string sha instead of throwing away the whole provider', async () => {
+            // `sha` is an unchecked cast over untrusted body JSON, and `RegExp.test` COERCES — so
+            // a numeric sha used to reach `.slice` and raise a TypeError from a line that runs
+            // AFTER the provider's entire network walk, discarding its window on every run
+            // (#275 review cycle 3, SEC-3). It must degrade to one named-invalid drop.
+            seedAlice(db);
+            stubGitHub([{sha: 12345, commit: NO_DATE_EMBEDDED, author: {login: 'alice'}}], {
+                '12345': {body: {sha: 12345, commit: NO_DATE_EMBEDDED, author: {login: 'alice'}}},
+            });
+
+            const result = await runSync(db);
+
+            // The provider was NOT skipped wholesale…
+            expect(result.errors.some((e) => /could not be used/.test(e))).toBe(false);
+            // …the loss is reported with the sha named as invalid…
+            const dropLine = dropLineOf(result.errors);
+            expect(dropLine).toBeDefined();
+            expect(dropLine).toContain('<invalid sha>');
+            // …and the run still completed, advancing the cursor.
+            expect(readState(db, FORWARD_KEY)).toBe(result.lastSyncTime);
+        });
+
+        it('does NOT claim the window was recorded when the rollback fires AFTER the cursor advance', async () => {
+            // The sharp version of the rollback case (#275 review cycle 3, TST-3). The other
+            // rollback test below fails at `projectSnapshots`, which is BEFORE the
+            // `cursorAdvances` loop — so it never reaches the staging site and passes for a
+            // reason that is not the mechanism. `stallUpdates` runs AFTER the advances, so a
+            // throw there is the one window where the advisory has already been staged and the
+            // transaction still rolls back. Push to `errors` at the staging site instead of
+            // staging, and only this test fails.
+            seedAlice(db);
+            stubGitHub([listRow('aaaa11', NO_DATE_EMBEDDED), listRow('bbbb22')], {
+                aaaa11: {body: detailBody('aaaa11', NO_DATE_EMBEDDED)},
+                bbbb22: {body: detailBody('bbbb22')},
+            });
+            // A complete run clears the provider's stall key in `stallUpdates`; seed that exact
+            // key so the DELETE matches a row, then make the delete abort.
+            db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+                stallStateKey('github', 'test-org'),
+                JSON.stringify({runs: 1, since: '2024-01-01T00:00:00.000Z'}),
+            );
+            db.exec(`
+                CREATE TRIGGER boom BEFORE DELETE ON sync_state
+                WHEN old.key LIKE 'git_stall:%'
+                BEGIN SELECT RAISE(ABORT, 'stall-clear boom'); END;
+            `);
+
+            const result = await runSync(db);
+
+            // Positive controls: the run rolled back, and the cursor the advisory's claim rests
+            // on did not persist…
+            expect(result.errors.some((e) => /transaction rolled back/.test(e))).toBe(true);
+            expect(readState(db, FORWARD_KEY)).toBeUndefined();
+            // …so no permanence claim survived, even though the staging site DID execute.
+            expect(dropLineOf(result.errors)).toBeUndefined();
         });
 
         it('does NOT claim the window was recorded when the write transaction rolls back', async () => {

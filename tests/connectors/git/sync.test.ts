@@ -24,6 +24,7 @@ import {
     GIT_CATCHUP_WINDOW_MAX_DAYS,
     UNMATCHED_AUTHORS_PREFIX,
     PROVIDER_DELETED_MID_RUN_PREFIX,
+    COMMITS_DROPPED_PREFIX,
     isAdvisoryError,
     type GitSyncProgress,
     type GitSyncRepoStep,
@@ -36,6 +37,7 @@ import {validateGitProviderConfig} from '../../../src/connectors/git/providers/f
 import {loadServerKey} from '../../../src/connectors/git/providers/secret';
 import type {GitConnectorConfig} from '../../../src/config/types';
 import type {GitProvider, GitProviderConfig, GitRepo, GitCommit, GitFetchProgress, GitPR, GitReviewComment, GitFileDiff} from '../../../src/connectors/git/providers/types';
+import {NO_AUTHOR_DATE_DROP_REASON} from '../../../src/connectors/git/providers/types';
 
 // Stub createGitProvider (so no network) but keep validateGitProviderConfig real,
 // so the store/codec that seed DB providers in the integration tests below work.
@@ -576,16 +578,36 @@ describe('GitSync', () => {
             configs: GitProviderConfig[] = [DB_PROVIDER],
             /** Mutation applied DURING the fetch — the delete (and optional re-add). */
             duringFetch?: () => void,
+            /** The `GitCommitDrop.reason` the mock reports (#275). */
+            dropReason: string = NO_AUTHOR_DATE_DROP_REASON,
         ): Promise<SyncResult> {
             const createGitProvider = await getCreateGitProvider();
             const provider = (): ReturnType<typeof makeMockProvider> =>
                 makeMockProvider({
                     name: 'github',
                     listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
-                    getCommits: vi.fn().mockImplementation(() => {
-                        duringFetch?.();
-                        return Promise.resolve([makeProviderCommit('alice')]);
-                    }),
+                    getCommits: vi
+                        .fn()
+                        .mockImplementation(
+                            (
+                                _repo: string,
+                                _since: string,
+                                _until: string,
+                                _onProgress: unknown,
+                                onDrop?: (d: {sha: string; reason: string}) => void,
+                            ) => {
+                                duringFetch?.();
+                                // ALSO report a dropped commit (#275). The drop advisory claims
+                                // "this run has recorded its window as covered", which is false
+                                // on every path this describe block exercises — a deleted
+                                // container advances no cursor and writes nothing. The claim is
+                                // suppressed by the advisory being staged INSIDE the
+                                // `cursorAdvances` closure, below its `isWritable` guard; move
+                                // the push above that guard and the assertions below fail.
+                                onDrop?.({sha: 'dead01', reason: dropReason});
+                                return Promise.resolve([makeProviderCommit('alice')]);
+                            },
+                        ),
                     getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
                     // A PR is fetched too, so `fetchedPRRecords` is NON-EMPTY and the gate's
                     // `pr_records` arm is actually exercised. Without this the "0 pr_records"
@@ -633,6 +655,45 @@ describe('GitSync', () => {
             expect(line).toBeDefined();
             expect(line).toContain('github:db-org');
             expect(isAdvisoryError(line as string)).toBe(true);
+            // The THIRD discard path for #275's drop advisory, and the one the first version of
+            // that gate missed. This run dropped a commit (the mock reports one), the fetch was
+            // COMPLETE, and the transaction COMMITTED — so neither the completeness check nor
+            // the rollback path suppresses the line. Only `isWritable` does. Nothing may claim
+            // the window was recorded when no cursor moved and nothing was written.
+            expect(result.errors.some((e) => e.startsWith(COMMITS_DROPPED_PREFIX))).toBe(false);
+        });
+
+        // Positive control for the assertion above: the identical mock reports a drop on a run
+        // whose row SURVIVES, and there the advisory must appear. Without this, "no drop line
+        // after a delete" would also hold if the advisory were never emitted at all.
+        it('positive control — the same dropped commit IS reported when the row survives', async () => {
+            seedDev(db, 'alice');
+            insertProviderRow(db, 'db-org');
+            const result = await runWithOneCommit(db);
+            const dropLine = result.errors.find((e) => e.startsWith(COMMITS_DROPPED_PREFIX));
+            expect(dropLine).toBeDefined();
+            expect(dropLine).toContain('dead01');
+            // The `(+N more)` suffix must not appear for a single drop — `more > 0`, not `>= 0`.
+            expect(dropLine).not.toContain('more)');
+        });
+
+        // #275 review cycle 3, SEC-2: the reason crosses a provider boundary before reaching a
+        // terminal and `sync_logs`, and TypeScript's union is not a runtime control. A provider
+        // that interpolated an API error body (or a response field) must not reach the log.
+        it('names an unrecognized drop reason instead of pasting it into the advisory', async () => {
+            seedDev(db, 'alice');
+            insertProviderRow(db, 'db-org');
+            const result = await runWithOneCommit(
+                db,
+                [DB_PROVIDER],
+                undefined,
+                'rate limit exceeded for token ghp_SECRET[31m',
+            );
+            const dropLine = result.errors.find((e) => e.startsWith(COMMITS_DROPPED_PREFIX));
+            expect(dropLine).toBeDefined();
+            expect(dropLine).toContain('<unrecognized drop reason>');
+            expect(dropLine).not.toContain('ghp_SECRET');
+            expect(dropLine).not.toContain('rate limit exceeded');
         });
 
         // Positive control for the assertions above: with the row INTACT the same run writes a

@@ -32,10 +32,12 @@ import type {
     GitProviderConfig,
     GitProviderType,
     GitCommitDrop,
+    GitCommitDropReason,
     GitFetchProgressListener,
     GitFileDiff,
     GitPR,
 } from './providers/types.js';
+import {COMMIT_DROP_REASONS} from './providers/types.js';
 import {promoteAllCandidates} from './onboarding.js';
 import {ensureTeam} from '../../registry/teams.js';
 import {resolveAutoCreateSettings, type AutoCreateSettings} from '../../config/git-auto-create.js';
@@ -160,14 +162,37 @@ const DROPPED_COMMIT_SAMPLE_SIZE = 5;
  * The sha is raw response JSON, and this line is printed to a terminal by the CLI and
  * persisted into `sync_logs.errors`. Allowlisted rather than escaped (the graduated
  * validate-at-the-boundary rule): a git object name is hex, so anything else is not a sha, and
- * a value that survives this cannot carry a newline, an ANSI escape, or unbounded length.
- * Truncated to 40 — a full SHA-1 — so a blob cannot flood the log; a non-hex value renders as
- * `<invalid>` rather than being silently dropped, since "GitHub returned a malformed sha" is
- * itself something the operator needs to see.
+ * a value that survives this cannot carry a newline, an ANSI escape, or excess length.
+ *
+ * TOTAL over `unknown`, which is the point of the signature. `sha` is declared `string` by a
+ * cast over an unvalidated body, so it can be a number or an array at runtime — and
+ * `RegExp.test` COERCES, so a bare pattern test would pass `12345` straight through and the
+ * next `.slice` would throw a `TypeError` out of a line that runs AFTER the provider's whole
+ * network walk, discarding the window. `typeof` first, exactly as `isAttributableDate` does.
+ *
+ * The length bound lives IN the pattern rather than in a trailing `slice`: truncating a
+ * 64-char hex value to 40 would manufacture a well-formed-looking sha that resolves to
+ * nothing, sending the operator to look up a commit that never existed. Anything not a
+ * plausible object name renders as `<invalid sha>` instead — visibly wrong, because "the
+ * provider returned a malformed sha" is itself something the operator needs to see.
  */
-function sanitizeSha(sha: string): string {
-    const hex = /^[0-9a-fA-F]+$/.test(sha) ? sha : '';
-    return hex === '' ? '<invalid sha>' : hex.slice(0, 40);
+function sanitizeSha(sha: unknown): string {
+    return typeof sha === 'string' && /^[0-9a-fA-F]{4,40}$/.test(sha) ? sha : '<invalid sha>';
+}
+
+/**
+ * A drop reason, safe to interpolate into the same line.
+ *
+ * A runtime allowlist against {@link COMMIT_DROP_REASONS}, not just the compile-time
+ * {@link GitCommitDropReason} union — the graduated rule is explicit that a TS union at a
+ * trust boundary is not a control, and this value crosses a provider boundary before reaching
+ * a terminal and `sync_logs`. An unrecognized value is named rather than pasted through, so a
+ * future provider interpolating an API error body cannot reach the log through this field.
+ */
+function sanitizeDropReason(reason: unknown): string {
+    return COMMIT_DROP_REASONS.includes(reason as GitCommitDropReason)
+        ? (reason as string)
+        : '<unrecognized drop reason>';
 }
 
 /** Every sentinel that marks an `errors` entry as advisory rather than a failure. */
@@ -1893,16 +1918,33 @@ async function fetchProviderData(
     // included so the operator can go look one up — not the full set, so the line stays
     // readable; the count is the complete figure.
     const droppedAdvisories = droppedByRepo.map(({repo: droppedRepo, drops}) => {
-        const reasons = [...new Set(drops.map((d) => d.reason))].join('; ');
-        const sample = drops.slice(0, DROPPED_COMMIT_SAMPLE_SIZE).map((d) => sanitizeSha(d.sha));
-        const more = drops.length - sample.length;
+        // Shas grouped UNDER their reason, not listed beside a merged reason set. The two
+        // reasons exist only because the operator's next step differs, and a line that says
+        // "reasons: A; B — affected: 5 shas" tells them nothing about which step applies to
+        // which sha. Insertion-ordered, so the output is deterministic.
+        const byReason = new Map<string, string[]>();
+        for (const drop of drops) {
+            const reason = sanitizeDropReason(drop.reason);
+            const shas = byReason.get(reason);
+            if (shas === undefined) byReason.set(reason, [sanitizeSha(drop.sha)]);
+            else shas.push(sanitizeSha(drop.sha));
+        }
+        // The SAMPLE cap is per reason group, so a systemic drop of one class cannot crowd the
+        // other class out of the line entirely.
+        const groups = [...byReason].map(([reason, shas]) => {
+            const sample = shas.slice(0, DROPPED_COMMIT_SAMPLE_SIZE);
+            const more = shas.length - sample.length;
+            return (
+                `${shas.length} because ${reason} — e.g. ${sample.join(', ')}` +
+                `${more > 0 ? ` (+${more} more)` : ''}`
+            );
+        });
         return (
             `${COMMITS_DROPPED_PREFIX} [${providerType}/${droppedRepo}] ${drops.length} ` +
             `commit(s) the provider listed could not be imported, and this run has recorded ` +
             `its window as covered — nothing re-asks them. There is no targeted re-fetch: ` +
             `"sync older history" only extends STRICTLY older than the earliest synced ` +
-            `instant, so it cannot reach a forward window. Reason(s): ${reasons}. ` +
-            `Affected: ${sample.join(', ')}${more > 0 ? ` (+${more} more)` : ''}.`
+            `instant, so it cannot reach a forward window. ${groups.join('; ')}.`
         );
     });
 

@@ -554,6 +554,34 @@ describe('GitHubProvider', () => {
             expect(commits[0].author.username).toBe('');
         });
 
+        it('classifies the reason from the DETAIL copy when only it carries a date', async () => {
+            // The other operand of `hasDate(detail…) || hasDate(list…)` (#275 review cycle 3,
+            // TST-4): narrowing the disjunction to the list row alone left the suite green, and
+            // would report a real commit with a garbled timestamp as a truncated response.
+            const garbled = {
+                author: {name: 'A', email: 'a@e.com', date: '9999-99-99T00:00:00Z'},
+                message: 'm',
+            };
+            vi.stubGlobal(
+                'fetch',
+                makeFetchMock([
+                    // List row: no embedded object at all.
+                    {body: [{sha: 'aaa111', author: {login: 'alice'}}]},
+                    // Detail: present, with a date that is shaped like a day but is not one.
+                    {body: {sha: 'aaa111', commit: garbled, author: {login: 'alice'}, stats: {additions: 1, deletions: 0, total: 1}}},
+                ]),
+            );
+
+            const onDrop = vi.fn();
+            const commits = await provider.getCommits('my-repo', '', '', undefined, onDrop);
+
+            expect(commits).toEqual([]);
+            expect(onDrop).toHaveBeenCalledWith({
+                sha: 'aaa111',
+                reason: UNATTRIBUTABLE_DATE_DROP_REASON,
+            });
+        });
+
         it('classifies the reason from EITHER copy carrying a date, not just the detail', async () => {
             // The reason is chosen by `hasDate(detail…) || hasDate(list…)`, and every other
             // fixture makes the two copies agree, so `||` could be narrowed to either operand
@@ -585,6 +613,55 @@ describe('GitHubProvider', () => {
                 sha: 'aaa111',
                 reason: UNATTRIBUTABLE_DATE_DROP_REASON,
             });
+        });
+
+        it('refuses a cache HIT when the list row date is unusable, even with a memo present', async () => {
+            // #275 review cycle 3, TST-1 — the highest-consequence gate in this loop, and the
+            // only one where a hit/miss divergence is FATAL rather than cosmetic.
+            //
+            // The hit gate reads the LIST row's date, which is the row it would then build the
+            // whole commit from. If the gate only checked presence (the pre-#275 code), a memo
+            // written on a cold run — where the DETAIL supplied a good date — would on the next
+            // warm run be served alongside the list row's UNUSABLE date. That commit then reaches
+            // `raw_author_daily`, whose validator THROWS inside the run's single all-providers
+            // write transaction: every provider's window rolls back, and because
+            // `commit_diffstats` has no invalidation the hit recurs forever. The connector is
+            // bricked permanently.
+            const badDate = '+033658-09-27T00:00:00.000Z';
+            const cache = {
+                load: vi
+                    .fn()
+                    .mockReturnValue(
+                        new Map([['aaa111', {additions: 5, deletions: 1, entries: [], absent: false}]]),
+                    ),
+                put: vi.fn(),
+            };
+            const cachingProvider = new GitHubProvider(CONFIG, cache);
+            const fetchMock = makeFetchMock([
+                {
+                    body: [
+                        {
+                            sha: 'aaa111',
+                            commit: {author: {name: 'A', email: 'a@e.com', date: badDate}, message: 'm'},
+                            author: {login: 'alice'},
+                        },
+                    ],
+                },
+                // The detail carries a GOOD date, so the commit is importable — via the fetch.
+                {body: makeCommitDetailFixture('aaa111')},
+            ]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            const commits = await cachingProvider.getCommits('my-repo', '', '');
+
+            // The memo was NOT served: the detail was requested (2 calls, not 1)…
+            expect(fetchMock).toHaveBeenCalledTimes(2);
+            // …so the commit carries the detail's usable date, never the list row's bad one.
+            expect(commits).toHaveLength(1);
+            expect(commits[0].date).toBe('2024-01-15T10:00:00Z');
+            expect(commits[0].date).not.toBe(badDate);
+            // And the churn is the freshly-fetched value, not the memo's 5/1.
+            expect(commits[0].additions).toBe(40);
         });
 
         it('classifies a null or empty date as ABSENT, not as present-but-unattributable', async () => {

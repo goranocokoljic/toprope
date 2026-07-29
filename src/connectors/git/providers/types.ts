@@ -244,30 +244,35 @@ export type GitFetchProgressListener = (progress: GitFetchProgress) => void;
 /**
  * Every reason a provider may give for dropping a commit it listed (#275).
  *
- * A CLOSED set, and a runtime-enumerable one, for the reason the project's allowlist rule
- * gives: this string is pushed verbatim into `SyncResult.errors`, which the CLI prints to a
- * terminal and the scheduler persists into `sync_logs.errors`. A `string` field would have
- * left "never interpolate a response body into this" as a comment a future provider is free
- * to ignore; the type is what actually forbids it.
- *
- * Both members describe the SAME defect class — the commit cannot be attributed to a UTC day
- * — split only because the operator's next step differs: a commit with no date at all is a
+ * Both members describe the SAME defect class — the commit cannot be attributed to a day —
+ * split only because the operator's next step differs: a commit with no date at all is a
  * truncated/garbled response, while one with an out-of-range or non-ISO date is a real commit
  * with a timestamp this pipeline cannot key on.
+ *
+ * Declared as SINGLE unbroken literals, deliberately. `'a' + 'b'` is not constant-folded by
+ * TypeScript, so a concatenated const widens to `string` and every type derived from it —
+ * including {@link GitCommitDropReason} — silently accepts any string. The whole point of
+ * naming these is that the type, not a comment, is what keeps a response body out of a line
+ * the CLI prints to a terminal and the scheduler persists into `sync_logs.errors`; a widened
+ * union provides none of that. Long lines are the price.
+ *
+ * The compile-time union is still only half the control, because the sink receives values
+ * across a provider boundary that a future implementation could be sloppy about — see the
+ * runtime allowlist in `sync.ts` that checks against {@link COMMIT_DROP_REASONS}. That
+ * pairing is the project's rule: a runtime allowlist at the trust boundary, not a
+ * compile-time union alone.
  */
-export const NO_AUTHOR_DATE_DROP_REASON =
-    'no author date on either the commit list row or the commit detail response, so the ' +
-    'commit cannot be attributed to a day';
+export const NO_AUTHOR_DATE_DROP_REASON = 'no author date on either the commit list row or the commit detail response, so the commit cannot be attributed to a day';
 
-export const UNATTRIBUTABLE_DATE_DROP_REASON =
-    'the author date is present but is not a YYYY-MM-DDT… day the pipeline can key on, so ' +
-    'the commit cannot be attributed to a day';
+export const UNATTRIBUTABLE_DATE_DROP_REASON = 'the author date is present but is not a day the pipeline can key on, so the commit cannot be attributed to a day';
 
 /**
- * NAMED at the declaration site and the tuple built from the names — never the reverse. A
- * tuple indexed by position (`COMMIT_DROP_REASONS[0]`) joins the two names to the two
- * sentences by ordinal, so reordering the array silently swaps every reported reason while
- * every test that compares against the same names stays green.
+ * The reasons as a runtime-enumerable set, for the allowlist check at the reporting sink.
+ *
+ * NAMED at the declaration site above and this tuple built from the names — never the reverse.
+ * A tuple indexed by position (`COMMIT_DROP_REASONS[0]`) would join the two names to the two
+ * sentences by ordinal, so reordering it would silently swap every reported reason while every
+ * test comparing against the same names stayed green.
  */
 export const COMMIT_DROP_REASONS = [
     NO_AUTHOR_DATE_DROP_REASON,
@@ -316,7 +321,7 @@ export interface GitCommitDrop {
  * red — see `isAdvisoryError`). The admin "Sync now" route classifies advisories out and
  * records `status: 'ok'`, which NULLs `last_sync_error`, so on that path the line is not
  * persisted at all, and no dashboard surface renders `sync_logs.errors` today. Closing that
- * gap is cross-cutting across all six advisory sentinels and is tracked separately.
+ * gap is cross-cutting across all six advisory sentinels and is tracked in #289.
  */
 export type GitCommitDropListener = (drop: GitCommitDrop) => void;
 
@@ -340,7 +345,7 @@ export interface GitProvider {
     // must THROW instead, so the fault reaches the in-run repo retry and then #231's cursor
     // hold.
     //
-    // TWO KNOWN EXCEPTIONS, stated rather than implied — the rule above is not yet true of
+    // THREE KNOWN EXCEPTIONS, stated rather than implied — the rule above is not yet true of
     // every implementation, and a reader must not infer from a clean `errors[]` that no
     // provider dropped anything:
     //   - Bitbucket's in-memory `until` filter legitimately removes commits outside the
@@ -356,8 +361,8 @@ export interface GitProvider {
     //     run's single all-providers write transaction. One such GitLab commit therefore rolls
     //     back the windows of every OTHER provider in the run too, identically, on every run.
     //     GitHub is pinned against this at its own boundary (see `isAttributableDate`); the
-    //     durable fix is a shared pin or a per-row skip at the write boundary, tracked
-    //     separately. Do not read GitHub's pin as protecting the run.
+    //     durable fix is a shared pin or a per-row skip at the write boundary, tracked in #290.
+    //     Do not read GitHub's pin as protecting the run.
     getCommits(
         repo: string,
         since: string,
