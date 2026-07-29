@@ -12,6 +12,7 @@ import type {
     GitAuthor,
     GitHubProviderConfig,
     GitFetchProgressListener,
+    GitCommitDropListener,
 } from './types.js';
 import {normalizeContainer} from './container.js';
 import {loadDiffstats} from './diffstat.js';
@@ -30,6 +31,19 @@ import {
 const BASE_URL = 'https://api.github.com';
 // Pause proactively when remaining requests drops below this threshold
 const RATE_LIMIT_PAUSE_THRESHOLD = 100;
+
+/**
+ * The `GitCommitDrop.reason` for the one commit loss GitHub can still produce (#275): a
+ * commit whose author date is missing from BOTH copies of the embedded `commit` object.
+ *
+ * A constant, not an interpolated string, because it is pushed verbatim into
+ * `SyncResult.errors` and rendered in the admin UI — see `GitCommitDrop.reason`. Exported so
+ * the tests assert against the string the code actually emits rather than a copy of it that
+ * can drift.
+ */
+export const NO_AUTHOR_DATE_DROP_REASON =
+    'no author date on either the commit list row or the commit detail response, so the ' +
+    'commit cannot be attributed to a day';
 
 function parseNextLink(header: string | null): string | null {
     if (!header) return null;
@@ -335,6 +349,7 @@ export class GitHubProvider implements GitProvider {
         since: string,
         until: string,
         onProgress?: GitFetchProgressListener,
+        onDrop?: GitCommitDropListener,
     ): Promise<GitCommit[]> {
         const params = new URLSearchParams({per_page: '100'});
         if (since) params.set('since', since);
@@ -360,9 +375,10 @@ export class GitHubProvider implements GitProvider {
         // done/total immediately, then tick every commit.
         //
         // The tick counts commits PROCESSED, not commits returned, so it also advances
-        // over the one lossy branch below (a detail with no author date — a data-shape
-        // problem no retry can fix). It no longer advances over a FAILED detail fetch:
-        // that now throws (#272, review cycle 3), see the catch below.
+        // over the one lossy branch below (a commit with no author date anywhere — a
+        // data-shape problem no retry can fix, now reported through `onDrop` rather than
+        // dropped silently: #275). It no longer advances over a FAILED detail fetch:
+        // that now throws (#272, review cycle 3), see the note below.
         let processed = 0;
         onProgress?.({done: 0, total: summaries.length});
         // The whole repo's already-known commit stats, resolved in ONE batched query rather
@@ -371,12 +387,16 @@ export class GitHubProvider implements GitProvider {
         const cached = loadDiffstats(this.diffstatCache, repo, summaries.map((s) => s.sha));
         for (const summary of summaries) {
             try {
-                // THE HIT AND THE WRITE ARE GATED ON THE SAME CONDITION — a usable author
-                // date — so the cache can neither DROP a commit the un-cached path kept nor
-                // ADD one it dropped. A list row with no author date simply falls through to
-                // the detail fetch exactly as it always did; that commit is discarded either
-                // way (see the guard below), and the cost is one re-request for a data-shape
-                // anomaly no retry can fix (the remaining half of #275).
+                // A HIT PRODUCES EXACTLY WHAT A FETCH PRODUCES, in both directions, which is
+                // what stops the cache DROPPING a commit the un-cached path keeps or ADDING
+                // one it drops. Since #275 the un-cached path accepts a usable author date
+                // from EITHER copy of the embedded `commit` object, so it is a superset of
+                // this gate rather than the same condition — and both directions still hold:
+                //   - hit here (list row has a date) → the un-cached path reads the same list
+                //     row as its fallback, so it keeps the commit too;
+                //   - no date on the list row → no lookup, straight to the detail fetch, and
+                //     the commit is kept iff the detail carries one. The only cost is one
+                //     re-request per run for a data-shape anomaly no retry can fix.
                 const listCommit = summary.commit;
                 if (listCommit?.author?.date) {
                     const hit = cached.get(summary.sha);
@@ -427,14 +447,43 @@ export class GitHubProvider implements GitProvider {
                 const additions = detail.stats?.additions ?? 0;
                 const deletions = detail.stats?.deletions ?? 0;
 
-                const detailCommit = detail.commit;
-                if (!detailCommit?.author?.date) continue;
+                // The list row and the detail response carry the IDENTICAL embedded `commit`
+                // object — that identity is precisely what licenses the cache-hit path above
+                // to build a whole `GitCommit` from the list row alone. So either copy
+                // answers, and a shape anomaly in ONE of two copies of the same object is not
+                // a reason to lose the commit (#275): prefer the detail, which is the response
+                // just fetched, and fall back to the list row. Before this, a detail whose
+                // `commit` was missing dropped the commit outright even when the list row —
+                // already in hand, no extra request — carried everything needed.
+                //
+                // ONE copy supplies the whole identity — never a mix. `author` (the linked
+                // GitHub user) is legitimately `null` on an unlinked commit, so it is NOT
+                // fallback-eligible on its own: reading it off the list row while taking the
+                // date from a well-formed detail would turn "GitHub reports no linked user"
+                // into "the other copy happened to name one". Falling back is only sound when
+                // the detail body as a whole is unusable, which is exactly this flag.
+                const fromListRow = !detail.commit?.author?.date;
+                const detailCommit = fromListRow ? listCommit : detail.commit;
+                if (!detailCommit?.author?.date) {
+                    // UNATTRIBUTABLE, not unfetched. `raw_author_daily` is keyed by (raw
+                    // identity, DATE), so with no date there is no cell to write this commit
+                    // to — there is nothing to salvage and nothing a retry would change. That
+                    // is why this reports a drop instead of throwing: a throw would hold the
+                    // provider's whole cursor (#231) on a fault that re-occurs identically
+                    // every run, i.e. it would brick the provider rather than heal anything.
+                    //
+                    // The loss is therefore permanent, and reporting it is the entire point of
+                    // #275 — this commit used to vanish with nothing in `errors[]` and the
+                    // cursor already moved past it. `summary.sha`, the spelling GitHub's own
+                    // commit list used, so the operator can look the commit up.
+                    onDrop?.({sha: summary.sha, reason: NO_AUTHOR_DATE_DROP_REASON});
+                    continue;
+                }
 
-                // Cached AFTER the author-date guard above, so the write is gated on exactly
-                // the condition the hit path reads on (#273). Writing before it would let a
-                // commit the un-cached path DROPS be pushed by a later warm run — the
-                // opposite divergence to the one the hit gate prevents, and just as much a
-                // break of "a hit produces what a fetch produces".
+                // Cached AFTER the author-date guard above, so a commit the un-cached path
+                // DROPS can never be pushed by a later warm run (#273) — the opposite
+                // divergence to the one the hit gate prevents, and just as much a break of
+                // "a hit produces what a fetch produces".
                 //
                 // Keyed on `summary.sha`, the same spelling `load` was asked for, so a write
                 // is guaranteed to be found by the next run's read.
@@ -453,11 +502,21 @@ export class GitHubProvider implements GitProvider {
                 });
 
                 commits.push({
-                    sha: detail.sha,
+                    // `summary.sha`, not `detail.sha`: identical by construction (the detail
+                    // was requested BY this sha), but it is also the spelling the diffstat
+                    // cache is keyed on above and the one the drop report names — and on the
+                    // fallback path the detail body is the one that came back malformed, so
+                    // reading the sha off the list row keeps every use of it consistent.
+                    sha: summary.sha,
                     author: {
                         name: detailCommit.author.name,
                         email: detailCommit.author.email,
-                        username: detail.author?.login ?? '',
+                        // Read off the SAME copy as the date/name/email above — see
+                        // `fromListRow`. `''` when that copy names no GitHub user, which on a
+                        // well-formed detail is a real answer (an unlinked commit, e.g. a
+                        // merge bot) and not a shape anomaly to route around.
+                        username:
+                            (fromListRow ? summary.author?.login : detail.author?.login) ?? '',
                     },
                     date: detailCommit.author.date,
                     message: detailCommit.message,
@@ -490,8 +549,13 @@ export class GitHubProvider implements GitProvider {
                 // GitHub's own commit list just returned is not legitimately absent, so a 404 here
                 // is an anomaly to surface, not a "this commit has no diff" answer.
                 //
-                // This closes the half of #275 that #272 could reach. What remains for #275 is the
-                // OTHER lossy branch — the `continue` above, a data-shape problem no retry fixes.
+                // Together with the `onDrop` report above, these are now the ONLY two ways this
+                // loop can return fewer commits than it listed, and BOTH are visible: a recoverable
+                // fault throws (here), an unattributable commit is reported (there). Neither is
+                // silent — that is what #275 closed. Keep it that way: a third, unreported
+                // `continue` restores exactly the permanent invisible snapshot gap #231/#235/#275
+                // exist to prevent, and see `GitProvider.getCommits` for why a short list on its
+                // own is read by the caller as "window fully covered".
             } finally {
                 // Its own counter, unlike the other two providers: the `continue` above skips the
                 // push, so `commits.length` would stall while the loop kept working. In a `finally`

@@ -31,6 +31,7 @@ import {loadServerKey} from './providers/secret.js';
 import type {
     GitProviderConfig,
     GitProviderType,
+    GitCommitDrop,
     GitFetchProgressListener,
     GitFileDiff,
     GitPR,
@@ -122,6 +123,40 @@ export const RETRY_HEALED_PREFIX = 'Recovered after retry:';
  */
 export const DIFFSTAT_CACHE_DEGRADED_PREFIX = 'Diffstat cache degraded:';
 
+/**
+ * Prefix of the advisory pushed when a provider LISTED commits it could not return — see
+ * {@link GitCommitDrop} and `GitProvider.getCommits` for the contract (#275).
+ *
+ * Deliberately NOT a failure, and this is the load-bearing part of the decision. A drop is
+ * permanent and non-retryable by construction: the commit was fetched and its response
+ * carries no author date, so `raw_author_daily` — keyed by (raw identity, DATE) — has no cell
+ * to put it in, and re-covering the window returns the identical unusable response. Turning
+ * the provider red would therefore (a) make `sync-pipeline` re-run the ENTIRE git connector,
+ * a second full network fetch, on every run forever, and (b) never recover the commit. The
+ * same argument as {@link DIFFSTAT_CACHE_DEGRADED_PREFIX}: a fault no retry can fix must not
+ * be classified as one that retrying helps.
+ *
+ * But it must be SAID, and this line is the whole point of #275. Before it, such a commit
+ * vanished with nothing in `errors[]`, nothing in the sync log, and the forward cursor already
+ * advanced past it — a permanent, silent hole in `git_snapshots`, which is the exact failure
+ * class #231/#235 exist to prevent. This is also the one place where "the run completed" stops
+ * implying "every commit in the window is present", so the advisory states the loss plainly
+ * rather than leaving the operator to infer it from a `diff N/M` counter (the only trace it
+ * previously left — see `GitSyncProgress.repo_step`).
+ *
+ * A RECOVERABLE fetch fault deliberately matches nothing here: it throws out of `getCommits`,
+ * lands on the `Failed to fetch commits:` line, and holds the provider's cursor (#231). Those
+ * two losses are opposites and must classify differently.
+ */
+export const COMMITS_DROPPED_PREFIX = 'Commits dropped as unattributable:';
+
+/**
+ * How many dropped shas the {@link COMMITS_DROPPED_PREFIX} advisory names before falling back
+ * to "+N more". Enough to go look one up in the provider's UI; small enough that a systemic
+ * shape problem across thousands of commits still produces one readable line.
+ */
+const DROPPED_COMMIT_SAMPLE_SIZE = 5;
+
 /** Every sentinel that marks an `errors` entry as advisory rather than a failure. */
 const ADVISORY_PREFIXES: readonly string[] = [
     UNMATCHED_AUTHORS_PREFIX,
@@ -130,6 +165,7 @@ const ADVISORY_PREFIXES: readonly string[] = [
     PROVIDER_DELETED_MID_RUN_PREFIX,
     RETRY_HEALED_PREFIX,
     DIFFSTAT_CACHE_DEGRADED_PREFIX,
+    COMMITS_DROPPED_PREFIX,
 ];
 
 /**
@@ -231,11 +267,14 @@ export interface GitSyncProgress {
      * Two caveats a reader of these numbers needs:
      *   - On GitHub the `commits` total counts commits LISTED while the `diffs` total
      *     counts commits RETURNED, so `commit N/N` followed by `diff 0/M` with M < N
-     *     is normal (a commit with no author date is skipped) and is also the only
-     *     visible trace of a partial per-commit detail failure — see #275. GitLab
-     *     lists exactly what it returns, and Bitbucket's total is commits RETAINED
-     *     after its in-memory `until` filter (see #276), so on those two the `diffs`
-     *     total always equals the `commits` total.
+     *     means the run dropped N − M commits it could not attribute to a day. Since
+     *     #275 that gap is no longer something a reader has to infer from these two
+     *     numbers: every dropped commit is named in `SyncResult.errors` under
+     *     {@link COMMITS_DROPPED_PREFIX}, which is where an operator should look —
+     *     these counters are a live indicator, not a record, and are gone the moment
+     *     the repo finishes. GitLab lists exactly what it returns, and Bitbucket's
+     *     total is commits RETAINED after its in-memory `until` filter (see #276), so
+     *     on those two the `diffs` total always equals the `commits` total.
      *   - The `diffs` step no longer re-walks the per-commit endpoint (#271). All three
      *     providers now return each commit's diff on `GitCommit.diffs` from the fetch they
      *     already made during the `commits` step, so on any such provider `diffs` is a
@@ -1554,8 +1593,29 @@ async function fetchProviderData(
         // Retried in-run on a healable fault (#272). The result is ASSIGNED, never appended
         // to, so a retry that re-pages the same window replaces the previous attempt's partial
         // list rather than doubling it — and nothing has been pushed into `allCommits` yet.
+        //
+        // Commits this repo's provider LISTED but could not return (#275). Reset at the top of
+        // EVERY attempt, not once per repo: `fetchRepoWithRetry` re-runs the whole call, which
+        // re-pages the same window and re-reports the same drops, so a per-repo list would
+        // multiply the count by the number of attempts. Same reasoning as the ASSIGNED (never
+        // appended) commit result above — a retry replaces the previous attempt, it does not
+        // add to it.
+        const droppedCommits: GitCommitDrop[] = [];
         const commitFetch = await fetchRepoWithRetry(
-            () => provider.getCommits(repoName, since, until, onCommitProgress),
+            () => {
+                droppedCommits.length = 0;
+                return provider.getCommits(
+                    repoName,
+                    since,
+                    until,
+                    onCommitProgress,
+                    // Unconditional, unlike `onCommitProgress` — the drop report is not
+                    // observability, it is the only record that data was lost, so it must exist
+                    // on the observer-free scheduled path too (that path is where nearly every
+                    // real sync runs).
+                    (drop) => droppedCommits.push(drop),
+                );
+            },
             () => reportStep('commits', 0, null),
             GIT_RUN_RETRY_SLEEP_BUDGET_MS,
             `[${providerType}/${repoName}] commit fetch`,
@@ -1574,6 +1634,27 @@ async function fetchProviderData(
             continue;
         }
         const rawCommits = commitFetch.value;
+        // Reported only on the SUCCESS path. A failed commit fetch already discards this
+        // repo's whole result and holds the provider's cursor, so the window is re-covered
+        // next run — announcing a permanent loss over data that is about to be re-fetched
+        // would be false. (The `continue` above is what makes this reachable only on success.)
+        //
+        // Aggregated per repo with a count, like the review-comment/verdict failures below and
+        // for the same reason: a systemic shape problem hits thousands of commits, and an
+        // `errors` list that long is unreadable in the sync log and the admin UI alike. A
+        // bounded sample of shas is included so the operator can actually go look at one.
+        if (droppedCommits.length > 0) {
+            const reasons = [...new Set(droppedCommits.map((d) => d.reason))].join('; ');
+            const sample = droppedCommits.slice(0, DROPPED_COMMIT_SAMPLE_SIZE).map((d) => d.sha);
+            const more = droppedCommits.length - sample.length;
+            errors.push(
+                `${COMMITS_DROPPED_PREFIX} [${providerType}/${repoName}] ${droppedCommits.length} ` +
+                    `commit(s) the provider listed could not be imported and are PERMANENTLY ` +
+                    `absent from this window — re-running the sync will not recover them. ` +
+                    `Reason(s): ${reasons}. Affected: ${sample.join(', ')}` +
+                    `${more > 0 ? ` (+${more} more)` : ''}.`,
+            );
+        }
         report?.((p) => {
             p.commits_fetched += rawCommits.length;
         });

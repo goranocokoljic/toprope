@@ -241,6 +241,43 @@ export interface GitFetchProgress {
  */
 export type GitFetchProgressListener = (progress: GitFetchProgress) => void;
 
+/**
+ * One commit a provider LISTED but cannot return (#275).
+ *
+ * This is not a fetch failure and must never be reported as one. A fetch failure is
+ * RECOVERABLE — it propagates out of `getCommits`, so #231 holds the provider's cursor and
+ * the whole window is re-covered next run. A drop reported here is the opposite: the commit
+ * WAS fetched and the response is simply unusable for attribution, so re-covering the window
+ * would produce the identical unusable response forever. Holding the cursor for it would
+ * brick the provider permanently rather than heal anything, which is why the two travel by
+ * different channels (a throw vs. this listener) instead of one shared "incomplete" flag.
+ *
+ * The loss is therefore PERMANENT, which is exactly why it has to be said out loud: before
+ * #275 such a commit vanished with nothing in `errors[]`, no trace in the sync log, and a
+ * cursor already advanced past it.
+ */
+export interface GitCommitDrop {
+    /** The sha as it appeared in the provider's own commit list. */
+    sha: string;
+    /**
+     * Why the commit is unusable, in words an operator can act on. Provider-authored and
+     * always a module-level constant on the provider (never interpolated from a response),
+     * because it is pushed verbatim into `SyncResult.errors` and rendered in the admin UI.
+     */
+    reason: string;
+}
+
+/**
+ * Optional sink for {@link GitCommitDrop}s, handed to `getCommits` alongside the progress
+ * listener and invoked through `?.()` the same way — a caller that supplies none pays
+ * nothing, and the argument object is never even constructed.
+ *
+ * Per-commit rather than a returned count so the caller can name the affected shas; the
+ * caller aggregates to one line per repo (a systemic shape problem hits thousands of commits,
+ * and an `errors` list that long is unreadable in the sync log and the admin UI alike).
+ */
+export type GitCommitDropListener = (drop: GitCommitDrop) => void;
+
 export interface GitProvider {
     name: GitProviderType;
     listRepos(): Promise<GitRepo[]>;
@@ -252,11 +289,21 @@ export interface GitProvider {
     // An implementation that fetches per-commit diff data while building its result MUST
     // also expose it on `GitCommit.diffs`, so the caller reuses that one fetch instead of
     // walking the same endpoint again per commit (#271).
+    //
+    // `onDrop` (optional) is the ONLY way an implementation may return fewer commits than it
+    // listed (#275). Returning a short list silently is forbidden: the caller reads a normal
+    // return as "this window is fully covered" and advances the provider's cursor past it
+    // (#231), so an unreported drop is a permanent, invisible hole in `git_snapshots`. An
+    // implementation that cannot use a listed commit must report it here; one that can retry
+    // must THROW instead, so the fault reaches the in-run repo retry and then #231's cursor
+    // hold. Bitbucket's in-memory `until` filter is neither — a commit outside the requested
+    // window was never in this call's result set to begin with (#276).
     getCommits(
         repo: string,
         since: string,
         until: string,
         onProgress?: GitFetchProgressListener,
+        onDrop?: GitCommitDropListener,
     ): Promise<GitCommit[]>;
     // `onProgress` (optional) reports the PR list paging in. The per-PR
     // comment/review fan-out lives in the sync loop, which reports that itself.

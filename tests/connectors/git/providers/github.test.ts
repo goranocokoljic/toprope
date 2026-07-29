@@ -1,5 +1,8 @@
 import {describe, it, expect, beforeEach, afterEach, vi} from 'vitest';
-import {GitHubProvider} from '../../../../src/connectors/git/providers/github';
+import {
+    GitHubProvider,
+    NO_AUTHOR_DATE_DROP_REASON,
+} from '../../../../src/connectors/git/providers/github';
 import {
     MAX_SERVER_ERROR_RETRIES,
     PROBE_SERVER_ERROR_RETRIES,
@@ -381,15 +384,16 @@ describe('GitHubProvider', () => {
             ]);
         });
 
-        it('still reaches total when a commit is skipped for having no author date', async () => {
-            // aaa111 and ccc333 map normally; bbb222's detail carries no author date and is
-            // skipped by a `continue`. Two GitCommits come back, but the counter must still reach
-            // 3/3 — a counter that stops short of its total is exactly the "hung" symptom of #270.
+        it('still reaches total when a commit is dropped for having no author date', async () => {
+            // aaa111 and ccc333 map normally; bbb222 carries no author date on EITHER copy of
+            // the embedded `commit` object and is dropped by the `continue`. Two GitCommits come
+            // back, but the counter must still reach 3/3 — a counter that stops short of its
+            // total is exactly the "hung" symptom of #270.
             //
-            // The `continue` is now the ONLY lossy branch left in this loop: a failed detail fetch
-            // throws (#272, review cycle 3) rather than being swallowed, so it no longer reaches
-            // the counter at all. It is also what remains of #275 — a data-shape problem no retry
-            // can fix, unlike a fetch fault.
+            // That `continue` is the only lossy branch left in this loop, and since #275 it is
+            // not silent: the sha is reported through `onDrop` so the sync can surface it. A
+            // failed detail fetch takes the other channel entirely — it throws (#272, review
+            // cycle 3) rather than being swallowed, so it never reaches the counter.
             const fetchMock = vi.fn().mockImplementation((url: string) => {
                 const ok = (body: unknown): Response =>
                     ({
@@ -411,7 +415,9 @@ describe('GitHubProvider', () => {
                 return Promise.resolve(
                     ok([
                         makeCommitListFixture('aaa111'),
-                        makeCommitListFixture('bbb222'),
+                        // Dateless on the list row too — with a date here the #275 fallback
+                        // recovers the commit and nothing is dropped.
+                        {sha: 'bbb222', commit: {author: null, message: 'm'}, author: {login: 'alice'}},
                         makeCommitListFixture('ccc333'),
                     ]),
                 );
@@ -419,12 +425,78 @@ describe('GitHubProvider', () => {
             vi.stubGlobal('fetch', fetchMock);
 
             const onProgress = vi.fn();
-            const pending = provider.getCommits('my-repo', '', '', onProgress);
+            const onDrop = vi.fn();
+            const pending = provider.getCommits('my-repo', '', '', onProgress, onDrop);
             await vi.runAllTimersAsync();
             const commits = await pending;
 
             expect(commits.map((c) => c.sha)).toEqual(['aaa111', 'ccc333']);
             expect(onProgress).toHaveBeenLastCalledWith({done: 3, total: 3});
+            // The commit the counter walked past is named, not merely counted.
+            expect(onDrop.mock.calls.map((c) => c[0])).toEqual([
+                {sha: 'bbb222', reason: NO_AUTHOR_DATE_DROP_REASON},
+            ]);
+        });
+
+        it('recovers a commit whose DETAIL has no author date from the list row already in hand', async () => {
+            // The list and the detail return the IDENTICAL embedded `commit` object — the
+            // identity the #273 cache-hit path already depends on. So a shape anomaly in one of
+            // two copies is not a reason to lose the commit (#275): the list row answers, with
+            // no extra request. Every field below is DISTINCT from `makeCommitDetailFixture`'s,
+            // so the assertions can only pass if the list row is what was actually read.
+            const listRow = {
+                sha: 'aaa111',
+                commit: {
+                    author: {
+                        name: 'List Alice',
+                        email: 'list-alice@example.com',
+                        date: '2024-02-20T08:30:00Z',
+                    },
+                    message: 'fix: from the list row',
+                },
+                author: {login: 'list-alice'},
+            };
+            const fetchMock = makeFetchMock([
+                {body: [listRow]},
+                // Detail: no embedded `commit` at all, but real stats/files — so the churn
+                // numbers still come from the detail while the identity comes from the list row.
+                {
+                    body: {
+                        sha: 'aaa111',
+                        author: null,
+                        stats: {additions: 7, deletions: 3, total: 10},
+                        files: [{filename: 'src/x.ts', additions: 7, deletions: 3, status: 'modified'}],
+                    },
+                },
+            ]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            const onDrop = vi.fn();
+            const commits = await provider.getCommits('my-repo', '', '', undefined, onDrop);
+
+            expect(commits).toHaveLength(1);
+            expect(commits[0].date).toBe('2024-02-20T08:30:00Z');
+            expect(commits[0].author.name).toBe('List Alice');
+            expect(commits[0].author.email).toBe('list-alice@example.com');
+            // `author.login` falls back the same way — same object on both endpoints.
+            expect(commits[0].author.username).toBe('list-alice');
+            expect(commits[0].message).toBe('fix: from the list row');
+            // The detail still supplied the churn, so the recovery is not a degraded row.
+            expect(commits[0].additions).toBe(7);
+            expect(commits[0].filesChanged).toEqual(['src/x.ts']);
+            // Nothing was lost, so nothing is reported…
+            expect(onDrop).not.toHaveBeenCalled();
+            // …and the recovery cost no extra request: list + one detail, as always.
+            expect(fetchMock).toHaveBeenCalledTimes(2);
+        });
+
+        it('drops nothing when no drop listener is supplied — a short list is still short', async () => {
+            // `onDrop` is optional, and an absent listener must not change WHICH commits come
+            // back (every probe path — doctor, test-connection — supplies none).
+            const dateless = {sha: 'aaa111', commit: {author: null, message: 'm'}, author: null};
+            vi.stubGlobal('fetch', makeFetchMock([{body: [dateless]}, {body: dateless}]));
+
+            await expect(provider.getCommits('my-repo', '', '')).resolves.toEqual([]);
         });
 
         it('ticks the counter for a commit whose detail fetch throws, before propagating', async () => {
@@ -489,24 +561,70 @@ describe('GitHubProvider', () => {
             ]);
         });
 
-        it('skips commits where author date is missing', async () => {
+        it('drops a commit with no author date on either copy, and reports the sha', async () => {
+            // The one remaining loss GitHub can produce (#275). Both copies of the embedded
+            // object are dateless, so there is no fallback — and `raw_author_daily` is keyed by
+            // (raw identity, DATE), so there is genuinely nowhere to put this commit. It is
+            // dropped, but it is NAMED: the sync turns this into an `errors[]` advisory rather
+            // than letting the commit vanish behind an already-advanced cursor.
             const sha = 'abc123';
-            const detailWithNoDate = {
-                sha,
-                commit: {author: null, message: 'msg'},
-                author: {login: 'alice'},
-                stats: {additions: 0, deletions: 0, total: 0},
-                files: [],
-            };
+            const datelessEmbedded = {author: null, message: 'msg'};
             const fetchMock = makeFetchMock([
-                {body: [makeCommitListFixture(sha)]},
-                {body: detailWithNoDate},
+                {body: [{sha, commit: datelessEmbedded, author: {login: 'alice'}}]},
+                {
+                    body: {
+                        sha,
+                        commit: datelessEmbedded,
+                        author: {login: 'alice'},
+                        stats: {additions: 0, deletions: 0, total: 0},
+                        files: [],
+                    },
+                },
             ]);
             vi.stubGlobal('fetch', fetchMock);
 
-            const commits = await provider.getCommits('my-repo', '2024-01-01T00:00:00Z', '2024-01-31T23:59:59Z');
+            const onDrop = vi.fn();
+            const commits = await provider.getCommits(
+                'my-repo',
+                '2024-01-01T00:00:00Z',
+                '2024-01-31T23:59:59Z',
+                undefined,
+                onDrop,
+            );
 
             expect(commits).toEqual([]);
+            expect(onDrop).toHaveBeenCalledTimes(1);
+            expect(onDrop).toHaveBeenCalledWith({sha, reason: NO_AUTHOR_DATE_DROP_REASON});
+        });
+
+        it('reports no drop for a commit whose detail fetch FAILS — that fault throws instead', async () => {
+            // The two loss channels must stay disjoint. A recoverable fault must reach #231's
+            // cursor hold, never the drop report: reporting it as a permanent loss over a window
+            // that is about to be re-covered would be false, and swallowing it into a drop is
+            // precisely the silent-gap bug #275 was filed about.
+            const onDrop = vi.fn();
+            vi.stubGlobal('fetch', vi.fn().mockImplementation((url: string) => {
+                if (url.includes('/commits/abc123')) {
+                    return Promise.resolve({
+                        ok: false,
+                        status: 404,
+                        headers: new Headers(),
+                        text: () => Promise.resolve('not found'),
+                    } as unknown as Response);
+                }
+                return Promise.resolve({
+                    ok: true,
+                    status: 200,
+                    headers: new Headers(),
+                    json: () => Promise.resolve([makeCommitListFixture('abc123')]),
+                    text: () => Promise.resolve(''),
+                } as unknown as Response);
+            }));
+
+            await expect(
+                provider.getCommits('my-repo', '', '', undefined, onDrop),
+            ).rejects.toThrow('GitHub API error 404');
+            expect(onDrop).not.toHaveBeenCalled();
         });
 
         it('surfaces error when all per-commit detail fetches fail (no partial success)', async () => {
@@ -615,6 +733,11 @@ describe('GitHubProvider', () => {
         });
 
         it('extracts username from author login even when commit author differs', async () => {
+            // Also pins the no-mixing half of #275's fallback: the LIST fixture below carries
+            // `author: {login: 'alice'}` while this well-formed detail carries `author: null`.
+            // `null` there is a real answer — an unlinked commit — so the fallback must NOT
+            // reach across to the list row's login just because the other copy names someone.
+            // Only a detail whose embedded `commit` is unusable switches copies, wholesale.
             const sha = 'abc123';
             const detailWithBot: Record<string, unknown> = {
                 sha,
