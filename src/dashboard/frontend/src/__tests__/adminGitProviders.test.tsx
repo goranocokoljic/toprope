@@ -1324,6 +1324,7 @@ describe('syncProgressLabel (#209)', () => {
         developers_matched: 0,
         repo_step: null,
         repo_step_done: 0,
+        repo_step_scanned: null,
         repo_step_total: null,
     };
 
@@ -1394,6 +1395,7 @@ describe('syncProgressLabel — within-repo progress (#270)', () => {
         developers_matched: 0,
         repo_step: null,
         repo_step_done: 0,
+        repo_step_scanned: null,
         repo_step_total: null,
     };
 
@@ -1558,6 +1560,125 @@ describe('syncProgressLabel — within-repo progress (#270)', () => {
         ).toBe('Fetching activity — repo 3/12 (web) · run total 1 commit · 1 PR');
     });
 
+    // --- scanned-vs-found on a walk that filters in memory (#276) ---
+
+    it('shows the scanned count alongside the found count while a walk approaches its window', () => {
+        // The reported #276 scenario: a Bitbucket backfill pages from HEAD and discards
+        // everything newer than `until`, so `repo_step_done` is pinned at 0 for hundreds
+        // of pages. The scanned count is the ONLY field that moves, so the line must carry
+        // it — and must say "scanned", never "found", because 3400 rows were examined and
+        // 0 commits were kept.
+        const label = syncProgressLabel({
+            started_at: 't',
+            progress: {
+                ...base,
+                repo_step: 'commits',
+                repo_step_done: 0,
+                repo_step_scanned: 3400,
+                repo_step_total: null,
+            },
+        });
+        expect(label).toBe(
+            'Fetching activity — repo 3/12 (web) · 0 commits found (3400 scanned) · run total 34 commits · 5 PRs',
+        );
+        // The scanned number must not be presented as commits found — the lie in the
+        // other direction the issue explicitly rules out.
+        expect(label).not.toContain('3400 commits found');
+    });
+
+    it('advances the line on every page of a walk that keeps nothing', () => {
+        // AC1 as the operator experiences it: consecutive snapshots from the approach
+        // walk must render DIFFERENT lines. Before #276 all three of these were the
+        // byte-identical "0 commits found".
+        const lines = [100, 200, 300].map((scanned) =>
+            syncProgressLabel({
+                started_at: 't',
+                progress: {
+                    ...base,
+                    repo_step: 'commits',
+                    repo_step_done: 0,
+                    repo_step_scanned: scanned,
+                    repo_step_total: null,
+                },
+            }),
+        );
+        expect(new Set(lines).size).toBe(3);
+    });
+
+    it('omits the scanned count when it adds nothing to the found count', () => {
+        // A forward run reports `scanned` too (the provider does not pre-filter), but
+        // there it equals the found count — appending "(300 scanned)" beside
+        // "300 commits found" would be noise. Equal and BELOW both suppress: below is
+        // unreachable for every producer, and a shrinking parenthetical would be worse
+        // than none.
+        for (const scanned of [300, 12]) {
+            expect(
+                syncProgressLabel({
+                    started_at: 't',
+                    progress: {
+                        ...base,
+                        repo_step: 'commits',
+                        repo_step_done: 300,
+                        repo_step_scanned: scanned,
+                        repo_step_total: null,
+                    },
+                }),
+            ).toBe('Fetching activity — repo 3/12 (web) · 300 commits found · run total 34 commits · 5 PRs');
+        }
+    });
+
+    it('ignores a scanned count once the set size is known', () => {
+        // Past the listing phase every row in the set was kept by definition, so a
+        // scanned value there is stale (or a newer backend's) and must not turn
+        // `commit 1240/5000` into something else.
+        expect(
+            syncProgressLabel({
+                started_at: 't',
+                progress: {
+                    ...base,
+                    repo_step: 'commits',
+                    repo_step_done: 1240,
+                    repo_step_scanned: 9999,
+                    repo_step_total: 5000,
+                },
+            }),
+        ).toBe('Fetching activity — repo 3/12 (web) · commit 1240/5000 · run total 34 commits · 5 PRs');
+    });
+
+    it('keeps suppressing a step that ran over an empty set even with a scanned count', () => {
+        // `total: 0` still wins: "commit 0/0 (500 scanned)" would resurrect exactly the
+        // meaningless counter the zero-total rule exists to hide.
+        expect(
+            syncProgressLabel({
+                started_at: 't',
+                progress: {
+                    ...base,
+                    repo_step: 'commits',
+                    repo_step_done: 0,
+                    repo_step_scanned: 500,
+                    repo_step_total: 0,
+                },
+            }),
+        ).toBe('Fetching activity — repo 3/12 (web) · run total 34 commits · 5 PRs');
+    });
+
+    it('does not render a scanned count for an unnameable step', () => {
+        // Same degradation as without it: an unknown step has no noun, so there is no
+        // honest sentence to put the scanned number in.
+        expect(
+            syncProgressLabel({
+                started_at: 't',
+                progress: {
+                    ...base,
+                    repo_step: 'reviews' as GitSyncRepoStep,
+                    repo_step_done: 0,
+                    repo_step_scanned: 400,
+                    repo_step_total: null,
+                },
+            }),
+        ).toBe('Fetching activity — repo 3/12 (web) · run total 34 commits · 5 PRs');
+    });
+
     it('leaves every other stage untouched by the within-repo fields', () => {
         // repo_step is only meaningful during `fetching`; a stale value must not
         // leak into any other stage's line.
@@ -1587,6 +1708,7 @@ describe('AdminGitProviders — live sync progress (#209)', () => {
             developers_matched: 0,
             repo_step: 'commits',
             repo_step_done: 1240,
+            repo_step_scanned: null,
             repo_step_total: 5000,
         },
     } as const;

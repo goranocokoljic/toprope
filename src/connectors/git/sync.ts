@@ -286,8 +286,8 @@ export interface GitSyncProgress {
     developers_matched: number;
     /**
      * Which within-repo fan-out is in flight, and how far it has advanced (#270).
-     * All three are reset to (null, 0, null) whenever a repo finishes (and on leaving
-     * the fetching stage), so a consumer never shows a finished repo's stale counter.
+     * All four are reset to (null, 0, null, null) whenever a repo finishes (and on
+     * leaving the fetching stage), so a consumer never shows a finished repo's stale counter.
      * A repo START is not idle — it enters the `commits` step immediately, before its
      * list request, so the indicator is never blank while that request is in flight.
      *
@@ -312,8 +312,9 @@ export interface GitSyncProgress {
      *     shas (not every sha — see {@link DROPPED_COMMIT_SAMPLE_SIZE}). That is where
      *     an operator should look; these counters are a live indicator, not a record,
      *     and are gone the moment the repo finishes. GitLab lists exactly what it returns, and Bitbucket's
-     *     total is commits RETAINED after its in-memory `until` filter (see #276), so
-     *     on those two the `diffs` total always equals the `commits` total.
+     *     total is commits RETAINED after its in-memory `until` filter (which is what
+     *     `repo_step_scanned` exists to expose — #276), so on those two the `diffs` total
+     *     always equals the `commits` total.
      *   - The `diffs` step no longer re-walks the per-commit endpoint (#271). All three
      *     providers now return each commit's diff on `GitCommit.diffs` from the fetch they
      *     already made during the `commits` step, so on any such provider `diffs` is a
@@ -327,6 +328,26 @@ export interface GitSyncProgress {
      */
     repo_step: GitSyncRepoStep | null;
     repo_step_done: number;
+    /**
+     * Rows the list endpoint returned to the step in flight, when that differs from the
+     * rows it kept in `repo_step_done` (#276) — null whenever there is no such distinction.
+     *
+     * Only a provider that cannot push the run's window to the server reports it: Bitbucket
+     * pages its commit list from HEAD and filters `until` in memory, so on a backfill or
+     * catch-up chunk `repo_step_done` is pinned at 0 for hundreds of pages while this
+     * advances a page of rows at a time. It is the ONLY field that moves there, and a
+     * consumer that renders `repo_step_done` alone shows the frozen line #270 exists to
+     * remove. `GitFetchProgress.scanned` is where the provider-side semantics live.
+     *
+     * Non-null is NOT by itself a reason to render it: the same provider reports it on a
+     * forward run too, where it simply equals `repo_step_done`. It is also meaningful only
+     * while `repo_step_total` is null — once the set is in hand, every row in it was kept.
+     * Both suppressions are `repoStepCount`'s call, like the `repo_step_total === 0` one.
+     *
+     * `repo_step_scanned >= repo_step_done` for every producer, since a row cannot be kept
+     * without having been returned.
+     */
+    repo_step_scanned: number | null;
     repo_step_total: number | null;
 }
 
@@ -334,8 +355,12 @@ export interface GitSyncProgress {
 const NO_REPO_STEP = {
     repo_step: null,
     repo_step_done: 0,
+    repo_step_scanned: null,
     repo_step_total: null,
-} as const satisfies Pick<GitSyncProgress, 'repo_step' | 'repo_step_done' | 'repo_step_total'>;
+} as const satisfies Pick<
+    GitSyncProgress,
+    'repo_step' | 'repo_step_done' | 'repo_step_scanned' | 'repo_step_total'
+>;
 
 /**
  * Listener for progress snapshots. Called synchronously with a fresh copy each time
@@ -1618,13 +1643,24 @@ async function fetchProviderData(
     const droppedByRepo: Array<{repo: string; drops: GitCommitDrop[]}> = [];
 
     // The ONE place the within-repo indicator is written (#270) — every producer
-    // below routes through it, so the three fields have a single source of truth.
+    // below routes through it, so the four fields have a single source of truth.
     // (A listener that throws cannot break the run; that is enforced once, where the
     // listener is actually invoked — see the `report` closure in syncProviders.)
-    const reportStep = (step: GitSyncRepoStep, done: number, total: number | null): void => {
+    //
+    // `scanned` defaults to null and is WRITTEN on every report rather than left alone
+    // (#276): every one of these fields describes the step named in the same call, so a
+    // producer that does not distinguish scanned from kept must clear a previous
+    // producer's value, not inherit it. Only the provider listener below ever passes one.
+    const reportStep = (
+        step: GitSyncRepoStep,
+        done: number,
+        total: number | null,
+        scanned: number | null = null,
+    ): void => {
         report?.((p) => {
             p.repo_step = step;
             p.repo_step_done = done;
+            p.repo_step_scanned = scanned;
             p.repo_step_total = total;
         });
     };
@@ -1633,8 +1669,14 @@ async function fetchProviderData(
     // the providers no listener at all and their `onProgress?.(…)` short-circuits —
     // not one progress object allocated across a full sync (#270). Hoisted out of the
     // repo loop: neither closure captures the repo.
+    //
+    // `scanned` is optional on the provider seam and nullable on the wire — absent and
+    // null mean the same thing there ("no distinction to draw"), so this is a null-coalesce
+    // rather than a translation of vocabularies.
     const stepListener = (step: GitSyncRepoStep): GitFetchProgressListener | undefined =>
-        report ? ({done, total}): void => reportStep(step, done, total) : undefined;
+        report
+            ? ({done, total, scanned}): void => reportStep(step, done, total, scanned ?? null)
+            : undefined;
     const onCommitProgress = stepListener('commits');
     const onPRProgress = stepListener('prs');
 

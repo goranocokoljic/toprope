@@ -1099,6 +1099,19 @@ export interface GitSyncProgress {
      */
     repo_step: GitSyncRepoStep | null;
     repo_step_done: number;
+    /**
+     * Rows the list endpoint returned to the step in flight, when that differs from the
+     * rows it KEPT in `repo_step_done` — null when there is no such distinction (#276).
+     *
+     * Bitbucket cannot pass the run's window to its commit endpoint, so it pages from HEAD
+     * and filters in memory: on a backfill `repo_step_done` is stuck at 0 for hundreds of
+     * pages and this is the only field that moves. Rendering `repo_step_done` alone there
+     * shows a frozen line. It is never a substitute for `repo_step_done` though — the same
+     * provider reports it on a forward run, where the two are equal — and it is meaningful
+     * only while `repo_step_total` is null. `repoStepCount` in AdminGitProviders is the
+     * single place both of those decisions are made.
+     */
+    repo_step_scanned: number | null;
     repo_step_total: number | null;
 }
 

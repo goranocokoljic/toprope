@@ -2604,6 +2604,144 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
             expect(getPullRequests.mock.calls[0][3]).toBeUndefined();
         });
     });
+
+    describe('syncProviders — scanned-vs-retained listing progress (#276)', () => {
+        const CONFIG: GitProviderConfig = {
+            type: 'bitbucket',
+            workspace: 'test-ws',
+            auth: {type: 'api_token', email: 'a@b.c', api_token: 'test-token'},
+        };
+
+        /**
+         * A provider whose commit listing walks pages that RETAIN nothing — the shape a
+         * Bitbucket backfill produces, where the window is filtered in memory and `done`
+         * cannot move. `pageSizes` is how many rows each page returned.
+         */
+        function makeApproachWalkProvider(pageSizes: number[]): GitProvider {
+            return makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                getCommits: vi
+                    .fn()
+                    .mockImplementation(
+                        async (
+                            _repo: string,
+                            _since: string,
+                            _until: string,
+                            onProgress?: (p: GitFetchProgress) => void,
+                        ) => {
+                            let scanned = 0;
+                            for (const size of pageSizes) {
+                                scanned += size;
+                                onProgress?.({done: 0, total: null, scanned});
+                            }
+                            onProgress?.({done: 0, total: 0});
+                            return [];
+                        },
+                    ),
+                getPullRequests: vi.fn().mockResolvedValue([]),
+            });
+        }
+
+        it('puts a provider\'s scanned count on the wire, so the label can move while nothing is retained', async () => {
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(makeApproachWalkProvider([100, 100, 100]));
+
+            const snapshots: GitSyncProgress[] = [];
+            await new GitSync({enabled: false}).syncProviders(db, [CONFIG], (p) => snapshots.push(p));
+
+            // The (done, scanned) pairs a poller could observe during the listing walk.
+            // `done` is pinned at 0 the whole way — that is the reported bug — so the
+            // scanned column is the only thing that distinguishes these snapshots.
+            const listing = snapshots
+                .filter((s) => s.repo_step === 'commits' && s.repo_step_total === null)
+                .map((s) => [s.repo_step_done, s.repo_step_scanned]);
+            expect(listing).toEqual([
+                // Entering the step, before the list request: nothing scanned yet.
+                [0, null],
+                [0, 100],
+                [0, 200],
+                [0, 300],
+            ]);
+        });
+
+        it('clears a scanned count as soon as a producer that has none reports', async () => {
+            // Every field of the indicator describes the step named in the SAME report.
+            // A scanned value left standing would attach a listing-phase number to the
+            // fan-out counter beside it, which is a different set entirely.
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(makeApproachWalkProvider([50, 50]));
+
+            const snapshots: GitSyncProgress[] = [];
+            await new GitSync({enabled: false}).syncProviders(db, [CONFIG], (p) => snapshots.push(p));
+
+            // A scanned count was genuinely observed…
+            expect(snapshots.some((s) => s.repo_step_scanned === 100)).toBe(true);
+            // …and no snapshot from the moment the total became real onward carries one.
+            const afterListing = snapshots.slice(
+                snapshots.findIndex((s) => s.repo_step_scanned === 100) + 1,
+            );
+            expect(afterListing.length).toBeGreaterThan(0);
+            expect(afterListing.every((s) => s.repo_step_scanned === null)).toBe(true);
+            // Including the idle clear, which every consumer reads as "no step at all".
+            const final = snapshots[snapshots.length - 1];
+            expect([final.repo_step, final.repo_step_done, final.repo_step_scanned, final.repo_step_total]).toEqual(
+                [null, 0, null, null],
+            );
+        });
+
+        it('leaves the field null for a provider that reports no scanned count', async () => {
+            // GitHub and GitLab push the window to the server, so scanned == retained and
+            // the seam's optional field stays absent. It must land as null, never as a
+            // second copy of `done` — a consumer renders a non-null value.
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits: vi
+                        .fn()
+                        .mockImplementation(
+                            async (
+                                _repo: string,
+                                _since: string,
+                                _until: string,
+                                onProgress?: (p: GitFetchProgress) => void,
+                            ) => {
+                                onProgress?.({done: 3, total: null});
+                                return [];
+                            },
+                        ),
+                    getPullRequests: vi.fn().mockResolvedValue([]),
+                }),
+            );
+
+            const snapshots: GitSyncProgress[] = [];
+            await new GitSync({enabled: false}).syncProviders(db, [CONFIG], (p) => snapshots.push(p));
+
+            expect(snapshots.some((s) => s.repo_step_done === 3)).toBe(true);
+            expect(snapshots.every((s) => s.repo_step_scanned === null)).toBe(true);
+        });
+
+        it('never reports a scanned count below the retained count', async () => {
+            // The stated wire invariant (a row cannot be kept without being returned).
+            // Asserted over the real Bitbucket-shaped walk rather than a hand-built
+            // snapshot, so it fails if a future producer inverts the two.
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(makeApproachWalkProvider([10, 20, 30]));
+
+            const snapshots: GitSyncProgress[] = [];
+            await new GitSync({enabled: false}).syncProviders(db, [CONFIG], (p) => snapshots.push(p));
+
+            for (const s of snapshots) {
+                if (s.repo_step_scanned !== null) {
+                    expect(s.repo_step_scanned).toBeGreaterThanOrEqual(s.repo_step_done);
+                }
+            }
+        });
+    });
 });
 
 describe('firstSyncSince — first-sync window math (#228)', () => {

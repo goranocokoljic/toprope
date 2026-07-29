@@ -465,12 +465,14 @@ describe('BitbucketProvider', () => {
             const onProgress = vi.fn();
             await provider.getCommits('my-repo', '', '', onProgress);
 
-            // Listing has no total (unknown until the last page); the per-commit
-            // diffstat fan-out — where nearly all of a big repo's wall time goes —
-            // then reports real done/total.
+            // Listing has no total (unknown until the last page) and carries the scanned
+            // count beside the retained one (#276) — here they are equal, because a
+            // forward run filters nothing; the per-commit diffstat fan-out — where nearly
+            // all of a big repo's wall time goes — then reports real done/total and no
+            // scanned count at all (past listing, every row in the set was kept).
             expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
-                {done: 1, total: null},
-                {done: 2, total: null},
+                {done: 1, total: null, scanned: 1},
+                {done: 2, total: null, scanned: 2},
                 {done: 0, total: 2},
                 {done: 1, total: 2},
                 {done: 2, total: 2},
@@ -486,17 +488,18 @@ describe('BitbucketProvider', () => {
             // `total: 0` is reported truthfully here as on the other two providers;
             // suppressing the meaningless "commit 0/0" is the consumer's job.
             expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
-                {done: 0, total: null},
+                {done: 0, total: null, scanned: 0},
                 {done: 0, total: 0},
             ]);
         });
 
-        it('reports every page of a walk that retains nothing, though the count cannot move', async () => {
-            // Bitbucket's commit endpoint takes no date bounds, so an `until` in the
-            // past is filtered in memory: each page before the window retains nothing
-            // and reports an unchanging 0. Pinned deliberately — this is the known
-            // stationary-counter case on the backfill/catch-up path (#276), and the
-            // assertion fails if a future change stops reporting these pages at all.
+        it('advances the scanned count on every page of a walk that retains nothing', async () => {
+            // The #276 contract, replacing the pin that recorded the old stationary
+            // behavior. Bitbucket's commit endpoint takes no date bounds, so an `until` in
+            // the past is filtered in memory: each page before the window retains nothing,
+            // `done` cannot move, and `scanned` is the only honest signal that the walk is
+            // progressing rather than hung. Both properties are asserted — every page
+            // still reports (that was the old pin), and consecutive reports now DIFFER.
             const fetchMock = makeFetchMock([
                 {
                     body: pagedResponse(
@@ -505,8 +508,17 @@ describe('BitbucketProvider', () => {
                     ),
                 },
                 {
+                    body: pagedResponse(
+                        [
+                            makeCommitFixture('newer2', {date: '2024-05-01T00:00:00+00:00'}),
+                            makeCommitFixture('newer3', {date: '2024-04-01T00:00:00+00:00'}),
+                        ],
+                        'https://api.bitbucket.org/2.0/next2',
+                    ),
+                },
+                {
                     body: pagedResponse([
-                        makeCommitFixture('newer2', {date: '2024-05-01T00:00:00+00:00'}),
+                        makeCommitFixture('newer4', {date: '2024-03-01T00:00:00+00:00'}),
                     ]),
                 },
             ]);
@@ -521,13 +533,19 @@ describe('BitbucketProvider', () => {
             );
 
             expect(commits).toEqual([]);
-            // Assert the PROPERTY (every page reports, in the listing phase), not the
-            // `done: 0` value itself — #276 is expected to change that value, and this
-            // test should not have to be rewritten to let the fix land.
             const listingTicks = onProgress.mock.calls
-                .map((c) => c[0] as {done: number; total: number | null})
+                .map((c) => c[0] as {done: number; total: number | null; scanned?: number})
                 .filter((p) => p.total === null);
-            expect(listingTicks).toHaveLength(2);
+            // Rows scanned accumulate across pages (1, then +2, then +1) while nothing is
+            // retained — the exact shape a backfill's approach walk produces.
+            expect(listingTicks).toEqual([
+                {done: 0, total: null, scanned: 1},
+                {done: 0, total: null, scanned: 3},
+                {done: 0, total: null, scanned: 4},
+            ]);
+            // Stated as a property too, since it is the acceptance criterion: no two
+            // consecutive reports of this walk are identical.
+            expect(new Set(listingTicks.map((t) => JSON.stringify(t))).size).toBe(3);
         });
 
         it('does not report the page that hits the since cutoff — that tick is unobservable', async () => {

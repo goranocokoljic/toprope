@@ -564,6 +564,66 @@ describe('admin git-provider sync-now API (#199)', () => {
             expect((await waitForSyncStatus(id, 'ok')).active_sync).toBeNull();
         });
 
+        it('serves the scanned count over HTTP while a walk retains nothing (#276)', async () => {
+            // Same boundary argument as the test above, for the field that is the ONLY
+            // one moving on a Bitbucket backfill: `repo_step_done` is pinned at 0 by the
+            // in-memory window filter, so if `repo_step_scanned` does not survive the trip
+            // to the client the label is the frozen "0 commits found" all over again.
+            const id = await createGithub();
+            let release!: () => void;
+            const gate = new Promise<void>((r) => {
+                release = r;
+            });
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    // Park the run mid-LISTING (not mid-fan-out): pages scanned, nothing
+                    // retained — the state a backfill spends most of its wall time in.
+                    getCommits: vi
+                        .fn()
+                        .mockImplementation(
+                            async (
+                                _repo: string,
+                                _since: string,
+                                _until: string,
+                                onProgress?: (p: {
+                                    done: number;
+                                    total: number | null;
+                                    scanned?: number;
+                                }) => void,
+                            ) => {
+                                onProgress?.({done: 0, total: null, scanned: 100});
+                                onProgress?.({done: 0, total: null, scanned: 300});
+                                await gate;
+                                return [];
+                            },
+                        ),
+                }),
+            );
+
+            expect((await triggerSync(id)).statusCode).toBe(202);
+
+            const deadline = Date.now() + 2000;
+            let progress: GitSyncProgress | null | undefined;
+            while (Date.now() < deadline) {
+                progress = (await readProvider(id))?.active_sync?.progress;
+                if (progress?.repo_step_scanned === 300) break;
+                await new Promise((r) => setTimeout(r, 10));
+            }
+            expect(progress).toMatchObject({
+                stage: 'fetching',
+                current_repo: 'repo1',
+                repo_step: 'commits',
+                repo_step_done: 0,
+                repo_step_scanned: 300,
+                repo_step_total: null,
+            });
+
+            release();
+            expect((await waitForSyncStatus(id, 'ok')).active_sync).toBeNull();
+        });
+
         it('returns a typed 404 for an unknown id', async () => {
             const res = await triggerSync('does-not-exist');
             expect(res.statusCode).toBe(404);

@@ -230,6 +230,29 @@ export interface CommitDiffstatCache {
 export interface GitFetchProgress {
     done: number;
     total: number | null;
+    /**
+     * Rows the list endpoint has RETURNED to this call so far, when that is a different
+     * number from `done` (#276).
+     *
+     * `done` counts rows KEPT. The two diverge only for an implementation that cannot push
+     * the requested window to the server and has to filter in memory: Bitbucket's commit
+     * endpoint takes no date bounds, so it pages from HEAD and discards everything newer
+     * than `until`. On a backfill or catch-up chunk (`until` in the past) that means
+     * hundreds of pages during which `done` cannot move at all, and reporting only `done`
+     * left an operator unable to tell a walk still approaching its window from a hang —
+     * the exact symptom #270 exists to remove.
+     *
+     * ABSENT means "no distinction to draw", not "zero": GitHub and GitLab pass
+     * `since`/`until` to the server, so every row they scan is a row they keep and a second
+     * copy of `done` would be noise. Reported unconditionally by an implementation that
+     * does filter, INCLUDING when it currently equals `done` — suppressing the redundant
+     * case is the consumer's call, exactly as with a `total` of 0 (see
+     * `GitSyncProgress.repo_step`).
+     *
+     * Meaningful only while `total` is null (the listing phase). Once the set is in hand
+     * every row in it was kept by definition, so the fan-out ticks omit it.
+     */
+    scanned?: number;
 }
 
 /**

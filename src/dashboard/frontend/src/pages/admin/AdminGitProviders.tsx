@@ -309,11 +309,12 @@ function repoStepDetail(p: GitSyncProgress): string {
 }
 
 /**
- * `commit 12/40` once the set size is known, `12 commits found` while it isn't, or
- * null when there is nothing honest to show: no step in flight, a step that ran over
- * an empty set (a total of 0 would render as the meaningless "commit 0/0"), or a step
- * name a newer backend emits that this bundle cannot name. This is the single place
- * that decision is made — providers deliberately do not pre-filter empty steps.
+ * `commit 12/40` once the set size is known, `12 commits found` while it isn't
+ * (with `(3400 scanned)` appended where the two differ — see below), or null when there
+ * is nothing honest to show: no step in flight, a step that ran over an empty set (a
+ * total of 0 would render as the meaningless "commit 0/0"), or a step name a newer
+ * backend emits that this bundle cannot name. This is the single place those decisions
+ * are made — providers deliberately do not pre-filter.
  */
 function repoStepCount(p: GitSyncProgress): string | null {
     // `Object.hasOwn`, not a bare lookup: `repo_step` is wire data, and a plain object
@@ -325,9 +326,30 @@ function repoStepCount(p: GitSyncProgress): string | null {
             : undefined;
     if (noun === undefined || p.repo_step_total === 0) return null;
     if (p.repo_step_total === null) {
-        return `${p.repo_step_done} ${noun}${p.repo_step_done === 1 ? '' : 's'} found`;
+        return `${p.repo_step_done} ${noun}${p.repo_step_done === 1 ? '' : 's'} found${scannedSuffix(p)}`;
     }
     return `${noun} ${p.repo_step_done}/${p.repo_step_total}`;
+}
+
+/**
+ * ` (3400 scanned)` when the listing step has been handed more rows than it kept, else
+ * empty (#276).
+ *
+ * A Bitbucket backfill walks from HEAD and discards everything newer than the window, so
+ * "found" cannot move for hundreds of pages while this can — without it the line is the
+ * frozen `0 commits found` that #270 was supposed to eliminate. It is APPENDED rather
+ * than substituted, and says "scanned" rather than reusing "found", because the two count
+ * different things and a scanned count presented as commits found would be a fresh lie in
+ * the other direction.
+ *
+ * Rendered only when strictly greater, so a provider that reports the field on a forward
+ * run (where it equals `repo_step_done` and adds nothing) shows the plain count. `>` is
+ * also what keeps a nonsense wire value — a `scanned` below `done`, which no producer can
+ * emit — from rendering as a shrinking parenthetical.
+ */
+function scannedSuffix(p: GitSyncProgress): string {
+    const scanned = p.repo_step_scanned;
+    return scanned !== null && scanned > p.repo_step_done ? ` (${scanned} scanned)` : '';
 }
 
 /**
