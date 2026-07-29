@@ -154,6 +154,22 @@ export const COMMITS_DROPPED_PREFIX = 'Commits dropped as unattributable:';
  */
 const DROPPED_COMMIT_SAMPLE_SIZE = 5;
 
+/**
+ * A sha, safe to interpolate into an operator-facing line.
+ *
+ * The sha is raw response JSON, and this line is printed to a terminal by the CLI and
+ * persisted into `sync_logs.errors`. Allowlisted rather than escaped (the graduated
+ * validate-at-the-boundary rule): a git object name is hex, so anything else is not a sha, and
+ * a value that survives this cannot carry a newline, an ANSI escape, or unbounded length.
+ * Truncated to 40 — a full SHA-1 — so a blob cannot flood the log; a non-hex value renders as
+ * `<invalid>` rather than being silently dropped, since "GitHub returned a malformed sha" is
+ * itself something the operator needs to see.
+ */
+function sanitizeSha(sha: string): string {
+    const hex = /^[0-9a-fA-F]+$/.test(sha) ? sha : '';
+    return hex === '' ? '<invalid sha>' : hex.slice(0, 40);
+}
+
 /** Every sentinel that marks an `errors` entry as advisory rather than a failure. */
 const ADVISORY_PREFIXES: readonly string[] = [
     UNMATCHED_AUTHORS_PREFIX,
@@ -266,10 +282,11 @@ export interface GitSyncProgress {
      *     counts commits RETURNED, so `commit N/N` followed by `diff 0/M` with M < N
      *     means the run dropped N − M commits it could not attribute to a day. Since
      *     #275 that gap is no longer something a reader has to infer from these two
-     *     numbers: every dropped commit is named in `SyncResult.errors` under
-     *     {@link COMMITS_DROPPED_PREFIX}, which is where an operator should look —
-     *     these counters are a live indicator, not a record, and are gone the moment
-     *     the repo finishes. GitLab lists exactly what it returns, and Bitbucket's
+     *     numbers: the drop is reported in `SyncResult.errors` under
+     *     {@link COMMITS_DROPPED_PREFIX}, with the full COUNT and a bounded sample of
+     *     shas (not every sha — see {@link DROPPED_COMMIT_SAMPLE_SIZE}). That is where
+     *     an operator should look; these counters are a live indicator, not a record,
+     *     and are gone the moment the repo finishes. GitLab lists exactly what it returns, and Bitbucket's
      *     total is commits RETAINED after its in-memory `until` filter (see #276), so
      *     on those two the `diffs` total always equals the `commits` total.
      *   - The `diffs` step no longer re-walks the per-commit endpoint (#271). All three
@@ -1303,6 +1320,20 @@ interface ProviderFetchResult {
      */
     forwardCursorTarget: string;
     /**
+     * Fully-formatted {@link COMMITS_DROPPED_PREFIX} lines for this provider, threaded out
+     * rather than pushed into {@link errors} — because whether they are TRUE depends on
+     * something `fetchProviderData` cannot see (#275).
+     *
+     * The line says these commits will not be re-asked, which holds only if this run's window
+     * is actually recorded as covered. Three separate paths discard a fetched window with no
+     * cursor advance: an incomplete provider (#231), a write transaction that rolls back, and a
+     * container whose owner was deleted mid-run (#262/#264 — `isWritable` turns its advance
+     * into a no-op while the transaction still commits). Enumerating those three at the push
+     * site is how the first version got two of them and missed the third; instead these are
+     * emitted from the ONE place that knows, keyed on the cursor advance having actually run.
+     */
+    droppedAdvisories: string[];
+    /**
      * True iff every fetch feeding the ADDITIVE commit-derived snapshot succeeded
      * for this provider — `listRepos` AND every repo's `getCommits`. When false the
      * run must NOT advance this provider's cursor/watermark AND must NOT write its
@@ -1524,6 +1555,8 @@ async function fetchProviderData(
             // Unused on this path (`complete: false` means no cursor advances), but the
             // window this run would have covered is still the honest value to report.
             forwardCursorTarget: until,
+            // No repo was reached, so nothing could have been dropped.
+            droppedAdvisories: [],
             // The window was not covered at all — hold the cursor so it retries (#231).
             complete: false,
         };
@@ -1850,30 +1883,28 @@ async function fetchProviderData(
         });
     }
 
-    // Now that the whole provider is fetched, `commitsComplete` is final — so this is the
-    // earliest point the permanence claim can honestly be made (#275). An incomplete provider
-    // has its window discarded and re-covered, so its staged drops are simply not reported;
-    // they will be re-discovered (or recovered) by the run that does keep its data.
+    // FORMATTED here, EMITTED by the caller — see `ProviderFetchResult.droppedAdvisories` for
+    // why the truth of these lines is not decidable at this point. Unconditional here: the
+    // caller's gate is the cursor advance itself.
     //
     // One line per affected repo, with a count, like the review-comment/verdict failures above
     // and for the same reason: a systemic shape problem hits thousands of commits, and an
-    // `errors` list that long is unreadable wherever it lands. A bounded sample of shas is
-    // included so the operator can actually go look one up.
-    if (commitsComplete) {
-        for (const {repo: droppedRepo, drops} of droppedByRepo) {
-            const reasons = [...new Set(drops.map((d) => d.reason))].join('; ');
-            const sample = drops.slice(0, DROPPED_COMMIT_SAMPLE_SIZE).map((d) => d.sha);
-            const more = drops.length - sample.length;
-            errors.push(
-                `${COMMITS_DROPPED_PREFIX} [${providerType}/${droppedRepo}] ${drops.length} ` +
-                    `commit(s) the provider listed could not be imported, and this run's cursor ` +
-                    `has advanced past them — a plain re-run will not re-ask. If the cause was a ` +
-                    `transient bad response rather than the commit itself, "sync older history" ` +
-                    `over the affected dates will. Reason(s): ${reasons}. ` +
-                    `Affected: ${sample.join(', ')}${more > 0 ? ` (+${more} more)` : ''}.`,
-            );
-        }
-    }
+    // `errors` list that long is unreadable wherever it lands. A bounded SAMPLE of shas is
+    // included so the operator can go look one up — not the full set, so the line stays
+    // readable; the count is the complete figure.
+    const droppedAdvisories = droppedByRepo.map(({repo: droppedRepo, drops}) => {
+        const reasons = [...new Set(drops.map((d) => d.reason))].join('; ');
+        const sample = drops.slice(0, DROPPED_COMMIT_SAMPLE_SIZE).map((d) => sanitizeSha(d.sha));
+        const more = drops.length - sample.length;
+        return (
+            `${COMMITS_DROPPED_PREFIX} [${providerType}/${droppedRepo}] ${drops.length} ` +
+            `commit(s) the provider listed could not be imported, and this run has recorded ` +
+            `its window as covered — nothing re-asks them. There is no targeted re-fetch: ` +
+            `"sync older history" only extends STRICTLY older than the earliest synced ` +
+            `instant, so it cannot reach a forward window. Reason(s): ${reasons}. ` +
+            `Affected: ${sample.join(', ')}${more > 0 ? ` (+${more} more)` : ''}.`
+        );
+    });
 
     // The cache never throws, so this line is the ONLY trace a broken one leaves. An advisory,
     // not a failure — see DIFFSTAT_CACHE_DEGRADED_PREFIX. Reported once per provider with a
@@ -1901,6 +1932,7 @@ async function fetchProviderData(
         identifier,
         firstSyncFloor,
         forwardCursorTarget: until,
+        droppedAdvisories,
         complete: commitsComplete,
     };
 }
@@ -2388,6 +2420,11 @@ export class GitSync implements ConnectorInterface {
         // rollback no developer was created, so reporting that any were would be a lie.
         // Appended only after the transaction commits, and discarded on failure.
         const autoCreateAdvisories: string[] = [];
+        // Drop advisories (#275), staged for exactly the reason `autoCreateAdvisories` is:
+        // they are produced inside the write transaction and are only true if it commits.
+        // Filled by the `cursorAdvances` closure — see there for why that is the one honest
+        // gate — and discarded on rollback below.
+        const droppedAdvisories: string[] = [];
         // Deferred stall-counter updates (#235), applied in the SAME transaction as
         // the cursor advances so the counter and the cursor can never disagree about
         // whether this run moved the provider forward. Unlike `cursorAdvances` this
@@ -2439,6 +2476,13 @@ export class GitSync implements ConnectorInterface {
                 // Advancing a cursor the cascade just purged is exactly what re-arms the #262
                 // double-count, so a container whose owner changed mid-run advances nothing.
                 if (!isWritable(providerType, identifier)) return;
+                // This provider's window IS being recorded as covered, which is the exact
+                // premise of its drop advisories (#275). Staged, not pushed: this closure runs
+                // INSIDE the write transaction, so on a rollback nothing was recorded and the
+                // lines must not be reported — same reasoning, and the same staging, as
+                // `autoCreateAdvisories`. Reaching this line is the one condition that is true
+                // on every keep path and false on all three discard paths.
+                droppedAdvisories.push(...result.droppedAdvisories);
                 if (options?.backfill) {
                     setProviderEarliestSyncTime(db, providerType, identifier, options.backfill.since);
                 } else {
@@ -2676,6 +2720,9 @@ export class GitSync implements ConnectorInterface {
             insertMany();
             // Committed — only now is the auto-create summary true.
             errors.push(...autoCreateAdvisories);
+            // …and only now has any window actually been recorded as covered, which is what
+            // the drop advisories claim (#275).
+            errors.push(...droppedAdvisories);
         } catch (err) {
             // Hard failure: the tx rolled back, so NO snapshots were written, NO developer
             // was auto-created and NO cursor advanced — the window is intact and will be
@@ -2691,15 +2738,11 @@ export class GitSync implements ConnectorInterface {
             // Same reason: the gate's findings describe a discarded transaction. Whether the
             // provider is really gone is re-established by the next run's own gate.
             orphanedContainers.clear();
-            // Same reason again, and the one advisory that has to be RETRACTED rather than
-            // simply not emitted: the drop lines were pushed by `fetchProviderData`, before
-            // this transaction existed. They claim the cursor advanced past the dropped
-            // commits — but a rollback advances no cursor, so the window (and every drop in
-            // it) is re-asked next run. Removed in place, since `errors` already carries them
-            // (#275).
-            for (let i = errors.length - 1; i >= 0; i--) {
-                if (errors[i].startsWith(COMMITS_DROPPED_PREFIX)) errors.splice(i, 1);
-            }
+            // NOTHING to clear for the drop advisories (#275), deliberately: they are pushed
+            // only after `insertMany()` returns, so on this path they were never pushed. That
+            // is the whole reason they are staged rather than emitted where they are formatted
+            // — a rollback advances no cursor, so "nothing re-asks them" would be false, and a
+            // structure that needs no retraction cannot forget one.
             errors.push(
                 `Failed to write sync data (transaction rolled back — no cursor advanced, window will be re-fetched next run): ${err instanceof Error ? err.message : String(err)}`,
             );

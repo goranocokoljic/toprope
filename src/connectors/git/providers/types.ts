@@ -255,11 +255,23 @@ export type GitFetchProgressListener = (progress: GitFetchProgress) => void;
  * truncated/garbled response, while one with an out-of-range or non-ISO date is a real commit
  * with a timestamp this pipeline cannot key on.
  */
-export const COMMIT_DROP_REASONS = [
+export const NO_AUTHOR_DATE_DROP_REASON =
     'no author date on either the commit list row or the commit detail response, so the ' +
-        'commit cannot be attributed to a day',
-    'the author date is present but is not a UTC ISO instant on a four-digit-year day, so ' +
-        'the commit cannot be attributed to a day',
+    'commit cannot be attributed to a day';
+
+export const UNATTRIBUTABLE_DATE_DROP_REASON =
+    'the author date is present but is not a YYYY-MM-DDT… day the pipeline can key on, so ' +
+    'the commit cannot be attributed to a day';
+
+/**
+ * NAMED at the declaration site and the tuple built from the names — never the reverse. A
+ * tuple indexed by position (`COMMIT_DROP_REASONS[0]`) joins the two names to the two
+ * sentences by ordinal, so reordering the array silently swaps every reported reason while
+ * every test that compares against the same names stays green.
+ */
+export const COMMIT_DROP_REASONS = [
+    NO_AUTHOR_DATE_DROP_REASON,
+    UNATTRIBUTABLE_DATE_DROP_REASON,
 ] as const;
 
 /** One of the {@link COMMIT_DROP_REASONS}. */
@@ -337,8 +349,15 @@ export interface GitProvider {
     //     filter compares `new Date(c.date)` and an Invalid Date fails both bounds, so the
     //     commit falls through and is neither retained nor reported. That is the same defect
     //     class this listener exists for, not a window filter — it is simply not wired up
-    //     here yet. GitLab has the mirror gap: it pushes `authored_date` with no shape check
-    //     at all. Only GitHub currently honors the rule in full.
+    //     here yet. Only GitHub currently honors the rule in full.
+    //   - GitLab has the mirror gap and it is SHARPER than a silent drop: `gitlab.ts` pushes
+    //     `authored_date` with no shape check at all, so a commit whose date is not a
+    //     `YYYY-MM-DD…` day reaches `raw_author_daily`'s validator, which THROWS — inside the
+    //     run's single all-providers write transaction. One such GitLab commit therefore rolls
+    //     back the windows of every OTHER provider in the run too, identically, on every run.
+    //     GitHub is pinned against this at its own boundary (see `isAttributableDate`); the
+    //     durable fix is a shared pin or a per-row skip at the write boundary, tracked
+    //     separately. Do not read GitHub's pin as protecting the run.
     getCommits(
         repo: string,
         since: string,

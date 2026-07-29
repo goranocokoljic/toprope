@@ -1,9 +1,10 @@
 import {describe, it, expect, beforeEach, afterEach, vi} from 'vitest';
+import {GitHubProvider} from '../../../../src/connectors/git/providers/github';
+// Imported from `types`, where they are DECLARED — the provider only consumes them.
 import {
-    GitHubProvider,
     NO_AUTHOR_DATE_DROP_REASON,
     UNATTRIBUTABLE_DATE_DROP_REASON,
-} from '../../../../src/connectors/git/providers/github';
+} from '../../../../src/connectors/git/providers/types';
 import {
     MAX_SERVER_ERROR_RETRIES,
     PROBE_SERVER_ERROR_RETRIES,
@@ -51,7 +52,13 @@ function makeCommitDetailFixture(
             author: {name: 'Alice', email: 'alice@example.com', date: '2024-01-15T10:00:00Z'},
             message: 'feat: add feature',
         },
-        author: {login: 'alice'},
+        // DISTINCT from the list fixture's `alice` on purpose (#275 review cycle 2, TST-4).
+        // GitHub returns the same top-level `author` on both endpoints, so the two agreeing was
+        // realistic but untestable: `username` is read from the LIST row on both the cache-hit
+        // and the fetch path — deliberately, so a warm run and a cold run cannot resolve
+        // different logins and split one author across two `raw_author_daily` identities — and
+        // with identical fixtures a regression that read the detail's copy passed every test.
+        author: {login: 'detail-alice'},
         stats: {additions: 40, deletions: 10, total: 50},
         files: [
             {filename: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'},
@@ -449,23 +456,23 @@ describe('GitHubProvider', () => {
         // of it to `!detail.commit` — which drops the commit permanently whenever `commit` is
         // present but its date is not usable — passed a suite that only covered the
         // `commit`-absent case (#275 review TST-1).
+        // One row per DISTINCT term of the predicate, rather than several rows that all fail
+        // the same one (#275 review cycle 2, OR-3): the optional chain, the day-shape check,
+        // and the `Date.parse` check. `9999-99-99T…` is the only shape that passes the regex
+        // and fails the parse, so without it that conjunct could be deleted with the suite
+        // still green.
         const unusableDetailCommit: Array<[string, unknown]> = [
             ['`commit` absent entirely', undefined],
-            ['`commit` present, `author` null', {author: null, message: 'from the detail'}],
-            [
-                '`commit.author` present, date empty',
-                {author: {name: 'D', email: 'd@e.com', date: ''}, message: 'from the detail'},
-            ],
-            [
-                '`commit.author` present, date an ISO expanded year',
-                {
-                    author: {name: 'D', email: 'd@e.com', date: '+033658-09-27T00:00:00.000Z'},
-                    message: 'from the detail',
-                },
-            ],
             [
                 '`commit.author` present, date not a timestamp at all',
                 {author: {name: 'D', email: 'd@e.com', date: 'unknown'}, message: 'from the detail'},
+            ],
+            [
+                '`commit.author` present, date shaped like a day but not a real one',
+                {
+                    author: {name: 'D', email: 'd@e.com', date: '9999-99-99T00:00:00Z'},
+                    message: 'from the detail',
+                },
             ],
         ];
 
@@ -532,13 +539,76 @@ describe('GitHubProvider', () => {
             };
             vi.stubGlobal(
                 'fetch',
-                makeFetchMock([{body: [listRow]}, {body: {sha: 'aaa111', author: null}}]),
+                makeFetchMock([
+                    {body: [listRow]},
+                    // Real `stats` — a body with neither a usable `commit` NOR stats now throws
+                    // rather than being recovered, so the recovery path is only reachable here
+                    // with the churn actually present.
+                    {body: {sha: 'aaa111', author: null, stats: {additions: 1, deletions: 0, total: 1}}},
+                ]),
             );
 
             const commits = await provider.getCommits('my-repo', '', '');
 
             expect(commits).toHaveLength(1);
             expect(commits[0].author.username).toBe('');
+        });
+
+        it('classifies the reason from EITHER copy carrying a date, not just the detail', async () => {
+            // The reason is chosen by `hasDate(detail…) || hasDate(list…)`, and every other
+            // fixture makes the two copies agree, so `||` could be narrowed to either operand
+            // with the suite still green (#275 review cycle 2, TST-3). This is the mixed shape:
+            // the detail body is truncated (no `commit` at all) while the LIST row carries a
+            // garbled date. A date IS present, so the operator should be sent to inspect the
+            // commit — not told the response was truncated.
+            vi.stubGlobal(
+                'fetch',
+                makeFetchMock([
+                    {
+                        body: [
+                            {
+                                sha: 'aaa111',
+                                commit: {author: {name: 'A', email: 'a@e.com', date: 'unknown'}, message: 'm'},
+                                author: {login: 'alice'},
+                            },
+                        ],
+                    },
+                    {body: {sha: 'aaa111', stats: {additions: 1, deletions: 0, total: 1}, files: []}},
+                ]),
+            );
+
+            const onDrop = vi.fn();
+            const commits = await provider.getCommits('my-repo', '', '', undefined, onDrop);
+
+            expect(commits).toEqual([]);
+            expect(onDrop).toHaveBeenCalledWith({
+                sha: 'aaa111',
+                reason: UNATTRIBUTABLE_DATE_DROP_REASON,
+            });
+        });
+
+        it('classifies a null or empty date as ABSENT, not as present-but-unattributable', async () => {
+            // `date: null` / `date: ''` are what a garbled body actually yields, and calling
+            // them "present" inverts the only distinction the two reasons draw (#275 review
+            // cycle 2, SO-6/SEC-6). Asserted against a literal as well as the constant, so
+            // swapping the two sentences cannot pass.
+            const nullDate = {author: {name: 'A', email: 'a@e.com', date: null}, message: 'm'};
+            vi.stubGlobal(
+                'fetch',
+                makeFetchMock([
+                    {body: [{sha: 'aaa111', commit: nullDate, author: null}]},
+                    {body: {sha: 'aaa111', commit: nullDate, author: null, stats: {additions: 0, deletions: 0, total: 0}}},
+                ]),
+            );
+
+            const onDrop = vi.fn();
+            await provider.getCommits('my-repo', '', '', undefined, onDrop);
+
+            expect(onDrop).toHaveBeenCalledWith({
+                sha: 'aaa111',
+                reason: NO_AUTHOR_DATE_DROP_REASON,
+            });
+            expect(onDrop.mock.calls[0][0].reason).toContain('no author date on either');
         });
 
         it('drops a commit whose date is PRESENT but unattributable, with its own reason', async () => {
@@ -572,13 +642,13 @@ describe('GitHubProvider', () => {
             expect(UNATTRIBUTABLE_DATE_DROP_REASON).not.toBe(NO_AUTHOR_DATE_DROP_REASON);
         });
 
-        it('does not memoize a diffstat read off the body it just declared unusable', async () => {
-            // #275 review SO-1/SEC-2. `commit_diffstats` has NO invalidation: a row written
-            // here is served on every later run and skips the detail request forever. The
-            // realistic malformed 200 is missing `stats`/`files` along with `commit`, so
-            // caching the recovery would freeze 0 additions / 0 deletions / no files as this
-            // commit's immutable answer — permanently understating that developer-day's churn,
-            // silently, and breaking the rule providers/diffstat.ts exists to enforce.
+        it('THROWS on a body with neither a usable commit nor stats, rather than inventing zero churn', async () => {
+            // #275 review cycle 2, SO-1. A 200 carrying neither is a malformed RESPONSE, not a
+            // fact about the commit, so it belongs to the recoverable channel. Recovering it
+            // was the trap: `additions`/`deletions`/`diffs` are read off that same body, so the
+            // commit would land in `raw_author_daily` — additive, append-only, cursor already
+            // advanced — with 0 churn, permanently and silently. Throwing sends it to the 5xx
+            // budget, then the in-run repo retry (where a truncated body heals), then #231.
             const put = vi.fn();
             const cache = {load: vi.fn().mockReturnValue(new Map()), put};
             const cachingProvider = new GitHubProvider(CONFIG, cache);
@@ -596,18 +666,68 @@ describe('GitHubProvider', () => {
                 makeFetchMock([{body: [listRow]}, {body: {sha: 'aaa111'}}]),
             );
 
-            const commits = await cachingProvider.getCommits('my-repo', '', '');
+            const onDrop = vi.fn();
+            const err: unknown = await cachingProvider
+                .getCommits('my-repo', '', '', undefined, onDrop)
+                .then(() => null)
+                .catch((e: unknown) => e);
 
-            // The commit is still recovered…
-            expect(commits).toHaveLength(1);
-            expect(commits[0].date).toBe('2024-02-20T08:30:00Z');
-            // …and its (unknown) churn is NOT ratcheted, so the next run re-asks.
+            expect(err).toBeInstanceOf(Error);
+            expect((err as Error).message).toContain('malformed response');
+            // RETRYABLE, so the fault reaches the request budget and the in-run repo retry
+            // rather than failing the repo outright — that is the whole point of routing a
+            // malformed body through the throw channel instead of the drop channel.
+            expect(isRetryableGitFetchError(err)).toBe(true);
+            // Not a drop: the commit may still be recoverable, so claiming a permanent loss
+            // would be false.
+            expect(onDrop).not.toHaveBeenCalled();
+            // And nothing was memoized — the zeros never reach the cache either.
             expect(put).not.toHaveBeenCalled();
         });
 
-        it('DOES memoize when the detail body itself is usable — the guard is not blanket', async () => {
-            // The positive control for the test above: without it, deleting the `put` outright
-            // would satisfy that assertion and silently disable the whole #273 ratchet.
+        it('recovers AND memoizes when the body is malformed but its stats are real', async () => {
+            // The other side of the throw above, and the positive control for the whole #273
+            // ratchet: because the recovery path now always has real stats, the `put` is
+            // unconditional again. Deleting it would silently disable the ratchet.
+            const put = vi.fn();
+            const cache = {load: vi.fn().mockReturnValue(new Map()), put};
+            const cachingProvider = new GitHubProvider(CONFIG, cache);
+            const listRow = {
+                sha: 'aaa111',
+                commit: {
+                    author: {name: 'A', email: 'a@e.com', date: '2024-02-20T08:30:00Z'},
+                    message: 'm',
+                },
+                author: {login: 'alice'},
+            };
+            vi.stubGlobal(
+                'fetch',
+                makeFetchMock([
+                    {body: [listRow]},
+                    // No `commit` (identity comes from the list row) but REAL stats.
+                    {
+                        body: {
+                            sha: 'aaa111',
+                            stats: {additions: 9, deletions: 2, total: 11},
+                            files: [{filename: 'src/z.ts', additions: 9, deletions: 2, status: 'modified'}],
+                        },
+                    },
+                ]),
+            );
+
+            const commits = await cachingProvider.getCommits('my-repo', '', '');
+
+            expect(commits).toHaveLength(1);
+            expect(commits[0].additions).toBe(9);
+            expect(put).toHaveBeenCalledWith('my-repo', 'aaa111', {
+                additions: 9,
+                deletions: 2,
+                entries: [{path: 'src/z.ts', additions: 9, deletions: 2, status: 'modified'}],
+                absent: false,
+            });
+        });
+
+        it('DOES memoize a fully well-formed detail — the ratchet is intact', async () => {
             const put = vi.fn();
             const cache = {load: vi.fn().mockReturnValue(new Map()), put};
             const cachingProvider = new GitHubProvider(CONFIG, cache);
@@ -874,7 +994,7 @@ describe('GitHubProvider', () => {
             ).rejects.toThrow('GitHub API error 401');
         });
 
-        it('extracts username from author login even when commit author differs', async () => {
+        it('returns an empty username when GitHub links no user, even though a git author exists', async () => {
             // `commit.author` (the git author) and `author` (the linked GitHub user) are
             // different things: a merge bot commits under a git identity with no GitHub user
             // linked, and `''` is the right answer for the latter.

@@ -14,7 +14,8 @@ import type {
     GitFetchProgressListener,
     GitCommitDropListener,
 } from './types.js';
-import {COMMIT_DROP_REASONS} from './types.js';
+import {NO_AUTHOR_DATE_DROP_REASON, UNATTRIBUTABLE_DATE_DROP_REASON} from './types.js';
+import {isUtcDay} from '../../../aggregation/dates.js';
 import {normalizeContainer} from './container.js';
 import {loadDiffstats} from './diffstat.js';
 import {
@@ -34,36 +35,39 @@ const BASE_URL = 'https://api.github.com';
 const RATE_LIMIT_PAUSE_THRESHOLD = 100;
 
 /**
- * The two `GitCommitDrop.reason`s GitHub can produce (#275). Re-exported from the closed
- * {@link COMMIT_DROP_REASONS} set rather than declared here, so the type — not a comment —
- * is what keeps a response body out of an operator-facing string, and so the tests assert
- * against the value the code actually emits rather than a copy of it that can drift.
- */
-export const NO_AUTHOR_DATE_DROP_REASON = COMMIT_DROP_REASONS[0];
-export const UNATTRIBUTABLE_DATE_DROP_REASON = COMMIT_DROP_REASONS[1];
-
-/**
- * A `YYYY-MM-DD` day followed by a time — the shape the whole pipeline downstream assumes.
+ * Can this author date be attributed to a day by the pipeline downstream (#275)?
  *
- * ANCHORED and four-digit-year-only, deliberately. The day key is derived by a bare
- * `isoDate.slice(0, 10)` (`analyzer.ts`, `churn.ts`) and the write boundary then hard-rejects
- * anything not `^\d{4}-\d{2}-\d{2}$` (`raw-author-daily.ts`'s `UTC_DAY_RE`) — by THROWING,
- * inside the run's single all-providers write transaction, which rolls back every provider's
- * window and re-throws identically on every subsequent run. So an ISO 8601 expanded year
- * (`+033658-09-27T…`, which a commit dated `git commit --date=@999999999999` produces) must
- * be caught HERE, where it can be reported as one dropped commit, rather than one frame down
- * where it bricks the whole git connector. Same class of hazard as #233's expanded-year
- * watermark, and the same fix: pin the shape at the boundary with an anchored regex.
- */
-const ATTRIBUTABLE_DATE_RE = /^\d{4}-\d{2}-\d{2}T/;
-
-/**
- * Can this author date be attributed to a UTC day by the pipeline downstream? Shape AND
- * parseability — the regex alone would accept `9999-99-99T00:00:00Z`, and `Date.parse` alone
- * would accept the expanded years the regex exists to reject.
+ * WHY IT IS PINNED HERE. The day key is derived by a bare `isoDate.slice(0, 10)`
+ * (`analyzer.ts`, `churn.ts`), and the write boundary then hard-rejects anything that is not
+ * a `YYYY-MM-DD` day — by THROWING, inside the run's single all-providers write transaction,
+ * which rolls back every provider's window and re-throws identically on every subsequent run.
+ * So an ISO 8601 expanded year (`+033658-09-27T…`, which `git commit --date=@999999999999`
+ * produces) has to be caught HERE, where it costs one reported commit, rather than one frame
+ * down where it bricks the whole git connector. Same hazard class as #233's expanded-year
+ * watermark, and the same fix: pin the shape at the boundary.
+ *
+ * WHAT IT PINS, exactly — it validates the DAY KEY the pipeline will actually derive, using
+ * the same predicate the store validates with (`isUtcDay`, whose regex is byte-identical to
+ * `raw-author-daily.ts`'s `UTC_DAY_RE`). That agreement is the point, so this is deliberately
+ * NOT stricter than the store:
+ *   - `typeof` first, because `.test()` COERCES — an array from an odd JSON body would
+ *     stringify into a matching value and sail through.
+ *   - `[10] === 'T'` so a bare day with no time is rejected: `Date.parse` reads that as UTC
+ *     midnight, but every other reader here expects an instant.
+ *   - `Date.parse` finite, because the shape check alone accepts `9999-99-99T00:00:00Z`.
+ * Calendar validity (`2024-02-30`) and UTC-ness (an `-05:00` offset attributes to the
+ * offset-local day) are NOT pinned, because the store accepts both: rejecting them here would
+ * DROP commits the store would have stored, trading a small mis-attribution for a real loss.
+ * Both are pre-existing and shared by all three providers; fixing them belongs at the write
+ * boundary, for every provider at once.
  */
 function isAttributableDate(date: string | undefined): boolean {
-    return date !== undefined && ATTRIBUTABLE_DATE_RE.test(date) && Number.isFinite(Date.parse(date));
+    return (
+        typeof date === 'string' &&
+        date[10] === 'T' &&
+        isUtcDay(date.slice(0, 10)) &&
+        Number.isFinite(Date.parse(date))
+    );
 }
 
 function parseNextLink(header: string | null): string | null {
@@ -499,34 +503,62 @@ export class GitHubProvider implements GitProvider {
                     // timestamp this pipeline cannot key on. Critically, the unusable case must
                     // be caught here and not left to pass — see `ATTRIBUTABLE_DATE_RE` for what
                     // it does one frame down if it escapes.
-                    const anyDatePresent =
-                        detailCommit?.author?.date !== undefined ||
-                        listCommit?.author?.date !== undefined;
+                    // `typeof … === 'string' && !== ''`, not `!== undefined`: `date: null` and
+                    // `date: ''` are what a truncated or garbled body actually yields, and
+                    // calling those "present but unattributable" sends the operator looking for
+                    // a real commit with an odd timestamp — the precise opposite of the truth,
+                    // and it inverts the only distinction the two reasons exist to draw.
+                    const hasDate = (d: unknown): boolean => typeof d === 'string' && d !== '';
                     onDrop?.({
                         sha: summary.sha,
-                        reason: anyDatePresent
-                            ? UNATTRIBUTABLE_DATE_DROP_REASON
-                            : NO_AUTHOR_DATE_DROP_REASON,
+                        reason:
+                            hasDate(detailCommit?.author?.date) || hasDate(listCommit?.author?.date)
+                                ? UNATTRIBUTABLE_DATE_DROP_REASON
+                                : NO_AUTHOR_DATE_DROP_REASON,
                     });
                     continue;
                 }
 
-                // NOT memoized when the identity came from the list row (`source !==
-                // detailCommit`), which is the whole reason this is a condition and not a bare
-                // `put`. On that path the detail body is the one that came back unusable, so
-                // `additions`/`deletions`/`diffs` above are `0`/`0`/`[]` read off it — and
-                // `commit_diffstats` has NO invalidation: a row written here is served on every
-                // later run and skips the detail request forever. Caching an outage's zeros as
-                // a commit's immutable answer is exactly what `providers/diffstat.ts` forbids
-                // ("ONLY a successful response or a deterministic 404 is ever recorded"), and it
-                // would understate that developer-day's churn permanently and silently. Paying
-                // one re-request per run for an anomalous commit is the cheap side of that
-                // trade — the same price the hit gate above already accepts.
+                // A body that supplied NEITHER a usable `commit` nor `stats` is a malformed
+                // RESPONSE, not a fact about the commit — so it belongs to the recoverable
+                // channel, and throwing puts it there (#275 review cycle 2, SO-1).
                 //
-                // Otherwise cached AFTER the date guard, so a commit the un-cached path DROPS
-                // can never be pushed by a later warm run (#273) — the opposite divergence to
-                // the one the hit gate prevents, and just as much a break of "a hit produces
-                // what a fetch produces".
+                // Recovering it instead was the trap: `additions`/`deletions`/`diffs` above are
+                // read off this same body, so the recovered commit would carry 0/0/[] — and
+                // those zeros land in `raw_author_daily`, which is ADDITIVE and append-only,
+                // with the cursor advanced past the day. That is a permanent, silent
+                // understatement of the developer-day's churn in the one table that has no
+                // recompute path, and the empty `diffs` array even suppresses the sync loop's
+                // `getCommitDiff` fallback (`[]` is an answer there, deliberately). Skipping the
+                // diffstat memo does not help: the memo is trivially re-fetchable, the snapshot
+                // is not, so guarding only the memo protected the cheap side.
+                //
+                // Throwing routes it to the request layer's 5xx budget, then the in-run repo
+                // retry — where a transient bad body actually heals — and then #231's cursor
+                // hold. `status: null` marks it retryable, like a transport fault, which is what
+                // a truncated body is. So the surviving recovery path always has real `stats`,
+                // and nothing downstream is ever handed fabricated churn.
+                if (source !== detailCommit && detail.stats === undefined) {
+                    throw new GitProviderFetchError(
+                        `GitHub commit detail for ${summary.sha} in ${this.org}/${repo} carried ` +
+                            'neither a usable commit object nor stats — malformed response',
+                        null,
+                    );
+                }
+
+                // Reached only with real `stats` in hand, on BOTH the normal and the recovery
+                // path — the throw above is what guarantees it, and it is why this is a bare
+                // `put` again rather than one guarded on which copy supplied the identity.
+                // `commit_diffstats` has NO invalidation, so a row written here is served on
+                // every later run forever; memoizing an outage's zeros as a commit's immutable
+                // answer is exactly what `providers/diffstat.ts` forbids ("ONLY a successful
+                // response or a deterministic 404 is ever recorded"). The recovery path is not
+                // an exception to that rule because it no longer carries zeros.
+                //
+                // Cached AFTER the date guard, so a commit the un-cached path DROPS can never be
+                // pushed by a later warm run (#273) — the opposite divergence to the one the hit
+                // gate prevents, and just as much a break of "a hit produces what a fetch
+                // produces".
                 //
                 // Keyed on `summary.sha`, the same spelling `load` was asked for, so a write
                 // is guaranteed to be found by the next run's read.
@@ -537,14 +569,12 @@ export class GitHubProvider implements GitProvider {
                 // anomaly that must surface, and `fetchGitHub` throws it (#272). No FETCH
                 // failure of any kind reaches this line, which is also why GitHub does not use
                 // the shared `resolveCommitDiffstat` helper the other two providers share.
-                if (source === detailCommit) {
-                    this.diffstatCache?.put(repo, summary.sha, {
-                        additions,
-                        deletions,
-                        entries: diffs,
-                        absent: false,
-                    });
-                }
+                this.diffstatCache?.put(repo, summary.sha, {
+                    additions,
+                    deletions,
+                    entries: diffs,
+                    absent: false,
+                });
 
                 commits.push({
                     // `summary.sha`, not `detail.sha`: identical by construction (the detail
