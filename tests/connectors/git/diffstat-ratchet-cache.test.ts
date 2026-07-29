@@ -806,11 +806,18 @@ describe('#273 per-commit diffstat ratchet cache', () => {
     // --- GitHub's malformed-commit branches ------------------------------------------------
 
     it('GitHub: a commit with no embedded `commit` object is dropped, uncached, on both the cold and the warm run', async () => {
-        // The hit path and the write are gated on the SAME condition (a usable author date), so
-        // the cache can neither drop a commit the un-cached path kept nor add one it dropped.
-        // The fixture omits the `commit` object entirely on BOTH the list row and the detail
-        // response, so an unguarded dereference on either side raises a TypeError out of
-        // `getCommits` — which #231 turns into "hold the cursor, discard the whole provider".
+        // The hit path gates on `isAttributableDate`, the SAME predicate the un-cached path
+        // decides on, so the cache can neither drop a commit the un-cached path kept nor add one
+        // it dropped. The fixture omits the `commit` object entirely on BOTH the list row and
+        // the detail response, so an unguarded dereference on either side raises a TypeError out
+        // of `getCommits` — which #231 turns into "hold the cursor, discard the whole provider".
+        //
+        // Since #275 a detail whose `commit` is unusable is RECOVERED from the list row, so this
+        // commit is dropped only because BOTH copies are missing it — which is what the fixture
+        // builds, and what keeps this test about the cache rather than about the fallback. The
+        // "uncached" half is load-bearing in a second way now: this fixture's detail carries no
+        // `stats` either, and #275 routes a body with neither a usable `commit` nor `stats` to a
+        // THROW rather than caching its zeros — so nothing is memoized for it on any run.
         const db = makeDb();
         const devId = seedAlice(db);
         const log = makeLog();
