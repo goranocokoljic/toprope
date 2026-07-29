@@ -124,29 +124,26 @@ export const RETRY_HEALED_PREFIX = 'Recovered after retry:';
 export const DIFFSTAT_CACHE_DEGRADED_PREFIX = 'Diffstat cache degraded:';
 
 /**
- * Prefix of the advisory pushed when a provider LISTED commits it could not return — see
- * {@link GitCommitDrop} and `GitProvider.getCommits` for the contract (#275).
+ * Prefix of the advisory pushed when a provider LISTED commits it could not return.
+ * {@link GitCommitDrop} is the canonical statement of that decision — permanent and
+ * non-retryable, so reported rather than thrown — and of where this line does and does not
+ * reach; read it rather than re-deriving the argument here (#275).
  *
- * Deliberately NOT a failure, and this is the load-bearing part of the decision. A drop is
- * permanent and non-retryable by construction: the commit was fetched and its response
- * carries no author date, so `raw_author_daily` — keyed by (raw identity, DATE) — has no cell
- * to put it in, and re-covering the window returns the identical unusable response. Turning
- * the provider red would therefore (a) make `sync-pipeline` re-run the ENTIRE git connector,
- * a second full network fetch, on every run forever, and (b) never recover the commit. The
- * same argument as {@link DIFFSTAT_CACHE_DEGRADED_PREFIX}: a fault no retry can fix must not
- * be classified as one that retrying helps.
+ * Deliberately NOT a failure, for the same reason as {@link DIFFSTAT_CACHE_DEGRADED_PREFIX}:
+ * a fault no retry can fix must not be classified as one that retrying helps. Turning the
+ * provider red would make `sync-pipeline` re-run the ENTIRE git connector — a second full
+ * network fetch — on every run forever and still never recover the commit.
  *
  * But it must be SAID, and this line is the whole point of #275. Before it, such a commit
  * vanished with nothing in `errors[]`, nothing in the sync log, and the forward cursor already
- * advanced past it — a permanent, silent hole in `git_snapshots`, which is the exact failure
- * class #231/#235 exist to prevent. This is also the one place where "the run completed" stops
- * implying "every commit in the window is present", so the advisory states the loss plainly
- * rather than leaving the operator to infer it from a `diff N/M` counter (the only trace it
- * previously left — see `GitSyncProgress.repo_step`).
+ * advanced past it — a permanent, silent hole in `git_snapshots`, the exact failure class
+ * #231/#235 exist to prevent. It is also one of the places where "the run completed" stops
+ * implying "every commit in the window is present", so it states the loss plainly rather than
+ * leaving the operator to infer it from a `diff N/M` counter (the only trace it previously
+ * left — see `GitSyncProgress.repo_step`).
  *
- * A RECOVERABLE fetch fault deliberately matches nothing here: it throws out of `getCommits`,
- * lands on the `Failed to fetch commits:` line, and holds the provider's cursor (#231). Those
- * two losses are opposites and must classify differently.
+ * Emitted only for a run whose data was actually KEPT — see the emit site and the rollback
+ * handler. A discarded window is re-fetched, so calling its drops permanent would be a lie.
  */
 export const COMMITS_DROPPED_PREFIX = 'Commits dropped as unattributable:';
 
@@ -1553,6 +1550,15 @@ async function fetchProviderData(
     // the whole provider's cursor and drop its partial snapshots (#231).
     let commitsComplete = true;
 
+    // Commits each repo's provider LISTED but could not return (#275), staged rather than
+    // reported inline. The advisory calls the loss PERMANENT, and that is only true if this
+    // run's data is kept: if a LATER repo's commit fetch fails, `commitsComplete` goes false
+    // and #231 discards this whole provider's window, so the "dropped" commits are re-asked
+    // next run like everything else. Reporting them inline would therefore describe a state
+    // that does not exist — the same reason `allUnmatched` and the auto-create advisories are
+    // staged and cleared on rollback rather than pushed as they are discovered.
+    const droppedByRepo: Array<{repo: string; drops: GitCommitDrop[]}> = [];
+
     // The ONE place the within-repo indicator is written (#270) — every producer
     // below routes through it, so the three fields have a single source of truth.
     // (A listener that throws cannot break the run; that is enforced once, where the
@@ -1634,26 +1640,11 @@ async function fetchProviderData(
             continue;
         }
         const rawCommits = commitFetch.value;
-        // Reported only on the SUCCESS path. A failed commit fetch already discards this
-        // repo's whole result and holds the provider's cursor, so the window is re-covered
-        // next run — announcing a permanent loss over data that is about to be re-fetched
-        // would be false. (The `continue` above is what makes this reachable only on success.)
-        //
-        // Aggregated per repo with a count, like the review-comment/verdict failures below and
-        // for the same reason: a systemic shape problem hits thousands of commits, and an
-        // `errors` list that long is unreadable in the sync log and the admin UI alike. A
-        // bounded sample of shas is included so the operator can actually go look at one.
+        // STAGED, not reported yet — see the emit site after the repo loop. Only the SUCCESS
+        // path stages: the `continue` above means a failed commit fetch contributes nothing,
+        // because its window is about to be re-covered.
         if (droppedCommits.length > 0) {
-            const reasons = [...new Set(droppedCommits.map((d) => d.reason))].join('; ');
-            const sample = droppedCommits.slice(0, DROPPED_COMMIT_SAMPLE_SIZE).map((d) => d.sha);
-            const more = droppedCommits.length - sample.length;
-            errors.push(
-                `${COMMITS_DROPPED_PREFIX} [${providerType}/${repoName}] ${droppedCommits.length} ` +
-                    `commit(s) the provider listed could not be imported and are PERMANENTLY ` +
-                    `absent from this window — re-running the sync will not recover them. ` +
-                    `Reason(s): ${reasons}. Affected: ${sample.join(', ')}` +
-                    `${more > 0 ? ` (+${more} more)` : ''}.`,
-            );
+            droppedByRepo.push({repo: repoName, drops: [...droppedCommits]});
         }
         report?.((p) => {
             p.commits_fetched += rawCommits.length;
@@ -1857,6 +1848,31 @@ async function fetchProviderData(
             // snapshot) never displays a finished repo's stale "PR 40/40" (#270).
             Object.assign(p, NO_REPO_STEP);
         });
+    }
+
+    // Now that the whole provider is fetched, `commitsComplete` is final — so this is the
+    // earliest point the permanence claim can honestly be made (#275). An incomplete provider
+    // has its window discarded and re-covered, so its staged drops are simply not reported;
+    // they will be re-discovered (or recovered) by the run that does keep its data.
+    //
+    // One line per affected repo, with a count, like the review-comment/verdict failures above
+    // and for the same reason: a systemic shape problem hits thousands of commits, and an
+    // `errors` list that long is unreadable wherever it lands. A bounded sample of shas is
+    // included so the operator can actually go look one up.
+    if (commitsComplete) {
+        for (const {repo: droppedRepo, drops} of droppedByRepo) {
+            const reasons = [...new Set(drops.map((d) => d.reason))].join('; ');
+            const sample = drops.slice(0, DROPPED_COMMIT_SAMPLE_SIZE).map((d) => d.sha);
+            const more = drops.length - sample.length;
+            errors.push(
+                `${COMMITS_DROPPED_PREFIX} [${providerType}/${droppedRepo}] ${drops.length} ` +
+                    `commit(s) the provider listed could not be imported, and this run's cursor ` +
+                    `has advanced past them — a plain re-run will not re-ask. If the cause was a ` +
+                    `transient bad response rather than the commit itself, "sync older history" ` +
+                    `over the affected dates will. Reason(s): ${reasons}. ` +
+                    `Affected: ${sample.join(', ')}${more > 0 ? ` (+${more} more)` : ''}.`,
+            );
+        }
     }
 
     // The cache never throws, so this line is the ONLY trace a broken one leaves. An advisory,
@@ -2675,6 +2691,15 @@ export class GitSync implements ConnectorInterface {
             // Same reason: the gate's findings describe a discarded transaction. Whether the
             // provider is really gone is re-established by the next run's own gate.
             orphanedContainers.clear();
+            // Same reason again, and the one advisory that has to be RETRACTED rather than
+            // simply not emitted: the drop lines were pushed by `fetchProviderData`, before
+            // this transaction existed. They claim the cursor advanced past the dropped
+            // commits — but a rollback advances no cursor, so the window (and every drop in
+            // it) is re-asked next run. Removed in place, since `errors` already carries them
+            // (#275).
+            for (let i = errors.length - 1; i >= 0; i--) {
+                if (errors[i].startsWith(COMMITS_DROPPED_PREFIX)) errors.splice(i, 1);
+            }
             errors.push(
                 `Failed to write sync data (transaction rolled back — no cursor advanced, window will be re-fetched next run): ${err instanceof Error ? err.message : String(err)}`,
             );

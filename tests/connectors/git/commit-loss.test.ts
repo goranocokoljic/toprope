@@ -32,7 +32,10 @@ import {
     isAdvisoryError,
     syncStateKey,
 } from '../../../src/connectors/git/sync';
-import {NO_AUTHOR_DATE_DROP_REASON} from '../../../src/connectors/git/providers/github';
+import {
+    NO_AUTHOR_DATE_DROP_REASON,
+    UNATTRIBUTABLE_DATE_DROP_REASON,
+} from '../../../src/connectors/git/providers/github';
 import {MAX_SERVER_ERROR_RETRIES} from '../../../src/connectors/git/providers/http-retry';
 import type {GitProviderConfig} from '../../../src/connectors/git/providers/types';
 
@@ -67,8 +70,18 @@ const EMBEDDED = {
     message: 'feat: add feature',
 };
 
-/** An embedded object carrying no author date at all — the unattributable shape. */
+/** An embedded object carrying no author date at all. */
 const NO_DATE_EMBEDDED = {author: null, message: 'unattributable'};
+
+/**
+ * An embedded object whose date is PRESENT but unattributable — an ISO 8601 expanded year.
+ * It round-trips through `Date`, so only an anchored shape check rejects it; left unchecked it
+ * reaches `raw_author_daily`'s `UTC_DAY_RE` and throws inside the run's write transaction.
+ */
+const BAD_DATE_EMBEDDED = {
+    author: {name: 'Alice', email: 'alice@example.com', date: '+033658-09-27T00:00:00.000Z'},
+    message: 'far future',
+};
 
 function listRow(sha: string, commit: unknown = EMBEDDED): Record<string, unknown> {
     return {sha, commit, author: {login: 'alice'}};
@@ -95,14 +108,20 @@ function respond({status = 200, body = []}: Route): Response {
 }
 
 /**
- * Stubs `fetch` for one org with one repo, routing by URL. `rows` is the commit LIST response
- * and `details` maps sha → the response for that commit's detail request (a value or a thunk,
- * so a test can make one commit fail on the first attempt and succeed on the next), which is
- * how a single commit is made lossy while its siblings behave normally.
+ * Stubs `fetch` for one org, routing by URL.
+ *
+ * - `rows` is the commit LIST response every repo serves by default.
+ * - `details` maps sha → that commit's detail response. A thunk instead of a value lets a test
+ *   make one commit fail on the first attempt and succeed on the next.
+ * - `repos` is the org's repo list; more than one is how a test reaches "repo A dropped, repo B
+ *   failed" (the interaction that decides whether a permanence claim is honest).
+ * - `listRoutes` overrides a specific repo's commit-LIST response, e.g. to fail it outright.
  */
 function stubGitHub(
     rows: Array<Record<string, unknown>>,
     details: Record<string, Route | (() => Route)>,
+    repos: string[] = ['repo1'],
+    listRoutes: Record<string, Route> = {},
 ): void {
     vi.stubGlobal(
         'fetch',
@@ -110,25 +129,36 @@ function stubGitHub(
             if (url.includes('/orgs/test-org/repos')) {
                 return Promise.resolve(
                     respond({
-                        body: [
-                            {
-                                id: 1,
-                                name: 'repo1',
-                                full_name: 'test-org/repo1',
-                                default_branch: 'main',
-                                archived: false,
-                            },
-                        ],
+                        body: repos.map((name, i) => ({
+                            id: i + 1,
+                            name,
+                            full_name: `test-org/${name}`,
+                            default_branch: 'main',
+                            archived: false,
+                        })),
                     }),
                 );
             }
             const detailMatch = url.match(/\/commits\/([^/?]+)$/);
             if (detailMatch) {
                 const route = details[detailMatch[1]];
-                if (!route) throw new Error(`unexpected detail request: ${url}`);
+                // A non-retryable 4xx rather than a throw: a thrown transport fault would be
+                // classified retryable and consumed by the 5xx + repo-retry budgets, surfacing
+                // minutes later as a generic "Failed to fetch commits" instead of this message.
+                if (!route) {
+                    return Promise.resolve({
+                        ok: false,
+                        status: 418,
+                        headers: new Headers(),
+                        text: () => Promise.resolve(`test harness: unexpected detail request ${url}`),
+                    } as unknown as Response);
+                }
                 return Promise.resolve(respond(typeof route === 'function' ? route() : route));
             }
-            if (url.includes('/commits?')) return Promise.resolve(respond({body: rows}));
+            const listMatch = url.match(/\/repos\/test-org\/([^/]+)\/commits\?/);
+            if (listMatch) {
+                return Promise.resolve(respond(listRoutes[listMatch[1]] ?? {body: rows}));
+            }
             // PRs, review comments, verdicts — empty; this suite is about commits.
             return Promise.resolve(respond({body: []}));
         }),
@@ -171,6 +201,9 @@ describe('unreturned commits are never silent (#275)', () => {
         db.close();
         vi.useRealTimers();
         vi.restoreAllMocks();
+        // `restoreAllMocks` does not undo `stubGlobal`, so without this a future test that
+        // forgets to stub would silently inherit the previous test's routes instead of failing.
+        vi.unstubAllGlobals();
     });
 
     describe('a per-commit detail FETCH failure (recoverable)', () => {
@@ -273,6 +306,73 @@ describe('unreturned commits are never silent (#275)', () => {
             expect(isAdvisoryError(dropLine!)).toBe(true);
             // …and the run as a whole reports no genuine failure.
             expect(result.errors.filter((e) => !isAdvisoryError(e))).toEqual([]);
+            // A repo whose EVERY commit is dropped still covered its window as well as it ever
+            // will, so the cursor advances rather than being held like an un-covered one — and
+            // nothing is written, because nothing was attributable (#275 review TST-3).
+            expect(readState(db, FORWARD_KEY)).toBe(result.lastSyncTime);
+            expect(dayCommits(db)).toBeUndefined();
+        });
+
+        it('names a bounded sample of shas, counts the rest, and states each reason once', async () => {
+            // The whole aggregation half of the advisory (#275 review TST-2): seven drops
+            // across BOTH reason classes. With one drop per test, `slice(0, 5)` was
+            // indistinguishable from `slice(0, 1)`, the `(+N more)` branch never ran, and the
+            // reason de-duplication was indistinguishable from a plain join that would repeat
+            // one sentence seven times.
+            seedAlice(db);
+            // Four dateless + three present-but-unattributable, so both reasons appear.
+            const shas = ['d1', 'd2', 'd3', 'd4', 'u1', 'u2', 'u3'];
+            const rows = shas.map((s) => listRow(s, s.startsWith('d') ? NO_DATE_EMBEDDED : BAD_DATE_EMBEDDED));
+            stubGitHub(
+                rows,
+                Object.fromEntries(
+                    shas.map((s) => [
+                        s,
+                        {body: detailBody(s, s.startsWith('d') ? NO_DATE_EMBEDDED : BAD_DATE_EMBEDDED)},
+                    ]),
+                ),
+            );
+
+            const result = await runSync(db);
+
+            const dropLine = dropLineOf(result.errors);
+            expect(dropLine).toBeDefined();
+            // ONE line for the repo, not one per commit — the point of aggregating.
+            expect(result.errors.filter((e) => e.startsWith(COMMITS_DROPPED_PREFIX))).toHaveLength(1);
+            expect(dropLine).toContain('7 commit(s)');
+            // Exactly the first five shas are named, and the remainder is counted.
+            for (const named of ['d1', 'd2', 'd3', 'd4', 'u1']) {
+                expect(dropLine).toContain(named);
+            }
+            expect(dropLine).not.toContain('u2');
+            expect(dropLine).not.toContain('u3');
+            expect(dropLine).toContain('(+2 more)');
+            // Both reasons stated, each exactly once — four dateless commits must not repeat
+            // their sentence four times.
+            expect(dropLine!.split(NO_AUTHOR_DATE_DROP_REASON)).toHaveLength(2);
+            expect(dropLine!.split(UNATTRIBUTABLE_DATE_DROP_REASON)).toHaveLength(2);
+        });
+
+        it('does NOT claim permanence when a later repo fails and the window is discarded', async () => {
+            // #275 review SEC-6. "The cursor has advanced past them" is only true of a run whose
+            // data was kept. repo1 drops a commit, then repo2's commit fetch fails → #231
+            // discards the WHOLE provider's window and holds the cursor, so repo1's dropped
+            // commit is re-asked next run like everything else. Reporting it as permanent would
+            // send the operator chasing a loss that has not happened.
+            seedAlice(db);
+            stubGitHub([listRow('aaa111', NO_DATE_EMBEDDED), listRow('bbb222')], {
+                aaa111: {body: detailBody('aaa111', NO_DATE_EMBEDDED)},
+                bbb222: {body: detailBody('bbb222')},
+            }, ['repo1', 'repo2'], {repo2: {status: 404, body: 'not found'}});
+
+            const result = await runSync(db);
+
+            // The genuine failure IS reported (positive control — the run really did fail)…
+            expect(result.errors.some((e) => /Failed to fetch commits/.test(e))).toBe(true);
+            // …the cursor is held…
+            expect(readState(db, FORWARD_KEY)).toBeUndefined();
+            // …and no permanence claim was made over a window that will be re-covered.
+            expect(dropLineOf(result.errors)).toBeUndefined();
         });
 
         it('counts each dropped commit ONCE even when an in-run retry re-pages the window', async () => {

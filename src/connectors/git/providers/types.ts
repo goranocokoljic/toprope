@@ -242,6 +242,30 @@ export interface GitFetchProgress {
 export type GitFetchProgressListener = (progress: GitFetchProgress) => void;
 
 /**
+ * Every reason a provider may give for dropping a commit it listed (#275).
+ *
+ * A CLOSED set, and a runtime-enumerable one, for the reason the project's allowlist rule
+ * gives: this string is pushed verbatim into `SyncResult.errors`, which the CLI prints to a
+ * terminal and the scheduler persists into `sync_logs.errors`. A `string` field would have
+ * left "never interpolate a response body into this" as a comment a future provider is free
+ * to ignore; the type is what actually forbids it.
+ *
+ * Both members describe the SAME defect class — the commit cannot be attributed to a UTC day
+ * — split only because the operator's next step differs: a commit with no date at all is a
+ * truncated/garbled response, while one with an out-of-range or non-ISO date is a real commit
+ * with a timestamp this pipeline cannot key on.
+ */
+export const COMMIT_DROP_REASONS = [
+    'no author date on either the commit list row or the commit detail response, so the ' +
+        'commit cannot be attributed to a day',
+    'the author date is present but is not a UTC ISO instant on a four-digit-year day, so ' +
+        'the commit cannot be attributed to a day',
+] as const;
+
+/** One of the {@link COMMIT_DROP_REASONS}. */
+export type GitCommitDropReason = (typeof COMMIT_DROP_REASONS)[number];
+
+/**
  * One commit a provider LISTED but cannot return (#275).
  *
  * This is not a fetch failure and must never be reported as one. A fetch failure is
@@ -254,17 +278,15 @@ export type GitFetchProgressListener = (progress: GitFetchProgress) => void;
  *
  * The loss is therefore PERMANENT, which is exactly why it has to be said out loud: before
  * #275 such a commit vanished with nothing in `errors[]`, no trace in the sync log, and a
- * cursor already advanced past it.
+ * cursor already advanced past it. This type is the CANONICAL statement of that decision —
+ * the sites that act on it (`COMMITS_DROPPED_PREFIX` in `sync.ts`, the drop report in
+ * `github.ts`) cite it rather than re-deriving it.
  */
 export interface GitCommitDrop {
     /** The sha as it appeared in the provider's own commit list. */
     sha: string;
-    /**
-     * Why the commit is unusable, in words an operator can act on. Provider-authored and
-     * always a module-level constant on the provider (never interpolated from a response),
-     * because it is pushed verbatim into `SyncResult.errors` and rendered in the admin UI.
-     */
-    reason: string;
+    /** Why the commit is unusable, in words an operator can act on. */
+    reason: GitCommitDropReason;
 }
 
 /**
@@ -273,8 +295,16 @@ export interface GitCommitDrop {
  * nothing, and the argument object is never even constructed.
  *
  * Per-commit rather than a returned count so the caller can name the affected shas; the
- * caller aggregates to one line per repo (a systemic shape problem hits thousands of commits,
- * and an `errors` list that long is unreadable in the sync log and the admin UI alike).
+ * caller aggregates to one line per repo, because a systemic shape problem hits thousands of
+ * commits and an `errors` list that long is unreadable wherever it lands.
+ *
+ * WHERE IT LANDS, precisely — this is the only durable record of the loss, so do not assume
+ * more reach than it has: `toprope sync git` / `sync all` print every entry to stdout, and
+ * the SCHEDULED path persists them into `sync_logs.errors` (advisories do not turn the run
+ * red — see `isAdvisoryError`). The admin "Sync now" route classifies advisories out and
+ * records `status: 'ok'`, which NULLs `last_sync_error`, so on that path the line is not
+ * persisted at all, and no dashboard surface renders `sync_logs.errors` today. Closing that
+ * gap is cross-cutting across all six advisory sentinels and is tracked separately.
  */
 export type GitCommitDropListener = (drop: GitCommitDrop) => void;
 
@@ -290,14 +320,25 @@ export interface GitProvider {
     // also expose it on `GitCommit.diffs`, so the caller reuses that one fetch instead of
     // walking the same endpoint again per commit (#271).
     //
-    // `onDrop` (optional) is the ONLY way an implementation may return fewer commits than it
-    // listed (#275). Returning a short list silently is forbidden: the caller reads a normal
-    // return as "this window is fully covered" and advances the provider's cursor past it
-    // (#231), so an unreported drop is a permanent, invisible hole in `git_snapshots`. An
-    // implementation that cannot use a listed commit must report it here; one that can retry
+    // `onDrop` (optional) is how an implementation reports a commit it listed but cannot
+    // return (#275). Returning a short list silently is the thing to avoid: the caller reads a
+    // normal return as "this window is fully covered" and advances the provider's cursor past
+    // it (#231), so an unreported drop is a permanent, invisible hole in `git_snapshots`. An
+    // implementation that cannot use a listed commit should report it here; one that can retry
     // must THROW instead, so the fault reaches the in-run repo retry and then #231's cursor
-    // hold. Bitbucket's in-memory `until` filter is neither — a commit outside the requested
-    // window was never in this call's result set to begin with (#276).
+    // hold.
+    //
+    // TWO KNOWN EXCEPTIONS, stated rather than implied — the rule above is not yet true of
+    // every implementation, and a reader must not infer from a clean `errors[]` that no
+    // provider dropped anything:
+    //   - Bitbucket's in-memory `until` filter legitimately removes commits outside the
+    //     requested window; those were never in this call's result set (#276).
+    //   - Bitbucket ALSO drops a commit whose `date` is missing or unparseable, silently: its
+    //     filter compares `new Date(c.date)` and an Invalid Date fails both bounds, so the
+    //     commit falls through and is neither retained nor reported. That is the same defect
+    //     class this listener exists for, not a window filter — it is simply not wired up
+    //     here yet. GitLab has the mirror gap: it pushes `authored_date` with no shape check
+    //     at all. Only GitHub currently honors the rule in full.
     getCommits(
         repo: string,
         since: string,

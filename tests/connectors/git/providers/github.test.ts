@@ -2,6 +2,7 @@ import {describe, it, expect, beforeEach, afterEach, vi} from 'vitest';
 import {
     GitHubProvider,
     NO_AUTHOR_DATE_DROP_REASON,
+    UNATTRIBUTABLE_DATE_DROP_REASON,
 } from '../../../../src/connectors/git/providers/github';
 import {
     MAX_SERVER_ERROR_RETRIES,
@@ -438,56 +439,197 @@ describe('GitHubProvider', () => {
             ]);
         });
 
-        it('recovers a commit whose DETAIL has no author date from the list row already in hand', async () => {
-            // The list and the detail return the IDENTICAL embedded `commit` object — the
-            // identity the #273 cache-hit path already depends on. So a shape anomaly in one of
-            // two copies is not a reason to lose the commit (#275): the list row answers, with
-            // no extra request. Every field below is DISTINCT from `makeCommitDetailFixture`'s,
-            // so the assertions can only pass if the list row is what was actually read.
+        // The list and the detail return the IDENTICAL embedded `commit` object — the identity
+        // the #273 cache-hit path already depends on. So a shape anomaly in ONE of two copies
+        // is not a reason to lose the commit (#275): the list row answers, with no extra
+        // request.
+        //
+        // Run over EVERY shape that makes the detail's copy unusable, not just the easy one.
+        // The predicate is `detail.commit?.author && isAttributableDate(...)`, and a narrowing
+        // of it to `!detail.commit` — which drops the commit permanently whenever `commit` is
+        // present but its date is not usable — passed a suite that only covered the
+        // `commit`-absent case (#275 review TST-1).
+        const unusableDetailCommit: Array<[string, unknown]> = [
+            ['`commit` absent entirely', undefined],
+            ['`commit` present, `author` null', {author: null, message: 'from the detail'}],
+            [
+                '`commit.author` present, date empty',
+                {author: {name: 'D', email: 'd@e.com', date: ''}, message: 'from the detail'},
+            ],
+            [
+                '`commit.author` present, date an ISO expanded year',
+                {
+                    author: {name: 'D', email: 'd@e.com', date: '+033658-09-27T00:00:00.000Z'},
+                    message: 'from the detail',
+                },
+            ],
+            [
+                '`commit.author` present, date not a timestamp at all',
+                {author: {name: 'D', email: 'd@e.com', date: 'unknown'}, message: 'from the detail'},
+            ],
+        ];
+
+        it.each(unusableDetailCommit)(
+            'recovers from the list row already in hand when the detail has %s',
+            async (_shape, commitField) => {
+                // Every field is DISTINCT from `makeCommitDetailFixture`'s (and from the
+                // detail's own decoy `commit` above), so these assertions can only pass if the
+                // list row is what was actually read.
+                const listRow = {
+                    sha: 'aaa111',
+                    commit: {
+                        author: {
+                            name: 'List Alice',
+                            email: 'list-alice@example.com',
+                            date: '2024-02-20T08:30:00Z',
+                        },
+                        message: 'fix: from the list row',
+                    },
+                    author: {login: 'list-alice'},
+                };
+                // Real stats/files, so the churn numbers still come from the detail while the
+                // identity comes from the list row.
+                const detail: Record<string, unknown> = {
+                    sha: 'aaa111',
+                    author: null,
+                    stats: {additions: 7, deletions: 3, total: 10},
+                    files: [{filename: 'src/x.ts', additions: 7, deletions: 3, status: 'modified'}],
+                };
+                if (commitField !== undefined) detail.commit = commitField;
+                const fetchMock = makeFetchMock([{body: [listRow]}, {body: detail}]);
+                vi.stubGlobal('fetch', fetchMock);
+
+                const onDrop = vi.fn();
+                const commits = await provider.getCommits('my-repo', '', '', undefined, onDrop);
+
+                expect(commits).toHaveLength(1);
+                expect(commits[0].date).toBe('2024-02-20T08:30:00Z');
+                expect(commits[0].author.name).toBe('List Alice');
+                expect(commits[0].author.email).toBe('list-alice@example.com');
+                expect(commits[0].message).toBe('fix: from the list row');
+                // `author.login` always comes from the list row — see the no-mixing test below.
+                expect(commits[0].author.username).toBe('list-alice');
+                // The detail still supplied the churn, so the recovery is not a degraded row.
+                expect(commits[0].additions).toBe(7);
+                expect(commits[0].filesChanged).toEqual(['src/x.ts']);
+                // Nothing was lost, so nothing is reported…
+                expect(onDrop).not.toHaveBeenCalled();
+                // …and the recovery cost no extra request: list + one detail, as always.
+                expect(fetchMock).toHaveBeenCalledTimes(2);
+            },
+        );
+
+        it('recovers with an empty username when neither copy names a GitHub user', async () => {
+            // The other arm of the login read (#275 review TST-5): recovery from the list row
+            // must not invent a username when the list row has none either.
             const listRow = {
                 sha: 'aaa111',
                 commit: {
-                    author: {
-                        name: 'List Alice',
-                        email: 'list-alice@example.com',
-                        date: '2024-02-20T08:30:00Z',
-                    },
-                    message: 'fix: from the list row',
+                    author: {name: 'A', email: 'a@e.com', date: '2024-02-20T08:30:00Z'},
+                    message: 'm',
                 },
-                author: {login: 'list-alice'},
+                author: null,
             };
-            const fetchMock = makeFetchMock([
-                {body: [listRow]},
-                // Detail: no embedded `commit` at all, but real stats/files — so the churn
-                // numbers still come from the detail while the identity comes from the list row.
-                {
-                    body: {
-                        sha: 'aaa111',
-                        author: null,
-                        stats: {additions: 7, deletions: 3, total: 10},
-                        files: [{filename: 'src/x.ts', additions: 7, deletions: 3, status: 'modified'}],
-                    },
-                },
-            ]);
-            vi.stubGlobal('fetch', fetchMock);
+            vi.stubGlobal(
+                'fetch',
+                makeFetchMock([{body: [listRow]}, {body: {sha: 'aaa111', author: null}}]),
+            );
+
+            const commits = await provider.getCommits('my-repo', '', '');
+
+            expect(commits).toHaveLength(1);
+            expect(commits[0].author.username).toBe('');
+        });
+
+        it('drops a commit whose date is PRESENT but unattributable, with its own reason', async () => {
+            // The date must be shape-pinned here, not merely present (#275 review SEC-1). An
+            // ISO 8601 expanded year round-trips through Date but `slice(0, 10)` turns it into
+            // a day `raw_author_daily` rejects by THROWING — inside the run's single write
+            // transaction, which rolls back every provider's window and does so again on every
+            // subsequent run. Caught here it costs one reported commit instead of the whole
+            // git connector.
+            const bad = {
+                author: {name: 'A', email: 'a@e.com', date: '+033658-09-27T00:00:00.000Z'},
+                message: 'far future',
+            };
+            vi.stubGlobal(
+                'fetch',
+                makeFetchMock([
+                    {body: [{sha: 'aaa111', commit: bad, author: {login: 'alice'}}]},
+                    {body: {sha: 'aaa111', commit: bad, author: {login: 'alice'}}},
+                ]),
+            );
 
             const onDrop = vi.fn();
             const commits = await provider.getCommits('my-repo', '', '', undefined, onDrop);
 
+            expect(commits).toEqual([]);
+            // A DISTINCT reason from the absent-date case — the operator's next step differs.
+            expect(onDrop).toHaveBeenCalledWith({
+                sha: 'aaa111',
+                reason: UNATTRIBUTABLE_DATE_DROP_REASON,
+            });
+            expect(UNATTRIBUTABLE_DATE_DROP_REASON).not.toBe(NO_AUTHOR_DATE_DROP_REASON);
+        });
+
+        it('does not memoize a diffstat read off the body it just declared unusable', async () => {
+            // #275 review SO-1/SEC-2. `commit_diffstats` has NO invalidation: a row written
+            // here is served on every later run and skips the detail request forever. The
+            // realistic malformed 200 is missing `stats`/`files` along with `commit`, so
+            // caching the recovery would freeze 0 additions / 0 deletions / no files as this
+            // commit's immutable answer — permanently understating that developer-day's churn,
+            // silently, and breaking the rule providers/diffstat.ts exists to enforce.
+            const put = vi.fn();
+            const cache = {load: vi.fn().mockReturnValue(new Map()), put};
+            const cachingProvider = new GitHubProvider(CONFIG, cache);
+            const listRow = {
+                sha: 'aaa111',
+                commit: {
+                    author: {name: 'A', email: 'a@e.com', date: '2024-02-20T08:30:00Z'},
+                    message: 'm',
+                },
+                author: {login: 'alice'},
+            };
+            // A degenerate detail: the sha and nothing else usable.
+            vi.stubGlobal(
+                'fetch',
+                makeFetchMock([{body: [listRow]}, {body: {sha: 'aaa111'}}]),
+            );
+
+            const commits = await cachingProvider.getCommits('my-repo', '', '');
+
+            // The commit is still recovered…
             expect(commits).toHaveLength(1);
             expect(commits[0].date).toBe('2024-02-20T08:30:00Z');
-            expect(commits[0].author.name).toBe('List Alice');
-            expect(commits[0].author.email).toBe('list-alice@example.com');
-            // `author.login` falls back the same way — same object on both endpoints.
-            expect(commits[0].author.username).toBe('list-alice');
-            expect(commits[0].message).toBe('fix: from the list row');
-            // The detail still supplied the churn, so the recovery is not a degraded row.
-            expect(commits[0].additions).toBe(7);
-            expect(commits[0].filesChanged).toEqual(['src/x.ts']);
-            // Nothing was lost, so nothing is reported…
-            expect(onDrop).not.toHaveBeenCalled();
-            // …and the recovery cost no extra request: list + one detail, as always.
-            expect(fetchMock).toHaveBeenCalledTimes(2);
+            // …and its (unknown) churn is NOT ratcheted, so the next run re-asks.
+            expect(put).not.toHaveBeenCalled();
+        });
+
+        it('DOES memoize when the detail body itself is usable — the guard is not blanket', async () => {
+            // The positive control for the test above: without it, deleting the `put` outright
+            // would satisfy that assertion and silently disable the whole #273 ratchet.
+            const put = vi.fn();
+            const cache = {load: vi.fn().mockReturnValue(new Map()), put};
+            const cachingProvider = new GitHubProvider(CONFIG, cache);
+            vi.stubGlobal(
+                'fetch',
+                makeFetchMock([
+                    {body: [makeCommitListFixture('aaa111')]},
+                    {body: makeCommitDetailFixture('aaa111')},
+                ]),
+            );
+
+            await cachingProvider.getCommits('my-repo', '', '');
+
+            expect(put).toHaveBeenCalledWith('my-repo', 'aaa111', {
+                additions: 40,
+                deletions: 10,
+                entries: [
+                    {path: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'},
+                    {path: 'src/bar.ts', additions: 10, deletions: 5, status: 'added'},
+                ],
+                absent: false,
+            });
         });
 
         it('drops nothing when no drop listener is supplied — a short list is still short', async () => {
@@ -733,11 +875,18 @@ describe('GitHubProvider', () => {
         });
 
         it('extracts username from author login even when commit author differs', async () => {
-            // Also pins the no-mixing half of #275's fallback: the LIST fixture below carries
-            // `author: {login: 'alice'}` while this well-formed detail carries `author: null`.
-            // `null` there is a real answer — an unlinked commit — so the fallback must NOT
-            // reach across to the list row's login just because the other copy names someone.
-            // Only a detail whose embedded `commit` is unusable switches copies, wholesale.
+            // `commit.author` (the git author) and `author` (the linked GitHub user) are
+            // different things: a merge bot commits under a git identity with no GitHub user
+            // linked, and `''` is the right answer for the latter.
+            //
+            // BOTH copies carry `author: null` here, deliberately (#275 review SO-4). The
+            // top-level `author` is the same embedded object on the list and the detail
+            // endpoint, so that is the only shape GitHub can actually return — and since #275
+            // the login is read from the list row on the cache-hit path AND the fetch path, a
+            // fixture that disagreed between them would pin a divergence that cannot occur
+            // while hiding the invariant that matters: a warm run and a cold run must resolve
+            // the same login, or `raw_author_daily` (which keys on login in preference to
+            // email) splits one author's history across two raw identities.
             const sha = 'abc123';
             const detailWithBot: Record<string, unknown> = {
                 sha,
@@ -750,7 +899,7 @@ describe('GitHubProvider', () => {
                 files: [],
             };
             const fetchMock = makeFetchMock([
-                {body: [makeCommitListFixture(sha)]},
+                {body: [{...makeCommitListFixture(sha), author: null}]},
                 {body: detailWithBot},
             ]);
             vi.stubGlobal('fetch', fetchMock);
