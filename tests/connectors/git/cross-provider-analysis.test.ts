@@ -83,18 +83,23 @@ describe('Cross-provider analysis: identical output for equivalent fixtures', ()
         const bbDay = bbResult.get(BITBUCKET_USERNAME)!.get('2024-03-10')!;
         const glDay = glResult.get(GITLAB_USERNAME)!.get('2024-03-10')!;
 
-        // Commit counts must match
+        // Pinned ABSOLUTELY, not just provider-against-provider. All three runs share one
+        // fixture builder and one analysis path, so an equality between them holds even when
+        // the shared path regresses — it would move all three values together. The absolute
+        // values are what actually fails when `toAnalysisCommit`/`aggregateDailyMetrics`
+        // stops deriving these from the commit totals and its file diffs.
         expect(ghDay.commits).toBe(1);
+        expect(ghDay.lines_added).toBe(245); // commit.additions, NOT summed from the diffs
+        expect(ghDay.lines_removed).toBe(40);
+        expect(ghDay.files_changed).toBe(CANONICAL_DIFFS.length); // 3
+
+        // …and identical across providers, which is this file's own subject.
         expect(bbDay.commits).toBe(1);
         expect(glDay.commits).toBe(1);
-
-        // Line counts must match
         expect(ghDay.lines_added).toBe(bbDay.lines_added);
         expect(ghDay.lines_added).toBe(glDay.lines_added);
         expect(ghDay.lines_removed).toBe(bbDay.lines_removed);
         expect(ghDay.lines_removed).toBe(glDay.lines_removed);
-
-        // File counts must match
         expect(ghDay.files_changed).toBe(bbDay.files_changed);
         expect(ghDay.files_changed).toBe(glDay.files_changed);
     });
@@ -108,6 +113,11 @@ describe('Cross-provider analysis: identical output for equivalent fixtures', ()
         const bbScore = bbResult.get(BITBUCKET_USERNAME)!.get('2024-03-10')!.ai_signature_score;
         const glScore = glResult.get(GITLAB_USERNAME)!.get('2024-03-10')!.ai_signature_score;
 
+        // Absolute too: 245 additions over 3 files trips no `scoreAiSignature` signal
+        // (all four need >=300 additions, >=5 new boilerplate files, >3 files at >50
+        // additions each, or >500 total lines), so 0 is this fixture's stated outcome —
+        // not an accident, and it fails if a threshold moves under it.
+        expect(ghScore).toBe(0);
         expect(ghScore).toBe(bbScore);
         expect(ghScore).toBe(glScore);
     });
@@ -134,9 +144,12 @@ describe('Cross-provider analysis: identical output for equivalent fixtures', ()
         const bbChurn = runChurnAnalysis(BITBUCKET_USERNAME).get(BITBUCKET_USERNAME)!.get('2024-03-10')!.code_churn_rate;
         const glChurn = runChurnAnalysis(GITLAB_USERNAME).get(GITLAB_USERNAME)!.get('2024-03-10')!.code_churn_rate;
 
+        // Absolute, for the reason given in the first test. The rate is re-churned lines
+        // over the day's total lines: both commits touch 60 lines of the same file, and
+        // only the second lands inside the 48h window of a prior touch — 60/120.
+        expect(ghChurn).toBe(0.5);
         expect(ghChurn).toBe(bbChurn);
         expect(ghChurn).toBe(glChurn);
-        expect(ghChurn).toBeGreaterThan(0); // should detect churn
     });
 
     it('detects commit bursts consistently across providers', () => {
@@ -163,7 +176,8 @@ describe('Cross-provider analysis: identical output for equivalent fixtures', ()
         const bbBurst = runBurstAnalysis(BITBUCKET_USERNAME).get(BITBUCKET_USERNAME)!.get('2024-03-10')!.commit_burst_count;
         const glBurst = runBurstAnalysis(GITLAB_USERNAME).get(GITLAB_USERNAME)!.get('2024-03-10')!.commit_burst_count;
 
-        expect(ghBurst).toBeGreaterThan(0);
+        // Absolute: three commits inside one 30-minute window is exactly one burst.
+        expect(ghBurst).toBe(1);
         expect(ghBurst).toBe(bbBurst);
         expect(ghBurst).toBe(glBurst);
     });

@@ -517,7 +517,12 @@ describe('GitHubProvider', () => {
                 expect(commits[0].author.username).toBe('list-alice');
                 // The detail still supplied the churn, so the recovery is not a degraded row.
                 expect(commits[0].additions).toBe(7);
-                expect(commits[0].diffs?.map((d) => d.path)).toEqual(['src/x.ts']);
+                // Full entries, not just paths: a recovery that kept the path list but lost
+                // the per-file churn would zero `code_churn_rate` downstream and still pass a
+                // path-only check.
+                expect(commits[0].diffs).toEqual([
+                    {path: 'src/x.ts', additions: 7, deletions: 3, status: 'modified'},
+                ]);
                 // Nothing was lost, so nothing is reported…
                 expect(onDrop).not.toHaveBeenCalled();
                 // …and the recovery cost no extra request: list + one detail, as always.
@@ -1754,8 +1759,6 @@ describe('GitHubProvider', () => {
 
             // Verify author data flows consistently
             expect(commits[0].author.username).toBe('alice');
-            // `getCommits` carries out the SAME value `getCommitDiff` returns (#271) — the
-            // path list the removed `filesChanged` used to hold is derived from it (#281).
             expect(commits[0].diffs).toEqual(diffs);
         });
     });

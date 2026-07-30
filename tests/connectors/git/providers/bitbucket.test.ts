@@ -769,8 +769,6 @@ describe('BitbucketProvider', () => {
             expect(commits[0].sha).toBe(hash);
             expect(commits[0].additions).toBe(0);
             expect(commits[0].deletions).toBe(0);
-            // `[]`, never undefined — the 404 is swallowed into "no file-level detail is
-            // obtainable", which must not send the commit back to the same endpoint (#271).
             expect(commits[0].diffs).toEqual([]);
         });
 
@@ -818,7 +816,12 @@ describe('BitbucketProvider', () => {
             expect(commits).toHaveLength(2);
             expect(commits[0].sha).toBe(hashA);
             expect(commits[0].additions).toBe(40);
-            expect(commits[0].diffs?.map((d) => d.path)).toEqual(['src/foo.ts', 'src/bar.ts']);
+            // Full entries, not just paths: the succeeding half of a mixed walk must carry
+            // per-file churn, which a path-only check cannot tell apart from a stripped diff.
+            expect(commits[0].diffs).toEqual([
+                {path: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'},
+                {path: 'src/bar.ts', additions: 10, deletions: 0, status: 'added'},
+            ]);
             expect(commits[1].sha).toBe(hashB);
             expect(commits[1].additions).toBe(0);
             expect(commits[1].diffs).toEqual([]);
@@ -1596,8 +1599,6 @@ describe('BitbucketProvider', () => {
             expect(diffs).toHaveLength(2);
             expect(diffs[0].path).toBe('src/foo.ts');
 
-            // `getCommits` carries out the SAME value `getCommitDiff` returns (#271) — the
-            // path list the removed `filesChanged` used to hold is derived from it (#281).
             expect(commits[0].diffs).toEqual(diffs);
             expect(commits[0].additions).toBe(40);
             expect(commits[0].deletions).toBe(5);

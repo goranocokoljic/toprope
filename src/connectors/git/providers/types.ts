@@ -60,10 +60,8 @@ export interface GitCommit {
      * value `getCommitDiff(repo, sha)` would return for this commit — with one deliberate
      * exception: where `getCommitDiff` would THROW a 404, this is `[]` (see below).
      *
-     * Since #281 it is the ONLY file-level representation on this type: the former
-     * `filesChanged: string[]`, which every provider had come to set to `diffs.map(d => d.path)`,
-     * is gone. A consumer that needs just the path list derives it — do not re-add a stored
-     * copy, or the type carries two representations of one payload again.
+     * This is the type's ONLY file-level representation: a consumer that needs the path
+     * list derives it. Do not add a stored copy back (#281).
      *
      * NOT a source for the totals above, and do NOT re-derive them from it. On Bitbucket
      * and GitLab `additions`/`deletions` are in fact the sum of these entries, but on
