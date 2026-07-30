@@ -13,179 +13,75 @@
  * driven off `GIT_PROVIDER_TYPES` — the same list `createGitProvider` switches on — so a new
  * member with no fixture FAILS rather than being silently skipped.
  *
- * The providers are the REAL classes over a `fetch` stub, not mocks: a mock provider would assert
- * only that the fixture sets the field.
+ * The providers are the REAL classes over the shared `fetch` stub, not mocks: a mock provider
+ * would assert only that the fixture sets the field.
+ *
+ * BOTH cache paths are covered. Production always hands `createGitProvider` a per-`(type,
+ * container)` diffstat cache (#273), and on every run after the first the already-seen commits
+ * take a cache-HIT branch that rebuilds the whole `GitCommit` from the memo row — a second,
+ * independent place a provider can forget `diffs` (GitHub has two literal `commits.push` sites for
+ * exactly this reason). Covering only the cold path would leave the warm path in the same
+ * hand-enumerated state this file exists to replace.
  */
 import {describe, it, expect, afterEach, vi} from 'vitest';
+import Database from 'better-sqlite3';
+import path from 'path';
+import {runMigrations} from '../../../../src/storage/migrator';
 import {createGitProvider} from '../../../../src/connectors/git/providers/factory';
+import {createCommitDiffstatCache} from '../../../../src/connectors/git/diffstat-cache';
 import {
     GIT_PROVIDER_TYPES,
     type GitProviderConfig,
     type GitProviderType,
 } from '../../../../src/connectors/git/providers/types';
+import {
+    BITBUCKET_CONFIG,
+    EXPECTED_DIFFS,
+    GITHUB_CONFIG,
+    GITLAB_CONFIG,
+    REPO,
+    SHAS,
+    bitbucketRoutes,
+    githubRoutes,
+    gitlabRoutes,
+    makeCountingFetch,
+    type Route,
+} from './provider-fetch-fixtures';
 
-const AUTHOR_EMAIL = 'alice@example.com';
-const COMMIT_DATE = '2024-01-15T10:00:00.000Z';
-const SHAS = ['sha-aaa', 'sha-bbb', 'sha-ccc'];
-const REPO = 'repo1';
+const MIGRATIONS_DIR = path.resolve(__dirname, '../../../../src/storage/migrations');
+
 const SINCE = '2024-01-01T00:00:00.000Z';
 const UNTIL = '2024-02-01T00:00:00.000Z';
-
-interface Route {
-    match: RegExp;
-    body?: unknown;
-    /** For an endpoint whose response must echo something from the URL (GitHub's commit detail). */
-    bodyFor?: (url: string) => unknown;
-}
-
-/**
- * Routes `fetch` by URL. An unrouted URL resolves to an empty page rather than throwing, so a
- * provider's unrelated paging does not have to be modelled — but every route a fixture DOES
- * declare must be hit, which the per-commit assertions below establish indirectly (a commit
- * only exists if its list route answered, and its `diffs` are only populated if its diff route
- * did).
- */
-function stubFetch(routes: Route[]): {urls: string[]} {
-    const urls: string[] = [];
-    vi.stubGlobal(
-        'fetch',
-        vi.fn().mockImplementation((url: string) => {
-            const u = String(url);
-            urls.push(u);
-            const route = routes.find((r) => r.match.test(u));
-            const body = route ? (route.bodyFor ? route.bodyFor(u) : route.body) : {values: []};
-            return Promise.resolve({
-                ok: true,
-                status: 200,
-                headers: new Headers({}),
-                json: () => Promise.resolve(body),
-                text: () => Promise.resolve(JSON.stringify(body)),
-            } as unknown as Response);
-        }),
-    );
-    return {urls};
-}
 
 interface ProviderFixture {
     config: GitProviderConfig;
     /** The commit-list + per-commit-diff endpoints, enough for `getCommits` to complete. */
-    routes: Route[];
-    /**
-     * The file paths the stubbed diff endpoint describes, in the order the provider yields them.
-     * Asserted so a provider that returns a well-formed but EMPTY `diffs` — which reads as "no
-     * file-level detail is obtainable" and silently zeroes every churn metric — cannot pass an
-     * `Array.isArray` check and look conformant.
-     */
-    expectedPaths: string[];
+    routes: () => Route[];
 }
 
 /**
  * One fixture per provider type. A `Record` keyed by {@link GitProviderType} so a new member of
  * the union is a compile error here — but tests are excluded from `tsconfig.json` and vitest
  * transpiles without type-checking, so that is a hint, NOT the enforcement. The enforcement is
- * the runtime lookup in the `it.each` below, driven off `GIT_PROVIDER_TYPES`.
+ * the runtime gate test below, driven off `GIT_PROVIDER_TYPES`.
+ *
+ * Route bodies and the expected normalized diffs both come from the shared fixture module, so a
+ * provider's URL/payload shape is written down once for every test that drives the real classes.
  */
 const FIXTURES: Record<GitProviderType, ProviderFixture> = {
-    github: {
-        config: {type: 'github', org: 'test-org', auth: {type: 'token', api_token: 'tok'}},
-        routes: [
-            {match: /\/repos\/test-org\/repo1\/commits\?/, body: SHAS.map((sha) => ({sha}))},
-            {
-                // The detail endpoint — no `?`, which is what distinguishes it from the list URL.
-                match: /\/repos\/test-org\/repo1\/commits\/[^?]+$/,
-                bodyFor: (url: string): Record<string, unknown> => ({
-                    sha: url.split('/').pop(),
-                    commit: {
-                        author: {name: 'Alice', email: AUTHOR_EMAIL, date: COMMIT_DATE},
-                        message: 'feat: work',
-                    },
-                    author: {login: 'alice-gh'},
-                    stats: {additions: 40, deletions: 5, total: 45},
-                    files: [
-                        {filename: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'},
-                        {filename: 'src/bar.ts', additions: 10, deletions: 0, status: 'added'},
-                    ],
-                }),
-            },
-        ],
-        expectedPaths: ['src/foo.ts', 'src/bar.ts'],
-    },
-    bitbucket: {
-        config: {
-            type: 'bitbucket',
-            workspace: 'test-ws',
-            auth: {type: 'access_token', token: 'tok'},
-        },
-        routes: [
-            {
-                match: /\/repositories\/test-ws\/repo1\/commits\?/,
-                body: {
-                    values: SHAS.map((hash) => ({
-                        hash,
-                        author: {raw: `Alice <${AUTHOR_EMAIL}>`, user: {nickname: 'alice-bb'}},
-                        date: COMMIT_DATE,
-                        message: 'feat: work',
-                    })),
-                },
-            },
-            {
-                match: /\/repositories\/test-ws\/repo1\/diffstat\//,
-                body: {
-                    values: [
-                        {
-                            status: 'modified',
-                            lines_added: 30,
-                            lines_removed: 5,
-                            new: {path: 'src/foo.ts'},
-                            old: {path: 'src/foo.ts'},
-                        },
-                        {
-                            status: 'added',
-                            lines_added: 10,
-                            lines_removed: 0,
-                            new: {path: 'src/bar.ts'},
-                            old: null,
-                        },
-                    ],
-                },
-            },
-        ],
-        expectedPaths: ['src/foo.ts', 'src/bar.ts'],
-    },
-    gitlab: {
-        config: {
-            type: 'gitlab',
-            group: 'test-group',
-            auth: {type: 'personal_access_token', token: 'tok'},
-        },
-        routes: [
-            {
-                match: /\/repository\/commits\?/,
-                body: SHAS.map((id) => ({
-                    id,
-                    author_name: 'Alice',
-                    author_email: AUTHOR_EMAIL,
-                    authored_date: COMMIT_DATE,
-                    message: 'feat: work',
-                })),
-            },
-            {
-                match: /\/repository\/commits\/[^/]+\/diff\?/,
-                body: [
-                    {
-                        old_path: 'src/foo.ts',
-                        new_path: 'src/foo.ts',
-                        new_file: false,
-                        renamed_file: false,
-                        deleted_file: false,
-                        diff: '@@ -1,2 +1,4 @@\n a\n+b\n+c\n-d\n',
-                    },
-                ],
-            },
-        ],
-        expectedPaths: ['src/foo.ts'],
-    },
+    github: {config: GITHUB_CONFIG, routes: githubRoutes},
+    bitbucket: {config: BITBUCKET_CONFIG, routes: bitbucketRoutes},
+    gitlab: {config: GITLAB_CONFIG, routes: gitlabRoutes},
 };
+
+/**
+ * Every URL that names a commit — the per-commit fan-out, whichever endpoint a provider reaches it
+ * through (GitHub's commit detail, Bitbucket's diffstat, GitLab's diff). The commit LIST url names
+ * no sha, so this counts exactly the O(commits) work.
+ */
+function perCommitRequests(urls: string[], sha: string): string[] {
+    return urls.filter((u) => u.includes(sha));
+}
 
 describe('#280 GitCommit.diffs conformance across every provider type', () => {
     afterEach(() => {
@@ -196,10 +92,10 @@ describe('#280 GitCommit.diffs conformance across every provider type', () => {
     });
 
     /**
-     * The gate that makes the table self-maintaining. Without it a provider type added to
-     * `GIT_PROVIDER_TYPES` with no fixture would make `FIXTURES[type]` `undefined` and the
-     * per-type test throw a bare `TypeError` — a failure, but one that reads as a broken test
-     * rather than as "your new provider is unverified".
+     * The gate that makes the table self-maintaining, and the only RUNTIME enforcement here: a
+     * provider type added to `GIT_PROVIDER_TYPES` with no fixture would otherwise make
+     * `FIXTURES[type]` `undefined` and the per-type tests throw a bare `TypeError` — a failure,
+     * but one that reads as a broken test rather than as "your new provider is unverified".
      */
     it('has a fixture for every provider type createGitProvider supports', () => {
         expect(Object.keys(FIXTURES).sort()).toEqual([...GIT_PROVIDER_TYPES].sort());
@@ -209,11 +105,10 @@ describe('#280 GitCommit.diffs conformance across every provider type', () => {
         '%s: getCommits returns every commit with a populated diffs array',
         async (type) => {
             const fixture = FIXTURES[type];
-            expect(fixture, `no #280 conformance fixture for provider type "${type}"`).toBeDefined();
+            const {fetchMock} = makeCountingFetch(fixture.routes());
+            vi.stubGlobal('fetch', fetchMock);
 
-            stubFetch(fixture.routes);
-            const provider = createGitProvider(fixture.config);
-            const commits = await provider.getCommits(REPO, SINCE, UNTIL);
+            const commits = await createGitProvider(fixture.config).getCommits(REPO, SINCE, UNTIL);
 
             // Guards the assertions below against being vacuous: a fixture whose commit-list
             // route stopped matching would return `[]` and every `for` below would pass.
@@ -225,10 +120,13 @@ describe('#280 GitCommit.diffs conformance across every provider type', () => {
                 expect(Array.isArray(commit.diffs), `${type}/${commit.sha} supplied no diffs`).toBe(
                     true,
                 );
-                // …and it must be the REAL diff, not an empty array. `[]` is a legal value of
-                // the field, but it means "no file-level detail is obtainable" — a provider
-                // that returned it for a commit the stub gave files for has lost the diff.
-                expect(commit.diffs?.map((d) => d.path)).toEqual(fixture.expectedPaths);
+                // …and the WHOLE entry, not just its path. `[]` is a legal value of the field, but
+                // it means "no file-level detail is obtainable" — and the next failure along from
+                // `[]` is a populated array of `{path}`-only entries, which passes any
+                // shape/length check while silently zeroing `code_churn_rate` and
+                // `ai_signature_score` (the only readers of `status` and of the per-file additions
+                // distribution) for every one of that provider's snapshots.
+                expect(commit.diffs, `${type}/${commit.sha} diffs`).toEqual(EXPECTED_DIFFS[type]);
             }
         },
     );
@@ -238,24 +136,77 @@ describe('#280 GitCommit.diffs conformance across every provider type', () => {
      * pins the count at the provider boundary — `diff-fetch-dedup.test.ts` pins it end-to-end
      * through the sync loop, but that file enumerates the three providers by hand, so only this
      * table would catch a fourth one that double-fetches inside `getCommits`.
+     *
+     * `<= 1`, not `=== 1`: a provider whose commit-LIST response already carries file-level stats
+     * would make ZERO per-commit requests, which is strictly better than the target and is the
+     * direction #271 was heading. The first `it.each` is what stops a provider from making zero
+     * requests AND supplying nothing.
      */
     it.each(GIT_PROVIDER_TYPES)(
         '%s: getCommits walks the per-commit diff endpoint at most once per commit',
         async (type) => {
             const fixture = FIXTURES[type];
-            const {urls} = stubFetch(fixture.routes);
+            const {fetchMock, urls} = makeCountingFetch(fixture.routes());
+            vi.stubGlobal('fetch', fetchMock);
 
             await createGitProvider(fixture.config).getCommits(REPO, SINCE, UNTIL);
 
             for (const sha of SHAS) {
-                // The per-commit endpoint differs per provider (GitHub's commit detail,
-                // Bitbucket's diffstat, GitLab's diff), but all three embed the sha, and the
-                // commit LIST url does not — so counting sha-bearing urls counts exactly the
-                // per-commit fan-out.
-                const perCommit = urls.filter((u) => u.includes(sha));
-                expect(perCommit.length, `${type} fanned out ${perCommit.length}× for ${sha}`).toBe(
-                    1,
-                );
+                const perCommit = perCommitRequests(urls, sha);
+                expect(
+                    perCommit.length,
+                    `${type} fanned out ${perCommit.length}× for ${sha}`,
+                ).toBeLessThanOrEqual(1);
+            }
+        },
+    );
+
+    /**
+     * The WARM path — the one production takes on every run after the first, and a second place a
+     * provider can drop `diffs`.
+     *
+     * With a diffstat cache supplied, each provider's second `getCommits` over the same commits
+     * serves them from the memo (`commit_diffstats`, #273) instead of re-walking the per-commit
+     * endpoint. That branch rebuilds the whole `GitCommit`, so it must reach the same `diffs` —
+     * otherwise a warm sync silently re-fans out ~2N requests forever via the fallback, which is
+     * exactly the cost #271 removed and the state #280 exists to make impossible to ship.
+     */
+    it.each(GIT_PROVIDER_TYPES)(
+        '%s: a cache-served getCommits still returns populated diffs, with no per-commit request',
+        async (type) => {
+            const fixture = FIXTURES[type];
+            const db = new Database(':memory:');
+            try {
+                runMigrations(db, MIGRATIONS_DIR);
+                const cache = createCommitDiffstatCache(db, type, 'test-container');
+                const {fetchMock, urls} = makeCountingFetch(fixture.routes());
+                vi.stubGlobal('fetch', fetchMock);
+
+                // Pass 1 populates the memo (write-through happens inside the provider).
+                const cold = createGitProvider(fixture.config, cache);
+                await cold.getCommits(REPO, SINCE, UNTIL);
+                const coldRequests = SHAS.flatMap((sha) => perCommitRequests(urls, sha)).length;
+                // The positive control: pass 1 really did walk the endpoint, so "pass 2 walked it
+                // zero times" is evidence of a cache hit and not of a dead fixture.
+                expect(coldRequests).toBeGreaterThan(0);
+
+                urls.length = 0;
+                const warm = createGitProvider(fixture.config, cache);
+                const commits = await warm.getCommits(REPO, SINCE, UNTIL);
+
+                expect(commits.map((c) => c.sha)).toEqual(SHAS);
+                for (const commit of commits) {
+                    expect(
+                        commit.diffs,
+                        `${type}/${commit.sha} lost its diffs on the cache-hit path`,
+                    ).toEqual(EXPECTED_DIFFS[type]);
+                }
+                expect(
+                    SHAS.flatMap((sha) => perCommitRequests(urls, sha)),
+                    `${type} re-walked the per-commit endpoint despite a warm cache`,
+                ).toEqual([]);
+            } finally {
+                db.close();
             }
         },
     );

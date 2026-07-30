@@ -108,6 +108,11 @@ function makeRepo(name: string): GitRepo {
  * Pass `NO_PROVIDER_DIFFS` for a deliberately diff-less commit. That branch IS real (the field
  * is optional by design — see `GitCommit.diffs`) and is still covered, but it now has to be
  * asked for rather than being what a test gets by accident.
+ *
+ * The `null` sentinel is deliberately NOT the `diffs?: GitFileDiff[]` shape its sibling
+ * `diff-fetch-dedup.test.ts`'s `makeCommit` uses. There the default is "no diffs", so absence can
+ * BE the default; here the default is "diffs supplied", so opting out needs a value that is
+ * distinguishable from "argument omitted". Same intent, opposite defaults.
  */
 function makeProviderCommit(
     username: string,
@@ -171,6 +176,35 @@ function makeProviderReviewComment(username: string, prId = '1'): GitReviewComme
     };
 }
 
+/**
+ * How many times the current test reached {@link makeMockProvider}'s DEFAULT `getCommitDiff` —
+ * i.e. fell onto the `getCommitDiff` fallback without asking to (#280). Asserted zero by the
+ * file-level `afterEach` below.
+ *
+ * This is what makes "the mainstream suite exercises the reuse path" an INVARIANT rather than a
+ * statement about the tree on the day #280 landed. Before it, three fixtures in this file had
+ * silently slid onto the fallback and nothing failed, because a fixture that loses its `diffs`
+ * keeps producing rows — just rows with no file-level detail. A test that genuinely means to
+ * exercise the fallback overrides `getCommitDiff` with its own stub, which by construction never
+ * touches this counter; so the invariant is precisely "no fixture reaches the fallback by
+ * accident", with no opt-in flag to remember.
+ */
+let unaskedFallbackFetches = 0;
+
+beforeEach(() => {
+    unaskedFallbackFetches = 0;
+});
+
+afterEach(() => {
+    expect(
+        unaskedFallbackFetches,
+        'this test fell onto the getCommitDiff fallback: its commits carry no `diffs`, so it is ' +
+            'measuring a branch no in-tree provider reaches (#271/#280). Build them with ' +
+            '`makeProviderCommit` (which supplies `diffs`), or — if the fallback IS the subject ' +
+            '— pass `NO_PROVIDER_DIFFS` and override `getCommitDiff` with your own stub.',
+    ).toBe(0);
+});
+
 function makeMockProvider(overrides: Partial<GitProvider> = {}): GitProvider {
     return {
         name: 'github',
@@ -181,9 +215,12 @@ function makeMockProvider(overrides: Partial<GitProvider> = {}): GitProvider {
         getPRReviews: vi.fn().mockResolvedValue([]),
         // Present because `GitProvider` requires it, NOT because the sync loop calls it: since
         // #271 the loop reuses `GitCommit.diffs`, and since #280 the commits this file builds
-        // carry them. A test that means to exercise the FALLBACK overrides this AND builds its
-        // commits with `NO_PROVIDER_DIFFS` — one without the other proves nothing.
-        getCommitDiff: vi.fn().mockResolvedValue([]),
+        // carry them. Reaching THIS implementation is therefore a fixture bug, which is what the
+        // counter above turns into a failing test.
+        getCommitDiff: vi.fn().mockImplementation(async (): Promise<GitFileDiff[]> => {
+            unaskedFallbackFetches += 1;
+            return [];
+        }),
         checkAccess: vi.fn().mockResolvedValue(undefined),
         ...overrides,
     };
@@ -1449,6 +1486,7 @@ describe('GitSync', () => {
             additions: 100,
             deletions: 0,
             filesChanged: ['src/a.ts'],
+            diffs: [{path: 'src/a.ts', additions: 100, deletions: 0, status: 'modified'}],
         });
         createGitProvider.mockReturnValueOnce(makeMockProvider({
             name: 'github',
@@ -1473,6 +1511,7 @@ describe('GitSync', () => {
                 additions: 20,
                 deletions: 0,
                 filesChanged: ['src/a.ts'],
+                diffs: [{path: 'src/a.ts', additions: 20, deletions: 0, status: 'modified'}],
             }]),
         }));
         await new GitSync(makeGithubConfig()).sync(db);
@@ -4908,6 +4947,7 @@ describe('GitSync — raw authorship retention + projection (#253)', () => {
                 additions: 5,
                 deletions: 1,
                 filesChanged: ['src/x.ts'],
+                diffs: [{path: 'src/x.ts', additions: 5, deletions: 1, status: 'modified'}],
             },
         ]);
 
@@ -5166,9 +5206,14 @@ describe('GitCommit.diffs reuse vs the getCommitDiff fallback (#280)', () => {
         );
 
         expect(getCommitDiff).not.toHaveBeenCalled();
-        // …and the commits really were imported, so the assertion above is about the reuse
-        // path and not about a run that quietly processed nothing.
+        // …and the commits really were imported WITH their diffs, so the assertion above is
+        // about the reuse path and not about a run that quietly processed nothing (or that
+        // reached `toAnalysisCommit` with `[]` instead of `rawCommit.diffs`).
         expect(countSnapshots(db)).toBe(1);
+        const row = db
+            .prepare(`SELECT files_changed FROM git_snapshots WHERE date = '2024-01-15'`)
+            .get() as {files_changed: number};
+        expect(row.files_changed).toBe(4);
         expect(diffAdvisories(result)).toEqual([]);
     });
 
@@ -5195,17 +5240,24 @@ describe('GitCommit.diffs reuse vs the getCommitDiff fallback (#280)', () => {
             ['repo1', 's1'],
             ['repo1', 's2'],
         ]);
-        // The fetched diff is what landed: both commits' file entries and their per-file line
-        // counts summed (2 files × 2 commits; 30+20 added and 5+5 removed per commit) — i.e.
-        // the fallback result really was analysed, not swallowed.
+        // The columns asserted here are only the ones the FALLBACK RESULT can move. Be precise
+        // about which those are, because two of the three obvious candidates cannot:
+        // `lines_added`/`lines_removed` come from `commit.additions`/`deletions` (the analyzer
+        // reads the commit, not the diff), which `makeProviderCommit` hardcodes — they would hold
+        // at 100/20 even if `getCommitDiff` returned nothing at all, so asserting them here would
+        // read as proof of something it cannot prove.
+        //
+        // `files_changed` counts the diff entries, and `code_churn_rate` is derived from their
+        // paths and line counts — both are zero if the fallback result is dropped. Two commits ×
+        // two entries → 4; both commits touch the SAME two paths, so the second is rework and the
+        // churn rate is above zero.
         const row = db
             .prepare(
-                `SELECT lines_added, lines_removed, files_changed FROM git_snapshots WHERE date = '2024-01-15'`,
+                `SELECT files_changed, code_churn_rate FROM git_snapshots WHERE date = '2024-01-15'`,
             )
-            .get() as {lines_added: number; lines_removed: number; files_changed: number};
+            .get() as {files_changed: number; code_churn_rate: number};
         expect(row.files_changed).toBe(4);
-        expect(row.lines_added).toBe(100);
-        expect(row.lines_removed).toBe(20);
+        expect(row.code_churn_rate).toBeGreaterThan(0);
     });
 
     /** AC3: the fallback is visible in the run's own output, with a usable count. */
@@ -5236,16 +5288,27 @@ describe('GitCommit.diffs reuse vs the getCommitDiff fallback (#280)', () => {
         expect(advisories[0]).toContain('3 commit(s)');
         expect(advisories[0]).toContain('2 repo(s)');
         expect(advisories[0]).toContain('[github]');
-        // An ADVISORY, not a failure: the fallback fetches the same diff, so classifying it as
-        // an error would turn the provider red and make the pipeline re-run the whole connector.
+        // Every fallback request SUCCEEDED here, which is the only condition under which the line
+        // is allowed to reassure the operator about the data. Pinned as the positive control for
+        // the failure case below: without it, a regression that emitted the reassuring sentence
+        // unconditionally would still pass that test.
+        expect(advisories[0]).toContain('no metric is wrong');
+        // An ADVISORY, not a failure: the fallback fetched the same diff, so classifying it as an
+        // error would redden the provider and make the pipeline re-run the whole connector.
         expect(isAdvisoryError(advisories[0])).toBe(true);
     });
 
     /**
-     * The count is of commits that TOOK the fallback, not of fallbacks that succeeded. A
-     * provider that is both diff-less and failing is the worst case, not a conformant one.
+     * The count is of commits that TOOK the fallback, not of fallbacks that succeeded — and the
+     * two populations must be reported differently.
+     *
+     * A failed fallback keeps the commit with EMPTY diffs (#271's preserved semantics: one bad
+     * diff must not fail the repo), which means its file-level metrics are computed from nothing
+     * while the cursor advances past it. Nothing else in the run mentions that — the fault is
+     * swallowed — so this line is the only output about those commits, and it must not tell the
+     * operator that nothing is wrong.
      */
-    it('counts a fallback whose getCommitDiff throws', async () => {
+    it('states the permanent loss, not "no metric is wrong", when a fallback fetch fails', async () => {
         seedDev(db, 'alice');
         const result = await syncWith(
             makeMockProvider({
@@ -5259,14 +5322,57 @@ describe('GitCommit.diffs reuse vs the getCommitDiff fallback (#280)', () => {
             }),
         );
 
-        expect(diffAdvisories(result)[0]).toContain('1 commit(s)');
+        const advisory = diffAdvisories(result)[0];
+        expect(advisory).toContain('1 commit(s)');
+        // The failure count is named, and the reassuring sentence is NOT emitted.
+        expect(advisory).toContain('1 of those requests FAILED');
+        expect(advisory).not.toContain('no metric is wrong');
+        expect(advisory).toContain('permanent');
+        // Still an advisory: turning it red buys no recovery (the window is already recorded as
+        // covered) and costs a full re-fetch of the connector.
+        expect(isAdvisoryError(advisory)).toBe(true);
         // The commit still counts — a failed diff fetch degrades to empty diffs, it does not
-        // drop the commit (#271's preserved failure semantics).
+        // drop the commit. `files_changed: 0` is exactly the loss the advisory now states.
         const row = db
             .prepare(`SELECT commits, files_changed FROM git_snapshots WHERE date = '2024-01-15'`)
             .get() as {commits: number; files_changed: number};
         expect(row.commits).toBe(1);
         expect(row.files_changed).toBe(0);
+    });
+
+    /**
+     * A run whose write was ROLLED BACK still reports the fallback. The drop advisories are
+     * deliberately staged and discarded on rollback — the data loss they describe is un-done by
+     * the re-fetch — but these requests were really made against the provider's rate limit, and a
+     * run that both took the slow path and threw its window away is if anything more worth saying.
+     *
+     * Untested, this survives only as a comment: the emit sits ~20 lines from `droppedAdvisories`,
+     * and a "consistency" refactor that moved it into their staging closure would be green.
+     */
+    it('reports the fallback even when the run\'s write is rolled back', async () => {
+        seedDev(db, 'alice');
+        // Break a table the write transaction touches, so the whole run's data is discarded. A PR
+        // is required to make the transaction reach `upsertPRRecord` at all — same fixture shape
+        // as the #253 rollback tests above.
+        db.exec('DROP TABLE pr_records');
+        const result = await syncWith(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                getCommits: vi
+                    .fn()
+                    .mockResolvedValue([
+                        makeProviderCommit('alice', '2024-01-15T10:00:00Z', 's1', NO_PROVIDER_DIFFS),
+                    ]),
+                getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+                getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+            }),
+        );
+
+        // Positive control: the write really did roll back, so this is not a run that quietly
+        // succeeded.
+        expect(result.errors.some((e) => e.includes('transaction rolled back'))).toBe(true);
+        expect(countSnapshots(db)).toBe(0);
+        expect(diffAdvisories(result)[0]).toContain('1 commit(s)');
     });
 
     /**

@@ -129,10 +129,12 @@ export const DIFFSTAT_CACHE_DEGRADED_PREFIX = 'Diffstat cache degraded:';
  * Prefix of the advisory pushed when a provider returned commits carrying no `GitCommit.diffs`,
  * so this run fell back to a second per-commit `getCommitDiff` request for each of them (#280).
  *
- * Deliberately NOT a failure: the fallback is correct — the diff IS fetched and every metric is
- * complete — and it is a supported branch of the interface (see `GitCommit.diffs` for why the
- * field is optional). Turning the provider red for taking a slower-but-correct path would hold
- * its cursor and discard a perfectly good window.
+ * Deliberately NOT a failure: taking the fallback is a supported branch of the interface (see
+ * `GitCommit.diffs` for why the field is optional), and the fallback fetches the same diff. What
+ * turning the provider red would actually cost is not a held cursor — the cursor advance and the
+ * snapshot write are gated on {@link ProviderFetchResult.complete}, never on `errors` — it is a
+ * red `sync_logs` row, a red provider in the admin UI, and `sync-pipeline` re-running the ENTIRE
+ * git connector (a second full network fetch) for a run that in fact imported everything.
  *
  * But it must be SAID, because the fallback is exactly the ~2N per-commit request volume #271
  * removed, and nothing else in the run distinguishes it from the reuse path. Every in-tree
@@ -140,6 +142,17 @@ export const DIFFSTAT_CACHE_DEGRADED_PREFIX = 'Diffstat cache degraded:';
  * the contract or a refactor that dropped the field from an existing one — and the only other
  * symptom is a sync that got slower, or a rate-limit stall that #235's lag machinery reports
  * with no cause. The count is what makes that diagnosable instead of merely felt.
+ *
+ * TWO counts, not one, and the difference is a data-integrity claim rather than a nicety. A
+ * fallback request that FAILS is swallowed by design (the commit is kept with empty diffs rather
+ * than failing the repo — #271's preserved semantics), and empty diffs mean `files_changed`,
+ * `code_churn_rate` and `ai_signature_score` are computed from nothing for that commit. The
+ * cursor still advances and the zeros land in `raw_author_daily`, which has no recompute path, so
+ * that understatement is PERMANENT. This line is the only output about those commits, so it must
+ * not claim "no metric is wrong" over them: the reassuring sentence is emitted only when the
+ * failure count is zero, and when it is not, the loss is stated plainly. Reporting a healthy
+ * fallback and a lossy one identically is precisely the "a completion signal is not a currency
+ * claim" failure this project has already been bitten by.
  */
 export const DIFFS_NOT_SUPPLIED_PREFIX = 'Provider supplied no commit diffs:';
 
@@ -1675,6 +1688,11 @@ async function fetchProviderData(
     // saying, not less.
     let fallbackDiffCommits = 0;
     const fallbackDiffRepos = new Set<string>();
+    // The subset of the above whose fallback request FAILED, so the commit was kept with empty
+    // diffs and its file-level metrics are permanently understated. Tracked separately because
+    // the advisory's reassuring "no metric is wrong" sentence is only true when this is zero —
+    // see {@link DIFFS_NOT_SUPPLIED_PREFIX}.
+    let fallbackDiffFailures = 0;
 
     // The ONE place the within-repo indicator is written (#270) — every producer
     // below routes through it, so the four fields have a single source of truth.
@@ -1811,7 +1829,12 @@ async function fetchProviderData(
                 try {
                     diffs = await provider.getCommitDiff(repoName, rawCommit.sha);
                 } catch {
-                    // Diff fetch failed — use empty diffs; commit still counts
+                    // Diff fetch failed — use empty diffs; commit still counts. Swallowing the
+                    // fault is #271's preserved semantics (one bad diff must not fail the repo),
+                    // but the commit's file-level metrics are now computed from nothing and the
+                    // cursor will advance past it, so the count is REPORTED rather than left as
+                    // the silent zero it used to be (#280).
+                    fallbackDiffFailures += 1;
                 }
                 // NOT ratcheted (#273). The diffstat cache lives inside each provider, at the
                 // single per-commit fetch site #271 consolidated; this is the fallback for a
@@ -2049,16 +2072,29 @@ async function fetchProviderData(
     // The ONLY trace the fallback path leaves (#280). One line per provider with a count, for
     // the same reason as the diffstat-cache line above: the condition is systemic, so a per-repo
     // or per-commit line would be thousands of copies of one sentence.
+    //
+    // The second half of the sentence is CONDITIONAL on the failure count. "No metric is wrong"
+    // is a data-integrity claim, and it is false for a commit whose fallback request failed — see
+    // DIFFS_NOT_SUPPLIED_PREFIX for why a line that makes it anyway is worse than no line.
     if (fallbackDiffCommits > 0) {
         errors.push(
             `${DIFFS_NOT_SUPPLIED_PREFIX} [${providerType}] ${fallbackDiffCommits} commit(s) ` +
                 `across ${fallbackDiffRepos.size} repo(s) arrived without GitCommit.diffs, so ` +
-                'this run made a SECOND per-commit diff request for each of them. No data is ' +
-                'missing and no metric is wrong — the fallback fetches the same diff — but it ' +
-                'roughly doubles the request volume and wall time of the slowest phase of a ' +
-                'sync, and it burns rate limit. Every in-tree provider supplies the field, so a ' +
-                'non-zero count means a provider implementation is not honouring the ' +
-                'GitCommit.diffs contract on GitProvider.getCommits (#271/#280).',
+                'this run made a SECOND per-commit diff request for each of them — the request ' +
+                'volume and wall time of the slowest phase of a sync, paid twice, and rate ' +
+                'limit burned for it. Every in-tree provider supplies the field, so a non-zero ' +
+                'count means a provider implementation is not honouring the GitCommit.diffs ' +
+                'contract on GitProvider.getCommits (#271/#280). ' +
+                (fallbackDiffFailures === 0
+                    ? 'No data is missing and no metric is wrong — every fallback request ' +
+                      'succeeded and fetched the same diff the provider should have supplied.'
+                    : `${fallbackDiffFailures} of those requests FAILED. Those commits were ` +
+                      'kept with no file-level detail at all, so their contribution to ' +
+                      'files_changed, code_churn_rate and ai_signature_score is zero rather ' +
+                      'than absent — and this run has recorded its window as covered, so ' +
+                      'nothing re-asks them. The understatement is permanent: the affected ' +
+                      'developer-days can only be corrected by resetting this provider\'s ' +
+                      'cursors and re-importing the span.'),
         );
     }
 
