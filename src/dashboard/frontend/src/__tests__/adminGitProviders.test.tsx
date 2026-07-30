@@ -11,6 +11,8 @@ import {
     parseReposList,
     repoScopeLabel,
     syncProgressLabel,
+    syncStageAnnouncement,
+    syncTerminalAnnouncement,
 } from '../pages/admin/AdminGitProviders';
 import {gitProvidersRefetchInterval} from '../hooks/useAdmin';
 import type {
@@ -1799,7 +1801,8 @@ describe('AdminGitProviders — live sync progress (#209)', () => {
         // Deliberately NOT a live region: this line changes on nearly every 1s poll, so
         // role="status" would announce it once per second for a multi-hour sync. Pinned
         // so a future "accessibility improvement" cannot silently reinstate it — the
-        // missing completion announcement is tracked in #278 instead.
+        // completion announcement lives on the row's low-churn sr-only element instead
+        // (#278, exercised in its own describe block below).
         expect(progress).not.toHaveAttribute('role');
         expect(screen.getByRole('button', {name: 'Syncing…'})).toBeDisabled();
         expect(screen.queryByRole('button', {name: 'Sync now'})).not.toBeInTheDocument();
@@ -1911,6 +1914,226 @@ describe('AdminGitProviders — live sync progress (#209)', () => {
     });
 });
 
+describe('syncStageAnnouncement / syncTerminalAnnouncement (#278)', () => {
+    const base: GitSyncProgress = {
+        stage: 'fetching',
+        repos_total: 12,
+        repos_processed: 2,
+        current_repo: 'web',
+        commits_fetched: 34,
+        prs_fetched: 5,
+        developers_matched: 3,
+        repo_step: 'commits',
+        repo_step_done: 1240,
+        repo_step_scanned: null,
+        repo_step_total: 5000,
+    };
+
+    it('names each stage coarsely, with NONE of the counters the visible line carries', () => {
+        // The whole reason this is a second function and not `syncProgressLabel`: every
+        // number below moves on nearly every 1s poll. If any leaks in, the live region
+        // becomes the once-per-second announcement #270 removed.
+        const stages: [GitSyncStage, string][] = [
+            ['listing_repos', 'Listing repositories'],
+            ['fetching', 'Fetching activity'],
+            ['analyzing', 'Matching developers'],
+            ['writing', 'Writing snapshots'],
+        ];
+        for (const [stage, expected] of stages) {
+            const label = syncStageAnnouncement({started_at: 't', progress: {...base, stage}});
+            expect(label).toBe(expected);
+            for (const counter of ['1240', '5000', '12', '34', '5', '3', 'web']) {
+                expect(label).not.toContain(counter);
+            }
+        }
+    });
+
+    it('shares one stage vocabulary with the visible progress line', () => {
+        // Both surfaces read STAGE_LABEL, so the coarse name is a PREFIX of the visible
+        // line for every stage. Renaming a stage in one place and not the other fails here.
+        for (const stage of ['listing_repos', 'fetching', 'analyzing', 'writing'] as GitSyncStage[]) {
+            const active = {started_at: 't', progress: {...base, stage}};
+            expect(syncProgressLabel(active).startsWith(syncStageAnnouncement(active))).toBe(true);
+        }
+    });
+
+    it('says "started" before the first progress emission', () => {
+        expect(syncStageAnnouncement({started_at: 't', progress: null})).toBe('Sync started');
+    });
+
+    it('degrades to a generic line on a stage this bundle cannot name', () => {
+        // `stage` is wire data: a newer backend's member, or an inherited object key,
+        // must not announce raw source text.
+        expect(
+            syncStageAnnouncement({
+                started_at: 't',
+                progress: {...base, stage: 'reconciling' as GitSyncStage},
+            }),
+        ).toBe('Sync in progress');
+        expect(
+            syncStageAnnouncement({
+                started_at: 't',
+                progress: {...base, stage: 'constructor' as GitSyncStage},
+            }),
+        ).toBe('Sync in progress');
+    });
+
+    it('maps a settled run to completed / failed, and claims nothing on an unrecorded outcome', () => {
+        expect(syncTerminalAnnouncement('ok')).toBe('Sync completed');
+        expect(syncTerminalAnnouncement('error')).toBe('Sync failed');
+        // Both writes of the outcome can fail server-side (startScopedSync logs and moves
+        // on), and a never-synced provider is null — neither is a completion.
+        expect(syncTerminalAnnouncement(null)).toBe('Sync finished — outcome unknown');
+        expect(syncTerminalAnnouncement('partial')).toBe('Sync finished — outcome unknown');
+    });
+});
+
+describe('AdminGitProviders — sync completion announced to assistive tech (#278)', () => {
+    const RUNNING_SYNC = {
+        started_at: '2026-07-13T10:00:00.000Z',
+        progress: {
+            stage: 'fetching',
+            repos_total: 12,
+            repos_processed: 2,
+            current_repo: 'web',
+            commits_fetched: 34,
+            prs_fetched: 5,
+            developers_matched: 0,
+            repo_step: 'commits',
+            repo_step_done: 1240,
+            repo_step_scanned: null,
+            repo_step_total: 5000,
+        },
+    } as const;
+
+    /** The GitHub row's sr-only live region. Scoped per row — every row has one. */
+    async function announcementFor(container: string): Promise<HTMLElement> {
+        const row = (await screen.findByText(container)).closest('tr') as HTMLElement;
+        return within(row).getByTestId('sync-announcement');
+    }
+
+    it('mounts the live region empty, so its first text lands into an element already in the DOM', async () => {
+        // A live region inserted together with its content is unreliably announced: the
+        // element must pre-exist. This is the assertion that fails if someone "optimizes"
+        // it into a conditional render.
+        renderPage();
+        const live = await announcementFor('acme-org');
+        expect(live).toHaveAttribute('role', 'status');
+        expect(live).toHaveClass('sr-only');
+        expect(live).toHaveTextContent('');
+    });
+
+    it('says nothing on mount for a row whose last sync settled before this page load', async () => {
+        // DB_GITHUB carries last_sync_status 'ok' from 2026-07-01. Announcing "Sync
+        // completed" for it would fire on every page load, for a run the user never
+        // triggered — the latch exists for exactly this.
+        renderPage();
+        // The visible Badge does show the settled 'ok' — the row is not blank, it is only
+        // the ANNOUNCEMENT that stays silent.
+        const row = (await screen.findByText('acme-org')).closest('tr') as HTMLElement;
+        expect(within(row).getByText('ok')).toBeInTheDocument();
+        expect(within(row).getByTestId('sync-announcement')).toHaveTextContent('');
+    });
+
+    it('announces the coarse stage while running — and not the per-second counters', async () => {
+        providers = [{...structuredClone(DB_GITHUB), active_sync: structuredClone(RUNNING_SYNC)}];
+        renderPage();
+        const live = await announcementFor('acme-org');
+        await waitFor(() =>
+            expect(live).toHaveTextContent('GitHub · acme-org: Fetching activity'),
+        );
+        // The counter line's numbers are visible on screen but must never reach the live
+        // region (#270): `commit 1240/5000` changes on nearly every 1s poll.
+        expect(live.textContent).not.toContain('1240');
+        expect(live.textContent).not.toContain('5000');
+        // …and the visible line itself is still not a live region.
+        expect(screen.getByTestId('sync-progress')).not.toHaveAttribute('role');
+    });
+
+    it('announces "Sync completed" when the run settles ok, without re-navigating', async () => {
+        providers = [{...structuredClone(DB_GITHUB), active_sync: structuredClone(RUNNING_SYNC)}];
+        renderPage();
+        const live = await announcementFor('acme-org');
+        await waitFor(() => expect(live).toHaveTextContent('Fetching activity'));
+
+        // The run settles server-side; the 1s poll observes an idle row carrying the
+        // terminal last_sync_status. Nothing about this is a user action — that IS the
+        // acceptance criterion.
+        providers = [{...structuredClone(DB_GITHUB), last_sync_status: 'ok'}];
+        await waitFor(() => expect(live).toHaveTextContent('GitHub · acme-org: Sync completed'), {
+            timeout: 3000,
+        });
+        // The element the announcement lives on is stable across the transition — a
+        // remount would re-insert the region and lose the announcement.
+        expect(await announcementFor('acme-org')).toBe(live);
+    }, 10000);
+
+    it('announces "Sync failed" when the run settles with an error', async () => {
+        providers = [{...structuredClone(DB_GITHUB), active_sync: structuredClone(RUNNING_SYNC)}];
+        renderPage();
+        const live = await announcementFor('acme-org');
+        await waitFor(() => expect(live).toHaveTextContent('Fetching activity'));
+
+        providers = [
+            {
+                ...structuredClone(DB_GITHUB),
+                last_sync_status: 'error',
+                last_sync_error: 'repo api: 403',
+            },
+        ];
+        await waitFor(() => expect(live).toHaveTextContent('GitHub · acme-org: Sync failed'), {
+            timeout: 3000,
+        });
+    }, 10000);
+
+    it('names the provider that settled, so a multi-row table is unambiguous', async () => {
+        // Two DB rows, only one syncing. Announcing a bare "Sync completed" would leave
+        // the listener to go find out which — the re-navigation this issue removes.
+        providers = [
+            {...structuredClone(DB_GITHUB), active_sync: structuredClone(RUNNING_SYNC)},
+            structuredClone(DB_MONITOR_ALL),
+        ];
+        renderPage();
+        const syncing = await announcementFor('acme-org');
+        const idle = await announcementFor('mono-org');
+        await waitFor(() => expect(syncing).toHaveTextContent('GitHub · acme-org: Fetching activity'));
+        expect(idle).toHaveTextContent('');
+
+        providers = [
+            {...structuredClone(DB_GITHUB), last_sync_status: 'ok'},
+            structuredClone(DB_MONITOR_ALL),
+        ];
+        await waitFor(() => expect(syncing).toHaveTextContent('GitHub · acme-org: Sync completed'), {
+            timeout: 3000,
+        });
+        // The row that never ran stays silent — the latch is per row, not per page.
+        expect(idle).toHaveTextContent('');
+    }, 10000);
+
+    it('claims nothing when a run vanishes without its outcome being recorded', async () => {
+        // Both outcome writes can fail server-side; the registry entry is cleared in
+        // `finally` either way. "Sync completed" there would be a completion claim the
+        // row cannot support.
+        providers = [
+            {
+                ...structuredClone(DB_GITHUB),
+                last_sync_status: null,
+                last_sync_at: null,
+                active_sync: structuredClone(RUNNING_SYNC),
+            },
+        ];
+        renderPage();
+        const live = await announcementFor('acme-org');
+        await waitFor(() => expect(live).toHaveTextContent('Fetching activity'));
+
+        providers = [{...structuredClone(DB_GITHUB), last_sync_status: null, last_sync_at: null}];
+        await waitFor(
+            () => expect(live).toHaveTextContent('GitHub · acme-org: Sync finished — outcome unknown'),
+            {timeout: 3000},
+        );
+    }, 10000);
+});
+
 describe('AdminGitProviders — add-flow repo selection (#211)', () => {
     it('auto-opens the repo-scope editor for the just-created provider, with the pre-sync prompt', async () => {
         renderPage();
@@ -1921,7 +2144,10 @@ describe('AdminGitProviders — add-flow repo selection (#211)', () => {
         // (a regression to a plain <p> must fail here).
         const prompt = await screen.findByTestId('scope-prompt');
         expect(prompt).toHaveTextContent(/Choose which repositories to analyze before the first sync/);
-        expect(screen.getByRole('status')).toBe(prompt);
+        // Membership, not identity: since #278 every provider row also carries an
+        // sr-only role="status" announcement, so "the only status element" is no longer
+        // the way to pin this. A regression to a plain <p> still fails here.
+        expect(screen.getAllByRole('status')).toContain(prompt);
         // The create modal handed off cleanly: it closed, and the ONLY dialog now
         // on screen is the new row's scope editor (#238 criterion 4).
         expect(screen.queryByRole('dialog', {name: 'Add git provider'})).not.toBeInTheDocument();

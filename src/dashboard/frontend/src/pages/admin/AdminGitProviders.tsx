@@ -1,4 +1,4 @@
-import {useMemo, useState, type ReactNode} from 'react';
+import {useEffect, useMemo, useRef, useState, type ReactNode} from 'react';
 import {Link} from 'react-router-dom';
 import {Card} from '../../components/Card';
 import {Badge} from '../../components/Badge';
@@ -37,6 +37,7 @@ import type {
     GitProviderType,
     GitSyncProgress,
     GitSyncRepoStep,
+    GitSyncStage,
 } from '../../api/types';
 import {
     AdminBanner,
@@ -361,6 +362,24 @@ function scannedSuffix(p: GitSyncProgress): string {
 }
 
 /**
+ * The COARSE, counter-free name of each pipeline stage — the one spelling of these
+ * four names. Both readers use it: the visible progress line, which appends that
+ * stage's live counters, and the screen-reader announcement (#278), which
+ * deliberately appends nothing. Keeping one record rather than a second literal set
+ * is what stops the two surfaces from growing separate vocabularies for one stage.
+ *
+ * A `Record` over the union, like `PROVIDER_META` and `REPO_STEP_NOUN` above: adding
+ * a `GitSyncStage` member without a name here is a BUILD error, and an unrecognized
+ * wire value from a newer backend reads `undefined` at runtime.
+ */
+const STAGE_LABEL: Record<GitSyncStage, string> = {
+    listing_repos: 'Listing repositories',
+    fetching: 'Fetching activity',
+    analyzing: 'Matching developers',
+    writing: 'Writing snapshots',
+};
+
+/**
  * Human-readable line for an in-flight sync's progress snapshot (#209) — stage
  * plus the counters that stage has meaningfully advanced. Exported for tests.
  */
@@ -369,19 +388,19 @@ export function syncProgressLabel(active: GitProviderActiveSync): string {
     if (!p) return 'Starting sync…';
     switch (p.stage) {
         case 'listing_repos':
-            return 'Listing repositories…';
+            return `${STAGE_LABEL.listing_repos}…`;
         case 'fetching': {
             const total = p.repos_total ?? 0;
             // repos_processed counts COMPLETED repos; the one in flight is +1,
             // clamped so the label never overshoots (12/12, not 13/12; 0/0).
             const position = Math.min(p.repos_processed + 1, total);
             const repo = p.current_repo ? ` (${p.current_repo})` : '';
-            return `Fetching activity — repo ${position}/${total}${repo} · ${repoStepDetail(p)}`;
+            return `${STAGE_LABEL.fetching} — repo ${position}/${total}${repo} · ${repoStepDetail(p)}`;
         }
         case 'analyzing':
-            return `Matching developers — ${p.developers_matched} matched`;
+            return `${STAGE_LABEL.analyzing} — ${p.developers_matched} matched`;
         case 'writing':
-            return `Writing snapshots — ${p.developers_matched} developer${p.developers_matched === 1 ? '' : 's'} matched`;
+            return `${STAGE_LABEL.writing} — ${p.developers_matched} developer${p.developers_matched === 1 ? '' : 's'} matched`;
         default: {
             // Exhaustiveness witness: adding a GitSyncStage member without a case here
             // is a BUILD error. (A bare `return` after the switch does NOT give this —
@@ -394,6 +413,47 @@ export function syncProgressLabel(active: GitProviderActiveSync): string {
             return 'Syncing…';
         }
     }
+}
+
+/**
+ * What an IN-FLIGHT run announces to a screen reader (#278): the coarse pipeline
+ * stage and nothing else.
+ *
+ * This is the whole point of the split from {@link syncProgressLabel} — the visible
+ * line's counters change on nearly every 1s poll, and a polite live region carrying
+ * them would announce a ~70-character string once a second for the length of a
+ * multi-hour first sync (#270's finding). The stage changes roughly four times per
+ * run, so it is safe to announce and is the part a listener can actually use.
+ *
+ * Degrades on wire data rather than trusting the union: `progress` is null until the
+ * pipeline's first emission, and `stage` is a string from the server, so a member a
+ * newer backend emits lands on the generic line instead of announcing raw source
+ * text. `Object.hasOwn`, not a bare lookup, for the reason `repoStepCount` uses it —
+ * a plain object literal resolves inherited keys ("toString", "constructor") to
+ * functions that pass an `undefined` check.
+ */
+export function syncStageAnnouncement(active: GitProviderActiveSync): string {
+    const p = active.progress;
+    if (p === null) return 'Sync started';
+    return Object.hasOwn(STAGE_LABEL, p.stage) ? STAGE_LABEL[p.stage] : 'Sync in progress';
+}
+
+/**
+ * What a SETTLED run announces (#278), read from the same `last_sync_status` column
+ * the status Badge renders.
+ *
+ * The third branch is not defensive padding: the server records the outcome and only
+ * then clears the in-flight registry, but if BOTH the ok-write and the error-write
+ * fail (`startScopedSync` logs and moves on), the run really does disappear with the
+ * column still holding the previous value — or null on a first sync. Announcing
+ * "completed" there would be a completion claim the row cannot support, so this says
+ * only what is known. `status` is an unconstrained TEXT column on the wire, so any
+ * other value lands here too.
+ */
+export function syncTerminalAnnouncement(status: string | null): string {
+    if (status === 'ok') return 'Sync completed';
+    if (status === 'error') return 'Sync failed';
+    return 'Sync finished — outcome unknown';
 }
 
 /** Small indeterminate spinner shown next to live sync progress. */
@@ -1326,6 +1386,48 @@ function ProviderRow({
 
     const isConfig = provider.source === 'config';
     const meta = PROVIDER_META[provider.type];
+
+    // --- Screen-reader announcement of the sync lifecycle (#278) ---
+    //
+    // Everything this row shows about a sync is silent to assistive tech once the run
+    // is under way: the disabled "Syncing…" button conveys in-flight state, but the
+    // terminal ok/error flip only changes the status cell's `<Badge>`, which is a plain
+    // `<span>` with no role (components/Badge.tsx). So a blind admin triggers a sync and
+    // has no way to learn it finished short of re-navigating to this row, hours later.
+    //
+    // Why a dedicated element rather than a role on something that already exists:
+    //  - `Badge` is shared by ~10 screens. A role there would make every tag, tier and
+    //    count pill in the app a live region — announcements for state nobody changed.
+    //  - The progress line is deliberately NOT a live region (#270): its within-repo
+    //    counter moves on nearly every 1s poll, so `role="status"` there announces a
+    //    ~70-character string once a second for a multi-hour first sync.
+    // So: a low-churn element carrying only the coarse stage and the terminal outcome.
+    const activeSync = provider.active_sync;
+    const stageAnnouncement = activeSync ? syncStageAnnouncement(activeSync) : null;
+    const [announcement, setAnnouncement] = useState('');
+    // Which provider settled — with more than one row, a bare "Sync completed" is
+    // ambiguous, and going to look it up is exactly the re-navigation this removes.
+    const announceLabel = `${meta.label} · ${provider.container}`;
+    // Only a run this row actually OBSERVED in flight earns a terminal announcement.
+    // Without the latch, mounting a row whose `last_sync_status` is already 'error'
+    // from last week would announce "Sync failed" on every page load.
+    const sawRunInFlight = useRef(false);
+    useEffect(() => {
+        if (stageAnnouncement !== null) {
+            sawRunInFlight.current = true;
+            setAnnouncement(`${announceLabel}: ${stageAnnouncement}`);
+            return;
+        }
+        if (!sawRunInFlight.current) return;
+        sawRunInFlight.current = false;
+        // The poll that observes `active_sync` clear already carries the terminal
+        // `last_sync_*` columns: the server records the outcome inside the run promise's
+        // then/catch and removes the in-flight registry entry only in `finally`
+        // (`startScopedSync`, api/admin/git-providers.ts). There is no window in which
+        // the run is gone and the status is still the previous run's.
+        setAnnouncement(`${announceLabel}: ${syncTerminalAnnouncement(provider.last_sync_status)}`);
+    }, [stageAnnouncement, announceLabel, provider.last_sync_status]);
+
     // A run is in flight server-side (from the polled list) OR either trigger POST
     // (sync-now / sync-older-history) is still pending — either way the sync
     // controls stay down and show progress. Both triggers share the server's
@@ -1393,6 +1495,18 @@ function ProviderRow({
                             {new Date(provider.last_sync_at).toLocaleString()}
                         </span>
                     ) : null}
+                    {/* The sync lifecycle for assistive tech (#278) — see the block that
+                        computes `announcement` in this component for why it lives here and
+                        not on the Badge or the progress line.
+
+                        Rendered UNCONDITIONALLY, empty until there is something to say: a
+                        live region inserted into the DOM together with its first text is
+                        unreliably announced, so the element has to already be present when
+                        the text changes. It sits in the "Last sync" cell because that is the
+                        cell whose visible state it is speaking for. */}
+                    <span role="status" className="sr-only" data-testid="sync-announcement">
+                        {announcement}
+                    </span>
                 </Td>
                 <Td>
                     <div className="flex flex-wrap items-center gap-2">
@@ -1526,14 +1640,12 @@ function ProviderRow({
                           * multi-hour first sync — and the digit is the least useful part
                           * to hear.
                           *
-                          * What a screen reader still gets: the disabled "Syncing…"
-                          * button conveys in-flight state. What it does NOT get is a
-                          * completion announcement — the status cell's <Badge> is a plain
-                          * span with no role (components/Badge.tsx), so the ok/error flip
-                          * is silent. That gap is pre-existing for every other admin
-                          * table and is tracked in #278; the right fix is a live region
-                          * on a low-churn element (the stage, or the badge), never on
-                          * this counter line.
+                          * What a screen reader gets instead, since #278: the disabled
+                          * "Syncing…" button conveys in-flight state, and the row's
+                          * sr-only `role="status"` element in the "Last sync" cell
+                          * announces the coarse stage plus the terminal completed/failed
+                          * outcome. That is the low-churn placement — never this counter
+                          * line, and never `Badge`, which ~10 other screens share.
                           */}
                         <span
                             className="flex items-center gap-2 text-sm text-muted"
