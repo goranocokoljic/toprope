@@ -35,6 +35,7 @@ import {
 import {GitProviderFetchError} from '../../../src/connectors/git/providers/http-retry';
 import type {
     GitCommit,
+    GitFetchProgressListener,
     GitProvider,
     GitProviderConfig,
     GitRepo,
@@ -288,6 +289,58 @@ describe('in-run repo retry (#272)', () => {
         const afterStale = seen.findIndex((s) => s.done === 7 && s.total === 7);
         expect(afterStale).toBeGreaterThanOrEqual(0);
         expect(seen.slice(afterStale + 1)).toContainEqual({done: 0, total: null});
+    });
+
+    it('the pre-pause reset also drops a stale scanned count, not just the counters', async () => {
+        // The sibling above fails mid-fan-out, where `repo_step_scanned` is already null.
+        // A Bitbucket backfill fails mid-LISTING instead — the phase that produces the
+        // field (#276) — so the tick the pause would freeze is `0 commits found
+        // (3400 scanned)`. If the reset left `scanned` alone, a 15-minute wait would show
+        // a stationary scanned count, which reads as a live walk that has stopped moving:
+        // strictly worse than the frozen `0 commits found` #276 set out to fix, because it
+        // now looks like the new signal itself is stuck.
+        seedAlice(db);
+        const createGitProvider = await getCreateGitProvider();
+        let calls = 0;
+        createGitProvider.mockReturnValue(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                getCommits: vi
+                    .fn()
+                    .mockImplementation(
+                        async (
+                            _repo: string,
+                            _since: string,
+                            _until: string,
+                            onProgress?: GitFetchProgressListener,
+                        ): Promise<GitCommit[]> => {
+                            calls++;
+                            // Listing-shaped: nothing retained yet, thousands of rows walked.
+                            onProgress?.({done: 0, total: null, scanned: 3400});
+                            if (calls === 1) throw new GitProviderFetchError('503', 503);
+                            return [makeCommit('c-1')];
+                        },
+                    ),
+            }),
+        );
+
+        const seen: Array<{done: number; scanned: number | null; total: number | null}> = [];
+        await runSync(db, (p) => {
+            if (p.repo_step === 'commits') {
+                seen.push({
+                    done: p.repo_step_done,
+                    scanned: p.repo_step_scanned,
+                    total: p.repo_step_total,
+                });
+            }
+        });
+
+        // Positive control: the count did reach the wire, so the clear assertion below is
+        // asserting a real transition rather than a field that was never set.
+        const stale = seen.findIndex((s) => s.scanned === 3400);
+        expect(stale).toBeGreaterThanOrEqual(0);
+        // …and the reset that runs before the pause supersedes it on all three fields.
+        expect(seen.slice(stale + 1)).toContainEqual({done: 0, scanned: null, total: null});
     });
 
     it('a persistently failing repo behaves exactly as before: cursor held, partials dropped, error recorded', async () => {

@@ -346,10 +346,16 @@ function repoStepCount(p: GitSyncProgress): string | null {
  * run (where it equals `repo_step_done` and adds nothing) shows the plain count. `>` is
  * also what keeps a nonsense wire value — a `scanned` below `done`, which no producer can
  * emit — from rendering as a shrinking parenthetical.
+ *
+ * `typeof === 'number'`, not `!== null`, for the same reason `repoStepCount` above uses
+ * `Object.hasOwn`: this is wire data. A cached bundle polling a rolled-back server gets
+ * the key absent, and `undefined !== null` is true — the plain count then survives only
+ * on the accident that `undefined > n` is false. A non-number would be worse (`'3400' > 0`
+ * is true, and the suffix would render remote text verbatim).
  */
 function scannedSuffix(p: GitSyncProgress): string {
     const scanned = p.repo_step_scanned;
-    return scanned !== null && scanned > p.repo_step_done ? ` (${scanned} scanned)` : '';
+    return typeof scanned === 'number' && scanned > p.repo_step_done ? ` (${scanned} scanned)` : '';
 }
 
 /**

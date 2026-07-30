@@ -548,6 +548,65 @@ describe('BitbucketProvider', () => {
             expect(new Set(listingTicks.map((t) => JSON.stringify(t))).size).toBe(3);
         });
 
+        it('counts a whole straddling page as scanned while keeping only the rows inside the window', async () => {
+            // The page every backfill crosses exactly once: the boundary page, where the
+            // walk is half past `until` and half inside it. It is the ONLY state in which
+            // both counters are non-zero AND different (`scanned > done > 0`), so it is
+            // where an off-by-a-page mistake shows — a `scanned` computed per page rather
+            // than cumulatively, or one incremented after the filter instead of before it,
+            // survives both the all-retained and the retained-nothing tests.
+            const fetchMock = makeFetchMock([
+                {
+                    // Entirely ahead of the window: 2 scanned, 0 kept.
+                    body: pagedResponse(
+                        [
+                            makeCommitFixture('ahead1', {date: '2024-06-01T00:00:00+00:00'}),
+                            makeCommitFixture('ahead2', {date: '2024-05-01T00:00:00+00:00'}),
+                        ],
+                        'https://api.bitbucket.org/2.0/next',
+                    ),
+                },
+                {
+                    // Straddles `until`: 3 scanned, the last 2 fall inside the window.
+                    body: pagedResponse([
+                        makeCommitFixture('ahead3', {date: '2024-03-01T00:00:00+00:00'}),
+                        makeCommitFixture('inside1', {date: '2024-01-20T00:00:00+00:00'}),
+                        makeCommitFixture('inside2', {date: '2024-01-10T00:00:00+00:00'}),
+                    ]),
+                },
+                {body: pagedResponse(makeDiffstatFixture())}, // diffstat for inside1
+                {body: pagedResponse(makeDiffstatFixture())}, // diffstat for inside2
+            ]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            const onProgress = vi.fn();
+            const commits = await provider.getCommits(
+                'my-repo',
+                '2024-01-01T00:00:00Z',
+                '2024-02-01T00:00:00Z',
+                onProgress,
+            );
+
+            expect(commits.map((c) => c.sha)).toEqual(['inside1', 'inside2']);
+            const ticks = onProgress.mock.calls.map(
+                (c) => c[0] as {done: number; total: number | null; scanned?: number},
+            );
+            const listingTicks = ticks.filter((p) => p.total === null);
+            // Page 1 keeps nothing; page 2 keeps 2 of its 3 rows, so the retained count
+            // moves for the first time while the scanned count runs 3 ahead of it.
+            expect(listingTicks).toEqual([
+                {done: 0, total: null, scanned: 2},
+                {done: 2, total: null, scanned: 5},
+            ]);
+            // The wire invariant, asserted against the only code that can violate it: a
+            // row cannot be kept without having been handed over. (The pipeline-level
+            // version of this check runs against a mock and so cannot fail — see
+            // tests/connectors/git/sync.test.ts.)
+            for (const t of listingTicks) {
+                expect(t.scanned).toBeGreaterThanOrEqual(t.done);
+            }
+        });
+
         it('does not report the page that hits the since cutoff — that tick is unobservable', async () => {
             // `break paging` skips the listing report on the cutoff page, deliberately:
             // the fan-out seed below it runs in the same synchronous block and would

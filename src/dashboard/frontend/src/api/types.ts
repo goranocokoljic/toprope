@@ -1091,8 +1091,10 @@ export interface GitSyncProgress {
     prs_fetched: number;
     developers_matched: number;
     /**
-     * The within-repo fan-out in flight and how far it has advanced (#270). Null /
-     * (0, null) whenever no fan-out is running. `repo_step_total` is null while the
+     * The within-repo fan-out in flight and how far it has advanced (#270). All four
+     * fields are reset to `(null, 0, null, null)` whenever no fan-out is running — the
+     * same reset the server documents on `GitSyncProgress.repo_step`, including
+     * `repo_step_scanned` since #276. `repo_step_total` is null while the
      * set is still being discovered (a list endpoint paging in), in which case
      * `repo_step_done` reads as "found so far" — the server cannot know the total
      * yet, so there is deliberately no percentage to render.

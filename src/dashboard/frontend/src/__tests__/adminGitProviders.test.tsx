@@ -1586,6 +1586,80 @@ describe('syncProgressLabel — within-repo progress (#270)', () => {
         expect(label).not.toContain('3400 commits found');
     });
 
+    it('shows both counts on the boundary page, where the found count is non-zero', () => {
+        // Every backfill crosses this state exactly once per repo: the page that straddles
+        // `until`, so some rows are kept and more were examined. All the other suffix
+        // cases hold `repo_step_done` at 0, which means nothing pins that the suffix
+        // survives a non-zero found count — a regression that only appended it while
+        // `done === 0` would pass them all. Singular "1 commit" is exercised here too,
+        // since the suffix composes onto the pluralised noun.
+        expect(
+            syncProgressLabel({
+                started_at: 't',
+                progress: {
+                    ...base,
+                    repo_step: 'commits',
+                    repo_step_done: 2,
+                    repo_step_scanned: 5,
+                    repo_step_total: null,
+                },
+            }),
+        ).toBe(
+            'Fetching activity — repo 3/12 (web) · 2 commits found (5 scanned) · run total 34 commits · 5 PRs',
+        );
+        expect(
+            syncProgressLabel({
+                started_at: 't',
+                progress: {
+                    ...base,
+                    repo_step: 'commits',
+                    repo_step_done: 1,
+                    repo_step_scanned: 5,
+                    repo_step_total: null,
+                },
+            }),
+        ).toContain('1 commit found (5 scanned)');
+    });
+
+    it('renders the plain count when an older backend omits the scanned key entirely', () => {
+        // `repo_step_scanned` is declared non-optional, but that is a claim about the
+        // CURRENT server: a cached bundle polling a rolled-back one receives the key
+        // absent. `undefined` must degrade to the plain count, never render as
+        // "undefined scanned" — the same wire-robustness posture `repoStepCount` takes
+        // with `Object.hasOwn` for `repo_step`.
+        const progress = {
+            ...base,
+            repo_step: 'commits' as const,
+            repo_step_done: 7,
+            repo_step_scanned: 3400,
+            repo_step_total: null,
+        };
+        // Positive control: with the key present the suffix does render, so the assertion
+        // below is about its absence and not about an unrelated suppression.
+        expect(syncProgressLabel({started_at: 't', progress})).toContain('7 commits found (3400 scanned)');
+
+        const {repo_step_scanned: _omitted, ...withoutKey} = progress;
+        const label = syncProgressLabel({
+            started_at: 't',
+            progress: withoutKey as typeof progress,
+        });
+        expect(label).toContain('7 commits found ·');
+        expect(label).not.toContain('scanned');
+        expect(label).not.toContain('undefined');
+
+        // A non-number is the case the `typeof` guard exists for, and the only one that
+        // distinguishes it from a bare `!== null`: relational comparison coerces, so
+        // `'3400' > 7` is true and a looser guard would interpolate remote text into the
+        // operator's line as though it were a count.
+        const asText = syncProgressLabel({
+            started_at: 't',
+            progress: {...progress, repo_step_scanned: '3400' as unknown as number},
+        });
+        expect(asText).toBe(
+            'Fetching activity — repo 3/12 (web) · 7 commits found · run total 34 commits · 5 PRs',
+        );
+    });
+
     it('advances the line on every page of a walk that keeps nothing', () => {
         // AC1 as the operator experiences it: consecutive snapshots from the approach
         // walk must render DIFFERENT lines. Before #276 all three of these were the

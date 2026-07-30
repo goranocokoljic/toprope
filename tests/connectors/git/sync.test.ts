@@ -2446,6 +2446,70 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
             expect(result.errors.some((e) => /bad-repo.*Failed to fetch commits/.test(e))).toBe(true);
         });
 
+        it('clears an in-flight scanned count when the listing that produced it fails', async () => {
+            // The sibling above fails mid-FAN-OUT, where `repo_step_scanned` is already
+            // null; this one fails mid-LISTING, the only phase that produces the field and
+            // the phase a Bitbucket backfill spends nearly all its wall time in (#276).
+            // A 429/5xx after thousands of scanned rows is the realistic failure, and the
+            // failure branch must clear the count rather than leave `0 commits found
+            // (3400 scanned)` on the label for the rest of the run — the same frozen line
+            // #270 exists to remove. Without a non-null scanned in flight here, nothing
+            // proves the error paths clear it: `reportStep`'s `scanned = null` default
+            // could be changed to "only write when provided" and the whole suite stays green.
+            seedDev(db, 'alice');
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(
+                makeMockProvider({
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('bad-repo')]),
+                    getCommits: vi
+                        .fn()
+                        .mockImplementation(
+                            async (
+                                _repo: string,
+                                _since: string,
+                                _until: string,
+                                onProgress?: (p: GitFetchProgress) => void,
+                            ) => {
+                                onProgress?.({done: 0, total: null, scanned: 3400});
+                                // Plain Error, like the sibling above: an unhealable fault
+                                // goes straight to the failure branch, so this test pins
+                                // that clear without paying the in-run retry's sleeps. The
+                                // retry's own reset is pinned in repo-retry.test.ts.
+                                throw new Error('Bitbucket API error 500');
+                            },
+                        ),
+                }),
+            );
+
+            const snapshots: GitSyncProgress[] = [];
+            const result = await new GitSync({enabled: false}).syncProviders(db, [CONFIG], (p) =>
+                snapshots.push(p),
+            );
+
+            // The approach walk's tick reached the wire — the positive control, without
+            // which the clear assertion below would pass on a field that was never set.
+            expect(
+                snapshots.some(
+                    (s) => s.repo_step === 'commits' && s.repo_step_done === 0 && s.repo_step_scanned === 3400,
+                ),
+            ).toBe(true);
+            // The failure branch clears the whole indicator — asserted on all four fields:
+            // from the last tick that carried the count onward, nothing may still carry it.
+            const lastScanned = snapshots.map((s) => s.repo_step_scanned).lastIndexOf(3400);
+            expect(
+                snapshots.slice(lastScanned + 1).every((s) => s.repo_step_scanned === null),
+            ).toBe(true);
+            const final = snapshots[snapshots.length - 1];
+            expect([
+                final.repo_step,
+                final.repo_step_done,
+                final.repo_step_scanned,
+                final.repo_step_total,
+            ]).toEqual([null, 0, null, null]);
+            expect(final.repos_processed).toBe(1);
+            expect(result.errors.some((e) => /bad-repo.*Failed to fetch commits/.test(e))).toBe(true);
+        });
+
         it('reports an empty repo as zero totals, leaving the "no 0/0 counter" call to the consumer', async () => {
             seedDev(db, 'alice');
             const createGitProvider = await getCreateGitProvider();
@@ -2724,10 +2788,13 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
             expect(snapshots.every((s) => s.repo_step_scanned === null)).toBe(true);
         });
 
-        it('never reports a scanned count below the retained count', async () => {
-            // The stated wire invariant (a row cannot be kept without being returned).
-            // Asserted over the real Bitbucket-shaped walk rather than a hand-built
-            // snapshot, so it fails if a future producer inverts the two.
+        it('threads the two counts through to the wire without transposing them', async () => {
+            // What this can actually catch, stated honestly: `stepListener` copies `done`
+            // and `scanned` positionally into `reportStep`, so a swap of the two arguments
+            // shows up here as a snapshot whose scanned count is below its retained count.
+            // It is NOT a test of the invariant itself — the producer that could violate it
+            // is Bitbucket's walk, which never runs here; that assertion lives at the
+            // producer, in tests/connectors/git/providers/bitbucket.test.ts.
             seedDev(db, 'alice');
             const createGitProvider = await getCreateGitProvider();
             createGitProvider.mockReturnValue(makeApproachWalkProvider([10, 20, 30]));
