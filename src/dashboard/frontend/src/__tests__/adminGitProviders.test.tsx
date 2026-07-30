@@ -8,6 +8,8 @@ import {MemoryRouter} from 'react-router-dom';
 import {
     AdminGitProviders,
     findContainerConflict,
+    laterInstant,
+    outcomeBelongsToRun,
     parseReposList,
     repoScopeLabel,
     syncProgressLabel,
@@ -1799,11 +1801,15 @@ describe('AdminGitProviders — live sync progress (#209)', () => {
             'Fetching activity — repo 3/12 (web) · commit 1240/5000 · run total 34 commits · 5 PRs',
         );
         // Deliberately NOT a live region: this line changes on nearly every 1s poll, so
-        // role="status" would announce it once per second for a multi-hour sync. Pinned
-        // so a future "accessibility improvement" cannot silently reinstate it — the
+        // announcing it would fire once per second for a multi-hour sync. Pinned so a
+        // future "accessibility improvement" cannot silently reinstate it — the
         // completion announcement lives on the row's low-churn sr-only element instead
-        // (#278, exercised in its own describe block below).
+        // (#278, exercised in its own describe block below). All three attributes,
+        // because `aria-live="polite"` alone reinstates the behavior and would sail past
+        // a role-only assertion.
         expect(progress).not.toHaveAttribute('role');
+        expect(progress).not.toHaveAttribute('aria-live');
+        expect(progress).not.toHaveAttribute('aria-atomic');
         expect(screen.getByRole('button', {name: 'Syncing…'})).toBeDisabled();
         expect(screen.queryByRole('button', {name: 'Sync now'})).not.toBeInTheDocument();
     });
@@ -1981,10 +1987,61 @@ describe('syncStageAnnouncement / syncTerminalAnnouncement (#278)', () => {
     it('maps a settled run to completed / failed, and claims nothing on an unrecorded outcome', () => {
         expect(syncTerminalAnnouncement('ok')).toBe('Sync completed');
         expect(syncTerminalAnnouncement('error')).toBe('Sync failed');
-        // Both writes of the outcome can fail server-side (startScopedSync logs and moves
-        // on), and a never-synced provider is null — neither is a completion.
+        // A never-synced provider reads null. `'never'` is the third value the column's
+        // CHECK actually admits (migration 039) — neither is a completion. (An arbitrary
+        // string is deliberately NOT asserted here: the column cannot hold one, so it
+        // would be an assertion that can only pass.)
         expect(syncTerminalAnnouncement(null)).toBe('Sync finished — outcome unknown');
-        expect(syncTerminalAnnouncement('partial')).toBe('Sync finished — outcome unknown');
+        expect(syncTerminalAnnouncement('never')).toBe('Sync finished — outcome unknown');
+    });
+});
+
+describe('outcomeBelongsToRun / laterInstant (#278)', () => {
+    it('accepts an outcome recorded at or after the run started', () => {
+        expect(outcomeBelongsToRun('2026-07-13T11:32:00.000Z', '2026-07-13T10:00:00.000Z')).toBe(true);
+        // Equal is inclusive: a run that settles inside the same millisecond it started
+        // still recorded its own outcome.
+        expect(outcomeBelongsToRun('2026-07-13T10:00:00.000Z', '2026-07-13T10:00:00.000Z')).toBe(true);
+    });
+
+    it('rejects an outcome that predates the run — the stale-column case', () => {
+        // The window: the in-flight registry is a process-local Map, so losing the process
+        // mid-run makes the run vanish with LAST week's outcome still in the columns.
+        // Announcing "Sync completed" there is the completion claim this guard exists for.
+        expect(outcomeBelongsToRun('2026-07-01T10:00:00.000Z', '2026-07-13T10:00:00.000Z')).toBe(false);
+    });
+
+    it('rejects a missing or unparseable operand explicitly, not via a NaN comparison', () => {
+        expect(outcomeBelongsToRun(null, '2026-07-13T10:00:00.000Z')).toBe(false);
+        expect(outcomeBelongsToRun('not-a-date', '2026-07-13T10:00:00.000Z')).toBe(false);
+        expect(outcomeBelongsToRun('2026-07-13T11:00:00.000Z', 'not-a-date')).toBe(false);
+    });
+
+    it('laterInstant picks the later instant, ignoring null and unparseable operands', () => {
+        expect(laterInstant('2026-07-01T00:00:00.000Z', '2026-07-13T00:00:00.000Z')).toBe(
+            '2026-07-13T00:00:00.000Z',
+        );
+        expect(laterInstant('2026-07-13T00:00:00.000Z', '2026-07-01T00:00:00.000Z')).toBe(
+            '2026-07-13T00:00:00.000Z',
+        );
+        expect(laterInstant(null, '2026-07-13T00:00:00.000Z')).toBe('2026-07-13T00:00:00.000Z');
+        expect(laterInstant('2026-07-13T00:00:00.000Z', null)).toBe('2026-07-13T00:00:00.000Z');
+        expect(laterInstant('nope', '2026-07-13T00:00:00.000Z')).toBe('2026-07-13T00:00:00.000Z');
+        expect(laterInstant('2026-07-13T00:00:00.000Z', 'nope')).toBe('2026-07-13T00:00:00.000Z');
+        expect(laterInstant(null, null)).toBeNull();
+        expect(laterInstant('nope', 'nope')).toBeNull();
+    });
+
+    it('compares parsed instants, not strings — an expanded year sorts the other way', () => {
+        // '+010000-…' begins with '+' (0x2B), which sorts BELOW '2' (0x32), so a lexical
+        // comparison would read the year 10000 as the earlier of the two and invert both
+        // decisions. This is the #233 rule applied here.
+        expect(laterInstant('2026-07-13T00:00:00.000Z', '+010000-01-01T00:00:00.000Z')).toBe(
+            '+010000-01-01T00:00:00.000Z',
+        );
+        expect(outcomeBelongsToRun('+010000-01-01T00:00:00.000Z', '2026-07-13T00:00:00.000Z')).toBe(
+            true,
+        );
     });
 });
 
@@ -2005,6 +2062,17 @@ describe('AdminGitProviders — sync completion announced to assistive tech (#27
             repo_step_total: 5000,
         },
     } as const;
+
+    /**
+     * A row whose outcome was genuinely RECORDED for `RUNNING_SYNC` — `last_sync_at` is
+     * after the run's `started_at`, which is exactly what `recordSyncOutcome` guarantees
+     * (it writes status and timestamp in one update). Leaving `last_sync_at` at
+     * DB_GITHUB's pre-run 2026-07-01 would instead be the *unrecorded* case, so the ok
+     * and failed assertions below would be asserting the wrong branch.
+     */
+    function settled(status: string, at = '2026-07-13T11:32:00.000Z'): AdminGitProvider {
+        return {...structuredClone(DB_GITHUB), last_sync_status: status, last_sync_at: at};
+    }
 
     /** The GitHub row's sr-only live region. Scoped per row — every row has one. */
     async function announcementFor(container: string): Promise<HTMLElement> {
@@ -2046,8 +2114,48 @@ describe('AdminGitProviders — sync completion announced to assistive tech (#27
         // region (#270): `commit 1240/5000` changes on nearly every 1s poll.
         expect(live.textContent).not.toContain('1240');
         expect(live.textContent).not.toContain('5000');
-        // …and the visible line itself is still not a live region.
-        expect(screen.getByTestId('sync-progress')).not.toHaveAttribute('role');
+        // …and the visible line itself is still not a live region, by any of the three
+        // attributes that would make it one.
+        const progress = screen.getByTestId('sync-progress');
+        expect(progress).not.toHaveAttribute('role');
+        expect(progress).not.toHaveAttribute('aria-live');
+        expect(progress).not.toHaveAttribute('aria-atomic');
+    });
+
+    it('announces the stage change when the pipeline advances mid-run', async () => {
+        // Proves the rendered region actually re-fires on a stage change (not just that
+        // the pure function names stages) — and that a run emits a handful of
+        // announcements, not one per poll.
+        providers = [{...structuredClone(DB_GITHUB), active_sync: structuredClone(RUNNING_SYNC)}];
+        renderPage();
+        const live = await announcementFor('acme-org');
+        await waitFor(() => expect(live).toHaveTextContent('Fetching activity'));
+
+        providers = [
+            {
+                ...structuredClone(DB_GITHUB),
+                active_sync: {
+                    ...structuredClone(RUNNING_SYNC),
+                    progress: {...structuredClone(RUNNING_SYNC.progress), stage: 'writing'},
+                },
+            },
+        ];
+        await waitFor(
+            () => expect(live).toHaveTextContent('GitHub · acme-org: Writing snapshots'),
+            {timeout: 3000},
+        );
+    }, 10000);
+
+    it('announces a started run that has not emitted progress yet', async () => {
+        providers = [
+            {
+                ...structuredClone(DB_GITHUB),
+                active_sync: {started_at: '2026-07-13T10:00:00.000Z', progress: null},
+            },
+        ];
+        renderPage();
+        const live = await announcementFor('acme-org');
+        await waitFor(() => expect(live).toHaveTextContent('GitHub · acme-org: Sync started'));
     });
 
     it('announces "Sync completed" when the run settles ok, without re-navigating', async () => {
@@ -2057,9 +2165,9 @@ describe('AdminGitProviders — sync completion announced to assistive tech (#27
         await waitFor(() => expect(live).toHaveTextContent('Fetching activity'));
 
         // The run settles server-side; the 1s poll observes an idle row carrying the
-        // terminal last_sync_status. Nothing about this is a user action — that IS the
+        // terminal last_sync_*. Nothing about this is a user action — that IS the
         // acceptance criterion.
-        providers = [{...structuredClone(DB_GITHUB), last_sync_status: 'ok'}];
+        providers = [settled('ok')];
         await waitFor(() => expect(live).toHaveTextContent('GitHub · acme-org: Sync completed'), {
             timeout: 3000,
         });
@@ -2074,17 +2182,92 @@ describe('AdminGitProviders — sync completion announced to assistive tech (#27
         const live = await announcementFor('acme-org');
         await waitFor(() => expect(live).toHaveTextContent('Fetching activity'));
 
-        providers = [
-            {
-                ...structuredClone(DB_GITHUB),
-                last_sync_status: 'error',
-                last_sync_error: 'repo api: 403',
-            },
-        ];
+        providers = [{...settled('error'), last_sync_error: 'repo api: 403'}];
         await waitFor(() => expect(live).toHaveTextContent('GitHub · acme-org: Sync failed'), {
             timeout: 3000,
         });
     }, 10000);
+
+    it('announces the outcome of a run that settled before its one refetch could see it in flight', async () => {
+        // The path a real admin takes, and the one a poll-only latch loses entirely: the
+        // trigger gets exactly ONE invalidation refetch and polling is itself gated on
+        // `active_sync`, so a run that fails immediately is never observed in flight and no
+        // later poll revisits the row. Silence here would be AC(1) failing on the error
+        // path — the outcome an admin most needs announced.
+        const base = fetchMock.getMockImplementation();
+        let triggered = false;
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const u = String(url);
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (/\/git\/providers\/[^/]+\/sync$/.test(u) && method === 'POST') {
+                // Server registers the run and answers 202 with its start instant…
+                triggered = true;
+                return json(
+                    {
+                        data: {
+                            provider_id: 'p-gh',
+                            status: 'running',
+                            started_at: '2026-07-13T10:00:00.000Z',
+                        },
+                    },
+                    202,
+                );
+            }
+            if (/\/git\/providers$/.test(u) && method === 'GET' && triggered) {
+                // …and by the time the invalidation refetch is served the run has already
+                // failed and been removed from the in-flight registry.
+                return json({data: [{...settled('error'), last_sync_error: 'bad credentials'}]});
+            }
+            return base!(url, init);
+        });
+        renderPage();
+        const live = await announcementFor('acme-org');
+        expect(live).toHaveTextContent('');
+
+        const row = (await screen.findByText('acme-org')).closest('tr') as HTMLElement;
+        fireEvent.click(within(row).getByRole('button', {name: 'Sync now'}));
+        await waitFor(() => expect(live).toHaveTextContent('GitHub · acme-org: Sync failed'));
+    });
+
+    it('re-announces a SECOND run in the same page session', async () => {
+        // `announcedRun` must not swallow the next run's outcome. Polling stops when the
+        // first run settles, so a second run is reached the way a real admin reaches it —
+        // by pressing Sync now, whose invalidation refetch restarts the poll.
+        providers = [{...structuredClone(DB_GITHUB), active_sync: structuredClone(RUNNING_SYNC)}];
+        renderPage();
+        const live = await announcementFor('acme-org');
+        await waitFor(() => expect(live).toHaveTextContent('Fetching activity'));
+
+        providers = [settled('ok')];
+        await waitFor(() => expect(live).toHaveTextContent('Sync completed'), {timeout: 3000});
+
+        // Second run, started later than the first (the server stamps `started_at` at
+        // trigger time, so it always is).
+        const secondRun = {
+            started_at: '2026-07-14T09:00:00.000Z',
+            progress: structuredClone(RUNNING_SYNC.progress),
+        };
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const u = String(url);
+            if (/\/git\/providers\/[^/]+\/sync$/.test(u) && (init?.method ?? 'GET') === 'POST') {
+                return json(
+                    {data: {provider_id: 'p-gh', status: 'running', started_at: secondRun.started_at}},
+                    202,
+                );
+            }
+            return base!(url, init);
+        });
+        providers = [{...settled('ok'), active_sync: secondRun}];
+        const row = (await screen.findByText('acme-org')).closest('tr') as HTMLElement;
+        fireEvent.click(within(row).getByRole('button', {name: 'Sync now'}));
+        await waitFor(() => expect(live).toHaveTextContent('Fetching activity'));
+
+        providers = [{...settled('error', '2026-07-14T09:41:00.000Z'), last_sync_error: 'boom'}];
+        await waitFor(() => expect(live).toHaveTextContent('GitHub · acme-org: Sync failed'), {
+            timeout: 3000,
+        });
+    }, 15000);
 
     it('names the provider that settled, so a multi-row table is unambiguous', async () => {
         // Two DB rows, only one syncing. Announcing a bare "Sync completed" would leave
@@ -2099,10 +2282,7 @@ describe('AdminGitProviders — sync completion announced to assistive tech (#27
         await waitFor(() => expect(syncing).toHaveTextContent('GitHub · acme-org: Fetching activity'));
         expect(idle).toHaveTextContent('');
 
-        providers = [
-            {...structuredClone(DB_GITHUB), last_sync_status: 'ok'},
-            structuredClone(DB_MONITOR_ALL),
-        ];
+        providers = [settled('ok'), structuredClone(DB_MONITOR_ALL)];
         await waitFor(() => expect(syncing).toHaveTextContent('GitHub · acme-org: Sync completed'), {
             timeout: 3000,
         });
@@ -2110,10 +2290,11 @@ describe('AdminGitProviders — sync completion announced to assistive tech (#27
         expect(idle).toHaveTextContent('');
     }, 10000);
 
-    it('claims nothing when a run vanishes without its outcome being recorded', async () => {
-        // Both outcome writes can fail server-side; the registry entry is cleared in
-        // `finally` either way. "Sync completed" there would be a completion claim the
-        // row cannot support.
+    it('claims nothing when a first-ever run vanishes with no outcome recorded at all', async () => {
+        // The null-column path through the freshness gate, end to end. Note this case
+        // cannot distinguish a false completion claim on its own — with a null status
+        // there is no "completed" to claim — so the discriminating assertions are the
+        // stale-column test below and the `outcomeBelongsToRun(null, …)` unit case.
         providers = [
             {
                 ...structuredClone(DB_GITHUB),
@@ -2131,6 +2312,27 @@ describe('AdminGitProviders — sync completion announced to assistive tech (#27
             () => expect(live).toHaveTextContent('GitHub · acme-org: Sync finished — outcome unknown'),
             {timeout: 3000},
         );
+    }, 10000);
+
+    it('claims nothing when a run vanishes leaving a PREVIOUS run’s outcome in the columns', async () => {
+        // The realistic unrecorded case, and the one the old code got wrong: the process
+        // dies mid-run (the in-flight registry is a process-local Map), so the run
+        // disappears with a stale 'ok' from 2026-07-01 — twelve days before this run
+        // started — still in the columns. A sighted admin sees that date next to the Badge;
+        // announcing a bare "Sync completed" would give the listener a strictly worse
+        // signal than the visible one.
+        providers = [{...structuredClone(DB_GITHUB), active_sync: structuredClone(RUNNING_SYNC)}];
+        renderPage();
+        const live = await announcementFor('acme-org');
+        await waitFor(() => expect(live).toHaveTextContent('Fetching activity'));
+
+        // Untouched columns: status 'ok', last_sync_at 2026-07-01 (see DB_GITHUB).
+        providers = [structuredClone(DB_GITHUB)];
+        await waitFor(
+            () => expect(live).toHaveTextContent('GitHub · acme-org: Sync finished — outcome unknown'),
+            {timeout: 3000},
+        );
+        expect(live.textContent).not.toContain('Sync completed');
     }, 10000);
 });
 

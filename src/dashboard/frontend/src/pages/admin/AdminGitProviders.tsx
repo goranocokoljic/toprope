@@ -371,6 +371,11 @@ function scannedSuffix(p: GitSyncProgress): string {
  * A `Record` over the union, like `PROVIDER_META` and `REPO_STEP_NOUN` above: adding
  * a `GitSyncStage` member without a name here is a BUILD error, and an unrecognized
  * wire value from a newer backend reads `undefined` at runtime.
+ *
+ * Scope of the claim: it covers the four NAMED stages only. The two non-stage fallbacks
+ * (no progress emitted yet; a stage this bundle cannot name) are deliberately spelled
+ * per surface — the visible line uses the ellipsis idiom ("Starting sync…", "Syncing…"),
+ * the spoken one does not ("Sync started", "Sync in progress").
  */
 const STAGE_LABEL: Record<GitSyncStage, string> = {
     listing_repos: 'Listing repositories',
@@ -425,35 +430,92 @@ export function syncProgressLabel(active: GitProviderActiveSync): string {
  * multi-hour first sync (#270's finding). The stage changes roughly four times per
  * run, so it is safe to announce and is the part a listener can actually use.
  *
- * Degrades on wire data rather than trusting the union: `progress` is null until the
- * pipeline's first emission, and `stage` is a string from the server, so a member a
- * newer backend emits lands on the generic line instead of announcing raw source
- * text. `Object.hasOwn`, not a bare lookup, for the reason `repoStepCount` uses it —
- * a plain object literal resolves inherited keys ("toString", "constructor") to
- * functions that pass an `undefined` check.
+ * Degrades on wire data rather than trusting the union: `progress` is null (or, from a
+ * rolled-back server a cached bundle is polling, absent — hence `!p`, the same guard
+ * `syncProgressLabel` uses, not `=== null`) until the pipeline's first emission, and
+ * `stage` is a string from the server, so a member a newer backend emits lands on the
+ * generic line instead of announcing raw source text. `Object.hasOwn`, not a bare
+ * lookup, for the reason `repoStepCount` uses it — a plain object literal resolves
+ * inherited keys ("toString", "constructor") to functions that pass an `undefined`
+ * check.
  */
 export function syncStageAnnouncement(active: GitProviderActiveSync): string {
     const p = active.progress;
-    if (p === null) return 'Sync started';
+    if (!p) return 'Sync started';
     return Object.hasOwn(STAGE_LABEL, p.stage) ? STAGE_LABEL[p.stage] : 'Sync in progress';
 }
 
 /**
- * What a SETTLED run announces (#278), read from the same `last_sync_status` column
- * the status Badge renders.
+ * What the row says when it cannot tell whether the run it watched produced the outcome
+ * the columns now hold. One spelling, shared by {@link syncTerminalAnnouncement}'s
+ * fallback and by the freshness gate in `ProviderRow`.
+ */
+const SYNC_OUTCOME_UNKNOWN = 'Sync finished — outcome unknown';
+
+/**
+ * Does the row's recorded outcome belong to the run that just disappeared (#278)?
  *
- * The third branch is not defensive padding: the server records the outcome and only
- * then clears the in-flight registry, but if BOTH the ok-write and the error-write
- * fail (`startScopedSync` logs and moves on), the run really does disappear with the
- * column still holding the previous value — or null on a first sync. Announcing
- * "completed" there would be a completion claim the row cannot support, so this says
- * only what is known. `status` is an unconstrained TEXT column on the wire, so any
- * other value lands here too.
+ * This is the guard that keeps the announcement from making a completion claim the row
+ * cannot support. `recordSyncOutcome` writes `last_sync_status` and `last_sync_at` in
+ * ONE update, and it is the only writer of either column — so an outcome recorded for
+ * this run necessarily carries a `last_sync_at` at or after the run's `started_at`.
+ *
+ * The window this closes is not hypothetical. `activeSyncs` is a process-local `Map`
+ * (`api/admin/git-providers.ts`), and the outcome is recorded in the run promise's
+ * then/catch while the registry entry is cleared in `finally`. Lose the process between
+ * them — a restart or deploy during exactly the multi-hour first sync this feature is
+ * for — and the run vanishes with no outcome ever written. The next poll then shows
+ * `active_sync: null` beside LAST week's `'ok'`, and announcing "Sync completed" would
+ * be a completion signal for a run that imported nothing (#231 discards a failed run's
+ * partial window). A sighted admin has a tell: `last_sync_at` renders next to the Badge
+ * and reads three weeks old. The announcement carries no timestamp, so without this
+ * gate the listener would get a strictly WORSE signal than the visible one.
+ *
+ * Parsed instants, and an unparseable operand REJECTED explicitly rather than left to
+ * `NaN >= NaN` happening to be false — both per the project's timestamp rule. Failing
+ * closed here costs only a vaguer announcement.
+ */
+export function outcomeBelongsToRun(lastSyncAt: string | null, runStartedAt: string): boolean {
+    if (lastSyncAt === null) return false;
+    const recorded = Date.parse(lastSyncAt);
+    const started = Date.parse(runStartedAt);
+    if (Number.isNaN(recorded) || Number.isNaN(started)) return false;
+    return recorded >= started;
+}
+
+/**
+ * The later of two ISO instants, or null when neither is usable (#278). Null and
+ * unparseable operands are discarded rather than winning or losing a comparison, and
+ * the comparison is on parsed instants — an expanded-year spelling
+ * (`+010000-01-01T…`) sorts BELOW an ordinary year as a string and would invert it.
+ *
+ * Used to pick the most recent run a row knows about out of two independent sources
+ * (the polled in-flight entry and this row's own trigger handles), which is what makes
+ * the "already announced" check monotone.
+ */
+export function laterInstant(a: string | null, b: string | null): string | null {
+    const ta = a === null ? NaN : Date.parse(a);
+    const tb = b === null ? NaN : Date.parse(b);
+    if (Number.isNaN(ta)) return Number.isNaN(tb) ? null : b;
+    if (Number.isNaN(tb)) return a;
+    return tb > ta ? b : a;
+}
+
+/**
+ * What a SETTLED run announces (#278), read from the same `last_sync_status` column the
+ * status Badge renders. Callers must have already established that the outcome belongs
+ * to the run being announced — see {@link outcomeBelongsToRun}.
+ *
+ * The third branch is not defensive padding. `status` here is UNVALIDATED WIRE DATA: the
+ * column is CHECK-constrained to `ok | error | never` and `recordSyncOutcome` re-validates
+ * before writing, but the frontend does no runtime validation of the response, and
+ * `'never'` is itself a reachable non-terminal value. Naming an outcome the row does not
+ * have would be exactly the completion claim this feature must not make.
  */
 export function syncTerminalAnnouncement(status: string | null): string {
     if (status === 'ok') return 'Sync completed';
     if (status === 'error') return 'Sync failed';
-    return 'Sync finished — outcome unknown';
+    return SYNC_OUTCOME_UNKNOWN;
 }
 
 /** Small indeterminate spinner shown next to live sync progress. */
@@ -1408,25 +1470,79 @@ function ProviderRow({
     // Which provider settled — with more than one row, a bare "Sync completed" is
     // ambiguous, and going to look it up is exactly the re-navigation this removes.
     const announceLabel = `${meta.label} · ${provider.container}`;
-    // Only a run this row actually OBSERVED in flight earns a terminal announcement.
-    // Without the latch, mounting a row whose `last_sync_status` is already 'error'
-    // from last week would announce "Sync failed" on every page load.
-    const sawRunInFlight = useRef(false);
+
+    // Runs THIS row triggered itself, identified by the 202 handle's `started_at`. This
+    // is the second source the latch needs, and it is not redundant with the poll: a
+    // trigger gets exactly ONE invalidation refetch, and polling is itself gated on
+    // `active_sync` (`gitProvidersRefetchInterval`). So a run that starts and settles
+    // before that single GET is served is never observed in flight, no later poll
+    // revisits the row, and a poll-only latch would stay silent for precisely the
+    // fast-failing run whose outcome an admin most needs to hear.
+    //
+    // `mutation.data` is a run IDENTITY, never an in-flight signal (it is cleared while
+    // the next trigger is pending and set again on its 202) — the in-flight test stays
+    // `stageAnnouncement !== null`. Both mutations can hold a handle, so take the later.
+    const triggeredRunStartedAt = laterInstant(
+        sync.data?.started_at ?? null,
+        syncOlder.data?.started_at ?? null,
+    );
+    // The most recent run this row knows about right now, from either source.
+    const knownRunStartedAt = laterInstant(activeSync?.started_at ?? null, triggeredRunStartedAt);
+
+    // The derived identity goes null the moment a poll-observed run settles, so the run
+    // has to be remembered; `laterInstant` keeps it monotone.
+    const knownRun = useRef<string | null>(null);
+    // Whether the CURRENT known run was ever seen in flight. It decides how a
+    // not-yet-recorded outcome is read (see below), and is consumed when the run is
+    // announced.
+    const observedInFlight = useRef(false);
+    // Which run's terminal outcome has already been spoken. Without it a later dep change
+    // would repeat it; with it, a SECOND run in the same page session announces exactly
+    // once (its `started_at` differs) — the mechanism the feature rests on across a
+    // session.
+    const announcedRun = useRef<string | null>(null);
     useEffect(() => {
+        knownRun.current = laterInstant(knownRun.current, knownRunStartedAt);
         if (stageAnnouncement !== null) {
-            sawRunInFlight.current = true;
+            observedInFlight.current = true;
+            // Deliberately NOT latched, unlike the terminal branch below: a page loaded
+            // while another admin's run is in flight should say so. It is the settled
+            // ok/error flip that must not be announced on mount.
             setAnnouncement(`${announceLabel}: ${stageAnnouncement}`);
             return;
         }
-        if (!sawRunInFlight.current) return;
-        sawRunInFlight.current = false;
-        // The poll that observes `active_sync` clear already carries the terminal
-        // `last_sync_*` columns: the server records the outcome inside the run promise's
-        // then/catch and removes the in-flight registry entry only in `finally`
-        // (`startScopedSync`, api/admin/git-providers.ts). There is no window in which
-        // the run is gone and the status is still the previous run's.
-        setAnnouncement(`${announceLabel}: ${syncTerminalAnnouncement(provider.last_sync_status)}`);
-    }, [stageAnnouncement, announceLabel, provider.last_sync_status]);
+        const run = knownRun.current;
+        // Nothing this row saw in flight or triggered itself. A row whose last sync
+        // settled before this page load stays silent — without this, mounting a row
+        // carrying last week's 'error' would announce "Sync failed" on every page load.
+        if (run === null || announcedRun.current === run) return;
+        const recorded = outcomeBelongsToRun(provider.last_sync_at, run);
+        // Knowing the run is OVER is not the same for the two sources, and conflating
+        // them is what makes the announcement either premature or absent:
+        //  - Observed in flight, now gone: the poll that shows `active_sync: null` is the
+        //    same response that would carry the outcome, so this IS the settle. An
+        //    unrecorded outcome here is the real thing — the in-flight registry is a
+        //    process-local Map, so a restart mid-run loses it — and must be said as such.
+        //  - Known only from our own 202: the registry entry is set BEFORE the 202 is
+        //    answered, so any later list either shows the run in flight or shows it
+        //    finished. A row that still carries the pre-run outcome is therefore just a
+        //    response we haven't received yet, not a lost run — keep waiting rather than
+        //    consuming the latch on a claim of ignorance.
+        if (!observedInFlight.current && !recorded) return;
+        observedInFlight.current = false;
+        announcedRun.current = run;
+        setAnnouncement(
+            `${announceLabel}: ${
+                recorded ? syncTerminalAnnouncement(provider.last_sync_status) : SYNC_OUTCOME_UNKNOWN
+            }`,
+        );
+    }, [
+        knownRunStartedAt,
+        stageAnnouncement,
+        announceLabel,
+        provider.last_sync_at,
+        provider.last_sync_status,
+    ]);
 
     // A run is in flight server-side (from the polled list) OR either trigger POST
     // (sync-now / sync-older-history) is still pending — either way the sync
