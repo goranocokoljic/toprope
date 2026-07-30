@@ -127,7 +127,6 @@ function makeProviderCommit(
         message: 'feat: add feature',
         additions: 50,
         deletions: 10,
-        filesChanged: ['src/foo.ts', 'src/bar.ts'],
     };
     // Assigned only when supplied, so "not supplied" is an ABSENT property rather than an
     // explicit `diffs: undefined` — the two are indistinguishable to the sync loop's
@@ -1206,7 +1205,6 @@ describe('GitSync', () => {
             message: 'feat: stuff',
             additions: 20,
             deletions: 5,
-            filesChanged: ['src/x.ts'],
             diffs: [{path: 'src/x.ts', additions: 20, deletions: 5, status: 'modified'}],
         };
         const provider = makeMockProvider({
@@ -1246,7 +1244,6 @@ describe('GitSync', () => {
             message: 'feat: secondary email',
             additions: 10,
             deletions: 2,
-            filesChanged: ['src/a.ts'],
             diffs: [{path: 'src/a.ts', additions: 10, deletions: 2, status: 'modified'}],
         };
         const provider = makeMockProvider({
@@ -1304,7 +1301,6 @@ describe('GitSync', () => {
             message: 'fix: bug',
             additions: 30,
             deletions: 5,
-            filesChanged: ['src/y.ts'],
             diffs: [{path: 'src/y.ts', additions: 30, deletions: 5, status: 'modified'}],
         };
 
@@ -1381,7 +1377,6 @@ describe('GitSync', () => {
                 message: 'fix: bug',
                 additions: 20,
                 deletions: 3,
-                filesChanged: ['src/y.ts'],
                 diffs: [{path: 'src/y.ts', additions: 20, deletions: 3, status: 'modified'}],
             }]),
         });
@@ -1528,7 +1523,6 @@ describe('GitSync', () => {
                 message: 'fix: bug',
                 additions: 10,
                 deletions: 2,
-                filesChanged: ['src/y.ts'],
                 diffs: [{path: 'src/y.ts', additions: 10, deletions: 2, status: 'modified'}],
             }]),
         });
@@ -1557,7 +1551,6 @@ describe('GitSync', () => {
             message: 'feat: big',
             additions: 100,
             deletions: 0,
-            filesChanged: ['src/a.ts'],
             diffs: [{path: 'src/a.ts', additions: 100, deletions: 0, status: 'modified'}],
         });
         createGitProvider.mockReturnValueOnce(makeMockProvider({
@@ -1582,7 +1575,6 @@ describe('GitSync', () => {
                 message: 'fix: small',
                 additions: 20,
                 deletions: 0,
-                filesChanged: ['src/a.ts'],
                 diffs: [{path: 'src/a.ts', additions: 20, deletions: 0, status: 'modified'}],
             }]),
         }));
@@ -5018,7 +5010,6 @@ describe('GitSync — raw authorship retention + projection (#253)', () => {
                 message: 'feat: x',
                 additions: 5,
                 deletions: 1,
-                filesChanged: ['src/x.ts'],
                 diffs: [{path: 'src/x.ts', additions: 5, deletions: 1, status: 'modified'}],
             },
         ]);
@@ -5198,7 +5189,6 @@ describe('GitSync — raw authorship retention + projection (#253)', () => {
                     message: 'fix: bug',
                     additions: 20,
                     deletions: 3,
-                    filesChanged: ['src/y.ts'],
                     diffs: [{path: 'src/y.ts', additions: 20, deletions: 3, status: 'modified'}],
                 }]),
             }),

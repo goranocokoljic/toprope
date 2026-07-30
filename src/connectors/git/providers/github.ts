@@ -454,7 +454,6 @@ export class GitHubProvider implements GitProvider {
                             // miss path below for why the two legitimately differ on GitHub.
                             additions: hit.additions,
                             deletions: hit.deletions,
-                            filesChanged: hit.entries.map((d) => d.path),
                             diffs: hit.entries,
                         });
                         continue;
@@ -624,7 +623,6 @@ export class GitHubProvider implements GitProvider {
                     message: source.message,
                     additions,
                     deletions,
-                    filesChanged: diffs.map((d) => d.path),
                     diffs,
                 });
                 // Deliberately NO `catch` (#272, review cycle 3) — every detail failure now

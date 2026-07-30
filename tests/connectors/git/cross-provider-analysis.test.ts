@@ -24,7 +24,6 @@ function makeEquivalentCommit(username: string, sha: string): GitCommit {
         message: 'feat: add service layer with comprehensive tests',
         additions: 245,
         deletions: 40,
-        filesChanged: CANONICAL_DIFFS.map((d) => d.path),
     };
 }
 
@@ -122,7 +121,6 @@ describe('Cross-provider analysis: identical output for equivalent fixtures', ()
             message: 'fix: re-churn',
             additions: 50,
             deletions: 10,
-            filesChanged: ['src/service.ts'],
         });
         const churnDiff: GitFileDiff[] = [{path: 'src/service.ts', additions: 50, deletions: 10, status: 'modified'}];
 
@@ -149,7 +147,6 @@ describe('Cross-provider analysis: identical output for equivalent fixtures', ()
             message: 'chore: quick commit',
             additions: 5,
             deletions: 2,
-            filesChanged: ['src/x.ts'],
         });
         const diff: GitFileDiff[] = [{path: 'src/x.ts', additions: 5, deletions: 2, status: 'modified'}];
 

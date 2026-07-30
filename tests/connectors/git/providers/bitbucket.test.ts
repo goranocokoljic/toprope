@@ -397,7 +397,6 @@ describe('BitbucketProvider', () => {
                 message: 'feat: add feature',
                 additions: 40,
                 deletions: 5,
-                filesChanged: ['src/foo.ts', 'src/bar.ts'],
                 // The diffstat this call already fetched, carried out so the sync loop
                 // does not request it a second time (#271).
                 diffs: [
@@ -770,7 +769,9 @@ describe('BitbucketProvider', () => {
             expect(commits[0].sha).toBe(hash);
             expect(commits[0].additions).toBe(0);
             expect(commits[0].deletions).toBe(0);
-            expect(commits[0].filesChanged).toEqual([]);
+            // `[]`, never undefined — the 404 is swallowed into "no file-level detail is
+            // obtainable", which must not send the commit back to the same endpoint (#271).
+            expect(commits[0].diffs).toEqual([]);
         });
 
         it('returns both commits when one diffstat succeeds and another returns 404', async () => {
@@ -817,10 +818,10 @@ describe('BitbucketProvider', () => {
             expect(commits).toHaveLength(2);
             expect(commits[0].sha).toBe(hashA);
             expect(commits[0].additions).toBe(40);
-            expect(commits[0].filesChanged).toEqual(['src/foo.ts', 'src/bar.ts']);
+            expect(commits[0].diffs?.map((d) => d.path)).toEqual(['src/foo.ts', 'src/bar.ts']);
             expect(commits[1].sha).toBe(hashB);
             expect(commits[1].additions).toBe(0);
-            expect(commits[1].filesChanged).toEqual([]);
+            expect(commits[1].diffs).toEqual([]);
         });
 
         it('propagates non-404 diffstat errors (e.g. 401 auth failure)', async () => {
@@ -1595,7 +1596,9 @@ describe('BitbucketProvider', () => {
             expect(diffs).toHaveLength(2);
             expect(diffs[0].path).toBe('src/foo.ts');
 
-            expect(commits[0].filesChanged).toEqual(diffs.map((d) => d.path));
+            // `getCommits` carries out the SAME value `getCommitDiff` returns (#271) — the
+            // path list the removed `filesChanged` used to hold is derived from it (#281).
+            expect(commits[0].diffs).toEqual(diffs);
             expect(commits[0].additions).toBe(40);
             expect(commits[0].deletions).toBe(5);
         });

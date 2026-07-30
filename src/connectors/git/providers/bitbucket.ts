@@ -390,7 +390,6 @@ export class BitbucketProvider implements GitProvider {
                 message: raw.message,
                 additions,
                 deletions,
-                filesChanged: diffs.map((d) => d.path),
                 // `[]`, never undefined — including via the helper's 404 branch, where `[]`
                 // is the true answer. See `GitCommit.diffs` for why that matters (#271).
                 diffs,

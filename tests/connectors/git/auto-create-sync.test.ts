@@ -63,7 +63,6 @@ function commitBy(username: string | null, email: string, sha?: string, day = DA
         message: 'feat: add feature',
         additions: 50,
         deletions: 10,
-        filesChanged: ['src/foo.ts'],
         // Carried on the commit, which is the path every in-tree provider takes since #271 —
         // the sync loop reuses this and never calls `getCommitDiff` (#280). Before that this
         // whole file exercised the fallback branch instead.
