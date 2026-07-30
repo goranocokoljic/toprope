@@ -368,6 +368,24 @@ export interface GitProvider {
     // also expose it on `GitCommit.diffs`, so the caller reuses that one fetch instead of
     // walking the same endpoint again per commit (#271).
     //
+    // That MUST is enforced twice since #280, because the field is optional and the sync
+    // silently falls back rather than failing:
+    //   - a table-driven conformance test over every type `createGitProvider` builds
+    //     (`tests/connectors/git/providers/diffs-contract.test.ts`) fails if any of them returns a
+    //     commit whose `diffs` is not the populated array the fixture's routes describe, on the
+    //     cold AND the cache-warm path. Add a fixture there when adding a provider; a new type
+    //     with none fails the gate test.
+    //   - a run that DOES take the fallback reports how many commits did so — see
+    //     `DIFFS_NOT_SUPPLIED_PREFIX` in `sync.ts`. It reaches the same surfaces, and no more,
+    //     as {@link GitCommitDropListener}'s advisory: the `toprope sync git` / `sync all`
+    //     console output, and `sync_logs.errors` on the SCHEDULED path. The admin "Sync now"
+    //     route classifies advisories out and records `status: 'ok'`, so on that path the count
+    //     is not persisted at all — closing that gap is the cross-cutting work tracked in #289.
+    //     It reports in TWO lines, split on whether the claim survives a discarded run: the
+    //     request-volume count is unconditional, while the "a failed fallback permanently
+    //     understated these developer-days" line is staged onto the cursor advance exactly like
+    //     the drop advisory, since a held or rolled-back window is re-fetched intact next run.
+    //
     // `onDrop` (optional) is how an implementation reports a commit it listed but cannot
     // return (#275). Returning a short list silently is the thing to avoid: the caller reads a
     // normal return as "this window is fully covered" and advances the provider's cursor past

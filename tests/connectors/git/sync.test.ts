@@ -25,6 +25,7 @@ import {
     UNMATCHED_AUTHORS_PREFIX,
     PROVIDER_DELETED_MID_RUN_PREFIX,
     COMMITS_DROPPED_PREFIX,
+    DIFFS_NOT_SUPPLIED_PREFIX,
     isAdvisoryError,
     type GitSyncProgress,
     type GitSyncRepoStep,
@@ -95,8 +96,31 @@ function makeRepo(name: string): GitRepo {
     };
 }
 
-function makeProviderCommit(username: string, date = '2024-01-15T10:00:00Z', sha?: string): GitCommit {
-    return {
+/**
+ * A commit as a PROVIDER returns it.
+ *
+ * `diffs` is populated by DEFAULT since #280, because that is what every in-tree provider does
+ * since #271: the sync loop reuses `GitCommit.diffs` and never calls `getCommitDiff`. Before
+ * #280 this helper set no `diffs`, so every test in this file — churn math, merge semantics,
+ * projection and retraction, cursor hold/advance, path namespacing, unmatched-author advisories,
+ * per-provider scoping — ran against a fallback branch that no real provider reaches.
+ *
+ * Pass `NO_PROVIDER_DIFFS` for a deliberately diff-less commit. That branch IS real (the field
+ * is optional by design — see `GitCommit.diffs`) and is still covered, but it now has to be
+ * asked for rather than being what a test gets by accident.
+ *
+ * The `null` sentinel is deliberately NOT the `diffs?: GitFileDiff[]` shape its sibling
+ * `diff-fetch-dedup.test.ts`'s `makeCommit` uses. There the default is "no diffs", so absence can
+ * BE the default; here the default is "diffs supplied", so opting out needs a value that is
+ * distinguishable from "argument omitted". Same intent, opposite defaults.
+ */
+function makeProviderCommit(
+    username: string,
+    date = '2024-01-15T10:00:00Z',
+    sha?: string,
+    diffs: GitFileDiff[] | null = makeProviderDiffs(),
+): GitCommit {
+    const commit: GitCommit = {
         sha: sha ?? `sha-${Date.now()}-${Math.random()}`,
         author: {name: username, email: `${username}@example.com`, username},
         date,
@@ -105,12 +129,25 @@ function makeProviderCommit(username: string, date = '2024-01-15T10:00:00Z', sha
         deletions: 10,
         filesChanged: ['src/foo.ts', 'src/bar.ts'],
     };
+    // Assigned only when supplied, so "not supplied" is an ABSENT property rather than an
+    // explicit `diffs: undefined` — the two are indistinguishable to the sync loop's
+    // `Array.isArray` check, but only the former is what a diff-less provider actually returns.
+    if (diffs !== null) commit.diffs = diffs;
+    return commit;
 }
 
-function makeProviderDiffs(repoPrefix = ''): GitFileDiff[] {
+/** Read at the call sites as "this provider supplies no diffs" — see {@link makeProviderCommit}. */
+const NO_PROVIDER_DIFFS = null;
+
+/**
+ * The file-level diff a provider hands back on `GitCommit.diffs`. Paths are the provider's
+ * OWN — never repo-namespaced — because that is the contract the sync loop namespaces on top
+ * of. A fresh array per call, as a real provider returns.
+ */
+function makeProviderDiffs(): GitFileDiff[] {
     return [
-        {path: `${repoPrefix}src/foo.ts`, additions: 30, deletions: 5, status: 'modified'},
-        {path: `${repoPrefix}src/bar.ts`, additions: 20, deletions: 5, status: 'modified'},
+        {path: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'},
+        {path: 'src/bar.ts', additions: 20, deletions: 5, status: 'modified'},
     ];
 }
 
@@ -139,6 +176,35 @@ function makeProviderReviewComment(username: string, prId = '1'): GitReviewComme
     };
 }
 
+/**
+ * How many times the current test reached {@link makeMockProvider}'s DEFAULT `getCommitDiff` —
+ * i.e. fell onto the `getCommitDiff` fallback without asking to (#280). Asserted zero by the
+ * file-level `afterEach` below.
+ *
+ * This is what makes "the mainstream suite exercises the reuse path" an INVARIANT rather than a
+ * statement about the tree on the day #280 landed. Before it, three fixtures in this file had
+ * silently slid onto the fallback and nothing failed, because a fixture that loses its `diffs`
+ * keeps producing rows — just rows with no file-level detail. A test that genuinely means to
+ * exercise the fallback overrides `getCommitDiff` with its own stub, which by construction never
+ * touches this counter; so the invariant is precisely "no fixture reaches the fallback by
+ * accident", with no opt-in flag to remember.
+ */
+let unaskedFallbackFetches = 0;
+
+beforeEach(() => {
+    unaskedFallbackFetches = 0;
+});
+
+afterEach(() => {
+    expect(
+        unaskedFallbackFetches,
+        'this test fell onto the getCommitDiff fallback: its commits carry no `diffs`, so it is ' +
+            'measuring a branch no in-tree provider reaches (#271/#280). Build them with ' +
+            '`makeProviderCommit` (which supplies `diffs`), or — if the fallback IS the subject ' +
+            '— pass `NO_PROVIDER_DIFFS` and override `getCommitDiff` with your own stub.',
+    ).toBe(0);
+});
+
 function makeMockProvider(overrides: Partial<GitProvider> = {}): GitProvider {
     return {
         name: 'github',
@@ -147,7 +213,14 @@ function makeMockProvider(overrides: Partial<GitProvider> = {}): GitProvider {
         getPullRequests: vi.fn().mockResolvedValue([]),
         getReviewComments: vi.fn().mockResolvedValue([]),
         getPRReviews: vi.fn().mockResolvedValue([]),
-        getCommitDiff: vi.fn().mockResolvedValue([]),
+        // Present because `GitProvider` requires it, NOT because the sync loop calls it: since
+        // #271 the loop reuses `GitCommit.diffs`, and since #280 the commits this file builds
+        // carry them. Reaching THIS implementation is therefore a fixture bug, which is what the
+        // counter above turns into a failing test.
+        getCommitDiff: vi.fn().mockImplementation(async (): Promise<GitFileDiff[]> => {
+            unaskedFallbackFetches += 1;
+            return [];
+        }),
         checkAccess: vi.fn().mockResolvedValue(undefined),
         ...overrides,
     };
@@ -229,7 +302,6 @@ describe('GitSync', () => {
         const provider = makeMockProvider({
             listRepos: vi.fn().mockResolvedValue([makeRepo('myrepo')]),
             getCommits: vi.fn().mockResolvedValue([commit]),
-            getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
         });
         createGitProvider.mockReturnValue(provider);
 
@@ -257,7 +329,6 @@ describe('GitSync', () => {
         const provider = makeMockProvider({
             listRepos: vi.fn().mockResolvedValue([makeRepo('myrepo')]),
             getCommits: vi.fn().mockResolvedValue([makeProviderCommit(devLogin)]),
-            getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
             getPullRequests: vi.fn().mockResolvedValue([makeProviderPR(devLogin)]),
         });
         createGitProvider.mockReturnValue(provider);
@@ -311,7 +382,6 @@ describe('GitSync', () => {
         const provider = makeMockProvider({
             listRepos: vi.fn().mockResolvedValue([makeRepo('myrepo')]),
             getCommits: vi.fn().mockResolvedValue([commit]),
-            getCommitDiff: vi.fn().mockResolvedValue([]),
         });
         createGitProvider.mockReturnValue(provider);
 
@@ -430,14 +500,12 @@ describe('GitSync', () => {
             listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
             getCommits: vi.fn().mockResolvedValue([makeProviderCommit(devLogin, '2024-01-15T10:00:00Z', 'sha-a')]),
             getPullRequests: vi.fn().mockResolvedValue([{...makeProviderPR(devLogin), id: 'pr-a'}]),
-            getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
         });
         const orgB = makeMockProvider({
             name: 'github',
             listRepos: vi.fn().mockResolvedValue([makeRepo('repo-b')]),
             getCommits: vi.fn().mockResolvedValue([makeProviderCommit(devLogin, '2024-01-15T11:00:00Z', 'sha-b')]),
             getPullRequests: vi.fn().mockResolvedValue([{...makeProviderPR(devLogin), id: 'pr-b'}]),
-            getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
         });
         const createGitProvider = await getCreateGitProvider();
         createGitProvider.mockReturnValueOnce(orgA).mockReturnValueOnce(orgB);
@@ -497,7 +565,6 @@ describe('GitSync', () => {
                     name: 'github',
                     listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
                     getCommits: vi.fn().mockResolvedValue([makeProviderCommit('alice')]),
-                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
                 });
             const createGitProvider = await getCreateGitProvider();
             // Delegate to the REAL `validateGitProviderConfig` before returning the stub, so this
@@ -580,12 +647,28 @@ describe('GitSync', () => {
             duringFetch?: () => void,
             /** The `GitCommitDrop.reason` the mock reports (#275). */
             dropReason: string = NO_AUTHOR_DATE_DROP_REASON,
+            /**
+             * Return the commit WITHOUT `diffs` and fail its fallback fetch (#280), so the run
+             * also stages a permanent-diff-loss advisory. Off by default: every other test in
+             * this block is about the #275 drop line and must stay on the reuse path.
+             */
+            diffLessWithFailingFetch: boolean = false,
         ): Promise<SyncResult> {
             const createGitProvider = await getCreateGitProvider();
             const provider = (): ReturnType<typeof makeMockProvider> =>
                 makeMockProvider({
                     name: 'github',
                     listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    // Overridden only in the #280 case — and overriding it is exactly how a test
+                    // that MEANS to exercise the fallback opts out of the `unaskedFallbackFetches`
+                    // guard. The default path leaves the guarded stub in place.
+                    ...(diffLessWithFailingFetch
+                        ? {
+                              getCommitDiff: vi
+                                  .fn()
+                                  .mockRejectedValue(new Error('502 from the diff endpoint')),
+                          }
+                        : {}),
                     getCommits: vi
                         .fn()
                         .mockImplementation(
@@ -605,10 +688,18 @@ describe('GitSync', () => {
                                 // `cursorAdvances` closure, below its `isWritable` guard; move
                                 // the push above that guard and the assertions below fail.
                                 onDrop?.({sha: 'dead01', reason: dropReason});
-                                return Promise.resolve([makeProviderCommit('alice')]);
+                                return Promise.resolve([
+                                    diffLessWithFailingFetch
+                                        ? makeProviderCommit(
+                                              'alice',
+                                              undefined,
+                                              undefined,
+                                              NO_PROVIDER_DIFFS,
+                                          )
+                                        : makeProviderCommit('alice'),
+                                ]);
                             },
                         ),
-                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
                     // A PR is fetched too, so `fetchedPRRecords` is NON-EMPTY and the gate's
                     // `pr_records` arm is actually exercised. Without this the "0 pr_records"
                     // assertions below hold whether the gate works or not — and a `pr_records`
@@ -661,6 +752,53 @@ describe('GitSync', () => {
             // the rollback path suppresses the line. Only `isWritable` does. Nothing may claim
             // the window was recorded when no cursor moved and nothing was written.
             expect(result.errors.some((e) => e.startsWith(COMMITS_DROPPED_PREFIX))).toBe(false);
+        });
+
+        /**
+         * The SAME third discard path, for #280's permanent-diff-loss advisory. It is staged in
+         * the same closure, below the same `isWritable` guard, and its line makes the same
+         * "recorded as covered" claim — so it inherits the same failure mode, and the same
+         * precedent: the first version of #275's gate missed exactly this path.
+         *
+         * Untested, the guard is free: hoisting `diffLossAdvisories.push` to the top of the
+         * cursor-advance closure (the obvious "keep the two staged pushes together" tidy-up)
+         * leaves every other test green, because the rollback case never runs the closure and
+         * the incomplete case never pushes it. Only a deleted container reaches the closure and
+         * returns early.
+         *
+         * What escapes if it regresses is not a cosmetic overstatement: the line tells the
+         * operator to delete and re-add a provider whose data the cascade has ALREADY removed.
+         */
+        it('does NOT claim permanent diff loss when the container was deleted mid-run', async () => {
+            seedDev(db, 'alice');
+            insertProviderRow(db, 'db-org');
+            const result = await runWithOneCommit(
+                db,
+                [DB_PROVIDER],
+                deleteRow(db, 'p1'),
+                NO_AUTHOR_DATE_DROP_REASON,
+                true,
+            );
+
+            // Positive control on the discard: the window really was thrown away, so nothing
+            // about it can honestly be called permanent.
+            expect(countSnapshots(db)).toBe(0);
+            expect(
+                (
+                    db.prepare("SELECT COUNT(*) AS n FROM sync_state WHERE key LIKE 'git_%'").get() as {
+                        n: number;
+                    }
+                ).n,
+            ).toBe(0);
+
+            const diffLines = result.errors.filter((e) => e.startsWith(DIFFS_NOT_SUPPLIED_PREFIX));
+            // Positive control on the emission: the run really did take the fallback and really
+            // did fail it, so "no PERMANENT line" cannot pass by nothing being reported at all.
+            expect(diffLines).toHaveLength(1);
+            expect(diffLines[0]).toContain('1 of those requests FAILED');
+            // …and the staged half is suppressed, exactly as for the drop line above.
+            expect(diffLines.some((e) => e.includes('PERMANENT'))).toBe(false);
+            expect(diffLines.some((e) => e.includes('delete cascade'))).toBe(false);
         });
 
         // Positive control for the assertion above: the identical mock reports a drop on a run
@@ -827,7 +965,6 @@ describe('GitSync', () => {
                     name: 'github',
                     listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
                     getCommits: vi.fn().mockResolvedValue([makeProviderCommit('alice')]),
-                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
                 }),
             );
             // Same provider, but now declared in the connector config.
@@ -902,7 +1039,6 @@ describe('GitSync', () => {
                 listRepos: vi.fn().mockResolvedValue([makeRepo('shared-name')]),
                 getCommits: vi.fn().mockResolvedValue([makeProviderCommit(devLogin, '2024-01-15T10:00:00Z', sha)]),
                 getPullRequests: vi.fn().mockResolvedValue([{...makeProviderPR(devLogin), id: '42'}]),
-                getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
             });
         const createGitProvider = await getCreateGitProvider();
         createGitProvider.mockReturnValueOnce(org('sha-a')).mockReturnValueOnce(org('sha-b'));
@@ -994,7 +1130,6 @@ describe('GitSync', () => {
             getCommits: vi.fn().mockImplementation(async () => [
                 makeProviderCommit('alice', '2024-01-15T10:00:00Z'),
             ]),
-            getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
         });
         createGitProvider.mockReturnValue(provider);
 
@@ -1030,14 +1165,16 @@ describe('GitSync', () => {
         seedDev(db, devLogin);
 
         const createGitProvider = await getCreateGitProvider();
-        const commit1 = makeProviderCommit(devLogin, '2024-01-15T08:00:00Z', 'c1');
-        const commit2 = makeProviderCommit(devLogin, '2024-01-15T12:00:00Z', 'c2');
+        // The SAME path on both commits is the whole fixture — churn is rework of a file
+        // already touched in the window. Supplied on the commits (the reuse path) rather
+        // than through `getCommitDiff`, and un-namespaced, which is the contract: the sync
+        // loop prefixes the repo itself.
+        const sameFile = [{path: 'src/foo.ts', additions: 100, deletions: 0, status: 'modified'}];
+        const commit1 = makeProviderCommit(devLogin, '2024-01-15T08:00:00Z', 'c1', sameFile);
+        const commit2 = makeProviderCommit(devLogin, '2024-01-15T12:00:00Z', 'c2', sameFile);
         const provider = makeMockProvider({
             listRepos: vi.fn().mockResolvedValue([makeRepo('myrepo')]),
             getCommits: vi.fn().mockResolvedValue([commit1, commit2]),
-            getCommitDiff: vi.fn().mockResolvedValue([
-                {path: 'myrepo/src/foo.ts', additions: 100, deletions: 0, status: 'modified'},
-            ]),
         });
         createGitProvider.mockReturnValue(provider);
 
@@ -1070,11 +1207,11 @@ describe('GitSync', () => {
             additions: 20,
             deletions: 5,
             filesChanged: ['src/x.ts'],
+            diffs: [{path: 'src/x.ts', additions: 20, deletions: 5, status: 'modified'}],
         };
         const provider = makeMockProvider({
             listRepos: vi.fn().mockResolvedValue([makeRepo('myrepo')]),
             getCommits: vi.fn().mockResolvedValue([commit]),
-            getCommitDiff: vi.fn().mockResolvedValue([{path: 'src/x.ts', additions: 20, deletions: 5, status: 'modified'}]),
         });
         createGitProvider.mockReturnValue(provider);
 
@@ -1110,13 +1247,11 @@ describe('GitSync', () => {
             additions: 10,
             deletions: 2,
             filesChanged: ['src/a.ts'],
+            diffs: [{path: 'src/a.ts', additions: 10, deletions: 2, status: 'modified'}],
         };
         const provider = makeMockProvider({
             listRepos: vi.fn().mockResolvedValue([makeRepo('myrepo')]),
             getCommits: vi.fn().mockResolvedValue([commit]),
-            getCommitDiff: vi
-                .fn()
-                .mockResolvedValue([{path: 'src/a.ts', additions: 10, deletions: 2, status: 'modified'}]),
         });
         createGitProvider.mockReturnValue(provider);
 
@@ -1140,7 +1275,6 @@ describe('GitSync', () => {
             name: 'github',
             listRepos: vi.fn().mockResolvedValue([makeRepo('myrepo')]),
             getCommits: vi.fn().mockResolvedValue([commit]),
-            getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
         });
         createGitProvider.mockReturnValue(provider);
 
@@ -1171,19 +1305,18 @@ describe('GitSync', () => {
             additions: 30,
             deletions: 5,
             filesChanged: ['src/y.ts'],
+            diffs: [{path: 'src/y.ts', additions: 30, deletions: 5, status: 'modified'}],
         };
 
         const githubProvider = makeMockProvider({
             name: 'github',
             listRepos: vi.fn().mockResolvedValue([makeRepo('gh-repo')]),
             getCommits: vi.fn().mockResolvedValue([githubCommit]),
-            getCommitDiff: vi.fn().mockResolvedValue([{path: 'src/x.ts', additions: 50, deletions: 10, status: 'modified'}]),
         });
         const bitbucketProvider = makeMockProvider({
             name: 'bitbucket',
             listRepos: vi.fn().mockResolvedValue([makeRepo('bb-repo')]),
             getCommits: vi.fn().mockResolvedValue([bitbucketCommit]),
-            getCommitDiff: vi.fn().mockResolvedValue([{path: 'src/y.ts', additions: 30, deletions: 5, status: 'modified'}]),
         });
 
         createGitProvider
@@ -1223,7 +1356,6 @@ describe('GitSync', () => {
             name: 'github',
             listRepos: vi.fn().mockResolvedValue([makeRepo('gh-repo')]),
             getCommits: vi.fn().mockResolvedValue([makeProviderCommit('alice', '2024-01-15T10:00:00Z', 'gh-1')]),
-            getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
         });
         createGitProvider.mockReturnValueOnce(githubProvider);
         await new GitSync({enabled: false}).syncProviders(db, [
@@ -1250,8 +1382,8 @@ describe('GitSync', () => {
                 additions: 20,
                 deletions: 3,
                 filesChanged: ['src/y.ts'],
+                diffs: [{path: 'src/y.ts', additions: 20, deletions: 3, status: 'modified'}],
             }]),
-            getCommitDiff: vi.fn().mockResolvedValue([{path: 'src/y.ts', additions: 20, deletions: 3, status: 'modified'}]),
         });
         createGitProvider.mockReturnValueOnce(bitbucketProvider);
         await new GitSync({enabled: false}).syncProviders(db, [
@@ -1277,7 +1409,6 @@ describe('GitSync', () => {
             name: 'github',
             listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
             getCommits: vi.fn().mockResolvedValue([makeProviderCommit('alice', '2024-01-15T09:00:00Z', 'c1')]),
-            getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
         });
         createGitProvider.mockReturnValueOnce(run1);
         await new GitSync(makeGithubConfig()).sync(db);
@@ -1296,7 +1427,6 @@ describe('GitSync', () => {
             name: 'github',
             listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
             getCommits: vi.fn().mockResolvedValue([makeProviderCommit('alice', '2024-01-15T15:00:00Z', 'c2')]),
-            getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
         });
         createGitProvider.mockReturnValueOnce(run2);
         await new GitSync(makeGithubConfig()).sync(db);
@@ -1399,8 +1529,8 @@ describe('GitSync', () => {
                 additions: 10,
                 deletions: 2,
                 filesChanged: ['src/y.ts'],
+                diffs: [{path: 'src/y.ts', additions: 10, deletions: 2, status: 'modified'}],
             }]),
-            getCommitDiff: vi.fn().mockResolvedValue([{path: 'src/y.ts', additions: 10, deletions: 2, status: 'modified'}]),
         });
         createGitProvider.mockReturnValueOnce(bitbucketProvider);
         await new GitSync({enabled: false}).syncProviders(db, [
@@ -1428,12 +1558,12 @@ describe('GitSync', () => {
             additions: 100,
             deletions: 0,
             filesChanged: ['src/a.ts'],
+            diffs: [{path: 'src/a.ts', additions: 100, deletions: 0, status: 'modified'}],
         });
         createGitProvider.mockReturnValueOnce(makeMockProvider({
             name: 'github',
             listRepos: vi.fn().mockResolvedValue([makeRepo('repo-a')]),
             getCommits: vi.fn().mockResolvedValue([bigCommit('b1'), bigCommit('b2')]),
-            getCommitDiff: vi.fn().mockResolvedValue([]),
         }));
         await new GitSync(makeGithubConfig()).sync(db);
         expect(
@@ -1453,8 +1583,8 @@ describe('GitSync', () => {
                 additions: 20,
                 deletions: 0,
                 filesChanged: ['src/a.ts'],
+                diffs: [{path: 'src/a.ts', additions: 20, deletions: 0, status: 'modified'}],
             }]),
-            getCommitDiff: vi.fn().mockResolvedValue([]),
         }));
         await new GitSync(makeGithubConfig()).sync(db);
 
@@ -1872,7 +2002,6 @@ describe('GitSync with DB-connected providers (#196)', () => {
         const provider = makeMockProvider({
             listRepos: vi.fn().mockResolvedValue([makeRepo('myrepo')]),
             getCommits: vi.fn().mockResolvedValue([makeProviderCommit(devLogin)]),
-            getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
         });
         createGitProvider.mockReturnValue(provider);
 
@@ -1948,7 +2077,6 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
         const provider = makeMockProvider({
             listRepos: vi.fn().mockResolvedValue([makeRepo('myrepo')]),
             getCommits: vi.fn().mockResolvedValue([makeProviderCommit(devLogin)]),
-            getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
         });
         createGitProvider.mockReturnValue(provider);
 
@@ -2039,7 +2167,6 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
                 makeMockProvider({
                     listRepos: vi.fn().mockResolvedValue([makeRepo('repo1'), makeRepo('repo2')]),
                     getCommits: vi.fn().mockResolvedValue([makeProviderCommit('alice')]),
-                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
                     getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
                 }),
             );
@@ -2108,7 +2235,6 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
                         if (repo === 'bad-repo') throw new Error('GitHub API error 500');
                         return [makeProviderCommit('alice')];
                     }),
-                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
                 }),
             );
 
@@ -2198,7 +2324,6 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
                             return commits;
                         },
                     ),
-                getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
                 getPullRequests: vi
                     .fn()
                     .mockImplementation(
@@ -2278,9 +2403,15 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
             const snapshots: GitSyncProgress[] = [];
             await new GitSync({enabled: false}).syncProviders(db, [CONFIG], (p) => snapshots.push(p));
 
-            // The sync loop's OWN getCommitDiff fan-out reports separately from the
-            // provider's commit step, seeded at 0 then ticking to the total — and it
-            // starts only AFTER the commit step has finished, never interleaved.
+            // The sync loop's OWN diff pass reports separately from the provider's commit
+            // step, seeded at 0 then ticking to the total — and it starts only AFTER the
+            // commit step has finished, never interleaved.
+            //
+            // The pass is a REUSE pass, not a fan-out: these commits carry `diffs` (as every
+            // in-tree provider's do since #271), so the loop makes no request per commit and
+            // the whole sequence lands within one tick. It still has to REPORT, because a
+            // provider that supplies no diffs falls back to a real `getCommitDiff` fan-out
+            // here — see `GitSyncProgress.repo_step`.
             const diffPhase = stepSequence(snapshots).filter(([step]) => step === 'diffs');
             expect(diffPhase).toEqual([
                 ['diffs', 0, 2],
@@ -2330,7 +2461,6 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
                 makeMockProvider({
                     listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
                     getCommits: vi.fn().mockResolvedValue(commits),
-                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
                     // Capture what a 1s poll would have seen at the instant the PR list
                     // request is in flight.
                     getPullRequests: vi.fn().mockImplementation(async () => {
@@ -2501,7 +2631,6 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
                         atCommitList = steps(snapshots);
                         return [makeProviderCommit('alice', '2024-01-15T10:00:00Z', 's1')];
                     }),
-                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
                     getPullRequests: vi.fn().mockImplementation(async () => {
                         atPRList = steps(snapshots);
                         return [];
@@ -2529,7 +2658,6 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
                     getCommits: vi
                         .fn()
                         .mockResolvedValue([makeProviderCommit('alice', '2024-01-15T10:00:00Z', 's1')]),
-                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
                     getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
                 }),
             );
@@ -3157,7 +3285,6 @@ describe('GitSync.syncProviders — sync-older-history backfill plumbing (#229)'
             makeMockProvider({
                 listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
                 getCommits,
-                getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs('repo1/')),
             }),
         );
         await new GitSync({enabled: false}).syncProviders(db, [CONFIG], undefined, {backfill});
@@ -3271,7 +3398,6 @@ describe('GitSync.syncProviders — sync-older-history backfill plumbing (#229)'
                 listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
                 getCommits: vi.fn().mockResolvedValue([]),
                 getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
-                getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs('repo1/')),
             }),
         );
         await new GitSync({enabled: false}).syncProviders(db, [CONFIG], undefined, {
@@ -3339,7 +3465,6 @@ describe('GitSync.syncProviders — backfill atomicity (#233)', () => {
                     if (repo === 'repo2') throw new Error('boom: 500 from provider');
                     return [makeProviderCommit('alice', '2024-03-10T10:00:00Z', 'sha-old')];
                 }),
-                getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs('repo1/')),
             }),
         );
 
@@ -3368,7 +3493,6 @@ describe('GitSync.syncProviders — backfill atomicity (#233)', () => {
                 getCommits: vi
                     .fn()
                     .mockResolvedValue([makeProviderCommit('alice', '2024-03-10T10:00:00Z', 'sha-old')]),
-                getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs('repo1/')),
             }),
         );
         // Break the snapshot write at the storage layer. This is the exact hazard the
@@ -3402,7 +3526,6 @@ describe('GitSync.syncProviders — backfill atomicity (#233)', () => {
                 getCommits: vi
                     .fn()
                     .mockResolvedValue([makeProviderCommit('alice', '2024-03-10T10:00:00Z', 'sha-old')]),
-                getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs('repo1/')),
                 // A PR is required for the run to reach upsertPRRecord at all.
                 getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
             }),
@@ -3431,7 +3554,6 @@ describe('GitSync.syncProviders — backfill atomicity (#233)', () => {
                 getCommits: vi
                     .fn()
                     .mockResolvedValue([makeProviderCommit('alice', '2024-03-10T10:00:00Z', 'sha-old')]),
-                getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs('repo1/')),
             }),
         );
 
@@ -3570,7 +3692,6 @@ describe('GitSync.syncProviders — first-sync earliest-watermark recording (#22
                 makeMockProvider({
                     listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
                     getCommits: vi.fn().mockResolvedValue([makeProviderCommit('alice')]),
-                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
                 }),
             );
 
@@ -3599,7 +3720,6 @@ describe('GitSync.syncProviders — first-sync earliest-watermark recording (#22
                         if (repo === 'bad-repo') throw new Error('GitHub API error 500');
                         return [makeProviderCommit('alice')];
                     }),
-                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
                 }),
             );
 
@@ -3623,7 +3743,6 @@ describe('GitSync.syncProviders — first-sync earliest-watermark recording (#22
                 makeMockProvider({
                     listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
                     getCommits: vi.fn().mockResolvedValue([makeProviderCommit('alice')]),
-                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
                 }),
             );
 
@@ -3642,7 +3761,6 @@ describe('GitSync.syncProviders — first-sync earliest-watermark recording (#22
                 makeMockProvider({
                     listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
                     getCommits: vi.fn().mockRejectedValue(new Error('GitHub API error 500')),
-                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
                 }),
             );
 
@@ -3672,7 +3790,6 @@ describe('GitSync.syncProviders — first-sync earliest-watermark recording (#22
                         if (repo === 'bad-repo') throw new Error('GitHub API error 500');
                         return [makeProviderCommit('alice', '2024-01-15T10:00:00Z', 'c-good')];
                     }),
-                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
                 }),
             );
             await new GitSync({enabled: false}).syncProviders(db, [CONFIG]);
@@ -3691,7 +3808,6 @@ describe('GitSync.syncProviders — first-sync earliest-watermark recording (#22
                         }
                         return [makeProviderCommit('alice', '2024-01-15T10:00:00Z', 'c-good')];
                     }),
-                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
                 }),
             );
             await new GitSync({enabled: false}).syncProviders(db, [CONFIG]);
@@ -3719,7 +3835,6 @@ describe('GitSync.syncProviders — first-sync earliest-watermark recording (#22
                 name: 'github',
                 listRepos: vi.fn().mockResolvedValue([makeRepo('gh-repo')]),
                 getCommits: vi.fn().mockResolvedValue([makeProviderCommit('alice', '2024-01-15T10:00:00Z', 'gh-1')]),
-                getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
             });
             const bitbucketProvider = makeMockProvider({
                 name: 'bitbucket',
@@ -3799,7 +3914,6 @@ describe('GitSync — stalled-provider detection (#235)', () => {
         makeMockProvider({
             listRepos: vi.fn().mockResolvedValue([makeRepo('good-repo')]),
             getCommits: vi.fn().mockResolvedValue([]),
-            getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
         });
 
     describe('stall counter', () => {
@@ -3910,7 +4024,6 @@ describe('GitSync — stalled-provider detection (#235)', () => {
                         name: 'github',
                         listRepos: vi.fn().mockResolvedValue([makeRepo('gh-repo')]),
                         getCommits: vi.fn().mockResolvedValue([makeProviderCommit('alice')]),
-                        getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
                     }),
                 )
                 .mockReturnValueOnce(
@@ -3983,7 +4096,6 @@ describe('GitSync — stalled-provider detection (#235)', () => {
                         name: 'github',
                         listRepos: vi.fn().mockResolvedValue([makeRepo('gh-repo')]),
                         getCommits: vi.fn().mockResolvedValue([makeProviderCommit('alice')]),
-                        getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
                     }),
                 )
                 .mockReturnValueOnce(
@@ -4023,7 +4135,6 @@ describe('GitSync — stalled-provider detection (#235)', () => {
                 makeMockProvider({
                     listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
                     getCommits: vi.fn().mockResolvedValue([makeProviderCommit('alice')]),
-                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
                 }),
             );
             // This provider's fetch is COMPLETE, so the run wants to clear the streak —
@@ -4424,7 +4535,6 @@ describe('GitSync — stalled-provider detection (#235)', () => {
                 makeMockProvider({
                     listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
                     getCommits,
-                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
                 }),
             );
 
@@ -4461,7 +4571,6 @@ describe('GitSync — stalled-provider detection (#235)', () => {
                 makeMockProvider({
                     listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
                     getCommits,
-                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
                 }),
             );
 
@@ -4490,7 +4599,6 @@ describe('GitSync — stalled-provider detection (#235)', () => {
                 makeMockProvider({
                     listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
                     getCommits,
-                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
                 }),
             );
 
@@ -4612,7 +4720,6 @@ describe('GitSync — stalled-provider detection (#235)', () => {
                             makeProviderCommit('alice', afternoon, 'c-afternoon'),
                         ].filter((c) => c.date >= since && c.date <= until),
                     ),
-                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
                 }),
             );
 
@@ -4881,7 +4988,6 @@ describe('GitSync — raw authorship retention + projection (#253)', () => {
                 listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
                 getCommits: vi.fn().mockResolvedValue(commits),
                 getPullRequests: vi.fn().mockResolvedValue(prs),
-                getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
             }),
         );
         return new GitSync({enabled: false}).syncProviders(db, [CONFIG]);
@@ -4913,6 +5019,7 @@ describe('GitSync — raw authorship retention + projection (#253)', () => {
                 additions: 5,
                 deletions: 1,
                 filesChanged: ['src/x.ts'],
+                diffs: [{path: 'src/x.ts', additions: 5, deletions: 1, status: 'modified'}],
             },
         ]);
 
@@ -4999,7 +5106,6 @@ describe('GitSync — raw authorship retention + projection (#253)', () => {
                     listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
                     getCommits: vi.fn().mockResolvedValue(commits),
                     getPullRequests: vi.fn().mockResolvedValue(prs),
-                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
                 }),
             );
             await new GitSync({enabled: false}).syncProviders(control, [CONFIG]);
@@ -5032,7 +5138,6 @@ describe('GitSync — raw authorship retention + projection (#253)', () => {
                 // A PR forces the tx to reach upsertPRRecord AFTER the raw rows and the
                 // projection have already been written inside it.
                 getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
-                getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
             }),
         );
         db.exec('DROP TABLE pr_records');
@@ -5063,7 +5168,6 @@ describe('GitSync — raw authorship retention + projection (#253)', () => {
                     lateId = seedDev(db, 'grace');
                     return [makeProviderCommit('grace', '2024-01-15T10:00:00Z', 'g1')];
                 }),
-                getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
             }),
         );
 
@@ -5095,8 +5199,8 @@ describe('GitSync — raw authorship retention + projection (#253)', () => {
                     additions: 20,
                     deletions: 3,
                     filesChanged: ['src/y.ts'],
+                    diffs: [{path: 'src/y.ts', additions: 20, deletions: 3, status: 'modified'}],
                 }]),
-                getCommitDiff: vi.fn().mockResolvedValue([{path: 'src/y.ts', additions: 20, deletions: 3, status: 'modified'}]),
             }),
         );
         await new GitSync({enabled: false}).syncProviders(db, [
@@ -5114,5 +5218,457 @@ describe('GitSync — raw authorship retention + projection (#253)', () => {
         // Two disjoint raw identities, one derived cell.
         expect(countRaw()).toBe(2);
         expect(countSnapshots(db)).toBe(1);
+    });
+});
+
+/**
+ * #280 — the `GitCommit.diffs` reuse path is what this suite exercises, and taking the
+ * `getCommitDiff` fallback instead is SAID rather than merely felt.
+ *
+ * Every in-tree provider supplies `diffs` (#271), so the fallback is a branch no production
+ * code path reaches — which is exactly why it needs pinning from both sides: the mainstream
+ * fixtures must be provably ON the reuse path (otherwise the 200 tests above are all measuring
+ * dead code), and a provider that stops supplying the field must be diagnosable from a run's
+ * output instead of only from its wall time.
+ */
+describe('GitCommit.diffs reuse vs the getCommitDiff fallback (#280)', () => {
+    let db: Database.Database;
+
+    beforeEach(() => {
+        db = makeDb();
+        vi.resetAllMocks();
+    });
+
+    afterEach(() => {
+        db.close();
+        vi.restoreAllMocks();
+    });
+
+    const CONFIG: GitProviderConfig = {
+        type: 'github',
+        org: 'test-org',
+        auth: {type: 'token', api_token: 'test-token'},
+    };
+
+    async function syncWith(provider: GitProvider): Promise<SyncResult> {
+        (await getCreateGitProvider()).mockReturnValue(provider);
+        return new GitSync({enabled: false}).syncProviders(db, [CONFIG]);
+    }
+
+    const diffAdvisories = (result: SyncResult): string[] =>
+        result.errors.filter((e) => e.startsWith(DIFFS_NOT_SUPPLIED_PREFIX));
+
+    /**
+     * The counters are per-`fetchProviderData` locals, and the `[type]` tag is the only thing
+     * that tells an operator WHICH provider broke the contract. Nothing pinned that: every other
+     * fixture here runs one provider, so a regression that hoisted the counters to run scope
+     * (the same per-provider-scoping class of bug as #192) would merge two providers' counts
+     * into one line tagged with whichever formatted last, and stay green.
+     *
+     * A multi-provider deployment is the realistic one, and it is exactly where the tag has to
+     * be right — "some provider fell back 4000 times" is not actionable.
+     */
+    it('reports only the non-conformant provider, tagged, in a mixed multi-provider run', async () => {
+        seedDev(db, 'alice');
+        const createGitProvider = await getCreateGitProvider();
+        // github is diff-less; bitbucket honours the contract.
+        createGitProvider
+            .mockReturnValueOnce(
+                makeMockProvider({
+                    name: 'github',
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits: vi.fn().mockResolvedValue([
+                        makeProviderCommit('alice', '2024-01-15T10:00:00Z', 's1', NO_PROVIDER_DIFFS),
+                        makeProviderCommit('alice', '2024-01-15T11:00:00Z', 's2', NO_PROVIDER_DIFFS),
+                    ]),
+                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+                }),
+            )
+            .mockReturnValueOnce(
+                makeMockProvider({
+                    name: 'bitbucket',
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo9')]),
+                    getCommits: vi
+                        .fn()
+                        .mockResolvedValue([
+                            makeProviderCommit('alice', '2024-01-15T12:00:00Z', 's9'),
+                        ]),
+                }),
+            );
+
+        const result = await new GitSync({enabled: false}).syncProviders(db, [
+            CONFIG,
+            {
+                type: 'bitbucket',
+                workspace: 'test-ws',
+                auth: {type: 'token', api_token: 'test-token'},
+            } as GitProviderConfig,
+        ]);
+
+        const advisories = diffAdvisories(result);
+        // ONE line, for the ONE provider that fell back — not one merged line, and not one per
+        // provider in the run.
+        expect(advisories).toHaveLength(1);
+        expect(advisories[0]).toContain('[github]');
+        expect(advisories[0]).not.toContain('[bitbucket]');
+        // …and the count is github's two commits only, not three. This is the assertion that
+        // fails if the counters stop being per-provider.
+        expect(advisories[0]).toContain('2 commit(s)');
+        // Positive control: bitbucket's commit really was imported in the same run, so the
+        // absence of a bitbucket line is suppression, not a run that skipped it.
+        const row = db
+            .prepare(`SELECT commits FROM git_snapshots WHERE date = '2024-01-15'`)
+            .get() as {commits: number};
+        expect(row.commits).toBe(3);
+    });
+
+    /**
+     * AC1's guarantee, stated once rather than left implicit in 200 fixtures: a commit built by
+     * `makeProviderCommit` carries `diffs`, so the sync loop never re-requests it. If this fails,
+     * the whole suite above has silently slid back onto the fallback branch.
+     */
+    it('never calls getCommitDiff for commits that carry diffs', async () => {
+        seedDev(db, 'alice');
+        const getCommitDiff = vi.fn().mockResolvedValue(makeProviderDiffs());
+        const result = await syncWith(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                getCommits: vi.fn().mockResolvedValue([
+                    makeProviderCommit('alice', '2024-01-15T10:00:00Z', 's1'),
+                    makeProviderCommit('alice', '2024-01-15T11:00:00Z', 's2'),
+                ]),
+                getCommitDiff,
+            }),
+        );
+
+        expect(getCommitDiff).not.toHaveBeenCalled();
+        // …and the commits really were imported WITH their diffs, so the assertion above is
+        // about the reuse path and not about a run that quietly processed nothing (or that
+        // reached `toAnalysisCommit` with `[]` instead of `rawCommit.diffs`).
+        expect(countSnapshots(db)).toBe(1);
+        const row = db
+            .prepare(`SELECT files_changed FROM git_snapshots WHERE date = '2024-01-15'`)
+            .get() as {files_changed: number};
+        expect(row.files_changed).toBe(4);
+        expect(diffAdvisories(result)).toEqual([]);
+    });
+
+    /**
+     * The retained FALLBACK fixture. The branch is legal — `GitCommit.diffs` is optional so a
+     * provider that cannot pre-fetch can say "I have none" — so it must keep working, not just
+     * keep being reported.
+     */
+    it('falls back to getCommitDiff, once per commit, for a provider that supplies none', async () => {
+        seedDev(db, 'alice');
+        const getCommitDiff = vi.fn().mockResolvedValue(makeProviderDiffs());
+        await syncWith(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                getCommits: vi.fn().mockResolvedValue([
+                    makeProviderCommit('alice', '2024-01-15T10:00:00Z', 's1', NO_PROVIDER_DIFFS),
+                    makeProviderCommit('alice', '2024-01-15T11:00:00Z', 's2', NO_PROVIDER_DIFFS),
+                ]),
+                getCommitDiff,
+            }),
+        );
+
+        expect(getCommitDiff.mock.calls).toEqual([
+            ['repo1', 's1'],
+            ['repo1', 's2'],
+        ]);
+        // The columns asserted here are only the ones the FALLBACK RESULT can move. Be precise
+        // about which those are, because two of the three obvious candidates cannot:
+        // `lines_added`/`lines_removed` come from `commit.additions`/`deletions` (the analyzer
+        // reads the commit, not the diff), which `makeProviderCommit` hardcodes — they would hold
+        // at 100/20 even if `getCommitDiff` returned nothing at all, so asserting them here would
+        // read as proof of something it cannot prove.
+        //
+        // `files_changed` counts the diff entries, and `code_churn_rate` is derived from their
+        // paths and line counts — both are zero if the fallback result is dropped. Two commits ×
+        // two entries → 4; both commits touch the SAME two paths, so the second is rework and the
+        // churn rate is above zero.
+        const row = db
+            .prepare(
+                `SELECT files_changed, code_churn_rate FROM git_snapshots WHERE date = '2024-01-15'`,
+            )
+            .get() as {files_changed: number; code_churn_rate: number};
+        expect(row.files_changed).toBe(4);
+        expect(row.code_churn_rate).toBeGreaterThan(0);
+    });
+
+    /** AC3: the fallback is visible in the run's own output, with a usable count. */
+    it('reports the fallback as an advisory naming the commit and repo counts', async () => {
+        seedDev(db, 'alice');
+        const result = await syncWith(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo1'), makeRepo('repo2')]),
+                getCommits: vi
+                    .fn()
+                    .mockResolvedValueOnce([
+                        makeProviderCommit('alice', '2024-01-15T10:00:00Z', 's1', NO_PROVIDER_DIFFS),
+                        makeProviderCommit('alice', '2024-01-15T11:00:00Z', 's2', NO_PROVIDER_DIFFS),
+                    ])
+                    .mockResolvedValueOnce([
+                        makeProviderCommit('alice', '2024-01-16T10:00:00Z', 's3', NO_PROVIDER_DIFFS),
+                    ]),
+                getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+            }),
+        );
+
+        const advisories = diffAdvisories(result);
+        expect(advisories).toHaveLength(1);
+        // One line for the whole provider, not one per repo or per commit — a diff-less
+        // provider is diff-less everywhere, and thousands of copies of one sentence is not a
+        // report. Both numbers are asserted because only their PAIR distinguishes "one odd
+        // repo" from "this provider never supplies diffs".
+        expect(advisories[0]).toContain('3 commit(s)');
+        expect(advisories[0]).toContain('2 repo(s)');
+        expect(advisories[0]).toContain('[github]');
+        // Every fallback request SUCCEEDED here, which is the only condition under which the line
+        // is allowed to reassure the operator about the data. Pinned as the positive control for
+        // the failure case below: without it, a regression that emitted the reassuring sentence
+        // unconditionally would still pass that test.
+        expect(advisories[0]).toContain('no metric is wrong');
+        // An ADVISORY, not a failure: the fallback fetched the same diff, so classifying it as an
+        // error would redden the provider and make the pipeline re-run the whole connector.
+        expect(isAdvisoryError(advisories[0])).toBe(true);
+    });
+
+    /**
+     * The count is of commits that TOOK the fallback, not of fallbacks that succeeded — and the
+     * two populations must be reported differently.
+     *
+     * A failed fallback keeps the commit with EMPTY diffs (#271's preserved semantics: one bad
+     * diff must not fail the repo), which means its file-level metrics are computed from nothing
+     * while the cursor advances past it. Nothing else in the run mentions that — the fault is
+     * swallowed — so this line is the only output about those commits, and it must not tell the
+     * operator that nothing is wrong.
+     */
+    it('states the permanent loss, not "no metric is wrong", when a fallback fetch fails', async () => {
+        seedDev(db, 'alice');
+        // THREE diff-less commits, ONE failing fetch. The three numbers the report interpolates
+        // — commits that fell back (3), repos they came from (1), and requests that failed (1) —
+        // must be pairwise distinguishable, or a refactor that swapped `fallbackDiffCommits` for
+        // `fallbackDiffFailures` would ship green while telling the operator the wrong recovery
+        // scope: "3 commits are permanently understated" and "1 is" are different incidents.
+        const result = await syncWith(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                getCommits: vi.fn().mockResolvedValue([
+                    makeProviderCommit('alice', '2024-01-15T10:00:00Z', 's1', NO_PROVIDER_DIFFS),
+                    makeProviderCommit('alice', '2024-01-15T11:00:00Z', 's2', NO_PROVIDER_DIFFS),
+                    makeProviderCommit('alice', '2024-01-15T12:00:00Z', 's3', NO_PROVIDER_DIFFS),
+                ]),
+                getCommitDiff: vi
+                    .fn()
+                    .mockImplementation(async (_repo: string, sha: string) =>
+                        sha === 's2'
+                            ? Promise.reject(new Error('502 from the diff endpoint'))
+                            : makeProviderDiffs(),
+                    ),
+            }),
+        );
+
+        // TWO lines now, and the split is the point (#280): request volume is true the moment
+        // the requests are made, permanence is only true once the window is recorded as covered.
+        const [volume, loss] = diffAdvisories(result);
+        expect(diffAdvisories(result)).toHaveLength(2);
+
+        expect(volume).toContain('3 commit(s)');
+        expect(volume).toContain('1 repo(s)');
+        // The failure count is named, and the reassuring sentence is NOT emitted.
+        expect(volume).toContain('1 of those requests FAILED');
+        expect(volume).not.toContain('no metric is wrong');
+        // …and the volume line no longer makes the permanence claim itself.
+        expect(volume).not.toContain('PERMANENT');
+
+        // The claim about persisted state, on its own line, keyed to the FAILURE count.
+        expect(loss).toContain('the 1 commit(s) whose fallback diff request failed');
+        expect(loss).toContain('PERMANENT');
+        // It must name the SAFE remedy. A bare cursor reset re-imports over surviving
+        // raw_author_daily rows, which additively double every commit metric in the span (#262)
+        // — a far larger corruption than the understatement being repaired.
+        expect(loss).toContain('delete cascade');
+        expect(loss).toContain('do NOT simply purge this provider\'s cursors');
+        // The remedy is only reachable for a DB-registered provider: the admin delete route
+        // refuses a config-file provider, and the cascade is skipped while the YAML entry still
+        // owns the container — so a line that named it unconditionally would send half the
+        // deployments to a no-op that looks like a repair.
+        expect(loss).toContain('CONFIG-FILE provider cannot be deleted');
+        // …and re-adding restores only the first-sync window, so the backfill step is part of
+        // the remedy, not an optional extra.
+        expect(loss).toContain('sync older history');
+
+        // Still advisories: turning them red buys no recovery (the window is already recorded as
+        // covered) and costs a full re-fetch of the connector.
+        expect(isAdvisoryError(volume)).toBe(true);
+        expect(isAdvisoryError(loss)).toBe(true);
+
+        // The commits still count — a failed diff fetch degrades to empty diffs, it does not
+        // drop the commit. The two that SUCCEEDED contribute 2 file entries each; s2 contributes
+        // nothing, which is exactly the loss the second advisory states.
+        const row = db
+            .prepare(`SELECT commits, files_changed FROM git_snapshots WHERE date = '2024-01-15'`)
+            .get() as {commits: number; files_changed: number};
+        expect(row.commits).toBe(3);
+        expect(row.files_changed).toBe(4);
+    });
+
+    /**
+     * The blocker this split exists for. "The understatement is PERMANENT, nothing re-asks
+     * them" is a claim about persisted state, and it is FALSE on every path that discards the
+     * run's window — the commits are re-fetched intact next run and the zeros never land.
+     *
+     * Emitting it anyway is not a cosmetic overstatement: the remedy it names is destructive, so
+     * a phantom loss report sends the operator to rebuild a span that was fine. That is why the
+     * line is staged onto the cursor advance like the #275 drop advisories rather than pushed
+     * where it is formatted.
+     */
+    it('does NOT claim permanent loss when the run\'s write is rolled back', async () => {
+        seedDev(db, 'alice');
+        db.exec('DROP TABLE pr_records');
+        const result = await syncWith(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                getCommits: vi
+                    .fn()
+                    .mockResolvedValue([
+                        makeProviderCommit('alice', '2024-01-15T10:00:00Z', 's1', NO_PROVIDER_DIFFS),
+                    ]),
+                getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+                getCommitDiff: vi.fn().mockRejectedValue(new Error('502 from the diff endpoint')),
+            }),
+        );
+
+        // Positive control: the write really did roll back, so no cursor advanced and the window
+        // is intact.
+        expect(result.errors.some((e) => e.includes('transaction rolled back'))).toBe(true);
+        expect(countSnapshots(db)).toBe(0);
+
+        const advisories = diffAdvisories(result);
+        // The request-volume line still fires — those requests were really made and really
+        // failed, whatever happened to the window afterwards.
+        expect(advisories).toHaveLength(1);
+        expect(advisories[0]).toContain('1 commit(s)');
+        expect(advisories[0]).toContain('1 of those requests FAILED');
+        // …but nothing claims the loss is permanent, and nothing sends the operator to a
+        // destructive rebuild of a span that will be re-fetched next run.
+        expect(advisories.some((a) => a.includes('PERMANENT'))).toBe(false);
+        expect(advisories.some((a) => a.includes('delete cascade'))).toBe(false);
+    });
+
+    /**
+     * The second discard path (#231): one repo's `getCommits` throws, so the provider is
+     * incomplete and `syncProviders` skips it entirely — no snapshot write, no cursor advance,
+     * whole window re-covered next run. The diff-less commits from the EARLIER repo already
+     * incremented the counters, which is exactly how an unstaged permanence claim would leak out.
+     */
+    it('does NOT claim permanent loss when the provider\'s fetch was incomplete', async () => {
+        seedDev(db, 'alice');
+        const result = await syncWith(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo1'), makeRepo('repo2')]),
+                getCommits: vi
+                    .fn()
+                    .mockResolvedValueOnce([
+                        makeProviderCommit('alice', '2024-01-15T10:00:00Z', 's1', NO_PROVIDER_DIFFS),
+                    ])
+                    .mockRejectedValueOnce(new Error('repo2 exploded')),
+                getCommitDiff: vi.fn().mockRejectedValue(new Error('502 from the diff endpoint')),
+            }),
+        );
+
+        // Positive control: the provider really was held, so its window is intact.
+        expect(countSnapshots(db)).toBe(0);
+
+        const advisories = diffAdvisories(result);
+        expect(advisories).toHaveLength(1);
+        expect(advisories[0]).toContain('1 of those requests FAILED');
+        expect(advisories.some((a) => a.includes('PERMANENT'))).toBe(false);
+    });
+
+    /**
+     * A run whose write was ROLLED BACK still reports the REQUEST-VOLUME half of the fallback
+     * report. Those requests were really made against the provider's rate limit, and a run that
+     * both took the slow path and threw its window away is if anything more worth saying.
+     *
+     * This is the opposite face of the "does NOT claim permanent loss when the run's write is
+     * rolled back" test above: the two together pin the seam. Volume survives a discard; the
+     * permanence claim does not. Untested in this direction, a "consistency" refactor that moved
+     * the WHOLE report into the staging closure would be green and the slow path would go silent
+     * on exactly the runs that are hardest to diagnose.
+     */
+    it('reports the fallback even when the run\'s write is rolled back', async () => {
+        seedDev(db, 'alice');
+        // Break a table the write transaction touches, so the whole run's data is discarded. A PR
+        // is required to make the transaction reach `upsertPRRecord` at all — same fixture shape
+        // as the #253 rollback tests above.
+        db.exec('DROP TABLE pr_records');
+        const result = await syncWith(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                getCommits: vi
+                    .fn()
+                    .mockResolvedValue([
+                        makeProviderCommit('alice', '2024-01-15T10:00:00Z', 's1', NO_PROVIDER_DIFFS),
+                    ]),
+                getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
+                getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+            }),
+        );
+
+        // Positive control: the write really did roll back, so this is not a run that quietly
+        // succeeded.
+        expect(result.errors.some((e) => e.includes('transaction rolled back'))).toBe(true);
+        expect(countSnapshots(db)).toBe(0);
+        expect(diffAdvisories(result)[0]).toContain('1 commit(s)');
+    });
+
+    /**
+     * The grain that matters for a REFACTOR that drops the field from one code path rather than
+     * from a whole provider: the count is per commit, so a provider supplying diffs on some
+     * commits and not others reports only the ones that fell back.
+     */
+    it('counts only the diff-less commits when a provider supplies diffs on some', async () => {
+        seedDev(db, 'alice');
+        const getCommitDiff = vi.fn().mockResolvedValue(makeProviderDiffs());
+        const result = await syncWith(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                getCommits: vi.fn().mockResolvedValue([
+                    makeProviderCommit('alice', '2024-01-15T10:00:00Z', 's1'),
+                    makeProviderCommit('alice', '2024-01-15T11:00:00Z', 's2', NO_PROVIDER_DIFFS),
+                    makeProviderCommit('alice', '2024-01-15T12:00:00Z', 's3'),
+                ]),
+                getCommitDiff,
+            }),
+        );
+
+        expect(getCommitDiff.mock.calls).toEqual([['repo1', 's2']]);
+        expect(diffAdvisories(result)[0]).toContain('1 commit(s)');
+        expect(diffAdvisories(result)[0]).toContain('1 repo(s)');
+    });
+
+    /**
+     * `[]` is an ANSWER, not an absence: Bitbucket and GitLab return it for a commit whose
+     * diffstat 404s, and re-asking the endpoint that just refused is the duplicate request
+     * #271 removed. So an empty array must NOT be counted as a fallback — otherwise the
+     * advisory fires on a perfectly conformant provider and stops meaning anything.
+     */
+    it('treats an empty diffs array as supplied — no fallback, no advisory', async () => {
+        seedDev(db, 'alice');
+        const getCommitDiff = vi.fn().mockResolvedValue(makeProviderDiffs());
+        const result = await syncWith(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                getCommits: vi
+                    .fn()
+                    .mockResolvedValue([makeProviderCommit('alice', '2024-01-15T10:00:00Z', 's1', [])]),
+                getCommitDiff,
+            }),
+        );
+
+        expect(getCommitDiff).not.toHaveBeenCalled();
+        expect(diffAdvisories(result)).toEqual([]);
     });
 });

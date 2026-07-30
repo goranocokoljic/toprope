@@ -24,9 +24,23 @@ import type {
     GitCommit,
     GitFileDiff,
     GitProvider,
-    GitProviderConfig,
     GitRepo,
 } from '../../../src/connectors/git/providers/types';
+// The per-provider fetch stub and route tables live in ONE place (#280) — they encode each
+// provider's URL and payload shape, and a private copy here would be a second source of truth
+// that drifts silently (an unrouted URL degrades to "no commits", not to a failure).
+import {
+    AUTHOR_EMAIL,
+    BITBUCKET_CONFIG,
+    COMMIT_DATE,
+    GITHUB_CONFIG,
+    GITLAB_CONFIG,
+    SHAS,
+    bitbucketRoutes,
+    githubRoutes,
+    gitlabRoutes,
+    makeCountingFetch,
+} from './providers/provider-fetch-fixtures';
 
 // Same shape as sync.test.ts: stub the factory so `syncProviders` uses the provider we
 // hand it, but keep the rest of the module (config validation) real.
@@ -36,10 +50,6 @@ vi.mock('../../../src/connectors/git/providers/factory', async (importOriginal) 
 });
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../../src/storage/migrations');
-
-const AUTHOR_EMAIL = 'alice@example.com';
-const COMMIT_DATE = '2024-01-15T10:00:00.000Z';
-const SHAS = ['sha-aaa', 'sha-bbb', 'sha-ccc'];
 
 function makeDb(): Database.Database {
     const db = new Database(':memory:');
@@ -57,46 +67,6 @@ function seedAlice(db: Database.Database): string {
 async function getCreateGitProvider(): Promise<ReturnType<typeof vi.fn>> {
     const {createGitProvider} = await import('../../../src/connectors/git/providers/factory');
     return createGitProvider as ReturnType<typeof vi.fn>;
-}
-
-/**
- * A `fetch` stub that routes by URL and counts every request per route. Unrouted URLs
- * resolve to an empty page rather than throwing, so a provider's unrelated paging (PR
- * lists) does not have to be modelled.
- */
-// `body` for a fixed payload, `bodyFor` when the response must echo something from the URL
-// (GitHub's commit-detail endpoint has to return the sha it was asked for). Two fields
-// rather than a `unknown | fn` union, which collapses to plain `unknown` and needs a cast.
-type Route = {match: RegExp; body?: unknown; bodyFor?: (url: string) => unknown; status?: number};
-
-interface CountingFetch {
-    fetchMock: ReturnType<typeof vi.fn>;
-    /** How many requests hit URLs matching `pattern`, counted from the request log. */
-    hits: (pattern: RegExp) => number;
-    urls: string[];
-}
-
-function makeCountingFetch(routes: Route[]): CountingFetch {
-    const urls: string[] = [];
-    const fetchMock = vi.fn().mockImplementation((url: string) => {
-        const u = String(url);
-        urls.push(u);
-        const route = routes.find((r) => r.match.test(u));
-        const status = route?.status ?? 200;
-        const body = route ? (route.bodyFor ? route.bodyFor(u) : route.body) : {values: []};
-        return Promise.resolve({
-            ok: status >= 200 && status < 300,
-            status,
-            headers: new Headers({}),
-            json: () => Promise.resolve(body),
-            text: () => Promise.resolve(JSON.stringify(body)),
-        } as unknown as Response);
-    });
-    return {
-        fetchMock,
-        hits: (pattern: RegExp): number => urls.filter((u) => pattern.test(u)).length,
-        urls,
-    };
 }
 
 interface SnapshotCounts {
@@ -132,160 +102,6 @@ function readFullSnapshot(db: Database.Database, devId: string): Record<string, 
     delete rest.id;
     delete rest.developer_id;
     return rest;
-}
-
-// --- Provider fixtures -------------------------------------------------------------
-
-const BITBUCKET_CONFIG: GitProviderConfig = {
-    type: 'bitbucket',
-    workspace: 'test-ws',
-    auth: {type: 'access_token', token: 'tok'},
-};
-
-const GITHUB_CONFIG: GitProviderConfig = {
-    type: 'github',
-    org: 'test-org',
-    auth: {type: 'token', api_token: 'tok'},
-};
-
-const GITLAB_CONFIG: GitProviderConfig = {
-    type: 'gitlab',
-    group: 'test-group',
-    auth: {type: 'personal_access_token', token: 'tok'},
-};
-
-function bitbucketRoutes(diffstatStatus = 200): Route[] {
-    return [
-        {
-            match: /\/repositories\/test-ws\?/,
-            body: {
-                values: [
-                    {
-                        uuid: 'u1',
-                        slug: 'repo1',
-                        full_name: 'test-ws/repo1',
-                        mainbranch: {name: 'main'},
-                        scm: 'git',
-                    },
-                ],
-            },
-        },
-        {
-            match: /\/repositories\/test-ws\/repo1\/commits\?/,
-            body: {
-                values: SHAS.map((hash) => ({
-                    hash,
-                    author: {raw: `Alice <${AUTHOR_EMAIL}>`, user: {nickname: 'alice-bb'}},
-                    date: COMMIT_DATE,
-                    message: 'feat: work',
-                })),
-            },
-        },
-        {
-            match: /\/repositories\/test-ws\/repo1\/diffstat\//,
-            status: diffstatStatus,
-            body: {
-                values: [
-                    {
-                        status: 'modified',
-                        lines_added: 30,
-                        lines_removed: 5,
-                        new: {path: 'src/foo.ts'},
-                        old: {path: 'src/foo.ts'},
-                    },
-                    {
-                        status: 'added',
-                        lines_added: 10,
-                        lines_removed: 0,
-                        new: {path: 'src/bar.ts'},
-                        old: null,
-                    },
-                ],
-            },
-        },
-    ];
-}
-
-function githubRoutes(): Route[] {
-    return [
-        {
-            match: /\/orgs\/test-org\/repos\?/,
-            body: [
-                {
-                    id: 1,
-                    name: 'repo1',
-                    full_name: 'test-org/repo1',
-                    default_branch: 'main',
-                    archived: false,
-                },
-            ],
-        },
-        {
-            match: /\/repos\/test-org\/repo1\/commits\?/,
-            body: SHAS.map((sha) => ({sha})),
-        },
-        {
-            // Detail endpoint — no `?`, which is what distinguishes it from the list URL.
-            // Echoes the requested sha so the three commits stay distinct.
-            match: /\/repos\/test-org\/repo1\/commits\/[^?]+$/,
-            bodyFor: (url: string): Record<string, unknown> => ({
-                sha: url.split('/').pop(),
-                commit: {
-                    author: {name: 'Alice', email: AUTHOR_EMAIL, date: COMMIT_DATE},
-                    message: 'feat: work',
-                },
-                author: {login: 'alice-gh'},
-                stats: {additions: 40, deletions: 5, total: 45},
-                files: [
-                    {filename: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'},
-                    {filename: 'src/bar.ts', additions: 10, deletions: 0, status: 'added'},
-                ],
-            }),
-        },
-        {match: /\/repos\/test-org\/repo1\/pulls\?/, body: []},
-    ];
-}
-
-function gitlabRoutes(): Route[] {
-    return [
-        {
-            match: /\/groups\/test-group\/projects\?/,
-            body: [
-                {
-                    id: 7,
-                    name: 'Repo1',
-                    path: 'repo1',
-                    path_with_namespace: 'test-group/repo1',
-                    default_branch: 'main',
-                    archived: false,
-                },
-            ],
-        },
-        {
-            match: /\/repository\/commits\?/,
-            body: SHAS.map((id) => ({
-                id,
-                author_name: 'Alice',
-                author_email: AUTHOR_EMAIL,
-                authored_date: COMMIT_DATE,
-                message: 'feat: work',
-            })),
-        },
-        {
-            match: /\/repository\/commits\/[^/]+\/diff\?/,
-            body: [
-                {
-                    old_path: 'src/foo.ts',
-                    new_path: 'src/foo.ts',
-                    new_file: false,
-                    renamed_file: false,
-                    deleted_file: false,
-                    diff: '@@ -1,2 +1,4 @@\n a\n+b\n+c\n-d\n',
-                },
-            ],
-        },
-        {match: /\/merge_requests\?/, body: []},
-    ];
 }
 
 // --- Mock-provider helpers (for the reuse/fallback branches) -----------------------

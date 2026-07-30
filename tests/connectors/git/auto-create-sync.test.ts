@@ -64,10 +64,38 @@ function commitBy(username: string | null, email: string, sha?: string, day = DA
         additions: 50,
         deletions: 10,
         filesChanged: ['src/foo.ts'],
+        // Carried on the commit, which is the path every in-tree provider takes since #271 —
+        // the sync loop reuses this and never calls `getCommitDiff` (#280). Before that this
+        // whole file exercised the fallback branch instead.
+        diffs: DIFFS,
     };
 }
 
 const DIFFS: GitFileDiff[] = [{path: 'src/foo.ts', additions: 50, deletions: 10, status: 'modified'}];
+
+/**
+ * How many times this file's provider stub reached `getCommitDiff` — i.e. fell onto the
+ * fallback branch no in-tree provider takes (#271/#280). Asserted zero by the `afterEach`
+ * below, for the same reason `sync.test.ts` carries the identical guard: without it, deleting
+ * `diffs` from `commitBy` above leaves every test in this file GREEN while silently measuring
+ * the dead branch — the stub returns the same `DIFFS`, so no assertion here can tell the
+ * difference. This file's subject is auto-create, never the fallback, so the invariant is
+ * unconditional: nothing here should ever reach it.
+ */
+let unaskedFallbackFetches = 0;
+
+beforeEach(() => {
+    unaskedFallbackFetches = 0;
+});
+
+afterEach(() => {
+    expect(
+        unaskedFallbackFetches,
+        'this test fell onto the getCommitDiff fallback: its commits carry no `diffs`, so it is ' +
+            'measuring a branch no in-tree provider reaches (#271/#280). Build commits with ' +
+            '`commitBy`, which supplies them.',
+    ).toBe(0);
+});
 
 function mockProvider(commits: GitCommit[]): GitProvider {
     return {
@@ -77,7 +105,10 @@ function mockProvider(commits: GitCommit[]): GitProvider {
         getPullRequests: vi.fn().mockResolvedValue([]),
         getReviewComments: vi.fn().mockResolvedValue([]),
         getPRReviews: vi.fn().mockResolvedValue([]),
-        getCommitDiff: vi.fn().mockResolvedValue(DIFFS),
+        getCommitDiff: vi.fn().mockImplementation(async (): Promise<GitFileDiff[]> => {
+            unaskedFallbackFetches += 1;
+            return DIFFS;
+        }),
         checkAccess: vi.fn().mockResolvedValue(undefined),
     };
 }

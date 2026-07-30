@@ -10,7 +10,7 @@ import {createUser} from '../../src/auth/users';
 import {hashPassword} from '../../src/auth/password';
 import {SESSION_COOKIE} from '../../src/auth/cookies';
 import type {GitConnectorConfig} from '../../src/config/types';
-import type {GitProvider, GitRepo, GitCommit} from '../../src/connectors/git/providers/types';
+import type {GitProvider, GitRepo, GitCommit, GitFileDiff} from '../../src/connectors/git/providers/types';
 import type {GitSyncProgress} from '../../src/connectors/git/sync';
 import {declareEarliestSyncedFloor} from '../../src/connectors/git/sync';
 
@@ -32,6 +32,29 @@ const GIT_CONFIG: GitConnectorConfig = {
     providers: [{type: 'github', org: 'config-org', auth: {type: 'token', api_token: 'ghp_CONFIG_9999'}}],
 };
 
+/**
+ * How many times a test reached this file's DEFAULT `getCommitDiff` — the fallback branch no
+ * in-tree provider takes (#271/#280). Asserted zero by the `afterEach` below, mirroring the
+ * guard in `tests/connectors/git/sync.test.ts`. Without it, deleting `diffs` from `makeCommit`
+ * slides these route tests back onto the fallback in total silence: they assert developer
+ * counts and advisory classification, not `files_changed`, so a snapshot built from empty diffs
+ * is invisible to every assertion in the file.
+ */
+let unaskedFallbackFetches = 0;
+
+beforeEach(() => {
+    unaskedFallbackFetches = 0;
+});
+
+afterEach(() => {
+    expect(
+        unaskedFallbackFetches,
+        'this test fell onto the getCommitDiff fallback: its commits carry no `diffs`, so it is ' +
+            'measuring a branch no in-tree provider reaches (#271/#280). Build commits with ' +
+            '`makeCommit`, which supplies them.',
+    ).toBe(0);
+});
+
 function makeMockProvider(overrides: Partial<GitProvider> = {}): GitProvider {
     return {
         name: 'github',
@@ -40,7 +63,10 @@ function makeMockProvider(overrides: Partial<GitProvider> = {}): GitProvider {
         getPullRequests: vi.fn().mockResolvedValue([]),
         getReviewComments: vi.fn().mockResolvedValue([]),
         getPRReviews: vi.fn().mockResolvedValue([]),
-        getCommitDiff: vi.fn().mockResolvedValue([]),
+        getCommitDiff: vi.fn().mockImplementation(async (): Promise<GitFileDiff[]> => {
+            unaskedFallbackFetches += 1;
+            return [];
+        }),
         checkAccess: vi.fn().mockResolvedValue(undefined),
         ...overrides,
     } as GitProvider;
@@ -59,6 +85,9 @@ function makeCommit(username: string): GitCommit {
         additions: 50,
         deletions: 10,
         filesChanged: ['src/foo.ts'],
+        // The reuse path (#271) — what every in-tree provider does, so it is what the route's
+        // tests must drive. Before #280 these ran against the `getCommitDiff` fallback.
+        diffs: [{path: 'src/foo.ts', additions: 50, deletions: 10, status: 'modified'}],
     };
 }
 
@@ -236,9 +265,6 @@ describe('admin git-provider sync-now API (#199)', () => {
                 makeMockProvider({
                     listRepos: vi.fn().mockResolvedValue([makeRepo('myrepo')]),
                     getCommits: vi.fn().mockResolvedValue([makeCommit('alice')]),
-                    getCommitDiff: vi.fn().mockResolvedValue([
-                        {path: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'},
-                    ]),
                 }),
             );
 
@@ -278,9 +304,6 @@ describe('admin git-provider sync-now API (#199)', () => {
                     getCommits: vi
                         .fn()
                         .mockResolvedValue([makeCommit('alice'), makeCommit('dependabot[bot]')]),
-                    getCommitDiff: vi.fn().mockResolvedValue([
-                        {path: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'},
-                    ]),
                 }),
             );
 
@@ -321,9 +344,6 @@ describe('admin git-provider sync-now API (#199)', () => {
                     // `carol` has no developer record, is not a bot, and carries a provider
                     // login — so auto-create onboards her and emits its summary advisory.
                     getCommits: vi.fn().mockResolvedValue([makeCommit('carol')]),
-                    getCommitDiff: vi
-                        .fn()
-                        .mockResolvedValue([{path: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'}]),
                 }),
             );
 
@@ -464,9 +484,6 @@ describe('admin git-provider sync-now API (#199)', () => {
                         }
                         return [makeCommit('alice')];
                     }),
-                    getCommitDiff: vi.fn().mockResolvedValue([
-                        {path: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'},
-                    ]),
                 }),
             );
 
