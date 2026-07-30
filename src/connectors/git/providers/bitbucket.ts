@@ -300,12 +300,31 @@ export class BitbucketProvider implements GitProvider {
         const untilDate = until ? new Date(until) : null;
 
         const collected: RawCommit[] = [];
+        // Rows this walk has been HANDED, as opposed to the ones it keeps in `collected`.
+        // The INTENDED reason the two differ is the in-memory `until` filter below, and
+        // telling them apart is the whole of #276 — see `GitFetchProgress.scanned`. Note it
+        // is not the only reason: a row whose `date` does not parse yields an Invalid Date
+        // that compares false against BOTH bounds, so it is counted here and silently
+        // dropped from `collected` (a pre-existing gap — that loss is not routed to the
+        // #275 drop reporter). The divergence is therefore an upper bound on filtered rows,
+        // not an exact count of them.
+        let scanned = 0;
         let nextUrl: string | null =
             `${BASE_URL}/repositories/${this.workspace}/${repo}/commits?pagelen=100`;
 
         paging: while (nextUrl) {
             const res = await fetchBitbucket(nextUrl, this.authHeaders);
             const page = (await res.json()) as RawPagedResponse<RawCommit>;
+
+            // Counted for the WHOLE page before the filter runs, so the number is the same
+            // whether the loop below breaks out or not. On the page that trips the `since`
+            // cutoff this over-counts: the rows after the break were returned but never
+            // examined. That value is unobservable rather than harmless — `break paging`
+            // skips this page's report (see below) and the next emission omits `scanned`
+            // entirely, so no consumer can read it. Moving or adding a report after the
+            // break would expose the over-count; count per row inside the loop if that
+            // ever happens.
+            scanned += page.values.length;
 
             for (const c of page.values) {
                 const commitDate = new Date(c.date);
@@ -317,20 +336,25 @@ export class BitbucketProvider implements GitProvider {
                 }
             }
 
-            // Reports rows RETAINED, not rows scanned. Bitbucket's commit endpoint takes
-            // no date bounds (see the URL above), so this walk pages from HEAD and
-            // filters `until` in memory — on a backfill or catch-up chunk whose `until`
-            // is in the past, every page before the window retains nothing and this
-            // reports an unchanging 0. The counter is honest but stationary there; a
-            // scanned-vs-found signal is a wire/label change tracked separately in #276.
-            // On a normal forward run (`until` = now) nothing is filtered and it
-            // advances per page as intended.
+            // BOTH numbers, because on this provider they are genuinely different facts
+            // (#276): `done` is rows retained, `scanned` is rows the endpoint handed over.
+            // Bitbucket's commit endpoint takes no date bounds (see the URL above), so this
+            // walk pages from HEAD and filters `until` in memory — on a backfill or
+            // catch-up chunk whose `until` is in the past, every page before the window
+            // retains nothing and `done` is pinned at 0 for the entire approach, which is
+            // what made the label look hung. `scanned` advances by a page of rows each
+            // time and is what moves there. On a normal forward run (`until` = now)
+            // nothing is filtered and the two track each other, which the consumer renders
+            // as the single `done` count it always did.
+            //
+            // Reported even when equal, deliberately: which of the two to show is the
+            // label's decision, not this walk's (see `GitFetchProgress.scanned`).
             //
             // Deliberately NOT reported on the page that trips the `since` cutoff: the
             // `break paging` skips it, and the seed below would overwrite it in the same
             // synchronous block anyway, so restructuring the walk to reach it would buy
             // an emission no consumer can ever observe (#270 review OR-1).
-            onProgress?.({done: collected.length, total: null});
+            onProgress?.({done: collected.length, total: null, scanned});
             nextUrl = page.next ?? null;
         }
 

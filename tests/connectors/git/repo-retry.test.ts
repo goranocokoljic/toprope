@@ -35,6 +35,7 @@ import {
 import {GitProviderFetchError} from '../../../src/connectors/git/providers/http-retry';
 import type {
     GitCommit,
+    GitFetchProgressListener,
     GitProvider,
     GitProviderConfig,
     GitRepo,
@@ -266,10 +267,17 @@ describe('in-run repo retry (#272)', () => {
                             _repo: string,
                             _since: string,
                             _until: string,
-                            onProgress?: (p: {done: number; total: number | null}) => void,
+                            onProgress?: GitFetchProgressListener,
                         ): Promise<GitCommit[]> => {
                             calls++;
-                            onProgress?.({done: 7, total: 7});
+                            // `scanned` rides on the same tick (#276): the reset must drop it
+                            // too, or a 15-minute pause leaves a stale scanned count on the
+                            // label, which reads as a live walk that has stopped moving.
+                            // Deliberately OUT of contract — a real producer reports
+                            // `scanned` only while `total` is null — so that this one
+                            // fixture isolates the reset rather than adding a second
+                            // listing-shaped run alongside it.
+                            onProgress?.({done: 7, total: 7, scanned: 9});
                             if (calls === 1) throw new GitProviderFetchError('503', 503);
                             return [makeCommit('c-1')];
                         },
@@ -277,17 +285,21 @@ describe('in-run repo retry (#272)', () => {
             }),
         );
 
-        const seen: Array<{done: number | null; total: number | null}> = [];
+        const seen: Array<{done: number | null; scanned: number | null; total: number | null}> = [];
         await runSync(db, (p) => {
             if (p.repo_step === 'commits') {
-                seen.push({done: p.repo_step_done, total: p.repo_step_total});
+                seen.push({
+                    done: p.repo_step_done,
+                    scanned: p.repo_step_scanned,
+                    total: p.repo_step_total,
+                });
             }
         });
 
         // The stale 7/7 from the failed attempt is superseded by a reset before the pause.
-        const afterStale = seen.findIndex((s) => s.done === 7 && s.total === 7);
+        const afterStale = seen.findIndex((s) => s.done === 7 && s.total === 7 && s.scanned === 9);
         expect(afterStale).toBeGreaterThanOrEqual(0);
-        expect(seen.slice(afterStale + 1)).toContainEqual({done: 0, total: null});
+        expect(seen.slice(afterStale + 1)).toContainEqual({done: 0, scanned: null, total: null});
     });
 
     it('a persistently failing repo behaves exactly as before: cursor held, partials dropped, error recorded', async () => {

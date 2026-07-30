@@ -554,6 +554,12 @@ describe('admin git-provider sync-now API (#199)', () => {
                 current_repo: 'repo1',
                 repo_step: 'commits',
                 repo_step_done: 12,
+                // Null here (this parks mid-fan-out, past listing), but the KEY must exist
+                // under this exact wire name (#276): `toMatchObject` treats a missing
+                // property as a mismatch against an expected `null`, so a server-side
+                // rename of `repo_step_scanned` fails here rather than silently reaching
+                // the client as undefined and suppressing the suffix.
+                repo_step_scanned: null,
                 repo_step_total: 40,
             });
             // Positive control that the run-level counter really is the frozen one this

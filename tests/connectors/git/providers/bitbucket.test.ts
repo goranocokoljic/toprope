@@ -465,12 +465,14 @@ describe('BitbucketProvider', () => {
             const onProgress = vi.fn();
             await provider.getCommits('my-repo', '', '', onProgress);
 
-            // Listing has no total (unknown until the last page); the per-commit
-            // diffstat fan-out — where nearly all of a big repo's wall time goes —
-            // then reports real done/total.
+            // Listing has no total (unknown until the last page) and carries the scanned
+            // count beside the retained one (#276) — here they are equal, because a
+            // forward run filters nothing; the per-commit diffstat fan-out — where nearly
+            // all of a big repo's wall time goes — then reports real done/total and no
+            // scanned count at all (past listing, every row in the set was kept).
             expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
-                {done: 1, total: null},
-                {done: 2, total: null},
+                {done: 1, total: null, scanned: 1},
+                {done: 2, total: null, scanned: 2},
                 {done: 0, total: 2},
                 {done: 1, total: 2},
                 {done: 2, total: 2},
@@ -486,17 +488,18 @@ describe('BitbucketProvider', () => {
             // `total: 0` is reported truthfully here as on the other two providers;
             // suppressing the meaningless "commit 0/0" is the consumer's job.
             expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
-                {done: 0, total: null},
+                {done: 0, total: null, scanned: 0},
                 {done: 0, total: 0},
             ]);
         });
 
-        it('reports every page of a walk that retains nothing, though the count cannot move', async () => {
-            // Bitbucket's commit endpoint takes no date bounds, so an `until` in the
-            // past is filtered in memory: each page before the window retains nothing
-            // and reports an unchanging 0. Pinned deliberately — this is the known
-            // stationary-counter case on the backfill/catch-up path (#276), and the
-            // assertion fails if a future change stops reporting these pages at all.
+        it('advances the scanned count on every page of a walk that retains nothing', async () => {
+            // The #276 contract, replacing the pin that recorded the old stationary
+            // behavior. Bitbucket's commit endpoint takes no date bounds, so an `until` in
+            // the past is filtered in memory: each page before the window retains nothing,
+            // `done` cannot move, and `scanned` is the only honest signal that the walk is
+            // progressing rather than hung. Both properties are asserted — every page
+            // still reports (that was the old pin), and consecutive reports now DIFFER.
             const fetchMock = makeFetchMock([
                 {
                     body: pagedResponse(
@@ -505,8 +508,17 @@ describe('BitbucketProvider', () => {
                     ),
                 },
                 {
+                    body: pagedResponse(
+                        [
+                            makeCommitFixture('newer2', {date: '2024-05-01T00:00:00+00:00'}),
+                            makeCommitFixture('newer3', {date: '2024-04-01T00:00:00+00:00'}),
+                        ],
+                        'https://api.bitbucket.org/2.0/next2',
+                    ),
+                },
+                {
                     body: pagedResponse([
-                        makeCommitFixture('newer2', {date: '2024-05-01T00:00:00+00:00'}),
+                        makeCommitFixture('newer4', {date: '2024-03-01T00:00:00+00:00'}),
                     ]),
                 },
             ]);
@@ -521,13 +533,88 @@ describe('BitbucketProvider', () => {
             );
 
             expect(commits).toEqual([]);
-            // Assert the PROPERTY (every page reports, in the listing phase), not the
-            // `done: 0` value itself — #276 is expected to change that value, and this
-            // test should not have to be rewritten to let the fix land.
             const listingTicks = onProgress.mock.calls
-                .map((c) => c[0] as {done: number; total: number | null})
+                .map((c) => c[0] as {done: number; total: number | null; scanned?: number})
                 .filter((p) => p.total === null);
-            expect(listingTicks).toHaveLength(2);
+            // Rows scanned accumulate across pages (1, then +2, then +1) while nothing is
+            // retained — the exact shape a backfill's approach walk produces. Three
+            // pairwise-distinct literals, so this also states AC1 (no two consecutive
+            // reports are identical) without needing a separate distinctness assertion,
+            // which could not fail once these exact values are pinned.
+            expect(listingTicks).toEqual([
+                {done: 0, total: null, scanned: 1},
+                {done: 0, total: null, scanned: 3},
+                {done: 0, total: null, scanned: 4},
+            ]);
+        });
+
+        it('counts a whole straddling page as scanned while keeping only the rows inside the window', async () => {
+            // The page every backfill crosses exactly once: the boundary page, where the
+            // walk is half past `until` and half inside it. It is the ONLY state in which
+            // both counters are non-zero AND different (`scanned > done > 0`), which is
+            // what pins `done` to `collected.length` rather than to the walk's position in
+            // the page. It also carries the row sitting exactly ON `until`, which this walk
+            // KEEPS (`commitDate <= untilDate`). Read that as a record of current behavior,
+            // not as a claim that keeping it is correct: the LOWER bound is inclusive too
+            // (the break is `commitDate < sinceDate`, so a row at `since` survives it), and
+            // a capped run advances the cursor to exactly its `until` — so adjacent windows
+            // share that instant and a commit stamped there is returned by BOTH of them.
+            // Since mergeDailyAcrossRuns ADDS commit metrics on a stated premise of
+            // disjoint windows, the real exposure at this boundary is a one-instant
+            // double-count, not a gap; an exclusive `until` would close it. Left alone here
+            // because the bounds are pre-existing and shared in spirit with the other two
+            // providers' server-side filters — the point of pinning it is that whoever
+            // changes them has to change this assertion deliberately rather than drift
+            // into it, in either direction.
+            const fetchMock = makeFetchMock([
+                {
+                    // Entirely ahead of the window: 2 scanned, 0 kept.
+                    body: pagedResponse(
+                        [
+                            makeCommitFixture('ahead1', {date: '2024-06-01T00:00:00+00:00'}),
+                            makeCommitFixture('ahead2', {date: '2024-05-01T00:00:00+00:00'}),
+                        ],
+                        'https://api.bitbucket.org/2.0/next',
+                    ),
+                },
+                {
+                    // Straddles `until`: 4 scanned, the last 3 fall inside the window —
+                    // `boundary` sits exactly ON `until` and is therefore kept.
+                    body: pagedResponse([
+                        makeCommitFixture('ahead3', {date: '2024-03-01T00:00:00+00:00'}),
+                        makeCommitFixture('boundary', {date: '2024-02-01T00:00:00+00:00'}),
+                        makeCommitFixture('inside1', {date: '2024-01-20T00:00:00+00:00'}),
+                        makeCommitFixture('inside2', {date: '2024-01-10T00:00:00+00:00'}),
+                    ]),
+                },
+                {body: pagedResponse(makeDiffstatFixture())}, // diffstat for boundary
+                {body: pagedResponse(makeDiffstatFixture())}, // diffstat for inside1
+                {body: pagedResponse(makeDiffstatFixture())}, // diffstat for inside2
+            ]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            const onProgress = vi.fn();
+            const commits = await provider.getCommits(
+                'my-repo',
+                '2024-01-01T00:00:00Z',
+                '2024-02-01T00:00:00Z',
+                onProgress,
+            );
+
+            // The boundary row is KEPT — the `<=` in the filter, pinned.
+            expect(commits.map((c) => c.sha)).toEqual(['boundary', 'inside1', 'inside2']);
+            const ticks = onProgress.mock.calls.map(
+                (c) => c[0] as {done: number; total: number | null; scanned?: number},
+            );
+            const listingTicks = ticks.filter((p) => p.total === null);
+            // Page 1 keeps nothing; page 2 keeps 3 of its 4 rows, so the retained count
+            // moves for the first time while the scanned count stays 3 ahead of it. The
+            // exact pairs also carry the invariant a row cannot be kept without having
+            // been handed over, so no separate `scanned >= done` loop is needed.
+            expect(listingTicks).toEqual([
+                {done: 0, total: null, scanned: 2},
+                {done: 3, total: null, scanned: 6},
+            ]);
         });
 
         it('does not report the page that hits the since cutoff — that tick is unobservable', async () => {
