@@ -126,6 +126,24 @@ export const RETRY_HEALED_PREFIX = 'Recovered after retry:';
 export const DIFFSTAT_CACHE_DEGRADED_PREFIX = 'Diffstat cache degraded:';
 
 /**
+ * Prefix of the advisory pushed when a provider returned commits carrying no `GitCommit.diffs`,
+ * so this run fell back to a second per-commit `getCommitDiff` request for each of them (#280).
+ *
+ * Deliberately NOT a failure: the fallback is correct — the diff IS fetched and every metric is
+ * complete — and it is a supported branch of the interface (see `GitCommit.diffs` for why the
+ * field is optional). Turning the provider red for taking a slower-but-correct path would hold
+ * its cursor and discard a perfectly good window.
+ *
+ * But it must be SAID, because the fallback is exactly the ~2N per-commit request volume #271
+ * removed, and nothing else in the run distinguishes it from the reuse path. Every in-tree
+ * provider supplies `diffs`, so a non-zero count means either a new provider that never honoured
+ * the contract or a refactor that dropped the field from an existing one — and the only other
+ * symptom is a sync that got slower, or a rate-limit stall that #235's lag machinery reports
+ * with no cause. The count is what makes that diagnosable instead of merely felt.
+ */
+export const DIFFS_NOT_SUPPLIED_PREFIX = 'Provider supplied no commit diffs:';
+
+/**
  * Prefix of the advisory pushed when a provider LISTED commits it could not return.
  * {@link GitCommitDrop} is the canonical statement of that decision — permanent and
  * non-retryable, so reported rather than thrown — and of where this line does and does not
@@ -203,6 +221,7 @@ const ADVISORY_PREFIXES: readonly string[] = [
     PROVIDER_DELETED_MID_RUN_PREFIX,
     RETRY_HEALED_PREFIX,
     DIFFSTAT_CACHE_DEGRADED_PREFIX,
+    DIFFS_NOT_SUPPLIED_PREFIX,
     COMMITS_DROPPED_PREFIX,
 ];
 
@@ -1642,6 +1661,21 @@ async function fetchProviderData(
     // staged and cleared on rollback rather than pushed as they are discovered.
     const droppedByRepo: Array<{repo: string; drops: GitCommitDrop[]}> = [];
 
+    // How many commits this provider returned WITHOUT `GitCommit.diffs`, forcing the diff pass
+    // below into its `getCommitDiff` fallback (#280), and which repos they came from. Counted
+    // for the whole provider rather than staged per repo, unlike `droppedByRepo` above: this is
+    // a property of the PROVIDER IMPLEMENTATION, not of any repo's data, so a diff-less provider
+    // hits every repo and a per-repo line would print the same sentence N times. The repo SET is
+    // kept anyway because it is the one number that separates "one repo behaves oddly" from
+    // "this provider never supplies diffs".
+    //
+    // Reported unconditionally rather than staged-and-discarded like the drop advisories: those
+    // describe DATA whose loss a rollback un-does, whereas these requests were really made, and
+    // a run that both took the slow path and was then discarded is if anything more worth
+    // saying, not less.
+    let fallbackDiffCommits = 0;
+    const fallbackDiffRepos = new Set<string>();
+
     // The ONE place the within-repo indicator is written (#270) — every producer
     // below routes through it, so the four fields have a single source of truth.
     // (A listener that throws cannot break the run; that is enforced once, where the
@@ -1767,6 +1801,12 @@ async function fetchProviderData(
             if (Array.isArray(rawCommit.diffs)) {
                 diffs = rawCommit.diffs;
             } else {
+                // Counted BEFORE the request, and counted whether or not it succeeds: what the
+                // advisory reports is that this run took the second-fetch path at all, which is
+                // true regardless of the outcome. Counting only successes would make a provider
+                // that is both diff-less AND failing look conformant (#280).
+                fallbackDiffCommits += 1;
+                fallbackDiffRepos.add(repoName);
                 diffs = [];
                 try {
                     diffs = await provider.getCommitDiff(repoName, rawCommit.sha);
@@ -2003,6 +2043,22 @@ async function fetchProviderData(
                 'it already had and a later failure may re-fetch these again. A count comparable ' +
                 'to the commit total means the cache is unusable (check disk space and database ' +
                 'permissions); one or two means transient lock contention.',
+        );
+    }
+
+    // The ONLY trace the fallback path leaves (#280). One line per provider with a count, for
+    // the same reason as the diffstat-cache line above: the condition is systemic, so a per-repo
+    // or per-commit line would be thousands of copies of one sentence.
+    if (fallbackDiffCommits > 0) {
+        errors.push(
+            `${DIFFS_NOT_SUPPLIED_PREFIX} [${providerType}] ${fallbackDiffCommits} commit(s) ` +
+                `across ${fallbackDiffRepos.size} repo(s) arrived without GitCommit.diffs, so ` +
+                'this run made a SECOND per-commit diff request for each of them. No data is ' +
+                'missing and no metric is wrong — the fallback fetches the same diff — but it ' +
+                'roughly doubles the request volume and wall time of the slowest phase of a ' +
+                'sync, and it burns rate limit. Every in-tree provider supplies the field, so a ' +
+                'non-zero count means a provider implementation is not honouring the ' +
+                'GitCommit.diffs contract on GitProvider.getCommits (#271/#280).',
         );
     }
 

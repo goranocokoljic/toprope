@@ -59,6 +59,9 @@ function makeCommit(username: string): GitCommit {
         additions: 50,
         deletions: 10,
         filesChanged: ['src/foo.ts'],
+        // The reuse path (#271) — what every in-tree provider does, so it is what the route's
+        // tests must drive. Before #280 these ran against the `getCommitDiff` fallback.
+        diffs: [{path: 'src/foo.ts', additions: 50, deletions: 10, status: 'modified'}],
     };
 }
 
@@ -236,9 +239,6 @@ describe('admin git-provider sync-now API (#199)', () => {
                 makeMockProvider({
                     listRepos: vi.fn().mockResolvedValue([makeRepo('myrepo')]),
                     getCommits: vi.fn().mockResolvedValue([makeCommit('alice')]),
-                    getCommitDiff: vi.fn().mockResolvedValue([
-                        {path: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'},
-                    ]),
                 }),
             );
 
@@ -278,9 +278,6 @@ describe('admin git-provider sync-now API (#199)', () => {
                     getCommits: vi
                         .fn()
                         .mockResolvedValue([makeCommit('alice'), makeCommit('dependabot[bot]')]),
-                    getCommitDiff: vi.fn().mockResolvedValue([
-                        {path: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'},
-                    ]),
                 }),
             );
 
@@ -321,9 +318,6 @@ describe('admin git-provider sync-now API (#199)', () => {
                     // `carol` has no developer record, is not a bot, and carries a provider
                     // login — so auto-create onboards her and emits its summary advisory.
                     getCommits: vi.fn().mockResolvedValue([makeCommit('carol')]),
-                    getCommitDiff: vi
-                        .fn()
-                        .mockResolvedValue([{path: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'}]),
                 }),
             );
 
@@ -464,9 +458,6 @@ describe('admin git-provider sync-now API (#199)', () => {
                         }
                         return [makeCommit('alice')];
                     }),
-                    getCommitDiff: vi.fn().mockResolvedValue([
-                        {path: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'},
-                    ]),
                 }),
             );
 

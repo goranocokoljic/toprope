@@ -368,6 +368,13 @@ export interface GitProvider {
     // also expose it on `GitCommit.diffs`, so the caller reuses that one fetch instead of
     // walking the same endpoint again per commit (#271).
     //
+    // That MUST is enforced twice since #280, because the field is optional and the sync
+    // silently falls back rather than failing: a table-driven conformance test over every
+    // type `createGitProvider` builds (`tests/connectors/git/providers/diffs-contract.test.ts`)
+    // fails if any of them returns a commit whose `diffs` is not a populated array, and a run
+    // that DOES take the fallback says so — see `DIFFS_NOT_SUPPLIED_PREFIX` in `sync.ts`. Add a
+    // fixture to that table when adding a provider; a new type with none fails the test.
+    //
     // `onDrop` (optional) is how an implementation reports a commit it listed but cannot
     // return (#275). Returning a short list silently is the thing to avoid: the caller reads a
     // normal return as "this window is fully covered" and advances the provider's cursor past
