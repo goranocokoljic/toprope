@@ -355,7 +355,6 @@ export class GitLabProvider implements GitProvider {
                 message: c.message,
                 additions,
                 deletions,
-                filesChanged: diffs.map((d) => d.path),
                 // `[]`, never undefined — including via the 404 branch above, where `[]`
                 // is the true answer. See `GitCommit.diffs` for why that matters (#271).
                 diffs,

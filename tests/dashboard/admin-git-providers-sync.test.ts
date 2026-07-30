@@ -84,7 +84,6 @@ function makeCommit(username: string): GitCommit {
         message: 'feat: add feature',
         additions: 50,
         deletions: 10,
-        filesChanged: ['src/foo.ts'],
         // The reuse path (#271) — what every in-tree provider does, so it is what the route's
         // tests must drive. Before #280 these ran against the `getCommitDiff` fallback.
         diffs: [{path: 'src/foo.ts', additions: 50, deletions: 10, status: 'modified'}],

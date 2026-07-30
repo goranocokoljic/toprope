@@ -118,10 +118,6 @@ function makeCommit(
         message: 'feat: work',
         additions: totals.additions,
         deletions: totals.deletions,
-        // A diff-less provider still lists file names, so keep this populated either way —
-        // nothing downstream of `toAnalysisCommit` reads it, but a fixture that empties it
-        // for the fallback case would misrepresent what such a provider returns.
-        filesChanged: (diffs ?? [{path: 'src/foo.ts'}, {path: 'src/bar.ts'}]).map((d) => d.path),
     };
     // Deliberately only assigned when supplied, so the "not supplied" case really is an
     // ABSENT property rather than an explicit `diffs: undefined`. Copied per commit because

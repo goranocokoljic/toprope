@@ -254,7 +254,6 @@ describe('GitHubProvider', () => {
                 message: 'feat: add feature',
                 additions: 40,
                 deletions: 10,
-                filesChanged: ['src/foo.ts', 'src/bar.ts'],
                 // The detail response's file list, carried out so the sync loop does not
                 // re-request the identical /commits/{sha} URL (#271).
                 diffs: [
@@ -518,7 +517,12 @@ describe('GitHubProvider', () => {
                 expect(commits[0].author.username).toBe('list-alice');
                 // The detail still supplied the churn, so the recovery is not a degraded row.
                 expect(commits[0].additions).toBe(7);
-                expect(commits[0].filesChanged).toEqual(['src/x.ts']);
+                // Full entries, not just paths: a recovery that kept the path list but lost
+                // the per-file churn would zero `code_churn_rate` downstream and still pass a
+                // path-only check.
+                expect(commits[0].diffs).toEqual([
+                    {path: 'src/x.ts', additions: 7, deletions: 3, status: 'modified'},
+                ]);
                 // Nothing was lost, so nothing is reported…
                 expect(onDrop).not.toHaveBeenCalled();
                 // …and the recovery cost no extra request: list + one detail, as always.
@@ -1755,7 +1759,7 @@ describe('GitHubProvider', () => {
 
             // Verify author data flows consistently
             expect(commits[0].author.username).toBe('alice');
-            expect(commits[0].filesChanged).toEqual(diffs.map((d) => d.path));
+            expect(commits[0].diffs).toEqual(diffs);
         });
     });
 });

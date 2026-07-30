@@ -53,20 +53,15 @@ export interface GitCommit {
     additions: number;
     deletions: number;
     /**
-     * Since #271 this is DERIVED — all three providers set it to `diffs.map(d => d.path)`
-     * — and it has no production reader (`toAnalysisCommit` builds `AnalysisCommit.fileDiffs`
-     * from the diffs the sync loop passes it, and `scoreAiSignature` counts those). Do not
-     * treat it as independent input, and do not add a reader: use `diffs` and derive. Kept
-     * only because removing it is a test-wide rename that #271 does not need.
-     */
-    filesChanged: string[];
-    /**
      * The file-level diff already fetched for this commit, carried out of `getCommits` so
      * the consumer does not request it a second time (#271). All three in-tree providers
      * supply it — each already walks a per-commit endpoint while building this row — which
      * is what makes a sync cost ~N per-commit diff walks instead of ~2N. It is the SAME
      * value `getCommitDiff(repo, sha)` would return for this commit — with one deliberate
      * exception: where `getCommitDiff` would THROW a 404, this is `[]` (see below).
+     *
+     * This is the type's ONLY file-level representation: a consumer that needs the path
+     * list derives it. Do not add a stored copy back (#281).
      *
      * NOT a source for the totals above, and do NOT re-derive them from it. On Bitbucket
      * and GitLab `additions`/`deletions` are in fact the sum of these entries, but on

@@ -452,7 +452,6 @@ describe('GitLabProvider', () => {
                 message: 'feat: add feature',
                 additions: 2,
                 deletions: 1,
-                filesChanged: ['src/foo.ts'],
                 // The diff this call already fetched, carried out so the sync loop does
                 // not request it a second time (#271).
                 diffs: [{path: 'src/foo.ts', additions: 2, deletions: 1, status: 'modified'}],
@@ -629,7 +628,7 @@ describe('GitLabProvider', () => {
             expect(commits[0].sha).toBe(sha);
             expect(commits[0].additions).toBe(0);
             expect(commits[0].deletions).toBe(0);
-            expect(commits[0].filesChanged).toEqual([]);
+            expect(commits[0].diffs).toEqual([]);
         });
 
         it('propagates non-404 diff errors (e.g. 401 auth failure)', async () => {
@@ -1369,7 +1368,7 @@ describe('GitLabProvider', () => {
             expect(diffs).toHaveLength(1);
             expect(diffs[0].path).toBe('src/foo.ts');
 
-            expect(commits[0].filesChanged).toEqual(diffs.map((d) => d.path));
+            expect(commits[0].diffs).toEqual(diffs);
         });
     });
 });

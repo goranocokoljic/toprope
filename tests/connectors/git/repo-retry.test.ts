@@ -87,7 +87,6 @@ function makeCommit(sha: string, date = '2024-01-15T10:00:00Z'): GitCommit {
         message: 'feat: add feature',
         additions: 50,
         deletions: 10,
-        filesChanged: ['src/foo.ts'],
         diffs: [{path: 'src/foo.ts', additions: 50, deletions: 10, status: 'modified'}],
     };
 }
