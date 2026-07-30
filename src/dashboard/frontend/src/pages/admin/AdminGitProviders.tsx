@@ -1,4 +1,4 @@
-import {useEffect, useMemo, useRef, useState, type ReactNode} from 'react';
+import {useCallback, useEffect, useMemo, useRef, useState, type ReactNode} from 'react';
 import {Link} from 'react-router-dom';
 import {Card} from '../../components/Card';
 import {Badge} from '../../components/Badge';
@@ -507,10 +507,12 @@ export function laterInstant(a: string | null, b: string | null): string | null 
  * to the run being announced — see {@link outcomeBelongsToRun}.
  *
  * The third branch is not defensive padding. `status` here is UNVALIDATED WIRE DATA: the
- * column is CHECK-constrained to `ok | error | never` and `recordSyncOutcome` re-validates
- * before writing, but the frontend does no runtime validation of the response, and
- * `'never'` is itself a reachable non-terminal value. Naming an outcome the row does not
- * have would be exactly the completion claim this feature must not make.
+ * frontend does no runtime validation of the response, and the column is CHECK-constrained
+ * to `ok | error | never` — a wider set than the two values `recordSyncOutcome` can write
+ * (`SyncOutcomeStatus` is `'ok' | 'error'`; `'never'` is the Badge's display default for a
+ * NULL column, not a stored outcome). Naming an outcome the row does not have would be
+ * exactly the completion claim this feature must not make, so anything but the two known
+ * terminals falls through to {@link SYNC_OUTCOME_UNKNOWN}.
  */
 export function syncTerminalAnnouncement(status: string | null): string {
     if (status === 'ok') return 'Sync completed';
@@ -1471,6 +1473,41 @@ function ProviderRow({
     // ambiguous, and going to look it up is exactly the re-navigation this removes.
     const announceLabel = `${meta.label} · ${provider.container}`;
 
+    // A live region speaks when its DOM text CHANGES — not when a RUN changes. The latch
+    // below reasons in run identities, but delivery is a string, and two runs that settle
+    // the same way produce a byte-identical one ("…: Sync failed" on a retry against the
+    // same bad token). React bails out of a `setState` to an `Object.is`-equal value, so
+    // the text node would never be touched and the second outcome would be announced to
+    // nobody — silently, on exactly the retry loop this feature exists for, and on the
+    // fast-settle path (never observed in flight) where no stage text intervenes to break
+    // the tie.
+    //
+    // So every announcement is delivered clear-then-set: empty the region in one commit,
+    // fill it in the NEXT. `setTimeout` and not a microtask because React batches a
+    // microtask back into the same commit, which would restore the bug. Preferred over the
+    // trailing-whitespace toggle: AT that normalizes whitespace before diffing can read
+    // that as unchanged. The empty commit is never observed as a lost announcement — the
+    // region is polite, so it is the settled text that gets spoken.
+    const pendingAnnouncement = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const announce = useCallback((text: string): void => {
+        // Latest text wins: a stage change arriving while the previous fill is still
+        // pending must not be overwritten by the older string when that timer runs.
+        if (pendingAnnouncement.current !== null) clearTimeout(pendingAnnouncement.current);
+        setAnnouncement('');
+        pendingAnnouncement.current = setTimeout(() => {
+            pendingAnnouncement.current = null;
+            setAnnouncement(text);
+        }, 0);
+    }, []);
+    // A row unmounts when the provider is deleted or the list re-filters; a pending fill
+    // must not outlive it.
+    useEffect(
+        () => () => {
+            if (pendingAnnouncement.current !== null) clearTimeout(pendingAnnouncement.current);
+        },
+        [],
+    );
+
     // Runs THIS row triggered itself, identified by the 202 handle's `started_at`. This
     // is the second source the latch needs, and it is not redundant with the poll: a
     // trigger gets exactly ONE invalidation refetch, and polling is itself gated on
@@ -1508,7 +1545,7 @@ function ProviderRow({
             // Deliberately NOT latched, unlike the terminal branch below: a page loaded
             // while another admin's run is in flight should say so. It is the settled
             // ok/error flip that must not be announced on mount.
-            setAnnouncement(`${announceLabel}: ${stageAnnouncement}`);
+            announce(`${announceLabel}: ${stageAnnouncement}`);
             return;
         }
         const run = knownRun.current;
@@ -1531,7 +1568,7 @@ function ProviderRow({
         if (!observedInFlight.current && !recorded) return;
         observedInFlight.current = false;
         announcedRun.current = run;
-        setAnnouncement(
+        announce(
             `${announceLabel}: ${
                 recorded ? syncTerminalAnnouncement(provider.last_sync_status) : SYNC_OUTCOME_UNKNOWN
             }`,
@@ -1542,14 +1579,14 @@ function ProviderRow({
         announceLabel,
         provider.last_sync_at,
         provider.last_sync_status,
+        announce,
     ]);
 
     // A run is in flight server-side (from the polled list) OR either trigger POST
     // (sync-now / sync-older-history) is still pending — either way the sync
     // controls stay down and show progress. Both triggers share the server's
     // in-flight registry, so only one can actually be running at a time.
-    const syncRunning =
-        provider.active_sync !== null || sync.isPending || syncOlder.isPending;
+    const syncRunning = activeSync !== null || sync.isPending || syncOlder.isPending;
 
     function toggleEnabled(): void {
         // A PATCH must carry the full provider identity (the server re-validates);

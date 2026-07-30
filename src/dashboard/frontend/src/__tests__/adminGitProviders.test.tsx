@@ -2269,6 +2269,112 @@ describe('AdminGitProviders — sync completion announced to assistive tech (#27
         });
     }, 15000);
 
+    it('re-announces a repeat run whose outcome text is identical to the previous run’s', async () => {
+        // The retry loop against a bad token: two runs that both fail fast, so neither is
+        // ever observed in flight and no stage text intervenes to break the tie. The
+        // announcement string is then byte-identical across the two runs — and a live
+        // region speaks on a DOM MUTATION, not on a state write, so a delivery that hands
+        // React an `Object.is`-equal value is bailed out, the text node is never touched,
+        // and the second failure is announced to nobody.
+        //
+        // `toHaveTextContent` cannot catch that: run 1's leftover text already satisfies
+        // it. The mutation of the node IS the assertion.
+        const RUNS = [
+            {started_at: '2026-07-13T10:00:00.000Z', settled_at: '2026-07-13T10:00:04.000Z'},
+            {started_at: '2026-07-14T09:00:00.000Z', settled_at: '2026-07-14T09:00:04.000Z'},
+        ];
+        let triggered = 0;
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const u = String(url);
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (/\/git\/providers\/[^/]+\/sync$/.test(u) && method === 'POST') {
+                const run = RUNS[triggered++];
+                return json(
+                    {data: {provider_id: 'p-gh', status: 'running', started_at: run.started_at}},
+                    202,
+                );
+            }
+            if (/\/git\/providers$/.test(u) && method === 'GET' && triggered > 0) {
+                // Already settled by the time the one invalidation refetch is served.
+                const run = RUNS[triggered - 1];
+                return json({
+                    data: [{...settled('error', run.settled_at), last_sync_error: 'bad credentials'}],
+                });
+            }
+            return base!(url, init);
+        });
+        renderPage();
+        const live = await announcementFor('acme-org');
+        const row = (await screen.findByText('acme-org')).closest('tr') as HTMLElement;
+
+        fireEvent.click(within(row).getByRole('button', {name: 'Sync now'}));
+        await waitFor(() => expect(live).toHaveTextContent('GitHub · acme-org: Sync failed'));
+
+        // From here the text can only ever be that SAME string again, so watch the node.
+        let mutations = 0;
+        const observer = new MutationObserver((records) => {
+            mutations += records.length;
+        });
+        observer.observe(live, {childList: true, characterData: true, subtree: true});
+        try {
+            await waitFor(() => expect(within(row).getByRole('button', {name: 'Sync now'})).toBeEnabled());
+            fireEvent.click(within(row).getByRole('button', {name: 'Sync now'}));
+            await waitFor(() => expect(mutations).toBeGreaterThan(0), {timeout: 3000});
+        } finally {
+            observer.disconnect();
+        }
+        expect(triggered).toBe(2);
+        expect(live).toHaveTextContent('GitHub · acme-org: Sync failed');
+    }, 10000);
+
+    it('waits rather than claiming ignorance while its own run’s outcome is not yet recorded', async () => {
+        // We hold a 202 handle but the list still carries the PRE-run outcome (DB_GITHUB's
+        // 'ok' from 2026-07-01). The row must stay SILENT: the in-flight registry entry is
+        // written before the 202 is answered, so a row still showing the old outcome is a
+        // response we have not received yet, not a lost run. Announcing "outcome unknown"
+        // here would also consume `announcedRun` and permanently suppress this run's real
+        // outcome. Without the `!observedInFlight && !recorded` guard this test fails.
+        let triggered = false;
+        let getsAfterTrigger = 0;
+        const base = fetchMock.getMockImplementation();
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const u = String(url);
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (/\/git\/providers\/[^/]+\/sync$/.test(u) && method === 'POST') {
+                triggered = true;
+                return json(
+                    {
+                        data: {
+                            provider_id: 'p-gh',
+                            status: 'running',
+                            started_at: '2026-07-13T10:00:00.000Z',
+                        },
+                    },
+                    202,
+                );
+            }
+            if (/\/git\/providers$/.test(u) && method === 'GET' && triggered) {
+                getsAfterTrigger += 1;
+                // Idle row, pre-run columns — the run is neither in flight nor recorded.
+                return json({data: [structuredClone(DB_GITHUB)]});
+            }
+            return base!(url, init);
+        });
+        renderPage();
+        const live = await announcementFor('acme-org');
+        const row = (await screen.findByText('acme-org')).closest('tr') as HTMLElement;
+        fireEvent.click(within(row).getByRole('button', {name: 'Sync now'}));
+
+        // Wait for the invalidation refetch to have been served AND rendered, so the
+        // silence below is an observed decision rather than a not-yet.
+        await waitFor(() => expect(getsAfterTrigger).toBeGreaterThan(0));
+        await waitFor(() => expect(within(row).getByRole('button', {name: 'Sync now'})).toBeEnabled());
+        expect(live.textContent).toBe('');
+        expect(live.textContent).not.toContain('outcome unknown');
+        expect(live.textContent).not.toContain('Sync completed');
+    }, 10000);
+
     it('names the provider that settled, so a multi-row table is unambiguous', async () => {
         // Two DB rows, only one syncing. Announcing a bare "Sync completed" would leave
         // the listener to go find out which — the re-navigation this issue removes.
