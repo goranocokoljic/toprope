@@ -537,15 +537,15 @@ describe('BitbucketProvider', () => {
                 .map((c) => c[0] as {done: number; total: number | null; scanned?: number})
                 .filter((p) => p.total === null);
             // Rows scanned accumulate across pages (1, then +2, then +1) while nothing is
-            // retained — the exact shape a backfill's approach walk produces.
+            // retained — the exact shape a backfill's approach walk produces. Three
+            // pairwise-distinct literals, so this also states AC1 (no two consecutive
+            // reports are identical) without needing a separate distinctness assertion,
+            // which could not fail once these exact values are pinned.
             expect(listingTicks).toEqual([
                 {done: 0, total: null, scanned: 1},
                 {done: 0, total: null, scanned: 3},
                 {done: 0, total: null, scanned: 4},
             ]);
-            // Stated as a property too, since it is the acceptance criterion: no two
-            // consecutive reports of this walk are identical.
-            expect(new Set(listingTicks.map((t) => JSON.stringify(t))).size).toBe(3);
         });
 
         it('counts a whole straddling page as scanned while keeping only the rows inside the window', async () => {
@@ -553,12 +553,19 @@ describe('BitbucketProvider', () => {
             // walk is half past `until` and half inside it. It is the ONLY state in which
             // both counters are non-zero AND different (`scanned > done > 0`), which is
             // what pins `done` to `collected.length` rather than to the walk's position in
-            // the page. It also carries the `until`-INCLUSIVE row (`commitDate <= untilDate`):
-            // consecutive backfill chunks are cut at matching `until`/`since` instants, so
-            // the commit stamped exactly on the boundary is the one that decides whether
-            // two chunks are disjoint or leave a permanent hole in that day's snapshot.
-            // Tightening the filter to `<` would drop it from `collected` while still
-            // counting it in `scanned`, and no other test in the suite would notice.
+            // the page. It also carries the row sitting exactly ON `until`, which this walk
+            // KEEPS (`commitDate <= untilDate`). Read that as a record of current behavior,
+            // not as a claim that keeping it is correct: the LOWER bound is inclusive too
+            // (the break is `commitDate < sinceDate`, so a row at `since` survives it), and
+            // a capped run advances the cursor to exactly its `until` — so adjacent windows
+            // share that instant and a commit stamped there is returned by BOTH of them.
+            // Since mergeDailyAcrossRuns ADDS commit metrics on a stated premise of
+            // disjoint windows, the real exposure at this boundary is a one-instant
+            // double-count, not a gap; an exclusive `until` would close it. Left alone here
+            // because the bounds are pre-existing and shared in spirit with the other two
+            // providers' server-side filters — the point of pinning it is that whoever
+            // changes them has to change this assertion deliberately rather than drift
+            // into it, in either direction.
             const fetchMock = makeFetchMock([
                 {
                     // Entirely ahead of the window: 2 scanned, 0 kept.

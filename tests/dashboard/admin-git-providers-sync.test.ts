@@ -569,6 +569,7 @@ describe('admin git-provider sync-now API (#199)', () => {
             release();
             expect((await waitForSyncStatus(id, 'ok')).active_sync).toBeNull();
         });
+
         it('returns a typed 404 for an unknown id', async () => {
             const res = await triggerSync('does-not-exist');
             expect(res.statusCode).toBe(404);

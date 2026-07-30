@@ -270,11 +270,13 @@ describe('in-run repo retry (#272)', () => {
                             onProgress?: GitFetchProgressListener,
                         ): Promise<GitCommit[]> => {
                             calls++;
-                            // `scanned` rides on the same tick (#276): the reset must drop
-                            // it too, or a 15-minute pause shows a stationary scanned count,
-                            // which reads as a live walk that has stopped moving — strictly
-                            // worse than the frozen `0 commits found` #276 set out to fix,
-                            // because the operator has been taught to watch that number.
+                            // `scanned` rides on the same tick (#276): the reset must drop it
+                            // too, or a 15-minute pause leaves a stale scanned count on the
+                            // label, which reads as a live walk that has stopped moving.
+                            // Deliberately OUT of contract — a real producer reports
+                            // `scanned` only while `total` is null — so that this one
+                            // fixture isolates the reset rather than adding a second
+                            // listing-shaped run alongside it.
                             onProgress?.({done: 7, total: 7, scanned: 9});
                             if (calls === 1) throw new GitProviderFetchError('503', 503);
                             return [makeCommit('c-1')];

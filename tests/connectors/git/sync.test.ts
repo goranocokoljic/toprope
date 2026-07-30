@@ -2427,11 +2427,12 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
                             ) => {
                                 // `scanned` rides on the same tick (#276) so this test also
                                 // covers the failure branch clearing it. It has to be in
-                                // flight when the throw happens or the assertion below
-                                // passes on a field that was never set — and a Bitbucket
-                                // backfill failing mid-listing after thousands of scanned
-                                // rows is the realistic case, since that is where such a
-                                // run spends nearly all its wall time.
+                                // flight when the throw happens, or the four-field assertion
+                                // below would pass on a field that was never set. Note the
+                                // tick is deliberately OUT of contract — a real producer
+                                // reports `scanned` only while `total` is null — so that one
+                                // fixture isolates the clear without needing a second run
+                                // shaped like a listing walk.
                                 onProgress?.({done: 2, total: 9, scanned: 11});
                                 throw new Error('GitHub API error 500');
                             },

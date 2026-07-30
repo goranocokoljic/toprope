@@ -314,7 +314,9 @@ function repoStepDetail(p: GitSyncProgress): string {
  * is nothing honest to show: no step in flight, a step that ran over an empty set (a
  * total of 0 would render as the meaningless "commit 0/0"), or a step name a newer
  * backend emits that this bundle cannot name. This is the single place those decisions
- * are made — providers deliberately do not pre-filter.
+ * are made — providers deliberately do not pre-suppress the cases this hides. (That is
+ * about REPORTS, not rows: Bitbucket does filter rows in memory, which is why the scanned
+ * count below exists.)
  */
 function repoStepCount(p: GitSyncProgress): string | null {
     // `Object.hasOwn`, not a bare lookup: `repo_step` is wire data, and a plain object
