@@ -447,8 +447,9 @@ export function syncStageAnnouncement(active: GitProviderActiveSync): string {
 
 /**
  * What the row says when it cannot tell whether the run it watched produced the outcome
- * the columns now hold. One spelling, shared by {@link syncTerminalAnnouncement}'s
- * fallback and by the freshness gate in `ProviderRow`.
+ * the columns now hold — the single fallback {@link syncTerminalAnnouncement} returns for
+ * anything that is not one of the two known terminals, including the `null` the freshness
+ * gate in `ProviderRow` passes when the recorded outcome predates the run.
  */
 const SYNC_OUTCOME_UNKNOWN = 'Sync finished — outcome unknown';
 
@@ -1468,45 +1469,32 @@ function ProviderRow({
     // So: a low-churn element carrying only the coarse stage and the terminal outcome.
     const activeSync = provider.active_sync;
     const stageAnnouncement = activeSync ? syncStageAnnouncement(activeSync) : null;
-    const [announcement, setAnnouncement] = useState('');
+    // A live region speaks when its DOM CHANGES — not when a RUN changes. The latch below
+    // reasons in run identities, but the announcement is a string, and two runs that settle
+    // the same way produce a byte-identical one ("…: Sync failed" on a retry against the
+    // same bad token). React bails out of a `setState` to an `Object.is`-equal value, so a
+    // plain `setAnnouncement(text)` would leave the text node untouched and the second
+    // outcome would be announced to nobody — silently, on exactly the retry loop this
+    // feature exists for, and on the fast-settle path (never observed in flight) where no
+    // stage text intervenes to break the tie.
+    //
+    // So the announcement carries a per-announcement `seq`, and `seq` is the KEY of the
+    // element holding the text. A key change makes React replace that node rather than
+    // reuse it, so identical text still arrives as a removal + insertion inside the live
+    // region — content the AT has not seen before, in ONE commit.
+    //
+    // Deliberately not the two alternatives: a clear-then-set across two commits works only
+    // if React commits the empty render before the refill lands, which is an assumption
+    // about scheduler ordering rather than something the code enforces (lose that race and
+    // the two updates coalesce and the bug is back); and a trailing-whitespace toggle can be
+    // read as unchanged by AT that normalizes whitespace before diffing.
+    const [announcement, setAnnouncement] = useState({seq: 0, text: ''});
+    const announce = useCallback((text: string): void => {
+        setAnnouncement((prev) => ({seq: prev.seq + 1, text}));
+    }, []);
     // Which provider settled — with more than one row, a bare "Sync completed" is
     // ambiguous, and going to look it up is exactly the re-navigation this removes.
     const announceLabel = `${meta.label} · ${provider.container}`;
-
-    // A live region speaks when its DOM text CHANGES — not when a RUN changes. The latch
-    // below reasons in run identities, but delivery is a string, and two runs that settle
-    // the same way produce a byte-identical one ("…: Sync failed" on a retry against the
-    // same bad token). React bails out of a `setState` to an `Object.is`-equal value, so
-    // the text node would never be touched and the second outcome would be announced to
-    // nobody — silently, on exactly the retry loop this feature exists for, and on the
-    // fast-settle path (never observed in flight) where no stage text intervenes to break
-    // the tie.
-    //
-    // So every announcement is delivered clear-then-set: empty the region in one commit,
-    // fill it in the NEXT. `setTimeout` and not a microtask because React batches a
-    // microtask back into the same commit, which would restore the bug. Preferred over the
-    // trailing-whitespace toggle: AT that normalizes whitespace before diffing can read
-    // that as unchanged. The empty commit is never observed as a lost announcement — the
-    // region is polite, so it is the settled text that gets spoken.
-    const pendingAnnouncement = useRef<ReturnType<typeof setTimeout> | null>(null);
-    const announce = useCallback((text: string): void => {
-        // Latest text wins: a stage change arriving while the previous fill is still
-        // pending must not be overwritten by the older string when that timer runs.
-        if (pendingAnnouncement.current !== null) clearTimeout(pendingAnnouncement.current);
-        setAnnouncement('');
-        pendingAnnouncement.current = setTimeout(() => {
-            pendingAnnouncement.current = null;
-            setAnnouncement(text);
-        }, 0);
-    }, []);
-    // A row unmounts when the provider is deleted or the list re-filters; a pending fill
-    // must not outlive it.
-    useEffect(
-        () => () => {
-            if (pendingAnnouncement.current !== null) clearTimeout(pendingAnnouncement.current);
-        },
-        [],
-    );
 
     // Runs THIS row triggered itself, identified by the 202 handle's `started_at`. This
     // is the second source the latch needs, and it is not redundant with the poll: a
@@ -1527,7 +1515,13 @@ function ProviderRow({
     const knownRunStartedAt = laterInstant(activeSync?.started_at ?? null, triggeredRunStartedAt);
 
     // The derived identity goes null the moment a poll-observed run settles, so the run
-    // has to be remembered; `laterInstant` keeps it monotone.
+    // has to be remembered; `laterInstant` keeps it monotone. That monotonicity is an
+    // ASSUMPTION about the server: `started_at` is stamped at trigger time, so a run is
+    // always later than the one before it. If a clock ever stepped backwards, this ref
+    // would stay pinned to the older run and no terminal outcome would be announced again
+    // for the rest of the page session (the unlatched stage branch would keep speaking, so
+    // the row would look alive and simply never finish). Tracked as a follow-up, not
+    // defended here — the wire carries no run id to key on instead.
     const knownRun = useRef<string | null>(null);
     // Whether the CURRENT known run was ever seen in flight. It decides how a
     // not-yet-recorded outcome is read (see below), and is consumed when the run is
@@ -1563,15 +1557,22 @@ function ProviderRow({
         //  - Known only from our own 202: the registry entry is set BEFORE the 202 is
         //    answered, so any later list either shows the run in flight or shows it
         //    finished. A row that still carries the pre-run outcome is therefore just a
-        //    response we haven't received yet, not a lost run — keep waiting rather than
-        //    consuming the latch on a claim of ignorance.
+        //    response we haven't received yet, not a lost run — don't consume the latch on
+        //    a claim of ignorance.
+        //    Be clear about what "wait" means here: polling is gated on `active_sync`, and
+        //    the trigger's one invalidation refetch has already been served, so there is no
+        //    further response coming and this row will simply never announce that run. That
+        //    is the accepted trade — a sighted admin gets nothing either (the badge keeps
+        //    its pre-run value), whereas consuming the latch here would suppress the REAL
+        //    outcome if it did arrive.
         if (!observedInFlight.current && !recorded) return;
         observedInFlight.current = false;
         announcedRun.current = run;
+        // An outcome that does not belong to this run is passed as `null`, which is the
+        // same "nothing this row can honestly name" input as a NULL column — one gate, in
+        // the function that owns the fallback, rather than the same fallback spelled twice.
         announce(
-            `${announceLabel}: ${
-                recorded ? syncTerminalAnnouncement(provider.last_sync_status) : SYNC_OUTCOME_UNKNOWN
-            }`,
+            `${announceLabel}: ${syncTerminalAnnouncement(recorded ? provider.last_sync_status : null)}`,
         );
     }, [
         knownRunStartedAt,
@@ -1658,7 +1659,10 @@ function ProviderRow({
                         the text changes. It sits in the "Last sync" cell because that is the
                         cell whose visible state it is speaking for. */}
                     <span role="status" className="sr-only" data-testid="sync-announcement">
-                        {announcement}
+                        {/* Keyed on the announcement sequence — see `announce` above: the
+                            key is what makes a REPEATED outcome ("Sync failed" twice) a real
+                            DOM change instead of a no-op React bails out of. */}
+                        <span key={announcement.seq}>{announcement.text}</span>
                     </span>
                 </Td>
                 <Td>
@@ -1970,7 +1974,17 @@ export function AdminGitProviders(): JSX.Element {
             <Card title="Connected providers">
                 {providers.isPending ? (
                     <p className="text-sm text-muted">Loading…</p>
-                ) : providers.isError ? (
+                ) : /* Only a load with NOTHING to show replaces the table. react-query keeps
+                       `data` when a BACKGROUND refetch fails, and this list is polled once a
+                       second while a sync runs (`gitProvidersRefetchInterval`), so blanking
+                       the table on `isError` alone threw away every row — and with it every
+                       ProviderRow's mount-scoped sync state: the #278 announcement latch
+                       (`knownRun`/`observedInFlight`/`announcedRun`) and the mutation handles
+                       holding the 202. The run that was in flight would then settle into a
+                       remounted row that has never heard of it, and its outcome would never
+                       be announced. A transient poll failure must not cost the announcement,
+                       so the retained rows stay and the failure is reported above them. */
+                providers.isError && !hasProviders ? (
                     <p className="text-sm text-danger">Failed to load: {providers.error.message}</p>
                 ) : !hasProviders ? (
                     <p className="text-sm text-muted">
@@ -1978,7 +1992,17 @@ export function AdminGitProviders(): JSX.Element {
                         analyzing git activity.
                     </p>
                 ) : (
-                    <Table
+                    <>
+                        {providers.isError ? (
+                            <p
+                                className="mb-2 text-sm text-danger"
+                                role="status"
+                                data-testid="providers-refresh-error"
+                            >
+                                Failed to refresh: {providers.error.message}
+                            </p>
+                        ) : null}
+                        <Table
                         head={
                             <>
                                 <Th>Type</Th>
@@ -2001,7 +2025,8 @@ export function AdminGitProviders(): JSX.Element {
                                 onDeleted={setLastRemoved}
                             />
                         ))}
-                    </Table>
+                        </Table>
+                    </>
                 )}
             </Card>
         </div>

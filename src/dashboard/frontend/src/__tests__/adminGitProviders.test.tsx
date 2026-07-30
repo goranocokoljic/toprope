@@ -2269,6 +2269,126 @@ describe('AdminGitProviders — sync completion announced to assistive tech (#27
         });
     }, 15000);
 
+    it('survives a failed poll mid-run and still announces the outcome', async () => {
+        // The latch lives in the ROW's refs, so anything that unmounts the row loses the
+        // run it was watching. react-query keeps `data` when a background refetch fails, so
+        // one failed poll during a multi-hour sync — a deploy, a blip — used to flip the
+        // page to "Failed to load" and take every row with it; the run then settled into a
+        // remounted row that had never heard of it and was announced to nobody. Exactly the
+        // restart scenario the freshness gate was written for.
+        providers = [{...structuredClone(DB_GITHUB), active_sync: structuredClone(RUNNING_SYNC)}];
+        renderPage();
+        const live = await announcementFor('acme-org');
+        await waitFor(() => expect(live).toHaveTextContent('Fetching activity'));
+
+        // One poll fails (the test client runs with retry: false, so this is immediate).
+        const base = fetchMock.getMockImplementation();
+        let failed = false;
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const u = String(url);
+            if (/\/git\/providers$/.test(u) && (init?.method ?? 'GET').toUpperCase() === 'GET') {
+                failed = true;
+                throw new Error('network down');
+            }
+            return base!(url, init);
+        });
+        await waitFor(() => expect(failed).toBe(true), {timeout: 3000});
+        // The retained rows stay on screen — the failure is reported above them, not
+        // instead of them — so the region (and the latch behind it) is never unmounted.
+        await waitFor(() => expect(screen.getByTestId('providers-refresh-error')).toBeInTheDocument());
+        expect(await announcementFor('acme-org')).toBe(live);
+
+        // The poll recovers and the run has settled: the outcome still gets announced.
+        fetchMock.mockImplementation(base!);
+        providers = [settled('ok')];
+        await waitFor(() => expect(live).toHaveTextContent('GitHub · acme-org: Sync completed'), {
+            timeout: 3000,
+        });
+    }, 15000);
+
+    it('does not re-announce on every poll while the stage is unchanged', async () => {
+        // AC(2) is not only "the counter line has no role" — it is that the region stays
+        // LOW-CHURN. The counters move on nearly every 1s poll; if the effect re-ran on the
+        // polled object rather than on the derived stage string, the region would re-fire
+        // once a second for a multi-hour sync, which is the #270 behaviour this feature was
+        // built to avoid. Nothing else in the suite fails if that dep is widened.
+        providers = [{...structuredClone(DB_GITHUB), active_sync: structuredClone(RUNNING_SYNC)}];
+        renderPage();
+        const live = await announcementFor('acme-org');
+        await waitFor(() => expect(live).toHaveTextContent('Fetching activity'));
+
+        let mutations = 0;
+        const observer = new MutationObserver((records) => {
+            mutations += records.length;
+        });
+        observer.observe(live, {childList: true, characterData: true, subtree: true});
+        try {
+            // Counters advance every poll; the STAGE does not. Sit through ≥2 polls.
+            let processed = RUNNING_SYNC.progress.repos_processed;
+            for (let i = 0; i < 3; i += 1) {
+                processed += 1;
+                providers = [
+                    {
+                        ...structuredClone(DB_GITHUB),
+                        active_sync: {
+                            ...structuredClone(RUNNING_SYNC),
+                            progress: {
+                                ...structuredClone(RUNNING_SYNC.progress),
+                                repos_processed: processed,
+                                repo_step_done: 1240 + processed * 100,
+                            },
+                        },
+                    },
+                ];
+                await new Promise((resolve) => setTimeout(resolve, 1100));
+            }
+            // The visible line DID move — otherwise this test proves nothing.
+            expect(screen.getByTestId('sync-progress').textContent).toContain(String(processed));
+            expect(mutations).toBe(0);
+        } finally {
+            observer.disconnect();
+        }
+    }, 15000);
+
+    it('announces a "Sync older history" run that settled before its one refetch', async () => {
+        // The run identity has TWO trigger sources (#229 backfills are the multi-hour runs
+        // this feature is most for). Only the Sync-now leg was exercised, so dropping the
+        // `syncOlder` handle broke nothing — while a backfill that fails fast, never
+        // observed in flight and never re-polled, would be announced to nobody.
+        const base = fetchMock.getMockImplementation();
+        let triggered = false;
+        fetchMock.mockImplementation(async (url: unknown, init?: RequestInit) => {
+            const u = String(url);
+            const method = (init?.method ?? 'GET').toUpperCase();
+            if (/\/git\/providers\/[^/]+\/sync-older-history$/.test(u) && method === 'POST') {
+                triggered = true;
+                return json(
+                    {
+                        data: {
+                            provider_id: 'p-gh',
+                            status: 'running',
+                            started_at: '2026-07-13T10:00:00.000Z',
+                        },
+                    },
+                    202,
+                );
+            }
+            if (/\/git\/providers$/.test(u) && method === 'GET' && triggered) {
+                return json({
+                    data: [{...settled('error'), last_sync_error: 'repo api: 403'}],
+                });
+            }
+            return base!(url, init);
+        });
+        renderPage();
+        const live = await announcementFor('acme-org');
+        expect(live.textContent).toBe('');
+
+        const row = (await screen.findByText('acme-org')).closest('tr') as HTMLElement;
+        fireEvent.click(within(row).getByRole('button', {name: 'Sync older history'}));
+        await waitFor(() => expect(live).toHaveTextContent('GitHub · acme-org: Sync failed'));
+    }, 10000);
+
     it('re-announces a repeat run whose outcome text is identical to the previous run’s', async () => {
         // The retry loop against a bad token: two runs that both fail fast, so neither is
         // ever observed in flight and no stage text intervenes to break the tie. The
@@ -2320,12 +2440,19 @@ describe('AdminGitProviders — sync completion announced to assistive tech (#27
         try {
             await waitFor(() => expect(within(row).getByRole('button', {name: 'Sync now'})).toBeEnabled());
             fireEvent.click(within(row).getByRole('button', {name: 'Sync now'}));
-            await waitFor(() => expect(mutations).toBeGreaterThan(0), {timeout: 3000});
+            // Both halves in one wait: a mutation count that rose is only the announcement
+            // if the region also still carries the text.
+            await waitFor(
+                () => {
+                    expect(mutations).toBeGreaterThan(0);
+                    expect(live).toHaveTextContent('GitHub · acme-org: Sync failed');
+                },
+                {timeout: 3000},
+            );
         } finally {
             observer.disconnect();
         }
         expect(triggered).toBe(2);
-        expect(live).toHaveTextContent('GitHub · acme-org: Sync failed');
     }, 10000);
 
     it('waits rather than claiming ignorance while its own run’s outcome is not yet recorded', async () => {
