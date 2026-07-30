@@ -7,7 +7,17 @@
  * project-scoped commits path, GitHub's `files`/`stats` payload, Bitbucket's `diffstat` route)
  * would need N independent edits, and because an unrouted URL resolves to a benign empty page
  * rather than throwing, a stale regex degrades into "the provider returned no commits" instead of
- * a loud failure. One table, one edit.
+ * a loud failure.
+ *
+ * KNOWN SECOND COPY, so this docstring does not claim more than the tree holds:
+ * `tests/connectors/git/diffstat-ratchet-cache.test.ts` carries its own parallel table — the same
+ * three provider configs, the same author/date constants, and the same seven URL regexes — and was
+ * deliberately NOT folded in here, because its stubs are behaviourally richer (per-sha scriptable
+ * 503/404, injected list callbacks, five shas, and a `stats` total deliberately unequal to the file
+ * sum) and would not survive collapsing into this declarative `Route[]` shape. A provider URL
+ * change therefore needs TWO edits, and the second file is the one that degrades silently — check
+ * it whenever you touch a regex below. Consolidating the parts that CAN move (the configs and the
+ * shared constants) is tracked as follow-up rather than done here.
  *
  * The three route builders describe ONE repo (`repo1`) with {@link SHAS} commits by one author,
  * each touching the same files — the minimum a `getCommits` call needs to complete, plus the

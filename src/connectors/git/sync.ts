@@ -1717,16 +1717,18 @@ async function fetchProviderData(
     // kept anyway because it is the one number that separates "one repo behaves oddly" from
     // "this provider never supplies diffs".
     //
-    // Reported unconditionally rather than staged-and-discarded like the drop advisories: those
-    // describe DATA whose loss a rollback un-does, whereas these requests were really made, and
-    // a run that both took the slow path and was then discarded is if anything more worth
-    // saying, not less.
+    // These two feed the REQUEST-VOLUME line, which is reported unconditionally rather than
+    // staged-and-discarded like the drop advisories: those describe DATA whose loss a rollback
+    // un-does, whereas these requests were really made, and a run that both took the slow path
+    // and was then discarded is if anything more worth saying, not less.
     let fallbackDiffCommits = 0;
     const fallbackDiffRepos = new Set<string>();
     // The subset of the above whose fallback request FAILED, so the commit was kept with empty
-    // diffs and its file-level metrics are permanently understated. Tracked separately because
-    // the advisory's reassuring "no metric is wrong" sentence is only true when this is zero —
-    // see {@link DIFFS_NOT_SUPPLIED_PREFIX}.
+    // diffs. Tracked separately because it is the only one of the three counts that carries a
+    // claim about PERSISTED state: whether those zeros are permanent depends on this run's
+    // window being recorded as covered, which is why the sentence it feeds is staged into
+    // `diffLossAdvisories` and discarded on all three discard paths — unlike the two counters
+    // above, which are honest whatever happens next. See {@link DIFFS_NOT_SUPPLIED_PREFIX}.
     let fallbackDiffFailures = 0;
 
     // The ONE place the within-repo indicator is written (#270) — every producer
@@ -2126,10 +2128,13 @@ async function fetchProviderData(
                 (fallbackDiffFailures === 0
                     ? 'No data is missing and no metric is wrong — every fallback request ' +
                       'succeeded and fetched the same diff the provider should have supplied.'
-                    : `${fallbackDiffFailures} of those requests FAILED, so those commits were ` +
-                      'kept with no file-level detail at all: their contribution to ' +
-                      'files_changed, code_churn_rate and ai_signature_score is zero rather ' +
-                      'than absent.'),
+                    : `${fallbackDiffFailures} of those requests FAILED, so those commits ` +
+                      'carry no file-level detail: IF this run\'s window is recorded as ' +
+                      'covered, their contribution to files_changed, code_churn_rate and ' +
+                      'ai_signature_score lands as zero rather than absent, and a companion ' +
+                      'line below says so. If it is not — a held, rolled-back or ' +
+                      'deleted-container run — this window is re-fetched intact next run and ' +
+                      'nothing is lost.'),
         );
 
         // The permanence claim and its remedy, staged. True only if this run's window is
@@ -2144,12 +2149,21 @@ async function fetchProviderData(
                     'commit(s) whose fallback diff request failed are now recorded as covered, ' +
                     'so nothing re-asks them and the understatement of files_changed, ' +
                     'code_churn_rate and ai_signature_score on their developer-days is ' +
-                    'PERMANENT. raw_author_daily has no recompute path. Correcting it means ' +
-                    'deleting this provider and re-adding it, so the delete cascade retracts ' +
-                    'this container\'s raw rows and re-projects the affected days BEFORE its ' +
-                    'cursors are purged — do NOT simply reset the cursors and re-sync, which ' +
-                    'would re-import over the surviving rows and permanently DOUBLE every ' +
-                    'commit metric in the span (#262).',
+                    'PERMANENT (at most — a commit whose author resolves to no registered ' +
+                    'developer produced no row to understate). raw_author_daily has no ' +
+                    'recompute path. Whatever you do, do NOT simply purge this provider\'s ' +
+                    'cursors and re-sync: that re-imports over the surviving rows and ' +
+                    'permanently DOUBLES every commit metric in the span (#262), which is ' +
+                    'strictly worse than the understatement. For a provider registered in the ' +
+                    'admin UI the repair is to DELETE it and re-add it — the delete cascade ' +
+                    'retracts this container\'s raw rows and re-projects the affected days ' +
+                    'BEFORE purging its cursors, so the re-import lands on an empty span — then ' +
+                    'run "sync older history" to recover anything beyond the ' +
+                    `${FIRST_SYNC_WINDOW_DEFAULT_MONTHS}-month first-sync window a re-added ` +
+                    'provider starts from. A CONFIG-FILE provider cannot be deleted (the route ' +
+                    'refuses it, and the cascade is skipped while the YAML entry still owns the ' +
+                    'container), so it has no supported repair today: leave the span ' +
+                    'understated and fix the provider\'s getCommits to supply GitCommit.diffs.',
             );
         }
     }

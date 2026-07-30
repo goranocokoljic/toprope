@@ -647,12 +647,28 @@ describe('GitSync', () => {
             duringFetch?: () => void,
             /** The `GitCommitDrop.reason` the mock reports (#275). */
             dropReason: string = NO_AUTHOR_DATE_DROP_REASON,
+            /**
+             * Return the commit WITHOUT `diffs` and fail its fallback fetch (#280), so the run
+             * also stages a permanent-diff-loss advisory. Off by default: every other test in
+             * this block is about the #275 drop line and must stay on the reuse path.
+             */
+            diffLessWithFailingFetch: boolean = false,
         ): Promise<SyncResult> {
             const createGitProvider = await getCreateGitProvider();
             const provider = (): ReturnType<typeof makeMockProvider> =>
                 makeMockProvider({
                     name: 'github',
                     listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    // Overridden only in the #280 case — and overriding it is exactly how a test
+                    // that MEANS to exercise the fallback opts out of the `unaskedFallbackFetches`
+                    // guard. The default path leaves the guarded stub in place.
+                    ...(diffLessWithFailingFetch
+                        ? {
+                              getCommitDiff: vi
+                                  .fn()
+                                  .mockRejectedValue(new Error('502 from the diff endpoint')),
+                          }
+                        : {}),
                     getCommits: vi
                         .fn()
                         .mockImplementation(
@@ -672,7 +688,16 @@ describe('GitSync', () => {
                                 // `cursorAdvances` closure, below its `isWritable` guard; move
                                 // the push above that guard and the assertions below fail.
                                 onDrop?.({sha: 'dead01', reason: dropReason});
-                                return Promise.resolve([makeProviderCommit('alice')]);
+                                return Promise.resolve([
+                                    diffLessWithFailingFetch
+                                        ? makeProviderCommit(
+                                              'alice',
+                                              undefined,
+                                              undefined,
+                                              NO_PROVIDER_DIFFS,
+                                          )
+                                        : makeProviderCommit('alice'),
+                                ]);
                             },
                         ),
                     // A PR is fetched too, so `fetchedPRRecords` is NON-EMPTY and the gate's
@@ -727,6 +752,53 @@ describe('GitSync', () => {
             // the rollback path suppresses the line. Only `isWritable` does. Nothing may claim
             // the window was recorded when no cursor moved and nothing was written.
             expect(result.errors.some((e) => e.startsWith(COMMITS_DROPPED_PREFIX))).toBe(false);
+        });
+
+        /**
+         * The SAME third discard path, for #280's permanent-diff-loss advisory. It is staged in
+         * the same closure, below the same `isWritable` guard, and its line makes the same
+         * "recorded as covered" claim — so it inherits the same failure mode, and the same
+         * precedent: the first version of #275's gate missed exactly this path.
+         *
+         * Untested, the guard is free: hoisting `diffLossAdvisories.push` to the top of the
+         * cursor-advance closure (the obvious "keep the two staged pushes together" tidy-up)
+         * leaves every other test green, because the rollback case never runs the closure and
+         * the incomplete case never pushes it. Only a deleted container reaches the closure and
+         * returns early.
+         *
+         * What escapes if it regresses is not a cosmetic overstatement: the line tells the
+         * operator to delete and re-add a provider whose data the cascade has ALREADY removed.
+         */
+        it('does NOT claim permanent diff loss when the container was deleted mid-run', async () => {
+            seedDev(db, 'alice');
+            insertProviderRow(db, 'db-org');
+            const result = await runWithOneCommit(
+                db,
+                [DB_PROVIDER],
+                deleteRow(db, 'p1'),
+                NO_AUTHOR_DATE_DROP_REASON,
+                true,
+            );
+
+            // Positive control on the discard: the window really was thrown away, so nothing
+            // about it can honestly be called permanent.
+            expect(countSnapshots(db)).toBe(0);
+            expect(
+                (
+                    db.prepare("SELECT COUNT(*) AS n FROM sync_state WHERE key LIKE 'git_%'").get() as {
+                        n: number;
+                    }
+                ).n,
+            ).toBe(0);
+
+            const diffLines = result.errors.filter((e) => e.startsWith(DIFFS_NOT_SUPPLIED_PREFIX));
+            // Positive control on the emission: the run really did take the fallback and really
+            // did fail it, so "no PERMANENT line" cannot pass by nothing being reported at all.
+            expect(diffLines).toHaveLength(1);
+            expect(diffLines[0]).toContain('1 of those requests FAILED');
+            // …and the staged half is suppressed, exactly as for the drop line above.
+            expect(diffLines.some((e) => e.includes('PERMANENT'))).toBe(false);
+            expect(diffLines.some((e) => e.includes('delete cascade'))).toBe(false);
         });
 
         // Positive control for the assertion above: the identical mock reports a drop on a run
@@ -5187,6 +5259,70 @@ describe('GitCommit.diffs reuse vs the getCommitDiff fallback (#280)', () => {
         result.errors.filter((e) => e.startsWith(DIFFS_NOT_SUPPLIED_PREFIX));
 
     /**
+     * The counters are per-`fetchProviderData` locals, and the `[type]` tag is the only thing
+     * that tells an operator WHICH provider broke the contract. Nothing pinned that: every other
+     * fixture here runs one provider, so a regression that hoisted the counters to run scope
+     * (the same per-provider-scoping class of bug as #192) would merge two providers' counts
+     * into one line tagged with whichever formatted last, and stay green.
+     *
+     * A multi-provider deployment is the realistic one, and it is exactly where the tag has to
+     * be right — "some provider fell back 4000 times" is not actionable.
+     */
+    it('reports only the non-conformant provider, tagged, in a mixed multi-provider run', async () => {
+        seedDev(db, 'alice');
+        const createGitProvider = await getCreateGitProvider();
+        // github is diff-less; bitbucket honours the contract.
+        createGitProvider
+            .mockReturnValueOnce(
+                makeMockProvider({
+                    name: 'github',
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                    getCommits: vi.fn().mockResolvedValue([
+                        makeProviderCommit('alice', '2024-01-15T10:00:00Z', 's1', NO_PROVIDER_DIFFS),
+                        makeProviderCommit('alice', '2024-01-15T11:00:00Z', 's2', NO_PROVIDER_DIFFS),
+                    ]),
+                    getCommitDiff: vi.fn().mockResolvedValue(makeProviderDiffs()),
+                }),
+            )
+            .mockReturnValueOnce(
+                makeMockProvider({
+                    name: 'bitbucket',
+                    listRepos: vi.fn().mockResolvedValue([makeRepo('repo9')]),
+                    getCommits: vi
+                        .fn()
+                        .mockResolvedValue([
+                            makeProviderCommit('alice', '2024-01-15T12:00:00Z', 's9'),
+                        ]),
+                }),
+            );
+
+        const result = await new GitSync({enabled: false}).syncProviders(db, [
+            CONFIG,
+            {
+                type: 'bitbucket',
+                workspace: 'test-ws',
+                auth: {type: 'token', api_token: 'test-token'},
+            } as GitProviderConfig,
+        ]);
+
+        const advisories = diffAdvisories(result);
+        // ONE line, for the ONE provider that fell back — not one merged line, and not one per
+        // provider in the run.
+        expect(advisories).toHaveLength(1);
+        expect(advisories[0]).toContain('[github]');
+        expect(advisories[0]).not.toContain('[bitbucket]');
+        // …and the count is github's two commits only, not three. This is the assertion that
+        // fails if the counters stop being per-provider.
+        expect(advisories[0]).toContain('2 commit(s)');
+        // Positive control: bitbucket's commit really was imported in the same run, so the
+        // absence of a bitbucket line is suppression, not a run that skipped it.
+        const row = db
+            .prepare(`SELECT commits FROM git_snapshots WHERE date = '2024-01-15'`)
+            .get() as {commits: number};
+        expect(row.commits).toBe(3);
+    });
+
+    /**
      * AC1's guarantee, stated once rather than left implicit in 200 fixtures: a commit built by
      * `makeProviderCommit` carries `diffs`, so the sync loop never re-requests it. If this fails,
      * the whole suite above has silently slid back onto the fallback branch.
@@ -5353,7 +5489,15 @@ describe('GitCommit.diffs reuse vs the getCommitDiff fallback (#280)', () => {
         // raw_author_daily rows, which additively double every commit metric in the span (#262)
         // — a far larger corruption than the understatement being repaired.
         expect(loss).toContain('delete cascade');
-        expect(loss).toContain('do NOT simply reset the cursors');
+        expect(loss).toContain('do NOT simply purge this provider\'s cursors');
+        // The remedy is only reachable for a DB-registered provider: the admin delete route
+        // refuses a config-file provider, and the cascade is skipped while the YAML entry still
+        // owns the container — so a line that named it unconditionally would send half the
+        // deployments to a no-op that looks like a repair.
+        expect(loss).toContain('CONFIG-FILE provider cannot be deleted');
+        // …and re-adding restores only the first-sync window, so the backfill step is part of
+        // the remedy, not an optional extra.
+        expect(loss).toContain('sync older history');
 
         // Still advisories: turning them red buys no recovery (the window is already recorded as
         // covered) and costs a full re-fetch of the connector.
