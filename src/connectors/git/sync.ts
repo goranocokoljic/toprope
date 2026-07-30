@@ -146,13 +146,32 @@ export const DIFFSTAT_CACHE_DEGRADED_PREFIX = 'Diffstat cache degraded:';
  * TWO counts, not one, and the difference is a data-integrity claim rather than a nicety. A
  * fallback request that FAILS is swallowed by design (the commit is kept with empty diffs rather
  * than failing the repo — #271's preserved semantics), and empty diffs mean `files_changed`,
- * `code_churn_rate` and `ai_signature_score` are computed from nothing for that commit. The
- * cursor still advances and the zeros land in `raw_author_daily`, which has no recompute path, so
- * that understatement is PERMANENT. This line is the only output about those commits, so it must
- * not claim "no metric is wrong" over them: the reassuring sentence is emitted only when the
- * failure count is zero, and when it is not, the loss is stated plainly. Reporting a healthy
- * fallback and a lossy one identically is precisely the "a completion signal is not a currency
- * claim" failure this project has already been bitten by.
+ * `code_churn_rate` and `ai_signature_score` are computed from nothing for that commit. This
+ * line is the only output about those commits, so it must not claim "no metric is wrong" over
+ * them: the reassuring sentence is emitted only when the failure count is zero, and when it is
+ * not, the loss is stated plainly. Reporting a healthy fallback and a lossy one identically is
+ * precisely the "a completion signal is not a currency claim" failure this project has already
+ * been bitten by.
+ *
+ * TWO LINES, not one, and the seam is the same one #275's drop advisory is cut along. Everything
+ * about REQUEST VOLUME is true the moment the requests are made, so it is pushed straight into
+ * `errors` here. Everything about the loss being PERMANENT depends on this run's window actually
+ * being recorded as covered, which `fetchProviderData` cannot see — three paths discard a fetched
+ * window with no cursor advance (incomplete provider, rolled-back write, container deleted
+ * mid-run), and on all three the commits are re-asked next run and the zeros never land. So the
+ * permanence half is threaded out as {@link ProviderFetchResult.diffLossAdvisories} and emitted
+ * from the cursor-advance closure, exactly like {@link ProviderFetchResult.droppedAdvisories}.
+ * Making that claim unconditionally would be worse than saying nothing, because the remedy it
+ * names is destructive: it sends the operator to rebuild a span that is in fact intact.
+ *
+ * WHICH REMEDY IT NAMES MATTERS. Purging `git_last_sync`/`git_earliest_sync` on its own and
+ * re-syncing is the one action that is NEVER safe here: `mergeDailyAcrossRuns` ADDS commits,
+ * lines and files on the premise that run windows are disjoint, and `upsertRawAuthorDaily` has no
+ * dedup guard, so re-importing an already-imported span permanently DOUBLES every commit metric
+ * in it (#262) — a far larger corruption than the understatement being repaired. The line
+ * therefore names the provider delete cascade (`providers/delete-cascade.ts`), which retracts the
+ * container's `raw_author_daily`/`pr_records`/`commit_diffstats` and re-projects the affected days
+ * BEFORE purging its cursors, so the re-import lands on an empty span.
  */
 export const DIFFS_NOT_SUPPLIED_PREFIX = 'Provider supplied no commit diffs:';
 
@@ -1416,6 +1435,20 @@ interface ProviderFetchResult {
      */
     droppedAdvisories: string[];
     /**
+     * Fully-formatted {@link DIFFS_NOT_SUPPLIED_PREFIX} lines reporting that N fallback diff
+     * requests FAILED, so those commits were kept with no file-level detail and their
+     * `files_changed` / `code_churn_rate` / `ai_signature_score` contribution is zero rather than
+     * absent (#280). Threaded out rather than pushed into {@link errors} for the same reason
+     * {@link droppedAdvisories} is: the line's claim is that the understatement is PERMANENT,
+     * which holds only if this run's window is actually recorded as covered. The request-volume
+     * half of the report — which is true whatever happens to the window — is pushed into
+     * `errors` directly and is not repeated here.
+     *
+     * Empty whenever no fallback request failed; a run that took the fallback and had every
+     * request succeed says so on the volume line and stages nothing.
+     */
+    diffLossAdvisories: string[];
+    /**
      * True iff every fetch feeding the ADDITIVE commit-derived snapshot succeeded
      * for this provider — `listRepos` AND every repo's `getCommits`. When false the
      * run must NOT advance this provider's cursor/watermark AND must NOT write its
@@ -1639,6 +1672,8 @@ async function fetchProviderData(
             forwardCursorTarget: until,
             // No repo was reached, so nothing could have been dropped.
             droppedAdvisories: [],
+            // No commit was fetched, so no fallback diff request could have failed.
+            diffLossAdvisories: [],
             // The window was not covered at all — hold the cursor so it retries (#231).
             complete: false,
         };
@@ -2073,9 +2108,12 @@ async function fetchProviderData(
     // the same reason as the diffstat-cache line above: the condition is systemic, so a per-repo
     // or per-commit line would be thousands of copies of one sentence.
     //
-    // The second half of the sentence is CONDITIONAL on the failure count. "No metric is wrong"
-    // is a data-integrity claim, and it is false for a commit whose fallback request failed — see
-    // DIFFS_NOT_SUPPLIED_PREFIX for why a line that makes it anyway is worse than no line.
+    // REQUEST VOLUME only. Everything below is true the moment the requests are made, so it is
+    // pushed here regardless of what the caller later does with this run's window. The claim that
+    // a failed fallback's understatement is PERMANENT is not — it is staged into
+    // `diffLossAdvisories` and emitted only from the cursor advance. See
+    // DIFFS_NOT_SUPPLIED_PREFIX for why splitting at that seam is the whole point.
+    const diffLossAdvisories: string[] = [];
     if (fallbackDiffCommits > 0) {
         errors.push(
             `${DIFFS_NOT_SUPPLIED_PREFIX} [${providerType}] ${fallbackDiffCommits} commit(s) ` +
@@ -2088,14 +2126,32 @@ async function fetchProviderData(
                 (fallbackDiffFailures === 0
                     ? 'No data is missing and no metric is wrong — every fallback request ' +
                       'succeeded and fetched the same diff the provider should have supplied.'
-                    : `${fallbackDiffFailures} of those requests FAILED. Those commits were ` +
-                      'kept with no file-level detail at all, so their contribution to ' +
+                    : `${fallbackDiffFailures} of those requests FAILED, so those commits were ` +
+                      'kept with no file-level detail at all: their contribution to ' +
                       'files_changed, code_churn_rate and ai_signature_score is zero rather ' +
-                      'than absent — and this run has recorded its window as covered, so ' +
-                      'nothing re-asks them. The understatement is permanent: the affected ' +
-                      'developer-days can only be corrected by resetting this provider\'s ' +
-                      'cursors and re-importing the span.'),
+                      'than absent.'),
         );
+
+        // The permanence claim and its remedy, staged. True only if this run's window is
+        // recorded as covered — on the three discard paths the commits are re-asked next run
+        // and these zeros never land, so making the claim there would send an operator to
+        // rebuild an intact span. The remedy names the delete cascade rather than a bare cursor
+        // purge, which would re-import over surviving raw rows and double every commit metric
+        // in the span (#262).
+        if (fallbackDiffFailures > 0) {
+            diffLossAdvisories.push(
+                `${DIFFS_NOT_SUPPLIED_PREFIX} [${providerType}] the ${fallbackDiffFailures} ` +
+                    'commit(s) whose fallback diff request failed are now recorded as covered, ' +
+                    'so nothing re-asks them and the understatement of files_changed, ' +
+                    'code_churn_rate and ai_signature_score on their developer-days is ' +
+                    'PERMANENT. raw_author_daily has no recompute path. Correcting it means ' +
+                    'deleting this provider and re-adding it, so the delete cascade retracts ' +
+                    'this container\'s raw rows and re-projects the affected days BEFORE its ' +
+                    'cursors are purged — do NOT simply reset the cursors and re-sync, which ' +
+                    'would re-import over the surviving rows and permanently DOUBLE every ' +
+                    'commit metric in the span (#262).',
+            );
+        }
     }
 
     return {
@@ -2109,6 +2165,7 @@ async function fetchProviderData(
         firstSyncFloor,
         forwardCursorTarget: until,
         droppedAdvisories,
+        diffLossAdvisories,
         complete: commitsComplete,
     };
 }
@@ -2601,6 +2658,10 @@ export class GitSync implements ConnectorInterface {
         // Filled by the `cursorAdvances` closure — see there for why that is the one honest
         // gate — and discarded on rollback below.
         const droppedAdvisories: string[] = [];
+        // Permanent-diff-loss advisories (#280), staged for exactly the reason the two above
+        // are: the line claims the loss can no longer be re-asked, which is only true once this
+        // run's window is recorded as covered. Same closure, same discard semantics.
+        const diffLossAdvisories: string[] = [];
         // Deferred stall-counter updates (#235), applied in the SAME transaction as
         // the cursor advances so the counter and the cursor can never disagree about
         // whether this run moved the provider forward. Unlike `cursorAdvances` this
@@ -2659,6 +2720,9 @@ export class GitSync implements ConnectorInterface {
                 // `autoCreateAdvisories`. Reaching this line is the one condition that is true
                 // on every keep path and false on all three discard paths.
                 droppedAdvisories.push(...result.droppedAdvisories);
+                // Same premise, same gate (#280): the failed-fallback commits are only
+                // unreachable-forever once this advance makes their window covered.
+                diffLossAdvisories.push(...result.diffLossAdvisories);
                 if (options?.backfill) {
                     setProviderEarliestSyncTime(db, providerType, identifier, options.backfill.since);
                 } else {
@@ -2897,8 +2961,11 @@ export class GitSync implements ConnectorInterface {
             // Committed — only now is the auto-create summary true.
             errors.push(...autoCreateAdvisories);
             // …and only now has any window actually been recorded as covered, which is what
-            // the drop advisories claim (#275).
+            // the drop advisories claim (#275) and the permanent-diff-loss advisories claim
+            // (#280). Both are cleared by construction on the rollback path below — never
+            // pushed there — for the same reason.
             errors.push(...droppedAdvisories);
+            errors.push(...diffLossAdvisories);
         } catch (err) {
             // Hard failure: the tx rolled back, so NO snapshots were written, NO developer
             // was auto-created and NO cursor advanced — the window is intact and will be

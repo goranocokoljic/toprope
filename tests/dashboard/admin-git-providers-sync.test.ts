@@ -10,7 +10,7 @@ import {createUser} from '../../src/auth/users';
 import {hashPassword} from '../../src/auth/password';
 import {SESSION_COOKIE} from '../../src/auth/cookies';
 import type {GitConnectorConfig} from '../../src/config/types';
-import type {GitProvider, GitRepo, GitCommit} from '../../src/connectors/git/providers/types';
+import type {GitProvider, GitRepo, GitCommit, GitFileDiff} from '../../src/connectors/git/providers/types';
 import type {GitSyncProgress} from '../../src/connectors/git/sync';
 import {declareEarliestSyncedFloor} from '../../src/connectors/git/sync';
 
@@ -32,6 +32,29 @@ const GIT_CONFIG: GitConnectorConfig = {
     providers: [{type: 'github', org: 'config-org', auth: {type: 'token', api_token: 'ghp_CONFIG_9999'}}],
 };
 
+/**
+ * How many times a test reached this file's DEFAULT `getCommitDiff` — the fallback branch no
+ * in-tree provider takes (#271/#280). Asserted zero by the `afterEach` below, mirroring the
+ * guard in `tests/connectors/git/sync.test.ts`. Without it, deleting `diffs` from `makeCommit`
+ * slides these route tests back onto the fallback in total silence: they assert developer
+ * counts and advisory classification, not `files_changed`, so a snapshot built from empty diffs
+ * is invisible to every assertion in the file.
+ */
+let unaskedFallbackFetches = 0;
+
+beforeEach(() => {
+    unaskedFallbackFetches = 0;
+});
+
+afterEach(() => {
+    expect(
+        unaskedFallbackFetches,
+        'this test fell onto the getCommitDiff fallback: its commits carry no `diffs`, so it is ' +
+            'measuring a branch no in-tree provider reaches (#271/#280). Build commits with ' +
+            '`makeCommit`, which supplies them.',
+    ).toBe(0);
+});
+
 function makeMockProvider(overrides: Partial<GitProvider> = {}): GitProvider {
     return {
         name: 'github',
@@ -40,7 +63,10 @@ function makeMockProvider(overrides: Partial<GitProvider> = {}): GitProvider {
         getPullRequests: vi.fn().mockResolvedValue([]),
         getReviewComments: vi.fn().mockResolvedValue([]),
         getPRReviews: vi.fn().mockResolvedValue([]),
-        getCommitDiff: vi.fn().mockResolvedValue([]),
+        getCommitDiff: vi.fn().mockImplementation(async (): Promise<GitFileDiff[]> => {
+            unaskedFallbackFetches += 1;
+            return [];
+        }),
         checkAccess: vi.fn().mockResolvedValue(undefined),
         ...overrides,
     } as GitProvider;

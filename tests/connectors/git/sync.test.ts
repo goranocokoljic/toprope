@@ -5310,6 +5310,79 @@ describe('GitCommit.diffs reuse vs the getCommitDiff fallback (#280)', () => {
      */
     it('states the permanent loss, not "no metric is wrong", when a fallback fetch fails', async () => {
         seedDev(db, 'alice');
+        // THREE diff-less commits, ONE failing fetch. The three numbers the report interpolates
+        // — commits that fell back (3), repos they came from (1), and requests that failed (1) —
+        // must be pairwise distinguishable, or a refactor that swapped `fallbackDiffCommits` for
+        // `fallbackDiffFailures` would ship green while telling the operator the wrong recovery
+        // scope: "3 commits are permanently understated" and "1 is" are different incidents.
+        const result = await syncWith(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
+                getCommits: vi.fn().mockResolvedValue([
+                    makeProviderCommit('alice', '2024-01-15T10:00:00Z', 's1', NO_PROVIDER_DIFFS),
+                    makeProviderCommit('alice', '2024-01-15T11:00:00Z', 's2', NO_PROVIDER_DIFFS),
+                    makeProviderCommit('alice', '2024-01-15T12:00:00Z', 's3', NO_PROVIDER_DIFFS),
+                ]),
+                getCommitDiff: vi
+                    .fn()
+                    .mockImplementation(async (_repo: string, sha: string) =>
+                        sha === 's2'
+                            ? Promise.reject(new Error('502 from the diff endpoint'))
+                            : makeProviderDiffs(),
+                    ),
+            }),
+        );
+
+        // TWO lines now, and the split is the point (#280): request volume is true the moment
+        // the requests are made, permanence is only true once the window is recorded as covered.
+        const [volume, loss] = diffAdvisories(result);
+        expect(diffAdvisories(result)).toHaveLength(2);
+
+        expect(volume).toContain('3 commit(s)');
+        expect(volume).toContain('1 repo(s)');
+        // The failure count is named, and the reassuring sentence is NOT emitted.
+        expect(volume).toContain('1 of those requests FAILED');
+        expect(volume).not.toContain('no metric is wrong');
+        // …and the volume line no longer makes the permanence claim itself.
+        expect(volume).not.toContain('PERMANENT');
+
+        // The claim about persisted state, on its own line, keyed to the FAILURE count.
+        expect(loss).toContain('the 1 commit(s) whose fallback diff request failed');
+        expect(loss).toContain('PERMANENT');
+        // It must name the SAFE remedy. A bare cursor reset re-imports over surviving
+        // raw_author_daily rows, which additively double every commit metric in the span (#262)
+        // — a far larger corruption than the understatement being repaired.
+        expect(loss).toContain('delete cascade');
+        expect(loss).toContain('do NOT simply reset the cursors');
+
+        // Still advisories: turning them red buys no recovery (the window is already recorded as
+        // covered) and costs a full re-fetch of the connector.
+        expect(isAdvisoryError(volume)).toBe(true);
+        expect(isAdvisoryError(loss)).toBe(true);
+
+        // The commits still count — a failed diff fetch degrades to empty diffs, it does not
+        // drop the commit. The two that SUCCEEDED contribute 2 file entries each; s2 contributes
+        // nothing, which is exactly the loss the second advisory states.
+        const row = db
+            .prepare(`SELECT commits, files_changed FROM git_snapshots WHERE date = '2024-01-15'`)
+            .get() as {commits: number; files_changed: number};
+        expect(row.commits).toBe(3);
+        expect(row.files_changed).toBe(4);
+    });
+
+    /**
+     * The blocker this split exists for. "The understatement is PERMANENT, nothing re-asks
+     * them" is a claim about persisted state, and it is FALSE on every path that discards the
+     * run's window — the commits are re-fetched intact next run and the zeros never land.
+     *
+     * Emitting it anyway is not a cosmetic overstatement: the remedy it names is destructive, so
+     * a phantom loss report sends the operator to rebuild a span that was fine. That is why the
+     * line is staged onto the cursor advance like the #275 drop advisories rather than pushed
+     * where it is formatted.
+     */
+    it('does NOT claim permanent loss when the run\'s write is rolled back', async () => {
+        seedDev(db, 'alice');
+        db.exec('DROP TABLE pr_records');
         const result = await syncWith(
             makeMockProvider({
                 listRepos: vi.fn().mockResolvedValue([makeRepo('repo1')]),
@@ -5318,36 +5391,68 @@ describe('GitCommit.diffs reuse vs the getCommitDiff fallback (#280)', () => {
                     .mockResolvedValue([
                         makeProviderCommit('alice', '2024-01-15T10:00:00Z', 's1', NO_PROVIDER_DIFFS),
                     ]),
+                getPullRequests: vi.fn().mockResolvedValue([makeProviderPR('alice')]),
                 getCommitDiff: vi.fn().mockRejectedValue(new Error('502 from the diff endpoint')),
             }),
         );
 
-        const advisory = diffAdvisories(result)[0];
-        expect(advisory).toContain('1 commit(s)');
-        // The failure count is named, and the reassuring sentence is NOT emitted.
-        expect(advisory).toContain('1 of those requests FAILED');
-        expect(advisory).not.toContain('no metric is wrong');
-        expect(advisory).toContain('permanent');
-        // Still an advisory: turning it red buys no recovery (the window is already recorded as
-        // covered) and costs a full re-fetch of the connector.
-        expect(isAdvisoryError(advisory)).toBe(true);
-        // The commit still counts — a failed diff fetch degrades to empty diffs, it does not
-        // drop the commit. `files_changed: 0` is exactly the loss the advisory now states.
-        const row = db
-            .prepare(`SELECT commits, files_changed FROM git_snapshots WHERE date = '2024-01-15'`)
-            .get() as {commits: number; files_changed: number};
-        expect(row.commits).toBe(1);
-        expect(row.files_changed).toBe(0);
+        // Positive control: the write really did roll back, so no cursor advanced and the window
+        // is intact.
+        expect(result.errors.some((e) => e.includes('transaction rolled back'))).toBe(true);
+        expect(countSnapshots(db)).toBe(0);
+
+        const advisories = diffAdvisories(result);
+        // The request-volume line still fires — those requests were really made and really
+        // failed, whatever happened to the window afterwards.
+        expect(advisories).toHaveLength(1);
+        expect(advisories[0]).toContain('1 commit(s)');
+        expect(advisories[0]).toContain('1 of those requests FAILED');
+        // …but nothing claims the loss is permanent, and nothing sends the operator to a
+        // destructive rebuild of a span that will be re-fetched next run.
+        expect(advisories.some((a) => a.includes('PERMANENT'))).toBe(false);
+        expect(advisories.some((a) => a.includes('delete cascade'))).toBe(false);
     });
 
     /**
-     * A run whose write was ROLLED BACK still reports the fallback. The drop advisories are
-     * deliberately staged and discarded on rollback — the data loss they describe is un-done by
-     * the re-fetch — but these requests were really made against the provider's rate limit, and a
-     * run that both took the slow path and threw its window away is if anything more worth saying.
+     * The second discard path (#231): one repo's `getCommits` throws, so the provider is
+     * incomplete and `syncProviders` skips it entirely — no snapshot write, no cursor advance,
+     * whole window re-covered next run. The diff-less commits from the EARLIER repo already
+     * incremented the counters, which is exactly how an unstaged permanence claim would leak out.
+     */
+    it('does NOT claim permanent loss when the provider\'s fetch was incomplete', async () => {
+        seedDev(db, 'alice');
+        const result = await syncWith(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('repo1'), makeRepo('repo2')]),
+                getCommits: vi
+                    .fn()
+                    .mockResolvedValueOnce([
+                        makeProviderCommit('alice', '2024-01-15T10:00:00Z', 's1', NO_PROVIDER_DIFFS),
+                    ])
+                    .mockRejectedValueOnce(new Error('repo2 exploded')),
+                getCommitDiff: vi.fn().mockRejectedValue(new Error('502 from the diff endpoint')),
+            }),
+        );
+
+        // Positive control: the provider really was held, so its window is intact.
+        expect(countSnapshots(db)).toBe(0);
+
+        const advisories = diffAdvisories(result);
+        expect(advisories).toHaveLength(1);
+        expect(advisories[0]).toContain('1 of those requests FAILED');
+        expect(advisories.some((a) => a.includes('PERMANENT'))).toBe(false);
+    });
+
+    /**
+     * A run whose write was ROLLED BACK still reports the REQUEST-VOLUME half of the fallback
+     * report. Those requests were really made against the provider's rate limit, and a run that
+     * both took the slow path and threw its window away is if anything more worth saying.
      *
-     * Untested, this survives only as a comment: the emit sits ~20 lines from `droppedAdvisories`,
-     * and a "consistency" refactor that moved it into their staging closure would be green.
+     * This is the opposite face of the "does NOT claim permanent loss when the run's write is
+     * rolled back" test above: the two together pin the seam. Volume survives a discard; the
+     * permanence claim does not. Untested in this direction, a "consistency" refactor that moved
+     * the WHOLE report into the staging closure would be green and the slow path would go silent
+     * on exactly the runs that are hardest to diagnose.
      */
     it('reports the fallback even when the run\'s write is rolled back', async () => {
         seedDev(db, 'alice');

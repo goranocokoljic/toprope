@@ -17,7 +17,11 @@
  * fixture data and the transport stub, nothing else.
  */
 import {vi} from 'vitest';
-import type {GitProviderConfig} from '../../../../src/connectors/git/providers/types';
+import type {
+    GitProviderConfig,
+    GitProviderType,
+    GitFileDiff,
+} from '../../../../src/connectors/git/providers/types';
 
 export const AUTHOR_EMAIL = 'alice@example.com';
 export const COMMIT_DATE = '2024-01-15T10:00:00.000Z';
@@ -255,12 +259,7 @@ export function gitlabRoutes(): Route[] {
  * are what the provider's hunk parser derives from `@@ -1,2 +1,4 @@\n a\n+b\n+c\n-d\n` (two added
  * lines, one removed), not the 30/5 the other two report.
  */
-export const EXPECTED_DIFFS: Record<GitProviderConfig['type'], Array<{
-    path: string;
-    additions: number;
-    deletions: number;
-    status: string;
-}>> = {
+export const EXPECTED_DIFFS: Record<GitProviderType, GitFileDiff[]> = {
     github: [
         {path: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'},
         {path: 'src/bar.ts', additions: 10, deletions: 0, status: 'added'},

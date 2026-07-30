@@ -99,6 +99,11 @@ describe('#280 GitCommit.diffs conformance across every provider type', () => {
      */
     it('has a fixture for every provider type createGitProvider supports', () => {
         expect(Object.keys(FIXTURES).sort()).toEqual([...GIT_PROVIDER_TYPES].sort());
+        // BOTH halves of the fixture, not just the routes: the per-commit assertions below
+        // compare against `EXPECTED_DIFFS[type]`, so a new type with routes but no expectation
+        // fails as `expected [...] to equal undefined` — the same illegible failure this gate
+        // exists to replace.
+        expect(Object.keys(EXPECTED_DIFFS).sort()).toEqual([...GIT_PROVIDER_TYPES].sort());
     });
 
     it.each(GIT_PROVIDER_TYPES)(
