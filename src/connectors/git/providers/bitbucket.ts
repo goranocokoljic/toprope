@@ -301,8 +301,13 @@ export class BitbucketProvider implements GitProvider {
 
         const collected: RawCommit[] = [];
         // Rows this walk has been HANDED, as opposed to the ones it keeps in `collected`.
-        // The only reason the two differ is the in-memory `until` filter below, and telling
-        // them apart is the whole of #276 — see `GitFetchProgress.scanned`.
+        // The INTENDED reason the two differ is the in-memory `until` filter below, and
+        // telling them apart is the whole of #276 — see `GitFetchProgress.scanned`. Note it
+        // is not the only reason: a row whose `date` does not parse yields an Invalid Date
+        // that compares false against BOTH bounds, so it is counted here and silently
+        // dropped from `collected` (a pre-existing gap — that loss is not routed to the
+        // #275 drop reporter). The divergence is therefore an upper bound on filtered rows,
+        // not an exact count of them.
         let scanned = 0;
         let nextUrl: string | null =
             `${BASE_URL}/repositories/${this.workspace}/${repo}/commits?pagelen=100`;
@@ -312,9 +317,13 @@ export class BitbucketProvider implements GitProvider {
             const page = (await res.json()) as RawPagedResponse<RawCommit>;
 
             // Counted for the WHOLE page before the filter runs, so the number is the same
-            // whether the loop below breaks out or not. Rows past the `since` cutoff were
-            // still returned and still examined; the page they arrive on is the last one, so
-            // its report is skipped anyway (see below).
+            // whether the loop below breaks out or not. On the page that trips the `since`
+            // cutoff this over-counts: the rows after the break were returned but never
+            // examined. That value is unobservable rather than harmless — `break paging`
+            // skips this page's report (see below) and the next emission omits `scanned`
+            // entirely, so no consumer can read it. Moving or adding a report after the
+            // break would expose the over-count; count per row inside the loop if that
+            // ever happens.
             scanned += page.values.length;
 
             for (const c of page.values) {

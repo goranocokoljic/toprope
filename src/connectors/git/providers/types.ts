@@ -242,6 +242,14 @@ export interface GitFetchProgress {
      * left an operator unable to tell a walk still approaching its window from a hang —
      * the exact symptom #270 exists to remove.
      *
+     * Two limits on what a moving count proves, both deliberate and neither fixed here.
+     * It advances only BETWEEN requests: `fetchBitbucket`'s rate-limit and 5xx backoff
+     * sleeps silently (see `http-retry.ts`), so a 429 on this request-dense walk still
+     * parks the line for the length of the wait — "the count is stuck" does not imply
+     * "the process is stuck". And it is a liveness signal, not a progress one: it says
+     * nothing about how much history is left before the window. An in-run repo retry also
+     * re-pages from HEAD with a fresh counter, so the number legitimately restarts at 0.
+     *
      * ABSENT means "no distinction to draw", not "zero": GitHub and GitLab pass
      * `since`/`until` to the server, so every row they scan is a row they keep and a second
      * copy of `done` would be noise. Reported unconditionally by an implementation that

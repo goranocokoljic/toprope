@@ -551,10 +551,14 @@ describe('BitbucketProvider', () => {
         it('counts a whole straddling page as scanned while keeping only the rows inside the window', async () => {
             // The page every backfill crosses exactly once: the boundary page, where the
             // walk is half past `until` and half inside it. It is the ONLY state in which
-            // both counters are non-zero AND different (`scanned > done > 0`), so it is
-            // where an off-by-a-page mistake shows — a `scanned` computed per page rather
-            // than cumulatively, or one incremented after the filter instead of before it,
-            // survives both the all-retained and the retained-nothing tests.
+            // both counters are non-zero AND different (`scanned > done > 0`), which is
+            // what pins `done` to `collected.length` rather than to the walk's position in
+            // the page. It also carries the `until`-INCLUSIVE row (`commitDate <= untilDate`):
+            // consecutive backfill chunks are cut at matching `until`/`since` instants, so
+            // the commit stamped exactly on the boundary is the one that decides whether
+            // two chunks are disjoint or leave a permanent hole in that day's snapshot.
+            // Tightening the filter to `<` would drop it from `collected` while still
+            // counting it in `scanned`, and no other test in the suite would notice.
             const fetchMock = makeFetchMock([
                 {
                     // Entirely ahead of the window: 2 scanned, 0 kept.
@@ -567,13 +571,16 @@ describe('BitbucketProvider', () => {
                     ),
                 },
                 {
-                    // Straddles `until`: 3 scanned, the last 2 fall inside the window.
+                    // Straddles `until`: 4 scanned, the last 3 fall inside the window —
+                    // `boundary` sits exactly ON `until` and is therefore kept.
                     body: pagedResponse([
                         makeCommitFixture('ahead3', {date: '2024-03-01T00:00:00+00:00'}),
+                        makeCommitFixture('boundary', {date: '2024-02-01T00:00:00+00:00'}),
                         makeCommitFixture('inside1', {date: '2024-01-20T00:00:00+00:00'}),
                         makeCommitFixture('inside2', {date: '2024-01-10T00:00:00+00:00'}),
                     ]),
                 },
+                {body: pagedResponse(makeDiffstatFixture())}, // diffstat for boundary
                 {body: pagedResponse(makeDiffstatFixture())}, // diffstat for inside1
                 {body: pagedResponse(makeDiffstatFixture())}, // diffstat for inside2
             ]);
@@ -587,24 +594,20 @@ describe('BitbucketProvider', () => {
                 onProgress,
             );
 
-            expect(commits.map((c) => c.sha)).toEqual(['inside1', 'inside2']);
+            // The boundary row is KEPT — the `<=` in the filter, pinned.
+            expect(commits.map((c) => c.sha)).toEqual(['boundary', 'inside1', 'inside2']);
             const ticks = onProgress.mock.calls.map(
                 (c) => c[0] as {done: number; total: number | null; scanned?: number},
             );
             const listingTicks = ticks.filter((p) => p.total === null);
-            // Page 1 keeps nothing; page 2 keeps 2 of its 3 rows, so the retained count
-            // moves for the first time while the scanned count runs 3 ahead of it.
+            // Page 1 keeps nothing; page 2 keeps 3 of its 4 rows, so the retained count
+            // moves for the first time while the scanned count stays 3 ahead of it. The
+            // exact pairs also carry the invariant a row cannot be kept without having
+            // been handed over, so no separate `scanned >= done` loop is needed.
             expect(listingTicks).toEqual([
                 {done: 0, total: null, scanned: 2},
-                {done: 2, total: null, scanned: 5},
+                {done: 3, total: null, scanned: 6},
             ]);
-            // The wire invariant, asserted against the only code that can violate it: a
-            // row cannot be kept without having been handed over. (The pipeline-level
-            // version of this check runs against a mock and so cannot fail — see
-            // tests/connectors/git/sync.test.ts.)
-            for (const t of listingTicks) {
-                expect(t.scanned).toBeGreaterThanOrEqual(t.done);
-            }
         });
 
         it('does not report the page that hits the since cutoff — that tick is unobservable', async () => {

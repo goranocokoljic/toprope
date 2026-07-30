@@ -1688,7 +1688,7 @@ async function fetchProviderData(
         // below: the first page request can sleep until the rate-limit reset, and
         // during that window the label would otherwise carry no within-repo segment at
         // all. Total is null — the commit count is not known yet. This also supersedes
-        // the previous explicit clear here, since it overwrites all three fields.
+        // the previous explicit clear here, since it overwrites all four fields.
         reportStep('commits', 0, null);
         // getCommits pages the commit list AND does the per-commit detail/diff fetch
         // internally; its onProgress reports both so the indicator advances during that work
