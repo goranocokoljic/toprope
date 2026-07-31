@@ -6,6 +6,7 @@ import {getMigrationStatus} from '../storage/migrator';
 import {resolveAllGitProviders} from '../connectors/git/providers/resolve';
 import {loadServerKey} from '../connectors/git/providers/secret';
 import {createGitProvider} from '../connectors/git/providers/factory';
+import {INTERACTIVE_REQUEST_POLICY} from '../connectors/git/providers/http-retry';
 import {GIT_CATCHUP_WINDOW_MAX_DAYS, loadGitSyncHealth} from '../connectors/git/sync';
 import type {GitProvider, GitProviderConfig} from '../connectors/git/providers/types';
 import {gitResetNotice, gitResetNoticeMessage} from '../connectors/git/reset-notice';
@@ -377,6 +378,19 @@ export function gitProviderFixHint(type: GitProviderConfig['type'], message?: st
     if (m.includes(' 401') || m.includes('(401)')) {
         return `${type}: credentials invalid or expired — generate a new token/app password with read access.`;
     }
+    // BEFORE the 403 rule, deliberately (#283 review, SO-2). GitHub signals its PRIMARY rate
+    // limit with 403, not 429, and since #283 an interactive client no longer waits one out —
+    // so the message that reaches here reads `GitHub API forbidden (403): … API rate limit
+    // exceeded …` and the scope rule below would tell an admin their perfectly good token
+    // lacks read scopes. Sending someone to rotate a working PAT because the nightly sync
+    // spent the org's quota is the worst answer available.
+    //
+    // Matched on the provider's own wording, not a status: `Rate limit exceeded after N
+    // retries` is what all three throw when a rate-limit budget is spent, and `rate limit`
+    // covers GitHub's 403 body which the thrown message interpolates verbatim.
+    if (/rate limit/i.test(m)) {
+        return `${type}: rate limited right now, not a credential problem — wait for the limit to reset and re-run. If this is constant, a sync may be consuming the quota.`;
+    }
     if (m.includes(' 403') || m.includes('(403)') || m.includes('forbidden')) {
         return `${type}: token lacks required read scopes (repositories + pull requests).`;
     }
@@ -420,7 +434,12 @@ async function checkOneGitProvider(pc: GitProviderConfig): Promise<CheckResult> 
     const label = `Git: ${pc.type}`;
     let provider: GitProvider;
     try {
-        provider = createGitProvider(pc);
+        // Interactive: `doctor` is a human at a terminal waiting for an answer, and BOTH calls
+        // below take this client — the probe AND the repo enumeration (#283). `listRepos` used
+        // to take a sync's budget, so one `503 Retry-After: 3600` from a provider parked the
+        // whole command for up to ten minutes, and a 429 for up to three hours, on a check
+        // whose entire value is being cheap and re-runnable.
+        provider = createGitProvider(pc, {policy: INTERACTIVE_REQUEST_POLICY});
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return fail(label, msg, gitProviderFixHint(pc.type));

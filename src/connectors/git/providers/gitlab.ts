@@ -12,19 +12,21 @@ import type {
     GitAuthor,
     GitLabProviderConfig,
     GitFetchProgressListener,
+    GitProviderClientOptions,
 } from './types.js';
 import {normalizeContainer} from './container.js';
 import {loadDiffstats, resolveCommitDiffstat} from './diffstat.js';
+import type {GitRequestPolicy} from './http-retry.js';
 import {
     GitProviderFetchError,
-    MAX_RATE_LIMIT_RETRIES,
-    MAX_SERVER_ERROR_RETRIES,
-    PROBE_SERVER_ERROR_RETRIES,
+    SYNC_REQUEST_POLICY,
+    assertRunTimeRemaining,
     parseEpochResetMs,
     rateLimitDelayMs,
     rateLimitFallbackMs,
+    requestTimeout,
     serverErrorDelayMs,
-    sleep,
+    sleepWithinRun,
 } from './http-retry.js';
 
 const DEFAULT_BASE_URL = 'https://gitlab.com/api/v4';
@@ -43,9 +45,10 @@ function buildAuthHeaders(auth: GitLabProviderConfig['auth']): Record<string, st
 async function fetchGitLab(
     url: string,
     headers: Record<string, string>,
-    // Overridden only by checkAccess, which is an interactive probe rather than a data fetch
-    // and must fail fast — see PROBE_SERVER_ERROR_RETRIES.
-    maxTransientRetries: number = MAX_SERVER_ERROR_RETRIES,
+    // The retry budgets and run deadline the CLIENT was built with (#283) — see the identical
+    // parameter on `fetchGitHub` for why this replaced a per-call transient-only override, and
+    // for why it carries no default.
+    policy: GitRequestPolicy,
 ): Promise<Response> {
     let attempt = 0;
     // Transient faults (5xx, transport) get their own, much longer budget than the 429 path —
@@ -56,15 +59,23 @@ async function fetchGitLab(
     // `for (;;)`: the two budgets above are counted separately, so no single loop guard can
     // express both, and every branch below either `continue`s or throws (#272).
     for (;;) {
+        // Per ATTEMPT, not only before a pause — see `fetchGitHub` (#283).
+        assertRunTimeRemaining(policy, url);
         let res: Response;
+        // Disarmed in `finally` the moment `fetch` settles — the signal bounds the RESPONSE,
+        // never the body the caller reads afterwards. See GIT_REQUEST_TIMEOUT_MS (#283).
+        const timeout = requestTimeout();
         try {
-            res = await fetch(url, {headers});
+            res = await fetch(url, {headers, signal: timeout.signal});
         } catch (err) {
             // A transport fault is the same outage as a 503, seen one layer down — same budget,
             // same backoff. Wrapped so the in-run repo retry (#272) can classify it; the message
-            // is preserved verbatim.
-            if (transientRetries < maxTransientRetries) {
-                await sleep(serverErrorDelayMs(transientRetries, null));
+            // is preserved verbatim. A GIT_REQUEST_TIMEOUT_MS abort lands here too (#283).
+            // Disarmed BEFORE the minutes-long backoff, not just by the `finally` — see the
+            // identical note in `github.ts` (#283 review).
+            timeout.clear();
+            if (transientRetries < policy.retries.transient) {
+                await sleepWithinRun(policy, serverErrorDelayMs(transientRetries, null), url);
                 transientRetries++;
                 continue;
             }
@@ -73,6 +84,10 @@ async function fetchGitLab(
                 null,
                 {cause: err},
             );
+        } finally {
+            // Idempotent, so clearing twice is safe; this stays the one guarantee no path
+            // leaves a signal armed over an unread body.
+            timeout.clear();
         }
 
         if (res.status === 429) {
@@ -82,25 +97,31 @@ async function fetchGitLab(
             // 1 ms. The pause meant to outlast the limit became an instant retry, and GitLab
             // was hammered while already rate-limiting us. Parsed by kind now.
             const resetMs = parseEpochResetMs(res.headers.get('ratelimit-reset'));
-            if (attempt < MAX_RATE_LIMIT_RETRIES) {
-                await sleep(
+            if (attempt < policy.retries.rateLimit) {
+                await sleepWithinRun(
+                    policy,
                     rateLimitDelayMs(
                         res.headers.get('retry-after'),
                         resetMs ?? rateLimitFallbackMs(attempt),
                     ),
+                    url,
                 );
                 attempt++;
                 continue;
             }
             throw new GitProviderFetchError(
-                `Rate limit exceeded after ${MAX_RATE_LIMIT_RETRIES} retries: ${url}`,
+                `Rate limit exceeded after ${policy.retries.rateLimit} retries: ${url}`,
                 429,
             );
         }
 
         if (res.status >= 500) {
-            if (transientRetries < maxTransientRetries) {
-                await sleep(serverErrorDelayMs(transientRetries, res.headers.get('retry-after')));
+            if (transientRetries < policy.retries.transient) {
+                await sleepWithinRun(
+                    policy,
+                    serverErrorDelayMs(transientRetries, res.headers.get('retry-after')),
+                    url,
+                );
                 transientRetries++;
                 continue;
             }
@@ -214,8 +235,9 @@ export class GitLabProvider implements GitProvider {
     private readonly includeRepos: string[];
     private readonly includeSubgroups: boolean;
     private readonly diffstatCache?: CommitDiffstatCache;
+    private readonly policy: GitRequestPolicy;
 
-    constructor(config: GitLabProviderConfig, diffstatCache?: CommitDiffstatCache) {
+    constructor(config: GitLabProviderConfig, options: GitProviderClientOptions = {}) {
         // Normalized (#266) — see the note in `github.ts`: the attribution key and the request
         // path must be the same spelling, and both derive from `normalizeContainer`.
         this.group = normalizeContainer(config.group);
@@ -224,7 +246,8 @@ export class GitLabProvider implements GitProvider {
         this.authHeaders = buildAuthHeaders(config.auth);
         this.includeRepos = config.repos ?? [];
         this.includeSubgroups = config.include_subgroups ?? false;
-        this.diffstatCache = diffstatCache;
+        this.diffstatCache = options.diffstatCache;
+        this.policy = options.policy ?? SYNC_REQUEST_POLICY;
     }
 
     private shouldInclude(pathWithNamespace: string): boolean {
@@ -244,11 +267,11 @@ export class GitLabProvider implements GitProvider {
     }
 
     async checkAccess(): Promise<void> {
+        // The client's own policy carries the caller's intent now (#283) — see `github.ts`.
         await fetchGitLab(
             `${this.baseUrl}/groups/${encodeURIComponent(this.group)}/projects?per_page=1`,
             this.authHeaders,
-            // An interactive probe, not a data fetch — a human is waiting on it (#272).
-            PROBE_SERVER_ERROR_RETRIES,
+            this.policy,
         );
     }
 
@@ -266,7 +289,7 @@ export class GitLabProvider implements GitProvider {
 
         let hasNextPage = true;
         while (hasNextPage) {
-            const res = await fetchGitLab(`${baseUrl}&page=${page}`, this.authHeaders);
+            const res = await fetchGitLab(`${baseUrl}&page=${page}`, this.authHeaders, this.policy);
             const projects = (await res.json()) as RawProject[];
 
             for (const p of projects) {
@@ -307,7 +330,7 @@ export class GitLabProvider implements GitProvider {
         while (hasNextPage) {
             params.set('page', String(page));
             const url = `${this.baseUrl}/projects/${this.projectPath(repo)}/repository/commits?${params.toString()}`;
-            const res = await fetchGitLab(url, this.authHeaders);
+            const res = await fetchGitLab(url, this.authHeaders, this.policy);
             const data = (await res.json()) as RawCommit[];
             raw.push(...data);
             // One report per page — the commit total is unknown until the last
@@ -403,7 +426,7 @@ export class GitLabProvider implements GitProvider {
         while (true) {
             params.set('page', String(page));
             const url = `${this.baseUrl}/projects/${this.projectPath(repo)}/merge_requests?${params.toString()}`;
-            const res = await fetchGitLab(url, this.authHeaders);
+            const res = await fetchGitLab(url, this.authHeaders, this.policy);
             const data = (await res.json()) as RawMR[];
 
             for (const mr of data) {
@@ -450,7 +473,7 @@ export class GitLabProvider implements GitProvider {
 
         while (true) {
             const url = `${this.baseUrl}/projects/${this.projectPath(repo)}/merge_requests/${prId}/notes?per_page=${PER_PAGE}&page=${page}`;
-            const res = await fetchGitLab(url, this.authHeaders);
+            const res = await fetchGitLab(url, this.authHeaders, this.policy);
             const data = (await res.json()) as RawNote[];
             notes.push(...data);
 
@@ -480,7 +503,7 @@ export class GitLabProvider implements GitProvider {
         let hasNextPage = true;
         while (hasNextPage) {
             const url = `${this.baseUrl}/projects/${this.projectPath(repo)}/merge_requests/${prId}/notes?per_page=${PER_PAGE}&page=${page}&sort=asc&order_by=created_at`;
-            const res = await fetchGitLab(url, this.authHeaders);
+            const res = await fetchGitLab(url, this.authHeaders, this.policy);
             const data = (await res.json()) as RawNote[];
             notes.push(...data);
 
@@ -529,7 +552,7 @@ export class GitLabProvider implements GitProvider {
 
         while (true) {
             const url = `${this.baseUrl}/projects/${this.projectPath(repo)}/repository/commits/${commitSha}/diff?per_page=${PER_PAGE}&page=${page}`;
-            const res = await fetchGitLab(url, this.authHeaders);
+            const res = await fetchGitLab(url, this.authHeaders, this.policy);
             const data = (await res.json()) as RawDiffEntry[];
             diffs.push(...data);
 

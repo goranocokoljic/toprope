@@ -11,18 +11,20 @@ import type {
     GitAuthor,
     BitbucketProviderConfig,
     GitFetchProgressListener,
+    GitProviderClientOptions,
 } from './types.js';
 import {normalizeContainer} from './container.js';
 import {loadDiffstats, resolveCommitDiffstat} from './diffstat.js';
+import type {GitRequestPolicy} from './http-retry.js';
 import {
     GitProviderFetchError,
-    MAX_RATE_LIMIT_RETRIES,
-    MAX_SERVER_ERROR_RETRIES,
-    PROBE_SERVER_ERROR_RETRIES,
+    SYNC_REQUEST_POLICY,
+    assertRunTimeRemaining,
     rateLimitDelayMs,
     rateLimitFallbackMs,
+    requestTimeout,
     serverErrorDelayMs,
-    sleep,
+    sleepWithinRun,
 } from './http-retry.js';
 
 const BASE_URL = 'https://api.bitbucket.org/2.0';
@@ -52,9 +54,10 @@ function buildAuthHeader(auth: BitbucketProviderConfig['auth']): string {
 async function fetchBitbucket(
     url: string,
     headers: Record<string, string>,
-    // Overridden only by checkAccess, which is an interactive probe rather than a data fetch
-    // and must fail fast — see PROBE_SERVER_ERROR_RETRIES.
-    maxTransientRetries: number = MAX_SERVER_ERROR_RETRIES,
+    // The retry budgets and run deadline the CLIENT was built with (#283) — see the identical
+    // parameter on `fetchGitHub` for why this replaced a per-call transient-only override, and
+    // for why it carries no default.
+    policy: GitRequestPolicy,
 ): Promise<Response> {
     let attempt = 0;
     // Transient faults (5xx, transport) get their OWN, much longer budget than the 429
@@ -65,15 +68,24 @@ async function fetchBitbucket(
     // `for (;;)`: the two budgets above are counted separately, so no single loop guard can
     // express both, and every branch below either `continue`s or throws (#272).
     for (;;) {
+        // Per ATTEMPT, not only before a pause — see `fetchGitHub` (#283).
+        assertRunTimeRemaining(policy, url);
         let res: Response;
+        // Disarmed in `finally` the moment `fetch` settles — the signal bounds the RESPONSE,
+        // never the body the caller reads afterwards. See GIT_REQUEST_TIMEOUT_MS (#283).
+        const timeout = requestTimeout();
         try {
-            res = await fetch(url, {headers});
+            res = await fetch(url, {headers, signal: timeout.signal});
         } catch (err) {
             // A transport fault is the same outage as a 503, seen one layer down — same
             // budget, same backoff. Wrapped so the in-run repo retry (#272) can classify
-            // it; the message is preserved verbatim.
-            if (transientRetries < maxTransientRetries) {
-                await sleep(serverErrorDelayMs(transientRetries, null));
+            // it; the message is preserved verbatim. A GIT_REQUEST_TIMEOUT_MS abort lands
+            // here too (#283).
+            // Disarmed BEFORE the minutes-long backoff, not just by the `finally` — see the
+            // identical note in `github.ts` (#283 review).
+            timeout.clear();
+            if (transientRetries < policy.retries.transient) {
+                await sleepWithinRun(policy, serverErrorDelayMs(transientRetries, null), url);
                 transientRetries++;
                 continue;
             }
@@ -82,25 +94,35 @@ async function fetchBitbucket(
                 null,
                 {cause: err},
             );
+        } finally {
+            // Idempotent, so clearing twice is safe; this stays the one guarantee no path
+            // leaves a signal armed over an unread body.
+            timeout.clear();
         }
 
         if (res.status === 429) {
-            if (attempt < MAX_RATE_LIMIT_RETRIES) {
-                await sleep(
+            if (attempt < policy.retries.rateLimit) {
+                await sleepWithinRun(
+                    policy,
                     rateLimitDelayMs(res.headers.get('retry-after'), rateLimitFallbackMs(attempt)),
+                    url,
                 );
                 attempt++;
                 continue;
             }
             throw new GitProviderFetchError(
-                `Rate limit exceeded after ${MAX_RATE_LIMIT_RETRIES} retries: ${url}`,
+                `Rate limit exceeded after ${policy.retries.rateLimit} retries: ${url}`,
                 429,
             );
         }
 
         if (res.status >= 500) {
-            if (transientRetries < maxTransientRetries) {
-                await sleep(serverErrorDelayMs(transientRetries, res.headers.get('retry-after')));
+            if (transientRetries < policy.retries.transient) {
+                await sleepWithinRun(
+                    policy,
+                    serverErrorDelayMs(transientRetries, res.headers.get('retry-after')),
+                    url,
+                );
                 transientRetries++;
                 continue;
             }
@@ -229,15 +251,17 @@ export class BitbucketProvider implements GitProvider {
     private readonly includeRepos: string[];
     private readonly excludeRepos: string[];
     private readonly diffstatCache?: CommitDiffstatCache;
+    private readonly policy: GitRequestPolicy;
 
-    constructor(config: BitbucketProviderConfig, diffstatCache?: CommitDiffstatCache) {
+    constructor(config: BitbucketProviderConfig, options: GitProviderClientOptions = {}) {
         // Normalized (#266) — see the note in `github.ts`: the attribution key and the request
         // path must be the same spelling, and both derive from `normalizeContainer`.
         this.workspace = normalizeContainer(config.workspace);
         this.includeRepos = config.repos ?? [];
         this.excludeRepos = config.exclude_repos ?? [];
         this.authHeaders = {Authorization: buildAuthHeader(config.auth)};
-        this.diffstatCache = diffstatCache;
+        this.diffstatCache = options.diffstatCache;
+        this.policy = options.policy ?? SYNC_REQUEST_POLICY;
     }
 
     private shouldInclude(repoSlug: string): boolean {
@@ -255,7 +279,7 @@ export class BitbucketProvider implements GitProvider {
         let nextUrl: string | null = startUrl;
 
         while (nextUrl) {
-            const res = await fetchBitbucket(nextUrl, this.authHeaders);
+            const res = await fetchBitbucket(nextUrl, this.authHeaders, this.policy);
             const page = (await res.json()) as RawPagedResponse<T>;
             results.push(...page.values);
             nextUrl = page.next ?? null;
@@ -265,11 +289,11 @@ export class BitbucketProvider implements GitProvider {
     }
 
     async checkAccess(): Promise<void> {
+        // The client's own policy carries the caller's intent now (#283) — see `github.ts`.
         await fetchBitbucket(
             `${BASE_URL}/repositories/${this.workspace}?role=member&pagelen=1`,
             this.authHeaders,
-            // An interactive probe, not a data fetch — a human is waiting on it (#272).
-            PROBE_SERVER_ERROR_RETRIES,
+            this.policy,
         );
     }
 
@@ -313,7 +337,7 @@ export class BitbucketProvider implements GitProvider {
             `${BASE_URL}/repositories/${this.workspace}/${repo}/commits?pagelen=100`;
 
         paging: while (nextUrl) {
-            const res = await fetchBitbucket(nextUrl, this.authHeaders);
+            const res = await fetchBitbucket(nextUrl, this.authHeaders, this.policy);
             const page = (await res.json()) as RawPagedResponse<RawCommit>;
 
             // Counted for the WHOLE page before the filter runs, so the number is the same
@@ -417,7 +441,7 @@ export class BitbucketProvider implements GitProvider {
             `${BASE_URL}/repositories/${this.workspace}/${repo}/pullrequests?pagelen=50&sort=-updated_on&${stateParams}`;
 
         while (nextUrl) {
-            const res = await fetchBitbucket(nextUrl, this.authHeaders);
+            const res = await fetchBitbucket(nextUrl, this.authHeaders, this.policy);
             const page = (await res.json()) as RawPagedResponse<RawPR>;
 
             let reachedSince = false;

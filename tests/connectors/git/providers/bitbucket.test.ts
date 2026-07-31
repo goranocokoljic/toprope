@@ -2,6 +2,7 @@ import {describe, it, expect, beforeEach, afterEach, vi} from 'vitest';
 import {BitbucketProvider} from '../../../../src/connectors/git/providers/bitbucket';
 import {
     GitProviderFetchError,
+    INTERACTIVE_REQUEST_POLICY,
     MAX_SERVER_ERROR_RETRIES,
     PROBE_SERVER_ERROR_RETRIES,
     isRetryableGitFetchError,
@@ -1415,7 +1416,11 @@ describe('BitbucketProvider', () => {
             // a mistyped host into a ~2.5-minute hang.
             vi.stubGlobal('fetch', vi.fn().mockResolvedValue(serverError(503)));
 
-            const pending = provider.checkAccess();
+            // The interactive budget lives on the CLIENT since #283, not on the call.
+            const probe = new BitbucketProvider(CONFIG_APP_PASSWORD, {
+                policy: INTERACTIVE_REQUEST_POLICY,
+            });
+            const pending = probe.checkAccess();
             void pending.catch(() => {});
             await vi.runAllTimersAsync();
 

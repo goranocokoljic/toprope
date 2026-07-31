@@ -11,6 +11,7 @@ import {hashPassword} from '../../src/auth/password';
 import {SESSION_COOKIE} from '../../src/auth/cookies';
 import type {GitConnectorConfig} from '../../src/config/types';
 import type {GitProvider, GitProviderConfig, GitRepo} from '../../src/connectors/git/providers/types';
+import {INTERACTIVE_REQUEST_POLICY} from '../../src/connectors/git/providers/http-retry';
 
 // Stub createGitProvider so no test hits the network, but keep
 // validateGitProviderConfig real so the store/codec that seed + decrypt DB
@@ -184,13 +185,17 @@ describe('admin git-provider test + repos API (#198)', () => {
             expect(res.statusCode).toBe(200);
             expect(res.json()).toEqual({ok: true});
             expect(provider.checkAccess).toHaveBeenCalledTimes(1);
-            // The stored token was decrypted and handed to the factory.
+            // The stored token was decrypted and handed to the factory — with the INTERACTIVE
+            // budget (#283). #272 already gave the probe a zero TRANSIENT budget; the
+            // rate-limit half could still sleep to a reset instant, up to an hour, three times,
+            // inside this one request.
             expect(createGitProvider).toHaveBeenCalledWith(
                 expect.objectContaining({
                     type: 'github',
                     org: 'db-org',
                     auth: expect.objectContaining({api_token: 'ghp_dbSECRET_TOKEN_ABCD'}),
                 }),
+                {policy: INTERACTIVE_REQUEST_POLICY},
             );
         });
 
@@ -231,6 +236,7 @@ describe('admin git-provider test + repos API (#198)', () => {
             // The config provider's inline token reached the factory (no DB, no key needed).
             expect(createGitProvider).toHaveBeenCalledWith(
                 expect.objectContaining({auth: expect.objectContaining({api_token: CONFIG_TOKEN})}),
+                {policy: INTERACTIVE_REQUEST_POLICY},
             );
         });
 
@@ -279,6 +285,7 @@ describe('admin git-provider test + repos API (#198)', () => {
                     org: 'draft-org',
                     auth: expect.objectContaining({api_token: 'ghp_DRAFT_TOKEN_5555'}),
                 }),
+                {policy: INTERACTIVE_REQUEST_POLICY},
             );
             // ...but nothing was written (provider count unchanged, config-only).
             expect(await countProviders()).toBe(before);
@@ -307,6 +314,7 @@ describe('admin git-provider test + repos API (#198)', () => {
             expect(res.json()).toEqual({ok: true});
             expect(createGitProvider).toHaveBeenCalledWith(
                 expect.objectContaining({type: 'gitlab', group: 'grp', url: 'https://gitlab.internal.acme.dev'}),
+                {policy: INTERACTIVE_REQUEST_POLICY},
             );
         });
 
@@ -405,6 +413,28 @@ describe('admin git-provider test + repos API (#198)', () => {
             ]);
             // The archived flag is surfaced so the UI can exclude archived by default.
             expect(repos.find((r) => r.slug === 'legacy-svc')?.archived).toBe(true);
+        });
+
+        it('builds the client with the INTERACTIVE budget, not a sync budget (#283)', async () => {
+            // This listing happens inside one HTTP request the repo picker is blocked on, and
+            // it used to take a SYNC's retry budget: a provider answering `503 Retry-After:
+            // 3600` parked it ~10 minutes PER PAGE, and a 429 for up to three hours — long
+            // after the browser or a proxy had given up. Asserted at the FACTORY seam because
+            // that is where the choice is made; what the budget then does is pinned in
+            // `providers/request-policy.test.ts`.
+            const id = await createGithub();
+            const createGitProvider = await getCreateGitProvider();
+            createGitProvider.mockReturnValue(makeMockProvider());
+
+            await app.inject({
+                method: 'GET',
+                url: `/api/admin/git/providers/${id}/repos`,
+                headers: authHeaders(adminToken),
+            });
+
+            expect(createGitProvider).toHaveBeenCalledWith(expect.anything(), {
+                policy: INTERACTIVE_REQUEST_POLICY,
+            });
         });
 
         it('returns an empty list when the provider has no repos', async () => {

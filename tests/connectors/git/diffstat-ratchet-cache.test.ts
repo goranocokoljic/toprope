@@ -24,7 +24,10 @@ import {addTeam} from '../../../src/registry/teams';
 import {addDeveloper} from '../../../src/registry/developers';
 import {
     DIFFSTAT_CACHE_DEGRADED_PREFIX,
+    GIT_REPO_RETRY_DELAYS_MS,
+    GIT_RUN_WALL_CLOCK_BUDGET_MS,
     GitSync,
+    RUN_DEADLINE_PREFIX,
     isAdvisoryError,
     syncStateKey,
 } from '../../../src/connectors/git/sync';
@@ -412,6 +415,20 @@ const PROVIDERS: ProviderCase[] = [
     },
 ];
 
+/**
+ * Each provider's repo COMMIT-LIST url, as distinct from its per-commit endpoint (#283).
+ *
+ * Anchored on the query string, which is what separates the two on GitHub
+ * (`/commits?per_page=…` vs `/commits/{sha}`); the other two use different path segments
+ * entirely. Kept beside {@link PROVIDERS} rather than inside the fetch stubs because the stubs
+ * log SHAS, and this is the one assertion that needs the raw urls.
+ */
+const LIST_PAGE_URL: Record<GitProviderType, RegExp> = {
+    bitbucket: /\/repositories\/test-ws\/repo1\/commits\?/,
+    github: /\/repos\/test-org\/repo1\/commits\?/,
+    gitlab: /\/repository\/commits\?/,
+};
+
 // --- Shared helpers ----------------------------------------------------------------------
 
 /** Runs one sync to completion, draining the request- and repo-level pauses on the fake clock. */
@@ -620,6 +637,114 @@ describe('#273 per-commit diffstat ratchet cache', () => {
             db.close();
         });
     }
+
+    // --- #283: what a repo RETRY actually costs, stated exactly ---------------------------
+
+    for (const provider of PROVIDERS) {
+        it(`${provider.name}: an in-run repo retry re-pages the commit LIST but not the fan-out (#283)`, async () => {
+            // #272's own docs called an unresumable `getCommits` a residual — "a retry
+            // re-issues the repo's whole O(commits) detail fan-out" — and #283 is titled for
+            // closing it. It was in fact closed by #273: the memo is written per commit
+            // OUTSIDE the run transaction, so a retry pays only for what never succeeded.
+            //
+            // The sibling test above pins the fan-out half by sha. This pins the SHAPE of the
+            // retry, which is the claim #283's docs now make and which nothing else measures:
+            // the list IS re-paged once per attempt (so the claim is not overstated — it is
+            // O(pages + failures), not O(failures)), and the per-commit endpoint is NOT.
+            const db = makeDb();
+            seedAlice(db);
+            const log = makeLog();
+            // The LAST sha fails all run: the first four are memoized before the fault, so a
+            // retry that re-issued the fan-out would show four extra per-commit requests.
+            log.failing.add(SHAS[4]);
+            const fetchMock = provider.fetchFor(log);
+            vi.stubGlobal('fetch', fetchMock);
+
+            await runSync(db, provider.config);
+
+            const urls = fetchMock.mock.calls.map((c) => String(c[0]));
+            const listPages = urls.filter((u) => LIST_PAGE_URL[provider.type].test(u)).length;
+            // Attempt + the two GIT_REPO_RETRY_DELAYS_MS retries: three walks of the list.
+            expect(listPages).toBe(1 + GIT_REPO_RETRY_DELAYS_MS.length);
+            // The four commits that succeeded were fetched exactly once ACROSS all three
+            // attempts — the fan-out did not repeat.
+            for (const sha of SHAS.slice(0, 4)) expect(log.countAll(sha)).toBe(1);
+            // Only the never-successful commit was re-attempted — and it alone carries the
+            // request layer's own 5xx budget on top of each repo attempt, which is the other
+            // multiplier #283 bounds with a wall clock.
+            expect(log.countAll(SHAS[4])).toBe(
+                (1 + GIT_REPO_RETRY_DELAYS_MS.length) * (1 + MAX_SERVER_ERROR_RETRIES),
+            );
+
+            db.close();
+        });
+    }
+
+    // --- #283: the deadline converges BECAUSE of this memo -------------------------------
+
+    it('a run cut off by the wall-clock deadline keeps its diffstats, and the next run finishes', async () => {
+        // The claim that licenses #283's hard cut-off at all — quoted in
+        // `GIT_RUN_WALL_CLOCK_BUDGET_MS` and in `GitRunDeadline`: a deadline is safe only
+        // because the memo survives #231's drop-partials rule, so consecutive runs redo
+        // strictly less. Until now that rested entirely on prose and on analogy with the 503
+        // case; a future "clean up after a failed run" step that purged the memo on the
+        // deadline path would leave every other assertion in this file green while turning a
+        // large repo into a permanent brick.
+        const db = makeDb();
+        seedAlice(db);
+        const log = makeLog();
+        const base = bitbucketFetch(log);
+        // Burn the run's whole wall clock partway through the fan-out. The NEXT request then
+        // trips `assertRunTimeRemaining` inside the provider — the request-layer check, not the
+        // repo-loop one — so this exercises the deadline exactly where it really lands.
+        const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+            if (/\/diffstat\//.test(String(url)) && log.ok.length === 2) {
+                vi.setSystemTime(new Date(Date.now() + GIT_RUN_WALL_CLOCK_BUDGET_MS + 1));
+            }
+            return base(url, init);
+        });
+        vi.stubGlobal('fetch', fetchMock);
+
+        const first = await runSync(db, BITBUCKET_CONFIG);
+
+        // #231 in full: the window was not covered, so nothing was written and no cursor moved.
+        // The PREFIX, not a 'wall-clock budget' substring: the pause-refusal suffix contains
+        // that phrase too, so the looser match could not tell which mechanism stopped the run
+        // — and the point of this test is that `assertRunTimeRemaining` fired inside the
+        // provider.
+        expect(first.errors.some((e) => e.startsWith(RUN_DEADLINE_PREFIX))).toBe(true);
+        expect(countRows(db, 'raw_author_daily')).toBe(0);
+        expect(countRows(db, 'git_snapshots')).toBe(0);
+        expect(
+            db
+                .prepare('SELECT value FROM sync_state WHERE key = ?')
+                .get(syncStateKey('bitbucket', 'test-ws')),
+        ).toBeUndefined();
+        // …but the diffstats fetched before the cut-off survived. THAT is the ratchet.
+        const kept = cachedRows(db).map((r) => r.sha);
+        expect(kept.length).toBeGreaterThan(0);
+
+        // --- Run 2, with a fresh deadline ---------------------------------------------
+        log.reset();
+        const second = await runSync(db, BITBUCKET_CONFIG);
+
+        expect(second.errors.filter((e) => !isAdvisoryError(e))).toEqual([]);
+        // It redid strictly less: not one of the memoized shas was re-requested.
+        for (const sha of kept) expect(log.countAll(sha)).toBe(0);
+        expect([...new Set(log.all)].sort()).toEqual(SHAS.filter((s) => !kept.includes(s)).sort());
+        // And it finished — cursor advanced, every commit's churn present including the ones
+        // it never re-fetched.
+        expect(
+            db.prepare('SELECT commits FROM git_snapshots').get(),
+        ).toEqual({commits: SHAS.length});
+        expect(
+            db
+                .prepare('SELECT value FROM sync_state WHERE key = ?')
+                .get(syncStateKey('bitbucket', 'test-ws')),
+        ).toEqual({value: second.lastSyncTime});
+
+        db.close();
+    });
 
     // --- AC3, the hard case: the write TRANSACTION rolls back ------------------------------
 

@@ -36,6 +36,7 @@ import type {SyncResult} from '../../../src/connectors/types';
 import {createProvider} from '../../../src/connectors/git/providers/store';
 import {validateGitProviderConfig} from '../../../src/connectors/git/providers/factory';
 import {loadServerKey} from '../../../src/connectors/git/providers/secret';
+import {SYNC_RETRY_PROFILE} from '../../../src/connectors/git/providers/http-retry';
 import type {GitConnectorConfig} from '../../../src/config/types';
 import type {GitProvider, GitProviderConfig, GitRepo, GitCommit, GitFetchProgress, GitPR, GitReviewComment, GitFileDiff} from '../../../src/connectors/git/providers/types';
 import {NO_AUTHOR_DATE_DROP_REASON} from '../../../src/connectors/git/providers/types';
@@ -53,16 +54,28 @@ const TEST_SECRET_KEY = Buffer.alloc(32, 9).toString('base64');
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../../src/storage/migrations');
 
 /**
- * The SECOND argument every sync-path `createGitProvider` call carries since #273: the
- * persistent per-commit diffstat cache, scoped to this provider's `(type, container)`.
+ * The SECOND argument every sync-path `createGitProvider` call carries: the client options.
  *
- * Matched by SHAPE rather than with `expect.anything()`, because "the pipeline still hands the
- * provider a cache" is itself worth pinning — a regression that dropped it would silently
- * disable the ratchet while every other assertion in this file kept passing.
+ * Two members, both pinned by SHAPE rather than with `expect.anything()`, because each is a
+ * silent-failure risk that no other assertion in this file would catch:
+ *   - `diffstatCache` (#273) — the persistent per-commit memo, scoped to this provider's
+ *     `(type, container)`. Dropping it disables the ratchet with every test still green.
+ *   - `policy.deadline` (#283) — the run's wall clock. Dropping it restores the unbounded
+ *     request-layer sleeping the deadline exists to remove, equally invisibly.
  */
-const DIFFSTAT_CACHE_ARG = expect.objectContaining({
-    load: expect.any(Function),
-    put: expect.any(Function),
+const CLIENT_OPTIONS_ARG = expect.objectContaining({
+    diffstatCache: expect.objectContaining({
+        load: expect.any(Function),
+        put: expect.any(Function),
+    }),
+    policy: expect.objectContaining({
+        // The SYNC profile by value, not `expect.any(Number)`: the shape matcher accepted
+        // `{transient: 0, rateLimit: 0}`, so silently handing the pipeline the INTERACTIVE
+        // budget — losing #272's retry cover on every scheduled sync — would have passed here
+        // and at all four sibling call sites.
+        retries: SYNC_RETRY_PROFILE,
+        deadline: expect.objectContaining({remainingMs: expect.any(Function)}),
+    }),
 });
 
 function makeDb(): Database.Database {
@@ -280,7 +293,7 @@ describe('GitSync', () => {
 
         expect(createGitProvider).toHaveBeenCalledWith(
             expect.objectContaining({type: 'github', org: 'myorg'}),
-            DIFFSTAT_CACHE_ARG,
+            CLIENT_OPTIONS_ARG,
         );
         expect(result.errors).toHaveLength(0);
     });
@@ -371,7 +384,7 @@ describe('GitSync', () => {
         // that the ATTRIBUTION side (asserted above) does not depend on the YAML being tidy.
         expect(createGitProvider).toHaveBeenCalledWith(
             expect.objectContaining({type: 'github', org: '  Test_Org '}),
-            DIFFSTAT_CACHE_ARG,
+            CLIENT_OPTIONS_ARG,
         );
     });
 
@@ -2007,7 +2020,7 @@ describe('GitSync with DB-connected providers (#196)', () => {
                 org: 'db-org',
                 auth: {type: 'token', api_token: 'db-token-1234'},
             }),
-            DIFFSTAT_CACHE_ARG,
+            CLIENT_OPTIONS_ARG,
         );
         // ...and produced snapshots.
         expect(result.errors.filter((e) => !e.includes('Unmatched'))).toHaveLength(0);
@@ -2082,7 +2095,7 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
         // The exact config handed to syncProviders reached the factory (scoped run).
         expect(createGitProvider).toHaveBeenCalledWith(
             expect.objectContaining({type: 'github', org: 'scoped-org'}),
-            DIFFSTAT_CACHE_ARG,
+            CLIENT_OPTIONS_ARG,
         );
         expect(result.errors.filter((e) => !e.includes('Unmatched'))).toHaveLength(0);
         expect(result.snapshotsWritten).toBeGreaterThan(0);
@@ -2132,7 +2145,7 @@ describe('GitSync.syncProviders — explicit provider set (sync-now #199)', () =
         expect(createGitProvider).toHaveBeenCalledTimes(1);
         expect(createGitProvider).toHaveBeenCalledWith(
             expect.objectContaining({org: 'only-org'}),
-            DIFFSTAT_CACHE_ARG,
+            CLIENT_OPTIONS_ARG,
         );
     });
 
