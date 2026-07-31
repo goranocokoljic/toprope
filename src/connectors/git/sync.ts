@@ -27,6 +27,7 @@ import {
 import {resolveAllGitProviders} from './providers/resolve.js';
 import type {GitRunDeadline} from './providers/http-retry.js';
 import {
+    GitRunDeadlineError,
     SYNC_RETRY_PROFILE,
     createRunDeadline,
     isRetryableGitFetchError,
@@ -587,13 +588,25 @@ export const GIT_RUN_BEST_EFFORT_RETRY_SLEEP_BUDGET_MS = 20 * 60_000;
  * operator should quote for a scheduled git sync is ~8 hours + the 5-minute retry pause — well
  * inside the daily cadence, and now genuinely a ceiling rather than an estimate.
  *
+ * The USABLE budget is smaller than the number for a rate-limited org, and deliberately so: a
+ * pause is refused rather than truncated (see `sleepWithinRun`), so a run with 50 minutes left
+ * that meets a 55-minute rate-limit reset stops there. Truncating instead would spend the last
+ * 50 minutes and still not have waited the wall out. Read this as "at most four hours", not "a
+ * guaranteed four hours of fetching".
+ *
  * A run that hits it fails like any other incompletely-covered window: #231 holds the cursor
  * and drops the run's partial snapshots. That is only sound because of #273 — every per-commit
  * diffstat the run fetched is memoized OUTSIDE the write transaction, so the next run re-pages
- * the commit lists and serves the whole fan-out from the memo. Consecutive runs ratchet
- * forward; a repo too large for one run is imported across several rather than failing
- * identically forever. See {@link GitRunDeadline} for the same argument from the request
- * layer's side.
+ * the commit lists and serves the whole fan-out from the memo, redoing strictly less of the
+ * dominant cost each time.
+ *
+ * That ratchet covers the per-commit fan-out and NOTHING ELSE: the commit-list paging and the
+ * per-PR review fan-out are re-paid in full every run, so convergence holds iff the un-memoized
+ * work for one window fits in the budget. {@link GIT_CATCHUP_WINDOW_MAX_DAYS} bounds that window
+ * to 30 days on any cursor-resuming run, which is what makes the condition hold in practice; a
+ * first sync is deliberately uncapped, so an initial import too large for one run stops at the
+ * same place until an operator narrows it — which is why {@link runDeadlineLine} names that lever.
+ * See {@link GitRunDeadline} for the same argument from the request layer's side.
  */
 export const GIT_RUN_WALL_CLOCK_BUDGET_MS = 4 * 60 * 60_000;
 
@@ -631,6 +644,13 @@ export const RUN_DEADLINE_PREFIX = 'Run stopped at its wall-clock budget:';
  *
  * Exported so the test asserts against the string the code emits rather than a copy of it —
  * the same reason `autoCreateFailureLine` is.
+ *
+ * The last sentence is deliberately CONDITIONAL rather than a promise (#283 review, SO-2).
+ * Only the per-commit detail fan-out is memoized; the commit-list paging and the whole per-PR
+ * review fan-out are re-paid in full every run. So "the next run gets further" holds for the
+ * memoized half and is not unconditional overall — if the un-memoized work alone exceeds the
+ * budget, consecutive runs stop at the same place and the operator needs a lever, which is why
+ * one is named here rather than left for them to infer.
  */
 export function runDeadlineLine(
     providerType: GitProviderType,
@@ -642,7 +662,31 @@ export function runDeadlineLine(
         `repo(s) — the run reached its ${Math.round(GIT_RUN_WALL_CLOCK_BUDGET_MS / 60_000)} min ` +
         'limit, so this window was not fully covered: the cursor is held and the whole window is ' +
         're-covered next run. Per-commit diffstats already fetched are kept, so the next run ' +
-        'gets further.'
+        'redoes less. If this repeats with the same repo count, the un-memoized work (commit-list ' +
+        'paging and the per-PR review fan-out) does not fit in one run on its own — narrow the ' +
+        'provider with repos/exclude_repos.'
+    );
+}
+
+/**
+ * The line for a provider the run never reached at all, because an EARLIER provider in the
+ * same run spent the shared wall clock (#283 review, SO-3).
+ *
+ * Its own sentence rather than `runDeadlineLine(type, 0, 0)`, which rendered as "stopped after
+ * 0 of 0 repo(s)" — a phrasing that reads as "this provider has no repositories", the opposite
+ * of the truth (it never got as far as listing them).
+ *
+ * Carries the same {@link RUN_DEADLINE_PREFIX}, so every consumer that classifies a wall-clock
+ * stop sees both shapes, and it is equally a FAILURE: this provider's window is uncovered and
+ * its cursor is held.
+ */
+export function providerNotReachedLine(providerType: GitProviderType): string {
+    return (
+        `${RUN_DEADLINE_PREFIX} [${providerType}] not reached — an earlier provider in this run ` +
+        `spent the shared ${Math.round(GIT_RUN_WALL_CLOCK_BUDGET_MS / 60_000)} min wall-clock ` +
+        'budget, so no request was made for this provider and its cursor is held. Providers are ' +
+        'fetched in configuration order out of ONE budget, so a provider that consistently fills ' +
+        'it will starve every provider after it — reorder or narrow that provider if this repeats.'
     );
 }
 
@@ -1646,6 +1690,26 @@ async function fetchProviderData(
     // provider client carries it into (see `createGitProvider` above).
 
     /**
+     * Did the run's wall clock end any fetch this provider attempted (#283)?
+     *
+     * A RUN-level fact, not a loop-control one, and that distinction is the whole reason it
+     * exists. The obvious implementation — break at the top of the repo loop — only notices a
+     * deadline that leaves another iteration to run, so it misses every expiry on the LAST
+     * repo. And "last repo" is not a corner: the per-PR review fan-out is the largest request
+     * population in a run and it runs at the END of each repo, and a single-repo provider is
+     * an ordinary admin-UI configuration.
+     *
+     * Missing it is not cosmetic. `getPullRequests` and the review fan-out are BEST-EFFORT —
+     * they record an error without clearing {@link commitsComplete} — so a deadline landing
+     * there used to leave `complete: true`, advance the forward cursor past a window whose PR
+     * data was never fetched, and lose it permanently: `getPullRequests` is bounded below by
+     * the cursor, so a PR never touched again is never re-listed, and its `prs_opened` /
+     * `prs_merged` / `review_comments_given` days are gone. Holding the cursor instead costs
+     * a re-fetch of an already-discarded window, which is exactly #231's trade.
+     */
+    let deadlineStopped = false;
+
+    /**
      * Run one repo fetch, retrying it in-run on a fault that could plausibly heal (#272).
      * Returns the value on success, or the LAST fault's message on failure — the one that
      * actually ended the fetch, which is what an operator needs.
@@ -1687,6 +1751,9 @@ async function fetchProviderData(
      * `onRetry` fires before each pause so the caller can reset its progress counter: the
      * count the failed attempt left behind is stale the moment it threw, and leaving it frozen
      * through a 15-minute wait is exactly the "reads as hung" symptom #270 exists to remove.
+     *
+     * Sets `deadlineStopped` when the run's wall clock is what ended a fetch — see the
+     * declaration for why that has to be a RUN-level fact rather than a loop-control one.
      */
     const fetchRepoWithRetry = async <T>(
         run: () => Promise<T>,
@@ -1714,6 +1781,12 @@ async function fetchProviderData(
                 return {value, error: null};
             } catch (err) {
                 const message = err instanceof Error ? err.message : String(err);
+                // The deadline reached this fetch, wherever it was raised — the request layer
+                // (`assertRunTimeRemaining`/`sleepWithinRun`) or the pause refusal below.
+                // Recorded on the RUN rather than left to the loop, because the caller that
+                // needs it is the post-loop check, not this one: a deadline that lands on the
+                // LAST repo's fetch has no next iteration to notice it (#283 review, SO-1).
+                if (err instanceof GitRunDeadlineError) deadlineStopped = true;
                 if (attempt >= GIT_REPO_RETRY_DELAYS_MS.length || !isRetryableGitFetchError(err)) {
                     return {value: null, error: message};
                 }
@@ -1732,6 +1805,7 @@ async function fetchProviderData(
                 // gave up", which sends the operator to the provider instead of to the run's
                 // length — the opposite of the diagnosis.
                 if (runBudget.deadline.remainingMs() <= delay) {
+                    deadlineStopped = true;
                     return {
                         value: null,
                         error:
@@ -1781,7 +1855,7 @@ async function fetchProviderData(
     // "Failed to list repos", which describes the provider rather than the run and would send
     // an operator to check a healthy provider's credentials.
     if (runBudget.deadline.remainingMs() <= 0) {
-        errors.push(runDeadlineLine(providerType, 0, 0));
+        errors.push(providerNotReachedLine(providerType));
         return noWindowCovered();
     }
 
@@ -1908,13 +1982,12 @@ async function fetchProviderData(
     let reposAttempted = 0;
 
     for (const repoName of reposToSync) {
-        // Stop at the run's wall clock with ONE clear line, rather than letting every
-        // remaining repo issue a request that `assertRunTimeRemaining` rejects and push its
-        // own "Failed to fetch commits" (#283). Both routes hold the cursor identically —
-        // this one is simply legible.
+        // Stop at the run's wall clock rather than letting every remaining repo issue a
+        // request that `assertRunTimeRemaining` rejects and push its own "Failed to fetch
+        // commits" (#283). The reporting is done ONCE after the loop, by the block that also
+        // catches a deadline landing on the last repo — see `deadlineStopped`.
         if (runBudget.deadline.remainingMs() <= 0) {
-            commitsComplete = false;
-            errors.push(runDeadlineLine(providerType, reposAttempted, reposToSync.length));
+            deadlineStopped = true;
             break;
         }
         reposAttempted++;
@@ -2196,6 +2269,22 @@ async function fetchProviderData(
             // snapshot) never displays a finished repo's stale "PR 40/40" (#270).
             Object.assign(p, NO_REPO_STEP);
         });
+    }
+
+    // The ONE place a wall-clock stop is turned into an outcome (#283). After the loop, not
+    // inside it, because that is the only position from which every expiry is visible: the
+    // loop-top break sees a deadline with another repo left to run, and this sees the ones
+    // that landed on the LAST repo — including inside the best-effort PR/review fan-out, which
+    // does not clear `commitsComplete` on its own and would otherwise have advanced the cursor
+    // past a PR window it never fetched (#283 review, SO-1/SEC-5).
+    //
+    // Keyed on `deadlineStopped` — "a deadline actually ended a fetch" — rather than on
+    // `remainingMs() <= 0`. A run whose last repo finishes everything just as the clock runs
+    // out covered its window, and holding that cursor would re-fetch a window this run is
+    // about to record, for nothing.
+    if (deadlineStopped) {
+        commitsComplete = false;
+        errors.push(runDeadlineLine(providerType, reposAttempted, reposToSync.length));
     }
 
     // FORMATTED here, EMITTED by the caller — see `ProviderFetchResult.droppedAdvisories` for

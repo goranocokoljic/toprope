@@ -36,6 +36,7 @@ import type {SyncResult} from '../../../src/connectors/types';
 import {createProvider} from '../../../src/connectors/git/providers/store';
 import {validateGitProviderConfig} from '../../../src/connectors/git/providers/factory';
 import {loadServerKey} from '../../../src/connectors/git/providers/secret';
+import {SYNC_RETRY_PROFILE} from '../../../src/connectors/git/providers/http-retry';
 import type {GitConnectorConfig} from '../../../src/config/types';
 import type {GitProvider, GitProviderConfig, GitRepo, GitCommit, GitFetchProgress, GitPR, GitReviewComment, GitFileDiff} from '../../../src/connectors/git/providers/types';
 import {NO_AUTHOR_DATE_DROP_REASON} from '../../../src/connectors/git/providers/types';
@@ -68,10 +69,11 @@ const CLIENT_OPTIONS_ARG = expect.objectContaining({
         put: expect.any(Function),
     }),
     policy: expect.objectContaining({
-        retries: expect.objectContaining({
-            transient: expect.any(Number),
-            rateLimit: expect.any(Number),
-        }),
+        // The SYNC profile by value, not `expect.any(Number)`: the shape matcher accepted
+        // `{transient: 0, rateLimit: 0}`, so silently handing the pipeline the INTERACTIVE
+        // budget — losing #272's retry cover on every scheduled sync — would have passed here
+        // and at all four sibling call sites.
+        retries: SYNC_RETRY_PROFILE,
         deadline: expect.objectContaining({remainingMs: expect.any(Function)}),
     }),
 });

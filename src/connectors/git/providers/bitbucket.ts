@@ -22,7 +22,7 @@ import {
     assertRunTimeRemaining,
     rateLimitDelayMs,
     rateLimitFallbackMs,
-    requestTimeoutSignal,
+    requestTimeout,
     serverErrorDelayMs,
     sleepWithinRun,
 } from './http-retry.js';
@@ -55,8 +55,9 @@ async function fetchBitbucket(
     url: string,
     headers: Record<string, string>,
     // The retry budgets and run deadline the CLIENT was built with (#283) — see the identical
-    // parameter on `fetchGitHub` for why this replaced a per-call transient-only override.
-    policy: GitRequestPolicy = SYNC_REQUEST_POLICY,
+    // parameter on `fetchGitHub` for why this replaced a per-call transient-only override, and
+    // for why it carries no default.
+    policy: GitRequestPolicy,
 ): Promise<Response> {
     let attempt = 0;
     // Transient faults (5xx, transport) get their OWN, much longer budget than the 429
@@ -70,8 +71,11 @@ async function fetchBitbucket(
         // Per ATTEMPT, not only before a pause — see `fetchGitHub` (#283).
         assertRunTimeRemaining(policy, url);
         let res: Response;
+        // Disarmed in `finally` the moment `fetch` settles — the signal bounds the RESPONSE,
+        // never the body the caller reads afterwards. See GIT_REQUEST_TIMEOUT_MS (#283).
+        const timeout = requestTimeout();
         try {
-            res = await fetch(url, {headers, signal: requestTimeoutSignal()});
+            res = await fetch(url, {headers, signal: timeout.signal});
         } catch (err) {
             // A transport fault is the same outage as a 503, seen one layer down — same
             // budget, same backoff. Wrapped so the in-run repo retry (#272) can classify
@@ -87,6 +91,8 @@ async function fetchBitbucket(
                 null,
                 {cause: err},
             );
+        } finally {
+            timeout.clear();
         }
 
         if (res.status === 429) {

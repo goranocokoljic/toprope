@@ -25,6 +25,7 @@ import {addDeveloper} from '../../../src/registry/developers';
 import {
     DIFFSTAT_CACHE_DEGRADED_PREFIX,
     GIT_REPO_RETRY_DELAYS_MS,
+    GIT_RUN_WALL_CLOCK_BUDGET_MS,
     GitSync,
     isAdvisoryError,
     syncStateKey,
@@ -677,6 +678,68 @@ describe('#273 per-commit diffstat ratchet cache', () => {
             db.close();
         });
     }
+
+    // --- #283: the deadline converges BECAUSE of this memo -------------------------------
+
+    it('a run cut off by the wall-clock deadline keeps its diffstats, and the next run finishes', async () => {
+        // The claim that licenses #283's hard cut-off at all — quoted in
+        // `GIT_RUN_WALL_CLOCK_BUDGET_MS` and in `GitRunDeadline`: a deadline is safe only
+        // because the memo survives #231's drop-partials rule, so consecutive runs redo
+        // strictly less. Until now that rested entirely on prose and on analogy with the 503
+        // case; a future "clean up after a failed run" step that purged the memo on the
+        // deadline path would leave every other assertion in this file green while turning a
+        // large repo into a permanent brick.
+        const db = makeDb();
+        seedAlice(db);
+        const log = makeLog();
+        const base = bitbucketFetch(log);
+        // Burn the run's whole wall clock partway through the fan-out. The NEXT request then
+        // trips `assertRunTimeRemaining` inside the provider — the request-layer check, not the
+        // repo-loop one — so this exercises the deadline exactly where it really lands.
+        const fetchMock = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+            if (/\/diffstat\//.test(String(url)) && log.ok.length === 2) {
+                vi.setSystemTime(new Date(Date.now() + GIT_RUN_WALL_CLOCK_BUDGET_MS + 1));
+            }
+            return base(url, init);
+        });
+        vi.stubGlobal('fetch', fetchMock);
+
+        const first = await runSync(db, BITBUCKET_CONFIG);
+
+        // #231 in full: the window was not covered, so nothing was written and no cursor moved.
+        expect(first.errors.some((e) => e.includes('wall-clock budget'))).toBe(true);
+        expect(countRows(db, 'raw_author_daily')).toBe(0);
+        expect(countRows(db, 'git_snapshots')).toBe(0);
+        expect(
+            db
+                .prepare('SELECT value FROM sync_state WHERE key = ?')
+                .get(syncStateKey('bitbucket', 'test-ws')),
+        ).toBeUndefined();
+        // …but the diffstats fetched before the cut-off survived. THAT is the ratchet.
+        const kept = cachedRows(db).map((r) => r.sha);
+        expect(kept.length).toBeGreaterThan(0);
+
+        // --- Run 2, with a fresh deadline ---------------------------------------------
+        log.reset();
+        const second = await runSync(db, BITBUCKET_CONFIG);
+
+        expect(second.errors.filter((e) => !isAdvisoryError(e))).toEqual([]);
+        // It redid strictly less: not one of the memoized shas was re-requested.
+        for (const sha of kept) expect(log.countAll(sha)).toBe(0);
+        expect([...new Set(log.all)].sort()).toEqual(SHAS.filter((s) => !kept.includes(s)).sort());
+        // And it finished — cursor advanced, every commit's churn present including the ones
+        // it never re-fetched.
+        expect(
+            db.prepare('SELECT commits FROM git_snapshots').get(),
+        ).toEqual({commits: SHAS.length});
+        expect(
+            db
+                .prepare('SELECT value FROM sync_state WHERE key = ?')
+                .get(syncStateKey('bitbucket', 'test-ws')),
+        ).toEqual({value: second.lastSyncTime});
+
+        db.close();
+    });
 
     // --- AC3, the hard case: the write TRANSACTION rolls back ------------------------------
 

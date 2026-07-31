@@ -30,7 +30,7 @@ import {
     parseRetryAfterMs,
     rateLimitDelayMs,
     rateLimitFallbackMs,
-    requestTimeoutSignal,
+    requestTimeout,
     serverErrorDelayMs,
     sleepWithinRun,
 } from '../../../../src/connectors/git/providers/http-retry';
@@ -463,10 +463,10 @@ describe('sleepWithinRun (#283)', () => {
     });
 });
 
-describe('requestTimeoutSignal (#283)', () => {
+describe('requestTimeout (#283)', () => {
     it('bounds one request at GIT_REQUEST_TIMEOUT_MS', async () => {
         vi.useFakeTimers();
-        const signal = requestTimeoutSignal();
+        const {signal} = requestTimeout();
         expect(signal.aborted).toBe(false);
 
         // Just short of the timeout it is still live — without this half the assertion below
@@ -480,5 +480,33 @@ describe('requestTimeoutSignal (#283)', () => {
         // of which needs a COMPLETED attempt to count — simply never fires.
         expect(signal.aborted).toBe(true);
         expect((signal.reason as Error).name).toBe('TimeoutError');
+    });
+
+    it('never fires once cleared', async () => {
+        // `clear` is not hygiene, it is correctness. `fetch` resolves on HEADERS; the body is a
+        // stream the caller reads afterwards, and per the Fetch spec an abort while that stream
+        // is open ERRORS it. A signal left armed past `fetch` therefore destroys a body the
+        // caller has not read — and on GitHub's pre-emptive rate-limit path, which sleeps up to
+        // an hour AFTER a 200 and then hands the response back, that is certain rather than
+        // unlikely.
+        vi.useFakeTimers();
+        const {signal, clear} = requestTimeout();
+        clear();
+
+        await vi.advanceTimersByTimeAsync(GIT_REQUEST_TIMEOUT_MS * 10);
+        expect(signal.aborted).toBe(false);
+    });
+
+    it('is a fresh timeout per call, so one request cannot disarm another', () => {
+        vi.useFakeTimers();
+        const first = requestTimeout();
+        const second = requestTimeout();
+        first.clear();
+
+        vi.advanceTimersByTime(GIT_REQUEST_TIMEOUT_MS + 1);
+        expect(first.signal.aborted).toBe(false);
+        // Each attempt must arm its own — a shared one would leave every retry after the first
+        // unbounded, which is the exact hang the timeout exists to prevent.
+        expect(second.signal.aborted).toBe(true);
     });
 });

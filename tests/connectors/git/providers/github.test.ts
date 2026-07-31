@@ -6,6 +6,7 @@ import {
     UNATTRIBUTABLE_DATE_DROP_REASON,
 } from '../../../../src/connectors/git/providers/types';
 import {
+    GIT_REQUEST_TIMEOUT_MS,
     INTERACTIVE_REQUEST_POLICY,
     MAX_SERVER_ERROR_RETRIES,
     PROBE_SERVER_ERROR_RETRIES,
@@ -1725,8 +1726,10 @@ describe('GitHubProvider', () => {
 
             const delays = setTimeoutSpy.mock.calls.map((c) => Number(c[1]));
             expect(delays).not.toContain(1_800_000 + 1_000);
-            // Only the per-request abort timer is scheduled — nothing minute-scale.
-            expect(delays.every((d) => d <= 120_000)).toBe(true);
+            // Only the per-request abort timer is scheduled — nothing minute-scale. Compared
+            // against the constant, not a copy of it: a raised GIT_REQUEST_TIMEOUT_MS must not
+            // break a test about the rate-limit pause.
+            expect(delays.every((d) => d <= GIT_REQUEST_TIMEOUT_MS)).toBe(true);
 
             // POSITIVE CONTROL on the same response: a sync client DOES pause, so the
             // assertions above cannot pass merely because the fixture stopped triggering it.

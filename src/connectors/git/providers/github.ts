@@ -27,7 +27,7 @@ import {
     parseEpochResetMs,
     rateLimitDelayMs,
     rateLimitFallbackMs,
-    requestTimeoutSignal,
+    requestTimeout,
     serverErrorDelayMs,
     sleepWithinRun,
 } from './http-retry.js';
@@ -94,8 +94,10 @@ async function fetchGitHub(
     headers: Record<string, string>,
     // The retry budgets and run deadline the CLIENT was built with (#283) — an interactive
     // probe/listing takes INTERACTIVE_REQUEST_POLICY, a sync fetch the run's own. Carried on
-    // the client rather than overridden per call, so no call site can forget it.
-    policy: GitRequestPolicy = SYNC_REQUEST_POLICY,
+    // the client rather than overridden per call, so no call site can forget it. REQUIRED:
+    // this function is module-private and every call site passes `this.policy`, so a default
+    // would be defensive code for a case that cannot occur.
+    policy: GitRequestPolicy,
 ): Promise<Response> {
     let attempt = 0;
     // Transient faults (5xx, transport) get their own, much longer budget than the rate-limit
@@ -110,8 +112,13 @@ async function fetchGitHub(
         // but promptly-answered work (#283).
         assertRunTimeRemaining(policy, url);
         let res: Response;
+        // Disarmed in `finally`, the moment `fetch` settles either way — the signal bounds the
+        // RESPONSE, never the body the caller reads afterwards. See GIT_REQUEST_TIMEOUT_MS: a
+        // signal left armed erases that body, and the resulting rejection escapes this `try`
+        // unclassified. The pre-emptive pause below makes the window certain, not theoretical.
+        const timeout = requestTimeout();
         try {
-            res = await fetch(url, {headers, signal: requestTimeoutSignal()});
+            res = await fetch(url, {headers, signal: timeout.signal});
         } catch (err) {
             // A transport fault is the same outage as a 503, seen one layer down — same budget,
             // same backoff. Wrapped so the in-run repo retry (#272) can classify it; the message
@@ -127,6 +134,8 @@ async function fetchGitHub(
                 null,
                 {cause: err},
             );
+        } finally {
+            timeout.clear();
         }
 
         if (res.status === 429) {

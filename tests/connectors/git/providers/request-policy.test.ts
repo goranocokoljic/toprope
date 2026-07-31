@@ -23,10 +23,12 @@ import type {
 import type {GitRequestPolicy} from '../../../../src/connectors/git/providers/http-retry';
 import {
     GIT_REQUEST_TIMEOUT_MS,
+    GitProviderFetchError,
     GitRunDeadlineError,
     INTERACTIVE_REQUEST_POLICY,
     MAX_RATE_LIMIT_RETRIES,
     SYNC_RETRY_PROFILE,
+    isRetryableGitFetchError,
 } from '../../../../src/connectors/git/providers/http-retry';
 import {
     BITBUCKET_CONFIG,
@@ -172,24 +174,126 @@ describe.each(CASES)('$type request policy (#283)', ({config, serverErrorMessage
         });
     });
 
-    it('bounds every request with an abort signal', async () => {
+    it('fails a 403 rate limit on the first response — the branch GitHub actually uses', async () => {
+        // GitHub signals its PRIMARY rate limit with 403 + `x-ratelimit-remaining: 0`, not 429,
+        // so this — not the 429 case above — is the branch a real repo-picker or `doctor` call
+        // hits. Bitbucket and GitLab have no 403 rate-limit branch, so for them this is just
+        // another non-retryable 4xx; asserting one request either way is still the right claim,
+        // and running it across the table is what stops the GitHub branch being missed.
         vi.useFakeTimers();
-        const fetchMock = stubStatus(503);
+        const reset = String(Math.floor(Date.now() / 1000) + 3600);
+        const fetchMock = stubStatus(403, {'x-ratelimit-remaining': '0', 'x-ratelimit-reset': reset});
 
-        // The interactive policy never retries, so this settles with no timer to drain — which
-        // matters here: `runAllTimersAsync()` would also fire the request timeout below and
-        // the "live at issue time" half of the assertion could not fail.
+        const pending = createGitProvider(config, {
+            policy: INTERACTIVE_REQUEST_POLICY,
+        }).listRepos();
+        void pending.catch(() => {});
+        await vi.runAllTimersAsync();
+
+        await expect(pending).rejects.toThrow(/403/);
+        expect(fetchMock.mock.calls).toHaveLength(1);
+    });
+
+    it('fails a 403 SECONDARY rate limit on the first response too', async () => {
+        vi.useFakeTimers();
+        const fetchMock = stubStatus(403, {'retry-after': '3600'});
+
+        const pending = createGitProvider(config, {
+            policy: INTERACTIVE_REQUEST_POLICY,
+        }).listRepos();
+        void pending.catch(() => {});
+        await vi.runAllTimersAsync();
+
+        await expect(pending).rejects.toThrow(/403/);
+        expect(fetchMock.mock.calls).toHaveLength(1);
+    });
+
+    it('disarms the request timeout as soon as fetch settles', async () => {
+        // The signal bounds the RESPONSE only. `fetch` resolves on HEADERS; the body is a
+        // stream the caller reads afterwards (`await res.json()`, outside these loops), and per
+        // the Fetch spec an abort while that stream is open ERRORS it. A signal left armed
+        // therefore destroys the body — and the rejection escapes the provider's `try`
+        // unwrapped, so `isRetryableGitFetchError` fails closed and #231 discards the run.
+        // GitHub's pre-emptive pause makes that certain: it sleeps up to an hour AFTER a 200
+        // and then hands the response back.
+        vi.useFakeTimers();
+        const signals: AbortSignal[] = [];
+        vi.stubGlobal(
+            'fetch',
+            vi.fn().mockImplementation((_url: string, init: RequestInit) => {
+                signals.push(init.signal as AbortSignal);
+                return Promise.resolve({
+                    ok: false,
+                    status: 503,
+                    headers: new Headers(),
+                    json: () => Promise.resolve([]),
+                    text: () => Promise.resolve('boom'),
+                } as unknown as Response);
+            }),
+        );
+
         await expect(
             createGitProvider(config, {policy: INTERACTIVE_REQUEST_POLICY}).listRepos(),
         ).rejects.toThrow(serverErrorMessage);
 
-        const init = fetchMock.mock.calls[0][1] as RequestInit;
-        const signal = init.signal as AbortSignal;
-        expect(signal).toBeInstanceOf(AbortSignal);
-        // Live at issue time and aborting at the bound — a socket that connects and then
-        // stalls produces no response at all, so no RETRY budget can ever fire for it.
-        expect(signal.aborted).toBe(false);
-        await vi.advanceTimersByTimeAsync(GIT_REQUEST_TIMEOUT_MS + 1);
-        expect(signal.aborted).toBe(true);
+        expect(signals).toHaveLength(1);
+        // Long past the bound, and still not aborted — because it was cleared.
+        await vi.advanceTimersByTimeAsync(GIT_REQUEST_TIMEOUT_MS * 3);
+        expect(signals[0].aborted).toBe(false);
+    });
+
+    it('aborts a request whose response never arrives, and treats it as a transient fault', async () => {
+        // The gap the timeout closes is SILENCE: a socket that connects and never answers
+        // produces no response and no error, so every retry budget — each of which needs a
+        // COMPLETED attempt to count — simply never fires. This stub honours the signal the way
+        // a real `fetch` does, so the assertion covers the whole path rather than the timer.
+        vi.useFakeTimers();
+        const fetchMock = vi.fn().mockImplementation(
+            (_url: string, init: RequestInit) =>
+                new Promise((_resolve, reject) => {
+                    const signal = init.signal as AbortSignal;
+                    signal.addEventListener('abort', () => reject(signal.reason));
+                }),
+        );
+        vi.stubGlobal('fetch', fetchMock);
+
+        const pending = createGitProvider(config, {
+            policy: INTERACTIVE_REQUEST_POLICY,
+        }).listRepos();
+        void pending.catch(() => {});
+        await vi.runAllTimersAsync();
+
+        // Classified as the transport fault it is — the message is preserved verbatim, and the
+        // interactive budget declines to retry it.
+        await expect(pending).rejects.toThrow(
+            new RegExp(`exceeded ${GIT_REQUEST_TIMEOUT_MS} ms with no response`),
+        );
+        const err = await pending.catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(GitProviderFetchError);
+        // `status: null` — a transport fault, so the in-run repo retry may still try it.
+        expect((err as GitProviderFetchError).status).toBeNull();
+        expect(isRetryableGitFetchError(err)).toBe(true);
+        expect(fetchMock.mock.calls).toHaveLength(1);
+    });
+
+    it('POSITIVE CONTROL: a sync client retries that stalled request its full transient budget', async () => {
+        vi.useFakeTimers();
+        const fetchMock = vi.fn().mockImplementation(
+            (_url: string, init: RequestInit) =>
+                new Promise((_resolve, reject) => {
+                    const signal = init.signal as AbortSignal;
+                    signal.addEventListener('abort', () => reject(signal.reason));
+                }),
+        );
+        vi.stubGlobal('fetch', fetchMock);
+
+        const pending = createGitProvider(config).listRepos();
+        void pending.catch(() => {});
+        await vi.runAllTimersAsync();
+        await expect(pending).rejects.toThrow(/with no response/);
+
+        // Each attempt arms its own fresh timeout — without that, only the first would ever
+        // abort and the rest would hang forever.
+        expect(fetchMock.mock.calls).toHaveLength(1 + SYNC_RETRY_PROFILE.transient);
     });
 });

@@ -29,10 +29,14 @@ import {
     GitSync,
     RUN_DEADLINE_PREFIX,
     isAdvisoryError,
+    providerNotReachedLine,
     runDeadlineLine,
     syncStateKey,
 } from '../../../src/connectors/git/sync';
-import {GitProviderFetchError} from '../../../src/connectors/git/providers/http-retry';
+import {
+    GitProviderFetchError,
+    GitRunDeadlineError,
+} from '../../../src/connectors/git/providers/http-retry';
 import type {
     GitCommit,
     GitProvider,
@@ -122,8 +126,19 @@ function readState(db: Database.Database, key: string): string | undefined {
         | undefined)?.value;
 }
 
+/**
+ * Rows in `git_snapshots` AND in `raw_author_daily`.
+ *
+ * Both, because `git_snapshots` is a PROJECTION: `raw_author_daily` is the source of record,
+ * and it is the table whose additive merge (`upsertRawAuthorDaily`, no dedup guard) turns a
+ * partial write into a permanent double-count on the next run. That is the reason #231's
+ * drop-partials rule exists at all, so asserting only the projection would leave the table
+ * that actually matters unchecked.
+ */
 function snapshotCount(db: Database.Database): number {
-    return (db.prepare('SELECT COUNT(*) AS n FROM git_snapshots').get() as {n: number}).n;
+    const snapshots = (db.prepare('SELECT COUNT(*) AS n FROM git_snapshots').get() as {n: number}).n;
+    const raw = (db.prepare('SELECT COUNT(*) AS n FROM raw_author_daily').get() as {n: number}).n;
+    return snapshots + raw;
 }
 
 describe('run wall-clock budget (#283)', () => {
@@ -223,7 +238,11 @@ describe('run wall-clock budget (#283)', () => {
         // have been recorded as "[gitlab] Failed to list repos", sending an operator to check a
         // perfectly healthy provider's credentials.
         expect(gitlabListRepos).not.toHaveBeenCalled();
-        expect(result.errors).toContain(runDeadlineLine('gitlab', 0, 0));
+        // Its OWN sentence, not `runDeadlineLine(type, 0, 0)` — which rendered as "stopped
+        // after 0 of 0 repo(s)", reading as "this provider has no repositories" when the truth
+        // is that it never got as far as listing them.
+        expect(result.errors).toContain(providerNotReachedLine('gitlab'));
+        expect(result.errors.some((e) => e.includes('0 of 0'))).toBe(false);
         expect(result.errors.some((e) => e.includes('Failed to list repos'))).toBe(false);
         // Completeness is per PROVIDER, and the deadline does not change that: github covered
         // every one of its repos before the clock ran out, so its cursor advances and its data
@@ -231,6 +250,90 @@ describe('run wall-clock budget (#283)', () => {
         // both would re-fetch github's whole window into an ADDITIVE commit merge next run.
         expect(readState(db, FORWARD_KEY)).toBe(result.lastSyncTime);
         expect(readState(db, syncStateKey('gitlab', 'test-group'))).toBeUndefined();
+    });
+
+    it('holds the cursor when the deadline lands on the LAST repo, not just before a next one', async () => {
+        // The loop-top break only ever sees a deadline that leaves another iteration to run.
+        // A single-repo provider — an ordinary admin-UI configuration — has none, so without a
+        // post-loop check the run reported a commit-fetch failure, left `commitsComplete`
+        // untouched by any deadline logic, and never emitted the wall-clock line at all.
+        seedAlice(db);
+        const createGitProvider = await getCreateGitProvider();
+        createGitProvider.mockReturnValue(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('only-repo')]),
+                getCommits: vi.fn().mockImplementation(async () => {
+                    burnTheBudget();
+                    throw new GitRunDeadlineError(
+                        'git sync run exceeded its wall-clock budget before requesting https://api/x',
+                    );
+                }),
+            }),
+        );
+
+        const result = await runSync(db);
+
+        expect(result.errors).toContain(runDeadlineLine('github', 1, 1));
+        expect(readState(db, FORWARD_KEY)).toBeUndefined();
+        expect(snapshotCount(db)).toBe(0);
+    });
+
+    it('holds the cursor when the deadline lands in the BEST-EFFORT PR fan-out of the last repo', async () => {
+        // The sharpest version, and the one that silently lost data. `getPullRequests` and the
+        // review fan-out deliberately do NOT clear `commitsComplete` — their failure is
+        // recorded and the run continues. So a deadline landing there used to leave
+        // `complete: true`, advance the forward cursor past a window whose PRs were never
+        // fetched, and lose them permanently: `getPullRequests` is bounded below by the cursor,
+        // so a PR not touched again is never re-listed.
+        seedAlice(db);
+        const createGitProvider = await getCreateGitProvider();
+        createGitProvider.mockReturnValue(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('only-repo')]),
+                // Commits succeed in full — this is NOT a commit-fetch failure.
+                getCommits: vi.fn().mockResolvedValue([makeCommit('c-1')]),
+                getPullRequests: vi.fn().mockImplementation(async () => {
+                    burnTheBudget();
+                    throw new GitRunDeadlineError(
+                        'git sync run exceeded its wall-clock budget before requesting https://api/pulls',
+                    );
+                }),
+            }),
+        );
+
+        const result = await runSync(db);
+
+        expect(result.errors).toContain(runDeadlineLine('github', 1, 1));
+        // The cursor is HELD even though every commit fetch succeeded — re-covering an
+        // already-discarded window is #231's trade, and it is far cheaper than a permanently
+        // missing PR day.
+        expect(readState(db, FORWARD_KEY)).toBeUndefined();
+        expect(snapshotCount(db)).toBe(0);
+    });
+
+    it('does NOT hold the cursor when the clock merely ran out on a fully covered window', async () => {
+        // The other side of the same decision, and the reason the post-loop check keys on "a
+        // deadline actually ended a fetch" rather than on `remainingMs() <= 0`. A run whose
+        // last repo finishes everything just as the clock expires covered its window; holding
+        // that cursor would re-fetch a window this run is about to record, for nothing.
+        seedAlice(db);
+        const createGitProvider = await getCreateGitProvider();
+        createGitProvider.mockReturnValue(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('only-repo')]),
+                getCommits: vi.fn().mockImplementation(async () => {
+                    burnTheBudget();
+                    return [makeCommit('c-1')];
+                }),
+            }),
+        );
+
+        const result = await runSync(db);
+
+        expect(result.errors.filter((e) => !isAdvisoryError(e))).toHaveLength(0);
+        expect(result.errors.some((e) => e.startsWith(RUN_DEADLINE_PREFIX))).toBe(false);
+        expect(readState(db, FORWARD_KEY)).toBe(result.lastSyncTime);
+        expect(snapshotCount(db)).toBeGreaterThan(0);
     });
 
     it('refuses a repo-retry pause the remaining budget cannot absorb, and says why', async () => {

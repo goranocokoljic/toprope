@@ -121,6 +121,11 @@ describe('createConnectorTick in-flight guard (#283)', () => {
         });
         const connector: ConnectorInterface = {
             getName: () => 'git',
+            // Part of ConnectorInterface. Present rather than omitted even though `runPipeline`
+            // never calls it: `tsconfig.json` excludes `tests` and Vitest does not type-check,
+            // so an incomplete stub compiles — and a stub that lies about the type is exactly
+            // what widening `makeConnector` to `ConnectorInterface` was meant to make honest.
+            getLastSyncTime: () => null,
             sync: async () => {
                 calls++;
                 await gate;
@@ -136,8 +141,8 @@ describe('createConnectorTick in-flight guard (#283)', () => {
         return {connector, syncCalls: () => calls, release};
     }
 
-    function entryFor(connector: ConnectorInterface): ScheduledConnector {
-        return {name: 'git', enabled: true, syncTime: '03:30', makeConnector: () => connector};
+    function entryFor(connector: ConnectorInterface, name = 'git'): ScheduledConnector {
+        return {name, enabled: true, syncTime: '03:30', makeConnector: () => connector};
     }
 
     it('skips a tick that fires while the previous run is still going', async () => {
@@ -161,6 +166,30 @@ describe('createConnectorTick in-flight guard (#283)', () => {
 
         release();
         await first;
+    });
+
+    it('guards each connector separately — a long git run does not suppress copilot', async () => {
+        // `startScheduler` builds one tick closure PER entry, so the guard is per connector.
+        // Hoisting `inFlight` to module scope — the obvious "simplification" — keeps every
+        // other test in this block green while a 4-hour git run silently swallows that day's
+        // copilot, claude-code, windsurf and cursor ticks.
+        const git = makeBlockingConnector();
+        const copilot = makeBlockingConnector();
+        copilot.release();
+        const gitTick = createConnectorTick(entryFor(git.connector, 'git'), dbPath);
+        const copilotTick = createConnectorTick(entryFor(copilot.connector, 'copilot'), dbPath);
+
+        const gitRun = gitTick();
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(git.syncCalls()).toBe(1);
+
+        await copilotTick();
+        expect(copilot.syncCalls()).toBe(1);
+        expect(console.warn).not.toHaveBeenCalled();
+
+        git.release();
+        await gitRun;
     });
 
     it('runs the NEXT tick once the previous one has finished', async () => {

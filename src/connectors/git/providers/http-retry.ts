@@ -86,9 +86,10 @@ export function rateLimitFallbackMs(attempt: number): number {
  * the way it looks — {@link serverErrorDelayMs} honors `Retry-After` as a floor, so one retry
  * against a host answering `503 Retry-After: 3600` (an utterly ordinary maintenance response,
  * and for self-hosted GitLab the host is admin-supplied) waits the full
- * {@link SERVER_ERROR_MAX_DELAY_MS}. There is no fetch-level timeout to cut that short, so the
- * request just hangs for two minutes and the browser or proxy gives up first — which is the
- * very symptom this constant was introduced to remove.
+ * {@link SERVER_ERROR_MAX_DELAY_MS} — two minutes of pure sleeping, after which the browser or
+ * proxy has usually given up first. {@link GIT_REQUEST_TIMEOUT_MS} (#283) does not shorten that:
+ * it bounds how long one request may wait for a RESPONSE, not how long the retry policy may
+ * sleep between requests. Only a zero budget removes the symptom this constant exists for.
  *
  * The trade is explicit: a probe now reports a one-off blip as unreachable. That is the right
  * failure for a cheap, idempotent, re-runnable check — and the sync itself, where a blip
@@ -169,9 +170,19 @@ export const INTERACTIVE_RETRY_PROFILE: GitRetryProfile = {
  * cursor and discards the run's partial snapshots, exactly as any other failure does. But the
  * per-commit diffstat memo (`commit_diffstats`) is written per commit OUTSIDE the run's write
  * transaction, so every commit detail the run did fetch is kept. The next run re-pages the
- * commit lists (O(pages)) and serves the whole fan-out from the memo — so consecutive runs
- * ratchet forward and one of them finishes. Without that memo a deadline would have been a
- * brick: a repo too big for the budget would fail identically forever.
+ * commit lists (O(pages)) and serves the whole fan-out from the memo — so each run redoes
+ * strictly less of the dominant cost than the last. Without that memo a deadline would have
+ * been a brick: a repo too big for the budget would fail identically forever.
+ *
+ * WHAT THAT DOES *NOT* PROMISE, stated because the ratchet is easy to over-read. Only the
+ * per-commit fan-out is memoized. The commit-LIST paging and the entire per-PR review fan-out
+ * (`getPullRequests` + two calls per PR) have no memo and are re-paid in full on every run. So
+ * convergence is conditional, not guaranteed: it holds iff the UN-memoized work for one window
+ * fits inside the budget. `GIT_CATCHUP_WINDOW_MAX_DAYS` bounds that window to 30 days on any
+ * cursor-resuming run, which is what makes the condition hold in practice; a FIRST sync is
+ * deliberately uncapped (see `SyncRunOptions.firstSyncWindowMonths`), so an initial import whose
+ * un-memoized work alone exceeds the budget will stop at the same place every run until the
+ * operator narrows it. `runDeadlineLine` names that lever rather than leaving it to be inferred.
  *
  * An interface rather than a bare instant so tests can drive it without a fake clock, and so
  * the sync's `runBudget` can own construction.
@@ -223,14 +234,35 @@ export const SYNC_REQUEST_POLICY: GitRequestPolicy = {retries: SYNC_RETRY_PROFIL
 export const INTERACTIVE_REQUEST_POLICY: GitRequestPolicy = {retries: INTERACTIVE_RETRY_PROFILE};
 
 /**
- * Ceiling on ONE HTTP request, enforced by an `AbortSignal` handed to `fetch`.
+ * Ceiling on how long ONE HTTP request may take to produce a RESPONSE, enforced by an
+ * `AbortSignal` handed to `fetch`.
  *
- * The gap it closes is not slowness but silence: a socket that connects and then stalls
- * produces no response and no error, so a request could hang indefinitely and no budget on
- * this page applied — they all bound RETRIES, which need a completed attempt to count. Two
- * minutes is far beyond any healthy response from these APIs (the slowest in-tree call is a
- * 100-item list page) while still being long enough that a merely slow provider is not
- * mistaken for a dead one.
+ * The gap it closes is not slowness but silence: a socket that connects and then never
+ * answers produces no response and no error, so a request could hang indefinitely and no
+ * budget on this page applied — they all bound RETRIES, which need a completed attempt to
+ * count. Two minutes is far beyond any healthy response from these APIs (the slowest in-tree
+ * call is a 100-item list page) while still being long enough that a merely slow provider is
+ * not mistaken for a dead one.
+ *
+ * SCOPE — this bounds the request up to the point `fetch` RESOLVES (connect + request +
+ * response headers), and nothing after it. That boundary is not a simplification, it is the
+ * only correct one available here, and getting it wrong was a shipped bug this comment exists
+ * to prevent recurring:
+ *
+ *   `fetch` resolves when the HEADERS arrive; the body is a stream the CALLER consumes later
+ *   (`await res.json()`, outside the retry loops, at ~20 call sites). Per the Fetch spec an
+ *   abort while that stream is still open ERRORS the stream. So a signal left armed past
+ *   `fetch` does not merely "fire harmlessly on a settled request" — it destroys the body the
+ *   caller has not read yet, and it rejects out of `res.json()` as a bare `Error`, OUTSIDE the
+ *   `try` that would have wrapped it in a {@link GitProviderFetchError}. `isRetryableGitFetchError`
+ *   then fails closed: no transient retry, no repo retry, `complete: false`, and #231 discards
+ *   the whole run. GitHub's pre-emptive rate-limit pause makes that certain rather than
+ *   unlikely — it sleeps up to {@link MAX_RATE_LIMIT_DELAY_MS} AFTER a 200 and then returns the
+ *   response, so any pause over two minutes would have handed back a destroyed body.
+ *
+ * Bounding the body read as well would mean reading it inside the retry loop, which is the
+ * `fetchWithGitRetry(url, headers)` consolidation tracked in #284. Until then the body read is
+ * bounded by undici's own `bodyTimeout` (300 s of inactivity), exactly as it was before #283.
  *
  * An abort surfaces to the caller as the ordinary transport fault it is, so it takes the
  * transient budget and the same backoff as a 503 — a stalled socket is the same outage seen
@@ -242,21 +274,32 @@ export const INTERACTIVE_REQUEST_POLICY: GitRequestPolicy = {retries: INTERACTIV
 export const GIT_REQUEST_TIMEOUT_MS = 120_000;
 
 /**
- * A fresh abort signal bounding one request at {@link GIT_REQUEST_TIMEOUT_MS}.
+ * One request's timeout: the signal to hand `fetch`, and the `clear` that disarms it.
  *
- * An `AbortController` on a plain `setTimeout` rather than `AbortSignal.timeout`, for one
- * reason: `AbortSignal.timeout` runs on a native timer that no test clock can advance, so the
- * only thing a test could assert about it is that it is an `AbortSignal` — which stays green
- * if the bound is changed to a decade. This form is drivable, so the timeout is pinned by a
- * test that can actually fail.
- *
- * The timer is `unref`ed and deliberately not cleared when the request settles. Firing on an
- * already-settled fetch is a no-op (aborting a completed request does nothing), unref means it
- * cannot hold the process open, and these providers issue requests strictly sequentially — so
- * the alternative, threading a disposal handle through all three fetch loops, would buy
- * nothing but call-site complexity.
+ * `clear` is not optional hygiene — see {@link GIT_REQUEST_TIMEOUT_MS} for why a signal left
+ * armed past `fetch` destroys the response body the caller is about to read. Call it in a
+ * `finally` around the `fetch`, so it runs on the retry/`continue` path and the throw path
+ * alike.
  */
-export function requestTimeoutSignal(): AbortSignal {
+export interface GitRequestTimeout {
+    readonly signal: AbortSignal;
+    /** Disarm the timer. MUST be called as soon as `fetch` settles, either way. */
+    clear(): void;
+}
+
+/**
+ * A fresh timeout bounding one request's RESPONSE at {@link GIT_REQUEST_TIMEOUT_MS}.
+ *
+ * An `AbortController` on a plain `setTimeout` rather than `AbortSignal.timeout`, for two
+ * reasons. `AbortSignal.timeout` runs on a native timer that no test clock can advance, so the
+ * only thing a test could assert about it is that it is an `AbortSignal` — which stays green if
+ * the bound is changed to a decade. And it cannot be cancelled, which the paragraph above makes
+ * mandatory rather than nice-to-have. This form is both drivable and disarmable.
+ *
+ * `unref`ed as well, so a timer disarmed late (or missed on some future path) still cannot hold
+ * the process open.
+ */
+export function requestTimeout(): GitRequestTimeout {
     const controller = new AbortController();
     const timer = setTimeout(() => {
         // Named `TimeoutError`, matching what `AbortSignal.timeout` produces — the transport
@@ -269,7 +312,7 @@ export function requestTimeoutSignal(): AbortSignal {
         controller.abort(reason);
     }, GIT_REQUEST_TIMEOUT_MS);
     timer.unref?.();
-    return controller.signal;
+    return {signal: controller.signal, clear: () => clearTimeout(timer)};
 }
 
 /**
