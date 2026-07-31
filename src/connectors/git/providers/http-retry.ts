@@ -13,8 +13,10 @@
  * deliberate rather than unfinished work: `fetchGitHub` alone handles a 403 primary/secondary
  * rate limit and pre-emptively pauses on `x-ratelimit-remaining`, so absorbing it would mean
  * adding hooks for branches its two siblings do not have. The residual cost is real and named at
- * `fetchGitHub` itself — four branches there restate this module's policy and must be changed in
- * lockstep with it, which `request-policy.test.ts` is the guard for.
+ * `fetchGitHub` itself — its transport, 5xx and `!res.ok` branches restate this module's policy
+ * and must be changed in lockstep with it. `request-policy.test.ts` guards branch presence,
+ * budgets, deadlines and message shape across all three; read that file's header for what it
+ * does NOT prove, rather than assuming it covers every kind of drift.
  *
  * SCOPE. This is the canonical `Retry-After` / backoff policy for the three GIT PROVIDERS
  * only. The tool connectors (`connectors/copilot`, `claude-code`, `windsurf`, `cursor`,
@@ -576,10 +578,15 @@ export function parseEpochResetMs(header: string | null | undefined): number | n
     const trimmed = header.trim();
     // A fractional epoch is accepted and floored rather than rejected. GitHub and GitLab send
     // integers, but rejecting `1785283320.5` would be a behaviour REGRESSION: the code this
-    // replaced used `parseInt`, which read it fine, and the caller's guard is `resetMs !== null`
-    // — so a null here makes GitHub's primary-rate-limit branch fall through to an immediate
+    // replaced used `parseInt`, which read it fine, and GitHub's primary-rate-limit branch
+    // CLASSIFIES on `resetMs !== null` — so a null here makes it fall through to an immediate
     // throw with no retry at all (#272 review cycle 2, TST-1). Sub-second precision is
     // irrelevant to a pause measured in minutes.
+    //
+    // That classification role is also why this function keeps flooring an elapsed reset at `0`
+    // instead of returning `null`: `0` still means "the header was there and readable". Callers
+    // deciding how long to SLEEP must not take that `0` at face value — they ask
+    // {@link usableResetMs} instead (#284 review cycle 2).
     if (!/^\d+(\.\d+)?$/.test(trimmed)) return null;
     const at = Math.floor(Number(trimmed)) * 1_000;
     if (!Number.isFinite(at)) return null;
@@ -627,6 +634,41 @@ export function isRetryableGitFetchError(err: unknown): boolean {
 }
 
 /**
+ * A rate-limit reset header that is actually SCHEDULABLE, or `null` when it tells us nothing
+ * usable — the single answer to "is this reset worth waiting for" that both retry loops share
+ * (#284 review cycle 2).
+ *
+ * WHY THIS IS NOT A GUARD INSIDE {@link parseEpochResetMs}. That parser floors an elapsed reset
+ * at `0` rather than returning `null`, deliberately: `fetchGitHub`'s primary-limit branch keys
+ * on `resetMs !== null` to decide whether the 403 is a rate limit AT ALL, so a `null` there
+ * makes it fall through to an immediate throw with no retry (#272 cycle 2, TST-1). The parser
+ * must keep reporting "the header was present and readable". This function answers the
+ * different question the two SLEEP sites ask.
+ *
+ * WHY `0` MUST NOT BE TAKEN AT FACE VALUE. `0` is not nullish, so a `?? fallback` at the call
+ * site skips the fallback and hands `0` to {@link rateLimitDelayMs}, which clamps it up to only
+ * {@link MIN_RATE_LIMIT_DELAY_MS}. The pause meant to outlast the limit becomes 1 second, three
+ * times in ~3 seconds, INTO a provider that just said it is rate-limiting us — the
+ * primary→secondary/abuse escalation `MIN_RATE_LIMIT_DELAY_MS` and this module's whole 429
+ * policy exist to prevent, and on GitHub an abuse block is token-wide. One second of clock skew
+ * against a self-hosted GitLab reaches it, as does a reset instant that elapses while the
+ * response is in flight, as does a delta-shaped value from a server following the IETF draft
+ * rather than the epoch spelling (it parses as 1970 and floors to `0`).
+ *
+ * A non-positive reset carries no schedulable information, so the honest reading is "the server
+ * told us nothing usable" and the caller's own backoff guess is the right answer.
+ *
+ * ONE helper rather than the guard written inline at each site, because there are two sites in
+ * two files and the second is the one that gets forgotten — which is exactly what happened when
+ * this rule was first written inline (#284 review cycle 1 fixed the shared loop and left
+ * `fetchGitHub` behind).
+ */
+export function usableResetMs(header: string | null | undefined): number | null {
+    const resetMs = parseEpochResetMs(header);
+    return resetMs !== null && resetMs > 0 ? resetMs : null;
+}
+
+/**
  * The provider name that opens every message {@link fetchWithGitRetry} throws.
  *
  * A closed union rather than a `string`, because these strings are a CONTRACT, not cosmetics:
@@ -636,7 +678,7 @@ export function isRetryableGitFetchError(err: unknown): boolean {
  * third provider cannot be added by typo. (No runtime allowlist: this is not a trust boundary —
  * the value is a module-internal literal, never request-supplied.)
  */
-export type GitProviderLabel = 'Bitbucket' | 'GitLab';
+type GitProviderLabel = 'Bitbucket' | 'GitLab';
 
 /**
  * The one retry loop Bitbucket and GitLab share (#284).
@@ -715,20 +757,11 @@ export async function fetchWithGitRetry(
             // Bitbucket as well, which simply does not send it: absent → `null` → the same
             // fallback Bitbucket always used.
             //
-            // ZERO IS TREATED AS ABSENT, not as "retry now" (#284 review, SO-1/SEC-1).
-            // `parseEpochResetMs` floors its result at 0, so a reset instant already in the
-            // past — one second of clock skew against a self-hosted GitLab is enough, and a
-            // delta-shaped value from a server following the IETF draft rather than GitLab's
-            // epoch spelling parses as 1970 — yields `0`, which `??` does NOT catch. That fell
-            // through to `rateLimitDelayMs(null, 0)`, clamped up to MIN_RATE_LIMIT_DELAY_MS, and
-            // spent the whole (deliberately small) rate-limit budget on three 1-second retries
-            // INTO a provider that just said it is rate-limiting us — the primary→secondary/abuse
-            // escalation MIN_RATE_LIMIT_DELAY_MS and this module's 429 policy exist to prevent.
-            // A non-positive reset carries no schedulable information, so the honest reading is
-            // "the server told us nothing usable" and the backoff guess is the right answer.
-            const resetMs = parseEpochResetMs(res.headers.get('ratelimit-reset'));
-            const rateLimitFallback =
-                resetMs !== null && resetMs > 0 ? resetMs : rateLimitFallbackMs(attempt);
+            // A non-positive reset is read as ABSENT, not as "retry now" — see
+            // {@link usableResetMs}, which is also what `fetchGitHub`'s 403 primary-limit branch
+            // calls, so the rule has one definition rather than two.
+            const resetMs = usableResetMs(res.headers.get('ratelimit-reset'));
+            const rateLimitFallback = resetMs ?? rateLimitFallbackMs(attempt);
             if (attempt < policy.retries.rateLimit) {
                 await sleepWithinRun(
                     policy,

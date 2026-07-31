@@ -33,6 +33,7 @@ import {
     requestTimeout,
     serverErrorDelayMs,
     sleepWithinRun,
+    usableResetMs,
 } from '../../../../src/connectors/git/providers/http-retry';
 
 afterEach(() => {
@@ -145,6 +146,45 @@ describe('parseEpochResetMs', () => {
         vi.setSystemTime(new Date('2026-07-28T10:00:00.000Z'));
         const inThirty = Math.floor(Date.parse('2026-07-28T10:00:30.000Z') / 1_000);
         expect(parseEpochResetMs(`${inThirty}.5`)).toBe(30_000);
+    });
+});
+
+describe('usableResetMs (#284)', () => {
+    // The shared answer to "is this reset worth waiting for", which BOTH sleep sites now call —
+    // `fetchWithGitRetry`'s 429 and `fetchGitHub`'s 403 primary limit. Its whole reason to exist
+    // is that `parseEpochResetMs` must keep returning 0 (GitHub classifies on `!== null`), so the
+    // 0-is-not-nullish trap has to be closed one layer up, once.
+    it('passes through a reset still in the future', () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(new Date('2026-07-28T10:00:00.000Z'));
+        const inThirty = Math.floor(Date.parse('2026-07-28T10:00:30.000Z') / 1_000);
+        expect(usableResetMs(String(inThirty))).toBe(30_000);
+    });
+
+    it('reports an ALREADY-ELAPSED reset as unusable, where parseEpochResetMs reports 0', () => {
+        // The divergence is the point. `0` is not nullish, so `?? fallback` at a call site skips
+        // the fallback and schedules MIN_RATE_LIMIT_DELAY_MS — three 1-second retries into an
+        // active rate limit.
+        vi.useFakeTimers();
+        vi.setSystemTime(new Date('2026-07-28T10:00:00.000Z'));
+        const aMinuteAgo = String(Math.floor(Date.now() / 1_000) - 60);
+        expect(parseEpochResetMs(aMinuteAgo)).toBe(0);
+        expect(usableResetMs(aMinuteAgo)).toBeNull();
+    });
+
+    it('reports a DELTA-shaped value as unusable rather than as an instant retry', () => {
+        // A server following the IETF draft sends seconds-until-reset, not an epoch. `30` parses
+        // as 1970, floors to 0, and would otherwise become a 1-second retry.
+        vi.useFakeTimers();
+        vi.setSystemTime(new Date('2026-07-28T10:00:00.000Z'));
+        expect(usableResetMs('30')).toBeNull();
+    });
+
+    it('reports an absent or unparseable header as unusable', () => {
+        expect(usableResetMs(null)).toBeNull();
+        expect(usableResetMs(undefined)).toBeNull();
+        expect(usableResetMs('')).toBeNull();
+        expect(usableResetMs('later')).toBeNull();
     });
 });
 
@@ -657,7 +697,7 @@ describe('fetchWithGitRetry (#284)', () => {
         // Dropping `headers` on the way into `fetch` would unauthenticate every Bitbucket and
         // GitLab request; the provider suites catch it, but the primitive should pin its own
         // contract rather than borrow theirs.
-        expect((fetchMock.mock.calls[0][1] as RequestInit).headers).toBe(headers);
+        expect((fetchMock.mock.calls[0][1] as RequestInit).headers).toEqual(headers);
         expect(fetchMock.mock.calls[0][0]).toBe(REQ_URL);
     });
 
@@ -692,17 +732,22 @@ describe('fetchWithGitRetry (#284)', () => {
         // freeze the escalation at 60s), stays green without this.
         vi.useFakeTimers();
         const timer = vi.spyOn(globalThis, 'setTimeout');
-        stubFetch(response(429), response(429), response(200));
+        stubFetch(response(429), response(429), response(429), response(200));
 
         const pending = fetchWithGitRetry(REQ_URL, {}, 'Bitbucket', SYNC_REQUEST_POLICY);
         await vi.runAllTimersAsync();
         await expect(pending).resolves.toMatchObject({status: 200});
 
         const delays = timer.mock.calls.map((c) => Number(c[1]));
-        // Both rungs: `rateLimitFallbackMs(0)` then `rateLimitFallbackMs(1)`. Asserting only the
-        // first would pass against a frozen escalation.
+        // First and THIRD rungs — `rateLimitFallbackMs(0)` and `rateLimitFallbackMs(2)`.
+        // Deliberately not the middle rung: `rateLimitFallbackMs(1)` is 120_000, which is also
+        // GIT_REQUEST_TIMEOUT_MS (armed on every attempt) and SERVER_ERROR_MAX_DELAY_MS, so
+        // asserting it would hold no matter what the fallback schedule did — the whole point of
+        // this assertion is to fail when `attempt` is replaced by a counter that freezes the
+        // escalation, and 120_000 cannot detect that (#284 review cycle 2, TST-1). 60_000 and
+        // 180_000 collide with no other timer in the module.
         expect(delays).toContain(60_000);
-        expect(delays).toContain(120_000);
+        expect(delays).toContain(180_000);
     });
 
     it('treats a ratelimit-reset already in the PAST as absent, not as "retry now"', async () => {

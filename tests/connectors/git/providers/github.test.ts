@@ -1610,6 +1610,56 @@ describe('GitHubProvider', () => {
             expect(calls).toBe(2);
         });
 
+        it('backs off 60s — not 1s — when the primary-limit reset has ALREADY elapsed', async () => {
+            // #284 review cycle 2 (SO-1/SEC-1/DUP-1). `parseEpochResetMs` floors an elapsed reset
+            // at 0, and `0 + 1_000` clamps to MIN_RATE_LIMIT_DELAY_MS — so all three rate-limit
+            // retries burned in ~3 seconds against an ACTIVE primary limit, which on GitHub
+            // escalates to a token-wide abuse block. One second of host clock skew at the reset
+            // boundary reaches it. `usableResetMs` now reports the elapsed reset as unusable and
+            // the branch falls back to the 60s/120s/180s guess.
+            //
+            // The CLASSIFICATION must survive that: `remaining === '0'` with an elapsed reset is
+            // still a primary limit, so it must still be RETRIED. If the guard were applied to
+            // `resetMs` itself, this 403 would fall through to the secondary branch, find no
+            // Retry-After, and throw with no retry at all — `calls` would be 1.
+            vi.useFakeTimers();
+            vi.setSystemTime(new Date('2026-07-28T10:00:00.000Z'));
+            const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+            const elapsed = Math.floor(Date.parse('2026-07-28T09:59:00.000Z') / 1_000);
+            let calls = 0;
+            vi.stubGlobal('fetch', vi.fn().mockImplementation(() => {
+                calls++;
+                if (calls === 1) {
+                    return Promise.resolve({
+                        ok: false,
+                        status: 403,
+                        headers: new Headers({
+                            'x-ratelimit-remaining': '0',
+                            'x-ratelimit-reset': String(elapsed),
+                        }),
+                        json: () => Promise.resolve({}),
+                        text: () => Promise.resolve('rate limit exceeded'),
+                    } as unknown as Response);
+                }
+                return Promise.resolve({
+                    ok: true,
+                    status: 200,
+                    headers: new Headers(),
+                    json: () => Promise.resolve([]),
+                    text: () => Promise.resolve(''),
+                } as unknown as Response);
+            }));
+
+            const listPromise = provider.listRepos();
+            await vi.runAllTimersAsync();
+
+            await expect(listPromise).resolves.toEqual([]);
+            expect(calls).toBe(2);
+            const delays = setTimeoutSpy.mock.calls.map((c) => Number(c[1]));
+            expect(delays).toContain(60_000);
+            expect(delays).not.toContain(1_000);
+        });
+
         it('tolerates a fractional x-ratelimit-reset rather than failing the 403 outright', async () => {
             // `parseInt` (pre-#272) read '….5' fine. If parseEpochResetMs rejected it, the
             // primary-limit guard `resetMs !== null` would fall through both 403 branches and

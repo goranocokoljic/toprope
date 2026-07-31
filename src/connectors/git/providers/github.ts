@@ -30,6 +30,7 @@ import {
     requestTimeout,
     serverErrorDelayMs,
     sleepWithinRun,
+    usableResetMs,
 } from './http-retry.js';
 
 const BASE_URL = 'https://api.github.com';
@@ -97,11 +98,22 @@ function globMatch(pattern: string, str: string): boolean {
  * into the shared loop would mean adding hooks for cases only one caller reaches.
  *
  * THE COST OF THAT, stated here rather than left to be discovered: the transport-fault catch, the
- * 429 branch, the 5xx branch and the `!res.ok` throw below are branch-for-branch the same policy
- * as {@link fetchWithGitRetry}, so a change to ANY of them must be made in both places. This file
- * is the copy that gets forgotten. `tests/connectors/git/providers/request-policy.test.ts` is the
- * guard — it is `describe.each` over all three provider types precisely so a policy change landed
- * only in the shared loop fails here.
+ * 5xx branch and the `!res.ok` throw below restate the same policy as {@link fetchWithGitRetry},
+ * so a change to any of them must be made in both places. This file is the copy that gets
+ * forgotten — it already was once (#284 review cycle 1 fixed the shared loop's reset handling and
+ * left this one behind, which is why `usableResetMs` is now a shared helper rather than a guard
+ * written inline).
+ *
+ * The 429 branch is NOT branch-for-branch identical, and this is the sentence that says so: the
+ * shared loop reads a `ratelimit-reset` header here that GitHub's 429 does not, because GitHub
+ * carries its reset on the 403 primary-limit branch below instead.
+ *
+ * WHAT GUARDS THIS, precisely — `tests/connectors/git/providers/request-policy.test.ts` is
+ * `describe.each` over all three provider types, so it catches a change to branch PRESENCE,
+ * retry BUDGETS, deadline handling and message shape that lands only in the shared loop. It does
+ * not by itself catch a change to the backoff SCHEDULE; the no-`retry-after` 429 case added
+ * there in #284 covers the rate-limit fallback rungs specifically. Do not read the table as
+ * proving more than that.
  */
 async function fetchGitHub(
     url: string,
@@ -177,13 +189,34 @@ async function fetchGitHub(
 
         if (res.status === 403) {
             const remaining = res.headers.get('x-ratelimit-remaining');
-            const resetMs = parseEpochResetMs(res.headers.get('x-ratelimit-reset'));
+            const resetHeader = res.headers.get('x-ratelimit-reset');
+            // TWO questions about ONE header, deliberately answered by two different reads
+            // (#284 review cycle 2):
+            //   - CLASSIFICATION — `resetMs !== null` decides whether this 403 is the primary
+            //     rate limit at all, i.e. "was the header present and readable". It must stay
+            //     `parseEpochResetMs`: an elapsed reset is still proof this is a primary limit,
+            //     and demoting it to the secondary branch would drop the retry entirely.
+            //   - DELAY — how long to actually wait, which an elapsed reset cannot answer. See
+            //     `usableResetMs`; `0 + 1_000` clamps to MIN_RATE_LIMIT_DELAY_MS and spends the
+            //     whole budget on three 1-second retries into an active primary limit, which on
+            //     GitHub escalates to a token-wide abuse block.
+            const resetMs = parseEpochResetMs(resetHeader);
+            const schedulableResetMs = usableResetMs(resetHeader);
             const retryAfter403 = res.headers.get('retry-after');
-            // Primary rate limit: x-ratelimit-remaining=0 with reset time. `+ 1_000` so the
+            // Primary rate limit: x-ratelimit-remaining=0 with a reset time. `+ 1_000` so the
             // retry lands just AFTER the reset instant rather than exactly on it.
             if (remaining === '0' && resetMs !== null) {
                 if (attempt < policy.retries.rateLimit) {
-                    await sleepWithinRun(policy, rateLimitDelayMs(null, resetMs + 1_000), url);
+                    await sleepWithinRun(
+                        policy,
+                        rateLimitDelayMs(
+                            null,
+                            schedulableResetMs !== null
+                                ? schedulableResetMs + 1_000
+                                : rateLimitFallbackMs(attempt),
+                        ),
+                        url,
+                    );
                     attempt++;
                     continue;
                 }
@@ -234,8 +267,12 @@ async function fetchGitHub(
         // sleep to the reset instant here, up to MAX_RATE_LIMIT_DELAY_MS, inside the one
         // request a human is waiting on. A caller that has forbidden waiting out a rate limit
         // has equally forbidden waiting to avoid one.
+        // `usableResetMs` here, unlike the 403 branch above: this pause has no classification
+        // job — there is no failure to categorize, only a reset to wait for — so an elapsed
+        // reset simply means there is nothing left to wait out, and skipping the pause is the
+        // correct answer rather than a 1-second sleep (#284 review cycle 2).
         const remaining = res.headers.get('x-ratelimit-remaining');
-        const resetMs = parseEpochResetMs(res.headers.get('x-ratelimit-reset'));
+        const resetMs = usableResetMs(res.headers.get('x-ratelimit-reset'));
         if (
             policy.retries.rateLimit > 0 &&
             remaining !== null &&
