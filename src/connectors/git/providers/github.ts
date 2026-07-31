@@ -13,14 +13,9 @@ import type {
     GitHubProviderConfig,
     GitFetchProgressListener,
     GitCommitDropListener,
-    GitCommitDegradedListener,
     GitProviderClientOptions,
 } from './types.js';
-import {
-    NO_AUTHOR_DATE_DROP_REASON,
-    UNATTRIBUTABLE_DATE_DROP_REASON,
-    UNKNOWN_CHURN_DEGRADE_REASON,
-} from './types.js';
+import {NO_AUTHOR_DATE_DROP_REASON, UNATTRIBUTABLE_DATE_DROP_REASON} from './types.js';
 import {isUtcDay} from '../../../aggregation/dates.js';
 import {normalizeContainer} from './container.js';
 import {loadDiffstats} from './diffstat.js';
@@ -335,9 +330,9 @@ interface RawCommitDetail {
         message: string;
     };
     author: {login: string} | null;
-    // Both OPTIONAL, which is why every reader here guards (`detail.stats?.additions ?? 0`,
-    // `detail.files ?? []`). Typed to match what the readers actually assume, so nobody writes
-    // `detail.files.map(...)` on the strength of the declaration.
+    // Both OPTIONAL, which is why every reader here guards. Typed to match what the readers
+    // actually assume, so nobody writes `detail.files.map(...)` on the strength of the
+    // declaration.
     //
     // The declaration follows GitHub's own: neither key is among the endpoint's required
     // response properties, and no condition for omitting them is documented (#288 — see the
@@ -345,7 +340,14 @@ interface RawCommitDetail {
     // "the contract permits absence", not the stronger "GitHub is known to omit them"; an
     // absent `stats` is therefore not treated as a malformed body, but the churn it would have
     // carried is treated as UNKNOWN rather than zero.
-    stats?: {additions: number; deletions: number; total: number};
+    //
+    // `| null` on `stats` is NOT decoration. This is an unchecked cast over a network body, and
+    // JSON has two idiomatic spellings of "no value" — an absent key and an explicit `null`.
+    // #288 makes this field decide whether a zero gets memoized into a table with no
+    // invalidation, so a declaration admitting only one spelling would invite an
+    // `=== undefined` guard that the other spelling walks straight past. The reader below does
+    // not test either spelling; it tests for a NUMBER (see `observedStats`).
+    stats?: {additions: number; deletions: number; total: number} | null;
     files?: Array<{filename: string; additions: number; deletions: number; status: string}>;
 }
 
@@ -488,7 +490,6 @@ export class GitHubProvider implements GitProvider {
         until: string,
         onProgress?: GitFetchProgressListener,
         onDrop?: GitCommitDropListener,
-        onDegraded?: GitCommitDegradedListener,
     ): Promise<GitCommit[]> {
         const params = new URLSearchParams({per_page: '100'});
         if (since) params.set('since', since);
@@ -564,6 +565,13 @@ export class GitHubProvider implements GitProvider {
                             additions: hit.additions,
                             deletions: hit.deletions,
                             diffs: hit.entries,
+                            // No `churnObserved: false` here, and that is a claim about what a
+                            // memo can contain, not an oversight: since #288 the miss path writes
+                            // a row ONLY for a commit whose `stats` it actually read, so every
+                            // row this can hit is an observation. The bound is rows written
+                            // BEFORE #288 — indistinguishable from an observed zero and served
+                            // here forever. `toprope git cache clear` is the operator surface for
+                            // discarding them; see the guard on the miss path.
                         });
                         continue;
                     }
@@ -590,24 +598,49 @@ export class GitHubProvider implements GitProvider {
                 // diagnoses "this implementation does not honour the GitCommit.diffs contract",
                 // which is the wrong story. The churn loss is reported on its own channel.
                 const diffs = toFileDiffs(detail);
-                // Read ONCE into a local, so the guard below, the two totals and the memo gate
-                // are all decided by the same value — `detail.stats` is a property of an
-                // unvalidated body, and three separate reads are three chances for a later edit
-                // to memoize a zero the guard already classified as unknown (#288).
-                const stats = detail.stats;
+                // THE ONE PLACE THIS RESPONSE'S CHURN IS CLASSIFIED (#288). Resolved once into a
+                // local so the malformed-body guard, the two totals, the memo gate and the
+                // `churnObserved` flag are all decided by the SAME value: `detail.stats` is a
+                // property of an unvalidated body, and four separate reads are four chances for
+                // a later edit to memoize a zero another reader already called unknown.
+                //
+                // A POSITIVE SHAPE TEST, not `=== undefined`. The premise of this whole issue is
+                // that GitHub's contract does not say how — or whether — it omits `stats`, so
+                // testing for one spelling of absence is exactly the wrong shape of guard: an
+                // explicit `"stats": null`, a `{}`, or a `{additions: "40"}` would all satisfy
+                // `!== undefined`, take the memoize branch, and write a fabricated `0`/`0` into a
+                // table with no invalidation — the precise outcome this issue exists to prevent,
+                // reintroduced through the spellings the guard did not enumerate. Testing for a
+                // NUMBER is total over every shape a body can take, and it fails in the safe
+                // direction: an unrecognized shape becomes "unknown churn", which is re-askable
+                // and reported, rather than a permanent silent zero.
+                //
+                // `Number.isInteger`, not `typeof === 'number'`: it subsumes the type test and
+                // rejects `NaN`/`Infinity`/fractions, and it is the SAME predicate
+                // `raw_author_daily` validates against one frame down. A float that passed here
+                // would throw there — inside the run's single all-providers write transaction,
+                // rolling back every provider's window. Caught here it costs one advisory line.
+                const rawStats = detail.stats;
+                const observedStats =
+                    rawStats !== undefined &&
+                    rawStats !== null &&
+                    Number.isInteger(rawStats.additions) &&
+                    Number.isInteger(rawStats.deletions)
+                        ? rawStats
+                        : null;
                 // NOT summed from `diffs`: GitHub caps `files` at 300 per commit while
                 // `stats` covers the whole commit, so the totals stay authoritative
                 // even where the file list is truncated. Unchanged by #271.
                 //
-                // `?? 0` here is "not observed", NOT "observed to be zero" — the two are
-                // distinguishable in the body (an empty commit returns
-                // `stats: {additions: 0, deletions: 0, total: 0}`, a present key) and #288
-                // keeps them distinguishable downstream: the absent case is reported through
-                // `onDegraded` and never memoized. `GitCommit.additions` is a required number,
-                // so zero is the only value expressible here; the report is what stops it
-                // reading as an observation.
-                const additions = stats?.additions ?? 0;
-                const deletions = stats?.deletions ?? 0;
+                // `?? 0` on the null branch is "not observed", NOT "observed to be zero" — the
+                // two are distinguishable in the body (an empty commit returns
+                // `stats: {additions: 0, deletions: 0, total: 0}`, present keys with real
+                // numbers) and #288 keeps them distinguishable downstream. `GitCommit.additions`
+                // is a required number, so zero is the only value expressible here;
+                // `churnObserved: false` on the pushed row is what stops it reading as an
+                // observation.
+                const additions = observedStats?.additions ?? 0;
+                const deletions = observedStats?.deletions ?? 0;
 
                 // The list row and the detail response carry the IDENTICAL embedded `commit`
                 // object — that identity is precisely what licenses the cache-hit path above
@@ -709,10 +742,17 @@ export class GitHubProvider implements GitProvider {
                 //   CONSEQUENCE, which is the part that actually changed. The commit is kept,
                 //   but its churn is UNKNOWN rather than zero, so the two things that would
                 //   otherwise launder that unknown into a fact are stopped: it is not memoized
-                //   (see the `put` gate below) and it is REPORTED through `onDegraded`, which
-                //   the sync aggregates into an operator-facing advisory naming the affected
-                //   developer-days. Before #288 it was memoized and silent.
-                if (source !== detailCommit && stats === undefined) {
+                //   (see the `put` gate below) and it is REPORTED, via `churnObserved: false` on
+                //   the returned row, which the sync aggregates into an operator-facing advisory
+                //   naming the affected developer-days. Before #288 it was memoized and silent.
+                //
+                //   BOUND, because the guarantee is prospective. Rows already in
+                //   `commit_diffstats` from a pre-#288 run are indistinguishable from an observed
+                //   zero, and the cache-hit path above serves them without ever reaching this
+                //   code — so an installation that already has them keeps being answered by them.
+                //   `toprope git cache clear` is the operator surface that discards them (#286);
+                //   the memo is of an idempotent remote read, so clearing costs only re-fetching.
+                if (source !== detailCommit && observedStats === null) {
                     throw new GitProviderFetchError(
                         `GitHub commit detail for ${summary.sha} in ${this.org}/${repo} carried ` +
                             'neither a usable commit object nor stats — malformed response',
@@ -732,13 +772,11 @@ export class GitHubProvider implements GitProvider {
                 // and memoizing them beside a fabricated `0`/`0` would be worse than memoizing
                 // nothing, because the row would then LOOK observed.
                 //
-                // Not memoizing costs one detail re-fetch per such commit per run — the memo is
-                // of an idempotent remote read, so skipping it is always safe (that is the whole
-                // reason `commit_diffstats` sits outside the append-only rule). The commit
-                // itself is still returned and imported; only the churn is unknown, and
-                // `onDegraded` is what stops that unknown from being silent. Reported here
-                // rather than at the totals above so the report and the skipped `put` are one
-                // decision on one condition, not two conditions that can drift.
+                // Not memoizing costs a re-fetch only where the commit is asked for again — an
+                // in-run retry, a backfill, or a re-import; a completed run advances the cursor
+                // past the window, so in steady state it costs nothing. Safe in any case: the
+                // memo is of an idempotent remote read, which is the whole reason
+                // `commit_diffstats` sits outside the append-only rule.
                 //
                 // On the RECOVERY path — identity from the list row — this is reached only with
                 // real `stats` in hand, because the throw above sends the alternative away.
@@ -757,9 +795,7 @@ export class GitHubProvider implements GitProvider {
                 // anomaly that must surface, and `fetchGitHub` throws it (#272). No FETCH
                 // failure of any kind reaches this line, which is also why GitHub does not use
                 // the shared `resolveCommitDiffstat` helper the other two providers share.
-                if (stats === undefined) {
-                    onDegraded?.({sha: summary.sha, reason: UNKNOWN_CHURN_DEGRADE_REASON});
-                } else {
+                if (observedStats !== null) {
                     this.diffstatCache?.put(repo, summary.sha, {
                         additions,
                         deletions,
@@ -792,6 +828,12 @@ export class GitHubProvider implements GitProvider {
                     additions,
                     deletions,
                     diffs,
+                    // The same condition that withheld the memo, on the row itself (#288), so a
+                    // reader downstream can tell a zero that was OBSERVED from one that was
+                    // merely not reported. Reached only after the date guard's `continue`, so a
+                    // dropped commit structurally cannot carry it — the two reports can never
+                    // both fire for one sha.
+                    churnObserved: observedStats !== null,
                 });
                 // Deliberately NO `catch` (#272, review cycle 3) — every detail failure now
                 // propagates out of `getCommits`. This used to record the error and carry on,

@@ -3311,15 +3311,14 @@ describe('GitSync.syncProviders — sync-older-history backfill plumbing (#229)'
         const backfill = {since: '2024-01-01T00:00:00.000Z', until: '2024-07-01T00:00:00.000Z'};
         const getCommits = await runBackfill(backfill);
         // Trailing args: the optional #270 progress listener (absent here, this caller
-        // observes nothing), then the #275 drop listener and the #288 degrade listener,
-        // BOTH of which are always supplied — each is the only record that data was lost,
-        // so they must exist on the observer-free path too.
+        // observes nothing) and the #275 drop listener, which is ALWAYS supplied — it is
+        // the only record that a commit was lost, so it must exist on the observer-free
+        // path too.
         expect(getCommits).toHaveBeenCalledWith(
             'repo1',
             backfill.since,
             backfill.until,
             undefined,
-            expect.any(Function),
             expect.any(Function),
         );
     });
@@ -4549,15 +4548,14 @@ describe('GitSync — stalled-provider detection (#235)', () => {
             // The commit walk (and its per-commit diff fetches) is bounded to one cap
             // width instead of the full 90 days — the point of the cap.
             // Trailing args: the optional #270 progress listener (absent here, this caller
-            // observes nothing), then the #275 drop listener and the #288 degrade listener,
-            // BOTH of which are always supplied — each is the only record that data was lost,
-            // so they must exist on the observer-free path too.
+            // observes nothing) and the #275 drop listener, which is ALWAYS supplied — it is
+            // the only record that a commit was lost, so it must exist on the observer-free
+            // path too.
             expect(getCommits).toHaveBeenCalledWith(
                 'repo1',
                 cursor,
                 expectedUntil,
                 undefined,
-                expect.any(Function),
                 expect.any(Function),
             );
             // …and CRUCIALLY the cursor advances only to what was actually covered.
@@ -4585,15 +4583,14 @@ describe('GitSync — stalled-provider detection (#235)', () => {
 
             // The normal daily path must be exactly what it was before the cap existed.
             // Trailing args: the optional #270 progress listener (absent here, this caller
-            // observes nothing), then the #275 drop listener and the #288 degrade listener,
-            // BOTH of which are always supplied — each is the only record that data was lost,
-            // so they must exist on the observer-free path too.
+            // observes nothing) and the #275 drop listener, which is ALWAYS supplied — it is
+            // the only record that a commit was lost, so it must exist on the observer-free
+            // path too.
             expect(getCommits).toHaveBeenCalledWith(
                 'repo1',
                 cursor,
                 result.lastSyncTime,
                 undefined,
-                expect.any(Function),
                 expect.any(Function),
             );
             expect(readState(FORWARD_KEY)).toBe(result.lastSyncTime);
@@ -4942,15 +4939,14 @@ describe('GitSync — stalled-provider detection (#235)', () => {
             // The backfill route already computed and overlap-guarded this exact slice;
             // narrowing it here would silently import less than the guard cleared.
             // Trailing args: the optional #270 progress listener (absent here, this caller
-            // observes nothing), then the #275 drop listener and the #288 degrade listener,
-            // BOTH of which are always supplied — each is the only record that data was lost,
-            // so they must exist on the observer-free path too.
+            // observes nothing) and the #275 drop listener, which is ALWAYS supplied — it is
+            // the only record that a commit was lost, so it must exist on the observer-free
+            // path too.
             expect(getCommits).toHaveBeenCalledWith(
                 'repo1',
                 backfill.since,
                 backfill.until,
                 undefined,
-                expect.any(Function),
                 expect.any(Function),
             );
         });

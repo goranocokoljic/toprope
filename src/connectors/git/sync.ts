@@ -40,13 +40,11 @@ import type {
     GitProviderType,
     GitCommitDrop,
     GitCommitDropReason,
-    GitCommitDegraded,
-    GitCommitDegradeReason,
     GitFetchProgressListener,
     GitFileDiff,
     GitPR,
 } from './providers/types.js';
-import {COMMIT_DROP_REASONS, COMMIT_DEGRADE_REASONS} from './providers/types.js';
+import {COMMIT_DROP_REASONS} from './providers/types.js';
 import {promoteAllCandidates} from './onboarding.js';
 import {ensureTeam} from '../../registry/teams.js';
 import {resolveAutoCreateSettings, type AutoCreateSettings} from '../../config/git-auto-create.js';
@@ -210,9 +208,10 @@ export const COMMITS_DROPPED_PREFIX = 'Commits dropped as unattributable:';
 
 /**
  * Prefix of the advisory pushed when a provider returned commits whose CHURN it could not
- * observe (#288) — on GitHub, a commit-detail response carrying no `stats` object.
- * {@link GitCommitDegraded} is the canonical statement of why that is neither a fetch failure
- * nor a drop; read it rather than re-deriving the argument here.
+ * observe — the commits it flagged `churnObserved: false` (#288); on GitHub, a commit-detail
+ * response carrying no usable `stats` object. `GitCommit.churnObserved` is the canonical
+ * statement of why that is neither a fetch failure nor a drop; read it rather than
+ * re-deriving the argument here.
  *
  * Deliberately NOT a failure, for the same reason as {@link COMMITS_DROPPED_PREFIX}: the
  * response was well-formed by the endpoint's published contract, so re-fetching returns the
@@ -284,17 +283,30 @@ function sanitizeDropReason(reason: unknown): string {
 }
 
 /**
- * A degrade reason, safe to interpolate into the churn advisory (#288).
+ * The repair for a span whose metrics are permanently understated, shared verbatim by the two
+ * advisories that have to prescribe one ({@link DIFFS_NOT_SUPPLIED_PREFIX}'s permanence half
+ * and {@link COMMIT_CHURN_UNKNOWN_PREFIX}).
  *
- * A runtime allowlist against {@link COMMIT_DEGRADE_REASONS}, for exactly the reason
- * {@link sanitizeDropReason} is one: the value crosses a provider boundary before reaching a
- * terminal and `sync_logs.errors`, and a compile-time union is not a control there. A future
- * provider interpolating an API error body cannot reach the log through this field.
+ * ONE copy, deliberately. This is executable advice whose first sentence exists to stop an
+ * operator from doing something strictly worse than the damage being repaired (#262), and two
+ * copies of it is two chances for a later change to the cascade to update one and leave the
+ * other prescribing the old procedure — the exact drift the "a remedy printed to an operator
+ * is executable advice" rule is about.
  */
-function sanitizeDegradeReason(reason: unknown): string {
-    return COMMIT_DEGRADE_REASONS.includes(reason as GitCommitDegradeReason)
-        ? (reason as string)
-        : '<unrecognized degrade reason>';
+function permanentSpanRepair(): string {
+    return (
+        'raw_author_daily has no recompute path. Whatever you do, do NOT simply purge this ' +
+        "provider's cursors and re-sync: that re-imports over the surviving rows and " +
+        'permanently DOUBLES every commit metric in the span (#262), which is strictly worse ' +
+        'than the understatement. For a provider registered in the admin UI the repair is to ' +
+        'DELETE it and re-add it — the delete cascade retracts this container\'s raw rows and ' +
+        're-projects the affected days BEFORE purging its cursors, so the re-import lands on ' +
+        'an empty span — then run "sync older history" to recover anything beyond the ' +
+        `${FIRST_SYNC_WINDOW_DEFAULT_MONTHS}-month first-sync window a re-added provider ` +
+        'starts from. A CONFIG-FILE provider cannot be deleted (the route refuses it, and the ' +
+        'cascade is skipped while the YAML entry still owns the container), so it has no ' +
+        'supported repair today: leave the span understated'
+    );
 }
 
 /** Every sentinel that marks an `errors` entry as advisory rather than a failure. */
@@ -2019,15 +2031,20 @@ async function fetchProviderData(
     // staged and cleared on rollback rather than pushed as they are discovered.
     const droppedByRepo: Array<{repo: string; drops: GitCommitDrop[]}> = [];
 
-    // Commits each repo's provider RETURNED but whose churn it could not observe (#288),
-    // staged on exactly the same terms and for exactly the same reason as `droppedByRepo`
-    // above: the advisory calls the understatement permanent, and a later repo's failure
-    // discards this whole provider's window and re-asks everything next run.
+    // Shas each repo's provider RETURNED with `churnObserved === false` (#288), staged on
+    // exactly the same terms and for exactly the same reason as `droppedByRepo` above: the
+    // advisory calls the understatement permanent, and a later repo's failure discards this
+    // whole provider's window and re-asks everything next run.
     //
     // Per repo, not per provider — unlike the fallback-diff counters below. This is a property
-    // of the DATA (which commits GitHub described without stats), not of the provider
-    // implementation, so naming the repo is what tells an operator where to look.
-    const degradedByRepo: Array<{repo: string; degraded: GitCommitDegraded[]}> = [];
+    // of the DATA (which commits the provider described without line counts), not of the
+    // provider implementation, so naming the repo is what tells an operator where to look.
+    //
+    // No per-ATTEMPT reset, unlike `droppedCommits` below, and the difference is real rather
+    // than an oversight: this is derived from the returned array, which `fetchRepoWithRetry`
+    // ASSIGNS rather than appends to, so a retry that re-pages the same window replaces the
+    // previous attempt's commits and can never double-count.
+    const degradedByRepo: Array<{repo: string; shas: string[]}> = [];
 
     // How many commits this provider returned WITHOUT `GitCommit.diffs`, forcing the diff pass
     // below into its `getCommitDiff` fallback (#280), and which repos they came from. Counted
@@ -2130,15 +2147,9 @@ async function fetchProviderData(
         // appended) commit result above — a retry replaces the previous attempt, it does not
         // add to it.
         const droppedCommits: GitCommitDrop[] = [];
-        // Same lifecycle as `droppedCommits`, and reset on the same line for the same reason:
-        // a retry re-pages the identical window and re-reports the identical degraded commits,
-        // so a list that survived across attempts would multiply the count by the attempt
-        // number (#288).
-        const degradedCommits: GitCommitDegraded[] = [];
         const commitFetch = await fetchRepoWithRetry(
             () => {
                 droppedCommits.length = 0;
-                degradedCommits.length = 0;
                 return provider.getCommits(
                     repoName,
                     since,
@@ -2149,9 +2160,6 @@ async function fetchProviderData(
                     // on the observer-free scheduled path too (that path is where nearly every
                     // real sync runs).
                     (drop) => droppedCommits.push(drop),
-                    // Unconditional for the same reason (#288): the churn advisory is the only
-                    // record that a developer-day's line counts are short.
-                    (degraded) => degradedCommits.push(degraded),
                 );
             },
             () => reportStep('commits', 0, null),
@@ -2178,9 +2186,12 @@ async function fetchProviderData(
         if (droppedCommits.length > 0) {
             droppedByRepo.push({repo: repoName, drops: [...droppedCommits]});
         }
-        // Staged on the success path only, exactly like the drops above (#288).
-        if (degradedCommits.length > 0) {
-            degradedByRepo.push({repo: repoName, degraded: [...degradedCommits]});
+        // Staged on the success path only, exactly like the drops above (#288). `=== false`,
+        // not `!churnObserved`: the field is OPTIONAL and absent means observed, so a
+        // truthiness test would report every commit from every provider that never sets it.
+        const churnUnobserved = rawCommits.filter((c) => c.churnObserved === false);
+        if (churnUnobserved.length > 0) {
+            degradedByRepo.push({repo: repoName, shas: churnUnobserved.map((c) => c.sha)});
         }
         report?.((p) => {
             p.commits_fetched += rawCommits.length;
@@ -2476,39 +2487,26 @@ async function fetchProviderData(
     // drop advisories directly above (#288). One line per affected repo with a count and a
     // bounded sha sample, grouped under the reason — the same shape, because an operator
     // reading both in one `errors` list should not have to learn two layouts.
-    const churnUnknownAdvisories = degradedByRepo.map(({repo: degradedRepo, degraded}) => {
-        const byReason = new Map<string, string[]>();
-        for (const entry of degraded) {
-            const reason = sanitizeDegradeReason(entry.reason);
-            const shas = byReason.get(reason);
-            if (shas === undefined) byReason.set(reason, [sanitizeSha(entry.sha)]);
-            else shas.push(sanitizeSha(entry.sha));
-        }
-        const groups = [...byReason].map(([reason, shas]) => {
-            const sample = shas.slice(0, DROPPED_COMMIT_SAMPLE_SIZE);
-            const more = shas.length - sample.length;
-            return (
-                `${shas.length} because ${reason} — e.g. ${sample.join(', ')}` +
-                `${more > 0 ? ` (+${more} more)` : ''}`
-            );
-        });
+    // NO per-reason grouping, unlike the drop advisory above. That map exists there because two
+    // drop reasons with DIFFERENT operator next-steps can appear in one repo; there is exactly
+    // one way to fail to observe churn, so a map here would always yield one group and the
+    // generality would be for a case that cannot occur.
+    const churnUnknownAdvisories = degradedByRepo.map(({repo: degradedRepo, shas}) => {
+        const named = shas.map(sanitizeSha);
+        const sample = named.slice(0, DROPPED_COMMIT_SAMPLE_SIZE);
+        const more = named.length - sample.length;
         return (
-            `${COMMIT_CHURN_UNKNOWN_PREFIX} [${providerType}/${degradedRepo}] ${degraded.length} ` +
-            `commit(s) were imported with their line counts recorded as zero rather than ` +
-            `observed, and this run has recorded its window as covered — so lines_added and ` +
-            `lines_removed on those developer-days are PERMANENTLY short by whatever those ` +
-            `commits changed (at most — a commit whose author resolves to no registered ` +
-            `developer produced no row to understate). Commit counts, files_changed and PR ` +
-            `metrics are unaffected. No diffstat was memoized for them, so a re-import does ` +
-            `get a fresh answer; but do NOT simply purge this provider's cursors and re-sync, ` +
-            `which re-imports over the surviving rows and permanently DOUBLES every commit ` +
-            `metric in the span (#262). For a provider registered in the admin UI the repair ` +
-            `is to DELETE it and re-add it — the cascade retracts this container's raw rows ` +
-            `and re-projects the affected days BEFORE purging its cursors — then run "sync ` +
-            `older history" to recover anything beyond the ` +
-            `${FIRST_SYNC_WINDOW_DEFAULT_MONTHS}-month window a re-added provider starts ` +
-            `from. A CONFIG-FILE provider cannot be deleted, so it has no supported repair ` +
-            `today: leave the span understated. ${groups.join('; ')}.`
+            `${COMMIT_CHURN_UNKNOWN_PREFIX} [${providerType}/${degradedRepo}] ${shas.length} ` +
+            'commit(s) were imported with their line counts recorded as zero because the ' +
+            'provider never observed them, and this run has recorded its window as covered — ' +
+            'so lines_added and lines_removed on those developer-days are PERMANENTLY short by ' +
+            'whatever those commits changed (at most — a commit whose author resolves to no ' +
+            'registered developer produced no row to understate). Commit counts and PR metrics ' +
+            'are unaffected; avg_commit_size is dragged toward zero. Where the same response ' +
+            'also carried no file list — the usual shape — files_changed, code_churn_rate and ' +
+            'ai_signature_score on those days are understated too. No diffstat was memoized, ' +
+            `so a re-import gets a fresh answer. ${permanentSpanRepair()}. ` +
+            `Affected: ${sample.join(', ')}${more > 0 ? ` (+${more} more)` : ''}.`
         );
     });
 
@@ -2572,20 +2570,8 @@ async function fetchProviderData(
                     'so nothing re-asks them and the understatement of files_changed, ' +
                     'code_churn_rate and ai_signature_score on their developer-days is ' +
                     'PERMANENT (at most — a commit whose author resolves to no registered ' +
-                    'developer produced no row to understate). raw_author_daily has no ' +
-                    'recompute path. Whatever you do, do NOT simply purge this provider\'s ' +
-                    'cursors and re-sync: that re-imports over the surviving rows and ' +
-                    'permanently DOUBLES every commit metric in the span (#262), which is ' +
-                    'strictly worse than the understatement. For a provider registered in the ' +
-                    'admin UI the repair is to DELETE it and re-add it — the delete cascade ' +
-                    'retracts this container\'s raw rows and re-projects the affected days ' +
-                    'BEFORE purging its cursors, so the re-import lands on an empty span — then ' +
-                    'run "sync older history" to recover anything beyond the ' +
-                    `${FIRST_SYNC_WINDOW_DEFAULT_MONTHS}-month first-sync window a re-added ` +
-                    'provider starts from. A CONFIG-FILE provider cannot be deleted (the route ' +
-                    'refuses it, and the cascade is skipped while the YAML entry still owns the ' +
-                    'container), so it has no supported repair today: leave the span ' +
-                    'understated and fix the provider\'s getCommits to supply GitCommit.diffs.',
+                    `developer produced no row to understate). ${permanentSpanRepair()} and ` +
+                    'fix the provider\'s getCommits to supply GitCommit.diffs.',
             );
         }
     }

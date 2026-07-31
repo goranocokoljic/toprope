@@ -4,7 +4,6 @@ import {GitHubProvider} from '../../../../src/connectors/git/providers/github';
 import {
     NO_AUTHOR_DATE_DROP_REASON,
     UNATTRIBUTABLE_DATE_DROP_REASON,
-    UNKNOWN_CHURN_DEGRADE_REASON,
 } from '../../../../src/connectors/git/providers/types';
 import {
     GIT_REQUEST_TIMEOUT_MS,
@@ -263,6 +262,11 @@ describe('GitHubProvider', () => {
                     {path: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'},
                     {path: 'src/bar.ts', additions: 10, deletions: 5, status: 'added'},
                 ],
+                // The detail carried real `stats`, so the totals above are an OBSERVATION
+                // rather than zero-by-absence (#288). Asserted here, in the one exhaustive
+                // shape test, so a regression that stopped setting the flag on the happy path
+                // — which would make every commit look unobserved to the sync — fails loudly.
+                churnObserved: true,
             });
         });
 
@@ -771,8 +775,9 @@ describe('GitHubProvider', () => {
 
         it('recovers AND memoizes when the body is malformed but its stats are real', async () => {
             // The other side of the throw above, and the positive control for the whole #273
-            // ratchet: because the recovery path now always has real stats, the `put` is
-            // unconditional again. Deleting it would silently disable the ratchet.
+            // ratchet: because the recovery path only ever reaches the `put` with real stats in
+            // hand (the throw sends the alternative away), the memo gate #288 added is always
+            // satisfied here. Deleting the `put` would silently disable the ratchet.
             const put = vi.fn();
             const cache = {load: vi.fn().mockReturnValue(new Map()), put};
             const cachingProvider = new GitHubProvider(CONFIG, {diffstatCache: cache});
@@ -873,15 +878,7 @@ describe('GitHubProvider', () => {
             );
 
             const onDrop = vi.fn();
-            const onDegraded = vi.fn();
-            const commits = await cachingProvider.getCommits(
-                'my-repo',
-                '',
-                '',
-                undefined,
-                onDrop,
-                onDegraded,
-            );
+            const commits = await cachingProvider.getCommits('my-repo', '', '', undefined, onDrop);
 
             // 1. The commit is KEPT, with its real identity — it is not a drop and not a throw.
             expect(commits).toHaveLength(1);
@@ -893,23 +890,22 @@ describe('GitHubProvider', () => {
             expect(commits[0].deletions).toBe(0);
             // 3. NOTHING is memoized, so a later run re-asks the endpoint.
             expect(put).not.toHaveBeenCalled();
-            // 4. And the zero is not silent.
-            expect(onDegraded).toHaveBeenCalledTimes(1);
-            expect(onDegraded).toHaveBeenCalledWith({
-                sha: 'aaa111',
-                reason: UNKNOWN_CHURN_DEGRADE_REASON,
-            });
-            // Asserted against a literal too, so swapping the reason for a drop reason cannot
-            // pass — the two sentences send an operator to different places.
-            expect(onDegraded.mock.calls[0][0].reason).toContain('carried no stats object');
+            // 4. And the zero is not silent — the row says the totals were not observed.
+            expect(commits[0].churnObserved).toBe(false);
+            // 5. `diffs` stays `[]`, NOT undefined. `undefined` would send the sync's
+            // `getCommitDiff` fallback back to this same endpoint for the same sha (one wasted
+            // request per degraded commit per run) and file the provider under
+            // DIFFS_NOT_SUPPLIED_PREFIX, which diagnoses a contract violation that did not
+            // happen.
+            expect(commits[0].diffs).toEqual([]);
         });
 
-        it('treats an OBSERVED zero as observed — it memoizes and reports nothing', async () => {
+        it('treats an OBSERVED zero as observed — it memoizes and flags nothing', async () => {
             // The control that gives the test above its meaning, and the empirical distinction
             // the whole #288 decision rests on: a genuinely empty commit returns
             // `stats: {additions: 0, deletions: 0, total: 0}` — a PRESENT key — so absence and
             // observed-zero are distinguishable in the body. Gate the memo on
-            // `additions === 0` instead of on `stats === undefined` and only this test fails.
+            // `additions === 0` instead of on the shape of `stats` and only this test fails.
             const put = vi.fn();
             const cache = {load: vi.fn().mockReturnValue(new Map()), put};
             const cachingProvider = new GitHubProvider(CONFIG, {diffstatCache: cache});
@@ -926,18 +922,11 @@ describe('GitHubProvider', () => {
                 ]),
             );
 
-            const onDegraded = vi.fn();
-            const commits = await cachingProvider.getCommits(
-                'my-repo',
-                '',
-                '',
-                undefined,
-                undefined,
-                onDegraded,
-            );
+            const commits = await cachingProvider.getCommits('my-repo', '', '');
 
             expect(commits).toHaveLength(1);
             expect(commits[0].additions).toBe(0);
+            expect(commits[0].churnObserved).toBe(true);
             // Observed, so it IS memoized — re-asking would return the same zero forever.
             expect(put).toHaveBeenCalledWith('my-repo', 'aaa111', {
                 additions: 0,
@@ -945,8 +934,75 @@ describe('GitHubProvider', () => {
                 entries: [],
                 absent: false,
             });
-            // …and nothing is reported: there is no understatement to warn about.
-            expect(onDegraded).not.toHaveBeenCalled();
+        });
+
+        it.each([
+            ['an explicit null', null],
+            ['an empty object', {}],
+            ['non-numeric values', {additions: '40', deletions: '10', total: '50'}],
+            ['a NaN total', {additions: Number.NaN, deletions: 0, total: Number.NaN}],
+            ['a fractional count', {additions: 4.5, deletions: 0, total: 4.5}],
+        ])('treats stats as UNOBSERVED when the body carries %s', async (_label, stats) => {
+            // #288 review cycle 1 (SO-1 / SEC-1 / SEC-3). The guard used to be
+            // `stats === undefined`, which recognizes exactly ONE spelling of an absence the
+            // issue itself says GitHub does not document. Every input here satisfies
+            // `!== undefined`, so under that guard each one took the memoize branch and wrote a
+            // fabricated `0`/`0` into a table with no invalidation — the precise outcome this
+            // issue exists to prevent, reintroduced through the spellings the guard did not
+            // enumerate. `'40'` is the sharpest: typed `number` by the unchecked cast, it
+            // string-concatenates through the analyzer's `reduce` and reaches `raw_author_daily`
+            // as a garbage integer; `4.5` throws there, inside the run's write transaction.
+            //
+            // Only a POSITIVE number test rejects all five. Revert the guard to
+            // `=== undefined` and every case here fails; nothing else in the suite does.
+            const put = vi.fn();
+            const cache = {load: vi.fn().mockReturnValue(new Map()), put};
+            const cachingProvider = new GitHubProvider(CONFIG, {diffstatCache: cache});
+            vi.stubGlobal(
+                'fetch',
+                makeFetchMock([
+                    {body: [makeCommitListFixture('aaa111')]},
+                    {body: makeCommitDetailFixture('aaa111', {stats, files: []})},
+                ]),
+            );
+
+            const commits = await cachingProvider.getCommits('my-repo', '', '');
+
+            // The commit is still kept — an unrecognized shape degrades, it does not throw.
+            expect(commits).toHaveLength(1);
+            expect(commits[0].churnObserved).toBe(false);
+            // …and the fabricated zero never reaches the totals or the memo.
+            expect(commits[0].additions).toBe(0);
+            expect(commits[0].deletions).toBe(0);
+            expect(put).not.toHaveBeenCalled();
+        });
+
+        it('THROWS on an unusable commit object plus a null stats, not just an absent one', async () => {
+            // The same widening applied to the #275 malformed-body guard, which shares the
+            // `stats` classification. A body with NEITHER a usable `commit` NOR observable stats
+            // is malformed however the second half is spelled; keying on `=== undefined` let
+            // `{commit: null, stats: null}` — a body with no evidence of usability at all — be
+            // silently recovered as a zero-churn commit.
+            const put = vi.fn();
+            const cache = {load: vi.fn().mockReturnValue(new Map()), put};
+            const cachingProvider = new GitHubProvider(CONFIG, {diffstatCache: cache});
+            vi.stubGlobal(
+                'fetch',
+                makeFetchMock([
+                    {body: [makeCommitListFixture('aaa111')]},
+                    {body: {sha: 'aaa111', commit: null, author: null, stats: null}},
+                ]),
+            );
+
+            const err: unknown = await cachingProvider
+                .getCommits('my-repo', '', '')
+                .then(() => null)
+                .catch((e: unknown) => e);
+
+            expect(err).toBeInstanceOf(Error);
+            expect((err as Error).message).toContain('malformed response');
+            expect(isRetryableGitFetchError(err)).toBe(true);
+            expect(put).not.toHaveBeenCalled();
         });
 
         it('withholds the memo on absent stats even when the detail DID carry files', async () => {
@@ -954,7 +1010,7 @@ describe('GitHubProvider', () => {
             // is the worst thing to memoize: the row would carry genuine `entries` beside a
             // fabricated `0`/`0`, so it would LOOK observed on every later read. The file list is
             // still handed back on `GitCommit.diffs` — it was really fetched — but no row is
-            // written and the churn loss is reported.
+            // written and the commit is flagged unobserved.
             const put = vi.fn();
             const cache = {load: vi.fn().mockReturnValue(new Map()), put};
             const cachingProvider = new GitHubProvider(CONFIG, {diffstatCache: cache});
@@ -982,18 +1038,10 @@ describe('GitHubProvider', () => {
                 ]),
             );
 
-            const onDegraded = vi.fn();
-            const commits = await cachingProvider.getCommits(
-                'my-repo',
-                '',
-                '',
-                undefined,
-                undefined,
-                onDegraded,
-            );
+            const commits = await cachingProvider.getCommits('my-repo', '', '');
 
             expect(put).not.toHaveBeenCalled();
-            expect(onDegraded).toHaveBeenCalledTimes(1);
+            expect(commits[0].churnObserved).toBe(false);
             // The file detail is NOT discarded — `diffs` is what spares the sync a second
             // request for the same endpoint, and it is real here even though the totals are not.
             expect(commits[0].diffs).toEqual([
@@ -1004,12 +1052,37 @@ describe('GitHubProvider', () => {
             expect(commits[0].additions).toBe(0);
         });
 
-        it('reports nothing and returns the commit when no degrade listener is supplied', async () => {
-            // `onDegraded` is optional and every probe path (doctor, test-connection) omits it.
-            // An absent listener must not change WHICH commits come back, nor re-enable the memo.
-            const put = vi.fn();
-            const cache = {load: vi.fn().mockReturnValue(new Map()), put};
-            const cachingProvider = new GitHubProvider(CONFIG, {diffstatCache: cache});
+        it('never flags a DROPPED commit as unobserved — the two reports are exclusive', async () => {
+            // #288 review cycle 1, TST-4. A commit with no usable author date is dropped at the
+            // guard ABOVE the churn classification, so it never reaches the flag. That ordering
+            // is what stops one sha producing both a "commit dropped" line (it is missing) and a
+            // "churn unobserved" line (its developer-day is short) — two advisories with
+            // different remedies, one of which would be describing a day that was never written.
+            //
+            // The fixture is deliberately BOTH: dateless on both copies AND stats-less.
+            const dateless = {author: null, message: 'unattributable'};
+            vi.stubGlobal(
+                'fetch',
+                makeFetchMock([
+                    {body: [{sha: 'aaa111', commit: dateless, author: null}]},
+                    {body: {sha: 'aaa111', commit: dateless, author: null}},
+                ]),
+            );
+
+            const onDrop = vi.fn();
+            const commits = await provider.getCommits('my-repo', '', '', undefined, onDrop);
+
+            // Dropped, so there is no row at all to carry a flag.
+            expect(commits).toEqual([]);
+            expect(onDrop).toHaveBeenCalledWith({
+                sha: 'aaa111',
+                reason: NO_AUTHOR_DATE_DROP_REASON,
+            });
+        });
+
+        it('flags and withholds the memo with no cache attached at all', async () => {
+            // Every probe path (doctor, test-connection) constructs the provider with no
+            // diffstat cache. The classification must not depend on one being present.
             vi.stubGlobal(
                 'fetch',
                 makeFetchMock([
@@ -1018,11 +1091,11 @@ describe('GitHubProvider', () => {
                 ]),
             );
 
-            const commits = await cachingProvider.getCommits('my-repo', '', '');
+            const commits = await provider.getCommits('my-repo', '', '');
 
             expect(commits).toHaveLength(1);
             expect(commits[0].additions).toBe(0);
-            expect(put).not.toHaveBeenCalled();
+            expect(commits[0].churnObserved).toBe(false);
         });
 
         it('drops nothing when no drop listener is supplied — a short list is still short', async () => {

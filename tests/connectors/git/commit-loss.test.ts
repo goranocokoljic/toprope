@@ -37,7 +37,6 @@ import {
 import {
     NO_AUTHOR_DATE_DROP_REASON,
     UNATTRIBUTABLE_DATE_DROP_REASON,
-    UNKNOWN_CHURN_DEGRADE_REASON,
 } from '../../../src/connectors/git/providers/types';
 import {MAX_SERVER_ERROR_RETRIES} from '../../../src/connectors/git/providers/http-retry';
 import type {GitProviderConfig} from '../../../src/connectors/git/providers/types';
@@ -93,8 +92,12 @@ function listRow(sha: string, commit: unknown = EMBEDDED): Record<string, unknow
 function detailBody(sha: string, commit: unknown = EMBEDDED): Record<string, unknown> {
     return {
         ...listRow(sha, commit),
+        // Deliberately SKEWED from `stats`: GitHub caps `files` at 300 per commit while
+        // `stats` covers the whole commit, so churn must be read from `stats` and never summed
+        // from the file list. With the two agreeing, a regression that summed `files` passed
+        // every assertion in this file (#288 review cycle 1, TST-7).
         stats: {additions: 40, deletions: 10, total: 50},
-        files: [{filename: 'src/foo.ts', additions: 40, deletions: 10, status: 'modified'}],
+        files: [{filename: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'}],
     };
 }
 
@@ -196,15 +199,27 @@ function churnLineOf(errors: string[]): string | undefined {
     return errors.find((e) => e.startsWith(COMMIT_CHURN_UNKNOWN_PREFIX));
 }
 
-/** A detail body with a usable `commit` object but NO `stats`/`files` keys (#288). */
+/**
+ * A detail body with a usable `commit` object but NO `stats`/`files` keys (#288).
+ *
+ * It is literally the commit-LIST row, and that is the empirical point the whole issue rests
+ * on rather than a shortcut: GitHub returns the identical embedded `commit` object on both
+ * endpoints and adds only `stats`/`files` on the detail, so a list row IS a well-formed detail
+ * body minus exactly the two keys in question. Nothing about this fixture is contrived.
+ */
 function statlessDetail(sha: string): Record<string, unknown> {
     return listRow(sha);
 }
 
-function dayLines(db: Database.Database): {added: number; removed: number} | undefined {
-    return db.prepare('SELECT lines_added AS added, lines_removed AS removed FROM git_snapshots WHERE date = ?').get(DAY) as
-        | {added: number; removed: number}
-        | undefined;
+function dayLines(
+    db: Database.Database,
+): {added: number; removed: number; files: number} | undefined {
+    return db
+        .prepare(
+            'SELECT lines_added AS added, lines_removed AS removed, files_changed AS files ' +
+                'FROM git_snapshots WHERE date = ?',
+        )
+        .get(DAY) as {added: number; removed: number; files: number} | undefined;
 }
 
 function memoCount(db: Database.Database): number {
@@ -655,15 +670,22 @@ describe('unreturned commits are never silent (#275)', () => {
 
             // 1. BOTH commits import — this is not a drop, so the commit count is the full 2.
             expect(dayCommits(db)).toBe(2);
-            // 2. …but only bbb222's churn is in the totals; aaa111 contributed nothing.
-            expect(dayLines(db)).toEqual({added: 40, removed: 10});
-            // 3. The loss is named, with the sha, the count and the reason the code emits.
+            // 2. …but only bbb222's churn is in the totals. `added: 40` also pins that churn
+            // came from `stats` and not from summing `files` (the fixture skews the two).
+            // `files: 1` is the point of SO-2/SEC-2: a stats-less detail carries no file list
+            // either, so files_changed is short too — the advisory must not call it unaffected.
+            expect(dayLines(db)).toEqual({added: 40, removed: 10, files: 1});
+            // 3. The loss is named, with the sha, the count and what actually happened.
             const churnLine = churnLineOf(result.errors);
             expect(churnLine).toBeDefined();
             expect(churnLine).toContain('[github/repo1]');
             expect(churnLine).toContain('aaa111');
             expect(churnLine).toContain('1 commit(s)');
-            expect(churnLine).toContain(UNKNOWN_CHURN_DEGRADE_REASON);
+            expect(churnLine).toContain('the provider never observed them');
+            // The advisory must NOT reassure about metrics this same shape understates — the
+            // operator sizes a destructive repair against this sentence (#288 review SO-2/SEC-2).
+            expect(churnLine).toContain('files_changed, code_churn_rate and ai_signature_score');
+            expect(churnLine).not.toMatch(/files_changed[^.]*are unaffected/);
             // A healthy commit is not named — an operator cannot act on a line listing the repo.
             expect(churnLine).not.toContain('bbb222');
             // 4. The cursor advances: re-fetching returns the identical body.
@@ -732,7 +754,7 @@ describe('unreturned commits are never silent (#275)', () => {
             const result = await runSync(db);
 
             expect(churnLineOf(result.errors)).toBeUndefined();
-            expect(dayLines(db)).toEqual({added: 40, removed: 10});
+            expect(dayLines(db)).toEqual({added: 40, removed: 10, files: 1});
         });
 
         it('does NOT claim permanence when a later repo fails and the window is discarded', async () => {
@@ -764,7 +786,41 @@ describe('unreturned commits are never silent (#275)', () => {
             expect(churnLineOf(result.errors)).toBeUndefined();
         });
 
-        it('does NOT claim permanence when the write transaction rolls back', async () => {
+        it('does NOT claim permanence when the rollback fires AFTER the cursor advance', async () => {
+            // #288 review cycle 1, TST-1 — the ONLY test that distinguishes staged-then-pushed
+            // from pushed-at-the-staging-site. The `DROP TABLE git_snapshots` variant below
+            // fails at `projectSnapshots`, which runs BEFORE the `cursorAdvances` loop, so it
+            // never reaches the staging site and passes for a reason that is not the mechanism —
+            // the #275 suite above documents exactly that trap. `stallUpdates` runs AFTER the
+            // advances, so a throw there is the one window where the advisory has already been
+            // staged and the transaction still rolls back. Push to `errors` at the staging site
+            // instead of staging, and only this test fails.
+            seedAlice(db);
+            stubGitHub([listRow('aaa111'), listRow('bbb222')], {
+                aaa111: {body: statlessDetail('aaa111')},
+                bbb222: {body: detailBody('bbb222')},
+            });
+            db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+                stallStateKey('github', 'test-org'),
+                JSON.stringify({runs: 1, since: '2024-01-01T00:00:00.000Z'}),
+            );
+            db.exec(`
+                CREATE TRIGGER churn_boom BEFORE DELETE ON sync_state
+                WHEN old.key LIKE 'git_stall:%'
+                BEGIN SELECT RAISE(ABORT, 'stall-clear boom'); END;
+            `);
+
+            const result = await runSync(db);
+
+            // Positive controls: the run rolled back and the cursor the claim rests on did not
+            // persist…
+            expect(result.errors.some((e) => /transaction rolled back/.test(e))).toBe(true);
+            expect(readState(db, FORWARD_KEY)).toBeUndefined();
+            // …so no permanence claim survived, even though the staging site DID execute.
+            expect(churnLineOf(result.errors)).toBeUndefined();
+        });
+
+        it('does NOT claim permanence when the write transaction rolls back early', async () => {
             seedAlice(db);
             stubGitHub([listRow('aaa111')], {aaa111: {body: statlessDetail('aaa111')}});
             db.exec('DROP TABLE git_snapshots');
@@ -775,11 +831,48 @@ describe('unreturned commits are never silent (#275)', () => {
             expect(churnLineOf(result.errors)).toBeUndefined();
         });
 
+        it('lets a LATER run recover the real churn, because nothing was memoized', async () => {
+            // #288 review cycle 1, SO-5. Every other assertion here is about the ABSENCE of a
+            // write; this is about what that absence buys. Withholding the memo is only
+            // worthwhile if a subsequent fetch of the same commit actually reaches the endpoint
+            // and gets the fresh answer — a refactor that "helpfully" memoized these as
+            // `absent: true` to stop the re-fetch would keep every not-called assertion green
+            // and silently make the loss permanent.
+            //
+            // Run 1's detail is stats-less; run 2's carries real stats. Run 2 is a BACKFILL over
+            // the same day, which is the real path that re-asks an already-covered window.
+            seedAlice(db);
+            let attempt = 0;
+            stubGitHub([listRow('aaa111')], {
+                aaa111: () =>
+                    attempt++ === 0 ? {body: statlessDetail('aaa111')} : {body: detailBody('aaa111')},
+            });
+
+            const first = await runSync(db);
+            // Run 1: imported, churn unknown, nothing memoized.
+            expect(churnLineOf(first.errors)).toBeDefined();
+            expect(dayLines(db)).toEqual({added: 0, removed: 0, files: 0});
+            expect(memoCount(db)).toBe(0);
+
+            const pending = new GitSync({enabled: false}).syncProviders(db, [CONFIG], undefined, {
+                backfill: {since: `${DAY}T00:00:00.000Z`, until: `${DAY}T23:59:59.000Z`},
+            });
+            await vi.runAllTimersAsync();
+            const second = await pending;
+
+            // Run 2 re-asked the endpoint — no memo short-circuited it — and got real stats, so
+            // the churn lands and the advisory is gone.
+            expect(churnLineOf(second.errors)).toBeUndefined();
+            expect(dayLines(db)?.added).toBe(40);
+            expect(memoCount(db)).toBe(1);
+        });
+
         it('counts each unobserved commit ONCE even when an in-run retry re-pages the window', async () => {
-            // The degrade list is reset at the top of every ATTEMPT, not once per repo: a retry
-            // re-pages the same window and re-reports the same commits. Reset per repo instead
-            // and this run claims "2 commit(s)" for one, sending an operator after a commit that
-            // does not exist.
+            // A retry re-pages the identical window, so a naive accumulator would claim
+            // "2 commit(s)" for one commit and send an operator after a commit that does not
+            // exist. The count is structurally safe rather than guarded: it is derived from the
+            // RETURNED array, which `fetchRepoWithRetry` ASSIGNS rather than appends to. This
+            // pins that the derivation stays on the returned array.
             seedAlice(db);
             let serverErrors = 0;
             stubGitHub([listRow('aaa111'), listRow('bbb222')], {
@@ -806,9 +899,9 @@ describe('unreturned commits are never silent (#275)', () => {
 
         it('reports each affected repo separately, caps the sample and counts the remainder', async () => {
             // Both aggregation halves at once: the per-repo loop must run more than once (a
-            // shared accumulator leaks repo1's shas into repo2's line), and the per-reason
-            // sample cap must actually bite — with one commit per test `slice(0, 5)` is
-            // indistinguishable from `slice(0, 1)` and the `(+N more)` branch never runs.
+            // shared accumulator leaks repo1's shas into repo2's line), and the sample cap must
+            // actually bite — with one commit per test `slice(0, 5)` is indistinguishable from
+            // `slice(0, 1)` and the `(+N more)` branch never runs.
             seedAlice(db);
             const many = ['ca01', 'ca02', 'ca03', 'ca04', 'ca05', 'ca06', 'ca07'];
             stubGitHub(
@@ -845,7 +938,7 @@ describe('unreturned commits are never silent (#275)', () => {
 
         it('renders a non-hex sha as invalid instead of interpolating it into the log line', async () => {
             // The sha is raw response JSON and this line reaches a terminal and `sync_logs`.
-            // The allowlist is shared with the drop advisory, but sharing it is a property of
+            // `sanitizeSha` is shared with the drop advisory, but sharing it is a property of
             // the CODE, not of the type — a future edit could sanitize one line and not the
             // other, and no other test in this file drives this line with a hostile sha.
             seedAlice(db);
