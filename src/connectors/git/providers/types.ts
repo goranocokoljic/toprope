@@ -384,6 +384,77 @@ export interface GitCommitDrop {
  */
 export type GitCommitDropListener = (drop: GitCommitDrop) => void;
 
+/**
+ * Every reason a provider may give for returning a commit whose CHURN it could not observe
+ * (#288).
+ *
+ * Distinct from {@link GitCommitDropReason} along the axis that matters downstream: a drop
+ * means the commit is not in the result at all, while this means the commit IS in the result
+ * and its `additions`/`deletions` are `0` BY ABSENCE rather than by observation. The two
+ * cannot share a channel — the drop advisory tells an operator a commit is missing, which
+ * would be false here, and this one tells them a present commit's line counts are wrong,
+ * which would be false there.
+ *
+ * Declared as a SINGLE unbroken literal for the same reason the drop reasons are: `'a' + 'b'`
+ * is not constant-folded, so a concatenated const widens to `string` and the derived union
+ * would accept any string — including a response body — into a line the CLI prints and the
+ * scheduler persists into `sync_logs.errors`.
+ */
+export const UNKNOWN_CHURN_DEGRADE_REASON = 'the commit detail response carried no stats object, so the commit\'s line counts were not observed and are recorded as zero';
+
+/**
+ * The reasons as a runtime-enumerable set, for the allowlist check at the reporting sink —
+ * the same pairing {@link COMMIT_DROP_REASONS} exists for, and for the same reason: a
+ * compile-time union is not a control at a boundary a future provider implementation crosses.
+ *
+ * Built from the NAME above, never indexed by position.
+ */
+export const COMMIT_DEGRADE_REASONS = [UNKNOWN_CHURN_DEGRADE_REASON] as const;
+
+/** One of the {@link COMMIT_DEGRADE_REASONS}. */
+export type GitCommitDegradeReason = (typeof COMMIT_DEGRADE_REASONS)[number];
+
+/**
+ * One commit a provider RETURNED but whose churn it could not observe (#288).
+ *
+ * Neither a fetch failure nor a {@link GitCommitDrop}. It is not a failure because the
+ * response was well-formed by the endpoint's own published contract — GitHub's REST reference
+ * for `GET /repos/{owner}/{repo}/commits/{ref}` does not mark `stats` required and documents
+ * no condition under which it is sent, so an absent `stats` cannot be read as evidence the
+ * body is broken, and throwing would hold the provider's cursor forever on a shape that
+ * recurs identically (the brick-rather-than-heal outcome {@link GitCommitDrop} describes).
+ * It is not a drop because the commit is kept: its author, date, message and file list are
+ * all present and are imported.
+ *
+ * What IS lost is the commit's contribution to `lines_added`/`lines_removed` on that
+ * developer-day. `raw_author_daily` is additive and append-only with the cursor advanced past
+ * the window, so once this run's window is recorded as covered the understatement is
+ * permanent — which is the whole reason the condition has to be said out loud rather than
+ * left as a silent zero.
+ *
+ * The other half of the response — the memo — is handled at the provider: a commit reported
+ * here is never written to `commit_diffstats`, because that table has no invalidation and a
+ * memoized zero would be served to every later run in place of a well-formed re-fetch (#288).
+ */
+export interface GitCommitDegraded {
+    /** The sha as it appeared in the provider's own commit list. */
+    sha: string;
+    /** What could not be observed, in words an operator can act on. */
+    reason: GitCommitDegradeReason;
+}
+
+/**
+ * Optional sink for {@link GitCommitDegraded}s, handed to `getCommits` alongside the progress
+ * and drop listeners and invoked through `?.()` the same way — a caller that supplies none
+ * pays nothing, and the argument object is never even constructed.
+ *
+ * Per-commit rather than a returned count, and aggregated by the caller into one line per
+ * repo, for exactly the reasons {@link GitCommitDropListener} states; its note on WHERE THE
+ * LINE LANDS (and the #289 gap on the admin "Sync now" path) applies verbatim to this
+ * advisory too.
+ */
+export type GitCommitDegradedListener = (degraded: GitCommitDegraded) => void;
+
 export interface GitProvider {
     name: GitProviderType;
     listRepos(): Promise<GitRepo[]>;
@@ -440,12 +511,20 @@ export interface GitProvider {
     //     GitHub is pinned against this at its own boundary (see `isAttributableDate`); the
     //     durable fix is a shared pin or a per-row skip at the write boundary, tracked in #290.
     //     Do not read GitHub's pin as protecting the run.
+    //
+    // `onDegraded` (optional) is the third and last channel, for a commit the implementation
+    // DOES return but whose churn it could not observe (#288) — see {@link GitCommitDegraded}
+    // for why that is neither a throw (the body is well-formed by the endpoint's own contract,
+    // so retrying recovers nothing and holding the cursor bricks the provider) nor a drop (the
+    // commit is imported). Only GitHub can currently report one; Bitbucket and GitLab derive
+    // their totals from a diffstat whose absence is already a documented `[]` answer.
     getCommits(
         repo: string,
         since: string,
         until: string,
         onProgress?: GitFetchProgressListener,
         onDrop?: GitCommitDropListener,
+        onDegraded?: GitCommitDegradedListener,
     ): Promise<GitCommit[]>;
     // `onProgress` (optional) reports the PR list paging in. The per-PR
     // comment/review fan-out lives in the sync loop, which reports that itself.

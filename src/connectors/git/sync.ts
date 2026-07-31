@@ -40,11 +40,13 @@ import type {
     GitProviderType,
     GitCommitDrop,
     GitCommitDropReason,
+    GitCommitDegraded,
+    GitCommitDegradeReason,
     GitFetchProgressListener,
     GitFileDiff,
     GitPR,
 } from './providers/types.js';
-import {COMMIT_DROP_REASONS} from './providers/types.js';
+import {COMMIT_DROP_REASONS, COMMIT_DEGRADE_REASONS} from './providers/types.js';
 import {promoteAllCandidates} from './onboarding.js';
 import {ensureTeam} from '../../registry/teams.js';
 import {resolveAutoCreateSettings, type AutoCreateSettings} from '../../config/git-auto-create.js';
@@ -207,9 +209,38 @@ export const DIFFS_NOT_SUPPLIED_PREFIX = 'Provider supplied no commit diffs:';
 export const COMMITS_DROPPED_PREFIX = 'Commits dropped as unattributable:';
 
 /**
+ * Prefix of the advisory pushed when a provider returned commits whose CHURN it could not
+ * observe (#288) — on GitHub, a commit-detail response carrying no `stats` object.
+ * {@link GitCommitDegraded} is the canonical statement of why that is neither a fetch failure
+ * nor a drop; read it rather than re-deriving the argument here.
+ *
+ * Deliberately NOT a failure, for the same reason as {@link COMMITS_DROPPED_PREFIX}: the
+ * response was well-formed by the endpoint's published contract, so re-fetching returns the
+ * identical body. Turning the provider red would make `sync-pipeline` re-run the ENTIRE git
+ * connector every run forever and still never learn the line counts.
+ *
+ * But it must be SAID. The commit IS imported — its author, date and file list all land — so
+ * every count-based surface looks complete; the only thing wrong is that `lines_added` and
+ * `lines_removed` on that developer-day are short by this commit's contribution, and nothing
+ * else in the run distinguishes "this commit changed nothing" from "nobody told us what it
+ * changed". That is the "a completion signal is not a currency claim" failure exactly.
+ *
+ * Emitted only for a run whose data was actually KEPT — same seam, same staging and the same
+ * three discard paths as {@link COMMITS_DROPPED_PREFIX} and the permanence half of
+ * {@link DIFFS_NOT_SUPPLIED_PREFIX}: a held, rolled-back or deleted-container window is
+ * re-fetched intact next run, and calling its understatement permanent would send an operator
+ * to repair a span that is fine. The memo half needs no such gate and is handled at the
+ * provider, which simply never writes a `commit_diffstats` row for these commits.
+ */
+export const COMMIT_CHURN_UNKNOWN_PREFIX = 'Commit churn not observed:';
+
+/**
  * How many dropped shas the {@link COMMITS_DROPPED_PREFIX} advisory names before falling back
  * to "+N more". Enough to go look one up in the provider's UI; small enough that a systemic
  * shape problem across thousands of commits still produces one readable line.
+ *
+ * Shared with the {@link COMMIT_CHURN_UNKNOWN_PREFIX} advisory (#288), which samples shas for
+ * the identical reason — one constant so the two lines cannot drift to different budgets.
  */
 const DROPPED_COMMIT_SAMPLE_SIZE = 5;
 
@@ -252,6 +283,20 @@ function sanitizeDropReason(reason: unknown): string {
         : '<unrecognized drop reason>';
 }
 
+/**
+ * A degrade reason, safe to interpolate into the churn advisory (#288).
+ *
+ * A runtime allowlist against {@link COMMIT_DEGRADE_REASONS}, for exactly the reason
+ * {@link sanitizeDropReason} is one: the value crosses a provider boundary before reaching a
+ * terminal and `sync_logs.errors`, and a compile-time union is not a control there. A future
+ * provider interpolating an API error body cannot reach the log through this field.
+ */
+function sanitizeDegradeReason(reason: unknown): string {
+    return COMMIT_DEGRADE_REASONS.includes(reason as GitCommitDegradeReason)
+        ? (reason as string)
+        : '<unrecognized degrade reason>';
+}
+
 /** Every sentinel that marks an `errors` entry as advisory rather than a failure. */
 const ADVISORY_PREFIXES: readonly string[] = [
     UNMATCHED_AUTHORS_PREFIX,
@@ -262,6 +307,7 @@ const ADVISORY_PREFIXES: readonly string[] = [
     DIFFSTAT_CACHE_DEGRADED_PREFIX,
     DIFFS_NOT_SUPPLIED_PREFIX,
     COMMITS_DROPPED_PREFIX,
+    COMMIT_CHURN_UNKNOWN_PREFIX,
 ];
 
 /**
@@ -1579,6 +1625,21 @@ interface ProviderFetchResult {
      */
     diffLossAdvisories: string[];
     /**
+     * Fully-formatted {@link COMMIT_CHURN_UNKNOWN_PREFIX} lines for this provider (#288),
+     * threaded out rather than pushed into {@link errors} for the identical reason
+     * {@link droppedAdvisories} and {@link diffLossAdvisories} are: each claims an
+     * understatement that nothing will re-ask, which is only true once this run's window is
+     * recorded as covered. The three share one emit site (the cursor-advance closure) rather
+     * than each enumerating the discard paths at its own push site — enumerating them is how
+     * the first version of this pattern got two of the three and missed the container-deleted
+     * one.
+     *
+     * Kept a SEPARATE field from the two siblings rather than merged into either: the
+     * advisory sentinel is what classifies an `errors` entry, and these lines carry a
+     * different prefix and a different remedy from both.
+     */
+    churnUnknownAdvisories: string[];
+    /**
      * True iff every fetch feeding the ADDITIVE commit-derived snapshot succeeded
      * for this provider — `listRepos` AND every repo's `getCommits`. When false the
      * run must NOT advance this provider's cursor/watermark AND must NOT write its
@@ -1872,6 +1933,8 @@ async function fetchProviderData(
         droppedAdvisories: [],
         // No commit was fetched, so no fallback diff request could have failed.
         diffLossAdvisories: [],
+        // No commit was fetched, so no commit's churn could have gone unobserved.
+        churnUnknownAdvisories: [],
         // The window was not covered at all — hold the cursor so it retries (#231).
         complete: false,
     });
@@ -1955,6 +2018,16 @@ async function fetchProviderData(
     // that does not exist — the same reason `allUnmatched` and the auto-create advisories are
     // staged and cleared on rollback rather than pushed as they are discovered.
     const droppedByRepo: Array<{repo: string; drops: GitCommitDrop[]}> = [];
+
+    // Commits each repo's provider RETURNED but whose churn it could not observe (#288),
+    // staged on exactly the same terms and for exactly the same reason as `droppedByRepo`
+    // above: the advisory calls the understatement permanent, and a later repo's failure
+    // discards this whole provider's window and re-asks everything next run.
+    //
+    // Per repo, not per provider — unlike the fallback-diff counters below. This is a property
+    // of the DATA (which commits GitHub described without stats), not of the provider
+    // implementation, so naming the repo is what tells an operator where to look.
+    const degradedByRepo: Array<{repo: string; degraded: GitCommitDegraded[]}> = [];
 
     // How many commits this provider returned WITHOUT `GitCommit.diffs`, forcing the diff pass
     // below into its `getCommitDiff` fallback (#280), and which repos they came from. Counted
@@ -2057,9 +2130,15 @@ async function fetchProviderData(
         // appended) commit result above — a retry replaces the previous attempt, it does not
         // add to it.
         const droppedCommits: GitCommitDrop[] = [];
+        // Same lifecycle as `droppedCommits`, and reset on the same line for the same reason:
+        // a retry re-pages the identical window and re-reports the identical degraded commits,
+        // so a list that survived across attempts would multiply the count by the attempt
+        // number (#288).
+        const degradedCommits: GitCommitDegraded[] = [];
         const commitFetch = await fetchRepoWithRetry(
             () => {
                 droppedCommits.length = 0;
+                degradedCommits.length = 0;
                 return provider.getCommits(
                     repoName,
                     since,
@@ -2070,6 +2149,9 @@ async function fetchProviderData(
                     // on the observer-free scheduled path too (that path is where nearly every
                     // real sync runs).
                     (drop) => droppedCommits.push(drop),
+                    // Unconditional for the same reason (#288): the churn advisory is the only
+                    // record that a developer-day's line counts are short.
+                    (degraded) => degradedCommits.push(degraded),
                 );
             },
             () => reportStep('commits', 0, null),
@@ -2095,6 +2177,10 @@ async function fetchProviderData(
         // because its window is about to be re-covered.
         if (droppedCommits.length > 0) {
             droppedByRepo.push({repo: repoName, drops: [...droppedCommits]});
+        }
+        // Staged on the success path only, exactly like the drops above (#288).
+        if (degradedCommits.length > 0) {
+            degradedByRepo.push({repo: repoName, degraded: [...degradedCommits]});
         }
         report?.((p) => {
             p.commits_fetched += rawCommits.length;
@@ -2386,6 +2472,46 @@ async function fetchProviderData(
         );
     });
 
+    // FORMATTED here, EMITTED by the caller, on the same gate and for the same reason as the
+    // drop advisories directly above (#288). One line per affected repo with a count and a
+    // bounded sha sample, grouped under the reason — the same shape, because an operator
+    // reading both in one `errors` list should not have to learn two layouts.
+    const churnUnknownAdvisories = degradedByRepo.map(({repo: degradedRepo, degraded}) => {
+        const byReason = new Map<string, string[]>();
+        for (const entry of degraded) {
+            const reason = sanitizeDegradeReason(entry.reason);
+            const shas = byReason.get(reason);
+            if (shas === undefined) byReason.set(reason, [sanitizeSha(entry.sha)]);
+            else shas.push(sanitizeSha(entry.sha));
+        }
+        const groups = [...byReason].map(([reason, shas]) => {
+            const sample = shas.slice(0, DROPPED_COMMIT_SAMPLE_SIZE);
+            const more = shas.length - sample.length;
+            return (
+                `${shas.length} because ${reason} — e.g. ${sample.join(', ')}` +
+                `${more > 0 ? ` (+${more} more)` : ''}`
+            );
+        });
+        return (
+            `${COMMIT_CHURN_UNKNOWN_PREFIX} [${providerType}/${degradedRepo}] ${degraded.length} ` +
+            `commit(s) were imported with their line counts recorded as zero rather than ` +
+            `observed, and this run has recorded its window as covered — so lines_added and ` +
+            `lines_removed on those developer-days are PERMANENTLY short by whatever those ` +
+            `commits changed (at most — a commit whose author resolves to no registered ` +
+            `developer produced no row to understate). Commit counts, files_changed and PR ` +
+            `metrics are unaffected. No diffstat was memoized for them, so a re-import does ` +
+            `get a fresh answer; but do NOT simply purge this provider's cursors and re-sync, ` +
+            `which re-imports over the surviving rows and permanently DOUBLES every commit ` +
+            `metric in the span (#262). For a provider registered in the admin UI the repair ` +
+            `is to DELETE it and re-add it — the cascade retracts this container's raw rows ` +
+            `and re-projects the affected days BEFORE purging its cursors — then run "sync ` +
+            `older history" to recover anything beyond the ` +
+            `${FIRST_SYNC_WINDOW_DEFAULT_MONTHS}-month window a re-added provider starts ` +
+            `from. A CONFIG-FILE provider cannot be deleted, so it has no supported repair ` +
+            `today: leave the span understated. ${groups.join('; ')}.`
+        );
+    });
+
     // The cache never throws, so this line is the ONLY trace a broken one leaves. An advisory,
     // not a failure — see DIFFSTAT_CACHE_DEGRADED_PREFIX. Reported once per provider with a
     // count rather than per commit: a dead cache fails on every one of thousands of commits,
@@ -2476,6 +2602,7 @@ async function fetchProviderData(
         forwardCursorTarget: until,
         droppedAdvisories,
         diffLossAdvisories,
+        churnUnknownAdvisories,
         complete: commitsComplete,
     };
 }
@@ -2979,6 +3106,10 @@ export class GitSync implements ConnectorInterface {
         // are: the line claims the loss can no longer be re-asked, which is only true once this
         // run's window is recorded as covered. Same closure, same discard semantics.
         const diffLossAdvisories: string[] = [];
+        // Unobserved-churn advisories (#288), staged for exactly the reason the two above are:
+        // the line claims the understatement can no longer be re-asked, which is only true once
+        // this run's window is recorded as covered. Same closure, same discard semantics.
+        const churnUnknownAdvisories: string[] = [];
         // Deferred stall-counter updates (#235), applied in the SAME transaction as
         // the cursor advances so the counter and the cursor can never disagree about
         // whether this run moved the provider forward. Unlike `cursorAdvances` this
@@ -3040,6 +3171,9 @@ export class GitSync implements ConnectorInterface {
                 // Same premise, same gate (#280): the failed-fallback commits are only
                 // unreachable-forever once this advance makes their window covered.
                 diffLossAdvisories.push(...result.diffLossAdvisories);
+                // Same premise, same gate (#288): a commit whose churn was never observed is
+                // only permanently understated once this advance makes its window covered.
+                churnUnknownAdvisories.push(...result.churnUnknownAdvisories);
                 if (options?.backfill) {
                     setProviderEarliestSyncTime(db, providerType, identifier, options.backfill.since);
                 } else {
@@ -3278,11 +3412,13 @@ export class GitSync implements ConnectorInterface {
             // Committed — only now is the auto-create summary true.
             errors.push(...autoCreateAdvisories);
             // …and only now has any window actually been recorded as covered, which is what
-            // the drop advisories claim (#275) and the permanent-diff-loss advisories claim
-            // (#280). Both are cleared by construction on the rollback path below — never
-            // pushed there — for the same reason.
+            // the drop advisories claim (#275), the permanent-diff-loss advisories claim (#280)
+            // and the unobserved-churn advisories claim (#288). All three are cleared by
+            // construction on the rollback path below — never pushed there — for the same
+            // reason.
             errors.push(...droppedAdvisories);
             errors.push(...diffLossAdvisories);
+            errors.push(...churnUnknownAdvisories);
         } catch (err) {
             // Hard failure: the tx rolled back, so NO snapshots were written, NO developer
             // was auto-created and NO cursor advanced — the window is intact and will be

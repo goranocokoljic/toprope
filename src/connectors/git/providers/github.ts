@@ -13,9 +13,14 @@ import type {
     GitHubProviderConfig,
     GitFetchProgressListener,
     GitCommitDropListener,
+    GitCommitDegradedListener,
     GitProviderClientOptions,
 } from './types.js';
-import {NO_AUTHOR_DATE_DROP_REASON, UNATTRIBUTABLE_DATE_DROP_REASON} from './types.js';
+import {
+    NO_AUTHOR_DATE_DROP_REASON,
+    UNATTRIBUTABLE_DATE_DROP_REASON,
+    UNKNOWN_CHURN_DEGRADE_REASON,
+} from './types.js';
 import {isUtcDay} from '../../../aggregation/dates.js';
 import {normalizeContainer} from './container.js';
 import {loadDiffstats} from './diffstat.js';
@@ -330,10 +335,16 @@ interface RawCommitDetail {
         message: string;
     };
     author: {login: string} | null;
-    // Both OPTIONAL: GitHub omits them on some commits, which is why every reader here
-    // guards (`detail.stats?.additions ?? 0`, `detail.files ?? []`). Typed to match what
-    // the readers actually assume, so nobody writes `detail.files.map(...)` on the strength
-    // of the declaration.
+    // Both OPTIONAL, which is why every reader here guards (`detail.stats?.additions ?? 0`,
+    // `detail.files ?? []`). Typed to match what the readers actually assume, so nobody writes
+    // `detail.files.map(...)` on the strength of the declaration.
+    //
+    // The declaration follows GitHub's own: neither key is among the endpoint's required
+    // response properties, and no condition for omitting them is documented (#288 — see the
+    // guard in `getCommits` for the evidence and what the codebase does about it). So this is
+    // "the contract permits absence", not the stronger "GitHub is known to omit them"; an
+    // absent `stats` is therefore not treated as a malformed body, but the churn it would have
+    // carried is treated as UNKNOWN rather than zero.
     stats?: {additions: number; deletions: number; total: number};
     files?: Array<{filename: string; additions: number; deletions: number; status: string}>;
 }
@@ -477,6 +488,7 @@ export class GitHubProvider implements GitProvider {
         until: string,
         onProgress?: GitFetchProgressListener,
         onDrop?: GitCommitDropListener,
+        onDegraded?: GitCommitDegradedListener,
     ): Promise<GitCommit[]> {
         const params = new URLSearchParams({per_page: '100'});
         if (since) params.set('since', since);
@@ -568,12 +580,34 @@ export class GitHubProvider implements GitProvider {
                 // same sha, so carry its file list out on `diffs` and let the caller skip
                 // that second identical request (#271). `[]`, never undefined — a detail
                 // with no `files` means "no files". See `GitCommit.diffs`.
+                //
+                // Stays `[]` even on the #288 degraded path (no `stats`), deliberately. `[]`
+                // means "no further request will help", and here that is literally true: the
+                // sync's fallback is `getCommitDiff`, which re-requests THIS endpoint for THIS
+                // sha and would map the same absent `files` to the same `[]`. Handing back
+                // `undefined` instead would buy one duplicate request per degraded commit per
+                // run and file the provider under DIFFS_NOT_SUPPLIED — an advisory that
+                // diagnoses "this implementation does not honour the GitCommit.diffs contract",
+                // which is the wrong story. The churn loss is reported on its own channel.
                 const diffs = toFileDiffs(detail);
+                // Read ONCE into a local, so the guard below, the two totals and the memo gate
+                // are all decided by the same value — `detail.stats` is a property of an
+                // unvalidated body, and three separate reads are three chances for a later edit
+                // to memoize a zero the guard already classified as unknown (#288).
+                const stats = detail.stats;
                 // NOT summed from `diffs`: GitHub caps `files` at 300 per commit while
                 // `stats` covers the whole commit, so the totals stay authoritative
                 // even where the file list is truncated. Unchanged by #271.
-                const additions = detail.stats?.additions ?? 0;
-                const deletions = detail.stats?.deletions ?? 0;
+                //
+                // `?? 0` here is "not observed", NOT "observed to be zero" — the two are
+                // distinguishable in the body (an empty commit returns
+                // `stats: {additions: 0, deletions: 0, total: 0}`, a present key) and #288
+                // keeps them distinguishable downstream: the absent case is reported through
+                // `onDegraded` and never memoized. `GitCommit.additions` is a required number,
+                // so zero is the only value expressible here; the report is what stops it
+                // reading as an observation.
+                const additions = stats?.additions ?? 0;
+                const deletions = stats?.deletions ?? 0;
 
                 // The list row and the detail response carry the IDENTICAL embedded `commit`
                 // object — that identity is precisely what licenses the cache-hit path above
@@ -644,21 +678,41 @@ export class GitHubProvider implements GitProvider {
                 //
                 // SCOPE, precisely, because the adjacent `put` depends on it: this fires only
                 // when the identity ALSO had to come from the list row. A detail whose `commit`
-                // is usable but whose `stats` is absent does NOT throw — it keeps the commit
-                // with `0`/`0`/`[]` churn and memoizes that. This is deliberate and it is
-                // PRE-EXISTING #273 behaviour, not something #275 introduced: `RawCommitDetail`
-                // declares `stats` optional because "GitHub omits them on some commits", so on
-                // that path zero IS the documented answer, and throwing instead would stall a
-                // provider on an ordinary commit. The two shapes are distinguished only because
-                // one of them has independent evidence the BODY is broken — it failed to carry
-                // a usable `commit` object, which GitHub's commit-detail endpoint always sends.
+                // is usable but whose `stats` is absent does NOT throw. The two shapes are
+                // distinguished because one of them has independent evidence the BODY is
+                // broken — it failed to carry a usable `commit` object, which GitHub's
+                // commit-detail endpoint always sends — while the other is a response GitHub's
+                // own published contract permits.
                 //
-                // The residual is real and bounded: if GitHub in fact never omits `stats`, then
-                // an absent `stats` is always a malformed body and this guard is too narrow.
-                // Deciding that needs evidence about the endpoint that this codebase does not
-                // have, so it is tracked in #288 rather than guessed at here. What matters for
-                // #275 is that the guard's scope is stated rather than overclaimed.
-                if (source !== detailCommit && detail.stats === undefined) {
+                // #288 SETTLED THAT SECOND HALF, which #275 left open, and this is the record of
+                // the decision and its evidence:
+                //
+                //   EVIDENCE. GitHub's REST reference for `GET /repos/{owner}/{repo}/commits/
+                //   {ref}` (docs.github.com/en/rest/commits/commits) does NOT list `stats` — or
+                //   `files` — among the 200 response's required properties, and documents no
+                //   condition under which either is sent. It does document that the diff-derived
+                //   parts of this response degrade: `files` paginates at 300 entries per page up
+                //   to a 3000-file ceiling, and the diff/patch media types "may time out and
+                //   return a 5xx status code" on large commits. A genuinely EMPTY commit is not
+                //   the omission case — it returns `stats: {additions: 0, deletions: 0,
+                //   total: 0}`, a present key — so absence and observed-zero are distinguishable
+                //   in the body, which is what makes any of this actionable.
+                //
+                //   DECISION. The published contract permits an absent `stats`, so absence is
+                //   not evidence of a malformed body and the throw is NOT widened to cover it.
+                //   Widening it would hold the provider's whole forward cursor on a shape that
+                //   recurs identically on every re-fetch — the brick-rather-than-heal outcome
+                //   `GitCommitDrop` exists to avoid — and it would do so for a fault whose
+                //   worst case (one commit's line counts understated) is strictly smaller than
+                //   its own (every commit for that provider, forever).
+                //
+                //   CONSEQUENCE, which is the part that actually changed. The commit is kept,
+                //   but its churn is UNKNOWN rather than zero, so the two things that would
+                //   otherwise launder that unknown into a fact are stopped: it is not memoized
+                //   (see the `put` gate below) and it is REPORTED through `onDegraded`, which
+                //   the sync aggregates into an operator-facing advisory naming the affected
+                //   developer-days. Before #288 it was memoized and silent.
+                if (source !== detailCommit && stats === undefined) {
                     throw new GitProviderFetchError(
                         `GitHub commit detail for ${summary.sha} in ${this.org}/${repo} carried ` +
                             'neither a usable commit object nor stats — malformed response',
@@ -666,16 +720,28 @@ export class GitHubProvider implements GitProvider {
                     );
                 }
 
-                // On the RECOVERY path this is reached only with real `stats` in hand, because
-                // the throw above sends the alternative away — which is what makes the recovery
-                // safe to memoize and why this is a bare `put` rather than one guarded on which
-                // copy supplied the identity. It is NOT a claim about the normal path: there, a
-                // detail with no `stats` still memoizes `0`/`0`/`[]`, exactly as it did before
-                // #275, because GitHub is documented to omit `stats` on some commits (see the
-                // throw's SCOPE note above). `commit_diffstats` has NO invalidation, so any row
-                // written here is served on every later run forever — which is why the recovery
-                // path had to be prevented from contributing zeros, and why widening the throw
-                // is the follow-up rather than something to be assumed here.
+                // THE MEMO IS GATED ON `stats` HAVING BEEN OBSERVED (#288). `commit_diffstats`
+                // has NO invalidation, so a row written here is served to every later run
+                // forever, in place of the detail fetch that would have produced it — which is
+                // exactly the "no path memoizes a diffstat that a later well-formed fetch would
+                // contradict" rule. Memoizing `additions: 0, deletions: 0` for a commit whose
+                // `stats` was merely absent is that contradiction in its purest form: the memo
+                // would outlive the condition that produced it and answer for a commit that
+                // GitHub is perfectly willing to describe. Note the gate is `stats`, NOT the
+                // whole body: a detail carrying `files` but no `stats` still has real `entries`,
+                // and memoizing them beside a fabricated `0`/`0` would be worse than memoizing
+                // nothing, because the row would then LOOK observed.
+                //
+                // Not memoizing costs one detail re-fetch per such commit per run — the memo is
+                // of an idempotent remote read, so skipping it is always safe (that is the whole
+                // reason `commit_diffstats` sits outside the append-only rule). The commit
+                // itself is still returned and imported; only the churn is unknown, and
+                // `onDegraded` is what stops that unknown from being silent. Reported here
+                // rather than at the totals above so the report and the skipped `put` are one
+                // decision on one condition, not two conditions that can drift.
+                //
+                // On the RECOVERY path — identity from the list row — this is reached only with
+                // real `stats` in hand, because the throw above sends the alternative away.
                 //
                 // Cached AFTER the date guard, so a commit the un-cached path DROPS can never be
                 // pushed by a later warm run (#273) — the opposite divergence to the one the hit
@@ -691,12 +757,16 @@ export class GitHubProvider implements GitProvider {
                 // anomaly that must surface, and `fetchGitHub` throws it (#272). No FETCH
                 // failure of any kind reaches this line, which is also why GitHub does not use
                 // the shared `resolveCommitDiffstat` helper the other two providers share.
-                this.diffstatCache?.put(repo, summary.sha, {
-                    additions,
-                    deletions,
-                    entries: diffs,
-                    absent: false,
-                });
+                if (stats === undefined) {
+                    onDegraded?.({sha: summary.sha, reason: UNKNOWN_CHURN_DEGRADE_REASON});
+                } else {
+                    this.diffstatCache?.put(repo, summary.sha, {
+                        additions,
+                        deletions,
+                        entries: diffs,
+                        absent: false,
+                    });
+                }
 
                 commits.push({
                     // `summary.sha`, not `detail.sha`: identical by construction (the detail
