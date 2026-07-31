@@ -953,6 +953,13 @@ describe('GitHubProvider', () => {
                 'a count past the safe-integer ceiling',
                 {additions: Number.MAX_SAFE_INTEGER + 2, deletions: 0, total: 0},
             ],
+            // The `deletions` conjunct decides this row and nothing else in the repo (#288
+            // review cycle 3, TST-288-A). Every case above puts the offending value in
+            // `additions`, which short-circuits the `&&` — so deleting
+            // `isCommitCount(rawStats.deletions)` from the guard left the whole 974-test git
+            // suite green, while `deletions: 4.5` would still reach `raw_author_daily` and
+            // throw inside the run's all-providers write transaction.
+            ['a malformed deletions beside a good additions', {additions: 40, deletions: -3, total: 37}],
         ])('treats stats as UNOBSERVED when the body carries %s', async (_label, stats) => {
             // #288 review cycle 1 (SO-1 / SEC-1 / SEC-3). The guard used to be
             // `stats === undefined`, which recognizes exactly ONE spelling of an absence the

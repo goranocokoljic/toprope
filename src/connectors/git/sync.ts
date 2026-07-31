@@ -238,7 +238,7 @@ export const COMMIT_CHURN_UNKNOWN_PREFIX = 'Commit churn not observed:';
  * in the provider's UI; small enough that a systemic shape problem across thousands of commits
  * still produces one readable line.
  */
-const DROPPED_COMMIT_SAMPLE_SIZE = 5;
+const ADVISORY_SHA_SAMPLE_SIZE = 5;
 
 /**
  * The bounded sha sample both commit advisories render — {@link COMMITS_DROPPED_PREFIX} per
@@ -254,7 +254,7 @@ const DROPPED_COMMIT_SAMPLE_SIZE = 5;
  * untrusted field and have it silently rendered as `<invalid sha>` instead of rejected.
  */
 function formatShaSample(shas: readonly string[]): string {
-    const sample = shas.slice(0, DROPPED_COMMIT_SAMPLE_SIZE);
+    const sample = shas.slice(0, ADVISORY_SHA_SAMPLE_SIZE);
     const more = shas.length - sample.length;
     return `${sample.join(', ')}${more > 0 ? ` (+${more} more)` : ''}`;
 }
@@ -311,9 +311,7 @@ function sanitizeDropReason(reason: unknown): string {
  */
 function permanentSpanRepair(): string {
     return (
-        'At most, though — a commit whose author resolves to no registered developer produced ' +
-        'no row to understate. raw_author_daily has no recompute path. Whatever you do, do ' +
-        'NOT simply purge this ' +
+        'raw_author_daily has no recompute path. Whatever you do, do NOT simply purge this ' +
         "provider's cursors and re-sync: that re-imports over the surviving rows and " +
         'permanently DOUBLES every commit metric in the span (#262), which is strictly worse ' +
         'than the understatement. For a provider registered in the admin UI the repair is to ' +
@@ -443,7 +441,7 @@ export interface GitSyncProgress {
      *     #275 that gap is no longer something a reader has to infer from these two
      *     numbers: the drop is reported in `SyncResult.errors` under
      *     {@link COMMITS_DROPPED_PREFIX}, with the full COUNT and a bounded sample of
-     *     shas (not every sha — see {@link DROPPED_COMMIT_SAMPLE_SIZE}). That is where
+     *     shas (not every sha — see {@link ADVISORY_SHA_SAMPLE_SIZE}). That is where
      *     an operator should look; these counters are a live indicator, not a record,
      *     and are gone the moment the repo finishes. GitLab lists exactly what it returns, and Bitbucket's
      *     total is commits RETAINED after its in-memory `until` filter (which is what
@@ -2062,7 +2060,7 @@ async function fetchProviderData(
     // than an oversight: this is derived from the returned array, which `fetchRepoWithRetry`
     // ASSIGNS rather than appends to, so a retry that re-pages the same window replaces the
     // previous attempt's commits and can never double-count.
-    const degradedByRepo: Array<{repo: string; shas: string[]}> = [];
+    const churnUnknownByRepo: Array<{repo: string; shas: string[]}> = [];
 
     // How many commits this provider returned WITHOUT `GitCommit.diffs`, forcing the diff pass
     // below into its `getCommitDiff` fallback (#280), and which repos they came from. Counted
@@ -2209,7 +2207,7 @@ async function fetchProviderData(
         // truthiness test would report every commit from every provider that never sets it.
         const churnUnobserved = rawCommits.filter((c) => c.churnObserved === false);
         if (churnUnobserved.length > 0) {
-            degradedByRepo.push({repo: repoName, shas: churnUnobserved.map((c) => c.sha)});
+            churnUnknownByRepo.push({repo: repoName, shas: churnUnobserved.map((c) => c.sha)});
         }
         report?.((p) => {
             p.commits_fetched += rawCommits.length;
@@ -2521,16 +2519,22 @@ async function fetchProviderData(
     //     score is a MEAN over commits.
     //   - `files_changed` and `code_churn_rate` read only `fileDiffs`, so those two — and only
     //     those two — are conditional on the response having also omitted the file list.
-    const churnUnknownAdvisories = degradedByRepo.map(({repo: degradedRepo, shas}) => {
+    const churnUnknownAdvisories = churnUnknownByRepo.map(({repo: affectedRepo, shas}) => {
         return (
-            `${COMMIT_CHURN_UNKNOWN_PREFIX} [${providerType}/${degradedRepo}] ${shas.length} ` +
+            `${COMMIT_CHURN_UNKNOWN_PREFIX} [${providerType}/${affectedRepo}] ${shas.length} ` +
             'commit(s) were imported with their line counts recorded as zero because the ' +
             'provider never observed them, and this run has recorded its window as covered — ' +
             'so lines_added, lines_removed, avg_commit_size and ai_signature_score on those ' +
-            'developer-days are PERMANENTLY wrong by whatever those commits changed. Where the ' +
-            'same response also carried no file list — the usual shape — files_changed and ' +
-            'code_churn_rate are understated too. Commit counts and PR metrics are unaffected. ' +
-            `No diffstat was memoized, so a re-import gets a fresh answer. ${permanentSpanRepair()}. ` +
+            'developer-days are PERMANENTLY wrong by whatever those commits changed (at most, ' +
+            'though — a commit whose author resolves to no registered developer produced no row ' +
+            'to understate). Where the same response also carried no file list — the usual ' +
+            'shape — files_changed and code_churn_rate are understated too. Commit counts and ' +
+            'PR metrics are unaffected. Nothing was memoized for these commits, so a re-import ' +
+            're-asks the endpoint rather than replaying this run\'s zero — but that is not a ' +
+            'promise of a different answer: if the provider omits the counts as a property of ' +
+            'the commit, every re-fetch returns the same body, which is exactly why this run ' +
+            'did not fail and retry. Run the repair below only where you have reason to think ' +
+            `the omission was transient. ${permanentSpanRepair()}. ` +
             `Affected: ${formatShaSample(shas.map(sanitizeSha))}.`
         );
     });
@@ -2594,7 +2598,8 @@ async function fetchProviderData(
                     'commit(s) whose fallback diff request failed are now recorded as covered, ' +
                     'so nothing re-asks them and the understatement of files_changed, ' +
                     'code_churn_rate and ai_signature_score on their developer-days is ' +
-                    `PERMANENT. ${permanentSpanRepair()} and ` +
+                    'PERMANENT (at most — a commit whose author resolves to no registered ' +
+                    `developer produced no row to understate). ${permanentSpanRepair()} and ` +
                     'fix the provider\'s getCommits to supply GitCommit.diffs.',
             );
         }
