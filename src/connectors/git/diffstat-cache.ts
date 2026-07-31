@@ -437,7 +437,13 @@ function scopeClause(scope: DiffstatScope): {where: string; params: string[]} {
         // point — until #286 the container was canonicalized here and the repo only in the
         // CLI, so `deleteDiffstats(db, {repo: ' api '})` silently matched nothing for every
         // other caller while the sibling column was forgiving.
-        params.push(scope.repo.trim());
+        //
+        // Guarded on `typeof`, so "total" is true of a `null`/non-string too rather than only
+        // of a string that needs trimming — `normalizeContainer` one branch up already is, and
+        // a bare `.trim()` here would throw a raw TypeError on the `{repo: null}` shape the CLI
+        // is careful to refuse. `''` fails closed: `CHECK (length(repo) > 0)` means it matches
+        // no row, so a non-string narrows to nothing rather than dropping the term and widening.
+        params.push(typeof scope.repo === 'string' ? scope.repo.trim() : '');
     }
     return {where: conditions.length > 0 ? ` WHERE ${conditions.join(' AND ')}` : '', params};
 }
@@ -484,6 +490,40 @@ export interface DiffstatCacheSize {
      * failure this line exists to prevent.
      */
     entryBytes: number;
+}
+
+/**
+ * How many rows a scope holds, and how many of them are the "no diffstat exists" marker.
+ *
+ * Deliberately NOT {@link countDiffstats}: this one omits `SUM(octet_length(entries))`, which
+ * is the expensive term by orders of magnitude — `absent` is a one-byte integer read straight
+ * off the row, while `octet_length(entries)` forces every matching row's blob (and its overflow
+ * pages) to be read, on a table whose whole point is that `entries` is uncapped.
+ *
+ * The split exists because the two callers want different things and one of them holds a write
+ * lock while it asks. `toprope doctor` wants the bytes and is a read-only, once-per-invocation
+ * command. The purge wants only the absent share, for one clause of its outcome message — and
+ * it runs inside the same IMMEDIATE transaction as the DELETE, so any page it reads there is
+ * read while every concurrent `put()` is blocked behind it. Scanning a multi-GB blob column to
+ * print one integer, with the sync's cache writes stalled on the lock for the duration, is not
+ * a trade this command should make. Both go through {@link scopeClause}, so the scope
+ * vocabulary stays single-sourced.
+ */
+export function countDiffstatRows(
+    db: Database.Database,
+    scope: DiffstatScope = {},
+): {rows: number; absent: number} {
+    const {where, params} = scopeClause(scope);
+    const row = db
+        .prepare(
+            `SELECT COUNT(*) AS rows, COALESCE(SUM(absent), 0) AS absent
+               FROM commit_diffstats${where}`,
+        )
+        .get(...params) as {rows: unknown; absent: unknown} | undefined;
+    return {
+        rows: typeof row?.rows === 'number' ? row.rows : 0,
+        absent: typeof row?.absent === 'number' ? row.absent : 0,
+    };
 }
 
 /**

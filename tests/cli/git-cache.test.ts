@@ -11,6 +11,8 @@
  */
 import {describe, it, expect, beforeEach, afterEach} from 'vitest';
 import Database from 'better-sqlite3';
+import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import {runMigrations} from '../../src/storage/migrator';
 import {clearDiffstatCache, diffstatCacheSummary} from '../../src/cli/git-cache';
@@ -54,8 +56,13 @@ function seed(
 
 describe('toprope git cache clear (#286)', () => {
     let db: Database.Database;
+    // A real file, not `:memory:`, for the one test that needs TWO connections to the same
+    // database — an in-memory store is private to its connection, so the WAL snapshot conflict
+    // this suite pins cannot be reproduced there at all.
+    let dbDir: string;
 
     beforeEach(() => {
+        dbDir = fs.mkdtempSync(path.join(os.tmpdir(), 'toprope-diffstat-cache-'));
         db = new Database(':memory:');
         db.pragma('foreign_keys = ON');
         runMigrations(db, MIGRATIONS_DIR);
@@ -67,7 +74,10 @@ describe('toprope git cache clear (#286)', () => {
         ]);
     });
 
-    afterEach(() => db.close());
+    afterEach(() => {
+        db.close();
+        fs.rmSync(dbDir, {recursive: true, force: true});
+    });
 
     describe('scope', () => {
         it('clears exactly one (provider, container, repo) and leaves the rest', () => {
@@ -212,6 +222,105 @@ describe('toprope git cache clear (#286)', () => {
             }
             // Nothing was touched by any of them — the assertion the widening bug fails.
             expect(countDiffstats(db).rows).toBe(4);
+        });
+
+        it('survives a concurrent writer committing between the count and the DELETE', () => {
+            // The failure this guards is the one an operator hits FIRST. better-sqlite3's
+            // default `BEGIN` is deferred: the count takes a WAL read snapshot and the DELETE
+            // then upgrades to a write, and under WAL SQLite fails that upgrade with
+            // SQLITE_BUSY_SNAPSHOT the moment any other connection has committed since the
+            // snapshot — WITHOUT calling the busy handler, because waiting cannot resolve it.
+            // So `busy_timeout` is structurally unable to help and the command dies in ~1ms.
+            //
+            // That writer is the design, not a corner case: `put` autocommits once per cache
+            // miss for the whole of a sync's fetch phase. "Clear the cache while a sync is
+            // running" is exactly what this command is for, so a deferred transaction would
+            // hard-fail for as long as the run lasted — hours — reported as "database is
+            // locked. Nothing was removed." BEGIN IMMEDIATE takes the write lock up front,
+            // making the wait a real one that busy_timeout bounds.
+            const file = path.join(dbDir, 'concurrent.db');
+            const writer = new Database(file);
+            const operator = new Database(file);
+            try {
+                writer.pragma('journal_mode = WAL');
+                // Short, so the IMMEDIATE case (where the writer is the one that must wait)
+                // costs the suite 200ms rather than 5s. The operator keeps a realistic wait.
+                writer.pragma('busy_timeout = 200');
+                operator.pragma('busy_timeout = 5000');
+                runMigrations(writer, MIGRATIONS_DIR);
+                seed(writer, [
+                    ['github', 'ws-a', 'api', 'c1'],
+                    ['github', 'ws-a', 'web', 'c2'],
+                    ['github', 'ws-b', 'api', 'c3'],
+                ]);
+
+                // Drive a sync's `put` in BETWEEN the purge's count and its DELETE — the only
+                // interleaving that invalidates a deferred read snapshot, and the one a
+                // single-threaded test cannot produce without hooking the statement itself.
+                // Under IMMEDIATE the operator already holds the write lock, so this commit is
+                // the one that waits (and here gives up after 200ms) — which is the correct,
+                // recoverable direction: a sync retries its cache write, having lost at most
+                // one memo, while the operator's purge completes.
+                let interleaved = false;
+                const realPrepare = operator.prepare.bind(operator);
+                operator.prepare = ((sql: string) => {
+                    const stmt = realPrepare(sql);
+                    if (!sql.includes('COUNT(*)')) return stmt;
+                    const realGet = stmt.get.bind(stmt);
+                    stmt.get = ((...args: unknown[]) => {
+                        const row = realGet(...args);
+                        if (!interleaved) {
+                            interleaved = true;
+                            try {
+                                seed(writer, [['github', 'ws-b', 'web', 'c4']]);
+                            } catch {
+                                // Blocked by the operator's write lock — expected under
+                                // IMMEDIATE, and exactly the outcome that makes the purge win.
+                            }
+                        }
+                        return row;
+                    }) as typeof stmt.get;
+                    return stmt;
+                }) as typeof operator.prepare;
+
+                let result;
+                try {
+                    result = clearDiffstatCache(operator, {
+                        provider: 'github',
+                        container: 'ws-a',
+                    });
+                } finally {
+                    operator.prepare = realPrepare;
+                }
+                expect(interleaved).toBe(true);
+                expect(result.ok).toBe(true);
+                expect(result.removed).toBe(2);
+                expect(countDiffstats(operator, {provider: 'github', container: 'ws-a'}).rows).toBe(0);
+            } finally {
+                writer.close();
+                operator.close();
+            }
+        });
+
+        it('does not read the entries blobs while holding the write lock', () => {
+            // The pre-count exists for ONE clause of the message (the absent share). Reading
+            // `octet_length(entries)` for it would scan every matched blob inside the IMMEDIATE
+            // transaction — stalling the concurrent `put`s the lock is already contending with,
+            // on the table whose entire premise is that `entries` is uncapped. The purge must
+            // use the rows+absent counter, not the byte-measuring one.
+            const statements: string[] = [];
+            const realPrepare = db.prepare.bind(db);
+            db.prepare = ((sql: string) => {
+                statements.push(sql);
+                return realPrepare(sql);
+            }) as typeof db.prepare;
+            try {
+                expect(clearDiffstatCache(db, {provider: 'bitbucket'}).removed).toBe(3);
+            } finally {
+                db.prepare = realPrepare;
+            }
+            expect(statements.some((s) => s.includes('DELETE FROM commit_diffstats'))).toBe(true);
+            expect(statements.some((s) => s.includes('octet_length'))).toBe(false);
         });
 
         it('reports a refusal rather than throwing AFTER the delete has committed', () => {

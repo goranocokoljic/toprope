@@ -95,10 +95,17 @@ describe('toprope git set-history-floor (#233)', () => {
     it.each([
         ['an empty container', ''],
         ['a whitespace-only container', '   '],
+        ['a null container', null as unknown as string],
     ])('rejects %s rather than write a key matching no provider', (_label, container) => {
         const result = setHistoryFloor(db, {provider: 'github', container, at: FLOOR}, NOW);
         expect(result.ok).toBe(false);
-        expect(result.message).toContain('--container');
+        // The EXACT refusal, not `toContain('--container')`: the unrelated `never_synced`
+        // message also contains that substring ("Check the --provider/--container spelling"),
+        // and a blank container falls through to precisely that message if the guard is
+        // removed — it builds `git_last_sync:github:`, matches nothing, and reports "has never
+        // synced" about a provider that has. A substring assertion therefore passes whether or
+        // not the guard exists, which is the inert shape #286 removed from git-cache.test.ts.
+        expect(result.message).toBe('--container must not be empty');
         expect(db.prepare("SELECT key FROM sync_state WHERE key LIKE 'git_%'").all()).toEqual([]);
     });
 

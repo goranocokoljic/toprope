@@ -1,5 +1,6 @@
 import type Database from 'better-sqlite3';
 import {
+    countDiffstatRows,
     countDiffstats,
     deleteDiffstats,
     type DiffstatScope,
@@ -142,10 +143,30 @@ export function clearDiffstatCache(
     // between two statements here — and "cleared 4 (7 of them absent)" is a nonsense line
     // to hand an operator. The graduated "wrap read-modify-write and multi-statement writes
     // in a transaction" rule.
+    //
+    // IMMEDIATE, not better-sqlite3's default deferred BEGIN, and this is load-bearing rather
+    // than a precaution. A deferred transaction takes its WAL read snapshot at the SELECT and
+    // only then tries to upgrade to a write; under WAL, if ANY other connection has committed
+    // since that snapshot, SQLite fails the upgrade with SQLITE_BUSY_SNAPSHOT — and it does
+    // NOT invoke the busy handler, because the conflict is unresolvable by waiting (the
+    // transaction has to be rolled back and retried). The `busy_timeout = 5000` set in
+    // `storage/db.ts` is therefore structurally unable to help, and the command fails in ~1ms.
+    // Measured on this repo's better-sqlite3: deferred -> SQLITE_BUSY_SNAPSHOT after 1ms.
+    //
+    // That is precisely the wrong failure mode here. The concurrent writer is not exotic, it
+    // is the design: `put` autocommits once per cache miss throughout a sync's fetch phase, so
+    // "an operator clears the cache while a sync is running" — the case this command exists
+    // for — would hard-fail instantly and keep failing for as long as the run lasted (hours on
+    // the org sizes this cache is for), reported as "database is locked, wait and retry".
+    // IMMEDIATE takes the write lock up front, so the wait is a real one that busy_timeout
+    // bounds, and the command succeeds instead of bouncing.
     const {before, removed} = db.transaction(() => ({
-        before: countDiffstats(db, scope),
+        // Rows + absent only. The byte total is NOT wanted here: it is unused by every message
+        // below, and reading it means scanning every matched `entries` blob WHILE holding the
+        // write lock this transaction just took — stalling the very `put`s it is racing.
+        before: countDiffstatRows(db, scope),
         removed: deleteDiffstats(db, scope),
-    }))();
+    })).immediate();
     const description = describeScope(scope);
 
     if (removed === 0) {
