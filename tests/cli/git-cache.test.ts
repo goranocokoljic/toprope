@@ -22,8 +22,15 @@ import type {GitFileDiff, GitProviderType} from '../../src/connectors/git/provid
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../src/storage/migrations');
 
+/**
+ * Deliberately carries a NON-ASCII path. `entryBytes` is rendered with byte units and its
+ * whole job is saying how much private source-tree path data this database retains, so an
+ * all-ASCII fixture would let `length()` (characters) pass for `octet_length()` (bytes) —
+ * the two agree on exactly the input a lazy fixture picks, and disagree by up to 3× on the
+ * repos that matter.
+ */
 const ENTRIES: GitFileDiff[] = [
-    {path: 'src/service/handler.ts', additions: 12, deletions: 3, status: 'modified'},
+    {path: 'src/サービス/handler.ts', additions: 12, deletions: 3, status: 'modified'},
 ];
 
 /**
@@ -80,16 +87,35 @@ describe('toprope git cache clear (#286)', () => {
             expect(countDiffstats(db, {provider: 'github'}).rows).toBe(1);
         });
 
-        it('widens over every flag omitted, up to the whole table with no flags at all', () => {
+        it('widens over every flag omitted, up to the whole table with --all', () => {
             expect(clearDiffstatCache(db, {container: 'ws-a'}).removed).toBe(3);
             expect(countDiffstats(db).rows).toBe(1);
             // The unscoped form must exist: migration 044 requires that any git-data reset be
             // able to empty this table outright, or the resync replays the cached answers the
             // reset was run to discard.
-            const all = clearDiffstatCache(db, {});
+            const all = clearDiffstatCache(db, {all: true});
             expect(all.removed).toBe(1);
             expect(all.message).toContain('the ENTIRE cache');
             expect(countDiffstats(db).rows).toBe(0);
+        });
+
+        it('refuses the unscoped purge without --all, and ignores --all when a scope is given', () => {
+            // The unscoped form has to be REACHABLE, not the zero-argument default: it is
+            // also what an operator gets by typing the command to see what it says, and it
+            // irreversibly drops a memo worth thousands of API calls on a large org. The
+            // sibling `git set-history-floor` gates a far cheaper overwrite behind --force on
+            // the same reasoning.
+            const bare = clearDiffstatCache(db, {});
+            expect(bare.ok).toBe(false);
+            expect(bare.removed).toBe(0);
+            expect(bare.message).toContain('--all');
+            expect(countDiffstats(db).rows).toBe(4);
+
+            // --all alongside a scope must not WIDEN it back to the whole table — it is a
+            // confirmation of the empty scope, not an override of a narrow one.
+            const scoped = clearDiffstatCache(db, {container: 'ws-b', all: true});
+            expect(scoped.removed).toBe(1);
+            expect(countDiffstats(db).rows).toBe(3);
         });
 
         it('clears a repo across every provider and container — the exclude_repos case', () => {
@@ -154,23 +180,71 @@ describe('toprope git cache clear (#286)', () => {
             expect(result.message).toBe('--repo must not be empty');
             expect(countDiffstats(db).rows).toBe(4);
         });
+
+        it('does not let a null --repo fall through into a table-wide purge', () => {
+            // `input.repo?.trim()` maps null to undefined, which passes an `!== undefined`
+            // guard and then fails `=== ''` — leaving the repo term UNSET, and an unset term
+            // widens. A one-repo command silently becoming a whole-table purge is the one
+            // failure mode a refusal path must not have. Not reachable from Commander, which
+            // is exactly why nothing else would catch it.
+            const result = clearDiffstatCache(db, {repo: null as unknown as string});
+            expect(result.ok).toBe(false);
+            expect(result.removed).toBe(0);
+            expect(countDiffstats(db).rows).toBe(4);
+        });
+
+        it('trims a non-blank --repo to match what the write path stored', () => {
+            const result = clearDiffstatCache(db, {repo: '  api  '});
+            expect(result.removed).toBe(3);
+            // …and the echoed scope shows the trimmed value, so the operator sees what was
+            // actually matched rather than what they typed.
+            expect(result.message).toContain('repo=api');
+        });
     });
 
     describe('messages', () => {
-        it('names the scope, the absent markers and the re-fetch it just bought', () => {
-            createCommitDiffstatCache(db, 'gitlab', 'grp').put('svc', 'gone', {
-                additions: 0,
-                deletions: 0,
-                entries: [],
-                absent: true,
-            });
+        it('reports the absent count OF THE SCOPE, not of the whole table', () => {
+            // Two absent markers exist; only one is inside the purge scope. Without the row
+            // OUTSIDE it, a regression that dropped the scope from the count would report the
+            // same "1" and this assertion could not fail — and that number is the operator's
+            // only evidence that a purge aimed at residual #1 (a frozen permission-revocation
+            // 404) actually reached those rows.
+            for (const [provider, container] of [
+                ['gitlab', 'grp'],
+                ['github', 'other-org'],
+            ] as const) {
+                createCommitDiffstatCache(db, provider, container).put('svc', 'gone', {
+                    additions: 0,
+                    deletions: 0,
+                    entries: [],
+                    absent: true,
+                });
+            }
+            expect(countDiffstats(db).absent).toBe(2);
+
             const {message} = clearDiffstatCache(db, {provider: 'gitlab', container: 'grp'});
             expect(message).toContain('cleared 1 cached diffstat(s)');
             expect(message).toContain('provider=gitlab container=grp');
             expect(message).toContain('1 of them the "no diffstat exists" marker');
-            // The consequence, not just the count: a mis-scoped purge costs the expensive
-            // phase of a sync, and this is the only moment the operator can notice.
-            expect(message).toContain('re-fetch');
+            expect(message).not.toContain('2 of them');
+        });
+
+        it('states the BOUND on the remedy, not just that rows are gone', () => {
+            // The failure this pins: a purge aimed at a frozen 404 whose run COMPLETED cannot
+            // fix the metric, because the forward cursor advanced past that window and the
+            // next run starts from the cursor. "No metric changed" alone reads as an
+            // all-clear on exactly the run the operator opened this command to repair — the
+            // graduated #235 rule (a completion signal is not a currency claim).
+            const {message} = clearDiffstatCache(db, {provider: 'github'});
+            expect(message).toContain('DOES NOT RE-ASK COMMITS ALREADY COVERED');
+            expect(message).toContain('forward cursor');
+            // …and names the repair that DOES correct it, which is the one sync.ts already
+            // prescribes for the same permanent understatement — plus the provenance that
+            // has none, rather than sending a config-file operator after a route that would
+            // refuse them.
+            expect(message).toContain('delete it and re-add it');
+            expect(message).toContain('sync older history');
+            expect(message).toContain('config-file provider cannot be deleted');
         });
 
         it('explains an empty match by the two columns’ different case rules', () => {
@@ -220,12 +294,17 @@ describe('diffstatCacheSummary (the toprope doctor line, #286)', () => {
         // The size half of the line is the point of it: `entries` is uncapped by design and
         // is the first column in this schema to persist real source-tree paths from private
         // repos, so "how much of this database is file paths" is the signal that says whether
-        // a purge is worth issuing. Asserted as the exact byte total the two real entry lists
+        // a purge is worth issuing. Asserted as the exact BYTE total the two real entry lists
         // plus the absent row's '[]' occupy — a report summing the wrong column, or skipping
         // the absent row, lands on a different number.
-        const bytes = JSON.stringify(ENTRIES).length * 2 + '[]'.length;
-        expect(bytes).toBe(170);
+        const bytes = Buffer.byteLength(JSON.stringify(ENTRIES)) * 2 + '[]'.length;
         expect(summary).toContain(`${bytes} B of stored file paths`);
+        // …and BYTES, not characters. The fixture path is non-ASCII, so `length()` and
+        // `octet_length()` disagree — this is the assertion that can fail if the query
+        // reverts, and the reason the fixture is not plain ASCII.
+        const characters = JSON.stringify(ENTRIES).length * 2 + '[]'.length;
+        expect(bytes).toBeGreaterThan(characters);
+        expect(summary).not.toContain(`${characters} B`);
     });
 
     it('scales the size unit rather than printing raw bytes for a large cache', () => {

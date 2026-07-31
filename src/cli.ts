@@ -907,7 +907,10 @@ gitCommand
 
 const gitCacheCommand = gitCommand
     .command('cache')
-    .description('Inspect and clear the per-commit diffstat cache (#273)');
+    // Names only what it HAS. An "Inspect and clear" description on a group whose sole
+    // subcommand is `clear` sends an operator looking for `git cache show`, which does not
+    // exist — the size report lives in `toprope doctor`.
+    .description('Clear the per-commit diffstat cache (#273). Its size is reported by "toprope doctor".');
 
 gitCacheCommand
     .command('clear')
@@ -918,17 +921,18 @@ gitCacheCommand
             'may not see this" rather than "this has no diffstat", a 404 on page 2+ of a paged ' +
             'diff, and a 200 silently truncated by a proxy. Clearing is how you act on those, ' +
             'and on a repo added to exclude_repos after its file inventory was already cached. ' +
-            'Every flag is optional and they compose — omitting one widens the scope, so with ' +
-            'NO flags this clears the whole cache. That is safe: the rows are a memo of an ' +
-            'immutable remote fact, so the only cost of clearing is that the next sync ' +
-            're-fetches those commits (one API call each — the expensive phase of a sync). Run ' +
-            '"toprope doctor" first to see how much is cached.',
+            'Every flag is optional and they compose — omitting one widens the scope; clearing ' +
+            'EVERYTHING additionally requires --all. Clearing loses no data (the rows are a memo ' +
+            'of an immutable remote fact) but it does NOT re-ask commits a completed run already ' +
+            'recorded as covered — the forward cursor is past them. Run "toprope doctor" first ' +
+            'to see how much is cached; the command prints the full caveat when it succeeds.',
     )
     .option('--provider <type>', 'Only this provider family (github, bitbucket, gitlab)')
     .option('--container <name>', 'Only this container: org (github) / workspace (bitbucket) / group (gitlab). Case-insensitive.')
     .option('--repo <name>', 'Only this repo, spelled exactly as the provider does (GitHub name, Bitbucket slug, GitLab path_with_namespace). Case-SENSITIVE.')
+    .option('--all', 'Required to clear the ENTIRE cache. Only meaningful with no other scope flag.')
     .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
-    .action((options: {provider?: string; container?: string; repo?: string; config: string}) => {
+    .action((options: {provider?: string; container?: string; repo?: string; all?: boolean; config: string}) => {
         const configPath = path.resolve(process.cwd(), options.config);
         const config = loadConfig(configPath);
         const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
@@ -943,6 +947,18 @@ gitCacheCommand
                 console.error(`[git] ${result.message}`);
                 failed = true;
             }
+        } catch (err) {
+            // The purge is allowed to throw (unlike the cache methods, which must never break
+            // a sync) — and the likeliest reason anyone reaches this command is that a sync is
+            // misbehaving, so racing an in-flight run for the write lock is the common case,
+            // not the exotic one. Reported in this command's own `[git] …` contract rather
+            // than as a raw stack trace out of Commander. Nothing is half-done: the DELETE is
+            // one statement inside one transaction, so a failure left the cache untouched.
+            console.error(
+                `[git] could not clear the diffstat cache: ${err instanceof Error ? err.message : String(err)}. ` +
+                    'Nothing was removed. If this is a database lock, wait for the running sync to finish and retry.',
+            );
+            failed = true;
         } finally {
             db.close();
         }

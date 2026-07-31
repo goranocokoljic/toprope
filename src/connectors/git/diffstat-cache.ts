@@ -364,6 +364,18 @@ export function deleteContainerDiffstats(
     providerType: GitProviderType,
     container: string,
 ): number {
+    // FAIL CLOSED on a container that is not a container, because the general builder below
+    // fails OPEN: it drops any scope member that is `undefined`, and a dropped `container`
+    // predicate turns "retract this workspace" into "retract every workspace this provider
+    // family ever cached" — inside the cascade's write transaction. Before #286 this function
+    // bound `normalizeContainer(container)` into a literal two-column DELETE, where a blank
+    // matched nothing by construction (`CHECK (length(container) > 0)`); delegating to a
+    // widening builder is what removed that property, so it is restored here rather than left
+    // to the `container: string` annotation. `normalizeContainer` is TOTAL over untrusted
+    // input by design — its own docstring notes `resolveGitProviderConfigs` yields entries
+    // whose container may be absent or not even a string — so this is the value that reaches
+    // it, not a hypothetical.
+    if (normalizeContainer(container) === '') return 0;
     return deleteDiffstats(db, {provider: providerType, container});
 }
 
@@ -456,6 +468,12 @@ export interface DiffstatCacheSize {
      * and page overhead. An approximation of the table's footprint, and the number that
      * actually grows: `entries` is uncapped by design and is the first column in this schema
      * to persist real source-tree paths from private repos (migration 044, DATA SCOPE).
+     *
+     * Really bytes, via `octet_length`, not `length` — SQLite's `length()` on TEXT counts
+     * CHARACTERS, so a CJK or Cyrillic source tree would be under-reported by up to 3× by
+     * the one number whose entire job is telling an operator how much unencrypted private
+     * path data this database retains. Under-reporting in exactly that direction is the
+     * failure this line exists to prevent.
      */
     entryBytes: number;
 }
@@ -469,9 +487,13 @@ export interface DiffstatCacheSize {
  * database, with no signal.
  *
  * `absent` is broken out because it answers a different question from the total: those rows
- * are the deterministic 404s, and a share of them far above a few percent means something
- * other than merge/initial commits is 404ing — which is exactly residual #1 (access revoked
- * mid-walk, frozen as an answer) and exactly what a purge is for.
+ * are the deterministic 404s, so a share that jumps between syncs of the same provider is a
+ * candidate for residual #1 (access revoked mid-walk, frozen as an answer). Deliberately NOT
+ * stated as an absolute threshold: migration 044 records that Bitbucket 404s the diffstat of
+ * every MERGE commit, which in a non-squash workflow is routinely 10-30% of history, so "far
+ * above a few percent" would read a perfectly healthy Bitbucket workspace as a residual and
+ * send an operator to buy a full re-fetch that fixes nothing. The honest signal is the
+ * per-provider trend, not a number.
  *
  * A full scan: no index covers `absent`, and none should — see migration 044's note on why
  * this table carries no secondary index. It runs once per `toprope doctor`, never in a sync.
@@ -482,16 +504,29 @@ export function countDiffstats(db: Database.Database, scope: DiffstatScope = {})
         .prepare(
             `SELECT COUNT(*) AS rows,
                     COALESCE(SUM(absent), 0) AS absent,
-                    COALESCE(SUM(length(entries)), 0) AS entry_bytes
+                    COALESCE(SUM(octet_length(entries)), 0) AS entry_bytes
                FROM commit_diffstats${where}`,
         )
-        .get(...params) as {rows: unknown; absent: unknown; entry_bytes: unknown};
-    // Narrowed rather than cast, for the same reason `decodeRow` narrows: `absent` and
-    // `entries` have no constraint SQLite enforces against a REAL, so SUM() over them can
-    // legitimately return a non-integer. A size report that cannot be trusted is reported as
-    // zero rather than propagated as a fractional row count.
+        .get(...params) as {rows: unknown; absent: unknown; entry_bytes: unknown} | undefined;
+    // Narrowed rather than cast, but NOT because a fractional aggregate is reachable — it is
+    // not, and claiming otherwise would be a comment that cannot fail CI asserting a fault
+    // mode the schema excludes. `COUNT(*)` is integral by definition; `SUM(absent)` is
+    // integral because `CHECK (absent IN (0, 1))` plus INTEGER affinity leaves no fractional
+    // value storable; `octet_length` returns a byte count. The narrowing is here for the
+    // shape SQLite CAN produce — an aggregate with no GROUP BY always yields a row, but
+    // `.get()` is typed to admit `undefined`, and this file refuses to let a cast paper over
+    // optionality anywhere else (`decodeRow`, `isFileDiff`).
+    //
+    // Zero is the honest fallback for `absent`/`entryBytes` and would NOT be for `rows`:
+    // "0 rows" is rendered as "nothing cached yet", a positive emptiness claim inferred from
+    // a read that did not produce one. There is no such row to fall back from, so this can
+    // only be reached by a future edit — which is exactly when the distinction has to already
+    // be written down.
+    if (row === undefined || !isCount(row.rows)) {
+        throw new Error('commit_diffstats size query returned no usable row');
+    }
     return {
-        rows: isCount(row.rows) ? row.rows : 0,
+        rows: row.rows,
         absent: isCount(row.absent) ? row.absent : 0,
         entryBytes: isCount(row.entry_bytes) ? row.entry_bytes : 0,
     };

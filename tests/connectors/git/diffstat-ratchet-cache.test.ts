@@ -1374,8 +1374,16 @@ describe('#273 per-commit diffstat ratchet cache', () => {
             const interleaved = new Promise<boolean>((resolve) => {
                 setImmediateReal(() => resolve(ranDuringLoad()));
             });
+            // The BATCHING half of the same contract, counted on the same load. Yielding and
+            // batching are independent: reverting to a point read per sha with a yield every
+            // 500 keeps the results correct AND keeps this test's timing assertions green,
+            // while silently restoring the O(commits) round trips the table exists to remove.
+            // Only a statement count can fail on that.
+            const prepare = vi.spyOn(db, 'prepare');
             const loaded = await cache.load('repo1', shas);
             loadFinished = true;
+            expect(prepare).toHaveBeenCalledTimes(3);
+            prepare.mockRestore();
 
             expect(loaded.size).toBe(shas.length);
             expect(ranDuringLoad).toHaveBeenCalled();
@@ -1508,6 +1516,29 @@ describe('#273 per-commit diffstat ratchet cache', () => {
             expect(cachedCount(db, 'github', 'ws-a')).toBe(1);
         });
 
+        it('deleteContainerDiffstats FAILS CLOSED on a container that is not one', () => {
+            // #286 routed this through a builder that DROPS an absent scope member — and a
+            // dropped `container` predicate turns "retract this workspace" into "retract every
+            // workspace this provider family ever cached", inside the #264 cascade's write
+            // transaction. `normalizeContainer` is total over untrusted input by design
+            // (`resolveGitProviderConfigs` yields entries whose container may be absent or not
+            // even a string), so this is the value that reaches here, not a hypothetical.
+            for (const container of ['ws-a', 'ws-b']) {
+                createCommitDiffstatCache(db, 'bitbucket', container).put('r', 's', {
+                    additions: 1,
+                    deletions: 0,
+                    entries: [],
+                    absent: false,
+                });
+            }
+            for (const blank of [undefined, null, '', '   ']) {
+                expect(
+                    deleteContainerDiffstats(db, 'bitbucket', blank as unknown as string),
+                ).toBe(0);
+            }
+            expect(countDiffstats(db, {provider: 'bitbucket'}).rows).toBe(2);
+        });
+
         // --- The scoped purge and size report behind `toprope git cache clear` (#286) -------
 
         describe('deleteDiffstats / countDiffstats', () => {
@@ -1562,6 +1593,32 @@ describe('#273 per-commit diffstat ratchet cache', () => {
                 ).n;
                 expect(all.entryBytes).toBe(entryBytes);
                 expect(countDiffstats(db, {provider: 'github'}).entryBytes).toBeLessThan(entryBytes);
+            });
+
+            it('never reports a row count it could not read', () => {
+                // A `SUM()` that cannot be narrowed degrades to 0 — an honest "none seen".
+                // A ROW COUNT must NOT, because `diffstatCacheSummary` renders 0 as "nothing
+                // cached yet": a positive emptiness claim inferred from a read that produced
+                // nothing, over a table that is not empty (the graduated #235 rule). So the
+                // unreadable case throws, and the summary turns that into "size could not be
+                // read" rather than into an all-clear.
+                db.exec('DROP TABLE commit_diffstats');
+                expect(() => countDiffstats(db)).toThrow();
+            });
+
+            it('cannot be handed a fractional absent — the CHECK, not the reader, excludes it', () => {
+                // Pinning WHY the narrowing on `absent` is unreachable, because the sibling
+                // narrowing on `additions` is very much reachable: `CHECK (additions >= 0)`
+                // is satisfied by 1.5, which is exactly the hazard the read path tests above
+                // ("treats a fractional stored total as a MISS"). `absent IN (0, 1)` admits
+                // no such value, so `SUM(absent)` is integral by the schema. If a future
+                // migration relaxes that CHECK, this test goes green while `countDiffstats`
+                // silently starts reporting `0 absent` over real 404 markers — so it is the
+                // tripwire on the assumption, not decoration.
+                expect(() =>
+                    db.prepare("UPDATE commit_diffstats SET absent = 0.5 WHERE sha = 's5'").run(),
+                ).toThrow(/CHECK constraint failed: absent/);
+                expect(countDiffstats(db).absent).toBe(1);
             });
 
             it('matches the container case-insensitively and the repo case-SENSITIVELY', () => {

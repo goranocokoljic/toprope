@@ -693,8 +693,13 @@ function checkGitResetNotice(db: Database.Database): CheckResult {
  * re-fetching). So there is no threshold to fail on and no fix to prescribe. What was missing
  * was the SIGNAL: the table grows monotonically with distinct commits ever synced, is uncapped
  * per commit, and is the first place this schema persists real source-tree paths from private
- * repos — and nothing said how big it was. `toprope git cache clear` is how an operator acts
- * on what this line tells them.
+ * repos — and nothing said how big it was.
+ *
+ * `toprope git cache clear` is how an operator acts on RETENTION — getting a repo's cached file
+ * inventory out of the database, or dropping a memo whose window a later sync will walk again.
+ * It is deliberately not described here as the fix for a wrong number: a completed run advanced
+ * the forward cursor past its window, so clearing the memo does not re-ask those commits and
+ * does not move a metric already derived from them. The command says so itself when it succeeds.
  */
 function checkDiffstatCache(db: Database.Database): CheckResult {
     return pass('Diffstat cache', diffstatCacheSummary(db));
