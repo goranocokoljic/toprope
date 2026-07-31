@@ -576,9 +576,18 @@ describe('requestTimeout (#283)', () => {
  * only ITS label, so neither can catch a `label` that is ignored, hardcoded, or applied to the
  * wrong message. These cases live here, in the primitive's own suite, and drive BOTH labels
  * through EVERY message shape the loop emits.
+ *
+ * SCOPE against the sibling suites, so the two don't drift into competing sources of truth:
+ * `request-policy.test.ts` stays the AUTHORITATIVE cross-provider guard (it is `describe.each`
+ * over all three provider types, and its 403 case is the positive control that would fail the
+ * moment anyone folded `fetchGitHub` into this loop). What lives here is what only the primitive
+ * can express — the `label` matrix, and the 429 header algebra the collapse routed through new
+ * code.
  */
 describe('fetchWithGitRetry (#284)', () => {
-    const URL = 'https://api/x';
+    // Not `URL`: that would shadow the global constructor for this whole block, so a later case
+    // needing `new URL(...)` would fail with a baffling "URL is not a constructor".
+    const REQ_URL = 'https://api/x';
 
     /** A `Response` stub with just the surface the loop reads: `status`, `ok`, `headers`. */
     const response = (status: number, headers: Record<string, string> = {}): Response =>
@@ -607,21 +616,21 @@ describe('fetchWithGitRetry (#284)', () => {
         it(`prefixes an exhausted 5xx with "${label}"`, async () => {
             stubFetch(response(503));
             await expect(
-                fetchWithGitRetry(URL, {}, label, INTERACTIVE_REQUEST_POLICY),
-            ).rejects.toThrow(`${label} API server error 503: ${URL}`);
+                fetchWithGitRetry(REQ_URL, {}, label, INTERACTIVE_REQUEST_POLICY),
+            ).rejects.toThrow(`${label} API server error 503: ${REQ_URL}`);
         });
 
         it(`prefixes a non-ok response with "${label}"`, async () => {
             stubFetch(response(401));
             await expect(
-                fetchWithGitRetry(URL, {}, label, INTERACTIVE_REQUEST_POLICY),
-            ).rejects.toThrow(`${label} API error 401: ${URL}`);
+                fetchWithGitRetry(REQ_URL, {}, label, INTERACTIVE_REQUEST_POLICY),
+            ).rejects.toThrow(`${label} API error 401: ${REQ_URL}`);
         });
 
         it(`classifies a 404 so doctor's " 404" search still matches, for ${label}`, async () => {
             stubFetch(response(404));
             await expect(
-                fetchWithGitRetry(URL, {}, label, INTERACTIVE_REQUEST_POLICY),
+                fetchWithGitRetry(REQ_URL, {}, label, INTERACTIVE_REQUEST_POLICY),
             ).rejects.toMatchObject({message: expect.stringContaining(' 404'), status: 404});
         });
     }
@@ -632,31 +641,40 @@ describe('fetchWithGitRetry (#284)', () => {
         // words (`ECONNRESET`, `TimeoutError`) rather than a guess about whose fault it was.
         vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new Error('ECONNRESET'))));
         await expect(
-            fetchWithGitRetry(URL, {}, 'GitLab', INTERACTIVE_REQUEST_POLICY),
+            fetchWithGitRetry(REQ_URL, {}, 'GitLab', INTERACTIVE_REQUEST_POLICY),
         ).rejects.toMatchObject({message: 'ECONNRESET', status: null});
     });
 
-    it('returns the response untouched on success, without reading its body', async () => {
+    it('returns the response untouched on success, and forwards the caller\'s headers', async () => {
         // The loop hands back a `Response` the ~20 call sites decode themselves — see
         // GIT_REQUEST_TIMEOUT_MS for why the body read deliberately stayed outside.
         const ok = response(200);
-        stubFetch(ok);
-        await expect(fetchWithGitRetry(URL, {}, 'Bitbucket', INTERACTIVE_REQUEST_POLICY)).resolves
-            .toBe(ok);
+        const fetchMock = stubFetch(ok);
+        const headers = {Authorization: 'Bearer secret'};
+        await expect(
+            fetchWithGitRetry(REQ_URL, headers, 'Bitbucket', INTERACTIVE_REQUEST_POLICY),
+        ).resolves.toBe(ok);
+        // Dropping `headers` on the way into `fetch` would unauthenticate every Bitbucket and
+        // GitLab request; the provider suites catch it, but the primitive should pin its own
+        // contract rather than borrow theirs.
+        expect((fetchMock.mock.calls[0][1] as RequestInit).headers).toBe(headers);
+        expect(fetchMock.mock.calls[0][0]).toBe(REQ_URL);
     });
 
-    it('honors `ratelimit-reset` on a 429 for BITBUCKET too, not just GitLab', async () => {
+    it('honors a USABLE `ratelimit-reset` on a 429 for BITBUCKET too, not just GitLab', async () => {
         // The one behaviour #284 actually changed. Bitbucket's loop never read this header; the
-        // collapse reads it for both. Bitbucket does not send it in practice (absent -> null ->
-        // the same `rateLimitFallbackMs` guess it always used), so the merge is safe — but if it
-        // ever does, the reset instant must win over the guess, exactly as it does for GitLab.
+        // collapse reads it for both. Bitbucket does not send it in practice — that is what the
+        // neutrality case below pins — so this is the other half of the merge's contract: when a
+        // reset IS present and still in the future, the advertised instant must win over the
+        // guess, exactly as it does for GitLab. The two cases bracket the merge; neither alone
+        // establishes it.
         vi.useFakeTimers();
         vi.setSystemTime(new Date('2026-07-28T10:00:00.000Z'));
         const timer = vi.spyOn(globalThis, 'setTimeout');
         const resetEpoch = Math.floor(Date.parse('2026-07-28T10:00:30.000Z') / 1_000);
         stubFetch(response(429, {'ratelimit-reset': String(resetEpoch)}), response(200));
 
-        const pending = fetchWithGitRetry(URL, {}, 'Bitbucket', SYNC_REQUEST_POLICY);
+        const pending = fetchWithGitRetry(REQ_URL, {}, 'Bitbucket', SYNC_REQUEST_POLICY);
         await vi.runAllTimersAsync();
         await expect(pending).resolves.toMatchObject({status: 200});
 
@@ -665,23 +683,81 @@ describe('fetchWithGitRetry (#284)', () => {
         expect(timer.mock.calls.map((c) => Number(c[1]))).toContain(30_000);
     });
 
+    it('falls back to the 60s/120s guess on a 429 carrying NO rate-limit headers', async () => {
+        // THE neutrality case — acceptance criterion (3), and the one branch the collapse
+        // actually routed through new code for Bitbucket. Every pre-#284 Bitbucket 429 test
+        // supplies `retry-after`, and `rateLimitDelayMs` prefers an advertised value over the
+        // fallback, so the fallback operand was dead in the whole tree. A regression writing
+        // `resetMs ?? 0`, or passing `transientRetries` where `attempt` belongs (which would
+        // freeze the escalation at 60s), stays green without this.
+        vi.useFakeTimers();
+        const timer = vi.spyOn(globalThis, 'setTimeout');
+        stubFetch(response(429), response(429), response(200));
+
+        const pending = fetchWithGitRetry(REQ_URL, {}, 'Bitbucket', SYNC_REQUEST_POLICY);
+        await vi.runAllTimersAsync();
+        await expect(pending).resolves.toMatchObject({status: 200});
+
+        const delays = timer.mock.calls.map((c) => Number(c[1]));
+        // Both rungs: `rateLimitFallbackMs(0)` then `rateLimitFallbackMs(1)`. Asserting only the
+        // first would pass against a frozen escalation.
+        expect(delays).toContain(60_000);
+        expect(delays).toContain(120_000);
+    });
+
+    it('treats a ratelimit-reset already in the PAST as absent, not as "retry now"', async () => {
+        // #284 review (SO-1/SEC-1). `parseEpochResetMs` floors at 0, and `0` is not nullish — so
+        // `resetMs ?? fallback` handed 0 to `rateLimitDelayMs`, which clamps up to only
+        // MIN_RATE_LIMIT_DELAY_MS. The whole (deliberately small) rate-limit budget then burned
+        // in ~3 seconds of 1-second retries INTO a provider actively rate-limiting us — the
+        // primary→secondary/abuse escalation the 429 policy exists to prevent. One second of
+        // clock skew against a self-hosted GitLab is enough to reach it.
+        vi.useFakeTimers();
+        vi.setSystemTime(new Date('2026-07-28T10:00:00.000Z'));
+        const timer = vi.spyOn(globalThis, 'setTimeout');
+        const elapsed = Math.floor(Date.parse('2026-07-28T09:59:00.000Z') / 1_000);
+        stubFetch(response(429, {'ratelimit-reset': String(elapsed)}), response(200));
+
+        const pending = fetchWithGitRetry(REQ_URL, {}, 'GitLab', SYNC_REQUEST_POLICY);
+        await vi.runAllTimersAsync();
+        await expect(pending).resolves.toMatchObject({status: 200});
+
+        const delays = timer.mock.calls.map((c) => Number(c[1]));
+        expect(delays).toContain(60_000);
+        expect(delays).not.toContain(1_000);
+    });
+
     it('counts the rate-limit and transient budgets separately', async () => {
         // The two counters are what forces `for (;;)`; folding them into one guard would let a
         // 429-heavy provider spend the (much larger) 5xx allowance, or the reverse.
+        //
+        // The sequence has to EXHAUST one budget while the other is partly spent — sizing alone
+        // proves nothing. Two 429s then a persistent 503 costs
+        // `2 + 1 + SYNC_RETRY_PROFILE.transient` calls under the real design; under any single
+        // shared counter (3 or 5) the loop throws several calls earlier, so the count assertion
+        // and the rejection below both fail.
         vi.useFakeTimers();
-        const fetchMock = stubFetch(response(429), response(429), response(503), response(200));
+        const fetchMock = stubFetch(response(429), response(429), response(503));
 
-        const pending = fetchWithGitRetry(URL, {}, 'GitLab', SYNC_REQUEST_POLICY);
+        const pending = fetchWithGitRetry(REQ_URL, {}, 'GitLab', SYNC_REQUEST_POLICY);
+        const settled = expect(pending).rejects.toThrow(
+            `GitLab API server error 503: ${REQ_URL}`,
+        );
         await vi.runAllTimersAsync();
-        await expect(pending).resolves.toMatchObject({status: 200});
-        expect(fetchMock).toHaveBeenCalledTimes(4);
+        await settled;
+        expect(fetchMock).toHaveBeenCalledTimes(2 + 1 + SYNC_RETRY_PROFILE.transient);
     });
 
     it('spends only the caller\'s budgets — an interactive policy never retries', async () => {
         const fetchMock = stubFetch(response(429));
         await expect(
-            fetchWithGitRetry(URL, {}, 'GitLab', INTERACTIVE_REQUEST_POLICY),
-        ).rejects.toThrow('Rate limit exceeded after 0 retries');
+            fetchWithGitRetry(REQ_URL, {}, 'GitLab', INTERACTIVE_REQUEST_POLICY),
+        ).rejects.toThrow(
+            // Anchored: `toThrow(string)` is a SUBSTRING match, so an unanchored form would
+            // still pass if a regression prefixed this message with the label — the exact
+            // property this suite exists to pin.
+            new RegExp(`^Rate limit exceeded after 0 retries: ${REQ_URL}$`),
+        );
         expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
@@ -691,7 +767,7 @@ describe('fetchWithGitRetry (#284)', () => {
             retries: SYNC_RETRY_PROFILE,
             deadline: {remainingMs: () => -1},
         };
-        await expect(fetchWithGitRetry(URL, {}, 'Bitbucket', spent)).rejects.toThrow(
+        await expect(fetchWithGitRetry(REQ_URL, {}, 'Bitbucket', spent)).rejects.toThrow(
             GitRunDeadlineError,
         );
         // Checked per ATTEMPT, before the request — a run can blow its wall clock purely by
@@ -712,7 +788,7 @@ describe('fetchWithGitRetry (#284)', () => {
             }),
         );
 
-        await fetchWithGitRetry(URL, {}, 'GitLab', SYNC_REQUEST_POLICY);
+        await fetchWithGitRetry(REQ_URL, {}, 'GitLab', SYNC_REQUEST_POLICY);
         await vi.advanceTimersByTimeAsync(GIT_REQUEST_TIMEOUT_MS * 2);
         expect(captured?.aborted).toBe(false);
     });

@@ -89,6 +89,20 @@ function globMatch(pattern: string, str: string): boolean {
     return new RegExp(`^${regexStr}$`, 'i').test(str);
 }
 
+/**
+ * GitHub's own retry loop — the one the #284 collapse deliberately left out.
+ *
+ * It stays separate because of two branches its siblings do not have: the 403 primary/secondary
+ * rate limit below, and the pre-emptive `x-ratelimit-remaining` pause after a 200. Folding those
+ * into the shared loop would mean adding hooks for cases only one caller reaches.
+ *
+ * THE COST OF THAT, stated here rather than left to be discovered: the transport-fault catch, the
+ * 429 branch, the 5xx branch and the `!res.ok` throw below are branch-for-branch the same policy
+ * as {@link fetchWithGitRetry}, so a change to ANY of them must be made in both places. This file
+ * is the copy that gets forgotten. `tests/connectors/git/providers/request-policy.test.ts` is the
+ * guard — it is `describe.each` over all three provider types precisely so a policy change landed
+ * only in the shared loop fails here.
+ */
 async function fetchGitHub(
     url: string,
     headers: Record<string, string>,

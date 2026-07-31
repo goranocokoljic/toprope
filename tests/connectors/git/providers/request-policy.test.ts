@@ -2,12 +2,12 @@
  * #283 — the request POLICY every provider client carries: caller-intent retry budgets and the
  * run's wall clock.
  *
- * Table-driven over all three provider types, deliberately. The three fetch loops are
- * near-identical clones (collapsing them is #284), so a per-provider copy of these cases would
- * be the third copy of a third copy — and the failure mode that actually matters is one
- * provider being MISSED when the policy changes. Every case below therefore runs against every
- * type that `createGitProvider` builds, exactly as `diffs-contract.test.ts` does for
- * `GitCommit.diffs`.
+ * Table-driven over all three provider types, deliberately — and MORE load-bearing since #284,
+ * not less. Bitbucket and GitLab now share one loop (`fetchWithGitRetry`), but GitHub keeps its
+ * own, so the failure mode that actually matters has sharpened: a policy change made in the
+ * shared loop alone silently leaves `github.ts` behind. This table is what catches that. Every
+ * case below therefore runs against every type that `createGitProvider` builds, exactly as
+ * `diffs-contract.test.ts` does for `GitCommit.diffs`.
  *
  * `listRepos()` is the call under test throughout, because it is the one #283 changed: the
  * pre-#283 interactive budget was a per-CALL argument only `checkAccess` passed, so this method

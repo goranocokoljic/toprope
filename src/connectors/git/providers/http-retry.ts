@@ -12,7 +12,9 @@
  * GitLab share ({@link fetchWithGitRetry}). GitHub keeps its own loop, and that asymmetry is
  * deliberate rather than unfinished work: `fetchGitHub` alone handles a 403 primary/secondary
  * rate limit and pre-emptively pauses on `x-ratelimit-remaining`, so absorbing it would mean
- * adding hooks for branches its two siblings do not have. Do not add them.
+ * adding hooks for branches its two siblings do not have. The residual cost is real and named at
+ * `fetchGitHub` itself — four branches there restate this module's policy and must be changed in
+ * lockstep with it, which `request-policy.test.ts` is the guard for.
  *
  * SCOPE. This is the canonical `Retry-After` / backoff policy for the three GIT PROVIDERS
  * only. The tool connectors (`connectors/copilot`, `claude-code`, `windsurf`, `cursor`,
@@ -646,6 +648,11 @@ export type GitProviderLabel = 'Bitbucket' | 'GitLab';
  * `null` and falls through to {@link rateLimitFallbackMs} exactly as before. So the collapse
  * needs one extra argument, `label`, and no knob.
  *
+ * That neutrality is now unconditional rather than contingent on the vendor's header spelling:
+ * the 429 branch treats a non-positive reset as absent, so even a Bitbucket that started sending
+ * `ratelimit-reset` — or sent it delta-shaped — degrades to the same fallback guess instead of
+ * to the 1-second floor. See the branch itself for why that direction matters.
+ *
  * `fetchGitHub` is deliberately NOT folded in — see this module's header.
  *
  * The two budgets are counted SEPARATELY (`attempt` for rate limits, `transientRetries` for 5xx
@@ -707,14 +714,25 @@ export async function fetchWithGitRetry(
             // was hammered while already rate-limiting us. Parsed by kind now. Read for
             // Bitbucket as well, which simply does not send it: absent → `null` → the same
             // fallback Bitbucket always used.
+            //
+            // ZERO IS TREATED AS ABSENT, not as "retry now" (#284 review, SO-1/SEC-1).
+            // `parseEpochResetMs` floors its result at 0, so a reset instant already in the
+            // past — one second of clock skew against a self-hosted GitLab is enough, and a
+            // delta-shaped value from a server following the IETF draft rather than GitLab's
+            // epoch spelling parses as 1970 — yields `0`, which `??` does NOT catch. That fell
+            // through to `rateLimitDelayMs(null, 0)`, clamped up to MIN_RATE_LIMIT_DELAY_MS, and
+            // spent the whole (deliberately small) rate-limit budget on three 1-second retries
+            // INTO a provider that just said it is rate-limiting us — the primary→secondary/abuse
+            // escalation MIN_RATE_LIMIT_DELAY_MS and this module's 429 policy exist to prevent.
+            // A non-positive reset carries no schedulable information, so the honest reading is
+            // "the server told us nothing usable" and the backoff guess is the right answer.
             const resetMs = parseEpochResetMs(res.headers.get('ratelimit-reset'));
+            const rateLimitFallback =
+                resetMs !== null && resetMs > 0 ? resetMs : rateLimitFallbackMs(attempt);
             if (attempt < policy.retries.rateLimit) {
                 await sleepWithinRun(
                     policy,
-                    rateLimitDelayMs(
-                        res.headers.get('retry-after'),
-                        resetMs ?? rateLimitFallbackMs(attempt),
-                    ),
+                    rateLimitDelayMs(res.headers.get('retry-after'), rateLimitFallback),
                     url,
                 );
                 attempt++;
