@@ -285,6 +285,7 @@ describe('run wall-clock budget (#283)', () => {
                 getCommits: vi.fn().mockImplementation(async () => {
                     burnTheBudget();
                     throw new GitRunDeadlineError(
+                        'clock-passed',
                         'git sync run exceeded its wall-clock budget before requesting https://api/x',
                     );
                 }),
@@ -315,6 +316,7 @@ describe('run wall-clock budget (#283)', () => {
                 getPullRequests: vi.fn().mockImplementation(async () => {
                     burnTheBudget();
                     throw new GitRunDeadlineError(
+                        'clock-passed',
                         'git sync run exceeded its wall-clock budget before requesting https://api/pulls',
                     );
                 }),
@@ -433,6 +435,123 @@ describe('run wall-clock budget (#283)', () => {
         // a best-effort failure, unchanged as AC4 requires.
         expect(readState(db, FORWARD_KEY)).toBe(result.lastSyncTime);
         expectBothWritten(db);
+    });
+
+    it('does NOT discard the run when a REQUEST-level pause is longer than the budget left', async () => {
+        // The same conflation as the test above, one layer down — and the layer with the wider
+        // trigger, because a rate-limit pause can be a full hour while a repo-level pause is
+        // 5 or 15 minutes. `sleepWithinRun` throws `GitRunDeadlineError` when the pause exceeds
+        // the remainder, so before the `kind` discriminant a best-effort review fetch meeting an
+        // hour-long reset with 45 minutes left threw away a whole provider's four-hour run.
+        seedAlice(db);
+        const createGitProvider = await getCreateGitProvider();
+        const getPullRequests = vi.fn().mockImplementation(async () => {
+            throw new GitRunDeadlineError(
+                'pause-refused',
+                'git sync run has 2700000 ms of its wall-clock budget left, less than the ' +
+                    '3600000 ms retry pause requested for https://api/pulls',
+            );
+        });
+        createGitProvider.mockReturnValue(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('only-repo')]),
+                getCommits: vi.fn().mockResolvedValue([makeCommit('c-1')]),
+                getPullRequests,
+            }),
+        );
+
+        const result = await runSync(db);
+
+        // Not reported as a wall-clock stop — the clock had 45 minutes left.
+        expect(result.errors.some((e) => e.startsWith(RUN_DEADLINE_PREFIX))).toBe(false);
+        // And the commits are KEPT, cursor advanced: a best-effort failure does not hold the
+        // cursor, which is the #231 trade AC4 requires be left unchanged.
+        expect(readState(db, FORWARD_KEY)).toBe(result.lastSyncTime);
+        expectBothWritten(db);
+    });
+
+    it('DOES discard the run when the clock is genuinely spent, from the same error type', async () => {
+        // The positive control for the discriminant: identical error class, identical call
+        // site, opposite `kind` — and the opposite outcome. Without this the test above would
+        // pass against a `deadlineStopped` that was simply deleted.
+        seedAlice(db);
+        const createGitProvider = await getCreateGitProvider();
+        createGitProvider.mockReturnValue(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('only-repo')]),
+                getCommits: vi.fn().mockResolvedValue([makeCommit('c-1')]),
+                getPullRequests: vi.fn().mockImplementation(async () => {
+                    throw new GitRunDeadlineError(
+                        'clock-passed',
+                        'git sync run exceeded its wall-clock budget before requesting https://api/pulls',
+                    );
+                }),
+            }),
+        );
+
+        const result = await runSync(db);
+
+        expect(result.errors).toContain(runDeadlineLine('github', 1, 1));
+        expect(readState(db, FORWARD_KEY)).toBeUndefined();
+        expect(snapshotCount(db)).toBe(0);
+    });
+
+    it('reports a spent clock inside the getCommitDiff fallback as a wall-clock stop', async () => {
+        // That call is NOT inside `fetchRepoWithRetry`, so a re-throw escaped
+        // `fetchProviderData` entirely and landed in the outer per-provider catch — the
+        // CONFIG-error seam, which reports "Skipped — this provider could not be used" and
+        // sends the operator to check a healthy provider's credentials. It also carried no
+        // RUN_DEADLINE_PREFIX and skipped the #235 stall counter.
+        seedAlice(db);
+        const createGitProvider = await getCreateGitProvider();
+        // A commit with NO `diffs` is what drives the fallback — no in-tree provider does this,
+        // which is why the branch needed a test to exist at all.
+        const diffless = {...makeCommit('c-1')};
+        delete (diffless as {diffs?: unknown}).diffs;
+        createGitProvider.mockReturnValue(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('only-repo')]),
+                getCommits: vi.fn().mockResolvedValue([diffless]),
+                getCommitDiff: vi.fn().mockImplementation(async () => {
+                    throw new GitRunDeadlineError(
+                        'clock-passed',
+                        'git sync run exceeded its wall-clock budget before requesting https://api/x',
+                    );
+                }),
+            }),
+        );
+
+        const result = await runSync(db);
+
+        expect(result.errors.some((e) => e.startsWith(RUN_DEADLINE_PREFIX))).toBe(true);
+        expect(result.errors.some((e) => e.includes('could not be used'))).toBe(false);
+        expect(readState(db, FORWARD_KEY)).toBeUndefined();
+        expect(snapshotCount(db)).toBe(0);
+    });
+
+    it('labels a clock spent inside listRepos as not-reached, without a "0 of 0" count', async () => {
+        // The listRepos return happens BEFORE the post-loop block, so the flag was set and
+        // discarded — leaving an unlabelled wall-clock shape. It now carries the prefix, and
+        // uses the not-reached wording rather than "stopped after 0 of 0 repo(s)", which reads
+        // as "this provider has no repositories".
+        seedAlice(db);
+        const createGitProvider = await getCreateGitProvider();
+        createGitProvider.mockReturnValue(
+            makeMockProvider({
+                listRepos: vi.fn().mockImplementation(async () => {
+                    throw new GitRunDeadlineError(
+                        'clock-passed',
+                        'git sync run exceeded its wall-clock budget before requesting https://api/repos',
+                    );
+                }),
+            }),
+        );
+
+        const result = await runSync(db);
+
+        expect(result.errors).toContain(providerNotReachedLine('github'));
+        expect(result.errors.some((e) => e.includes('0 of 0'))).toBe(false);
+        expect(readState(db, FORWARD_KEY)).toBeUndefined();
     });
 
     it('lets a run that stays inside its budget finish normally', async () => {

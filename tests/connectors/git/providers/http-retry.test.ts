@@ -322,10 +322,10 @@ describe('isRetryableGitFetchError', () => {
         // and 15-minute pauses; answering "the run is out of wall clock" that way would
         // multiply exactly the quantity the deadline bounds. It fails closed here because
         // GitRunDeadlineError is deliberately NOT a GitProviderFetchError.
-        expect(isRetryableGitFetchError(new GitRunDeadlineError('out of time'))).toBe(false);
+        expect(isRetryableGitFetchError(new GitRunDeadlineError('clock-passed', 'out of time'))).toBe(false);
         // It is equally not the 404-is-an-answer case `resolveCommitDiffstat` memoizes: a
         // deadline frozen as a commit's permanent empty diffstat would be a silent data loss.
-        const err = new GitRunDeadlineError('out of time');
+        const err = new GitRunDeadlineError('clock-passed', 'out of time');
         expect(err instanceof GitProviderFetchError).toBe(false);
         expect((err as unknown as {status?: number}).status).toBeUndefined();
     });
@@ -394,6 +394,23 @@ describe('assertRunTimeRemaining (#283)', () => {
         deadline: {remainingMs: () => remainingMs},
     });
 
+    it('marks a spent budget as `clock-passed`, distinguishably from a refused pause', () => {
+        // The two producers of this error mean opposite things to the sync layer, and the
+        // discriminant is the only thing that separates them: `clock-passed` holds the
+        // provider's cursor and discards its run, `pause-refused` is an ordinary tolerated
+        // fault. Getting them the same way round is what turned one best-effort rate-limit
+        // pause into a four-hour data loss.
+        const spent = ((): GitRunDeadlineError => {
+            try {
+                assertRunTimeRemaining(withRemaining(0), 'https://api/x');
+                throw new Error('expected a throw');
+            } catch (e) {
+                return e as GitRunDeadlineError;
+            }
+        })();
+        expect(spent.kind).toBe('clock-passed');
+    });
+
     it('refuses to START a request once the budget is spent', () => {
         // Checked per attempt, not only before a pause: a run can exhaust its wall clock on
         // nothing but promptly-answered work, and a deadline guarding only pauses would not
@@ -456,6 +473,20 @@ describe('sleepWithinRun (#283)', () => {
         // request the pause exists to enable.
         await expect(sleepWithinRun(withRemaining(5_000), 5_000, 'https://api/x')).rejects.toThrow(
             GitRunDeadlineError,
+        );
+    });
+
+    it('marks a refused pause as `pause-refused`, NOT as a spent clock', () => {
+        // With 45 minutes left and an hour-long rate-limit reset, the run is not over — it just
+        // cannot afford this wait. The sync layer keys on this to decide whether to discard a
+        // whole provider's run, so the two must never collapse into one value.
+        return sleepWithinRun(withRemaining(45 * 60_000), 60 * 60_000, 'https://api/x').then(
+            () => {
+                throw new Error('expected a throw');
+            },
+            (e: GitRunDeadlineError) => {
+                expect(e.kind).toBe('pause-refused');
+            },
         );
     });
 

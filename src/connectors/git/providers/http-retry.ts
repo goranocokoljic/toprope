@@ -332,9 +332,29 @@ export function requestTimeout(): GitRequestTimeout {
  * converges instead of bricking.
  */
 export class GitRunDeadlineError extends Error {
-    constructor(message: string) {
+    /**
+     * WHY the fetch was abandoned — and the two are not interchangeable, which is the whole
+     * reason this field exists (#283 review cycle 3, SO-1/SEC-1).
+     *
+     * - `clock-passed` — the budget is SPENT. Everything still unfetched in this run stays
+     *   unfetched, so the window is not covered and the cursor must be held.
+     * - `pause-refused` — the clock has NOT passed; the run simply cannot afford THIS pause,
+     *   which for a rate-limit reset can be a full {@link MAX_RATE_LIMIT_DELAY_MS} hour. The
+     *   fetch that provoked it failed for an ordinary retryable reason and the run is entitled
+     *   to carry on and finish.
+     *
+     * Conflating them means one best-effort review-comment fetch meeting an hour-long
+     * rate-limit reset with 45 minutes left discards a whole provider's successfully-fetched
+     * run — the #231 best-effort trade this pipeline spends paragraphs refusing to make. The
+     * caller distinguishes on this field rather than by re-reading the clock, because the
+     * question is why we gave up, not what time it is now.
+     */
+    readonly kind: 'clock-passed' | 'pause-refused';
+
+    constructor(kind: 'clock-passed' | 'pause-refused', message: string) {
         super(message);
         this.name = 'GitRunDeadlineError';
+        this.kind = kind;
     }
 }
 
@@ -356,6 +376,7 @@ export function assertRunTimeRemaining(policy: GitRequestPolicy, url: string): v
     // interface anything may implement, so "Date.now() can't be NaN" does not cover it.
     if (!Number.isFinite(remaining) || remaining <= 0) {
         throw new GitRunDeadlineError(
+            'clock-passed',
             `git sync run exceeded its wall-clock budget before requesting ${url}`,
         );
     }
@@ -380,7 +401,11 @@ export async function sleepWithinRun(
     // Total on both operands, per the graduated rule — `NaN >= NaN` is false, so an
     // unparseable reading would slip the guard and take the pause.
     if (remaining !== undefined && (!Number.isFinite(remaining) || delayMs >= remaining)) {
+        // `pause-refused`, NOT `clock-passed`: the budget may have most of an hour left and
+        // simply be shorter than this one rate-limit reset. See {@link GitRunDeadlineError.kind}
+        // for why the caller must not read this as "the run is over".
         throw new GitRunDeadlineError(
+            'pause-refused',
             `git sync run has ${Number.isFinite(remaining) ? Math.max(remaining, 0) : 'an unreadable amount of'} ` +
                 `ms of its wall-clock budget left, less than the ${delayMs} ms retry pause ` +
                 `requested for ${url}`,
