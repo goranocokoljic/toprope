@@ -540,12 +540,19 @@ export interface SyncOutcome {
      * failed can still have reported an irreversible commit drop before it did, and that
      * report must not be lost to the failure beside it.
      *
-     * The caller classifies. `isAdvisoryError` (connectors/git/sync.ts) is the single
-     * classifier every consumer shares; this function persists what it is handed and does
-     * not re-derive the split, so passing a genuine failure here would hide it from the
-     * red/green surface. Omitted (or empty) clears the column — this describes the LAST
-     * run, exactly like `error` beside it, so a run that reported nothing must not leave
-     * the previous run's advisories standing as if they were its own.
+     * The caller classifies AND orders. `isAdvisoryError` (connectors/git/sync.ts) is the
+     * single classifier every consumer shares; this function persists what it is handed and
+     * does not re-derive the split, so passing a genuine failure here would hide it from the
+     * red/green surface. It is likewise handed the list MOST-IMPORTANT-FIRST — see
+     * {@link MAX_STORED_ADVISORIES} for why that matters and `rankAdvisories` (beside the
+     * sentinels, which is where their relative severity is knowable) for the ordering.
+     *
+     * Omitted (or empty) clears the column — this describes the LAST run, exactly like
+     * `error` beside it, so a run that reported nothing must not leave the previous run's
+     * advisories standing as if they were its own.
+     *
+     * @see isAdvisoryError in `src/connectors/git/sync.ts` — the classifier this trusts.
+     * @see rankAdvisories in `src/connectors/git/sync.ts` — the ordering this assumes.
      */
     advisories?: readonly string[];
 }
@@ -557,10 +564,30 @@ export interface SyncOutcome {
  * (`COMMITS_DROPPED_PREFIX` is per repo, and a systemic response-shape problem hits every
  * repo at once), so an unbounded column would let a 500-repo org write hundreds of
  * kilobytes into a row that `GET /api/admin/git/providers` then serves for EVERY provider
- * on every 1s poll while a sync is in flight. The cap is on the durable report surface;
- * the CLI (stdout) and the scheduled path (`sync_logs.errors`) still carry the full set.
+ * on every 1s poll while a sync is in flight.
+ *
+ * The cap truncates the TAIL, which is only safe because the caller hands the list in
+ * importance order (`rankAdvisories`). Arrival order is close to the INVERSE of importance —
+ * the permanent-loss lines are appended after the write transaction, behind every healed-retry
+ * line the run produced — so a cap applied to the raw order would evict exactly the report
+ * this column exists to keep.
  */
 export const MAX_STORED_ADVISORIES = 20;
+
+/**
+ * How many characters of ONE advisory line this row will store.
+ *
+ * The second axis of the same bound, and not redundant with the line cap: a single line can
+ * be arbitrarily long on its own. `UNMATCHED_AUTHORS_PREFIX` joins the WHOLE unmatched-author
+ * set into one entry, and on the first sync of a not-yet-mapped org that is every author in
+ * the history — ~70-100 KB for a 2,000-author org, which passes a 20-LINE cap untouched.
+ *
+ * Together the two caps bound the column at roughly `20 × 2 KB` ≈ 40 KB worst case, with the
+ * realistic case far below it (most lines are a few hundred bytes). 2 KB is chosen to sit
+ * above the longest single-purpose advisory the pipeline emits — the ~1.5 KB permanent-span
+ * repair prose — so the lines that carry an operator instruction arrive whole.
+ */
+export const MAX_STORED_ADVISORY_CHARS = 2_000;
 
 /**
  * The line appended in place of the advisories the cap dropped.
@@ -569,23 +596,46 @@ export const MAX_STORED_ADVISORIES = 20;
  * of it, and so the truncation is never SILENT: a reader of the column is told the count it
  * is not seeing and where the full set lives, instead of reading 20 lines as "that was all
  * of them".
+ *
+ * The surface it names is a CONTRACT on the caller, not a guess: a caller that bounds this
+ * column must also write the complete, unbounded set to the server log for the same run.
+ * The one caller today — the admin scoped-sync route — does exactly that, and a route test
+ * pins it. Naming `toprope sync git` or `sync_logs.errors` here would be worse than saying
+ * nothing: neither holds THIS run's advisories (this column is only ever written by the
+ * scoped admin path, which is neither the CLI nor the scheduled path), so it would send an
+ * operator to look somewhere guaranteed to be empty.
  */
 export function advisoriesTruncatedLine(omitted: number): string {
     return (
-        `… and ${omitted} more advisory line(s) not stored on this row (capped at ` +
-        `${MAX_STORED_ADVISORIES}). The full set is printed by "toprope sync git" and, on ` +
-        'the scheduled path, persisted to sync_logs.errors.'
+        `… and ${omitted} more advisory line(s) omitted — this row keeps at most ` +
+        `${MAX_STORED_ADVISORIES}. The complete set for this run was written to the server ` +
+        'log, keyed by this provider id.'
     );
 }
 
-// Apply the cap, naming what it dropped. Kept beside the constant it enforces so the
-// "no silent caps" property is one function, not a rule spread across call sites.
+/**
+ * The marker appended to one line the character cap cut.
+ *
+ * Same reason as {@link advisoriesTruncatedLine}: a silently shortened line reads as a
+ * complete one, and these lines can end in an operator instruction.
+ */
+export function advisoryLineTruncatedSuffix(): string {
+    return `… [line truncated at ${MAX_STORED_ADVISORY_CHARS} characters — see the server log]`;
+}
+
+// Apply both caps, naming what each one dropped. Kept beside the constants they enforce so
+// the "no silent caps" property is one function, not a rule spread across call sites.
+// Assumes an importance-ordered input — see MAX_STORED_ADVISORIES.
 function boundAdvisories(advisories: readonly string[]): string[] {
-    if (advisories.length <= MAX_STORED_ADVISORIES) return [...advisories];
-    return [
-        ...advisories.slice(0, MAX_STORED_ADVISORIES),
-        advisoriesTruncatedLine(advisories.length - MAX_STORED_ADVISORIES),
-    ];
+    const kept = advisories
+        .slice(0, MAX_STORED_ADVISORIES)
+        .map((line) =>
+            line.length <= MAX_STORED_ADVISORY_CHARS
+                ? line
+                : line.slice(0, MAX_STORED_ADVISORY_CHARS) + advisoryLineTruncatedSuffix(),
+        );
+    const omitted = advisories.length - kept.length;
+    return omitted > 0 ? [...kept, advisoriesTruncatedLine(omitted)] : kept;
 }
 
 // Runtime allowlist for the outcome status (review-rule: allowlist at the write
@@ -661,10 +711,18 @@ export function toPublicProvider(record: GitProviderRecord): PublicGitProvider {
         // Flattened to `[]` rather than passed through as null: the wire field answers
         // "what did the last run report", and one spelling of "nothing" is enough for a
         // client that only ever wants to iterate it.
+        //
+        // Guarded on the TYPE, not on `=== null`, because the record is a `SELECT *` row
+        // cast to `GitProviderRecord` — a cast is not a runtime type. Two reachable values
+        // the narrower check would pass straight into the decoder: `undefined`, on a
+        // database where migration 045 has not been applied (the column does not exist, so
+        // the property is absent), and `''` from a hand-edited row. Both would come back
+        // out of the tolerant decoder as a one-entry list, and the UI would render a
+        // phantom advisory with a blank bullet on every provider.
         last_sync_advisories:
-            record.last_sync_advisories === null
-                ? []
-                : decodeStringArrayColumn(record.last_sync_advisories),
+            typeof record.last_sync_advisories === 'string' && record.last_sync_advisories !== ''
+                ? decodeStringArrayColumn(record.last_sync_advisories)
+                : [],
     };
 }
 

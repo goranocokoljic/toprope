@@ -31,6 +31,8 @@ import {
     COMMIT_CHURN_UNKNOWN_PREFIX,
     RETRY_HEALED_PREFIX,
     isAdvisoryError,
+    isPermanentLossAdvisory,
+    rankAdvisories,
     stallStateKey,
     syncStateKey,
 } from '../../../src/connectors/git/sync';
@@ -980,5 +982,61 @@ describe('unreturned commits are never silent (#275)', () => {
             expect(churnLine).not.toContain('[31m');
             expect(churnLine!.split('\n')).toHaveLength(1);
         });
+    });
+});
+
+/**
+ * #289 — the ordering a BOUNDED advisory surface depends on.
+ *
+ * `git_providers.last_sync_advisories` keeps at most `MAX_STORED_ADVISORIES` lines and
+ * truncates the tail. That is only safe if the list arrives importance-first, and
+ * `SyncResult.errors` arrives close to the OPPOSITE order: every per-provider fetch-phase
+ * line is spliced in first — `RETRY_HEALED_PREFIX` once per healed fetch, so hundreds of them
+ * for a large org riding out rate limiting — while the permanent-loss lines are appended last,
+ * after the write transaction, because only then is the loss real.
+ *
+ * Unit-level rather than through a run, deliberately: producing 20+ real retry-heals requires
+ * two 5-and-15-minute sleeps per heal (`GIT_REPO_RETRY_DELAYS_MS`), so a run-level test of the
+ * over-cap case could only be built on faked time — and what needs pinning is the ordering
+ * rule itself, not the pipeline that feeds it.
+ */
+describe('rankAdvisories — importance order for a bounded surface (#289)', () => {
+    const healed = (n: number): string => `${RETRY_HEALED_PREFIX} [github/repo-${n}] commit fetch succeeded on attempt 2`;
+    const drop = `${COMMITS_DROPPED_PREFIX} [github/api] 3 commit(s)`;
+    const churn = `${COMMIT_CHURN_UNKNOWN_PREFIX} [github/api] 2 commit(s)`;
+
+    it('moves permanent-loss lines ahead of recoverable ones, so a tail cap cannot evict them', () => {
+        // The exact arrival shape of a rate-limited large-org run: noise first, loss last.
+        const arrived = [...Array.from({length: 25}, (_, i) => healed(i)), drop, churn];
+
+        const ranked = rankAdvisories(arrived);
+
+        // A 20-line tail cap applied to `arrived` keeps zero loss lines; applied to `ranked`
+        // it keeps both. That difference IS the finding this function exists to fix.
+        expect(arrived.slice(0, 20).filter((a) => isPermanentLossAdvisory(a))).toEqual([]);
+        expect(ranked.slice(0, 20).filter((a) => isPermanentLossAdvisory(a))).toEqual([drop, churn]);
+    });
+
+    it('is stable within each class and loses nothing', () => {
+        // An operator reading the retained set should see it in the order the run produced it,
+        // and ranking is a REORDER — never a filter. A rank that dropped the recoverable lines
+        // would pass the assertion above while quietly discarding the healed-retry report.
+        const arrived = [healed(0), drop, healed(1), churn, healed(2)];
+        expect(rankAdvisories(arrived)).toEqual([drop, churn, healed(0), healed(1), healed(2)]);
+        expect(rankAdvisories(arrived)).toHaveLength(arrived.length);
+    });
+
+    it('leaves a list with no permanent-loss line exactly as it arrived', () => {
+        const arrived = [healed(0), healed(1)];
+        expect(rankAdvisories(arrived)).toEqual(arrived);
+        expect(rankAdvisories([])).toEqual([]);
+    });
+
+    it('classifies only the un-re-askable sentinels as permanent loss', () => {
+        // Both directions, against strings the code itself builds: a recoverable advisory
+        // ranked as permanent would push the real loss down and back under the cap.
+        expect(isPermanentLossAdvisory(drop)).toBe(true);
+        expect(isPermanentLossAdvisory(churn)).toBe(true);
+        expect(isPermanentLossAdvisory(healed(0))).toBe(false);
     });
 });

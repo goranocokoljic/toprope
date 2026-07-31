@@ -56,4 +56,13 @@ describe('decodeStringArrayColumn', () => {
     it('coerces non-string array members instead of leaking them to a string consumer', () => {
         expect(decodeStringArrayColumn('[1,null,true]')).toEqual(['1', 'null', 'true']);
     });
+
+    it('coerces an object member to its String() form rather than leaking an object', () => {
+        // Documents the limit of "degraded, but never silently dropped": a nested object
+        // renders as `[object Object]` in whatever surface reads it. That is deliberate — the
+        // consumer's type says `string[]` and must not be handed an object — but it is the
+        // one case where the degraded output tells the reader nothing, so it is pinned rather
+        // than left to be discovered in an admin row.
+        expect(decodeStringArrayColumn('[{"repo":"x"}]')).toEqual(['[object Object]']);
+    });
 });

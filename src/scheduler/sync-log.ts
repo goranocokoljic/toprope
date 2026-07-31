@@ -120,7 +120,7 @@ function reapAbandonedSyncLogs(db: Database.Database, connector: string, at: str
         `UPDATE sync_logs
          SET finished_at = ?, error_count = 1, errors = ?, status = 'error'
          WHERE connector = ? AND status = 'running' AND started_at < ?`,
-    ).run(at, JSON.stringify([ABANDONED_RUN_ERROR]), connector, cutoff);
+    ).run(at, encodeStringArrayColumn([ABANDONED_RUN_ERROR]), connector, cutoff);
 }
 
 export function startSyncLog(db: Database.Database, connector: string): string {

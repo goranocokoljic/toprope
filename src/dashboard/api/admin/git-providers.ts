@@ -39,6 +39,7 @@ import {sameContainer} from '../../../connectors/git/providers/container';
 import {
     GitSync,
     isAdvisoryError,
+    rankAdvisories,
     FIRST_SYNC_WINDOW_MIN_MONTHS,
     FIRST_SYNC_WINDOW_MAX_MONTHS,
     FIRST_SYNC_WINDOW_DEFAULT_MONTHS,
@@ -641,27 +642,29 @@ export function registerAdminGitProviderRoutes(
                     (isAdvisoryError(entry) ? advisories : genuineErrors).push(entry);
                 }
                 if (advisories.length > 0) {
-                    // Also logged, not only persisted: the row keeps a bounded report for
-                    // the UI, the log keeps the full set for whoever is tailing the server.
+                    // Not decoration, and not merely "also logged": the row's advisory
+                    // column is BOUNDED (`MAX_STORED_ADVISORIES`), and its truncation line
+                    // tells the operator the omitted lines are in the server log. This is
+                    // the write that makes that true, so it is a contract, not a courtesy —
+                    // it logs the COMPLETE, unranked, unbounded set, keyed by provider id.
                     request.log.warn(
                         {providerId: id, advisories},
                         'git sync completed with advisories',
                     );
                 }
-                if (genuineErrors.length > 0) {
-                    recordSyncOutcome(db, id, {
-                        status: 'error',
-                        at: new Date().toISOString(),
-                        error: genuineErrors.join('; '),
-                        advisories,
-                    });
-                } else {
-                    recordSyncOutcome(db, id, {
-                        status: 'ok',
-                        at: new Date().toISOString(),
-                        advisories,
-                    });
-                }
+                // ONE call, not a branch per status: `error` is ignored (and the column
+                // NULLed) on `ok`, so the two branches differed only in the status they
+                // passed — and a field added to one of them and not the other is exactly
+                // how the advisory column would come to be written on one path only.
+                recordSyncOutcome(db, id, {
+                    status: genuineErrors.length > 0 ? 'error' : 'ok',
+                    at: new Date().toISOString(),
+                    error: genuineErrors.join('; '),
+                    // Importance-ordered, because the store's cap truncates the tail and
+                    // arrival order buries the permanent-loss lines behind every healed
+                    // retry the run reported.
+                    advisories: rankAdvisories(advisories),
+                });
             })
             .catch((err: unknown) => {
                 // A thrown failure (e.g. an unexpected pipeline crash) is still

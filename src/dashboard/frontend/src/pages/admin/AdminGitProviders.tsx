@@ -41,6 +41,7 @@ import type {
 } from '../../api/types';
 import {
     AdminBanner,
+    adminBannerFrame,
     ErrorText,
     PageHeader,
     PrimaryButton,
@@ -545,6 +546,71 @@ function ProbeResultView({result}: {result: GitProviderProbeResult}): JSX.Elemen
             ✕ {result.error ?? 'Connection failed'}
             {result.hint ? <span className="block text-xs text-muted">{result.hint}</span> : null}
         </span>
+    );
+}
+
+/**
+ * The heading over a row's advisory note (#289).
+ *
+ * Two claims it must not overstate, both of which a fixed string got wrong:
+ *
+ *  - "**Last manual** sync", not "last sync". `last_sync_advisories` — like every
+ *    `last_sync_*` column beside it — is written ONLY by the admin per-provider routes. The
+ *    scheduler never touches them, so on a deployment with a nightly sync the run this
+ *    describes is usually not the most recent one, and an absent note is emphatically not
+ *    evidence that nothing was lost.
+ *  - The parenthetical is conditional on the outcome. Advisories are recorded on BOTH
+ *    statuses on purpose (a run that fails can still have reported an irreversible loss
+ *    before it did), so on a red row a fixed "the sync itself did not fail" contradicts the
+ *    `error` badge two lines above it.
+ *
+ * `line(s)` rather than a plurality branch: the count includes the store's truncation line
+ * when the cap trips, so "advisories" would be off by one exactly when the operator most
+ * needs to trust the number — and it matches the `(s)` convention the advisory lines
+ * themselves use.
+ */
+export function syncAdvisoryHeading(count: number, status: string | null): string {
+    const qualifier =
+        status === 'error'
+            ? 'reported separately from the failure above'
+            : 'the sync itself did not fail';
+    return `Last manual sync reported ${count} advisory line(s) — ${qualifier}`;
+}
+
+/**
+ * A row's advisory note: what the last manual sync REPORTED but did not fail on (#289).
+ *
+ * Rendered whenever the column is non-empty, including while a new run is in flight — it
+ * describes the last SETTLED manual run, exactly like the status Badge and timestamp above
+ * it, and the point of the drop advisory is that it stays visible until a later run reports
+ * clean.
+ *
+ * `warning`, never `danger`: an advisory that turned the row red would re-introduce in the UI
+ * the misclassification the server's `isAdvisoryError` split exists to prevent. The frame
+ * comes from {@link adminBannerFrame} so the amber treatment has one definition — this is
+ * deliberately not an `AdminBanner`, which hardcodes `role="status"` and a mandatory Dismiss
+ * button. Neither fits: the row's sr-only status element (#278) already owns the announced
+ * sync lifecycle and an advisory list appearing mid-poll is not a lifecycle event, and there
+ * is nothing to dismiss polled server state to.
+ */
+function SyncAdvisories({lines, status}: {lines: string[]; status: string | null}): JSX.Element {
+    return (
+        <div
+            data-testid="sync-advisories"
+            className={`rounded border px-3 py-2 text-sm text-foreground ${adminBannerFrame('warning')}`}
+        >
+            <div className="font-medium text-warning">{syncAdvisoryHeading(lines.length, status)}</div>
+            <ul className="mt-1 list-disc space-y-1 pl-5 text-muted">
+                {lines.map((line, i) => (
+                    // Index key: these are report LINES, not entities — they have no id, can
+                    // legitimately repeat (one per repo), and the whole list is replaced
+                    // wholesale by the next run.
+                    <li key={i} className="break-words">
+                        {line}
+                    </li>
+                ))}
+            </ul>
+        </div>
     );
 }
 
@@ -1814,41 +1880,13 @@ function ProviderRow({
                     </td>
                 </tr>
             ) : null}
-            {/* What the last run REPORTED but did not fail on (#289).
-
-                Rendered whenever the column is non-empty, including while a new run is in
-                flight: it describes the last SETTLED run, exactly like the status Badge and
-                timestamp above it, and the whole point of the drop advisory is that it stays
-                visible until a later run reports clean. `warning`, never `danger` — an
-                advisory that turned the row red would be the failure classification this
-                feature exists to avoid. Plain static text, not a live region: the row's
-                sr-only status element (#278) owns the announced lifecycle, and an advisory
-                list appearing mid-poll is not a lifecycle event. */}
             {provider.last_sync_advisories.length > 0 ? (
                 <tr>
                     <td colSpan={7} className="px-3 pb-3">
-                        <div
-                            data-testid="sync-advisories"
-                            className="rounded border border-warning/40 bg-warning/10 px-3 py-2 text-sm text-foreground"
-                        >
-                            <div className="font-medium text-warning">
-                                Last sync reported{' '}
-                                {provider.last_sync_advisories.length === 1
-                                    ? '1 advisory'
-                                    : `${provider.last_sync_advisories.length} advisories`}{' '}
-                                (the sync itself did not fail)
-                            </div>
-                            <ul className="mt-1 list-disc space-y-1 pl-5 text-muted">
-                                {provider.last_sync_advisories.map((line, i) => (
-                                    // Index key: these are report LINES, not entities — they
-                                    // have no id, can legitimately repeat (one per repo), and
-                                    // the whole list is replaced wholesale by the next run.
-                                    <li key={i} className="break-words">
-                                        {line}
-                                    </li>
-                                ))}
-                            </ul>
-                        </div>
+                        <SyncAdvisories
+                            lines={provider.last_sync_advisories}
+                            status={provider.last_sync_status}
+                        />
                     </td>
                 </tr>
             ) : null}

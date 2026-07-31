@@ -18,9 +18,12 @@ import type {
     GitFetchProgressListener,
     GitFileDiff,
 } from '../../src/connectors/git/providers/types';
-import {COMMIT_DROP_REASONS} from '../../src/connectors/git/providers/types';
+// The reason constant by NAME, not `COMMIT_DROP_REASONS[0]` — the tuple's own docstring
+// rejects positional access, since ordinal is not what joins a reason to its meaning.
+import {NO_AUTHOR_DATE_DROP_REASON} from '../../src/connectors/git/providers/types';
 import type {GitSyncProgress} from '../../src/connectors/git/sync';
 import {
+    AUTO_CREATE_SUMMARY_PREFIX,
     COMMITS_DROPPED_PREFIX,
     UNMATCHED_AUTHORS_PREFIX,
     declareEarliestSyncedFloor,
@@ -107,11 +110,42 @@ async function getCreateGitProvider() {
     return createGitProvider as ReturnType<typeof vi.fn>;
 }
 
+/**
+ * Every line the app's pino logger wrote, as parsed JSON records (#289).
+ *
+ * `logCapture` is opt-in per app: passing it swaps `logger: false` for a real pino writing to
+ * an in-memory stream, so a test can assert on `request.log` output. Needed because the
+ * advisory column is BOUNDED and its truncation line tells the operator the omitted lines are
+ * in the server log — that is a contract on the route, and a contract nothing can observe is
+ * one a refactor deletes in silence.
+ */
+interface LogRecord {
+    msg?: string;
+    providerId?: string;
+    advisories?: string[];
+}
+
 async function buildApp(
     db: Database.Database,
     gitConfig: GitConnectorConfig = GIT_CONFIG,
+    logCapture?: LogRecord[],
 ): Promise<FastifyInstance> {
-    const app = Fastify({logger: false});
+    const app = Fastify(
+        logCapture === undefined
+            ? {logger: false}
+            : {
+                  logger: {
+                      level: 'warn',
+                      // A child logger (`request.log`) inherits this stream, which is the
+                      // whole point — the write under test is on the request logger.
+                      stream: {
+                          write(line: string): void {
+                              logCapture.push(JSON.parse(line) as LogRecord);
+                          },
+                      },
+                  },
+              },
+    );
     registerSessionAuth(app, db);
     registerAuthRoutes(app, db, {sessionTtlHours: 24, cookieSecure: false});
     registerMeRoutes(app, db);
@@ -432,7 +466,7 @@ describe('admin git-provider sync-now API (#199)', () => {
                                     _onProgress?: GitFetchProgressListener,
                                     onDrop?: GitCommitDropListener,
                                 ): Promise<GitCommit[]> => {
-                                    onDrop?.({sha: DROPPED_SHA, reason: COMMIT_DROP_REASONS[0]});
+                                    onDrop?.({sha: DROPPED_SHA, reason: NO_AUTHOR_DATE_DROP_REASON});
                                     return [makeCommit('alice')];
                                 },
                             ),
@@ -532,6 +566,91 @@ describe('admin git-provider sync-now API (#199)', () => {
                 // The failure line is NOT duplicated into the advisory column — one entry
                 // belongs to exactly one channel.
                 expect(row.last_sync_advisories.some((e) => e.includes('401'))).toBe(false);
+            });
+
+            it('stores the permanent-loss line FIRST, ahead of an advisory that arrived before it', async () => {
+                // The route half of the bounded-surface fix. The store keeps the first
+                // `MAX_STORED_ADVISORIES` lines and drops the tail, so which line survives a
+                // cap is decided HERE, by whether the route ranks before recording.
+                //
+                // Observable without building an over-cap run (which would need 20+ real
+                // retry-heals, i.e. two multi-minute sleeps each): the auto-create SUMMARY is
+                // pushed to `errors` at the top of the post-commit block, immediately BEFORE
+                // the staged drop advisories. So arrival order here is [summary, drop] and
+                // importance order is [drop, summary] — a route that passed `errors` through
+                // unranked stores them the other way round and fails this. The over-cap
+                // behaviour itself is pinned at the unit level in
+                // `tests/connectors/git/commit-loss.test.ts` ("rankAdvisories").
+                await app.close();
+                app = await buildApp(db, {
+                    ...GIT_CONFIG,
+                    auto_create_developers: true,
+                    auto_create_team: 'discovered',
+                });
+                adminToken = await login(app, 'admin@test.com');
+
+                const id = await createGithub();
+                const createGitProvider = await getCreateGitProvider();
+                createGitProvider.mockReturnValue(
+                    makeMockProvider({
+                        listRepos: vi.fn().mockResolvedValue([makeRepo('myrepo')]),
+                        getCommits: vi
+                            .fn()
+                            .mockImplementation(
+                                async (
+                                    _repo: string,
+                                    _since: string,
+                                    _until: string,
+                                    _onProgress?: GitFetchProgressListener,
+                                    onDrop?: GitCommitDropListener,
+                                ): Promise<GitCommit[]> => {
+                                    onDrop?.({sha: DROPPED_SHA, reason: NO_AUTHOR_DATE_DROP_REASON});
+                                    // `carol` is onboardable, so auto-create emits its summary.
+                                    return [makeCommit('alice'), makeCommit('carol')];
+                                },
+                            ),
+                    }),
+                );
+
+                expect((await triggerSync(id)).statusCode).toBe(202);
+                const row = await waitForSyncStatus(id, 'ok');
+
+                // Positive control: BOTH advisories really were produced by this run, so the
+                // ordering assertion below is comparing two present lines rather than passing
+                // because the summary never appeared.
+                const summaryIndex = row.last_sync_advisories.findIndex((e) =>
+                    e.startsWith(AUTO_CREATE_SUMMARY_PREFIX),
+                );
+                expect(summaryIndex).toBeGreaterThanOrEqual(0);
+                expect(dropLines(row)).toHaveLength(1);
+
+                // The permanent, un-re-askable loss sorts ahead of the recoverable report.
+                expect(row.last_sync_advisories[0].startsWith(COMMITS_DROPPED_PREFIX)).toBe(true);
+                expect(summaryIndex).toBeGreaterThan(0);
+            });
+
+            it('logs the complete unbounded advisory set the truncation line points at', async () => {
+                // `advisoriesTruncatedLine` tells the operator the omitted lines "were written
+                // to the server log, keyed by this provider id". That is executable advice, so
+                // it has to be true — and the route is what makes it true. Without this test
+                // the log write can be deleted and every other assertion stays green while the
+                // truncation line starts pointing at nothing.
+                const logs: LogRecord[] = [];
+                await app.close();
+                app = await buildApp(db, GIT_CONFIG, logs);
+                adminToken = await login(app, 'admin@test.com');
+
+                const id = await createGithub();
+                await armDroppingProvider();
+                expect((await triggerSync(id)).statusCode).toBe(202);
+                await waitForSyncStatus(id, 'ok');
+
+                const warned = logs.find((l) => l.msg === 'git sync completed with advisories');
+                expect(warned).toBeDefined();
+                expect(warned?.providerId).toBe(id);
+                expect(warned?.advisories?.some((a) => a.startsWith(COMMITS_DROPPED_PREFIX))).toBe(
+                    true,
+                );
             });
 
             it('clears the previous run\'s advisories when a later run reports none', async () => {

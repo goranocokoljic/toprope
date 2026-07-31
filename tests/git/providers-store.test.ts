@@ -5,9 +5,11 @@ import {runMigrations} from '../../src/storage/migrator';
 import {loadServerKey, type ServerKeyResult} from '../../src/connectors/git/providers/secret';
 import {
     advisoriesTruncatedLine,
+    advisoryLineTruncatedSuffix,
     createProvider,
     deleteProvider,
     MAX_STORED_ADVISORIES,
+    MAX_STORED_ADVISORY_CHARS,
     findProviderByTypeContainer,
     getDecryptedConfig,
     getProvider,
@@ -695,6 +697,33 @@ describe('provider store — recordSyncOutcome advisories (#289)', () => {
         expect(toPublicProvider(getProvider(db, rec.id)!).last_sync_advisories).toEqual(lines);
     });
 
+    it('truncates one over-long line without dropping it, and says so', () => {
+        // The second axis of the bound. UNMATCHED_AUTHORS_PREFIX joins the WHOLE unmatched set
+        // into ONE entry, so a first sync of a 2,000-author org writes ~70-100 KB in a single
+        // line — which a 20-LINE cap passes untouched, into a row the admin list serves for
+        // every provider on every 1s poll while a sync is in flight.
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        const huge = `${DROP_LINE} ${'x'.repeat(MAX_STORED_ADVISORY_CHARS * 3)}`;
+        recordSyncOutcome(db, rec.id, {status: 'ok', at: '2026-07-07T10:00:00.000Z', advisories: [huge]});
+
+        const stored = toPublicProvider(getProvider(db, rec.id)!).last_sync_advisories;
+        // Kept, not dropped — the line still identifies what it is about…
+        expect(stored).toHaveLength(1);
+        expect(stored[0].startsWith(DROP_LINE)).toBe(true);
+        // …bounded…
+        expect(stored[0]).toHaveLength(MAX_STORED_ADVISORY_CHARS + advisoryLineTruncatedSuffix().length);
+        // …and not silently: a shortened line must not read as a complete one.
+        expect(stored[0].endsWith(advisoryLineTruncatedSuffix())).toBe(true);
+    });
+
+    it('leaves a line exactly at the character cap untouched', () => {
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        const exact = 'y'.repeat(MAX_STORED_ADVISORY_CHARS);
+        recordSyncOutcome(db, rec.id, {status: 'ok', at: '2026-07-07T10:00:00.000Z', advisories: [exact]});
+        // `<=` not `<` on this axis too.
+        expect(toPublicProvider(getProvider(db, rec.id)!).last_sync_advisories).toEqual([exact]);
+    });
+
     it('surfaces a malformed stored value as its raw text rather than failing the row', () => {
         const rec = createProvider(db, keyOk(), {config: GITHUB});
         // Reachable from a hand-edited row: the column is untyped TEXT with no CHECK.
@@ -705,5 +734,23 @@ describe('provider store — recordSyncOutcome advisories (#289)', () => {
         expect(toPublicProvider(getProvider(db, rec.id)!).last_sync_advisories).toEqual([
             'half-written {',
         ]);
+    });
+
+    it('reports no advisories for column values a `=== null` guard would let through', () => {
+        // The two inputs only the TYPE guard handles. A `record.last_sync_advisories === null`
+        // test passes both straight into the tolerant decoder, which returns a one-entry list
+        // — and the row then renders "reported 1 advisory line(s)" with a blank bullet on
+        // EVERY provider. `undefined` is the serious one: it is what `SELECT *` yields on a
+        // database where migration 045 has not been applied, and the record type is a cast,
+        // not a runtime check.
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        db.prepare('UPDATE git_providers SET last_sync_advisories = ? WHERE id = ?').run('', rec.id);
+        expect(toPublicProvider(getProvider(db, rec.id)!).last_sync_advisories).toEqual([]);
+
+        const noColumn = {...getProvider(db, rec.id)!} as GitProviderRecord & {
+            last_sync_advisories?: string | null;
+        };
+        delete noColumn.last_sync_advisories;
+        expect(toPublicProvider(noColumn as GitProviderRecord).last_sync_advisories).toEqual([]);
     });
 });

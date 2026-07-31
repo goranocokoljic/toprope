@@ -22,7 +22,17 @@
 -- lines, not a closed vocabulary, and the decoder is tolerant so a malformed value degrades
 -- to its raw text rather than making the row unreadable.
 --
--- Scope: this column describes the LAST run only, exactly like `last_sync_at` /
--- `last_sync_status` / `last_sync_error` beside it. It is a report surface, not a ledger —
--- the durable per-run history on the scheduled path stays `sync_logs.errors`.
+-- Scope: this column describes the LAST SCOPED run only, exactly like `last_sync_at` /
+-- `last_sync_status` / `last_sync_error` beside it — all four are written ONLY by the admin
+-- per-provider routes, never by the scheduler or the CLI, so a nightly run neither populates
+-- nor clears them. It is a report surface, not a ledger: the durable per-run history on the
+-- scheduled path stays `sync_logs.errors`, which no dashboard surface renders yet. An empty
+-- column is therefore "the last manual sync reported nothing", NOT "nothing has been lost" —
+-- the UI says "Last manual sync" for that reason.
+--
+-- Retention note: advisory text can embed third-party commit-author logins and emails (the
+-- unmatched-authors line names every author with no developer record — external contributors
+-- and bots). That data class already lives in `sync_logs.errors`; what is new here is that it
+-- is served by GET /api/admin/git/providers, which is admin-gated, and that its only expiry is
+-- the next scoped run reporting nothing. Deleting the provider drops the row with it.
 ALTER TABLE git_providers ADD COLUMN last_sync_advisories TEXT;

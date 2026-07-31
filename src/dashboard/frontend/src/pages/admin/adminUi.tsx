@@ -272,6 +272,20 @@ const BANNER_TONE: Record<AdminBannerTone, BannerToneStyle> = {
 };
 
 /**
+ * The frame (border + background) of an admin banner tone, for a surface that needs the
+ * treatment but not {@link AdminBanner} itself.
+ *
+ * Exported so the tone has ONE definition. `AdminBanner` is not reusable everywhere the amber
+ * frame is wanted — it hardcodes `role="status"` (load-bearing, see its doc) and a mandatory
+ * Dismiss button, and a row-scoped note derived from polled server state wants neither. The
+ * alternative was a second literal copy of `border-warning/40 bg-warning/10`, which is how the
+ * two amber surfaces on one page drift apart.
+ */
+export function adminBannerFrame(tone: AdminBannerTone): string {
+    return BANNER_TONE[tone].frame;
+}
+
+/**
  * The shared "what a write just did" banner for admin pages.
  *
  * Deliberately NOT `StatePanel`, which is the shell behind every *data-state* treatment

@@ -12,6 +12,7 @@ import {
     outcomeBelongsToRun,
     parseReposList,
     repoScopeLabel,
+    syncAdvisoryHeading,
     syncProgressLabel,
     syncStageAnnouncement,
     syncTerminalAnnouncement,
@@ -2588,18 +2589,77 @@ describe('AdminGitProviders — last-sync advisories (#289)', () => {
         renderPage();
 
         const panel = await screen.findByTestId('sync-advisories');
-        expect(panel).toHaveTextContent('2 advisories');
+        expect(panel).toHaveTextContent(syncAdvisoryHeading(2, 'ok'));
         // Both lines in full — a summary count with the text truncated away would be a
         // pointer to information the operator still cannot reach.
         expect(panel).toHaveTextContent(DROP_LINE);
         expect(panel).toHaveTextContent(UNMATCHED_LINE);
 
-        // …and the run is still reported as the success it was. An advisory that flipped the
-        // status cell to `error` would be the exact misclassification the server-side
-        // `isAdvisoryError` split exists to prevent, re-introduced in the UI.
+        // The tone claim, asserted where it can actually fail. The status Badge below is
+        // driven purely by `last_sync_status`, so a Badge assertion cannot catch this panel
+        // being restyled `danger` — which would re-introduce in the UI the very
+        // misclassification the server-side `isAdvisoryError` split exists to prevent.
+        expect(panel.className).toContain('warning');
+        expect(panel.className).not.toContain('danger');
+
+        // …and the run is still reported as the success it was.
         const row = (await screen.findByText('acme-org')).closest('tr') as HTMLElement;
         expect(within(row).getByText('ok')).toBeInTheDocument();
         expect(within(row).queryByText('error')).toBeNull();
+    });
+
+    it('does not claim the sync succeeded on a row whose run FAILED', async () => {
+        // Advisories are recorded on both outcomes on purpose — a run that fails can still
+        // have reported an irreversible loss before it did. A fixed "the sync itself did not
+        // fail" caption would then sit directly under an `error` badge and contradict it, on
+        // the one row where the operator most needs a coherent story.
+        providers = [
+            {
+                ...structuredClone(DB_GITHUB),
+                last_sync_status: 'error',
+                last_sync_error: 'GitHub API error 401',
+                last_sync_advisories: [DROP_LINE],
+            },
+        ];
+        renderPage();
+
+        const panel = await screen.findByTestId('sync-advisories');
+        expect(panel).toHaveTextContent(syncAdvisoryHeading(1, 'error'));
+        expect(panel.textContent).not.toContain('the sync itself did not fail');
+        // Still amber, not red: the advisory is not the failure.
+        expect(panel.className).toContain('warning');
+    });
+
+    it('keeps the last run\'s advisories visible while a new run is in flight', async () => {
+        // The panel describes the last SETTLED manual run, exactly like the status Badge and
+        // timestamp beside it. Hiding it the moment a retry starts would make the drop report
+        // disappear at precisely the moment the operator acts on it.
+        providers = [
+            {
+                ...structuredClone(DB_GITHUB),
+                last_sync_advisories: [DROP_LINE],
+                active_sync: {
+                    started_at: '2026-07-13T10:00:00.000Z',
+                    progress: {
+                        stage: 'fetching',
+                        repos_total: 3,
+                        repos_processed: 1,
+                        current_repo: 'web',
+                        commits_fetched: 10,
+                        prs_fetched: 0,
+                        developers_matched: 0,
+                        repo_step: 'commits',
+                        repo_step_done: 5,
+                        repo_step_scanned: null,
+                        repo_step_total: 50,
+                    },
+                },
+            },
+        ];
+        renderPage();
+
+        expect(await screen.findByTestId('sync-advisories')).toHaveTextContent(DROP_LINE);
+        expect(screen.getByTestId('sync-progress')).toBeInTheDocument();
     });
 
     it('renders nothing when the last run reported no advisories', async () => {
@@ -2612,12 +2672,15 @@ describe('AdminGitProviders — last-sync advisories (#289)', () => {
         expect(screen.queryByTestId('sync-advisories')).toBeNull();
     });
 
-    it('uses the singular heading for one advisory', async () => {
+    it('scopes the heading to the manual run the column actually describes', async () => {
+        // `last_sync_advisories`, like every `last_sync_*` column, is written only by the
+        // admin per-provider routes — the scheduler never touches them. "Last sync reported…"
+        // would therefore assert something about a nightly run this row knows nothing about,
+        // and (worse) an empty panel would read as "nothing was lost".
         providers = [{...structuredClone(DB_GITHUB), last_sync_advisories: [DROP_LINE]}];
         renderPage();
         const panel = await screen.findByTestId('sync-advisories');
-        expect(panel).toHaveTextContent('1 advisory');
-        expect(panel.textContent).not.toContain('1 advisories');
+        expect(panel).toHaveTextContent('Last manual sync reported');
     });
 
     it('is not a live region — the row already owns the announced sync lifecycle', async () => {
