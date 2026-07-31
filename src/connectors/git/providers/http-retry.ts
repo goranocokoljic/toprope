@@ -658,10 +658,15 @@ export function isRetryableGitFetchError(err: unknown): boolean {
  * A non-positive reset carries no schedulable information, so the honest reading is "the server
  * told us nothing usable" and the caller's own backoff guess is the right answer.
  *
- * ONE helper rather than the guard written inline at each site, because there are two sites in
- * two files and the second is the one that gets forgotten — which is exactly what happened when
- * this rule was first written inline (#284 review cycle 1 fixed the shared loop and left
- * `fetchGitHub` behind).
+ * THE BOUND IS `> 0`, NOT `> MIN_RATE_LIMIT_DELAY_MS`, so this closes the non-positive half only:
+ * a reset landing under a second from now is still clamped up to the 1-second floor. That is the
+ * right trade rather than an oversight — a genuinely imminent reset SHOULD be honored, and the
+ * case self-corrects, since the next attempt re-reads a header that has by then elapsed and gets
+ * the full backoff. Don't read this function as making a 1-second retry unreachable.
+ *
+ * ONE helper rather than the guard written inline, because there are three sleep sites across
+ * two files — this module's 429, and `fetchGitHub`'s 429 and 403 primary-limit branches — and
+ * the ones in the other file are what get forgotten.
  */
 export function usableResetMs(header: string | null | undefined): number | null {
     const resetMs = parseEpochResetMs(header);
@@ -686,14 +691,10 @@ type GitProviderLabel = 'Bitbucket' | 'GitLab';
  * After #272 moved the policy here, `fetchBitbucket` and `fetchGitLab` were line-for-line
  * identical — same five branches in the same order, same two independent counters — differing
  * only in the message prefix and in GitLab reading `ratelimit-reset` on a 429. The second is not
- * a real difference: Bitbucket does not send that header, so reading it unconditionally yields
- * `null` and falls through to {@link rateLimitFallbackMs} exactly as before. So the collapse
- * needs one extra argument, `label`, and no knob.
- *
- * That neutrality is now unconditional rather than contingent on the vendor's header spelling:
- * the 429 branch treats a non-positive reset as absent, so even a Bitbucket that started sending
- * `ratelimit-reset` — or sent it delta-shaped — degrades to the same fallback guess instead of
- * to the 1-second floor. See the branch itself for why that direction matters.
+ * a real difference: that is the un-prefixed IETF spelling GitLab uses, and it does not match the
+ * `X-RateLimit-*` family Bitbucket documents — so for Bitbucket the read yields `null` and falls
+ * through to {@link rateLimitFallbackMs} exactly as before. The header NAME is what carries that
+ * guarantee; see the 429 branch. So the collapse needs one extra argument, `label`, and no knob.
  *
  * `fetchGitHub` is deliberately NOT folded in — see this module's header.
  *
@@ -753,13 +754,16 @@ export async function fetchWithGitRetry(
             // (#272). Both were previously fed to the same `parseFloat(…) * 1_000`, so the
             // reset became ~1.8e12 ms — past setTimeout's 32-bit limit, which Node clamps to
             // 1 ms. The pause meant to outlast the limit became an instant retry, and GitLab
-            // was hammered while already rate-limiting us. Parsed by kind now. Read for
-            // Bitbucket as well, which simply does not send it: absent → `null` → the same
-            // fallback Bitbucket always used.
+            // was hammered while already rate-limiting us. Parsed by kind now.
             //
-            // A non-positive reset is read as ABSENT, not as "retry now" — see
-            // {@link usableResetMs}, which is also what `fetchGitHub`'s 403 primary-limit branch
-            // calls, so the rule has one definition rather than two.
+            // THE HEADER NAME IS THE WHOLE OF BITBUCKET'S NEUTRALITY, so don't "tidy" it. This is
+            // the un-prefixed IETF spelling, which is GitLab's; `Headers.get` is case-insensitive
+            // but NOT prefix-insensitive, so it does not match the `X-RateLimit-*` family
+            // Bitbucket documents, nor GitHub's `x-ratelimit-reset`. Adding those spellings here
+            // would be a behaviour change for Bitbucket, not a cleanup.
+            //
+            // A non-positive reset reads as absent rather than as "retry now" — see
+            // {@link usableResetMs}.
             const resetMs = usableResetMs(res.headers.get('ratelimit-reset'));
             const rateLimitFallback = resetMs ?? rateLimitFallbackMs(attempt);
             if (attempt < policy.retries.rateLimit) {

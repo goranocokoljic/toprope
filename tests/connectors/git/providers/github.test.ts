@@ -1746,6 +1746,87 @@ describe('GitHubProvider', () => {
             expect(delays.every((d) => d <= 3_600_000)).toBe(true);
         });
 
+        it('skips the pre-emptive rate-limit pause when the reset has ALREADY elapsed', async () => {
+            // #284. `parseEpochResetMs` floors an elapsed reset at 0, so this branch used to
+            // sleep `rateLimitDelayMs(null, 0 + 1_000)` — MIN_RATE_LIMIT_DELAY_MS, a full second,
+            // AFTER a successful 200 and with nothing left to wait out. On the per-commit
+            // detail/diffstat fan-out that is a 1-second tax on an O(commits) population, inside
+            // the same run wall clock #283 exists to bound. `usableResetMs` reports it unusable
+            // and the pause is skipped entirely.
+            vi.useFakeTimers();
+            vi.setSystemTime(new Date('2026-07-28T10:00:00.000Z'));
+            const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+            const elapsed = Math.floor(Date.parse('2026-07-28T09:59:00.000Z') / 1_000);
+            vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+                ok: true,
+                status: 200,
+                headers: new Headers({
+                    'x-ratelimit-remaining': '3',
+                    'x-ratelimit-reset': String(elapsed),
+                }),
+                json: () => Promise.resolve([]),
+                text: () => Promise.resolve(''),
+            } as unknown as Response));
+
+            const listPromise = provider.listRepos();
+            await vi.runAllTimersAsync();
+            await listPromise;
+
+            // Only the per-request timeout should have been armed — no pause at all. The sibling
+            // case above is the positive control that this branch still fires on a USABLE reset,
+            // so a green here cannot mean "the pre-emptive pause was deleted".
+            const delays = setTimeoutSpy.mock.calls.map((c) => Number(c[1]));
+            expect(delays).not.toContain(1_000);
+            expect(delays.every((d) => d === GIT_REQUEST_TIMEOUT_MS)).toBe(true);
+        });
+
+        it('waits out a 429 to the x-ratelimit-reset instant, not the blind 60s guess', async () => {
+            // #284. GitHub signals the PRIMARY limit as 403 *or* 429, and on a 429 the reset is
+            // the only header that says when the wall comes down — `Retry-After` is what it sends
+            // for the SECONDARY limit. This branch used to read no reset at all and guess
+            // 60s/120s/180s, i.e. four requests inside six minutes into a window that can be most
+            // of an hour; a 429 is deliberately not repo-retryable, so that failed the repo and
+            // #231 discarded the run.
+            vi.useFakeTimers();
+            vi.setSystemTime(new Date('2026-07-28T10:00:00.000Z'));
+            const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+            const resetEpoch = Math.floor(Date.parse('2026-07-28T10:50:00.000Z') / 1_000);
+            let calls = 0;
+            vi.stubGlobal('fetch', vi.fn().mockImplementation(() => {
+                calls++;
+                if (calls === 1) {
+                    return Promise.resolve({
+                        ok: false,
+                        status: 429,
+                        headers: new Headers({
+                            'x-ratelimit-remaining': '0',
+                            'x-ratelimit-reset': String(resetEpoch),
+                        }),
+                        json: () => Promise.resolve({}),
+                        text: () => Promise.resolve('rate limited'),
+                    } as unknown as Response);
+                }
+                return Promise.resolve({
+                    ok: true,
+                    status: 200,
+                    headers: new Headers(),
+                    json: () => Promise.resolve([]),
+                    text: () => Promise.resolve(''),
+                } as unknown as Response);
+            }));
+
+            const listPromise = provider.listRepos();
+            await vi.runAllTimersAsync();
+            await expect(listPromise).resolves.toEqual([]);
+
+            const delays = setTimeoutSpy.mock.calls.map((c) => Number(c[1]));
+            // 50 minutes to the advertised reset — NOT `rateLimitFallbackMs(0)`, which is the
+            // 60s guess this branch used to take while the wall stayed up for another 49.
+            expect(delays).toContain(3_000_000);
+            expect(delays).not.toContain(60_000);
+            expect(calls).toBe(2);
+        });
+
         it('skips the pre-emptive rate-limit pause for an interactive client (#283)', async () => {
             // The third hour-long sleep, and the one a retry-count override alone would have
             // missed: this fires after a 200, so it is neither a retry nor a failure. The

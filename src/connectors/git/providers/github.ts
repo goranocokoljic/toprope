@@ -98,15 +98,13 @@ function globMatch(pattern: string, str: string): boolean {
  * into the shared loop would mean adding hooks for cases only one caller reaches.
  *
  * THE COST OF THAT, stated here rather than left to be discovered: the transport-fault catch, the
- * 5xx branch and the `!res.ok` throw below restate the same policy as {@link fetchWithGitRetry},
- * so a change to any of them must be made in both places. This file is the copy that gets
- * forgotten — it already was once (#284 review cycle 1 fixed the shared loop's reset handling and
- * left this one behind, which is why `usableResetMs` is now a shared helper rather than a guard
- * written inline).
+ * 429 branch, the 5xx branch and the `!res.ok` throw below all restate the same policy as
+ * {@link fetchWithGitRetry}, so a change to any of them must be made in both places. This file is
+ * the copy that gets forgotten, which is why the reset rule the 429 and 403 branches share with
+ * the other loop lives in one place — {@link usableResetMs} — rather than inline at each site.
  *
- * The 429 branch is NOT branch-for-branch identical, and this is the sentence that says so: the
- * shared loop reads a `ratelimit-reset` header here that GitHub's 429 does not, because GitHub
- * carries its reset on the 403 primary-limit branch below instead.
+ * The only genuine divergence is the header NAME: GitHub spells its reset `x-ratelimit-reset`,
+ * GitLab the un-prefixed `ratelimit-reset`. The 403 branch below is the real extra surface.
  *
  * WHAT GUARDS THIS, precisely — `tests/connectors/git/providers/request-policy.test.ts` is
  * `describe.each` over all three provider types, so it catches a change to branch PRESENCE,
@@ -172,10 +170,22 @@ async function fetchGitHub(
         }
 
         if (res.status === 429) {
+            // GitHub signals the PRIMARY rate limit as either 403 or 429, and on a 429 the reset
+            // instant is the only thing that says when the wall comes down — `Retry-After` is a
+            // delta GitHub sends for the secondary/abuse limit, not for this one. Reading it
+            // here rather than guessing 60s/120s/180s into a window that can be most of an hour:
+            // four requests inside six minutes, then `Rate limit exceeded after 3 retries`, is a
+            // repo failure the run cannot recover from (a 429 is not repo-retryable, by design —
+            // see `isRetryableGitFetchError`), so #231 discards the run and holds the cursor.
+            // `Retry-After` still wins where present, exactly as in the shared loop.
+            const resetMs = usableResetMs(res.headers.get('x-ratelimit-reset'));
             if (attempt < policy.retries.rateLimit) {
                 await sleepWithinRun(
                     policy,
-                    rateLimitDelayMs(res.headers.get('retry-after'), rateLimitFallbackMs(attempt)),
+                    rateLimitDelayMs(
+                        res.headers.get('retry-after'),
+                        resetMs ?? rateLimitFallbackMs(attempt),
+                    ),
                     url,
                 );
                 attempt++;
@@ -190,16 +200,11 @@ async function fetchGitHub(
         if (res.status === 403) {
             const remaining = res.headers.get('x-ratelimit-remaining');
             const resetHeader = res.headers.get('x-ratelimit-reset');
-            // TWO questions about ONE header, deliberately answered by two different reads
-            // (#284 review cycle 2):
-            //   - CLASSIFICATION — `resetMs !== null` decides whether this 403 is the primary
-            //     rate limit at all, i.e. "was the header present and readable". It must stay
-            //     `parseEpochResetMs`: an elapsed reset is still proof this is a primary limit,
-            //     and demoting it to the secondary branch would drop the retry entirely.
-            //   - DELAY — how long to actually wait, which an elapsed reset cannot answer. See
-            //     `usableResetMs`; `0 + 1_000` clamps to MIN_RATE_LIMIT_DELAY_MS and spends the
-            //     whole budget on three 1-second retries into an active primary limit, which on
-            //     GitHub escalates to a token-wide abuse block.
+            // TWO questions about ONE header, and only this site asks both. CLASSIFICATION —
+            // "was the header there at all", which decides whether this 403 is the primary limit
+            // — must stay `parseEpochResetMs`, because an elapsed reset is still proof of a
+            // primary limit and demoting it to the secondary branch would drop the retry
+            // entirely. DELAY is the different question `usableResetMs` answers (#284).
             const resetMs = parseEpochResetMs(resetHeader);
             const schedulableResetMs = usableResetMs(resetHeader);
             const retryAfter403 = res.headers.get('retry-after');
@@ -267,10 +272,9 @@ async function fetchGitHub(
         // sleep to the reset instant here, up to MAX_RATE_LIMIT_DELAY_MS, inside the one
         // request a human is waiting on. A caller that has forbidden waiting out a rate limit
         // has equally forbidden waiting to avoid one.
-        // `usableResetMs` here, unlike the 403 branch above: this pause has no classification
-        // job — there is no failure to categorize, only a reset to wait for — so an elapsed
-        // reset simply means there is nothing left to wait out, and skipping the pause is the
-        // correct answer rather than a 1-second sleep (#284 review cycle 2).
+        // `usableResetMs` and nothing else here, unlike the 403 branch: this pause has no
+        // classification job, so an elapsed reset just means there is nothing left to wait out
+        // and skipping is the right answer (#284).
         const remaining = res.headers.get('x-ratelimit-remaining');
         const resetMs = usableResetMs(res.headers.get('x-ratelimit-reset'));
         if (

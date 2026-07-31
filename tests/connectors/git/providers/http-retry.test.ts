@@ -723,7 +723,7 @@ describe('fetchWithGitRetry (#284)', () => {
         expect(timer.mock.calls.map((c) => Number(c[1]))).toContain(30_000);
     });
 
-    it('falls back to the 60s/120s guess on a 429 carrying NO rate-limit headers', async () => {
+    it('escalates the rate-limit fallback on a 429 carrying NO headers (60s ... 180s rungs)', async () => {
         // THE neutrality case — acceptance criterion (3), and the one branch the collapse
         // actually routed through new code for Bitbucket. Every pre-#284 Bitbucket 429 test
         // supplies `retry-after`, and `rateLimitDelayMs` prefers an advertised value over the

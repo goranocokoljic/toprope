@@ -140,7 +140,7 @@ describe.each(CASES)('$type request policy (#283)', ({type, config, serverErrorM
     });
 
     describe('rate-limit fallback schedule', () => {
-        it('escalates 60s/120s/180s on a 429 carrying NO rate-limit headers', async () => {
+        it('escalates the rate-limit fallback on a 429 carrying NO headers (60s ... 180s rungs)', async () => {
             // The case #284 review cycle 2 added to make this table's guarantee true for the
             // backoff SCHEDULE, not just for branch presence and retry counts. Every other
             // 429/403 fixture here supplies `retry-after` or a future reset, and
