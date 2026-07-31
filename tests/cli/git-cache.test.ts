@@ -181,16 +181,50 @@ describe('toprope git cache clear (#286)', () => {
             expect(countDiffstats(db).rows).toBe(4);
         });
 
-        it('does not let a null --repo fall through into a table-wide purge', () => {
-            // `input.repo?.trim()` maps null to undefined, which passes an `!== undefined`
-            // guard and then fails `=== ''` — leaving the repo term UNSET, and an unset term
-            // widens. A one-repo command silently becoming a whole-table purge is the one
-            // failure mode a refusal path must not have. Not reachable from Commander, which
-            // is exactly why nothing else would catch it.
-            const result = clearDiffstatCache(db, {repo: null as unknown as string});
-            expect(result.ok).toBe(false);
-            expect(result.removed).toBe(0);
+        it('refuses a null/blank scope term PAIRED with another flag, instead of widening to it', () => {
+            // The shape that actually bites, and the one an earlier revision got wrong. A bare
+            // `{repo: null}` is caught by the --all gate no matter how the repo term behaves,
+            // so asserting only that shape cannot fail on the defect it names. Paired with
+            // another flag the scope is non-empty, --all never fires, and a dropped term
+            // silently promotes a one-repo command into a provider-wide purge — the one
+            // failure mode a refusal path must not have. Not reachable from Commander (a
+            // `--repo <name>` option is `string | undefined`), which is exactly why nothing
+            // else would catch it; `clearDiffstatCache` is exported as the boundary, and a
+            // JSON body `{"repo": null}` is the natural shape of the next consumer.
+            // `undefined` is excluded deliberately: it is the only value that legitimately
+            // means "flag not given", so it widens by design rather than being refused.
+            for (const blank of [null, '', '   ']) {
+                const repoResult = clearDiffstatCache(db, {
+                    provider: 'bitbucket',
+                    repo: blank as unknown as string,
+                });
+                expect(repoResult.ok).toBe(false);
+                expect(repoResult.removed).toBe(0);
+                expect(repoResult.message).toBe('--repo must not be empty');
+
+                const containerResult = clearDiffstatCache(db, {
+                    provider: 'bitbucket',
+                    container: blank as unknown as string,
+                });
+                expect(containerResult.ok).toBe(false);
+                expect(containerResult.removed).toBe(0);
+                expect(containerResult.message).toBe('--container must not be empty');
+            }
+            // Nothing was touched by any of them — the assertion the widening bug fails.
             expect(countDiffstats(db).rows).toBe(4);
+        });
+
+        it('reports a refusal rather than throwing AFTER the delete has committed', () => {
+            // The second half of the same defect: the outcome message used to re-derive
+            // `input.repo.trim()`, which throws on a null — and it runs after the transaction
+            // commits, so the CLI's catch printed "Nothing was removed" over a purge that had
+            // removed the provider's entire cache. The message must describe the scope the
+            // DELETE actually ran with, so there is nothing left to re-derive.
+            expect(() =>
+                clearDiffstatCache(db, {provider: 'bitbucket', repo: null as unknown as string}),
+            ).not.toThrow();
+            expect(countDiffstats(db).rows).toBe(4);
+            expect(countDiffstats(db, {provider: 'bitbucket'}).rows).toBe(3);
         });
 
         it('trims a non-blank --repo to match what the write path stored', () => {

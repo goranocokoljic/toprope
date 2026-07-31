@@ -429,7 +429,15 @@ function scopeClause(scope: DiffstatScope): {where: string; params: string[]} {
     }
     if (scope.repo !== undefined) {
         conditions.push('repo = ?');
-        params.push(scope.repo);
+        // Trimmed here, alongside the container's normalization, so the builder is total over
+        // its own input rather than relying on each caller to canonicalize first. Trim only,
+        // never casefold: repo identifiers are case-sensitive on all three providers and are
+        // stored exactly as the fetch path spells them, so folding would both miss the rows
+        // meant and reach rows that were not. Owning both columns' rules in one place is the
+        // point — until #286 the container was canonicalized here and the repo only in the
+        // CLI, so `deleteDiffstats(db, {repo: ' api '})` silently matched nothing for every
+        // other caller while the sibling column was forgiving.
+        params.push(scope.repo.trim());
     }
     return {where: conditions.length > 0 ? ` WHERE ${conditions.join(' AND ')}` : '', params};
 }

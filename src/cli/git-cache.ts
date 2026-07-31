@@ -4,8 +4,7 @@ import {
     deleteDiffstats,
     type DiffstatScope,
 } from '../connectors/git/diffstat-cache';
-import {normalizeContainer} from '../connectors/git/providers/container';
-import {GIT_PROVIDER_TYPES} from '../connectors/git/providers/types';
+import {parseContainer, parseProviderType} from './git-args';
 
 /**
  * `toprope git cache clear` — the operator surface for the per-commit diffstat cache (#286).
@@ -53,12 +52,18 @@ export interface ClearDiffstatCacheResult {
     removed: number;
 }
 
-/** Human-readable rendering of what a scope covers, for the outcome message. */
-function describeScope(input: ClearDiffstatCacheInput, container: string): string {
-    const parts: string[] = [];
-    if (input.provider !== undefined) parts.push(`provider=${input.provider}`);
-    if (input.container !== undefined) parts.push(`container=${container}`);
-    if (input.repo !== undefined) parts.push(`repo=${input.repo.trim()}`);
+/**
+ * Human-readable rendering of what a scope covers, for the outcome message.
+ *
+ * Takes the BUILT scope, not the raw input: the operator must be shown the terms the DELETE
+ * actually ran with, and re-deriving them here would be a third copy of the canonicalization
+ * rules (the CLI trims `--repo`, `normalizeContainer` casefolds `--container`) that drifts the
+ * moment either changes. It also removes a whole class of hazard structurally — this function
+ * runs AFTER the transaction commits, so anything it can throw on turns a completed purge into
+ * a caught error the CLI reports as "Nothing was removed".
+ */
+function describeScope(scope: DiffstatScope): string {
+    const parts = Object.entries(scope).map(([column, value]) => `${column}=${value}`);
     return parts.length > 0 ? parts.join(' ') : 'the ENTIRE cache (no scope given)';
 }
 
@@ -80,45 +85,37 @@ export function clearDiffstatCache(
 ): ClearDiffstatCacheResult {
     const scope: DiffstatScope = {};
 
+    // Both terms go through the shared `./git-args` parsers — the same allowlist and the same
+    // canonicalization `git set-history-floor` applies, so the two commands cannot drift on
+    // what a valid provider is called or on which container a spelling resolves to.
     if (input.provider !== undefined) {
-        // Runtime allowlist, not the compile-time union: the value arrives as an arbitrary
-        // CLI string. An unrecognized one matches no row, and "0 rows removed" would read as
-        // a fact about the cache ("nothing was there") rather than as the typo it is.
-        const providerType = GIT_PROVIDER_TYPES.find((t) => t === input.provider);
-        if (!providerType) {
-            return {
-                ok: false,
-                removed: 0,
-                message: `unknown provider type: ${input.provider} (expected one of: ${GIT_PROVIDER_TYPES.join(', ')})`,
-            };
-        }
-        scope.provider = providerType;
+        const provider = parseProviderType(input.provider);
+        if (!provider.ok) return {ok: false, removed: 0, message: provider.message};
+        scope.provider = provider.value;
     }
 
-    // Normalized through the SHARED helper, which is what the write boundary uses, so the
-    // value compared is the value persisted (the graduated #255 rule): `--container " ACME "`
-    // must reach the rows stored under `acme`, not silently match nothing.
-    const container = normalizeContainer(input.container);
     if (input.container !== undefined) {
-        if (container === '') {
-            return {ok: false, removed: 0, message: '--container must not be empty'};
-        }
-        scope.container = container;
+        const container = parseContainer(input.container);
+        if (!container.ok) return {ok: false, removed: 0, message: container.message};
+        scope.container = container.value;
     }
 
     // Repo is trimmed but NOT casefolded — repo identifiers are case-sensitive on all three
     // providers and are stored exactly as the provider's fetch path spells them, so folding
     // here would both miss the rows meant and reach rows that were not.
     //
-    // Gated on `typeof === 'string'`, not on `!== undefined`: `?.trim()` maps a `null` to
-    // `undefined`, which passes an `!== undefined` guard and then fails `=== ''`, leaving
-    // `scope.repo` unset — and an unset member WIDENS. A one-repo command silently becoming
-    // a table-wide purge is the one failure mode a refusal path must not have. The container
-    // branch above is immune to the same input only by accident (`normalizeContainer(null)`
-    // is `''`), so this is the guard that makes both total rather than one lucky.
-    const repo = typeof input.repo === 'string' ? input.repo.trim() : undefined;
-    if (input.repo !== undefined && input.repo !== null) {
-        if (repo === '' || repo === undefined) {
+    // Entered on `!== undefined` so that EVERY non-undefined value reaches the refusal, and a
+    // non-string normalizes to '' rather than to `undefined`. An earlier revision gated the
+    // branch on `!== null` as well, which skipped it entirely for a `null` — leaving
+    // `scope.repo` unset, and an unset member WIDENS. A one-repo command silently becoming a
+    // provider-wide purge is the one failure mode a refusal path must not have, and it is only
+    // the bare `{repo: null}` case that the --all gate below happened to catch: paired with any
+    // other flag the scope was non-empty and the widened DELETE ran. The container branch above
+    // is total over the same input only by accident (`normalizeContainer(null)` is `''`); this
+    // makes both total by construction rather than one lucky.
+    if (input.repo !== undefined) {
+        const repo = typeof input.repo === 'string' ? input.repo.trim() : '';
+        if (repo === '') {
             return {ok: false, removed: 0, message: '--repo must not be empty'};
         }
         scope.repo = repo;
@@ -149,7 +146,7 @@ export function clearDiffstatCache(
         before: countDiffstats(db, scope),
         removed: deleteDiffstats(db, scope),
     }))();
-    const description = describeScope(input, container);
+    const description = describeScope(scope);
 
     if (removed === 0) {
         // Say what was searched and why nothing matched, rather than reporting an empty scope
