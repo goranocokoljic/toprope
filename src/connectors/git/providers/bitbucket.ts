@@ -16,16 +16,7 @@ import type {
 import {normalizeContainer} from './container.js';
 import {loadDiffstats, resolveCommitDiffstat} from './diffstat.js';
 import type {GitRequestPolicy} from './http-retry.js';
-import {
-    GitProviderFetchError,
-    SYNC_REQUEST_POLICY,
-    assertRunTimeRemaining,
-    rateLimitDelayMs,
-    rateLimitFallbackMs,
-    requestTimeout,
-    serverErrorDelayMs,
-    sleepWithinRun,
-} from './http-retry.js';
+import {SYNC_REQUEST_POLICY, fetchWithGitRetry} from './http-retry.js';
 
 const BASE_URL = 'https://api.bitbucket.org/2.0';
 
@@ -51,93 +42,16 @@ function buildAuthHeader(auth: BitbucketProviderConfig['auth']): string {
     return `Bearer ${auth.token}`;
 }
 
-async function fetchBitbucket(
+/**
+ * Bitbucket's binding of the shared retry loop (#284). The loop itself, and every message
+ * this file's tests assert on, lives in `http-retry.ts`; only the label is ours.
+ */
+function fetchBitbucket(
     url: string,
     headers: Record<string, string>,
-    // The retry budgets and run deadline the CLIENT was built with (#283) — see the identical
-    // parameter on `fetchGitHub` for why this replaced a per-call transient-only override, and
-    // for why it carries no default.
     policy: GitRequestPolicy,
 ): Promise<Response> {
-    let attempt = 0;
-    // Transient faults (5xx, transport) get their OWN, much longer budget than the 429
-    // path — see http-retry.ts. Counted separately so a run does not spend its 5xx
-    // allowance on rate limiting, or vice versa.
-    let transientRetries = 0;
-
-    // `for (;;)`: the two budgets above are counted separately, so no single loop guard can
-    // express both, and every branch below either `continue`s or throws (#272).
-    for (;;) {
-        // Per ATTEMPT, not only before a pause — see `fetchGitHub` (#283).
-        assertRunTimeRemaining(policy, url);
-        let res: Response;
-        // Disarmed in `finally` the moment `fetch` settles — the signal bounds the RESPONSE,
-        // never the body the caller reads afterwards. See GIT_REQUEST_TIMEOUT_MS (#283).
-        const timeout = requestTimeout();
-        try {
-            res = await fetch(url, {headers, signal: timeout.signal});
-        } catch (err) {
-            // A transport fault is the same outage as a 503, seen one layer down — same
-            // budget, same backoff. Wrapped so the in-run repo retry (#272) can classify
-            // it; the message is preserved verbatim. A GIT_REQUEST_TIMEOUT_MS abort lands
-            // here too (#283).
-            // Disarmed BEFORE the minutes-long backoff, not just by the `finally` — see the
-            // identical note in `github.ts` (#283 review).
-            timeout.clear();
-            if (transientRetries < policy.retries.transient) {
-                await sleepWithinRun(policy, serverErrorDelayMs(transientRetries, null), url);
-                transientRetries++;
-                continue;
-            }
-            throw new GitProviderFetchError(
-                err instanceof Error ? err.message : String(err),
-                null,
-                {cause: err},
-            );
-        } finally {
-            // Idempotent, so clearing twice is safe; this stays the one guarantee no path
-            // leaves a signal armed over an unread body.
-            timeout.clear();
-        }
-
-        if (res.status === 429) {
-            if (attempt < policy.retries.rateLimit) {
-                await sleepWithinRun(
-                    policy,
-                    rateLimitDelayMs(res.headers.get('retry-after'), rateLimitFallbackMs(attempt)),
-                    url,
-                );
-                attempt++;
-                continue;
-            }
-            throw new GitProviderFetchError(
-                `Rate limit exceeded after ${policy.retries.rateLimit} retries: ${url}`,
-                429,
-            );
-        }
-
-        if (res.status >= 500) {
-            if (transientRetries < policy.retries.transient) {
-                await sleepWithinRun(
-                    policy,
-                    serverErrorDelayMs(transientRetries, res.headers.get('retry-after')),
-                    url,
-                );
-                transientRetries++;
-                continue;
-            }
-            throw new GitProviderFetchError(
-                `Bitbucket API server error ${res.status}: ${url}`,
-                res.status,
-            );
-        }
-
-        if (!res.ok) {
-            throw new GitProviderFetchError(`Bitbucket API error ${res.status}: ${url}`, res.status);
-        }
-
-        return res;
-    }
+    return fetchWithGitRetry(url, headers, 'Bitbucket', policy);
 }
 
 // --- Raw API shapes ---

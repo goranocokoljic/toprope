@@ -8,16 +8,11 @@
  * must not advance the cursor — see `ProviderFetchResult.complete`). This module owns the
  * one 5xx policy the three share so they cannot drift apart again.
  *
- * It is a policy + typed-error module, not a `fetchWithRetry` wrapper. That is the right shape
- * for GitHub, whose loop genuinely differs — it alone handles a 403 primary/secondary rate limit
- * and pre-emptively pauses on `x-ratelimit-remaining`. It is a WEAKER argument for the other
- * two: after #272, `fetchBitbucket` and `fetchGitLab` differ only in their message prefix and
- * GitLab's `ratelimit-reset` fallback, so they are near-identical clones of each other and the
- * next policy change has to be made in both (#272 review cycle 2, OR-3). Everything a change
- * could get WRONG — the two budgets, both delay schedules, the header parsing, the typed error —
- * now lives here, which bounds the damage; collapsing the two remaining loop bodies into one
- * `fetchWithGitRetry(url, headers, {label, rateLimitFallback})` is a follow-up worth doing, not
- * something to attempt in the same change that moved the policy.
+ * It is a policy + typed-error module AND — since #284 — the one retry LOOP that Bitbucket and
+ * GitLab share ({@link fetchWithGitRetry}). GitHub keeps its own loop, and that asymmetry is
+ * deliberate rather than unfinished work: `fetchGitHub` alone handles a 403 primary/secondary
+ * rate limit and pre-emptively pauses on `x-ratelimit-remaining`, so absorbing it would mean
+ * adding hooks for branches its two siblings do not have. Do not add them.
  *
  * SCOPE. This is the canonical `Retry-After` / backoff policy for the three GIT PROVIDERS
  * only. The tool connectors (`connectors/copilot`, `claude-code`, `windsurf`, `cursor`,
@@ -262,9 +257,13 @@ export const INTERACTIVE_REQUEST_POLICY: GitRequestPolicy = {
  *   unlikely — it sleeps up to {@link MAX_RATE_LIMIT_DELAY_MS} AFTER a 200 and then returns the
  *   response, so any pause over two minutes would have handed back a destroyed body.
  *
- * Bounding the body read as well would mean reading it inside the retry loop, which is the
- * `fetchWithGitRetry(url, headers)` consolidation tracked in #284. Until then the body read is
- * bounded by undici's own `bodyTimeout` (300 s of inactivity), exactly as it was before #283.
+ * Bounding the body read as well would mean reading it inside the retry loop. #284 collapsed two
+ * of the three loops into {@link fetchWithGitRetry} but deliberately did NOT do that: every call
+ * site is handed a `Response` and consumes it itself — usually `res.json()` plus a paging header,
+ * and `checkAccess` discards it unread — so pulling the read inside would change what all three
+ * loops return and would still leave `fetchGitHub`, which keeps its own loop, outside the bound.
+ * The body read remains bounded by undici's own `bodyTimeout` (300 s of inactivity), exactly as
+ * it was before #283.
  *
  * An abort surfaces to the caller as the ordinary transport fault it is, so it takes the
  * transient budget and the same backoff as a 503 — a stalled socket is the same outage seen
@@ -623,4 +622,130 @@ export function isRetryableGitFetchError(err: unknown): boolean {
     if (!(err instanceof GitProviderFetchError)) return false;
     if (err.status === null) return true;
     return err.status >= 500;
+}
+
+/**
+ * The provider name that opens every message {@link fetchWithGitRetry} throws.
+ *
+ * A closed union rather than a `string`, because these strings are a CONTRACT, not cosmetics:
+ * `toprope doctor` classifies a provider failure by searching the message for ` 404`, and the
+ * provider suites assert on `'GitLab API server error 502'` / `'Bitbucket API error 401'`
+ * verbatim. Two literal call sites is the whole population, so the union costs nothing and a
+ * third provider cannot be added by typo. (No runtime allowlist: this is not a trust boundary —
+ * the value is a module-internal literal, never request-supplied.)
+ */
+export type GitProviderLabel = 'Bitbucket' | 'GitLab';
+
+/**
+ * The one retry loop Bitbucket and GitLab share (#284).
+ *
+ * After #272 moved the policy here, `fetchBitbucket` and `fetchGitLab` were line-for-line
+ * identical — same five branches in the same order, same two independent counters — differing
+ * only in the message prefix and in GitLab reading `ratelimit-reset` on a 429. The second is not
+ * a real difference: Bitbucket does not send that header, so reading it unconditionally yields
+ * `null` and falls through to {@link rateLimitFallbackMs} exactly as before. So the collapse
+ * needs one extra argument, `label`, and no knob.
+ *
+ * `fetchGitHub` is deliberately NOT folded in — see this module's header.
+ *
+ * The two budgets are counted SEPARATELY (`attempt` for rate limits, `transientRetries` for 5xx
+ * and transport faults) so a run cannot spend its 5xx allowance on rate limiting or vice versa;
+ * that is also why the loop is a `for (;;)` rather than a counted one, and why every branch
+ * either `continue`s or throws.
+ */
+export async function fetchWithGitRetry(
+    url: string,
+    headers: Record<string, string>,
+    label: GitProviderLabel,
+    // The retry budgets and run deadline the CLIENT was built with (#283) — see the identical
+    // parameter on `fetchGitHub` for why this replaced a per-call transient-only override, and
+    // for why it carries no default.
+    policy: GitRequestPolicy,
+): Promise<Response> {
+    let attempt = 0;
+    let transientRetries = 0;
+
+    for (;;) {
+        // Per ATTEMPT, not only before a pause — see `fetchGitHub` (#283).
+        assertRunTimeRemaining(policy, url);
+        let res: Response;
+        // Disarmed in `finally` the moment `fetch` settles — the signal bounds the RESPONSE,
+        // never the body the caller reads afterwards. See GIT_REQUEST_TIMEOUT_MS (#283).
+        const timeout = requestTimeout();
+        try {
+            res = await fetch(url, {headers, signal: timeout.signal});
+        } catch (err) {
+            // A transport fault is the same outage as a 503, seen one layer down — same budget,
+            // same backoff. Wrapped so the in-run repo retry (#272) can classify it; the message
+            // is preserved verbatim, WITHOUT the `label` prefix, because it is the transport's
+            // own wording and both providers threw it bare before #284. A
+            // GIT_REQUEST_TIMEOUT_MS abort lands here too (#283).
+            // Disarmed BEFORE the minutes-long backoff, not just by the `finally` — see the
+            // identical note in `github.ts` (#283 review).
+            timeout.clear();
+            if (transientRetries < policy.retries.transient) {
+                await sleepWithinRun(policy, serverErrorDelayMs(transientRetries, null), url);
+                transientRetries++;
+                continue;
+            }
+            throw new GitProviderFetchError(
+                err instanceof Error ? err.message : String(err),
+                null,
+                {cause: err},
+            );
+        } finally {
+            // Idempotent, so clearing twice is safe; this stays the one guarantee no path
+            // leaves a signal armed over an unread body.
+            timeout.clear();
+        }
+
+        if (res.status === 429) {
+            // `RateLimit-Reset` is an absolute EPOCH instant, not a delta like `Retry-After`
+            // (#272). Both were previously fed to the same `parseFloat(…) * 1_000`, so the
+            // reset became ~1.8e12 ms — past setTimeout's 32-bit limit, which Node clamps to
+            // 1 ms. The pause meant to outlast the limit became an instant retry, and GitLab
+            // was hammered while already rate-limiting us. Parsed by kind now. Read for
+            // Bitbucket as well, which simply does not send it: absent → `null` → the same
+            // fallback Bitbucket always used.
+            const resetMs = parseEpochResetMs(res.headers.get('ratelimit-reset'));
+            if (attempt < policy.retries.rateLimit) {
+                await sleepWithinRun(
+                    policy,
+                    rateLimitDelayMs(
+                        res.headers.get('retry-after'),
+                        resetMs ?? rateLimitFallbackMs(attempt),
+                    ),
+                    url,
+                );
+                attempt++;
+                continue;
+            }
+            throw new GitProviderFetchError(
+                `Rate limit exceeded after ${policy.retries.rateLimit} retries: ${url}`,
+                429,
+            );
+        }
+
+        if (res.status >= 500) {
+            if (transientRetries < policy.retries.transient) {
+                await sleepWithinRun(
+                    policy,
+                    serverErrorDelayMs(transientRetries, res.headers.get('retry-after')),
+                    url,
+                );
+                transientRetries++;
+                continue;
+            }
+            throw new GitProviderFetchError(
+                `${label} API server error ${res.status}: ${url}`,
+                res.status,
+            );
+        }
+
+        if (!res.ok) {
+            throw new GitProviderFetchError(`${label} API error ${res.status}: ${url}`, res.status);
+        }
+
+        return res;
+    }
 }
