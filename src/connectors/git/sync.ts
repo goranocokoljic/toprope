@@ -234,14 +234,30 @@ export const COMMITS_DROPPED_PREFIX = 'Commits dropped as unattributable:';
 export const COMMIT_CHURN_UNKNOWN_PREFIX = 'Commit churn not observed:';
 
 /**
- * How many dropped shas the {@link COMMITS_DROPPED_PREFIX} advisory names before falling back
- * to "+N more". Enough to go look one up in the provider's UI; small enough that a systemic
- * shape problem across thousands of commits still produces one readable line.
- *
- * Shared with the {@link COMMIT_CHURN_UNKNOWN_PREFIX} advisory (#288), which samples shas for
- * the identical reason — one constant so the two lines cannot drift to different budgets.
+ * How many shas an advisory names before falling back to "+N more". Enough to go look one up
+ * in the provider's UI; small enough that a systemic shape problem across thousands of commits
+ * still produces one readable line.
  */
 const DROPPED_COMMIT_SAMPLE_SIZE = 5;
+
+/**
+ * The bounded sha sample both commit advisories render — {@link COMMITS_DROPPED_PREFIX} per
+ * reason group, {@link COMMIT_CHURN_UNKNOWN_PREFIX} per repo (#288).
+ *
+ * ONE renderer, not two, so "the two lines cannot drift to different budgets" is structurally
+ * true rather than a promise a shared constant only half keeps: the cap, the join and the
+ * `(+N more)` tail are the whole of what an operator reads as the sample, and a second copy
+ * could diverge on any of them while both still sliced at the same number.
+ *
+ * Takes ALREADY-SANITIZED shas: the allowlist belongs at the boundary that knows the value is
+ * a sha, and folding it in here would make it easy for a future caller to pass some other
+ * untrusted field and have it silently rendered as `<invalid sha>` instead of rejected.
+ */
+function formatShaSample(shas: readonly string[]): string {
+    const sample = shas.slice(0, DROPPED_COMMIT_SAMPLE_SIZE);
+    const more = shas.length - sample.length;
+    return `${sample.join(', ')}${more > 0 ? ` (+${more} more)` : ''}`;
+}
 
 /**
  * A sha, safe to interpolate into an operator-facing line.
@@ -295,7 +311,9 @@ function sanitizeDropReason(reason: unknown): string {
  */
 function permanentSpanRepair(): string {
     return (
-        'raw_author_daily has no recompute path. Whatever you do, do NOT simply purge this ' +
+        'At most, though — a commit whose author resolves to no registered developer produced ' +
+        'no row to understate. raw_author_daily has no recompute path. Whatever you do, do ' +
+        'NOT simply purge this ' +
         "provider's cursors and re-sync: that re-imports over the surviving rows and " +
         'permanently DOUBLES every commit metric in the span (#262), which is strictly worse ' +
         'than the understatement. For a provider registered in the admin UI the repair is to ' +
@@ -2466,14 +2484,9 @@ async function fetchProviderData(
         }
         // The SAMPLE cap is per reason group, so a systemic drop of one class cannot crowd the
         // other class out of the line entirely.
-        const groups = [...byReason].map(([reason, shas]) => {
-            const sample = shas.slice(0, DROPPED_COMMIT_SAMPLE_SIZE);
-            const more = shas.length - sample.length;
-            return (
-                `${shas.length} because ${reason} — e.g. ${sample.join(', ')}` +
-                `${more > 0 ? ` (+${more} more)` : ''}`
-            );
-        });
+        const groups = [...byReason].map(
+            ([reason, shas]) => `${shas.length} because ${reason} — e.g. ${formatShaSample(shas)}`,
+        );
         return (
             `${COMMITS_DROPPED_PREFIX} [${providerType}/${droppedRepo}] ${drops.length} ` +
             `commit(s) the provider listed could not be imported, and this run has recorded ` +
@@ -2485,28 +2498,40 @@ async function fetchProviderData(
 
     // FORMATTED here, EMITTED by the caller, on the same gate and for the same reason as the
     // drop advisories directly above (#288). One line per affected repo with a count and a
-    // bounded sha sample, grouped under the reason — the same shape, because an operator
-    // reading both in one `errors` list should not have to learn two layouts.
+    // bounded sha sample — the same shape, because an operator reading both in one `errors`
+    // list should not have to learn two layouts.
+    //
     // NO per-reason grouping, unlike the drop advisory above. That map exists there because two
     // drop reasons with DIFFERENT operator next-steps can appear in one repo; there is exactly
     // one way to fail to observe churn, so a map here would always yield one group and the
     // generality would be for a case that cannot occur.
+    //
+    // WHICH METRICS IT NAMES IS A CLAIM ABOUT THE CODE, not reassurance — the operator sizes a
+    // DESTRUCTIVE repair against this sentence, so an over-broad "unaffected" is worse than
+    // saying nothing (#288 review cycles 1 and 2). Verified against the analyzer rather than
+    // copied from the sibling #280 line, whose scoping is correct there and wrong here because
+    // there the line counts are known and only the file list is missing:
+    //   - `commits` counts rows, and PR metrics come from a different fetch: genuinely
+    //     unaffected.
+    //   - `avg_commit_size` divides total lines by commit count: the commit is in the
+    //     denominator with a zero numerator, so it is dragged down whatever else the body had.
+    //   - `ai_signature_score` is UNCONDITIONAL too, which is the correction: three of its five
+    //     signals gate on `additions`/`deletions` (`ai-signature.ts` signals 1, 3 and 4), so a
+    //     zero-churn commit cannot score them even when `files` arrived intact, and the day's
+    //     score is a MEAN over commits.
+    //   - `files_changed` and `code_churn_rate` read only `fileDiffs`, so those two — and only
+    //     those two — are conditional on the response having also omitted the file list.
     const churnUnknownAdvisories = degradedByRepo.map(({repo: degradedRepo, shas}) => {
-        const named = shas.map(sanitizeSha);
-        const sample = named.slice(0, DROPPED_COMMIT_SAMPLE_SIZE);
-        const more = named.length - sample.length;
         return (
             `${COMMIT_CHURN_UNKNOWN_PREFIX} [${providerType}/${degradedRepo}] ${shas.length} ` +
             'commit(s) were imported with their line counts recorded as zero because the ' +
             'provider never observed them, and this run has recorded its window as covered — ' +
-            'so lines_added and lines_removed on those developer-days are PERMANENTLY short by ' +
-            'whatever those commits changed (at most — a commit whose author resolves to no ' +
-            'registered developer produced no row to understate). Commit counts and PR metrics ' +
-            'are unaffected; avg_commit_size is dragged toward zero. Where the same response ' +
-            'also carried no file list — the usual shape — files_changed, code_churn_rate and ' +
-            'ai_signature_score on those days are understated too. No diffstat was memoized, ' +
-            `so a re-import gets a fresh answer. ${permanentSpanRepair()}. ` +
-            `Affected: ${sample.join(', ')}${more > 0 ? ` (+${more} more)` : ''}.`
+            'so lines_added, lines_removed, avg_commit_size and ai_signature_score on those ' +
+            'developer-days are PERMANENTLY wrong by whatever those commits changed. Where the ' +
+            'same response also carried no file list — the usual shape — files_changed and ' +
+            'code_churn_rate are understated too. Commit counts and PR metrics are unaffected. ' +
+            `No diffstat was memoized, so a re-import gets a fresh answer. ${permanentSpanRepair()}. ` +
+            `Affected: ${formatShaSample(shas.map(sanitizeSha))}.`
         );
     });
 
@@ -2569,8 +2594,7 @@ async function fetchProviderData(
                     'commit(s) whose fallback diff request failed are now recorded as covered, ' +
                     'so nothing re-asks them and the understatement of files_changed, ' +
                     'code_churn_rate and ai_signature_score on their developer-days is ' +
-                    'PERMANENT (at most — a commit whose author resolves to no registered ' +
-                    `developer produced no row to understate). ${permanentSpanRepair()} and ` +
+                    `PERMANENT. ${permanentSpanRepair()} and ` +
                     'fix the provider\'s getCommits to supply GitCommit.diffs.',
             );
         }

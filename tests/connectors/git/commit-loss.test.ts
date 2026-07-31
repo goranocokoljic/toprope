@@ -684,8 +684,19 @@ describe('unreturned commits are never silent (#275)', () => {
             expect(churnLine).toContain('the provider never observed them');
             // The advisory must NOT reassure about metrics this same shape understates — the
             // operator sizes a destructive repair against this sentence (#288 review SO-2/SEC-2).
-            expect(churnLine).toContain('files_changed, code_churn_rate and ai_signature_score');
-            expect(churnLine).not.toMatch(/files_changed[^.]*are unaffected/);
+            // ai_signature_score is UNCONDITIONAL (three of its five signals gate on the line
+            // counts), so it must not sit in the file-list-conditional clause; files_changed and
+            // code_churn_rate must (#288 review cycle 2, SO-2).
+            expect(churnLine).toContain('avg_commit_size and ai_signature_score');
+            expect(churnLine).toContain('files_changed and code_churn_rate are understated too');
+            expect(churnLine).not.toMatch(/files_changed[^.]*(are|is) unaffected/);
+            // The REMEDY half, which is the part that stops an operator doing something
+            // strictly worse than the damage. Deleting `permanentSpanRepair()` from this line
+            // left the whole suite green (#288 review cycle 2, TST-2).
+            expect(churnLine).toContain('do NOT simply purge');
+            expect(churnLine).toContain('delete cascade');
+            expect(churnLine).toContain('sync older history');
+            expect(churnLine).toContain('CONFIG-FILE provider cannot be deleted');
             // A healthy commit is not named — an operator cannot act on a line listing the repo.
             expect(churnLine).not.toContain('bbb222');
             // 4. The cursor advances: re-fetching returns the identical body.
@@ -839,8 +850,15 @@ describe('unreturned commits are never silent (#275)', () => {
             // `absent: true` to stop the re-fetch would keep every not-called assertion green
             // and silently make the loss permanent.
             //
-            // Run 1's detail is stats-less; run 2's carries real stats. Run 2 is a BACKFILL over
-            // the same day, which is the real path that re-asks an already-covered window.
+            // Run 1's detail is stats-less; run 2's carries real stats.
+            //
+            // Run 2 drives `syncProviders` with an overlapping backfill window DIRECTLY, which is
+            // a MECHANISM PROBE and emphatically NOT the supported repair — the admin route only
+            // ever builds a strictly-older, disjoint slice, and re-importing an overlapping span
+            // is exactly what `permanentSpanRepair()` tells an operator never to do. It is used
+            // here because it is the cheapest way to make a second fetch of the same sha happen;
+            // the double-counted commit total it leaves behind is asserted below rather than
+            // hidden, so nobody reads this test as licensing the action.
             seedAlice(db);
             let attempt = 0;
             stubGitHub([listRow('aaa111')], {
@@ -860,11 +878,18 @@ describe('unreturned commits are never silent (#275)', () => {
             await vi.runAllTimersAsync();
             const second = await pending;
 
-            // Run 2 re-asked the endpoint — no memo short-circuited it — and got real stats, so
-            // the churn lands and the advisory is gone.
+            // Run 2 re-asked the endpoint — no memo short-circuited it. THIS is the assertion
+            // that pins the mechanism: a refactor that memoized the degraded commit (as
+            // `absent: true`, say, to "save" the re-fetch) would serve the memo here, skip the
+            // detail request, and leave the count at 0.
+            expect(memoCount(db)).toBe(1);
+            // The fresh answer arrived and the advisory is gone…
             expect(churnLineOf(second.errors)).toBeUndefined();
             expect(dayLines(db)?.added).toBe(40);
-            expect(memoCount(db)).toBe(1);
+            // …and the price of getting it this way, stated rather than hidden: the overlapping
+            // re-import ADDED a second commit for one real commit (#262). That is why the
+            // supported repair retracts the span first.
+            expect(dayCommits(db)).toBe(2);
         });
 
         it('counts each unobserved commit ONCE even when an in-run retry re-pages the window', async () => {

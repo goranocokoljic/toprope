@@ -18,7 +18,7 @@ import type {
 import {NO_AUTHOR_DATE_DROP_REASON, UNATTRIBUTABLE_DATE_DROP_REASON} from './types.js';
 import {isUtcDay} from '../../../aggregation/dates.js';
 import {normalizeContainer} from './container.js';
-import {loadDiffstats} from './diffstat.js';
+import {isCommitCount, loadDiffstats} from './diffstat.js';
 import type {GitRequestPolicy} from './http-retry.js';
 import {
     GitProviderFetchError,
@@ -615,19 +615,28 @@ export class GitHubProvider implements GitProvider {
                 // direction: an unrecognized shape becomes "unknown churn", which is re-askable
                 // and reported, rather than a permanent silent zero.
                 //
-                // `Number.isInteger`, not `typeof === 'number'`: it subsumes the type test and
-                // rejects `NaN`/`Infinity`/fractions, and it is the SAME predicate
-                // `raw_author_daily` validates against one frame down. A float that passed here
-                // would throw there — inside the run's single all-providers write transaction,
-                // rolling back every provider's window. Caught here it costs one advisory line.
+                // `isCommitCount`, the SHARED predicate, not a local `Number.isInteger`. The two
+                // boundaries downstream ask the identical question about this identical value
+                // and both enforce a lower bound: `diffstat-cache.ts` refuses to persist a row
+                // whose counts are not counts (silently, and deliberately not as a fault), and
+                // `raw-author-daily.ts` THROWS on one, inside the run's single all-providers
+                // write transaction — rolling back every provider's window, deterministically,
+                // on every later run. A value this line waved through but they refuse would be
+                // reported to the operator as OBSERVED while being invisible on both of their
+                // channels, which is the failure this classification exists to prevent. One
+                // predicate is what makes the classification protect them.
                 const rawStats = detail.stats;
                 const observedStats =
                     rawStats !== undefined &&
                     rawStats !== null &&
-                    Number.isInteger(rawStats.additions) &&
-                    Number.isInteger(rawStats.deletions)
+                    isCommitCount(rawStats.additions) &&
+                    isCommitCount(rawStats.deletions)
                         ? rawStats
                         : null;
+                // The classification itself, named once and read by the memo gate and the
+                // returned row alike — `observedStats !== null` recomputed at each site is two
+                // chances to drift, which is the same argument that put `rawStats` in a local.
+                const churnObserved = observedStats !== null;
                 // NOT summed from `diffs`: GitHub caps `files` at 300 per commit while
                 // `stats` covers the whole commit, so the totals stay authoritative
                 // even where the file list is truncated. Unchanged by #271.
@@ -744,7 +753,10 @@ export class GitHubProvider implements GitProvider {
                 //   otherwise launder that unknown into a fact are stopped: it is not memoized
                 //   (see the `put` gate below) and it is REPORTED, via `churnObserved: false` on
                 //   the returned row, which the sync aggregates into an operator-facing advisory
-                //   naming the affected developer-days. Before #288 it was memoized and silent.
+                //   naming the affected repo, a count and a bounded sample of the affected
+                //   commits. NOT the developer-days themselves — naming an individual's day in a
+                //   line that reaches a shared sync log is exactly what the privacy model
+                //   forbids. Before #288 it was memoized and silent.
                 //
                 //   BOUND, because the guarantee is prospective. Rows already in
                 //   `commit_diffstats` from a pre-#288 run are indistinguishable from an observed
@@ -752,7 +764,7 @@ export class GitHubProvider implements GitProvider {
                 //   code — so an installation that already has them keeps being answered by them.
                 //   `toprope git cache clear` is the operator surface that discards them (#286);
                 //   the memo is of an idempotent remote read, so clearing costs only re-fetching.
-                if (source !== detailCommit && observedStats === null) {
+                if (source !== detailCommit && !churnObserved) {
                     throw new GitProviderFetchError(
                         `GitHub commit detail for ${summary.sha} in ${this.org}/${repo} carried ` +
                             'neither a usable commit object nor stats — malformed response',
@@ -795,7 +807,7 @@ export class GitHubProvider implements GitProvider {
                 // anomaly that must surface, and `fetchGitHub` throws it (#272). No FETCH
                 // failure of any kind reaches this line, which is also why GitHub does not use
                 // the shared `resolveCommitDiffstat` helper the other two providers share.
-                if (observedStats !== null) {
+                if (churnObserved) {
                     this.diffstatCache?.put(repo, summary.sha, {
                         additions,
                         deletions,
@@ -833,7 +845,7 @@ export class GitHubProvider implements GitProvider {
                     // merely not reported. Reached only after the date guard's `continue`, so a
                     // dropped commit structurally cannot carry it — the two reports can never
                     // both fire for one sha.
-                    churnObserved: observedStats !== null,
+                    churnObserved,
                 });
                 // Deliberately NO `catch` (#272, review cycle 3) — every detail failure now
                 // propagates out of `getCommits`. This used to record the error and carry on,

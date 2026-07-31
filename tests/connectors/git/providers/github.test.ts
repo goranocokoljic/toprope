@@ -61,10 +61,15 @@ function makeCommitDetailFixture(
         // different logins and split one author across two `raw_author_daily` identities — and
         // with identical fixtures a regression that read the detail's copy passed every test.
         author: {login: 'detail-alice'},
+        // Deliberately SKEWED from the `files` sum below (35/7, not 40/10). GitHub caps
+        // `files` at 300 per commit while `stats` covers the whole commit, so the totals must
+        // come from `stats` and must never be re-derived from the file list — with the two
+        // agreeing, a regression that summed `files` passed every assertion in this file
+        // (#288 review cycle 2, TST-4).
         stats: {additions: 40, deletions: 10, total: 50},
         files: [
             {filename: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'},
-            {filename: 'src/bar.ts', additions: 10, deletions: 5, status: 'added'},
+            {filename: 'src/bar.ts', additions: 5, deletions: 2, status: 'added'},
         ],
         ...overrides,
     };
@@ -260,7 +265,7 @@ describe('GitHubProvider', () => {
                 // re-request the identical /commits/{sha} URL (#271).
                 diffs: [
                     {path: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'},
-                    {path: 'src/bar.ts', additions: 10, deletions: 5, status: 'added'},
+                    {path: 'src/bar.ts', additions: 5, deletions: 2, status: 'added'},
                 ],
                 // The detail carried real `stats`, so the totals above are an OBSERVATION
                 // rather than zero-by-absence (#288). Asserted here, in the one exhaustive
@@ -330,8 +335,9 @@ describe('GitHubProvider', () => {
 
             expect(commits[0].additions).toBe(9999);
             expect(commits[0].deletions).toBe(8888);
-            // …while the exposed diffs remain just the (partial) file list.
-            expect(commits[0].diffs?.reduce((s, d) => s + d.additions, 0)).toBe(40);
+            // …while the exposed diffs remain just the (partial) file list, which sums to
+            // LESS than the totals — the whole point of not re-deriving them.
+            expect(commits[0].diffs?.reduce((s, d) => s + d.additions, 0)).toBe(35);
         });
 
         it('follows Link header pagination for commit list', async () => {
@@ -835,7 +841,7 @@ describe('GitHubProvider', () => {
                 deletions: 10,
                 entries: [
                     {path: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'},
-                    {path: 'src/bar.ts', additions: 10, deletions: 5, status: 'added'},
+                    {path: 'src/bar.ts', additions: 5, deletions: 2, status: 'added'},
                 ],
                 absent: false,
             });
@@ -942,6 +948,11 @@ describe('GitHubProvider', () => {
             ['non-numeric values', {additions: '40', deletions: '10', total: '50'}],
             ['a NaN total', {additions: Number.NaN, deletions: 0, total: Number.NaN}],
             ['a fractional count', {additions: 4.5, deletions: 0, total: 4.5}],
+            ['a negative count', {additions: -5, deletions: 0, total: -5}],
+            [
+                'a count past the safe-integer ceiling',
+                {additions: Number.MAX_SAFE_INTEGER + 2, deletions: 0, total: 0},
+            ],
         ])('treats stats as UNOBSERVED when the body carries %s', async (_label, stats) => {
             // #288 review cycle 1 (SO-1 / SEC-1 / SEC-3). The guard used to be
             // `stats === undefined`, which recognizes exactly ONE spelling of an absence the
@@ -949,12 +960,23 @@ describe('GitHubProvider', () => {
             // `!== undefined`, so under that guard each one took the memoize branch and wrote a
             // fabricated `0`/`0` into a table with no invalidation — the precise outcome this
             // issue exists to prevent, reintroduced through the spellings the guard did not
-            // enumerate. `'40'` is the sharpest: typed `number` by the unchecked cast, it
-            // string-concatenates through the analyzer's `reduce` and reaches `raw_author_daily`
-            // as a garbage integer; `4.5` throws there, inside the run's write transaction.
+            // enumerate. `'40'` is the sharpest of the shape cases: typed `number` by the
+            // unchecked cast, it string-concatenates through the analyzer's `reduce` and reaches
+            // `raw_author_daily` as a garbage integer; `4.5` throws there, inside the run's
+            // write transaction.
             //
-            // Only a POSITIVE number test rejects all five. Revert the guard to
-            // `=== undefined` and every case here fails; nothing else in the suite does.
+            // The last two are the DOMAIN cases (#288 review cycle 2, SO-1/SEC-1/TST-1), which a
+            // shape-only `Number.isInteger` waved through while calling itself parity with
+            // `raw_author_daily` — which enforces `>= 0`. A negative is the worse of the two: it
+            // would be flagged OBSERVED (so no advisory names it), silently refused by the memo
+            // (`diffstat-cache` drops a non-count without counting a fault), and still summed
+            // into the developer-day, where a net-negative throws inside the write transaction
+            // on every run forever. Above the safe-integer ceiling the value clears every
+            // integrality test and fails at better-sqlite3 bind time instead. Both are why the
+            // predicate is the SHARED `isCommitCount` rather than a local test.
+            //
+            // Revert the guard to `=== undefined`, or drop either bound from `isCommitCount`,
+            // and cases here fail; nothing else in the suite does.
             const put = vi.fn();
             const cache = {load: vi.fn().mockReturnValue(new Map()), put};
             const cachingProvider = new GitHubProvider(CONFIG, {diffstatCache: cache});
@@ -1078,6 +1100,35 @@ describe('GitHubProvider', () => {
                 sha: 'aaa111',
                 reason: NO_AUTHOR_DATE_DROP_REASON,
             });
+        });
+
+        it('leaves a cache HIT unflagged — a warm run must not report every commit', async () => {
+            // #288 review cycle 2, TST-3. The hit path deliberately omits `churnObserved`, and
+            // the comment there makes a load-bearing claim about why ("every row this can hit is
+            // an observation"). The sync filters on `churnObserved === false`, so a hit row that
+            // ever acquired the flag would emit a COMMIT_CHURN_UNKNOWN line for every warm commit
+            // on every warm run — the advisory going loud on healthy data, which is how an
+            // operator learns to ignore it.
+            const cache = {
+                load: vi
+                    .fn()
+                    .mockReturnValue(
+                        new Map([['aaa111', {additions: 5, deletions: 1, entries: [], absent: false}]]),
+                    ),
+                put: vi.fn(),
+            };
+            const cachingProvider = new GitHubProvider(CONFIG, {diffstatCache: cache});
+            const fetchMock = makeFetchMock([{body: [makeCommitListFixture('aaa111')]}]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            const commits = await cachingProvider.getCommits('my-repo', '', '');
+
+            // The memo really was served — one request, no detail fetch — so this is the hit
+            // path and not a silent fall-through to the miss path.
+            expect(fetchMock).toHaveBeenCalledTimes(1);
+            expect(commits[0].additions).toBe(5);
+            // …and the row does not claim the churn went unobserved.
+            expect(commits[0].churnObserved).not.toBe(false);
         });
 
         it('flags and withholds the memo with no cache attached at all', async () => {
@@ -1579,8 +1630,8 @@ describe('GitHubProvider', () => {
             });
             expect(diffs[1]).toEqual({
                 path: 'src/bar.ts',
-                additions: 10,
-                deletions: 5,
+                additions: 5,
+                deletions: 2,
                 status: 'added',
             });
         });

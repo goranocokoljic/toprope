@@ -24,6 +24,34 @@ import {GitProviderFetchError} from './http-retry.js';
 import type {CommitDiffstat, CommitDiffstatCache, GitFileDiff} from './types.js';
 
 /**
+ * Is this value usable as a stored line/file count? A non-negative safe integer (#288).
+ *
+ * THE canonical predicate for the question, shared rather than restated, because three
+ * boundaries ask it about the SAME value — a provider's commit-level total — and they must
+ * not drift:
+ *   - `providers/github.ts` classifies a commit-detail `stats` object as observed or not,
+ *     which decides whether the churn is memoized and whether the developer-day is reported
+ *     as understated;
+ *   - `diffstat-cache.ts` refuses to persist a row whose counts are not counts;
+ *   - `raw-author-daily.ts` THROWS on one, inside the run's single all-providers write
+ *     transaction, which rolls back every provider's window and does so again on every
+ *     later run.
+ * The middle one drops the row silently and deliberately does not count a fault, so a value
+ * the first boundary waves through and the second refuses is invisible on both channels
+ * while still reaching the third. Keeping one predicate is what makes the front boundary's
+ * classification actually protect the back one.
+ *
+ * TOTAL over `unknown`, and non-negative and safe-integer rather than merely integral. The
+ * lower bound is what the two boundaries downstream already enforce. The upper bound is not
+ * decoration either: `Number.isInteger(1e300)` is `true` and clears them both, and the value
+ * then fails at better-sqlite3 bind time — again inside that write transaction, again
+ * deterministically. Rejected here it costs one advisory line instead.
+ */
+export function isCommitCount(value: unknown): value is number {
+    return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
  * Every diffstat already known for `shas` in `repo`, in one batched query.
  *
  * Returns an empty map when no cache was supplied, which is every probe path (`toprope
