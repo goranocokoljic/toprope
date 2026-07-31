@@ -96,6 +96,246 @@ export function rateLimitFallbackMs(attempt: number): number {
  */
 export const PROBE_SERVER_ERROR_RETRIES = 0;
 
+/**
+ * Retries granted to a request out of BOTH budgets — the caller's intent, expressed as
+ * numbers rather than as a boolean the request loops would have to interpret (#283).
+ *
+ * Before this the two halves were asymmetric in a way nothing named: `maxTransientRetries`
+ * was a per-CALL parameter (so {@link PROBE_SERVER_ERROR_RETRIES} could be applied to
+ * `checkAccess`), while the rate-limit budget was the module constant with no override at
+ * all. An interactive probe therefore failed fast on a 503 and still slept up to
+ * `MAX_RATE_LIMIT_RETRIES × MAX_RATE_LIMIT_DELAY_MS` — three hours — inside one HTTP request
+ * a human was waiting on. Both halves live here now so a caller cannot close one and leave
+ * the other open.
+ */
+export interface GitRetryProfile {
+    /** Retries for a 5xx or transport fault. */
+    readonly transient: number;
+    /** Retries for a rate-limited response (429, GitHub's 403 secondary limit). */
+    readonly rateLimit: number;
+}
+
+/**
+ * What a SYNC's data fetch gets: the full budgets this module documents. A single failure
+ * here discards a multi-hour run via #231's cursor hold, so waiting is much cheaper than
+ * failing.
+ */
+export const SYNC_RETRY_PROFILE: GitRetryProfile = {
+    transient: MAX_SERVER_ERROR_RETRIES,
+    rateLimit: MAX_RATE_LIMIT_RETRIES,
+};
+
+/**
+ * What an INTERACTIVE caller gets: no sleeping at all, on either budget.
+ *
+ * Zero on BOTH halves, for the one reason {@link PROBE_SERVER_ERROR_RETRIES} states at
+ * length — the caller is answering "is this reachable right now" inside a single HTTP
+ * request a human (or a browser, or a proxy) is waiting on, and every pause available here
+ * is measured in minutes or hours, not seconds. Three callers take it, and the second and
+ * third are what #283 added:
+ *   - `checkAccess()` — `toprope doctor` and the admin test-connection route;
+ *   - `listRepos()` on `GET /api/admin/git/providers/:id/repos`, the repo-scope picker;
+ *   - `listRepos()` in `toprope doctor`, which enumerates repos to verify configured slugs.
+ *
+ * It also disables GitHub's PRE-EMPTIVE rate-limit pause, which is neither a retry nor a
+ * failure — it fires after a 200 when `x-ratelimit-remaining` is low and sleeps to the reset
+ * instant, up to {@link MAX_RATE_LIMIT_DELAY_MS}. A retry-count override alone would have
+ * left that third hour-long sleep on the interactive path.
+ *
+ * The trade is the same one {@link PROBE_SERVER_ERROR_RETRIES} names: an interactive call
+ * reports a one-off blip as a failure. That is the right answer for a cheap, idempotent,
+ * re-runnable read — and the sync, where a blip costs hours, still gets
+ * {@link SYNC_RETRY_PROFILE}.
+ */
+export const INTERACTIVE_RETRY_PROFILE: GitRetryProfile = {
+    transient: PROBE_SERVER_ERROR_RETRIES,
+    rateLimit: 0,
+};
+
+/**
+ * A wall-clock deadline for one sync RUN, which the request layer consults on the same clock
+ * the repo-level pauses are bounded by (#283).
+ *
+ * WHY A DEADLINE AND NOT A BIGGER BUDGET. Before this, nothing bounded how long a run could
+ * take. `GIT_RUN_RETRY_SLEEP_BUDGET_MS` bounds only the REPO-level pauses; the request layer's
+ * own sleeping was unbounded in aggregate because each request carries its budget
+ * independently, and the per-commit detail/diffstat fetch is an O(commits) population. A host
+ * answering every request `503 Retry-After: 3600` pins each pause to
+ * {@link SERVER_ERROR_MAX_DELAY_MS}, i.e. ~10 minutes PER REQUEST — so run length was a
+ * function of the provider's behaviour, with no ceiling at all.
+ *
+ * WHY IT IS SAFE TO CUT A RUN OFF — this is the part that changed in #273 and makes the
+ * deadline possible now. A cut-off run's window is not fully covered, so #231 holds the
+ * cursor and discards the run's partial snapshots, exactly as any other failure does. But the
+ * per-commit diffstat memo (`commit_diffstats`) is written per commit OUTSIDE the run's write
+ * transaction, so every commit detail the run did fetch is kept. The next run re-pages the
+ * commit lists (O(pages)) and serves the whole fan-out from the memo — so consecutive runs
+ * ratchet forward and one of them finishes. Without that memo a deadline would have been a
+ * brick: a repo too big for the budget would fail identically forever.
+ *
+ * An interface rather than a bare instant so tests can drive it without a fake clock, and so
+ * the sync's `runBudget` can own construction.
+ */
+export interface GitRunDeadline {
+    /** Milliseconds left before the deadline. Zero or negative once it has passed. */
+    remainingMs(): number;
+}
+
+/**
+ * A deadline `budgetMs` from now.
+ *
+ * Range-validated on BOTH bounds rather than trusted, per the graduated rule: a `NaN` or
+ * `Infinity` budget would make every `remainingMs()` comparison false and silently restore the
+ * unbounded behaviour this exists to remove, and a non-positive one would fail every request
+ * before it is issued. Neither is reachable from the in-tree callers (both pass a module
+ * constant), which is precisely why an unchecked mistake here would be invisible.
+ */
+export function createRunDeadline(budgetMs: number): GitRunDeadline {
+    if (!Number.isFinite(budgetMs) || budgetMs <= 0) {
+        throw new Error(`git run deadline budget must be a positive finite number of ms, got ${budgetMs}`);
+    }
+    const at = Date.now() + budgetMs;
+    return {remainingMs: () => at - Date.now()};
+}
+
+/**
+ * The retry budgets and the wall-clock deadline one provider CLIENT was built with.
+ *
+ * Carried on the client rather than passed per call, because it is a property of WHO built it:
+ * the sync pipeline builds one client per provider per run and hands it that run's deadline,
+ * while `doctor` and the admin routes build a throwaway client per request. That also means a
+ * client can never be half-configured — there is no call site that could forget to pass the
+ * interactive budget to `listRepos` the way #283's bullet 4 describes.
+ */
+export interface GitRequestPolicy {
+    readonly retries: GitRetryProfile;
+    /**
+     * Absent on the interactive clients, which are bounded by their zero retry budgets and by
+     * {@link GIT_REQUEST_TIMEOUT_MS} instead. Only a sync run has a wall clock worth naming.
+     */
+    readonly deadline?: GitRunDeadline;
+}
+
+/** The policy every sync fetch takes, unless the caller supplies a run deadline as well. */
+export const SYNC_REQUEST_POLICY: GitRequestPolicy = {retries: SYNC_RETRY_PROFILE};
+
+/** The policy every interactive probe/listing takes — see {@link INTERACTIVE_RETRY_PROFILE}. */
+export const INTERACTIVE_REQUEST_POLICY: GitRequestPolicy = {retries: INTERACTIVE_RETRY_PROFILE};
+
+/**
+ * Ceiling on ONE HTTP request, enforced by an `AbortSignal` handed to `fetch`.
+ *
+ * The gap it closes is not slowness but silence: a socket that connects and then stalls
+ * produces no response and no error, so a request could hang indefinitely and no budget on
+ * this page applied — they all bound RETRIES, which need a completed attempt to count. Two
+ * minutes is far beyond any healthy response from these APIs (the slowest in-tree call is a
+ * 100-item list page) while still being long enough that a merely slow provider is not
+ * mistaken for a dead one.
+ *
+ * An abort surfaces to the caller as the ordinary transport fault it is, so it takes the
+ * transient budget and the same backoff as a 503 — a stalled socket is the same outage seen
+ * one layer down. It is deliberately NOT wired to {@link GitRunDeadline}: an abort carrying
+ * the deadline would be classified as transient and retried, which is the opposite of what
+ * the deadline means, so the deadline is checked explicitly instead (see
+ * {@link assertRunTimeRemaining}).
+ */
+export const GIT_REQUEST_TIMEOUT_MS = 120_000;
+
+/**
+ * A fresh abort signal bounding one request at {@link GIT_REQUEST_TIMEOUT_MS}.
+ *
+ * An `AbortController` on a plain `setTimeout` rather than `AbortSignal.timeout`, for one
+ * reason: `AbortSignal.timeout` runs on a native timer that no test clock can advance, so the
+ * only thing a test could assert about it is that it is an `AbortSignal` — which stays green
+ * if the bound is changed to a decade. This form is drivable, so the timeout is pinned by a
+ * test that can actually fail.
+ *
+ * The timer is `unref`ed and deliberately not cleared when the request settles. Firing on an
+ * already-settled fetch is a no-op (aborting a completed request does nothing), unref means it
+ * cannot hold the process open, and these providers issue requests strictly sequentially — so
+ * the alternative, threading a disposal handle through all three fetch loops, would buy
+ * nothing but call-site complexity.
+ */
+export function requestTimeoutSignal(): AbortSignal {
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+        // Named `TimeoutError`, matching what `AbortSignal.timeout` produces — the transport
+        // catch in each provider reads `err.message`, and an operator seeing this in
+        // `sync_logs.errors` should get the standard wording.
+        const reason = new Error(
+            `git provider request exceeded ${GIT_REQUEST_TIMEOUT_MS} ms with no response`,
+        );
+        reason.name = 'TimeoutError';
+        controller.abort(reason);
+    }, GIT_REQUEST_TIMEOUT_MS);
+    timer.unref?.();
+    return controller.signal;
+}
+
+/**
+ * A fetch abandoned because the RUN ran out of wall clock (#283).
+ *
+ * Deliberately NOT a {@link GitProviderFetchError}, and that is load-bearing rather than
+ * stylistic: {@link isRetryableGitFetchError} fails closed on any other error type, so this
+ * cannot be handed to the in-run repo retry — which would answer "the run is out of time" by
+ * sleeping another 5 and 15 minutes, the exact multiplication the deadline exists to stop.
+ * It is also not a 404, so `resolveCommitDiffstat` rethrows it rather than memoizing a
+ * deadline as a commit's answer.
+ *
+ * It propagates out of `getCommits` like any other fault, so #231 holds the provider's cursor
+ * and the run's partial snapshots are discarded — see {@link GitRunDeadline} for why that
+ * converges instead of bricking.
+ */
+export class GitRunDeadlineError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'GitRunDeadlineError';
+    }
+}
+
+/**
+ * Refuse to START another request once the run's deadline has passed.
+ *
+ * Checked per request, not only before a sleep: a run can exceed its wall clock purely by
+ * doing work — an O(commits) fan-out over a large history, with every request answering
+ * promptly — and a deadline that only guarded pauses would not bound that at all.
+ *
+ * A no-op for a policy with no deadline (every interactive client).
+ */
+export function assertRunTimeRemaining(policy: GitRequestPolicy, url: string): void {
+    const remaining = policy.deadline?.remainingMs();
+    if (remaining !== undefined && remaining <= 0) {
+        throw new GitRunDeadlineError(
+            `git sync run exceeded its wall-clock budget before requesting ${url}`,
+        );
+    }
+}
+
+/**
+ * Pause for `delayMs`, unless the run's deadline could not survive the pause.
+ *
+ * Checked BEFORE sleeping and against the FULL delay, mirroring `fetchRepoWithRetry`'s
+ * treatment of `GIT_RUN_RETRY_SLEEP_BUDGET_MS`: the deadline then bounds time actually spent
+ * rather than time attempted, and a request cannot start a 120-second pause with 3 seconds of
+ * budget left and report the overrun afterwards.
+ *
+ * A plain {@link sleep} for a policy with no deadline.
+ */
+export async function sleepWithinRun(
+    policy: GitRequestPolicy,
+    delayMs: number,
+    url: string,
+): Promise<void> {
+    const remaining = policy.deadline?.remainingMs();
+    if (remaining !== undefined && delayMs >= remaining) {
+        throw new GitRunDeadlineError(
+            `git sync run has ${Math.max(remaining, 0)} ms of its wall-clock budget left, ` +
+                `less than the ${delayMs} ms retry pause requested for ${url}`,
+        );
+    }
+    await sleep(delayMs);
+}
+
 /** First 5xx pause, before jitter. Doubles per retry. */
 export const SERVER_ERROR_BASE_DELAY_MS = 5_000;
 
@@ -297,6 +537,9 @@ export function parseEpochResetMs(header: string | null | undefined): number | n
  *   layer had no information to schedule around.
  * - 401/403/404/422 … — a deterministic answer about the request, not about the server's
  *   health. Asking again in five minutes gets the same answer.
+ * - {@link GitRunDeadlineError}, which is not a `GitProviderFetchError` at all and so is
+ *   caught by the fail-closed first line. Answering "the run is out of wall clock" with two
+ *   more repo-level pauses would multiply exactly the quantity the deadline bounds (#283).
  */
 export function isRetryableGitFetchError(err: unknown): boolean {
     if (!(err instanceof GitProviderFetchError)) return false;

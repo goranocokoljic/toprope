@@ -1,6 +1,6 @@
 import type {
-    CommitDiffstatCache,
     GitProvider,
+    GitProviderClientOptions,
     GitProviderConfig,
     GitHubProviderConfig,
     BitbucketProviderConfig,
@@ -101,25 +101,34 @@ export function validateGitProviderConfig(config: GitProviderConfig): void {
 /**
  * Build the provider client for a config.
  *
- * `diffstatCache` (#273) is the persistent per-commit diffstat memo the client consults
- * instead of re-fetching. OPTIONAL, and omitted by every non-sync caller on purpose: `toprope
- * doctor`, the admin test-connection route and the repo-listing route are probes that never
- * walk commits, so handing them a cache would be dead weight. Only the sync pipeline supplies
- * one — it is also the only caller that has resolved the `(type, container)` scope the cache
- * must be keyed by.
+ * `options.diffstatCache` (#273) is the persistent per-commit diffstat memo the client
+ * consults instead of re-fetching. OPTIONAL, and omitted by every non-sync caller on purpose:
+ * `toprope doctor`, the admin test-connection route and the repo-listing route are probes that
+ * never walk commits, so handing them a cache would be dead weight. Only the sync pipeline
+ * supplies one — it is also the only caller that has resolved the `(type, container)` scope
+ * the cache must be keyed by.
+ *
+ * `options.policy` (#283) is how much this client may sleep inside one request, and — for a
+ * sync — the run deadline every request measures itself against. This is the ONLY place the
+ * distinction is made, which is the point: before #283 the interactive budget was a per-CALL
+ * argument that only `checkAccess` passed, so `listRepos()` on the admin repo picker and in
+ * `toprope doctor` silently took a sync's budget. Binding it to the client makes the two
+ * kinds of caller structurally distinct instead of relying on every call site to remember.
+ * Defaulting to the SYNC policy (see {@link GitProviderClientOptions}) means an omission can
+ * only ever be over-patient, never a silent weakening of #272's retry cover.
  */
 export function createGitProvider(
     config: GitProviderConfig,
-    diffstatCache?: CommitDiffstatCache,
+    options: GitProviderClientOptions = {},
 ): GitProvider {
     validateGitProviderConfig(config);
     switch (config.type) {
         case 'github':
-            return new GitHubProvider(config, diffstatCache);
+            return new GitHubProvider(config, options);
         case 'bitbucket':
-            return new BitbucketProvider(config, diffstatCache);
+            return new BitbucketProvider(config, options);
         case 'gitlab':
-            return new GitLabProvider(config, diffstatCache);
+            return new GitLabProvider(config, options);
         default: {
             const exhaustive: never = config;
             throw new Error(

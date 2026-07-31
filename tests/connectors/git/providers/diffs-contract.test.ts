@@ -188,7 +188,7 @@ describe('#280 GitCommit.diffs conformance across every provider type', () => {
                 vi.stubGlobal('fetch', fetchMock);
 
                 // Pass 1 populates the memo (write-through happens inside the provider).
-                const cold = createGitProvider(fixture.config, cache);
+                const cold = createGitProvider(fixture.config, {diffstatCache: cache});
                 await cold.getCommits(REPO, SINCE, UNTIL);
                 const coldRequests = SHAS.flatMap((sha) => perCommitRequests(urls, sha)).length;
                 // The positive control: pass 1 really did walk the endpoint, so "pass 2 walked it
@@ -196,7 +196,7 @@ describe('#280 GitCommit.diffs conformance across every provider type', () => {
                 expect(coldRequests).toBeGreaterThan(0);
 
                 urls.length = 0;
-                const warm = createGitProvider(fixture.config, cache);
+                const warm = createGitProvider(fixture.config, {diffstatCache: cache});
                 const commits = await warm.getCommits(REPO, SINCE, UNTIL);
 
                 expect(commits.map((c) => c.sha)).toEqual(SHAS);

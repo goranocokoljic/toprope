@@ -25,7 +25,13 @@ import {
     resolveGitProviderConfigs,
 } from './providers/config.js';
 import {resolveAllGitProviders} from './providers/resolve.js';
-import {isRetryableGitFetchError, sleep} from './providers/http-retry.js';
+import type {GitRunDeadline} from './providers/http-retry.js';
+import {
+    SYNC_RETRY_PROFILE,
+    createRunDeadline,
+    isRetryableGitFetchError,
+    sleep,
+} from './providers/http-retry.js';
 import {findProviderByTypeContainer} from './providers/store.js';
 import {loadServerKey} from './providers/secret.js';
 import type {
@@ -563,6 +569,82 @@ export const GIT_RUN_RETRY_SLEEP_BUDGET_MS = 40 * 60_000;
  * wait would have healed.
  */
 export const GIT_RUN_BEST_EFFORT_RETRY_SLEEP_BUDGET_MS = 20 * 60_000;
+
+/**
+ * Total WALL CLOCK one `runSync` call may span, across every provider, repo and request (#283).
+ *
+ * The two budgets above bound only the REPO-level pauses. Nothing bounded the request layer's
+ * own sleeping in aggregate — each request carries its own `MAX_SERVER_ERROR_RETRIES × 120s`
+ * (see `SERVER_ERROR_MAX_DELAY_MS`: a host answering `503 Retry-After: 3600` pins every pause
+ * to the cap, so ~10 minutes PER REQUEST), and the per-commit fan-out is an O(commits)
+ * population of such requests. Run length was therefore a function of the provider's behaviour
+ * with no ceiling at all, and length is not cosmetic here: `sync-pipeline` re-runs a failed
+ * connector once, and two overlapping git runs read the same forward cursor into an ADDITIVE
+ * commit merge — a permanent double-count (see `sync-log.ts`).
+ *
+ * FOUR HOURS, chosen against what actually runs on top of it rather than as a round number:
+ * `runConnectorWithRetry` grants a failed connector one full second attempt, so the ceiling an
+ * operator should quote for a scheduled git sync is ~8 hours + the 5-minute retry pause — well
+ * inside the daily cadence, and now genuinely a ceiling rather than an estimate.
+ *
+ * A run that hits it fails like any other incompletely-covered window: #231 holds the cursor
+ * and drops the run's partial snapshots. That is only sound because of #273 — every per-commit
+ * diffstat the run fetched is memoized OUTSIDE the write transaction, so the next run re-pages
+ * the commit lists and serves the whole fan-out from the memo. Consecutive runs ratchet
+ * forward; a repo too large for one run is imported across several rather than failing
+ * identically forever. See {@link GitRunDeadline} for the same argument from the request
+ * layer's side.
+ */
+export const GIT_RUN_WALL_CLOCK_BUDGET_MS = 4 * 60 * 60_000;
+
+/**
+ * The two RUN-level bounds a sync carries into every provider: how long it may sleep in
+ * repo-level retry pauses, and when it must stop altogether (#283).
+ *
+ * One object rather than two parameters because they are the same kind of thing — the run's
+ * shared, mutable-in-one-direction budget — and because a future third bound should not widen
+ * `fetchProviderData`'s already long signature again. Shared across PROVIDERS by construction:
+ * a wide outage must not cost `budget × providers`, which is the defect #272's review cycle 3
+ * found when the sleep counter was per provider.
+ */
+export interface GitRunBudget {
+    /** Time the run has already spent asleep in {@link GIT_REPO_RETRY_DELAYS_MS} pauses. */
+    retrySleepMs: number;
+    /** The run's wall clock — see {@link GIT_RUN_WALL_CLOCK_BUDGET_MS}. */
+    readonly deadline: GitRunDeadline;
+}
+
+/**
+ * The sentinel marking the line a run emits when it stopped because it ran out of wall clock.
+ *
+ * A genuine FAILURE, not an advisory (it is deliberately absent from `ADVISORY_PREFIXES`): the
+ * provider's window was not covered, its cursor is held and its partial snapshots are dropped,
+ * so the run must go red and `sync-pipeline` must be allowed its retry — the retry starts with
+ * a fresh deadline and a warm diffstat memo, which is exactly the ratchet that makes the run
+ * eventually finish.
+ */
+export const RUN_DEADLINE_PREFIX = 'Run stopped at its wall-clock budget:';
+
+/**
+ * The operator-facing line for a run that ran out of wall clock, with the one number that
+ * tells them whether to widen the window or investigate the provider: how far it got.
+ *
+ * Exported so the test asserts against the string the code emits rather than a copy of it —
+ * the same reason `autoCreateFailureLine` is.
+ */
+export function runDeadlineLine(
+    providerType: GitProviderType,
+    reposDone: number,
+    reposTotal: number,
+): string {
+    return (
+        `${RUN_DEADLINE_PREFIX} [${providerType}] stopped after ${reposDone} of ${reposTotal} ` +
+        `repo(s) — the run reached its ${Math.round(GIT_RUN_WALL_CLOCK_BUDGET_MS / 60_000)} min ` +
+        'limit, so this window was not fully covered: the cursor is held and the whole window is ' +
+        're-covered next run. Per-commit diffstats already fetched are kept, so the next run ' +
+        'gets further.'
+    );
+}
 
 /**
  * The upper bound a forward run should actually fetch to, given the cursor it is
@@ -1470,7 +1552,7 @@ async function fetchProviderData(
     providerConfig: GitProviderConfig,
     now: string,
     db: Database.Database,
-    runRetrySleep: {spentMs: number},
+    runBudget: GitRunBudget,
     report?: ProgressReporter,
     firstSyncWindowMonths?: number,
     backfill?: {since: string; until: string},
@@ -1494,7 +1576,13 @@ async function fetchProviderData(
     // rejects that config with the canonical message on the very next line, before a single
     // commit is fetched.
     const diffstatCache = createCommitDiffstatCache(db, providerConfig.type, identifier);
-    const provider = createGitProvider(providerConfig, diffstatCache);
+    // The run's deadline rides into the request layer on the client (#283), so every request
+    // this provider makes — including the per-commit fan-out, which is where the unbounded
+    // sleeping lived — measures itself against the same clock `fetchRepoWithRetry` below does.
+    const provider = createGitProvider(providerConfig, {
+        diffstatCache,
+        policy: {retries: SYNC_RETRY_PROFILE, deadline: runBudget.deadline},
+    });
     const providerType = provider.name;
     const stateKey = syncStateKey(providerType, identifier);
     // Window selection:
@@ -1541,15 +1629,21 @@ async function fetchProviderData(
     const {include: includeRepos, exclude: excludeFromList} = parseRepoFilters(rawRepos);
     const allExclude = [...excludeFromList, ...(excludeRepos ?? [])];
 
-    // Time the RUN has already spent asleep in in-run retry pauses, against
-    // GIT_RUN_RETRY_SLEEP_BUDGET_MS. Owned by the caller and shared by every PROVIDER as well as
-    // every repo and every fetch kind, so a wide outage cannot cost
+    // `runBudget.retrySleepMs` is time the RUN has already spent asleep in in-run retry pauses,
+    // against GIT_RUN_RETRY_SLEEP_BUDGET_MS. Owned by the caller and shared by every PROVIDER as
+    // well as every repo and every fetch kind, so a wide outage cannot cost
     // `pauses × providers × repos × fetches` (#272, review cycle 3). It was per-provider first,
     // which made the documented 40-minute ceiling really `40 min × providers` — and
     // `runConnectorWithRetry` doubles whatever that is again. Run length is not a cosmetic
-    // concern here: `scheduler.ts` fires the git cron with no in-flight guard, and two
-    // overlapping git runs read the same forward cursor and fetch non-disjoint windows into an
-    // additive commit merge, which is a permanent double-count (see `sync-log.ts`).
+    // concern here: two overlapping git runs read the same forward cursor and fetch
+    // non-disjoint windows into an additive commit merge, which is a permanent double-count
+    // (see `sync-log.ts`); since #283 `scheduler.ts` also refuses to start a tick while the
+    // previous one is still in flight.
+    //
+    // `runBudget.deadline` is the run's WALL CLOCK (#283) — the bound the sleep counter could
+    // not express, because the sleep counter only sees repo-level pauses. It is consulted in
+    // two places: here, before a repo-level pause, and inside the request layer, which the
+    // provider client carries it into (see `createGitProvider` above).
 
     /**
      * Run one repo fetch, retrying it in-run on a fault that could plausibly heal (#272).
@@ -1568,13 +1662,19 @@ async function fetchProviderData(
      * that each run delivers the full per-day set, so the loss does not self-heal. Retrying them
      * all keeps them coupled.
      *
-     * The budget bounds only these repo-level PAUSES. It does not bound the request layer's own
-     * 5xx/rate-limit sleeping inside each attempt, and there is no run-level wall-clock deadline —
-     * so a provider that answers every request with `503 Retry-After` can still make a run much
-     * longer than 40 minutes, and a retry re-issues the repo's whole O(commits) detail fan-out
-     * rather than resuming it. That is a real residual, tracked separately: it needs a deadline
-     * threaded into the providers (or a resumable `getCommits`), which is a wider change than
-     * #272. What is bounded here is the part that would otherwise multiply per provider.
+     * `budgetMs` bounds only these repo-level PAUSES; the request layer's own 5xx/rate-limit
+     * sleeping inside each attempt is bounded by `runBudget.deadline` instead, which the
+     * provider client carries into every request (#283). Both are checked here, and for the
+     * same reason in the same order: BEFORE the pause, against the full delay, so each bounds
+     * time actually spent rather than time attempted. A pause the deadline cannot absorb is
+     * refused rather than truncated — sleeping 4 of the 5 minutes and retrying anyway would
+     * spend the pause and still not have waited out the outage.
+     *
+     * The other half of #272's residual — "a retry re-issues the repo's whole O(commits) detail
+     * fan-out rather than resuming it" — was closed by #273 rather than here: the per-commit
+     * diffstat memo is written per commit outside the run's write transaction, so a retried
+     * `getCommits` re-pages the commit LIST but serves the fan-out from the memo. The retry is
+     * O(pages + commits whose detail never succeeded), not O(commits).
      *
      * `budgetMs` is the share of {@link GIT_RUN_RETRY_SLEEP_BUDGET_MS} this fetch kind may draw
      * to. It is what stops a BEST-EFFORT fetch from starving the cursor-critical one: a failed
@@ -1618,12 +1718,28 @@ async function fetchProviderData(
                     return {value: null, error: message};
                 }
                 const delay = GIT_REPO_RETRY_DELAYS_MS[attempt];
-                // Check the budget BEFORE sleeping, and count the pause we are about to take —
-                // so the budget bounds time actually spent, not time attempted.
-                if (runRetrySleep.spentMs + delay > budgetMs) {
+                // Check both budgets BEFORE sleeping, and count the pause we are about to take —
+                // so each bounds time actually spent, not time attempted.
+                if (runBudget.retrySleepMs + delay > budgetMs) {
                     return {value: null, error: message};
                 }
-                runRetrySleep.spentMs += delay;
+                // The run's wall clock, which the sleep counter cannot express: `budgetMs` says
+                // how much of the RETRY allowance is left, not how much of the RUN is (#283).
+                // `<=` rather than `<`: finishing the pause with exactly zero left leaves no
+                // time to make the request the pause exists to enable.
+                //
+                // Says WHY there was no retry. The bare fault message reads as "one 503 and it
+                // gave up", which sends the operator to the provider instead of to the run's
+                // length — the opposite of the diagnosis.
+                if (runBudget.deadline.remainingMs() <= delay) {
+                    return {
+                        value: null,
+                        error:
+                            `${message} (no further retry: the run's wall-clock budget could ` +
+                            'not absorb the pause)',
+                    };
+                }
+                runBudget.retrySleepMs += delay;
                 sleptMs += delay;
                 healed = message;
                 onRetry();
@@ -1631,6 +1747,43 @@ async function fetchProviderData(
             }
         }
     };
+
+    /**
+     * The result for a provider that reached NO repo — nothing fetched, nothing imported, the
+     * window not covered. Written once and shared by the two paths that produce it (the run
+     * deadline below and a failed `listRepos`), because every field on it is a claim about
+     * "we got nowhere" and the two copies could only ever drift apart.
+     */
+    const noWindowCovered = (): ProviderFetchResult => ({
+        commits: allCommits,
+        prs: allPRs,
+        reviewComments: allReviewComments,
+        prRecords: allPRRecords,
+        errors,
+        stateKey,
+        identifier,
+        // Nothing was imported, so don't claim a synced-back-to floor even on a first sync.
+        firstSyncFloor: null,
+        // Unused on this path (`complete: false` means no cursor advances), but the window
+        // this run would have covered is still the honest value to report.
+        forwardCursorTarget: until,
+        // No repo was reached, so nothing could have been dropped.
+        droppedAdvisories: [],
+        // No commit was fetched, so no fallback diff request could have failed.
+        diffLossAdvisories: [],
+        // The window was not covered at all — hold the cursor so it retries (#231).
+        complete: false,
+    });
+
+    // The run's wall clock is spent before this provider has issued a single request (#283).
+    // Providers are fetched sequentially out of one shared deadline, so this is the shape
+    // EVERY provider after the one that ran long sees — and it must not be reported as
+    // "Failed to list repos", which describes the provider rather than the run and would send
+    // an operator to check a healthy provider's credentials.
+    if (runBudget.deadline.remainingMs() <= 0) {
+        errors.push(runDeadlineLine(providerType, 0, 0));
+        return noWindowCovered();
+    }
 
     report?.((p) => {
         p.stage = 'listing_repos';
@@ -1656,27 +1809,7 @@ async function fetchProviderData(
         repoNames = repoList.value.filter((r) => !r.isArchived).map((r) => r.name);
     } else {
         errors.push(`[${providerType}] Failed to list repos: ${repoList.error}`);
-        return {
-            commits: allCommits,
-            prs: allPRs,
-            reviewComments: allReviewComments,
-            prRecords: allPRRecords,
-            errors,
-            stateKey,
-            identifier,
-            // listRepos failed before any repo was processed — nothing was imported,
-            // so don't claim a synced-back-to floor even on a first sync.
-            firstSyncFloor: null,
-            // Unused on this path (`complete: false` means no cursor advances), but the
-            // window this run would have covered is still the honest value to report.
-            forwardCursorTarget: until,
-            // No repo was reached, so nothing could have been dropped.
-            droppedAdvisories: [],
-            // No commit was fetched, so no fallback diff request could have failed.
-            diffLossAdvisories: [],
-            // The window was not covered at all — hold the cursor so it retries (#231).
-            complete: false,
-        };
+        return noWindowCovered();
     }
 
     const reposToSync = applyRepoFilter(
@@ -1769,7 +1902,22 @@ async function fetchProviderData(
     const onCommitProgress = stepListener('commits');
     const onPRProgress = stepListener('prs');
 
+    // Repos this provider actually attempted, so the deadline line below can say how far the
+    // run got — the one number that tells an operator whether the provider is slow or the
+    // window is simply too wide for one run.
+    let reposAttempted = 0;
+
     for (const repoName of reposToSync) {
+        // Stop at the run's wall clock with ONE clear line, rather than letting every
+        // remaining repo issue a request that `assertRunTimeRemaining` rejects and push its
+        // own "Failed to fetch commits" (#283). Both routes hold the cursor identically —
+        // this one is simply legible.
+        if (runBudget.deadline.remainingMs() <= 0) {
+            commitsComplete = false;
+            errors.push(runDeadlineLine(providerType, reposAttempted, reposToSync.length));
+            break;
+        }
+        reposAttempted++;
         report?.((p) => {
             p.current_repo = repoName;
         });
@@ -2578,9 +2726,16 @@ export class GitSync implements ConnectorInterface {
         // (developer_id, date) are accumulated rather than overwritten.
         const fetchResults: Array<{result: ProviderFetchResult; providerType: GitProviderType}> = [];
 
-        // ONE in-run retry sleep budget for the whole run, shared across providers — see the
-        // declaration comment in `fetchProviderData` for why it is not per-provider (#272).
-        const runRetrySleep = {spentMs: 0};
+        // ONE retry-sleep counter and ONE wall-clock deadline for the whole run, shared across
+        // providers — see the declaration comment in `fetchProviderData` for why neither is
+        // per-provider (#272, #283). The deadline starts here, at the first fetch, rather than
+        // at `runSync`'s entry: the migrations and config resolution before this point are
+        // bounded local work, and starting the clock over them would silently shrink the
+        // network budget the constant names.
+        const runBudget: GitRunBudget = {
+            retrySleepMs: 0,
+            deadline: createRunDeadline(GIT_RUN_WALL_CLOCK_BUDGET_MS),
+        };
 
         for (const pc of providerConfigs) {
             let result: ProviderFetchResult;
@@ -2589,7 +2744,7 @@ export class GitSync implements ConnectorInterface {
                     pc,
                     now,
                     db,
-                    runRetrySleep,
+                    runBudget,
                     report,
                     options?.firstSyncWindowMonths,
                     options?.backfill,

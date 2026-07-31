@@ -13,21 +13,23 @@ import type {
     GitHubProviderConfig,
     GitFetchProgressListener,
     GitCommitDropListener,
+    GitProviderClientOptions,
 } from './types.js';
 import {NO_AUTHOR_DATE_DROP_REASON, UNATTRIBUTABLE_DATE_DROP_REASON} from './types.js';
 import {isUtcDay} from '../../../aggregation/dates.js';
 import {normalizeContainer} from './container.js';
 import {loadDiffstats} from './diffstat.js';
+import type {GitRequestPolicy} from './http-retry.js';
 import {
     GitProviderFetchError,
-    MAX_RATE_LIMIT_RETRIES,
-    MAX_SERVER_ERROR_RETRIES,
-    PROBE_SERVER_ERROR_RETRIES,
+    SYNC_REQUEST_POLICY,
+    assertRunTimeRemaining,
     parseEpochResetMs,
     rateLimitDelayMs,
     rateLimitFallbackMs,
+    requestTimeoutSignal,
     serverErrorDelayMs,
-    sleep,
+    sleepWithinRun,
 } from './http-retry.js';
 
 const BASE_URL = 'https://api.github.com';
@@ -90,9 +92,10 @@ function globMatch(pattern: string, str: string): boolean {
 async function fetchGitHub(
     url: string,
     headers: Record<string, string>,
-    // Overridden only by checkAccess, which is an interactive probe rather than a data fetch
-    // and must fail fast — see PROBE_SERVER_ERROR_RETRIES.
-    maxTransientRetries: number = MAX_SERVER_ERROR_RETRIES,
+    // The retry budgets and run deadline the CLIENT was built with (#283) — an interactive
+    // probe/listing takes INTERACTIVE_REQUEST_POLICY, a sync fetch the run's own. Carried on
+    // the client rather than overridden per call, so no call site can forget it.
+    policy: GitRequestPolicy = SYNC_REQUEST_POLICY,
 ): Promise<Response> {
     let attempt = 0;
     // Transient faults (5xx, transport) get their own, much longer budget than the rate-limit
@@ -103,15 +106,19 @@ async function fetchGitHub(
     // `for (;;)`: the two budgets above are counted separately, so no single loop guard can
     // express both, and every branch below either `continue`s or throws (#272).
     for (;;) {
+        // Per ATTEMPT, not only before a pause: a run can exhaust its wall clock doing nothing
+        // but promptly-answered work (#283).
+        assertRunTimeRemaining(policy, url);
         let res: Response;
         try {
-            res = await fetch(url, {headers});
+            res = await fetch(url, {headers, signal: requestTimeoutSignal()});
         } catch (err) {
             // A transport fault is the same outage as a 503, seen one layer down — same budget,
             // same backoff. Wrapped so the in-run repo retry (#272) can classify it; the message
-            // is preserved verbatim.
-            if (transientRetries < maxTransientRetries) {
-                await sleep(serverErrorDelayMs(transientRetries, null));
+            // is preserved verbatim. A GIT_REQUEST_TIMEOUT_MS abort lands here too, deliberately:
+            // a stalled socket is that same outage with no response at all (#283).
+            if (transientRetries < policy.retries.transient) {
+                await sleepWithinRun(policy, serverErrorDelayMs(transientRetries, null), url);
                 transientRetries++;
                 continue;
             }
@@ -123,15 +130,17 @@ async function fetchGitHub(
         }
 
         if (res.status === 429) {
-            if (attempt < MAX_RATE_LIMIT_RETRIES) {
-                await sleep(
+            if (attempt < policy.retries.rateLimit) {
+                await sleepWithinRun(
+                    policy,
                     rateLimitDelayMs(res.headers.get('retry-after'), rateLimitFallbackMs(attempt)),
+                    url,
                 );
                 attempt++;
                 continue;
             }
             throw new GitProviderFetchError(
-                `Rate limit exceeded after ${MAX_RATE_LIMIT_RETRIES} retries: ${url}`,
+                `Rate limit exceeded after ${policy.retries.rateLimit} retries: ${url}`,
                 429,
             );
         }
@@ -143,15 +152,19 @@ async function fetchGitHub(
             // Primary rate limit: x-ratelimit-remaining=0 with reset time. `+ 1_000` so the
             // retry lands just AFTER the reset instant rather than exactly on it.
             if (remaining === '0' && resetMs !== null) {
-                if (attempt < MAX_RATE_LIMIT_RETRIES) {
-                    await sleep(rateLimitDelayMs(null, resetMs + 1_000));
+                if (attempt < policy.retries.rateLimit) {
+                    await sleepWithinRun(policy, rateLimitDelayMs(null, resetMs + 1_000), url);
                     attempt++;
                     continue;
                 }
             // Secondary rate limit (abuse detection): Retry-After present, no ratelimit headers
             } else if (retryAfter403 !== null) {
-                if (attempt < MAX_RATE_LIMIT_RETRIES) {
-                    await sleep(rateLimitDelayMs(retryAfter403, rateLimitFallbackMs(attempt)));
+                if (attempt < policy.retries.rateLimit) {
+                    await sleepWithinRun(
+                        policy,
+                        rateLimitDelayMs(retryAfter403, rateLimitFallbackMs(attempt)),
+                        url,
+                    );
                     attempt++;
                     continue;
                 }
@@ -163,8 +176,12 @@ async function fetchGitHub(
         }
 
         if (res.status >= 500) {
-            if (transientRetries < maxTransientRetries) {
-                await sleep(serverErrorDelayMs(transientRetries, res.headers.get('retry-after')));
+            if (transientRetries < policy.retries.transient) {
+                await sleepWithinRun(
+                    policy,
+                    serverErrorDelayMs(transientRetries, res.headers.get('retry-after')),
+                    url,
+                );
                 transientRetries++;
                 continue;
             }
@@ -180,14 +197,22 @@ async function fetchGitHub(
 
         // Proactively pause when approaching rate limit. Capped like every other rate-limit
         // wait (#272): a garbage reset header must not park the sync for a decade.
+        //
+        // Gated on the rate-limit budget rather than on the retry counter, because this is
+        // neither a retry nor a failure — it fires after a 200 (#283). Without the gate an
+        // interactive listing whose zero retry budgets close every OTHER sleep would still
+        // sleep to the reset instant here, up to MAX_RATE_LIMIT_DELAY_MS, inside the one
+        // request a human is waiting on. A caller that has forbidden waiting out a rate limit
+        // has equally forbidden waiting to avoid one.
         const remaining = res.headers.get('x-ratelimit-remaining');
         const resetMs = parseEpochResetMs(res.headers.get('x-ratelimit-reset'));
         if (
+            policy.retries.rateLimit > 0 &&
             remaining !== null &&
             parseInt(remaining, 10) < RATE_LIMIT_PAUSE_THRESHOLD &&
             resetMs !== null
         ) {
-            await sleep(rateLimitDelayMs(null, resetMs + 1_000));
+            await sleepWithinRun(policy, rateLimitDelayMs(null, resetMs + 1_000), url);
         }
 
         return res;
@@ -311,8 +336,9 @@ export class GitHubProvider implements GitProvider {
     private readonly includeRepos: string[];
     private readonly excludeRepos: string[];
     private readonly diffstatCache?: CommitDiffstatCache;
+    private readonly policy: GitRequestPolicy;
 
-    constructor(config: GitHubProviderConfig, diffstatCache?: CommitDiffstatCache) {
+    constructor(config: GitHubProviderConfig, options: GitProviderClientOptions = {}) {
         // Normalized (#266): the org is the attribution key AND the request path, and both have
         // to be the same spelling. `providerContainer` normalizes the former; this normalizes the
         // latter, from the same shared helper, so a YAML `org: '  Acme '` cannot attribute rows to
@@ -325,7 +351,8 @@ export class GitHubProvider implements GitProvider {
             Accept: 'application/vnd.github+json',
             'X-GitHub-Api-Version': '2022-11-28',
         };
-        this.diffstatCache = diffstatCache;
+        this.diffstatCache = options.diffstatCache;
+        this.policy = options.policy ?? SYNC_REQUEST_POLICY;
     }
 
     private shouldInclude(repoName: string): boolean {
@@ -339,12 +366,11 @@ export class GitHubProvider implements GitProvider {
     }
 
     async checkAccess(): Promise<void> {
-        await fetchGitHub(
-            `${BASE_URL}/orgs/${this.org}/repos?per_page=1`,
-            this.authHeaders,
-            // An interactive probe, not a data fetch — a human is waiting on it (#272).
-            PROBE_SERVER_ERROR_RETRIES,
-        );
+        // No per-call budget override any more (#283): the client's own policy already carries
+        // the caller's intent, and every path that reaches `checkAccess` builds an
+        // INTERACTIVE_REQUEST_POLICY client — which now also closes the rate-limit branches a
+        // transient-only override left open.
+        await fetchGitHub(`${BASE_URL}/orgs/${this.org}/repos?per_page=1`, this.authHeaders, this.policy);
     }
 
     async listRepos(): Promise<GitRepo[]> {
@@ -353,7 +379,7 @@ export class GitHubProvider implements GitProvider {
             `${BASE_URL}/orgs/${this.org}/repos?per_page=100&sort=pushed`;
 
         while (nextUrl) {
-            const res = await fetchGitHub(nextUrl, this.authHeaders);
+            const res = await fetchGitHub(nextUrl, this.authHeaders, this.policy);
             const page = (await res.json()) as RawRepo[];
 
             for (const r of page) {
@@ -390,7 +416,7 @@ export class GitHubProvider implements GitProvider {
             `${BASE_URL}/repos/${this.org}/${repo}/commits?${params.toString()}`;
 
         while (nextUrl) {
-            const res = await fetchGitHub(nextUrl, this.authHeaders);
+            const res = await fetchGitHub(nextUrl, this.authHeaders, this.policy);
             const page = (await res.json()) as RawCommitListItem[];
             summaries.push(...page);
             // One report per page — the only granularity available here, since the
@@ -463,6 +489,7 @@ export class GitHubProvider implements GitProvider {
                 const detailRes = await fetchGitHub(
                     `${BASE_URL}/repos/${this.org}/${repo}/commits/${summary.sha}`,
                     this.authHeaders,
+                    this.policy,
                 );
                 const detail = (await detailRes.json()) as RawCommitDetail;
 
@@ -688,7 +715,7 @@ export class GitHubProvider implements GitProvider {
         const sinceDate = since ? new Date(since) : null;
 
         while (nextUrl) {
-            const res = await fetchGitHub(nextUrl, this.authHeaders);
+            const res = await fetchGitHub(nextUrl, this.authHeaders, this.policy);
             const page = (await res.json()) as RawPR[];
 
             let reachedSince = false;
@@ -748,7 +775,7 @@ export class GitHubProvider implements GitProvider {
             `${BASE_URL}/repos/${this.org}/${repo}/pulls/${prId}/comments?per_page=100`;
 
         while (nextUrl) {
-            const res = await fetchGitHub(nextUrl, this.authHeaders);
+            const res = await fetchGitHub(nextUrl, this.authHeaders, this.policy);
             const page = (await res.json()) as RawReviewComment[];
 
             for (const c of page) {
@@ -776,7 +803,7 @@ export class GitHubProvider implements GitProvider {
             `${BASE_URL}/repos/${this.org}/${repo}/pulls/${prId}/reviews?per_page=100`;
 
         while (nextUrl) {
-            const res = await fetchGitHub(nextUrl, this.authHeaders);
+            const res = await fetchGitHub(nextUrl, this.authHeaders, this.policy);
             const page = (await res.json()) as RawReview[];
 
             for (const r of page) {
@@ -806,6 +833,7 @@ export class GitHubProvider implements GitProvider {
         const res = await fetchGitHub(
             `${BASE_URL}/repos/${this.org}/${repo}/commits/${commitSha}`,
             this.authHeaders,
+            this.policy,
         );
         const detail = (await res.json()) as RawCommitDetail;
 

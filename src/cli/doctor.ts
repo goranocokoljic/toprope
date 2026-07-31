@@ -6,6 +6,7 @@ import {getMigrationStatus} from '../storage/migrator';
 import {resolveAllGitProviders} from '../connectors/git/providers/resolve';
 import {loadServerKey} from '../connectors/git/providers/secret';
 import {createGitProvider} from '../connectors/git/providers/factory';
+import {INTERACTIVE_REQUEST_POLICY} from '../connectors/git/providers/http-retry';
 import {GIT_CATCHUP_WINDOW_MAX_DAYS, loadGitSyncHealth} from '../connectors/git/sync';
 import type {GitProvider, GitProviderConfig} from '../connectors/git/providers/types';
 import {gitResetNotice, gitResetNoticeMessage} from '../connectors/git/reset-notice';
@@ -420,7 +421,12 @@ async function checkOneGitProvider(pc: GitProviderConfig): Promise<CheckResult> 
     const label = `Git: ${pc.type}`;
     let provider: GitProvider;
     try {
-        provider = createGitProvider(pc);
+        // Interactive: `doctor` is a human at a terminal waiting for an answer, and BOTH calls
+        // below take this client — the probe AND the repo enumeration (#283). `listRepos` used
+        // to take a sync's budget, so one `503 Retry-After: 3600` from a provider parked the
+        // whole command for up to ten minutes, and a 429 for up to three hours, on a check
+        // whose entire value is being cheap and re-runnable.
+        provider = createGitProvider(pc, {policy: INTERACTIVE_REQUEST_POLICY});
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return fail(label, msg, gitProviderFixHint(pc.type));

@@ -1,6 +1,7 @@
 import {describe, it, expect, beforeEach, afterEach, vi} from 'vitest';
 import {GitLabProvider} from '../../../../src/connectors/git/providers/gitlab';
 import {
+    INTERACTIVE_REQUEST_POLICY,
     MAX_SERVER_ERROR_RETRIES,
     PROBE_SERVER_ERROR_RETRIES,
     isRetryableGitFetchError,
@@ -1304,7 +1305,9 @@ describe('GitLabProvider', () => {
                 text: () => Promise.resolve('boom'),
             } as unknown as Response));
 
-            const pending = provider.checkAccess();
+            // The interactive budget lives on the CLIENT since #283, not on the call.
+            const probe = new GitLabProvider(CONFIG_PAT, {policy: INTERACTIVE_REQUEST_POLICY});
+            const pending = probe.checkAccess();
             void pending.catch(() => {});
             await vi.runAllTimersAsync();
 

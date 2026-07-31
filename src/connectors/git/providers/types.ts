@@ -1,3 +1,5 @@
+import type {GitRequestPolicy} from './http-retry.js';
+
 export type GitProviderType = 'github' | 'bitbucket' | 'gitlab';
 
 /**
@@ -207,6 +209,31 @@ export interface CommitDiffstatCache {
      * no-op in effect.
      */
     put(repo: string, sha: string, value: CommitDiffstat): void;
+}
+
+/**
+ * Everything a provider CLIENT is built with beyond its config (#283).
+ *
+ * One object rather than a positional list, because the two members are set by different
+ * concerns and a caller supplies whichever apply: the sync pipeline supplies both, `doctor`
+ * and the admin routes supply only a policy, and a test may supply neither.
+ *
+ * Declared here, beside {@link GitProvider}, for the same reason {@link CommitDiffstatCache}
+ * is: the three provider classes must be able to name it without importing the factory that
+ * builds them.
+ */
+export interface GitProviderClientOptions {
+    /**
+     * The persistent per-commit diffstat memo (#273). OPTIONAL and omitted by every non-sync
+     * caller on purpose — probes never walk commits, so a cache would be dead weight.
+     */
+    diffstatCache?: CommitDiffstatCache;
+    /**
+     * The retry budgets and run deadline this client's requests take (#283). Defaults to
+     * `SYNC_REQUEST_POLICY` — the pre-#283 behaviour — so an omission is never a silent
+     * WEAKENING of a sync's retry budget; an interactive caller must say so explicitly.
+     */
+    policy?: GitRequestPolicy;
 }
 
 /**

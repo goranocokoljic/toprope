@@ -34,6 +34,7 @@ import {
     resolveGitProviderConfigs,
 } from '../../../connectors/git/providers/config';
 import {createGitProvider} from '../../../connectors/git/providers/factory';
+import {INTERACTIVE_REQUEST_POLICY} from '../../../connectors/git/providers/http-retry';
 import {sameContainer} from '../../../connectors/git/providers/container';
 import {
     GitSync,
@@ -440,7 +441,10 @@ interface ProbeResult {
 // read identically to `toprope doctor` (single source of remediation copy).
 async function probeProvider(config: GitProviderConfig): Promise<ProbeResult> {
     try {
-        await createGitProvider(config).checkAccess();
+        // Interactive: the admin is waiting on this HTTP request. #272 already gave the probe a
+        // zero TRANSIENT budget; #283 closes the rate-limit half, which could still sleep to a
+        // reset instant (up to an hour, three times) inside this one request.
+        await createGitProvider(config, {policy: INTERACTIVE_REQUEST_POLICY}).checkAccess();
         return {ok: true};
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -927,7 +931,14 @@ export function registerAdminGitProviderRoutes(
             try {
                 // List the FULL workspace (filter stripped) so the picker can
                 // offer repos beyond the saved selection (#217).
-                const repos = await createGitProvider(repoListingConfig(resolved.config)).listRepos();
+                //
+                // Interactive (#283): this listing happens inside one HTTP request the picker
+                // is blocked on, and it used to take a SYNC's retry budget — a provider
+                // answering `503 Retry-After: 3600` parked it for ~10 minutes per page, and a
+                // 429 for up to three hours, long after the browser or a proxy had given up.
+                const repos = await createGitProvider(repoListingConfig(resolved.config), {
+                    policy: INTERACTIVE_REQUEST_POLICY,
+                }).listRepos();
                 return {
                     data: repos.map((r) => ({
                         slug: r.name,

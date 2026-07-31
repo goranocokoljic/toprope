@@ -1,6 +1,15 @@
-import {describe, it, expect} from 'vitest';
-import {parseSyncTimeToCron, buildConnectorSchedule} from '../../src/scheduler/scheduler';
+import {describe, it, expect, beforeEach, afterEach, vi} from 'vitest';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import {
+    parseSyncTimeToCron,
+    buildConnectorSchedule,
+    createConnectorTick,
+    type ScheduledConnector,
+} from '../../src/scheduler/scheduler';
 import type {TopropeConfig} from '../../src/config/types';
+import type {ConnectorInterface} from '../../src/connectors/types';
 import {defaultConfig} from '../../src/config/defaults';
 
 function makeConfig(overrides: Partial<TopropeConfig> = {}): TopropeConfig {
@@ -72,5 +81,132 @@ describe('buildConnectorSchedule', () => {
             const connector = entry.makeConnector();
             expect(connector.getName()).toBeTruthy();
         }
+    });
+});
+
+/**
+ * #283 — the cron tick's in-flight guard.
+ *
+ * `node-cron` fires on the wall clock and does not care whether the previous firing has
+ * returned, so a run that outlasts its period used to overlap the next one. For git that is a
+ * DATA-INTEGRITY defect, not a latency one: two overlapping runs read the same forward cursor,
+ * fetch non-disjoint windows, and the additive commit merge double-counts them permanently.
+ */
+describe('createConnectorTick in-flight guard (#283)', () => {
+    let dbPath: string;
+    let tmpDir: string;
+
+    beforeEach(() => {
+        tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'toprope-sched-'));
+        dbPath = path.join(tmpDir, 'test.db');
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        vi.spyOn(console, 'error').mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+        vi.restoreAllMocks();
+        fs.rmSync(tmpDir, {recursive: true, force: true});
+    });
+
+    /** A connector whose `sync` blocks until the test releases it. */
+    function makeBlockingConnector(): {
+        connector: ConnectorInterface;
+        syncCalls: () => number;
+        release: () => void;
+    } {
+        let calls = 0;
+        let release = (): void => {};
+        const gate = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        const connector: ConnectorInterface = {
+            getName: () => 'git',
+            sync: async () => {
+                calls++;
+                await gate;
+                return {
+                    connector: 'git',
+                    snapshotsWritten: 0,
+                    snapshotsSkipped: 0,
+                    errors: [],
+                    lastSyncTime: '2026-07-31T03:30:00.000Z',
+                };
+            },
+        };
+        return {connector, syncCalls: () => calls, release};
+    }
+
+    function entryFor(connector: ConnectorInterface): ScheduledConnector {
+        return {name: 'git', enabled: true, syncTime: '03:30', makeConnector: () => connector};
+    }
+
+    it('skips a tick that fires while the previous run is still going', async () => {
+        const {connector, syncCalls, release} = makeBlockingConnector();
+        const tick = createConnectorTick(entryFor(connector), dbPath);
+
+        const first = tick();
+        // Let the first tick reach the blocked `sync`.
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(syncCalls()).toBe(1);
+
+        // The cron fires again while the first run is still in flight.
+        await tick();
+        // SKIPPED, not queued: the skipped tick's work is exactly what the running one is
+        // already doing, so queueing would preserve the overlap one period later.
+        expect(syncCalls()).toBe(1);
+        expect(console.warn).toHaveBeenCalledWith(
+            expect.stringContaining('still in flight'),
+        );
+
+        release();
+        await first;
+    });
+
+    it('runs the NEXT tick once the previous one has finished', async () => {
+        // Positive control: without it the test above would pass against a guard that latched
+        // permanently and silently stopped every future sync.
+        const {connector, syncCalls, release} = makeBlockingConnector();
+        const tick = createConnectorTick(entryFor(connector), dbPath);
+
+        const first = tick();
+        await Promise.resolve();
+        release();
+        await first;
+
+        await tick();
+        expect(syncCalls()).toBe(2);
+    });
+
+    it('releases the guard when the tick cannot even open the database', async () => {
+        // The sharpest wedge case: `openDb` runs before any connector work, so before #283 a
+        // failure there escaped the handler entirely. That was harmless when the tick held no
+        // state; with a guard it would latch `inFlight` forever and silently stop every future
+        // sync, with nothing in the log to say why.
+        const {connector, syncCalls, release} = makeBlockingConnector();
+        release();
+        // A path whose PARENT is a regular file: `openDb` creates missing directories, so a
+        // merely-absent one would succeed. This is the shape a misconfigured `db_path` really
+        // takes.
+        const blocker = path.join(tmpDir, 'not-a-dir');
+        fs.writeFileSync(blocker, 'x');
+        const badPath = path.join(blocker, 'test.db');
+        const tick = createConnectorTick(entryFor(connector), badPath);
+
+        await tick();
+        expect(console.error).toHaveBeenCalledWith(
+            expect.stringContaining('git unhandled error'),
+            expect.anything(),
+        );
+        // The guard is free again, so a later tick still runs — proven by the connector being
+        // reached on the second call, which the first never got to.
+        expect(syncCalls()).toBe(0);
+
+        const good = createConnectorTick(entryFor(connector), dbPath);
+        await good();
+        expect(syncCalls()).toBe(1);
+        await tick();
+        // Second failing tick STILL ran (and failed again) rather than being skipped.
+        expect((console.error as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(2);
     });
 });

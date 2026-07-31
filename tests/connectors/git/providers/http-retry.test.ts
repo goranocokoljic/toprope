@@ -8,20 +8,31 @@
  * request COUNT of).
  */
 import {describe, it, expect, afterEach, vi} from 'vitest';
+import type {GitRequestPolicy} from '../../../../src/connectors/git/providers/http-retry';
 import {
+    GIT_REQUEST_TIMEOUT_MS,
     GitProviderFetchError,
+    GitRunDeadlineError,
+    INTERACTIVE_REQUEST_POLICY,
+    INTERACTIVE_RETRY_PROFILE,
     MAX_RATE_LIMIT_DELAY_MS,
     MAX_RATE_LIMIT_RETRIES,
     MAX_SERVER_ERROR_RETRIES,
     PROBE_SERVER_ERROR_RETRIES,
     SERVER_ERROR_BASE_DELAY_MS,
     SERVER_ERROR_MAX_DELAY_MS,
+    SYNC_REQUEST_POLICY,
+    SYNC_RETRY_PROFILE,
+    assertRunTimeRemaining,
+    createRunDeadline,
     isRetryableGitFetchError,
     parseEpochResetMs,
     parseRetryAfterMs,
     rateLimitDelayMs,
     rateLimitFallbackMs,
+    requestTimeoutSignal,
     serverErrorDelayMs,
+    sleepWithinRun,
 } from '../../../../src/connectors/git/providers/http-retry';
 
 afterEach(() => {
@@ -299,5 +310,175 @@ describe('isRetryableGitFetchError', () => {
         expect(isRetryableGitFetchError(new TypeError('cannot read x of undefined'))).toBe(false);
         expect(isRetryableGitFetchError('503')).toBe(false);
         expect(isRetryableGitFetchError(undefined)).toBe(false);
+    });
+
+    it('fails closed on the run-deadline error too (#283)', () => {
+        // Load-bearing, not stylistic. The in-run repo retry answers a retryable fault with 5-
+        // and 15-minute pauses; answering "the run is out of wall clock" that way would
+        // multiply exactly the quantity the deadline bounds. It fails closed here because
+        // GitRunDeadlineError is deliberately NOT a GitProviderFetchError.
+        expect(isRetryableGitFetchError(new GitRunDeadlineError('out of time'))).toBe(false);
+        // It is equally not the 404-is-an-answer case `resolveCommitDiffstat` memoizes: a
+        // deadline frozen as a commit's permanent empty diffstat would be a silent data loss.
+        const err = new GitRunDeadlineError('out of time');
+        expect(err instanceof GitProviderFetchError).toBe(false);
+        expect((err as unknown as {status?: number}).status).toBeUndefined();
+    });
+});
+
+/**
+ * #283 — the caller-intent retry profiles and the run-level wall clock.
+ *
+ * Pure-function tests, in the same spirit as the rest of this file: the provider-level tests
+ * can only pin request COUNTS, so the decisions themselves — when a pause is refused, what an
+ * expired deadline throws — are pinned here, once, where they live.
+ */
+describe('retry profiles (#283)', () => {
+    it('gives a sync fetch the full documented budgets', () => {
+        expect(SYNC_RETRY_PROFILE).toEqual({
+            transient: MAX_SERVER_ERROR_RETRIES,
+            rateLimit: MAX_RATE_LIMIT_RETRIES,
+        });
+        expect(SYNC_REQUEST_POLICY.retries).toEqual(SYNC_RETRY_PROFILE);
+        // No deadline until a RUN supplies one — `SYNC_REQUEST_POLICY` is the default a
+        // provider client falls back to, and a default deadline would be a wall clock nobody
+        // chose.
+        expect(SYNC_REQUEST_POLICY.deadline).toBeUndefined();
+    });
+
+    it('gives an interactive caller NO sleeping on either budget', () => {
+        // Pinned as LITERALS, not against the constants they are built from: "an interactive
+        // caller never waits" is the whole of #283's bullet 4, and deriving the expectation
+        // from the source would keep this green through the exact regression it guards —
+        // wiring `rateLimit` back to MAX_RATE_LIMIT_RETRIES, i.e. up to three hours of
+        // sleeping inside one HTTP request a human is waiting on.
+        expect(INTERACTIVE_RETRY_PROFILE).toEqual({transient: 0, rateLimit: 0});
+        expect(INTERACTIVE_REQUEST_POLICY.retries).toEqual({transient: 0, rateLimit: 0});
+        expect(INTERACTIVE_REQUEST_POLICY.deadline).toBeUndefined();
+    });
+});
+
+describe('createRunDeadline (#283)', () => {
+    it('counts down from now', () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(new Date('2026-07-31T00:00:00.000Z'));
+        const deadline = createRunDeadline(60_000);
+
+        expect(deadline.remainingMs()).toBe(60_000);
+        vi.setSystemTime(new Date('2026-07-31T00:00:45.000Z'));
+        expect(deadline.remainingMs()).toBe(15_000);
+        vi.setSystemTime(new Date('2026-07-31T00:01:30.000Z'));
+        // Negative, not clamped to zero — the callers compare it against a delay, and a clamp
+        // would hide how far past its budget a run already is.
+        expect(deadline.remainingMs()).toBe(-30_000);
+    });
+
+    it('rejects a budget that is not a positive finite number of ms', () => {
+        // Range-validated on BOTH bounds. A NaN budget makes every `remainingMs()` comparison
+        // false, silently restoring the unbounded behaviour the deadline exists to remove —
+        // precisely the failure a lower-bound-only check would let through.
+        for (const bad of [NaN, Infinity, -Infinity, 0, -1]) {
+            expect(() => createRunDeadline(bad)).toThrow(/positive finite/);
+        }
+        expect(() => createRunDeadline(1)).not.toThrow();
+    });
+});
+
+describe('assertRunTimeRemaining (#283)', () => {
+    const withRemaining = (remainingMs: number): GitRequestPolicy => ({
+        retries: SYNC_RETRY_PROFILE,
+        deadline: {remainingMs: () => remainingMs},
+    });
+
+    it('refuses to START a request once the budget is spent', () => {
+        // Checked per attempt, not only before a pause: a run can exhaust its wall clock on
+        // nothing but promptly-answered work, and a deadline guarding only pauses would not
+        // bound the O(commits) fan-out at all.
+        expect(() => assertRunTimeRemaining(withRemaining(0), 'https://api/x')).toThrow(
+            GitRunDeadlineError,
+        );
+        expect(() => assertRunTimeRemaining(withRemaining(-5), 'https://api/x')).toThrow(
+            /wall-clock budget/,
+        );
+    });
+
+    it('names the url so an operator can see where the run stopped', () => {
+        expect(() => assertRunTimeRemaining(withRemaining(0), 'https://api/repos/x')).toThrow(
+            /https:\/\/api\/repos\/x/,
+        );
+    });
+
+    it('allows a request while time remains, and always without a deadline', () => {
+        expect(() => assertRunTimeRemaining(withRemaining(1), 'https://api/x')).not.toThrow();
+        expect(() => assertRunTimeRemaining(SYNC_REQUEST_POLICY, 'https://api/x')).not.toThrow();
+        expect(() =>
+            assertRunTimeRemaining(INTERACTIVE_REQUEST_POLICY, 'https://api/x'),
+        ).not.toThrow();
+    });
+});
+
+describe('sleepWithinRun (#283)', () => {
+    const withRemaining = (remainingMs: number): GitRequestPolicy => ({
+        retries: SYNC_RETRY_PROFILE,
+        deadline: {remainingMs: () => remainingMs},
+    });
+
+    it('refuses a pause the run cannot finish, BEFORE sleeping', async () => {
+        vi.useFakeTimers();
+        const timer = vi.spyOn(globalThis, 'setTimeout');
+
+        await expect(
+            sleepWithinRun(withRemaining(5_000), 60_000, 'https://api/x'),
+        ).rejects.toThrow(GitRunDeadlineError);
+        // Not "slept 5s and then gave up": spending the run's last seconds on a pause that
+        // cannot finish burns the budget and still has not waited out the outage.
+        expect(timer).not.toHaveBeenCalled();
+    });
+
+    it('refuses a pause that would land exactly on the deadline', async () => {
+        // `>=`, not `>`: finishing the pause with zero budget left leaves no time to make the
+        // request the pause exists to enable.
+        await expect(sleepWithinRun(withRemaining(5_000), 5_000, 'https://api/x')).rejects.toThrow(
+            GitRunDeadlineError,
+        );
+    });
+
+    it('sleeps when the run can absorb the pause', async () => {
+        vi.useFakeTimers();
+        let settled = false;
+        const pending = sleepWithinRun(withRemaining(60_000), 5_000, 'https://api/x').then(() => {
+            settled = true;
+        });
+        expect(settled).toBe(false);
+        await vi.advanceTimersByTimeAsync(5_000);
+        await pending;
+        expect(settled).toBe(true);
+    });
+
+    it('sleeps unconditionally for a policy with no deadline', async () => {
+        vi.useFakeTimers();
+        const pending = sleepWithinRun(INTERACTIVE_REQUEST_POLICY, 5_000, 'https://api/x');
+        await vi.advanceTimersByTimeAsync(5_000);
+        await expect(pending).resolves.toBeUndefined();
+    });
+});
+
+describe('requestTimeoutSignal (#283)', () => {
+    it('bounds one request at GIT_REQUEST_TIMEOUT_MS', async () => {
+        vi.useFakeTimers();
+        const signal = requestTimeoutSignal();
+        expect(signal.aborted).toBe(false);
+
+        // Just short of the timeout it is still live — without this half the assertion below
+        // would pass against a signal that aborts immediately.
+        await vi.advanceTimersByTimeAsync(GIT_REQUEST_TIMEOUT_MS - 1);
+        expect(signal.aborted).toBe(false);
+
+        await vi.advanceTimersByTimeAsync(2);
+        // The gap this closes is silence, not slowness: a socket that connects and then stalls
+        // produces neither a response nor an error, so every RETRY budget in this module — each
+        // of which needs a COMPLETED attempt to count — simply never fires.
+        expect(signal.aborted).toBe(true);
+        expect((signal.reason as Error).name).toBe('TimeoutError');
     });
 });

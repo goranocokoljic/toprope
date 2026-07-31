@@ -6,6 +6,7 @@ import {
     UNATTRIBUTABLE_DATE_DROP_REASON,
 } from '../../../../src/connectors/git/providers/types';
 import {
+    INTERACTIVE_REQUEST_POLICY,
     MAX_SERVER_ERROR_RETRIES,
     PROBE_SERVER_ERROR_RETRIES,
     isRetryableGitFetchError,
@@ -640,7 +641,7 @@ describe('GitHubProvider', () => {
                     ),
                 put: vi.fn(),
             };
-            const cachingProvider = new GitHubProvider(CONFIG, cache);
+            const cachingProvider = new GitHubProvider(CONFIG, {diffstatCache: cache});
             const fetchMock = makeFetchMock([
                 {
                     body: [
@@ -732,7 +733,7 @@ describe('GitHubProvider', () => {
             // budget, then the in-run repo retry (where a truncated body heals), then #231.
             const put = vi.fn();
             const cache = {load: vi.fn().mockReturnValue(new Map()), put};
-            const cachingProvider = new GitHubProvider(CONFIG, cache);
+            const cachingProvider = new GitHubProvider(CONFIG, {diffstatCache: cache});
             const listRow = {
                 sha: 'aaa111',
                 commit: {
@@ -772,7 +773,7 @@ describe('GitHubProvider', () => {
             // unconditional again. Deleting it would silently disable the ratchet.
             const put = vi.fn();
             const cache = {load: vi.fn().mockReturnValue(new Map()), put};
-            const cachingProvider = new GitHubProvider(CONFIG, cache);
+            const cachingProvider = new GitHubProvider(CONFIG, {diffstatCache: cache});
             const listRow = {
                 sha: 'aaa111',
                 commit: {
@@ -811,7 +812,7 @@ describe('GitHubProvider', () => {
         it('DOES memoize a fully well-formed detail — the ratchet is intact', async () => {
             const put = vi.fn();
             const cache = {load: vi.fn().mockReturnValue(new Map()), put};
-            const cachingProvider = new GitHubProvider(CONFIG, cache);
+            const cachingProvider = new GitHubProvider(CONFIG, {diffstatCache: cache});
             vi.stubGlobal(
                 'fetch',
                 makeFetchMock([
@@ -1694,10 +1695,59 @@ describe('GitHubProvider', () => {
             expect(delays.every((d) => d <= 3_600_000)).toBe(true);
         });
 
+        it('skips the pre-emptive rate-limit pause for an interactive client (#283)', async () => {
+            // The third hour-long sleep, and the one a retry-count override alone would have
+            // missed: this fires after a 200, so it is neither a retry nor a failure. The
+            // caller that has forbidden waiting OUT a rate limit has equally forbidden waiting
+            // to AVOID one — inside the one HTTP request the repo picker is blocked on.
+            vi.useFakeTimers();
+            vi.setSystemTime(new Date('2026-07-28T10:00:00.000Z'));
+            const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+            const lowRemaining = {
+                ok: true,
+                status: 200,
+                headers: new Headers({
+                    'x-ratelimit-remaining': '3',
+                    // 30 minutes out, so a pause would be unmistakable in the delay list.
+                    'x-ratelimit-reset': String(
+                        Math.floor(Date.parse('2026-07-28T10:30:00.000Z') / 1000),
+                    ),
+                }),
+                json: () => Promise.resolve([]),
+                text: () => Promise.resolve(''),
+            } as unknown as Response;
+            vi.stubGlobal('fetch', vi.fn().mockResolvedValue(lowRemaining));
+
+            const interactive = new GitHubProvider(CONFIG, {policy: INTERACTIVE_REQUEST_POLICY});
+            const listPromise = interactive.listRepos();
+            await vi.runAllTimersAsync();
+            await listPromise;
+
+            const delays = setTimeoutSpy.mock.calls.map((c) => Number(c[1]));
+            expect(delays).not.toContain(1_800_000 + 1_000);
+            // Only the per-request abort timer is scheduled — nothing minute-scale.
+            expect(delays.every((d) => d <= 120_000)).toBe(true);
+
+            // POSITIVE CONTROL on the same response: a sync client DOES pause, so the
+            // assertions above cannot pass merely because the fixture stopped triggering it.
+            setTimeoutSpy.mockClear();
+            vi.setSystemTime(new Date('2026-07-28T10:00:00.000Z'));
+            const syncClient = new GitHubProvider(CONFIG);
+            const syncList = syncClient.listRepos();
+            await vi.runAllTimersAsync();
+            await syncList;
+            expect(setTimeoutSpy.mock.calls.map((c) => Number(c[1]))).toContain(1_800_000 + 1_000);
+        });
+
         it('checkAccess fails fast on a 5xx instead of inheriting the sync budget', async () => {
             vi.stubGlobal('fetch', vi.fn().mockResolvedValue(serverError(503)));
 
-            const pending = provider.checkAccess();
+            // Built with the INTERACTIVE policy, which is what every path reaching checkAccess
+            // now supplies (#283) — `doctor` and the admin test-connection route. The budget
+            // moved from a per-call argument to the client, so it is the client, not the
+            // method, that has to be interactive.
+            const probe = new GitHubProvider(CONFIG, {policy: INTERACTIVE_REQUEST_POLICY});
+            const pending = probe.checkAccess();
             void pending.catch(() => {});
             await vi.runAllTimersAsync();
 

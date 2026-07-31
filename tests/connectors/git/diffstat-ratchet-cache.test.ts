@@ -24,6 +24,7 @@ import {addTeam} from '../../../src/registry/teams';
 import {addDeveloper} from '../../../src/registry/developers';
 import {
     DIFFSTAT_CACHE_DEGRADED_PREFIX,
+    GIT_REPO_RETRY_DELAYS_MS,
     GitSync,
     isAdvisoryError,
     syncStateKey,
@@ -412,6 +413,20 @@ const PROVIDERS: ProviderCase[] = [
     },
 ];
 
+/**
+ * Each provider's repo COMMIT-LIST url, as distinct from its per-commit endpoint (#283).
+ *
+ * Anchored on the query string, which is what separates the two on GitHub
+ * (`/commits?per_page=…` vs `/commits/{sha}`); the other two use different path segments
+ * entirely. Kept beside {@link PROVIDERS} rather than inside the fetch stubs because the stubs
+ * log SHAS, and this is the one assertion that needs the raw urls.
+ */
+const LIST_PAGE_URL: Record<GitProviderType, RegExp> = {
+    bitbucket: /\/repositories\/test-ws\/repo1\/commits\?/,
+    github: /\/repos\/test-org\/repo1\/commits\?/,
+    gitlab: /\/repository\/commits\?/,
+};
+
 // --- Shared helpers ----------------------------------------------------------------------
 
 /** Runs one sync to completion, draining the request- and repo-level pauses on the fake clock. */
@@ -616,6 +631,48 @@ describe('#273 per-commit diffstat ratchet cache', () => {
                     .prepare('SELECT value FROM sync_state WHERE key = ?')
                     .get(syncStateKey(provider.type, provider.container)),
             ).toEqual({value: second.lastSyncTime});
+
+            db.close();
+        });
+    }
+
+    // --- #283: what a repo RETRY actually costs, stated exactly ---------------------------
+
+    for (const provider of PROVIDERS) {
+        it(`${provider.name}: an in-run repo retry re-pages the commit LIST but not the fan-out (#283)`, async () => {
+            // #272's own docs called an unresumable `getCommits` a residual — "a retry
+            // re-issues the repo's whole O(commits) detail fan-out" — and #283 is titled for
+            // closing it. It was in fact closed by #273: the memo is written per commit
+            // OUTSIDE the run transaction, so a retry pays only for what never succeeded.
+            //
+            // The sibling test above pins the fan-out half by sha. This pins the SHAPE of the
+            // retry, which is the claim #283's docs now make and which nothing else measures:
+            // the list IS re-paged once per attempt (so the claim is not overstated — it is
+            // O(pages + failures), not O(failures)), and the per-commit endpoint is NOT.
+            const db = makeDb();
+            seedAlice(db);
+            const log = makeLog();
+            // The LAST sha fails all run: the first four are memoized before the fault, so a
+            // retry that re-issued the fan-out would show four extra per-commit requests.
+            log.failing.add(SHAS[4]);
+            const fetchMock = provider.fetchFor(log);
+            vi.stubGlobal('fetch', fetchMock);
+
+            await runSync(db, provider.config);
+
+            const urls = fetchMock.mock.calls.map((c) => String(c[0]));
+            const listPages = urls.filter((u) => LIST_PAGE_URL[provider.type].test(u)).length;
+            // Attempt + the two GIT_REPO_RETRY_DELAYS_MS retries: three walks of the list.
+            expect(listPages).toBe(1 + GIT_REPO_RETRY_DELAYS_MS.length);
+            // The four commits that succeeded were fetched exactly once ACROSS all three
+            // attempts — the fan-out did not repeat.
+            for (const sha of SHAS.slice(0, 4)) expect(log.countAll(sha)).toBe(1);
+            // Only the never-successful commit was re-attempted — and it alone carries the
+            // request layer's own 5xx budget on top of each repo attempt, which is the other
+            // multiplier #283 bounds with a wall clock.
+            expect(log.countAll(SHAS[4])).toBe(
+                (1 + GIT_REPO_RETRY_DELAYS_MS.length) * (1 + MAX_SERVER_ERROR_RETRIES),
+            );
 
             db.close();
         });

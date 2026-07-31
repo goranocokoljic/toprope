@@ -7,6 +7,7 @@ import {runMigrations} from '../../src/storage/migrator';
 import {runDoctor, exactConfiguredRepos, findMissingRepos} from '../../src/cli/doctor';
 import {createProvider} from '../../src/connectors/git/providers/store';
 import {loadServerKey} from '../../src/connectors/git/providers/secret';
+import {INTERACTIVE_REQUEST_POLICY} from '../../src/connectors/git/providers/http-retry';
 import type {TopropeConfig} from '../../src/config/types';
 import type {GitProvider, GitProviderConfig} from '../../src/connectors/git/providers/types';
 
@@ -312,6 +313,12 @@ describe('runDoctor', () => {
             expect(allOutput).not.toContain('No git providers configured');
             expect(createGitProvider).toHaveBeenCalledWith(
                 expect.objectContaining({type: 'github', org: 'db-org'}),
+                // Interactive, not the sync budget (#283). One client serves BOTH of doctor's
+                // calls — the probe and the repo enumeration — so this single assertion is
+                // what stops `listRepos` from parking the command for ten minutes on a `503
+                // Retry-After: 3600`, or three hours on a 429. What the budget then does is
+                // pinned in `providers/request-policy.test.ts`.
+                {policy: INTERACTIVE_REQUEST_POLICY},
             );
             expect(result).toBe(true);
         } finally {
