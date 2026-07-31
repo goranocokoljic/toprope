@@ -11,6 +11,7 @@ import {
     gitProviderFixHint,
 } from '../../src/cli/doctor';
 import {createProvider} from '../../src/connectors/git/providers/store';
+import {createCommitDiffstatCache} from '../../src/connectors/git/diffstat-cache';
 import {loadServerKey} from '../../src/connectors/git/providers/secret';
 import {INTERACTIVE_REQUEST_POLICY} from '../../src/connectors/git/providers/http-retry';
 import type {TopropeConfig} from '../../src/config/types';
@@ -104,6 +105,40 @@ describe('runDoctor', () => {
         // not evidence of currency (the graduated #235 rule).
         expect(output.join('\n')).toContain('Git reset notice');
         expect(output.join('\n')).toContain('none pending');
+    });
+
+    // #286: the diffstat cache grows monotonically with distinct commits ever synced, is
+    // uncapped per commit, and is the first place this schema persists real source-tree paths
+    // from private repos. Nothing reported its size, so an operator had no way to know a purge
+    // was worth issuing — or that the table had become the largest in the database.
+    it('reports the diffstat cache size, and passes at every size', async () => {
+        const empty = await runDoctor(db, disabledConfig(), tmpConfigPath, MIGRATIONS_DIR);
+        expect(empty).toBe(true);
+        expect(output.join('\n')).toContain('commit_diffstats: 0 rows (nothing cached yet)');
+
+        output.length = 0;
+        createCommitDiffstatCache(db, 'github', 'org').put('api', 'sha1', {
+            additions: 4,
+            deletions: 1,
+            entries: [{path: 'src/a.ts', additions: 4, deletions: 1, status: 'modified'}],
+            absent: false,
+        });
+        createCommitDiffstatCache(db, 'github', 'org').put('api', 'sha2', {
+            additions: 0,
+            deletions: 0,
+            entries: [],
+            absent: true,
+        });
+
+        // Informational, never a failure: there is no size at which the cache is WRONG. It is
+        // an immutable memo, never consulted for freshness, and emptying it costs only
+        // re-fetching — so there is no threshold to fail on and no fix to prescribe.
+        const populated = await runDoctor(db, disabledConfig(), tmpConfigPath, MIGRATIONS_DIR);
+        expect(populated).toBe(true);
+        const combined = output.join('\n');
+        expect(combined).toContain('Diffstat cache');
+        expect(combined).toContain('commit_diffstats: 2 rows (1 absent)');
+        expect(errors.join('\n')).not.toContain('Diffstat cache');
     });
 
     it('FAILS while a migration reset is unacknowledged', async () => {

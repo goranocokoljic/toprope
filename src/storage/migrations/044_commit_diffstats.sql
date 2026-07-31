@@ -69,7 +69,13 @@
 -- whole window and re-asked. The remedy is that this table is disposable: deleting the
 -- affected rows (or the container's whole set) makes the next sync re-fetch them.
 --     DELETE FROM commit_diffstats WHERE provider = ? AND container = ?;   -- and/or AND repo = ?
--- The provider delete cascade (#264) issues exactly that statement for its container.
+-- Since #286 that statement has an operator surface and does NOT require opening sqlite3
+-- against the production database:
+--     toprope git cache clear [--provider <t>] [--container <c>] [--repo <r>]
+-- with every flag optional and composing (omitting one widens the scope). `toprope doctor`
+-- reports the table's row count, its share of `absent` markers and the bytes its `entries`
+-- occupy, which is the signal that says whether a purge is worth issuing.
+-- The provider delete cascade (#264) issues the same DELETE for its container.
 --
 -- THIS TABLE IS PART OF THE GIT-DATA RESET CONTRACT — a future reset MUST clear it. Migrations
 -- 042 and 043 established the project's remedy for wrong git data: empty `git_snapshots` /
@@ -92,7 +98,7 @@
 -- taken deliberately: the file-level entries are what `code_churn_rate` and `ai_signature_score`
 -- are computed from, and a deployment that cannot accept storing them should not enable git
 -- analysis at all. Excluding a repo after the fact stops it being listed; it does NOT retract
--- rows already cached — use the DELETE above.
+-- rows already cached — run `toprope git cache clear --repo <name>` (#286).
 
 CREATE TABLE IF NOT EXISTS commit_diffstats (
     -- Provider family. Closed set, DB-enforced — same vocabulary as git_providers.

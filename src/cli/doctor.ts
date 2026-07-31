@@ -10,6 +10,7 @@ import {INTERACTIVE_REQUEST_POLICY} from '../connectors/git/providers/http-retry
 import {GIT_CATCHUP_WINDOW_MAX_DAYS, loadGitSyncHealth} from '../connectors/git/sync';
 import type {GitProvider, GitProviderConfig} from '../connectors/git/providers/types';
 import {gitResetNotice, gitResetNoticeMessage} from '../connectors/git/reset-notice';
+import {diffstatCacheSummary} from './git-cache';
 import {trimTrailingSlash} from '../summaries/model-client';
 
 interface CheckResult {
@@ -683,6 +684,22 @@ function checkGitResetNotice(db: Database.Database): CheckResult {
     );
 }
 
+/**
+ * Report how large the per-commit diffstat cache has grown (#286).
+ *
+ * INFORMATIONAL — it always passes, and that is the right shape. There is no size at which
+ * the cache is wrong: it holds an immutable memo of an idempotent remote read, it is never
+ * consulted for freshness, and it can be emptied at any moment with no data loss (the cost is
+ * re-fetching). So there is no threshold to fail on and no fix to prescribe. What was missing
+ * was the SIGNAL: the table grows monotonically with distinct commits ever synced, is uncapped
+ * per commit, and is the first place this schema persists real source-tree paths from private
+ * repos — and nothing said how big it was. `toprope git cache clear` is how an operator acts
+ * on what this line tells them.
+ */
+function checkDiffstatCache(db: Database.Database): CheckResult {
+    return pass('Diffstat cache', diffstatCacheSummary(db));
+}
+
 async function checkSummaryModel(config: TopropeConfig): Promise<CheckResult> {
     const {summaries} = config;
     if (!summaries?.enabled) {
@@ -811,6 +828,7 @@ export async function runDoctor(
     checks.push(await checkCursorKey(config));
     checks.push(...(await checkGitProviders(db, config)));
     checks.push(checkGitResetNotice(db));
+    checks.push(checkDiffstatCache(db));
     checks.push(await checkSummaryModel(config));
 
     let allPassed = true;

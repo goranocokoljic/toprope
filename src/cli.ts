@@ -29,6 +29,7 @@ import {CursorSync} from './connectors/cursor/sync';
 import {GitSync} from './connectors/git/sync';
 import {replayDeveloper} from './connectors/git/projection';
 import {setHistoryFloor} from './cli/git-history-floor';
+import {clearDiffstatCache} from './cli/git-cache';
 import {clearGitResetNotice, gitResetNotice} from './connectors/git/reset-notice';
 import {runPipeline} from './scheduler/sync-pipeline';
 import {importCsv} from './expenses/importer';
@@ -902,6 +903,50 @@ gitCommand
         } finally {
             db.close();
         }
+    });
+
+const gitCacheCommand = gitCommand
+    .command('cache')
+    .description('Inspect and clear the per-commit diffstat cache (#273)');
+
+gitCacheCommand
+    .command('clear')
+    .description(
+        'Clear cached per-commit diffstats (#286). The cache freezes a provider\'s answer ' +
+            'per (provider, container, repo, sha), and migration 044 documents three cases ' +
+            'where that answer can stop being a fact about the commit: a 404 that meant "you ' +
+            'may not see this" rather than "this has no diffstat", a 404 on page 2+ of a paged ' +
+            'diff, and a 200 silently truncated by a proxy. Clearing is how you act on those, ' +
+            'and on a repo added to exclude_repos after its file inventory was already cached. ' +
+            'Every flag is optional and they compose — omitting one widens the scope, so with ' +
+            'NO flags this clears the whole cache. That is safe: the rows are a memo of an ' +
+            'immutable remote fact, so the only cost of clearing is that the next sync ' +
+            're-fetches those commits (one API call each — the expensive phase of a sync). Run ' +
+            '"toprope doctor" first to see how much is cached.',
+    )
+    .option('--provider <type>', 'Only this provider family (github, bitbucket, gitlab)')
+    .option('--container <name>', 'Only this container: org (github) / workspace (bitbucket) / group (gitlab). Case-insensitive.')
+    .option('--repo <name>', 'Only this repo, spelled exactly as the provider does (GitHub name, Bitbucket slug, GitLab path_with_namespace). Case-SENSITIVE.')
+    .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
+    .action((options: {provider?: string; container?: string; repo?: string; config: string}) => {
+        const configPath = path.resolve(process.cwd(), options.config);
+        const config = loadConfig(configPath);
+        const dbPath = path.resolve(process.cwd(), config.storage.sqlite_path);
+        const db = openDb(dbPath);
+        let failed = false;
+        try {
+            runMigrations(db, MIGRATIONS_DIR);
+            const result = clearDiffstatCache(db, options);
+            if (result.ok) {
+                console.log(`[git] ${result.message}`);
+            } else {
+                console.error(`[git] ${result.message}`);
+                failed = true;
+            }
+        } finally {
+            db.close();
+        }
+        if (failed) process.exit(1);
     });
 
 const expensesCommand = program.command('expenses').description('Manage expense and subscription data');

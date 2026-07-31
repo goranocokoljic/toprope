@@ -22,9 +22,29 @@
  * would be caused by the optimisation that exists to make losing one cheaper. A memo that can
  * kill the run it is accelerating is worse than no memo. Every failure here degrades to
  * exactly one re-fetch on the next run.
+ *
+ * ── AND NEITHER MAY MONOPOLISE THE EVENT LOOP (#286) ──────────────────────────
+ * `load` runs in the process that also serves Fastify, and its input is a WHOLE repo's
+ * commit window: on a monorepo that is tens of thousands of shas, each costing a row decode
+ * and a `JSON.parse` of an uncapped file list. Done in one synchronous burst that is a
+ * multi-second stall of every in-flight dashboard request, at the start of every repo. So
+ * the batched read is `async` and yields to the event loop BETWEEN chunks — the batching
+ * win (one query per {@link READ_CHUNK_SIZE} shas rather than one per commit) is untouched,
+ * because the yield sits between queries, not inside one. A single-chunk read — every probe,
+ * every small repo, every test below the chunk size — yields not at all and is exactly as it
+ * was.
+ *
+ * `put` is deliberately NOT batched, and that is a decision rather than an omission. Every
+ * `put` is reached only on a cache MISS, i.e. immediately after the per-commit HTTP round
+ * trip that the whole table exists to avoid repeating — so its implicit transaction is
+ * already amortised over a network fetch that costs orders of magnitude more than the fsync.
+ * Buffering it would trade this module's load-bearing "immediately and durably" property
+ * (see {@link CommitDiffstatCache.put}: the row must survive a run that fails a moment later)
+ * for a saving that is noise against the fetch it follows.
  */
 
 import type Database from 'better-sqlite3';
+import {setImmediate as setImmediateReal} from 'node:timers';
 import {normalizeContainer} from './providers/container.js';
 import {chunk, READ_CHUNK_SIZE} from './raw-author-daily.js';
 import type {
@@ -48,6 +68,29 @@ interface DiffstatRow {
     deletions: unknown;
     absent: unknown;
     entries: unknown;
+}
+
+/**
+ * Hand the event loop one full turn (#286).
+ *
+ * `setImmediate` specifically: it schedules into the CHECK phase, so the poll phase in
+ * between gets to run every pending socket callback — which is the entire point, since the
+ * process this blocks is the one serving Fastify. `process.nextTick` and `queueMicrotask`
+ * both drain before the loop advances and would yield nothing to a waiting request.
+ *
+ * Taken from `node:timers` rather than the global, which is NOT incidental. A fake-timer
+ * harness replaces the global `setImmediate` with one that only fires when the test advances
+ * its clock — and this is not a delay, it is a turn of a loop that turns on its own. Bound to
+ * the global, any test that froze time and then read a repo wider than one chunk would
+ * deadlock: the optimisation that exists to keep the process responsive would be the thing
+ * that hangs it. There is no behaviour here a test could want to schedule; the only thing
+ * faking it can produce is that hang. The `node:timers` binding is the real one either way,
+ * so production and test take the identical path.
+ */
+function yieldToEventLoop(): Promise<void> {
+    return new Promise<void>((resolve) => {
+        setImmediateReal(resolve);
+    });
 }
 
 /** A non-negative integer, as every stored count must be. Narrows `unknown`. */
@@ -207,7 +250,7 @@ export function createCommitDiffstatCache(
     return {
         faults: () => faults,
 
-        load(repo: string, shas: readonly string[]): Map<string, CommitDiffstat> {
+        async load(repo: string, shas: readonly string[]): Promise<Map<string, CommitDiffstat>> {
             const hits = new Map<string, CommitDiffstat>();
             if (repo === '') return hits;
             // De-duped so a repeated sha cannot inflate a chunk past the parameter limit, and
@@ -220,7 +263,15 @@ export function createCommitDiffstatCache(
             );
             if (distinct.length === 0) return hits;
             try {
-                for (const part of chunk(distinct, READ_CHUNK_SIZE)) {
+                const parts = chunk(distinct, READ_CHUNK_SIZE);
+                for (const [index, part] of parts.entries()) {
+                    // BETWEEN chunks, never before the first and never after the last (#286):
+                    // a single-chunk read must stay exactly as cheap as it was, and a trailing
+                    // yield would only delay the caller. `setImmediate` rather than a microtask
+                    // — `await Promise.resolve()` drains the microtask queue without ever
+                    // reaching the poll phase, so it would keep the loop just as blocked while
+                    // looking like it yielded.
+                    if (index > 0) await yieldToEventLoop();
                     const rows = db
                         .prepare(
                             `SELECT sha, additions, deletions, absent, entries
@@ -313,7 +364,135 @@ export function deleteContainerDiffstats(
     providerType: GitProviderType,
     container: string,
 ): number {
-    return db
-        .prepare('DELETE FROM commit_diffstats WHERE provider = ? AND container = ?')
-        .run(providerType, normalizeContainer(container)).changes;
+    return deleteDiffstats(db, {provider: providerType, container});
+}
+
+/**
+ * Which rows a purge is aimed at. Every member is OPTIONAL and they compose: omitting one
+ * widens the scope over that column, so `{}` is "the whole table" and `{provider, container}`
+ * is exactly what the #264 cascade retracts.
+ *
+ * A scope is a set of EQUALITY predicates only — no patterns, no ranges. `commit_diffstats`
+ * has no column an operator could sensibly express a range over (`fetched_at` is provenance,
+ * explicitly never consulted for freshness — see migration 044), and a LIKE would let one
+ * mistyped `%` empty a monorepo's whole cache while reading as a narrow command.
+ */
+export interface DiffstatScope {
+    /** Provider family. Already narrowed to the closed set by the type. */
+    provider?: GitProviderType;
+    /**
+     * The provider INSTANCE. Normalized here with the shared {@link normalizeContainer}, the
+     * same function the write boundary uses, so the value compared IS the value persisted
+     * (the graduated #255 rule) — `--container " ACME "` matches the rows `acme` stored.
+     */
+    container?: string;
+    /**
+     * The repo, spelled EXACTLY as the provider's fetch path spells it (GitHub name,
+     * Bitbucket slug, GitLab path_with_namespace). Deliberately NOT casefolded, unlike
+     * `container`: repo identifiers are case-sensitive on all three providers, so folding
+     * would make one command match rows the write path can never produce, and — worse — make
+     * `--repo Api` silently purge `api` as well.
+     */
+    repo?: string;
+}
+
+/**
+ * The one WHERE builder every diffstat purge goes through, so the cascade, the CLI and any
+ * future caller cannot drift on how a scope is spelled (the graduated "reuse the canonical
+ * helper" rule). Returns a clause that is `''` for the empty scope — a whole-table purge,
+ * which is a supported operation here precisely because the table is disposable (migration
+ * 044: "any future migration or command that resets git data must add DELETE FROM
+ * commit_diffstats").
+ */
+function scopeClause(scope: DiffstatScope): {where: string; params: string[]} {
+    const conditions: string[] = [];
+    const params: string[] = [];
+    if (scope.provider !== undefined) {
+        conditions.push('provider = ?');
+        params.push(scope.provider);
+    }
+    if (scope.container !== undefined) {
+        conditions.push('container = ?');
+        params.push(normalizeContainer(scope.container));
+    }
+    if (scope.repo !== undefined) {
+        conditions.push('repo = ?');
+        params.push(scope.repo);
+    }
+    return {where: conditions.length > 0 ? ` WHERE ${conditions.join(' AND ')}` : '', params};
+}
+
+/**
+ * Drop every cached diffstat matching `scope`, and return how many rows went.
+ *
+ * This is the operator surface migration 044 names as the remedy for the three residual
+ * cases it accepts (a permission-revocation 404 frozen as "no diffstat exists", a 404 on
+ * page >= 2 of a paged diff, a silently truncated 200) and for a repo excluded after the
+ * fact — until #286 the ONLY caller of that DELETE was the #264 provider delete cascade, so
+ * acting on a residual meant opening `sqlite3` against the production database.
+ *
+ * Deleting is always SAFE and never loses data: the rows are a memo of an idempotent remote
+ * read of an immutable fact, sitting strictly upstream of the accumulator, so the cost of an
+ * over-broad purge is re-fetching and nothing else. That asymmetry is why this takes a scope
+ * rather than refusing the unscoped call.
+ *
+ * Allowed to throw, like {@link deleteContainerDiffstats} and unlike the cache methods: its
+ * callers are a transaction that must roll back as a unit and a CLI command that must report
+ * a failure rather than print a false row count.
+ */
+export function deleteDiffstats(db: Database.Database, scope: DiffstatScope): number {
+    const {where, params} = scopeClause(scope);
+    return db.prepare(`DELETE FROM commit_diffstats${where}`).run(...params).changes;
+}
+
+/** What one scope of the cache currently occupies. See {@link countDiffstats}. */
+export interface DiffstatCacheSize {
+    /** Rows cached — one per distinct `(provider, container, repo, sha)` ever fetched. */
+    rows: number;
+    /** How many of those are the explicit "the provider has no diffstat for this commit" marker. */
+    absent: number;
+    /**
+     * Bytes of stored `entries` JSON — the file-path payload only, excluding keys, indexes
+     * and page overhead. An approximation of the table's footprint, and the number that
+     * actually grows: `entries` is uncapped by design and is the first column in this schema
+     * to persist real source-tree paths from private repos (migration 044, DATA SCOPE).
+     */
+    entryBytes: number;
+}
+
+/**
+ * How big the diffstat cache is, optionally within one {@link DiffstatScope}.
+ *
+ * Reported by `toprope doctor` (#286). Before it, nothing in the product said how many rows
+ * this table held or what they occupied, while the table grows monotonically with distinct
+ * commits ever synced and is uncapped per commit — plausibly the largest table in the
+ * database, with no signal.
+ *
+ * `absent` is broken out because it answers a different question from the total: those rows
+ * are the deterministic 404s, and a share of them far above a few percent means something
+ * other than merge/initial commits is 404ing — which is exactly residual #1 (access revoked
+ * mid-walk, frozen as an answer) and exactly what a purge is for.
+ *
+ * A full scan: no index covers `absent`, and none should — see migration 044's note on why
+ * this table carries no secondary index. It runs once per `toprope doctor`, never in a sync.
+ */
+export function countDiffstats(db: Database.Database, scope: DiffstatScope = {}): DiffstatCacheSize {
+    const {where, params} = scopeClause(scope);
+    const row = db
+        .prepare(
+            `SELECT COUNT(*) AS rows,
+                    COALESCE(SUM(absent), 0) AS absent,
+                    COALESCE(SUM(length(entries)), 0) AS entry_bytes
+               FROM commit_diffstats${where}`,
+        )
+        .get(...params) as {rows: unknown; absent: unknown; entry_bytes: unknown};
+    // Narrowed rather than cast, for the same reason `decodeRow` narrows: `absent` and
+    // `entries` have no constraint SQLite enforces against a REAL, so SUM() over them can
+    // legitimately return a non-integer. A size report that cannot be trusted is reported as
+    // zero rather than propagated as a fractional row count.
+    return {
+        rows: isCount(row.rows) ? row.rows : 0,
+        absent: isCount(row.absent) ? row.absent : 0,
+        entryBytes: isCount(row.entry_bytes) ? row.entry_bytes : 0,
+    };
 }
