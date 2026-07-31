@@ -2,12 +2,21 @@
  * #283 — the request POLICY every provider client carries: caller-intent retry budgets and the
  * run's wall clock.
  *
- * Table-driven over all three provider types, deliberately. The three fetch loops are
- * near-identical clones (collapsing them is #284), so a per-provider copy of these cases would
- * be the third copy of a third copy — and the failure mode that actually matters is one
- * provider being MISSED when the policy changes. Every case below therefore runs against every
- * type that `createGitProvider` builds, exactly as `diffs-contract.test.ts` does for
+ * Table-driven over all three provider types, deliberately — and MORE load-bearing since #284,
+ * not less. Bitbucket and GitLab now share one loop (`fetchWithGitRetry`), but GitHub keeps its
+ * own, so the failure mode that actually matters has sharpened: a policy change made in the
+ * shared loop alone silently leaves `github.ts` behind. Every case below therefore runs against
+ * every type that `createGitProvider` builds, exactly as `diffs-contract.test.ts` does for
  * `GitCommit.diffs`.
+ *
+ * WHAT THIS TABLE ACTUALLY PROVES, stated because the claim was previously over-read (#284
+ * review cycle 2, SO-2/OR-3): most cases assert a request COUNT and a message shape, which
+ * catches a missing branch or a wrong budget but NOT a wrong delay. Every 429/403 fixture here
+ * also supplies `retry-after` or a future reset, and `rateLimitDelayMs` prefers an advertised
+ * value over the fallback — so the fallback SCHEDULE was invisible to this table until the
+ * no-`retry-after` case below was added for it. Read the guarantee as: branch presence, retry
+ * budgets, deadline handling, message shape, and the rate-limit fallback rungs. Not the 5xx
+ * schedule, which is still pinned only in `http-retry.test.ts` as a pure function.
  *
  * `listRepos()` is the call under test throughout, because it is the one #283 changed: the
  * pre-#283 interactive budget was a per-CALL argument only `checkAccess` passed, so this method
@@ -127,6 +136,36 @@ describe.each(CASES)('$type request policy (#283)', ({type, config, serverErrorM
                 new RegExp(`Rate limit exceeded after ${MAX_RATE_LIMIT_RETRIES} retries`),
             );
             expect(fetchMock.mock.calls).toHaveLength(1 + MAX_RATE_LIMIT_RETRIES);
+        });
+    });
+
+    describe('rate-limit fallback schedule', () => {
+        it('escalates the rate-limit fallback on a 429 carrying NO headers (60s ... 180s rungs)', async () => {
+            // The case #284 review cycle 2 added to make this table's guarantee true for the
+            // backoff SCHEDULE, not just for branch presence and retry counts. Every other
+            // 429/403 fixture here supplies `retry-after` or a future reset, and
+            // `rateLimitDelayMs` prefers an advertised value over the fallback — so before this,
+            // a change to the fallback rungs landed in one loop passed the whole table.
+            //
+            // Run across all three types precisely because GitHub keeps its own loop: this is
+            // the shape of drift that goes unnoticed.
+            vi.useFakeTimers();
+            const timer = vi.spyOn(globalThis, 'setTimeout');
+            stubStatus(429);
+
+            const pending = createGitProvider(config).listRepos();
+            void pending.catch(() => {});
+            await vi.runAllTimersAsync();
+            await expect(pending).rejects.toThrow(/Rate limit exceeded/);
+
+            const delays = timer.mock.calls.map((c) => Number(c[1]));
+            // 60_000 and 180_000 only — NOT the middle rung. `rateLimitFallbackMs(1)` is
+            // 120_000, which is also GIT_REQUEST_TIMEOUT_MS and SERVER_ERROR_MAX_DELAY_MS, so
+            // asserting it would pass unconditionally on the per-attempt request timer. These
+            // two rungs collide with no other timer in the module, so they can only come from
+            // the rate-limit fallback.
+            expect(delays).toContain(60_000);
+            expect(delays).toContain(180_000);
         });
     });
 

@@ -17,17 +17,7 @@ import type {
 import {normalizeContainer} from './container.js';
 import {loadDiffstats, resolveCommitDiffstat} from './diffstat.js';
 import type {GitRequestPolicy} from './http-retry.js';
-import {
-    GitProviderFetchError,
-    SYNC_REQUEST_POLICY,
-    assertRunTimeRemaining,
-    parseEpochResetMs,
-    rateLimitDelayMs,
-    rateLimitFallbackMs,
-    requestTimeout,
-    serverErrorDelayMs,
-    sleepWithinRun,
-} from './http-retry.js';
+import {SYNC_REQUEST_POLICY, fetchWithGitRetry} from './http-retry.js';
 
 const DEFAULT_BASE_URL = 'https://gitlab.com/api/v4';
 const PER_PAGE = 100;
@@ -42,101 +32,17 @@ function buildAuthHeaders(auth: GitLabProviderConfig['auth']): Record<string, st
     return {Authorization: `Bearer ${auth.token}`};
 }
 
-async function fetchGitLab(
+/**
+ * GitLab's binding of the shared retry loop (#284). The loop itself — including the
+ * `ratelimit-reset` handling this provider needs — lives in `http-retry.ts`; only the label
+ * is ours.
+ */
+function fetchGitLab(
     url: string,
     headers: Record<string, string>,
-    // The retry budgets and run deadline the CLIENT was built with (#283) — see the identical
-    // parameter on `fetchGitHub` for why this replaced a per-call transient-only override, and
-    // for why it carries no default.
     policy: GitRequestPolicy,
 ): Promise<Response> {
-    let attempt = 0;
-    // Transient faults (5xx, transport) get their own, much longer budget than the 429 path —
-    // see http-retry.ts. Counted separately so one class of fault cannot spend the other's
-    // allowance.
-    let transientRetries = 0;
-
-    // `for (;;)`: the two budgets above are counted separately, so no single loop guard can
-    // express both, and every branch below either `continue`s or throws (#272).
-    for (;;) {
-        // Per ATTEMPT, not only before a pause — see `fetchGitHub` (#283).
-        assertRunTimeRemaining(policy, url);
-        let res: Response;
-        // Disarmed in `finally` the moment `fetch` settles — the signal bounds the RESPONSE,
-        // never the body the caller reads afterwards. See GIT_REQUEST_TIMEOUT_MS (#283).
-        const timeout = requestTimeout();
-        try {
-            res = await fetch(url, {headers, signal: timeout.signal});
-        } catch (err) {
-            // A transport fault is the same outage as a 503, seen one layer down — same budget,
-            // same backoff. Wrapped so the in-run repo retry (#272) can classify it; the message
-            // is preserved verbatim. A GIT_REQUEST_TIMEOUT_MS abort lands here too (#283).
-            // Disarmed BEFORE the minutes-long backoff, not just by the `finally` — see the
-            // identical note in `github.ts` (#283 review).
-            timeout.clear();
-            if (transientRetries < policy.retries.transient) {
-                await sleepWithinRun(policy, serverErrorDelayMs(transientRetries, null), url);
-                transientRetries++;
-                continue;
-            }
-            throw new GitProviderFetchError(
-                err instanceof Error ? err.message : String(err),
-                null,
-                {cause: err},
-            );
-        } finally {
-            // Idempotent, so clearing twice is safe; this stays the one guarantee no path
-            // leaves a signal armed over an unread body.
-            timeout.clear();
-        }
-
-        if (res.status === 429) {
-            // `RateLimit-Reset` is an absolute EPOCH instant, not a delta like `Retry-After`
-            // (#272). Both were previously fed to the same `parseFloat(…) * 1_000`, so the
-            // reset became ~1.8e12 ms — past setTimeout's 32-bit limit, which Node clamps to
-            // 1 ms. The pause meant to outlast the limit became an instant retry, and GitLab
-            // was hammered while already rate-limiting us. Parsed by kind now.
-            const resetMs = parseEpochResetMs(res.headers.get('ratelimit-reset'));
-            if (attempt < policy.retries.rateLimit) {
-                await sleepWithinRun(
-                    policy,
-                    rateLimitDelayMs(
-                        res.headers.get('retry-after'),
-                        resetMs ?? rateLimitFallbackMs(attempt),
-                    ),
-                    url,
-                );
-                attempt++;
-                continue;
-            }
-            throw new GitProviderFetchError(
-                `Rate limit exceeded after ${policy.retries.rateLimit} retries: ${url}`,
-                429,
-            );
-        }
-
-        if (res.status >= 500) {
-            if (transientRetries < policy.retries.transient) {
-                await sleepWithinRun(
-                    policy,
-                    serverErrorDelayMs(transientRetries, res.headers.get('retry-after')),
-                    url,
-                );
-                transientRetries++;
-                continue;
-            }
-            throw new GitProviderFetchError(
-                `GitLab API server error ${res.status}: ${url}`,
-                res.status,
-            );
-        }
-
-        if (!res.ok) {
-            throw new GitProviderFetchError(`GitLab API error ${res.status}: ${url}`, res.status);
-        }
-
-        return res;
-    }
+    return fetchWithGitRetry(url, headers, 'GitLab', policy);
 }
 
 function parseDiffHunks(diff: string): {additions: number; deletions: number} {

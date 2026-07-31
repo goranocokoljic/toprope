@@ -30,6 +30,7 @@ import {
     requestTimeout,
     serverErrorDelayMs,
     sleepWithinRun,
+    usableResetMs,
 } from './http-retry.js';
 
 const BASE_URL = 'https://api.github.com';
@@ -89,6 +90,29 @@ function globMatch(pattern: string, str: string): boolean {
     return new RegExp(`^${regexStr}$`, 'i').test(str);
 }
 
+/**
+ * GitHub's own retry loop — the one the #284 collapse deliberately left out.
+ *
+ * It stays separate because of two branches its siblings do not have: the 403 primary/secondary
+ * rate limit below, and the pre-emptive `x-ratelimit-remaining` pause after a 200. Folding those
+ * into the shared loop would mean adding hooks for cases only one caller reaches.
+ *
+ * THE COST OF THAT, stated here rather than left to be discovered: the transport-fault catch, the
+ * 429 branch, the 5xx branch and the `!res.ok` throw below all restate the same policy as
+ * {@link fetchWithGitRetry}, so a change to any of them must be made in both places. This file is
+ * the copy that gets forgotten, which is why the reset rule the 429 and 403 branches share with
+ * the other loop lives in one place — {@link usableResetMs} — rather than inline at each site.
+ *
+ * The only genuine divergence is the header NAME: GitHub spells its reset `x-ratelimit-reset`,
+ * GitLab the un-prefixed `ratelimit-reset`. The 403 branch below is the real extra surface.
+ *
+ * WHAT GUARDS THIS, precisely — `tests/connectors/git/providers/request-policy.test.ts` is
+ * `describe.each` over all three provider types, so it catches a change to branch PRESENCE,
+ * retry BUDGETS, deadline handling and message shape that lands only in the shared loop. It does
+ * not by itself catch a change to the backoff SCHEDULE; the no-`retry-after` 429 case added
+ * there in #284 covers the rate-limit fallback rungs specifically. Do not read the table as
+ * proving more than that.
+ */
 async function fetchGitHub(
     url: string,
     headers: Record<string, string>,
@@ -146,10 +170,22 @@ async function fetchGitHub(
         }
 
         if (res.status === 429) {
+            // GitHub signals the PRIMARY rate limit as either 403 or 429, and on a 429 the reset
+            // instant is the only thing that says when the wall comes down — `Retry-After` is a
+            // delta GitHub sends for the secondary/abuse limit, not for this one. Reading it
+            // here rather than guessing 60s/120s/180s into a window that can be most of an hour:
+            // four requests inside six minutes, then `Rate limit exceeded after 3 retries`, is a
+            // repo failure the run cannot recover from (a 429 is not repo-retryable, by design —
+            // see `isRetryableGitFetchError`), so #231 discards the run and holds the cursor.
+            // `Retry-After` still wins where present, exactly as in the shared loop.
+            const resetMs = usableResetMs(res.headers.get('x-ratelimit-reset'));
             if (attempt < policy.retries.rateLimit) {
                 await sleepWithinRun(
                     policy,
-                    rateLimitDelayMs(res.headers.get('retry-after'), rateLimitFallbackMs(attempt)),
+                    rateLimitDelayMs(
+                        res.headers.get('retry-after'),
+                        resetMs ?? rateLimitFallbackMs(attempt),
+                    ),
                     url,
                 );
                 attempt++;
@@ -163,13 +199,29 @@ async function fetchGitHub(
 
         if (res.status === 403) {
             const remaining = res.headers.get('x-ratelimit-remaining');
-            const resetMs = parseEpochResetMs(res.headers.get('x-ratelimit-reset'));
+            const resetHeader = res.headers.get('x-ratelimit-reset');
+            // TWO questions about ONE header, and only this site asks both. CLASSIFICATION —
+            // "was the header there at all", which decides whether this 403 is the primary limit
+            // — must stay `parseEpochResetMs`, because an elapsed reset is still proof of a
+            // primary limit and demoting it to the secondary branch would drop the retry
+            // entirely. DELAY is the different question `usableResetMs` answers (#284).
+            const resetMs = parseEpochResetMs(resetHeader);
+            const schedulableResetMs = usableResetMs(resetHeader);
             const retryAfter403 = res.headers.get('retry-after');
-            // Primary rate limit: x-ratelimit-remaining=0 with reset time. `+ 1_000` so the
+            // Primary rate limit: x-ratelimit-remaining=0 with a reset time. `+ 1_000` so the
             // retry lands just AFTER the reset instant rather than exactly on it.
             if (remaining === '0' && resetMs !== null) {
                 if (attempt < policy.retries.rateLimit) {
-                    await sleepWithinRun(policy, rateLimitDelayMs(null, resetMs + 1_000), url);
+                    await sleepWithinRun(
+                        policy,
+                        rateLimitDelayMs(
+                            null,
+                            schedulableResetMs !== null
+                                ? schedulableResetMs + 1_000
+                                : rateLimitFallbackMs(attempt),
+                        ),
+                        url,
+                    );
                     attempt++;
                     continue;
                 }
@@ -220,8 +272,11 @@ async function fetchGitHub(
         // sleep to the reset instant here, up to MAX_RATE_LIMIT_DELAY_MS, inside the one
         // request a human is waiting on. A caller that has forbidden waiting out a rate limit
         // has equally forbidden waiting to avoid one.
+        // `usableResetMs` and nothing else here, unlike the 403 branch: this pause has no
+        // classification job, so an elapsed reset just means there is nothing left to wait out
+        // and skipping is the right answer (#284).
         const remaining = res.headers.get('x-ratelimit-remaining');
-        const resetMs = parseEpochResetMs(res.headers.get('x-ratelimit-reset'));
+        const resetMs = usableResetMs(res.headers.get('x-ratelimit-reset'));
         if (
             policy.retries.rateLimit > 0 &&
             remaining !== null &&

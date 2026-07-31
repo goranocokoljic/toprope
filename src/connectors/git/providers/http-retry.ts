@@ -8,16 +8,15 @@
  * must not advance the cursor — see `ProviderFetchResult.complete`). This module owns the
  * one 5xx policy the three share so they cannot drift apart again.
  *
- * It is a policy + typed-error module, not a `fetchWithRetry` wrapper. That is the right shape
- * for GitHub, whose loop genuinely differs — it alone handles a 403 primary/secondary rate limit
- * and pre-emptively pauses on `x-ratelimit-remaining`. It is a WEAKER argument for the other
- * two: after #272, `fetchBitbucket` and `fetchGitLab` differ only in their message prefix and
- * GitLab's `ratelimit-reset` fallback, so they are near-identical clones of each other and the
- * next policy change has to be made in both (#272 review cycle 2, OR-3). Everything a change
- * could get WRONG — the two budgets, both delay schedules, the header parsing, the typed error —
- * now lives here, which bounds the damage; collapsing the two remaining loop bodies into one
- * `fetchWithGitRetry(url, headers, {label, rateLimitFallback})` is a follow-up worth doing, not
- * something to attempt in the same change that moved the policy.
+ * It is a policy + typed-error module AND — since #284 — the one retry LOOP that Bitbucket and
+ * GitLab share ({@link fetchWithGitRetry}). GitHub keeps its own loop, and that asymmetry is
+ * deliberate rather than unfinished work: `fetchGitHub` alone handles a 403 primary/secondary
+ * rate limit and pre-emptively pauses on `x-ratelimit-remaining`, so absorbing it would mean
+ * adding hooks for branches its two siblings do not have. The residual cost is real and named at
+ * `fetchGitHub` itself — its transport, 5xx and `!res.ok` branches restate this module's policy
+ * and must be changed in lockstep with it. `request-policy.test.ts` guards branch presence,
+ * budgets, deadlines and message shape across all three; read that file's header for what it
+ * does NOT prove, rather than assuming it covers every kind of drift.
  *
  * SCOPE. This is the canonical `Retry-After` / backoff policy for the three GIT PROVIDERS
  * only. The tool connectors (`connectors/copilot`, `claude-code`, `windsurf`, `cursor`,
@@ -262,9 +261,13 @@ export const INTERACTIVE_REQUEST_POLICY: GitRequestPolicy = {
  *   unlikely — it sleeps up to {@link MAX_RATE_LIMIT_DELAY_MS} AFTER a 200 and then returns the
  *   response, so any pause over two minutes would have handed back a destroyed body.
  *
- * Bounding the body read as well would mean reading it inside the retry loop, which is the
- * `fetchWithGitRetry(url, headers)` consolidation tracked in #284. Until then the body read is
- * bounded by undici's own `bodyTimeout` (300 s of inactivity), exactly as it was before #283.
+ * Bounding the body read as well would mean reading it inside the retry loop. #284 collapsed two
+ * of the three loops into {@link fetchWithGitRetry} but deliberately did NOT do that: every call
+ * site is handed a `Response` and consumes it itself — usually `res.json()` plus a paging header,
+ * and `checkAccess` discards it unread — so pulling the read inside would change what all three
+ * loops return and would still leave `fetchGitHub`, which keeps its own loop, outside the bound.
+ * The body read remains bounded by undici's own `bodyTimeout` (300 s of inactivity), exactly as
+ * it was before #283.
  *
  * An abort surfaces to the caller as the ordinary transport fault it is, so it takes the
  * transient budget and the same backoff as a 503 — a stalled socket is the same outage seen
@@ -575,10 +578,15 @@ export function parseEpochResetMs(header: string | null | undefined): number | n
     const trimmed = header.trim();
     // A fractional epoch is accepted and floored rather than rejected. GitHub and GitLab send
     // integers, but rejecting `1785283320.5` would be a behaviour REGRESSION: the code this
-    // replaced used `parseInt`, which read it fine, and the caller's guard is `resetMs !== null`
-    // — so a null here makes GitHub's primary-rate-limit branch fall through to an immediate
+    // replaced used `parseInt`, which read it fine, and GitHub's primary-rate-limit branch
+    // CLASSIFIES on `resetMs !== null` — so a null here makes it fall through to an immediate
     // throw with no retry at all (#272 review cycle 2, TST-1). Sub-second precision is
     // irrelevant to a pause measured in minutes.
+    //
+    // That classification role is also why this function keeps flooring an elapsed reset at `0`
+    // instead of returning `null`: `0` still means "the header was there and readable". Callers
+    // deciding how long to SLEEP must not take that `0` at face value — they ask
+    // {@link usableResetMs} instead (#284 review cycle 2).
     if (!/^\d+(\.\d+)?$/.test(trimmed)) return null;
     const at = Math.floor(Number(trimmed)) * 1_000;
     if (!Number.isFinite(at)) return null;
@@ -623,4 +631,176 @@ export function isRetryableGitFetchError(err: unknown): boolean {
     if (!(err instanceof GitProviderFetchError)) return false;
     if (err.status === null) return true;
     return err.status >= 500;
+}
+
+/**
+ * A rate-limit reset header that is actually SCHEDULABLE, or `null` when it tells us nothing
+ * usable — the single answer to "is this reset worth waiting for" that both retry loops share
+ * (#284 review cycle 2).
+ *
+ * WHY THIS IS NOT A GUARD INSIDE {@link parseEpochResetMs}. That parser floors an elapsed reset
+ * at `0` rather than returning `null`, deliberately: `fetchGitHub`'s primary-limit branch keys
+ * on `resetMs !== null` to decide whether the 403 is a rate limit AT ALL, so a `null` there
+ * makes it fall through to an immediate throw with no retry (#272 cycle 2, TST-1). The parser
+ * must keep reporting "the header was present and readable". This function answers the
+ * different question the two SLEEP sites ask.
+ *
+ * WHY `0` MUST NOT BE TAKEN AT FACE VALUE. `0` is not nullish, so a `?? fallback` at the call
+ * site skips the fallback and hands `0` to {@link rateLimitDelayMs}, which clamps it up to only
+ * {@link MIN_RATE_LIMIT_DELAY_MS}. The pause meant to outlast the limit becomes 1 second, three
+ * times in ~3 seconds, INTO a provider that just said it is rate-limiting us — the
+ * primary→secondary/abuse escalation `MIN_RATE_LIMIT_DELAY_MS` and this module's whole 429
+ * policy exist to prevent, and on GitHub an abuse block is token-wide. One second of clock skew
+ * against a self-hosted GitLab reaches it, as does a reset instant that elapses while the
+ * response is in flight, as does a delta-shaped value from a server following the IETF draft
+ * rather than the epoch spelling (it parses as 1970 and floors to `0`).
+ *
+ * A non-positive reset carries no schedulable information, so the honest reading is "the server
+ * told us nothing usable" and the caller's own backoff guess is the right answer.
+ *
+ * THE BOUND IS `> 0`, NOT `> MIN_RATE_LIMIT_DELAY_MS`, so this closes the non-positive half only:
+ * a reset landing under a second from now is still clamped up to the 1-second floor. That is the
+ * right trade rather than an oversight — a genuinely imminent reset SHOULD be honored, and the
+ * case self-corrects, since the next attempt re-reads a header that has by then elapsed and gets
+ * the full backoff. Don't read this function as making a 1-second retry unreachable.
+ *
+ * ONE helper rather than the guard written inline, because there are three sleep sites across
+ * two files — this module's 429, and `fetchGitHub`'s 429 and 403 primary-limit branches — and
+ * the ones in the other file are what get forgotten.
+ */
+export function usableResetMs(header: string | null | undefined): number | null {
+    const resetMs = parseEpochResetMs(header);
+    return resetMs !== null && resetMs > 0 ? resetMs : null;
+}
+
+/**
+ * The provider name that opens every message {@link fetchWithGitRetry} throws.
+ *
+ * A closed union rather than a `string`, because these strings are a CONTRACT, not cosmetics:
+ * `toprope doctor` classifies a provider failure by searching the message for ` 404`, and the
+ * provider suites assert on `'GitLab API server error 502'` / `'Bitbucket API error 401'`
+ * verbatim. Two literal call sites is the whole population, so the union costs nothing and a
+ * third provider cannot be added by typo. (No runtime allowlist: this is not a trust boundary —
+ * the value is a module-internal literal, never request-supplied.)
+ */
+type GitProviderLabel = 'Bitbucket' | 'GitLab';
+
+/**
+ * The one retry loop Bitbucket and GitLab share (#284).
+ *
+ * After #272 moved the policy here, `fetchBitbucket` and `fetchGitLab` were line-for-line
+ * identical — same five branches in the same order, same two independent counters — differing
+ * only in the message prefix and in GitLab reading `ratelimit-reset` on a 429. The second is not
+ * a real difference: that is the un-prefixed IETF spelling GitLab uses, and it does not match the
+ * `X-RateLimit-*` family Bitbucket documents — so for Bitbucket the read yields `null` and falls
+ * through to {@link rateLimitFallbackMs} exactly as before. The header NAME is what carries that
+ * guarantee; see the 429 branch. So the collapse needs one extra argument, `label`, and no knob.
+ *
+ * `fetchGitHub` is deliberately NOT folded in — see this module's header.
+ *
+ * The two budgets are counted SEPARATELY (`attempt` for rate limits, `transientRetries` for 5xx
+ * and transport faults) so a run cannot spend its 5xx allowance on rate limiting or vice versa;
+ * that is also why the loop is a `for (;;)` rather than a counted one, and why every branch
+ * either `continue`s or throws.
+ */
+export async function fetchWithGitRetry(
+    url: string,
+    headers: Record<string, string>,
+    label: GitProviderLabel,
+    // The retry budgets and run deadline the CLIENT was built with (#283) — see the identical
+    // parameter on `fetchGitHub` for why this replaced a per-call transient-only override, and
+    // for why it carries no default.
+    policy: GitRequestPolicy,
+): Promise<Response> {
+    let attempt = 0;
+    let transientRetries = 0;
+
+    for (;;) {
+        // Per ATTEMPT, not only before a pause — see `fetchGitHub` (#283).
+        assertRunTimeRemaining(policy, url);
+        let res: Response;
+        // Disarmed in `finally` the moment `fetch` settles — the signal bounds the RESPONSE,
+        // never the body the caller reads afterwards. See GIT_REQUEST_TIMEOUT_MS (#283).
+        const timeout = requestTimeout();
+        try {
+            res = await fetch(url, {headers, signal: timeout.signal});
+        } catch (err) {
+            // A transport fault is the same outage as a 503, seen one layer down — same budget,
+            // same backoff. Wrapped so the in-run repo retry (#272) can classify it; the message
+            // is preserved verbatim, WITHOUT the `label` prefix, because it is the transport's
+            // own wording and both providers threw it bare before #284. A
+            // GIT_REQUEST_TIMEOUT_MS abort lands here too (#283).
+            // Disarmed BEFORE the minutes-long backoff, not just by the `finally` — see the
+            // identical note in `github.ts` (#283 review).
+            timeout.clear();
+            if (transientRetries < policy.retries.transient) {
+                await sleepWithinRun(policy, serverErrorDelayMs(transientRetries, null), url);
+                transientRetries++;
+                continue;
+            }
+            throw new GitProviderFetchError(
+                err instanceof Error ? err.message : String(err),
+                null,
+                {cause: err},
+            );
+        } finally {
+            // Idempotent, so clearing twice is safe; this stays the one guarantee no path
+            // leaves a signal armed over an unread body.
+            timeout.clear();
+        }
+
+        if (res.status === 429) {
+            // `RateLimit-Reset` is an absolute EPOCH instant, not a delta like `Retry-After`
+            // (#272). Both were previously fed to the same `parseFloat(…) * 1_000`, so the
+            // reset became ~1.8e12 ms — past setTimeout's 32-bit limit, which Node clamps to
+            // 1 ms. The pause meant to outlast the limit became an instant retry, and GitLab
+            // was hammered while already rate-limiting us. Parsed by kind now.
+            //
+            // THE HEADER NAME IS THE WHOLE OF BITBUCKET'S NEUTRALITY, so don't "tidy" it. This is
+            // the un-prefixed IETF spelling, which is GitLab's; `Headers.get` is case-insensitive
+            // but NOT prefix-insensitive, so it does not match the `X-RateLimit-*` family
+            // Bitbucket documents, nor GitHub's `x-ratelimit-reset`. Adding those spellings here
+            // would be a behaviour change for Bitbucket, not a cleanup.
+            //
+            // A non-positive reset reads as absent rather than as "retry now" — see
+            // {@link usableResetMs}.
+            const resetMs = usableResetMs(res.headers.get('ratelimit-reset'));
+            const rateLimitFallback = resetMs ?? rateLimitFallbackMs(attempt);
+            if (attempt < policy.retries.rateLimit) {
+                await sleepWithinRun(
+                    policy,
+                    rateLimitDelayMs(res.headers.get('retry-after'), rateLimitFallback),
+                    url,
+                );
+                attempt++;
+                continue;
+            }
+            throw new GitProviderFetchError(
+                `Rate limit exceeded after ${policy.retries.rateLimit} retries: ${url}`,
+                429,
+            );
+        }
+
+        if (res.status >= 500) {
+            if (transientRetries < policy.retries.transient) {
+                await sleepWithinRun(
+                    policy,
+                    serverErrorDelayMs(transientRetries, res.headers.get('retry-after')),
+                    url,
+                );
+                transientRetries++;
+                continue;
+            }
+            throw new GitProviderFetchError(
+                `${label} API server error ${res.status}: ${url}`,
+                res.status,
+            );
+        }
+
+        if (!res.ok) {
+            throw new GitProviderFetchError(`${label} API error ${res.status}: ${url}`, res.status);
+        }
+
+        return res;
+    }
 }
