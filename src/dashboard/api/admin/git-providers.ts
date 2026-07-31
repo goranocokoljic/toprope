@@ -365,6 +365,9 @@ function configProviderToDto(config: GitProviderConfig): AdminGitProviderDto {
         last_sync_at: null,
         last_sync_status: null,
         last_sync_error: null,
+        // Config providers have no row to record an outcome on: the scoped sync routes
+        // 409 them, so no run ever writes here (#289).
+        last_sync_advisories: [],
         active_sync: null,
         // Config rows are read-only and never show the window input.
         first_sync_pending: false,
@@ -620,21 +623,55 @@ export function registerAdminGitProviderRoutes(
                 // not flip a provider that synced fine to red. The auto-create SUMMARY
                 // (#256) is advisory on the same terms — it reports what was onboarded.
                 // Auto-create FAILURE lines carry neither prefix on purpose and stay
-                // classified as genuine errors. Classify and surface only those.
-                const genuineErrors = result.errors.filter((e) => !isAdvisoryError(e));
+                // classified as genuine errors.
+                //
+                // ONE pass, not two complementary filters (#289): every entry lands in
+                // exactly one list by construction, so the red/green decision and the
+                // advisory report can never disagree about an entry — no line can be both
+                // counted as a failure and stored as an advisory, and none can be dropped
+                // by both. Advisories used to be classified out and then discarded: the
+                // `ok` branch NULLs `last_sync_error`, and this route writes no `sync_logs`
+                // row and returns `{status: 'running'}` long before the run settles, so an
+                // irreversible commit drop (#275) left NO trace on the one interactive path
+                // an operator drives. They are now recorded on their own column, which is
+                // independent of the status — visible without being red.
+                const advisories: string[] = [];
+                const genuineErrors: string[] = [];
+                for (const entry of result.errors) {
+                    (isAdvisoryError(entry) ? advisories : genuineErrors).push(entry);
+                }
+                if (advisories.length > 0) {
+                    // Also logged, not only persisted: the row keeps a bounded report for
+                    // the UI, the log keeps the full set for whoever is tailing the server.
+                    request.log.warn(
+                        {providerId: id, advisories},
+                        'git sync completed with advisories',
+                    );
+                }
                 if (genuineErrors.length > 0) {
                     recordSyncOutcome(db, id, {
                         status: 'error',
                         at: new Date().toISOString(),
                         error: genuineErrors.join('; '),
+                        advisories,
                     });
                 } else {
-                    recordSyncOutcome(db, id, {status: 'ok', at: new Date().toISOString()});
+                    recordSyncOutcome(db, id, {
+                        status: 'ok',
+                        at: new Date().toISOString(),
+                        advisories,
+                    });
                 }
             })
             .catch((err: unknown) => {
                 // A thrown failure (e.g. an unexpected pipeline crash) is still
                 // recorded as a status=error outcome, not lost.
+                //
+                // No advisories are passed, which CLEARS the column — deliberately. A run
+                // that threw produced no `SyncResult`, so this route knows of no advisory
+                // for it, and every one of these columns describes THE LAST RUN. Leaving
+                // the previous run's report standing beside this run's timestamp would
+                // attribute it to a run that never reported it.
                 const message = err instanceof Error ? err.message : String(err);
                 try {
                     recordSyncOutcome(db, id, {

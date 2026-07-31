@@ -262,8 +262,12 @@ function formatShaSample(shas: readonly string[]): string {
 /**
  * A sha, safe to interpolate into an operator-facing line.
  *
- * The sha is raw response JSON, and this line is printed to a terminal by the CLI and
- * persisted into `sync_logs.errors`. Allowlisted rather than escaped (the graduated
+ * The sha is raw response JSON, and this line is printed to a terminal by the CLI, persisted
+ * into `sync_logs.errors`, and — since #289 — stored on `git_providers.last_sync_advisories`
+ * and rendered in the admin provider row. That third sink adds no markup hazard (React
+ * escapes text children), so the control this allowlist exists for is unchanged: the terminal
+ * and the log, where a newline or an ANSI escape is what does the damage. Allowlisted rather
+ * than escaped (the graduated
  * validate-at-the-boundary rule): a git object name is hex, so anything else is not a sha, and
  * a value that survives this cannot carry a newline, an ANSI escape, or excess length.
  *

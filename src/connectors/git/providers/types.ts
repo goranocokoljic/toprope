@@ -409,12 +409,20 @@ export interface GitCommitDrop {
  * commits and an `errors` list that long is unreadable wherever it lands.
  *
  * WHERE IT LANDS, precisely — this is the only durable record of the loss, so do not assume
- * more reach than it has: `toprope sync git` / `sync all` print every entry to stdout, and
- * the SCHEDULED path persists them into `sync_logs.errors` (advisories do not turn the run
- * red — see `isAdvisoryError`). The admin "Sync now" route classifies advisories out and
- * records `status: 'ok'`, which NULLs `last_sync_error`, so on that path the line is not
- * persisted at all, and no dashboard surface renders `sync_logs.errors` today. Closing that
- * gap is cross-cutting across all six advisory sentinels and is tracked in #289.
+ * more reach than it has. All three entry points now keep it (#289):
+ *   - `toprope sync git` / `sync all` print every entry to stdout;
+ *   - the SCHEDULED path persists them into `sync_logs.errors` (advisories do not turn the
+ *     run red — see `isAdvisoryError`), which no dashboard surface renders;
+ *   - the admin "Sync now" / "Sync older history" routes classify advisories out of the
+ *     red/green decision — they still record `status: 'ok'`, which NULLs `last_sync_error` —
+ *     and store them on `git_providers.last_sync_advisories`, which the admin provider row
+ *     renders as a non-red note. That column is BOUNDED (`MAX_STORED_ADVISORIES` in the
+ *     provider store, with a truncation line naming the count it dropped), so a systemic
+ *     drop across hundreds of repos is reported there as a sample plus a pointer to the two
+ *     unbounded surfaces above — do not treat it as the full list.
+ *
+ * Every one of these describes the LAST run only. None of them is a per-loss ledger: nothing
+ * in the system can re-derive which shas were dropped once a later run overwrites the report.
  */
 export type GitCommitDropListener = (drop: GitCommitDrop) => void;
 
@@ -440,9 +448,9 @@ export interface GitProvider {
     //   - a run that DOES take the fallback reports how many commits did so — see
     //     `DIFFS_NOT_SUPPLIED_PREFIX` in `sync.ts`. It reaches the same surfaces, and no more,
     //     as {@link GitCommitDropListener}'s advisory: the `toprope sync git` / `sync all`
-    //     console output, and `sync_logs.errors` on the SCHEDULED path. The admin "Sync now"
-    //     route classifies advisories out and records `status: 'ok'`, so on that path the count
-    //     is not persisted at all — closing that gap is the cross-cutting work tracked in #289.
+    //     console output, `sync_logs.errors` on the SCHEDULED path, and — since #289 —
+    //     `git_providers.last_sync_advisories` on the admin "Sync now" / "Sync older history"
+    //     routes, which still record `status: 'ok'` (an advisory never turns a provider red).
     //     It reports in TWO lines, split on whether the claim survives a discarded run: the
     //     request-volume count is unconditional, while the "a failed fallback permanently
     //     understated these developer-days" line is staged onto the cursor advance exactly like

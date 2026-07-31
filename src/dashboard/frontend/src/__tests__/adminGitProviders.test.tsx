@@ -56,6 +56,7 @@ const DB_GITHUB: AdminGitProvider = {
     last_sync_at: '2026-07-01T10:00:00.000Z',
     last_sync_status: 'ok',
     last_sync_error: null,
+    last_sync_advisories: [],
     active_sync: null,
     first_sync_pending: false,
 };
@@ -80,6 +81,7 @@ const CONFIG_GITLAB: AdminGitProvider = {
     last_sync_at: null,
     last_sync_status: null,
     last_sync_error: null,
+    last_sync_advisories: [],
     active_sync: null,
     first_sync_pending: false,
 };
@@ -2567,6 +2569,68 @@ describe('AdminGitProviders — sync completion announced to assistive tech (#27
         );
         expect(live.textContent).not.toContain('Sync completed');
     }, 10000);
+});
+
+/**
+ * #289 — the provider row is the surface that RENDERS what a sync reported but did not fail
+ * on. The server half is worthless without it: an advisory persisted to a column nothing
+ * draws is the same invisibility, one layer down.
+ */
+describe('AdminGitProviders — last-sync advisories (#289)', () => {
+    const DROP_LINE =
+        'Commits dropped as unattributable: [github/api] 3 commit(s) — deadbeef, cafebabe';
+    const UNMATCHED_LINE = 'Unmatched authors (no developer record found): dependabot[bot]';
+
+    it('renders every advisory line the last run reported, without turning the row red', async () => {
+        providers = [
+            {...structuredClone(DB_GITHUB), last_sync_advisories: [DROP_LINE, UNMATCHED_LINE]},
+        ];
+        renderPage();
+
+        const panel = await screen.findByTestId('sync-advisories');
+        expect(panel).toHaveTextContent('2 advisories');
+        // Both lines in full — a summary count with the text truncated away would be a
+        // pointer to information the operator still cannot reach.
+        expect(panel).toHaveTextContent(DROP_LINE);
+        expect(panel).toHaveTextContent(UNMATCHED_LINE);
+
+        // …and the run is still reported as the success it was. An advisory that flipped the
+        // status cell to `error` would be the exact misclassification the server-side
+        // `isAdvisoryError` split exists to prevent, re-introduced in the UI.
+        const row = (await screen.findByText('acme-org')).closest('tr') as HTMLElement;
+        expect(within(row).getByText('ok')).toBeInTheDocument();
+        expect(within(row).queryByText('error')).toBeNull();
+    });
+
+    it('renders nothing when the last run reported no advisories', async () => {
+        // The negative control: DB_GITHUB's `last_sync_advisories` is `[]`, which is what
+        // every clean run stores. Without this, a panel rendered unconditionally (or one fed
+        // a fabricated line) would pass the test above.
+        providers = [structuredClone(DB_GITHUB)];
+        renderPage();
+        await screen.findByText('acme-org');
+        expect(screen.queryByTestId('sync-advisories')).toBeNull();
+    });
+
+    it('uses the singular heading for one advisory', async () => {
+        providers = [{...structuredClone(DB_GITHUB), last_sync_advisories: [DROP_LINE]}];
+        renderPage();
+        const panel = await screen.findByTestId('sync-advisories');
+        expect(panel).toHaveTextContent('1 advisory');
+        expect(panel.textContent).not.toContain('1 advisories');
+    });
+
+    it('is not a live region — the row already owns the announced sync lifecycle', async () => {
+        // #278 put ONE `role="status"` per row, in the "Last sync" cell, deliberately kept
+        // low-churn. An advisory list appearing on a poll is not a lifecycle event, and a
+        // second live region in the same row competes with the one that is.
+        providers = [{...structuredClone(DB_GITHUB), last_sync_advisories: [DROP_LINE]}];
+        renderPage();
+        const panel = await screen.findByTestId('sync-advisories');
+        expect(panel).not.toHaveAttribute('role');
+        expect(panel).not.toHaveAttribute('aria-live');
+        expect(panel.querySelector('[role="status"], [aria-live]')).toBeNull();
+    });
 });
 
 describe('AdminGitProviders — add-flow repo selection (#211)', () => {

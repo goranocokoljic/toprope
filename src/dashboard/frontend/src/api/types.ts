@@ -981,6 +981,17 @@ export interface AdminGitProvider {
     last_sync_at: string | null;
     last_sync_status: string | null;
     last_sync_error: string | null;
+    /**
+     * The last run's ADVISORY lines (#289) — things the run wants reported that are NOT
+     * failures: unmatched CI-bot authors, an auto-create summary, a degraded diff cache,
+     * and (the one that matters most) commits permanently dropped as unattributable, which
+     * the cursor has already advanced past.
+     *
+     * Independent of `last_sync_status`: entries here never mean the run failed, and a
+     * failed run can carry them too. Always an array — `[]` is "the last run reported
+     * none", and config-file providers (which cannot be synced individually) are always `[]`.
+     */
+    last_sync_advisories: string[];
     /** Non-null only while a sync-now run is in flight for this provider (#209). */
     active_sync: GitProviderActiveSync | null;
     /**

@@ -4,8 +4,10 @@ import path from 'path';
 import {runMigrations} from '../../src/storage/migrator';
 import {loadServerKey, type ServerKeyResult} from '../../src/connectors/git/providers/secret';
 import {
+    advisoriesTruncatedLine,
     createProvider,
     deleteProvider,
+    MAX_STORED_ADVISORIES,
     findProviderByTypeContainer,
     getDecryptedConfig,
     getProvider,
@@ -604,5 +606,104 @@ describe('provider store — recordSyncOutcome (#199)', () => {
         ).toThrow(GitProviderStoreError);
         // The row is untouched — no partial write from the rejected status.
         expect(getProvider(db, rec.id)?.last_sync_status).toBeNull();
+    });
+});
+
+/**
+ * The advisory column (#289): the half of a run's report that must be VISIBLE without being
+ * RED. Its whole reason to exist is that the `ok` branch NULLs `last_sync_error`, so before
+ * this an advisory recorded on the scoped admin path was indistinguishable from no advisory.
+ */
+describe('provider store — recordSyncOutcome advisories (#289)', () => {
+    const DROP_LINE = 'Commits dropped as unattributable: [github/api] 3 commit(s)';
+
+    it('stores advisories on an OK outcome without populating the error column', () => {
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        expect(rec.last_sync_advisories).toBeNull();
+
+        recordSyncOutcome(db, rec.id, {
+            status: 'ok',
+            at: '2026-07-07T10:00:00.000Z',
+            advisories: [DROP_LINE],
+        });
+
+        const after = getProvider(db, rec.id);
+        expect(after?.last_sync_status).toBe('ok');
+        // Visible…
+        expect(toPublicProvider(after!).last_sync_advisories).toEqual([DROP_LINE]);
+        // …and not red. Both halves matter: a fix that wrote the line into `last_sync_error`
+        // would satisfy "durably recorded" and break the classification the route exists to keep.
+        expect(after?.last_sync_error).toBeNull();
+    });
+
+    it('stores advisories alongside a failure on an ERROR outcome', () => {
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        recordSyncOutcome(db, rec.id, {
+            status: 'error',
+            at: '2026-07-07T11:00:00.000Z',
+            error: 'GitHub API error 401',
+            advisories: [DROP_LINE],
+        });
+
+        const pub = toPublicProvider(getProvider(db, rec.id)!);
+        expect(pub.last_sync_status).toBe('error');
+        expect(pub.last_sync_error).toBe('GitHub API error 401');
+        expect(pub.last_sync_advisories).toEqual([DROP_LINE]);
+    });
+
+    it('clears a prior run\'s advisories when a later run reports none', () => {
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        recordSyncOutcome(db, rec.id, {
+            status: 'ok',
+            at: '2026-07-07T10:00:00.000Z',
+            advisories: [DROP_LINE],
+        });
+        recordSyncOutcome(db, rec.id, {status: 'ok', at: '2026-07-07T12:00:00.000Z'});
+
+        // The column describes the LAST run, exactly like `last_sync_error` beside it: a stale
+        // drop line standing next to a newer timestamp attributes it to a run that never
+        // reported it, and nothing would ever clear it.
+        expect(getProvider(db, rec.id)?.last_sync_advisories).toBeNull();
+        expect(toPublicProvider(getProvider(db, rec.id)!).last_sync_advisories).toEqual([]);
+    });
+
+    it('caps the stored list and says how many lines it dropped', () => {
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        const overflow = 7;
+        const lines = Array.from(
+            {length: MAX_STORED_ADVISORIES + overflow},
+            (_, i) => `${DROP_LINE} #${i}`,
+        );
+        recordSyncOutcome(db, rec.id, {status: 'ok', at: '2026-07-07T10:00:00.000Z', advisories: lines});
+
+        const stored = toPublicProvider(getProvider(db, rec.id)!).last_sync_advisories;
+        // Capped… (the cap + one line about the cap)
+        expect(stored).toHaveLength(MAX_STORED_ADVISORIES + 1);
+        expect(stored.slice(0, MAX_STORED_ADVISORIES)).toEqual(lines.slice(0, MAX_STORED_ADVISORIES));
+        // …but never SILENTLY: the reader is told the count it is not seeing. Asserted against
+        // the builder, not a copy of its wording, so a reword cannot quietly pass this.
+        expect(stored[MAX_STORED_ADVISORIES]).toBe(advisoriesTruncatedLine(overflow));
+        expect(stored[MAX_STORED_ADVISORIES]).toContain(String(overflow));
+    });
+
+    it('stores a list exactly at the cap with no truncation line', () => {
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        const lines = Array.from({length: MAX_STORED_ADVISORIES}, (_, i) => `${DROP_LINE} #${i}`);
+        recordSyncOutcome(db, rec.id, {status: 'ok', at: '2026-07-07T10:00:00.000Z', advisories: lines});
+
+        // The boundary: `<=` not `<`, so a full-but-not-over list is not reported as truncated.
+        expect(toPublicProvider(getProvider(db, rec.id)!).last_sync_advisories).toEqual(lines);
+    });
+
+    it('surfaces a malformed stored value as its raw text rather than failing the row', () => {
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        // Reachable from a hand-edited row: the column is untyped TEXT with no CHECK.
+        db.prepare('UPDATE git_providers SET last_sync_advisories = ? WHERE id = ?').run(
+            'half-written {',
+            rec.id,
+        );
+        expect(toPublicProvider(getProvider(db, rec.id)!).last_sync_advisories).toEqual([
+            'half-written {',
+        ]);
     });
 });

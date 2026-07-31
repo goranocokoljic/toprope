@@ -1814,6 +1814,44 @@ function ProviderRow({
                     </td>
                 </tr>
             ) : null}
+            {/* What the last run REPORTED but did not fail on (#289).
+
+                Rendered whenever the column is non-empty, including while a new run is in
+                flight: it describes the last SETTLED run, exactly like the status Badge and
+                timestamp above it, and the whole point of the drop advisory is that it stays
+                visible until a later run reports clean. `warning`, never `danger` — an
+                advisory that turned the row red would be the failure classification this
+                feature exists to avoid. Plain static text, not a live region: the row's
+                sr-only status element (#278) owns the announced lifecycle, and an advisory
+                list appearing mid-poll is not a lifecycle event. */}
+            {provider.last_sync_advisories.length > 0 ? (
+                <tr>
+                    <td colSpan={7} className="px-3 pb-3">
+                        <div
+                            data-testid="sync-advisories"
+                            className="rounded border border-warning/40 bg-warning/10 px-3 py-2 text-sm text-foreground"
+                        >
+                            <div className="font-medium text-warning">
+                                Last sync reported{' '}
+                                {provider.last_sync_advisories.length === 1
+                                    ? '1 advisory'
+                                    : `${provider.last_sync_advisories.length} advisories`}{' '}
+                                (the sync itself did not fail)
+                            </div>
+                            <ul className="mt-1 list-disc space-y-1 pl-5 text-muted">
+                                {provider.last_sync_advisories.map((line, i) => (
+                                    // Index key: these are report LINES, not entities — they
+                                    // have no id, can legitimately repeat (one per repo), and
+                                    // the whole list is replaced wholesale by the next run.
+                                    <li key={i} className="break-words">
+                                        {line}
+                                    </li>
+                                ))}
+                            </ul>
+                        </div>
+                    </td>
+                </tr>
+            ) : null}
             {sync.isError ? (
                 <tr>
                     <td colSpan={7} className="px-3 pb-3">

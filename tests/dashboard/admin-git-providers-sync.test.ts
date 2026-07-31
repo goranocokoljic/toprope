@@ -10,9 +10,21 @@ import {createUser} from '../../src/auth/users';
 import {hashPassword} from '../../src/auth/password';
 import {SESSION_COOKIE} from '../../src/auth/cookies';
 import type {GitConnectorConfig} from '../../src/config/types';
-import type {GitProvider, GitRepo, GitCommit, GitFileDiff} from '../../src/connectors/git/providers/types';
+import type {
+    GitProvider,
+    GitRepo,
+    GitCommit,
+    GitCommitDropListener,
+    GitFetchProgressListener,
+    GitFileDiff,
+} from '../../src/connectors/git/providers/types';
+import {COMMIT_DROP_REASONS} from '../../src/connectors/git/providers/types';
 import type {GitSyncProgress} from '../../src/connectors/git/sync';
-import {declareEarliestSyncedFloor} from '../../src/connectors/git/sync';
+import {
+    COMMITS_DROPPED_PREFIX,
+    UNMATCHED_AUTHORS_PREFIX,
+    declareEarliestSyncedFloor,
+} from '../../src/connectors/git/sync';
 
 // Stub createGitProvider so no test hits the network, but keep the rest of the
 // factory (validateGitProviderConfig) real so the store/codec seeding + decrypt
@@ -129,6 +141,7 @@ interface ProviderListRow {
     last_sync_status: string | null;
     last_sync_at: string | null;
     last_sync_error: string | null;
+    last_sync_advisories: string[];
     active_sync: {started_at: string; progress: GitSyncProgress | null} | null;
     first_sync_pending: boolean;
 }
@@ -208,18 +221,36 @@ describe('admin git-provider sync-now API (#199)', () => {
         return (res.json().data as ProviderListRow[]).find((p) => p.id === id);
     }
 
-    // Poll the (durable) provider row until its last_sync_status settles to the
-    // expected terminal value — the same surface the UI polls. The sync is
-    // fire-and-forget, so the 202 lands before the run finishes.
-    async function waitForSyncStatus(id: string, expected: 'ok' | 'error', timeoutMs = 2000): Promise<ProviderListRow> {
+    // Poll the (durable) provider row until it satisfies `settled` — the same surface the UI
+    // polls. The sync is fire-and-forget, so the 202 lands before the run finishes.
+    //
+    // Takes a predicate rather than only a status because a SECOND run whose outcome is the
+    // same status as the first's would satisfy a status-only wait instantly, before it has
+    // even started (#289's "a later clean run clears the previous run's advisories" case).
+    async function waitForProviderRow(
+        id: string,
+        settled: (row: ProviderListRow) => boolean,
+        what: string,
+        timeoutMs = 2000,
+    ): Promise<ProviderListRow> {
         const deadline = Date.now() + timeoutMs;
         let last: ProviderListRow | undefined;
         while (Date.now() < deadline) {
             last = await readProvider(id);
-            if (last?.last_sync_status === expected) return last;
+            if (last !== undefined && settled(last)) return last;
             await new Promise((r) => setTimeout(r, 10));
         }
-        throw new Error(`timed out waiting for status=${expected}; last=${JSON.stringify(last)}`);
+        throw new Error(`timed out waiting for ${what}; last=${JSON.stringify(last)}`);
+    }
+
+    // The common case: wait for a terminal status.
+    async function waitForSyncStatus(id: string, expected: 'ok' | 'error', timeoutMs = 2000): Promise<ProviderListRow> {
+        return waitForProviderRow(
+            id,
+            (row) => row.last_sync_status === expected,
+            `status=${expected}`,
+            timeoutMs,
+        );
     }
 
     // Mock getCommits so a run resolves fast AND the [since, until] window it computed
@@ -358,6 +389,180 @@ describe('admin git-provider sync-now API (#199)', () => {
             // …and the advisory did not turn the provider red.
             expect(row.last_sync_error).toBeNull();
             expect(row.last_sync_at).not.toBeNull();
+        });
+
+        /**
+         * #289 — the advisory half of a run's report is now DURABLE on the scoped route.
+         *
+         * Before this, `genuineErrors = errors.filter(e => !isAdvisoryError(e))` classified
+         * advisories out and then dropped them on the floor: the `ok` branch NULLs
+         * `last_sync_error`, this route writes no `sync_logs` row, and it returns
+         * `{status: 'running'}` long before the run settles — so an advisory was neither
+         * returned, nor persisted, nor logged. The tests above only ever asserted the
+         * NEGATIVE half of that (`last_sync_error` stays null), which a route that throws the
+         * report away satisfies perfectly.
+         *
+         * These drive `COMMITS_DROPPED_PREFIX` specifically, because it is the advisory whose
+         * entire purpose is to be seen: it reports an IRREVERSIBLE loss behind a cursor that
+         * has already advanced past it (#275), on the one interactive path an operator
+         * reaches for *after* noticing a problem.
+         */
+        describe('advisories are recorded durably and never turn the provider red (#289)', () => {
+            // A 40-char hex sha, so it survives the advisory line's sha allowlist (`sync.ts`
+            // renders anything else as `<invalid sha>` and the assertion below would be
+            // matching a sanitizer artifact instead of the identity the operator needs).
+            const DROPPED_SHA = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
+
+            // One repo whose provider LISTS two commits and can return only one: the other is
+            // reported through `onDrop`, which is exactly how a real provider reports a commit
+            // it cannot attribute. `alice` still lands, so the run is genuinely healthy apart
+            // from the loss — the state the classification is about.
+            async function armDroppingProvider(): Promise<void> {
+                const createGitProvider = await getCreateGitProvider();
+                createGitProvider.mockReturnValue(
+                    makeMockProvider({
+                        listRepos: vi.fn().mockResolvedValue([makeRepo('myrepo')]),
+                        getCommits: vi
+                            .fn()
+                            .mockImplementation(
+                                async (
+                                    _repo: string,
+                                    _since: string,
+                                    _until: string,
+                                    _onProgress?: GitFetchProgressListener,
+                                    onDrop?: GitCommitDropListener,
+                                ): Promise<GitCommit[]> => {
+                                    onDrop?.({sha: DROPPED_SHA, reason: COMMIT_DROP_REASONS[0]});
+                                    return [makeCommit('alice')];
+                                },
+                            ),
+                    }),
+                );
+            }
+
+            // The advisory lines this run stored, as the admin API serves them.
+            function dropLines(row: ProviderListRow): string[] {
+                return row.last_sync_advisories.filter((e) => e.startsWith(COMMITS_DROPPED_PREFIX));
+            }
+
+            it('stores an advisory-only run on the row while still recording status=ok', async () => {
+                const id = await createGithub();
+                await armDroppingProvider();
+
+                expect((await triggerSync(id)).statusCode).toBe(202);
+                const row = await waitForSyncStatus(id, 'ok');
+
+                // Positive control: the run really did import, so the drop really was
+                // reported by a run that otherwise succeeded.
+                const snap = db
+                    .prepare(`SELECT developer_id FROM git_snapshots WHERE date = '2024-01-15'`)
+                    .get() as {developer_id: string} | undefined;
+                expect(snap?.developer_id).toBe('dev-1');
+
+                // The durable trace — the thing that did not exist before #289.
+                const drops = dropLines(row);
+                expect(drops).toHaveLength(1);
+                // …naming the commit, so the operator can go look it up.
+                expect(drops[0]).toContain(DROPPED_SHA);
+
+                // …and it did NOT turn the provider red.
+                expect(row.last_sync_status).toBe('ok');
+                expect(row.last_sync_error).toBeNull();
+            });
+
+            it('records an empty advisory list for a run that reported nothing', async () => {
+                // The negative control for the test above: without it, a column that is
+                // unconditionally non-empty (or one the DTO fabricates) would pass everything
+                // else in this block.
+                const id = await createGithub();
+                const createGitProvider = await getCreateGitProvider();
+                createGitProvider.mockReturnValue(
+                    makeMockProvider({
+                        listRepos: vi.fn().mockResolvedValue([makeRepo('myrepo')]),
+                        getCommits: vi.fn().mockResolvedValue([makeCommit('alice')]),
+                    }),
+                );
+
+                expect((await triggerSync(id)).statusCode).toBe(202);
+                const row = await waitForSyncStatus(id, 'ok');
+                expect(row.last_sync_advisories).toEqual([]);
+            });
+
+            it('keeps the advisory beside a genuine failure that turns the provider red', async () => {
+                // The two channels are independent: a run that fails can still have reported
+                // something before it did, and losing that report to the failure beside it is
+                // the same disappearance in a different disguise.
+                //
+                // The failure has to be a BEST-EFFORT one (a PR-list fetch), and the advisory
+                // the unmatched-authors line. That pairing is forced by the pipeline, not a
+                // preference:
+                //  - a COMMIT fetch failure clears `commitsComplete`, and #231 then discards
+                //    the whole provider's run — no attribution runs, so no advisory of any
+                //    kind is produced to sit beside the error;
+                //  - drop lines are STAGED onto the cursor advance (`cursorAdvances` in
+                //    sync.ts) and deliberately withheld when the window is held, because a
+                //    re-covered window makes "permanently lost" a false claim.
+                // A `getPullRequests` failure is the reachable combination: it is pushed to
+                // `errors` as a genuine failure while the provider stays complete, so the run
+                // goes red AND still reports its advisories.
+                const id = await createGithub();
+                const createGitProvider = await getCreateGitProvider();
+                createGitProvider.mockReturnValue(
+                    makeMockProvider({
+                        listRepos: vi.fn().mockResolvedValue([makeRepo('myrepo')]),
+                        // dependabot[bot] has no developer record → unmatched-author advisory.
+                        getCommits: vi
+                            .fn()
+                            .mockResolvedValue([makeCommit('alice'), makeCommit('dependabot[bot]')]),
+                        getPullRequests: vi
+                            .fn()
+                            .mockRejectedValue(new Error('GitHub API error 401: bad token')),
+                    }),
+                );
+
+                expect((await triggerSync(id)).statusCode).toBe(202);
+                const row = await waitForSyncStatus(id, 'error');
+
+                expect(row.last_sync_error).toMatch(/401/);
+                const unmatched = row.last_sync_advisories.filter((e) =>
+                    e.startsWith(UNMATCHED_AUTHORS_PREFIX),
+                );
+                expect(unmatched).toHaveLength(1);
+                expect(unmatched[0]).toContain('dependabot[bot]');
+                // The failure line is NOT duplicated into the advisory column — one entry
+                // belongs to exactly one channel.
+                expect(row.last_sync_advisories.some((e) => e.includes('401'))).toBe(false);
+            });
+
+            it('clears the previous run\'s advisories when a later run reports none', async () => {
+                // The column describes the LAST run. Leaving a stale drop line standing beside
+                // a newer timestamp would attribute it to a run that never reported it — and
+                // would make the report unfalsifiable, since nothing would ever clear it.
+                const id = await createGithub();
+                await armDroppingProvider();
+                expect((await triggerSync(id)).statusCode).toBe(202);
+                const dirty = await waitForProviderRow(
+                    id,
+                    (r) => r.last_sync_advisories.length > 0,
+                    'the first run to record its advisory',
+                );
+                expect(dropLines(dirty)).toHaveLength(1);
+
+                const createGitProvider = await getCreateGitProvider();
+                createGitProvider.mockReturnValue(
+                    makeMockProvider({
+                        listRepos: vi.fn().mockResolvedValue([makeRepo('myrepo')]),
+                        getCommits: vi.fn().mockResolvedValue([makeCommit('alice')]),
+                    }),
+                );
+                expect((await triggerSync(id)).statusCode).toBe(202);
+                const clean = await waitForProviderRow(
+                    id,
+                    (r) => r.last_sync_advisories.length === 0,
+                    'the clean run to clear the advisory',
+                );
+                expect(clean.last_sync_status).toBe('ok');
+            });
         });
 
         it('persists status=error with the failure message when the provider fails', async () => {

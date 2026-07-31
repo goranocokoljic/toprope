@@ -30,6 +30,10 @@ import {providerConfigToRowFields, rowToProviderConfig, type GitProviderRow} fro
 import {decryptSecret, encryptSecret, type SecretMeta, type ServerKeyResult} from './secret.js';
 import {normalizeContainer, sameContainer} from './container.js';
 import type {GitProviderConfig, GitProviderType} from './types.js';
+import {
+    decodeStringArrayColumn,
+    encodeStringArrayColumn,
+} from '../../../storage/string-array-column.js';
 
 /** The mask shown in place of a secret — a fixed run of bullets, never key material. */
 const TOKEN_MASK = '••••';
@@ -95,6 +99,8 @@ export interface GitProviderRecord {
     last_sync_at: string | null;
     last_sync_status: string | null;
     last_sync_error: string | null;
+    /** JSON array of the last run's advisory lines, or NULL for none (#289). */
+    last_sync_advisories: string | null;
 }
 
 /**
@@ -125,6 +131,13 @@ export interface PublicGitProvider {
     last_sync_at: string | null;
     last_sync_status: string | null;
     last_sync_error: string | null;
+    /**
+     * The last run's ADVISORY lines — decoded, and `[]` (never null) when there were none
+     * (#289). Separate from `last_sync_error` because an advisory must be visible WITHOUT
+     * being a failure: a non-empty list here says nothing about `last_sync_status`, and a
+     * run can legitimately be `ok` with entries, or `error` with both.
+     */
+    last_sync_advisories: string[];
 }
 
 /** Create input: the validated provider shape (its `auth` carries the plaintext token) + audit/enable flags. */
@@ -305,8 +318,8 @@ export function createProvider(
                 id, type, container, url, include_subgroups, auth_method, auth_username,
                 token_ciphertext, token_meta, token_last4, repos_include, repos_exclude,
                 enabled, created_at, updated_at, created_by,
-                last_sync_at, last_sync_status, last_sync_error
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)`,
+                last_sync_at, last_sync_status, last_sync_error, last_sync_advisories
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL)`,
         ).run(
             id,
             fields.type,
@@ -522,6 +535,57 @@ export interface SyncOutcome {
     at: string;
     /** The failure summary on `status: 'error'`; ignored (cleared) on `'ok'`. */
     error?: string | null;
+    /**
+     * The run's ADVISORY lines (#289) — recorded on BOTH statuses, because a run that
+     * failed can still have reported an irreversible commit drop before it did, and that
+     * report must not be lost to the failure beside it.
+     *
+     * The caller classifies. `isAdvisoryError` (connectors/git/sync.ts) is the single
+     * classifier every consumer shares; this function persists what it is handed and does
+     * not re-derive the split, so passing a genuine failure here would hide it from the
+     * red/green surface. Omitted (or empty) clears the column — this describes the LAST
+     * run, exactly like `error` beside it, so a run that reported nothing must not leave
+     * the previous run's advisories standing as if they were its own.
+     */
+    advisories?: readonly string[];
+}
+
+/**
+ * How many advisory lines a provider row will store for one run.
+ *
+ * A bound, not a preference. Several sentinels emit ONE LINE PER REPO
+ * (`COMMITS_DROPPED_PREFIX` is per repo, and a systemic response-shape problem hits every
+ * repo at once), so an unbounded column would let a 500-repo org write hundreds of
+ * kilobytes into a row that `GET /api/admin/git/providers` then serves for EVERY provider
+ * on every 1s poll while a sync is in flight. The cap is on the durable report surface;
+ * the CLI (stdout) and the scheduled path (`sync_logs.errors`) still carry the full set.
+ */
+export const MAX_STORED_ADVISORIES = 20;
+
+/**
+ * The line appended in place of the advisories the cap dropped.
+ *
+ * Exported so a test asserts against the string the code actually emits rather than a copy
+ * of it, and so the truncation is never SILENT: a reader of the column is told the count it
+ * is not seeing and where the full set lives, instead of reading 20 lines as "that was all
+ * of them".
+ */
+export function advisoriesTruncatedLine(omitted: number): string {
+    return (
+        `… and ${omitted} more advisory line(s) not stored on this row (capped at ` +
+        `${MAX_STORED_ADVISORIES}). The full set is printed by "toprope sync git" and, on ` +
+        'the scheduled path, persisted to sync_logs.errors.'
+    );
+}
+
+// Apply the cap, naming what it dropped. Kept beside the constant it enforces so the
+// "no silent caps" property is one function, not a rule spread across call sites.
+function boundAdvisories(advisories: readonly string[]): string[] {
+    if (advisories.length <= MAX_STORED_ADVISORIES) return [...advisories];
+    return [
+        ...advisories.slice(0, MAX_STORED_ADVISORIES),
+        advisoriesTruncatedLine(advisories.length - MAX_STORED_ADVISORIES),
+    ];
 }
 
 // Runtime allowlist for the outcome status (review-rule: allowlist at the write
@@ -531,12 +595,17 @@ const SYNC_OUTCOME_STATUSES: readonly SyncOutcomeStatus[] = ['ok', 'error'];
 
 /**
  * Persist the terminal result of a sync-now run (GC1.7 / #199) onto the provider
- * row: `last_sync_at`, `last_sync_status`(ok|error), and `last_sync_error`. On
- * `ok` the error column is cleared; on `error` a non-blank summary is stored (a
- * failed sync must surface its message to the UI, never a swallowed error — so a
- * missing/blank message is coerced to a generic non-null sentinel rather than
+ * row: `last_sync_at`, `last_sync_status`(ok|error), `last_sync_error`, and
+ * `last_sync_advisories`. On `ok` the error column is cleared; on `error` a non-blank
+ * summary is stored (a failed sync must surface its message to the UI, never a swallowed
+ * error — so a missing/blank message is coerced to a generic non-null sentinel rather than
  * left NULL, which the UI would read as "clean"). Returns true when the row
  * existed and was updated. Fail-closed on an unknown status.
+ *
+ * The advisory column is written on BOTH statuses and is INDEPENDENT of the red/green one
+ * (#289): recording an advisory must never be what turns a provider red, and a provider
+ * turning red must never be what discards its advisories. One UPDATE writes all four, so a
+ * row can never hold one run's status beside another run's report.
  */
 export function recordSyncOutcome(db: Database.Database, id: string, outcome: SyncOutcome): boolean {
     if (!SYNC_OUTCOME_STATUSES.includes(outcome.status)) {
@@ -550,11 +619,14 @@ export function recordSyncOutcome(db: Database.Database, id: string, outcome: Sy
         outcome.status === 'error'
             ? (outcome.error && outcome.error.trim() !== '' ? outcome.error : 'Sync failed (no error message)')
             : null;
+    const advisoriesText = encodeStringArrayColumn(boundAdvisories(outcome.advisories ?? []));
     const changes = db
         .prepare(
-            'UPDATE git_providers SET last_sync_at = ?, last_sync_status = ?, last_sync_error = ? WHERE id = ?',
+            `UPDATE git_providers
+             SET last_sync_at = ?, last_sync_status = ?, last_sync_error = ?, last_sync_advisories = ?
+             WHERE id = ?`,
         )
-        .run(outcome.at, outcome.status, errorText, id).changes;
+        .run(outcome.at, outcome.status, errorText, advisoriesText, id).changes;
     return changes > 0;
 }
 
@@ -586,6 +658,13 @@ export function toPublicProvider(record: GitProviderRecord): PublicGitProvider {
         last_sync_at: record.last_sync_at,
         last_sync_status: record.last_sync_status,
         last_sync_error: record.last_sync_error,
+        // Flattened to `[]` rather than passed through as null: the wire field answers
+        // "what did the last run report", and one spelling of "nothing" is enough for a
+        // client that only ever wants to iterate it.
+        last_sync_advisories:
+            record.last_sync_advisories === null
+                ? []
+                : decodeStringArrayColumn(record.last_sync_advisories),
     };
 }
 
