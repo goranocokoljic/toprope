@@ -79,7 +79,7 @@ afterEach(() => {
     vi.useRealTimers();
 });
 
-describe.each(CASES)('$type request policy (#283)', ({config, serverErrorMessage}) => {
+describe.each(CASES)('$type request policy (#283)', ({type, config, serverErrorMessage}) => {
     describe('interactive budget on listRepos', () => {
         it('fails a 5xx on the first response instead of taking a sync budget', async () => {
             vi.useFakeTimers();
@@ -206,6 +206,29 @@ describe.each(CASES)('$type request policy (#283)', ({config, serverErrorMessage
 
         await expect(pending).rejects.toThrow(/403/);
         expect(fetchMock.mock.calls).toHaveLength(1);
+    });
+
+    it('POSITIVE CONTROL: a sync client waits out the 403 rate limit its full budget', async () => {
+        // Without this the two 403 cases above are blind to the fixture drifting OUT of the
+        // rate-limit branch: a 403 with no rate-limit handling is just a non-retryable 4xx —
+        // one request, same rejection, both assertions still green. This proves the branch is
+        // live and that only the POLICY closes it.
+        //
+        // GitHub is the only provider with a 403 rate-limit branch, so it is the only one that
+        // retries here; the other two treat it as a plain 4xx, which is the correct behaviour
+        // for them and is what the expected count encodes.
+        vi.useFakeTimers();
+        const reset = String(Math.floor(Date.now() / 1000) + 3600);
+        const fetchMock = stubStatus(403, {'x-ratelimit-remaining': '0', 'x-ratelimit-reset': reset});
+
+        const pending = createGitProvider(config).listRepos();
+        void pending.catch(() => {});
+        await vi.runAllTimersAsync();
+        await expect(pending).rejects.toThrow(/403/);
+
+        expect(fetchMock.mock.calls).toHaveLength(
+            type === 'github' ? 1 + MAX_RATE_LIMIT_RETRIES : 1,
+        );
     });
 
     it('disarms the request timeout as soon as fetch settles', async () => {

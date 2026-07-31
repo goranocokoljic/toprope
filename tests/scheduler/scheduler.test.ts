@@ -2,10 +2,12 @@ import {describe, it, expect, beforeEach, afterEach, vi} from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import cron from 'node-cron';
 import {
     parseSyncTimeToCron,
     buildConnectorSchedule,
     createConnectorTick,
+    startScheduler,
     type ScheduledConnector,
 } from '../../src/scheduler/scheduler';
 import type {TopropeConfig} from '../../src/config/types';
@@ -205,6 +207,40 @@ describe('createConnectorTick in-flight guard (#283)', () => {
 
         await tick();
         expect(syncCalls()).toBe(2);
+    });
+
+    it('startScheduler gives each enabled connector its OWN guarded tick', () => {
+        // The seam where the guard actually reaches production, and the only place the
+        // per-connector property is decided. `createConnectorTick` being per-instance proves
+        // nothing if `startScheduler` hoists one closure out of the loop — a 4-hour git run
+        // would then swallow that day's copilot/claude-code/windsurf/cursor ticks, invisibly.
+        const config = makeConfig();
+        config.connectors.git.enabled = true;
+        config.connectors.copilot.enabled = true;
+        config.connectors.claude_code.enabled = false;
+        config.connectors.windsurf.enabled = false;
+        config.connectors.cursor.enabled = false;
+
+        const registered: Array<{expr: string; cb: () => Promise<void>; opts: unknown}> = [];
+        const scheduleSpy = vi
+            .spyOn(cron, 'schedule')
+            .mockImplementation(((expr: string, cb: () => Promise<void>, opts: unknown) => {
+                registered.push({expr, cb, opts});
+                return {stop: (): void => {}} as unknown as ReturnType<typeof cron.schedule>;
+            }) as unknown as typeof cron.schedule);
+
+        startScheduler(config, dbPath);
+
+        // Only the two enabled connectors, each at its own time and in UTC.
+        expect(scheduleSpy).toHaveBeenCalledTimes(2);
+        expect(registered.map((r) => r.expr)).toEqual(['00 02 * * *', '30 03 * * *']);
+        expect(registered.every((r) => (r.opts as {timezone: string}).timezone === 'UTC')).toBe(true);
+        // DISTINCT closures — the regression this test exists for. Hoisting
+        // `createConnectorTick(entry, dbPath)` out of the loop makes these the same function,
+        // and one connector's in-flight run then suppresses every other connector's tick.
+        // (That the guard is per-closure is proven by the sibling test above; this proves
+        // `startScheduler` really hands each connector its own.)
+        expect(registered[0].cb).not.toBe(registered[1].cb);
     });
 
     it('releases the guard when the tick cannot even open the database', async () => {

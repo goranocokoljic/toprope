@@ -14,7 +14,6 @@ import {
     GitProviderFetchError,
     GitRunDeadlineError,
     INTERACTIVE_REQUEST_POLICY,
-    INTERACTIVE_RETRY_PROFILE,
     MAX_RATE_LIMIT_DELAY_MS,
     MAX_RATE_LIMIT_RETRIES,
     MAX_SERVER_ERROR_RETRIES,
@@ -48,6 +47,12 @@ describe('policy constants', () => {
     // is the entire point of the issue, so it gets an assertion that cannot move with the code.
     it('spend minutes on a 5xx, and an hour at most on a rate limit', () => {
         expect(MAX_SERVER_ERROR_RETRIES).toBe(5);
+        // Pinned as a literal for the same reason as its neighbours (#283). Every other
+        // assertion about the request timeout derives its expectation FROM the constant —
+        // advancing by `GIT_REQUEST_TIMEOUT_MS ± n`, or bounding `<= GIT_REQUEST_TIMEOUT_MS` —
+        // so raising it to half an hour left the whole suite green. That is exactly the
+        // property the source docstring says it rejected `AbortSignal.timeout` to avoid.
+        expect(GIT_REQUEST_TIMEOUT_MS).toBe(120_000);
         expect(SERVER_ERROR_BASE_DELAY_MS).toBe(5_000);
         expect(SERVER_ERROR_MAX_DELAY_MS).toBe(120_000);
         expect(MAX_RATE_LIMIT_DELAY_MS).toBe(3_600_000);
@@ -352,7 +357,6 @@ describe('retry profiles (#283)', () => {
         // from the source would keep this green through the exact regression it guards —
         // wiring `rateLimit` back to MAX_RATE_LIMIT_RETRIES, i.e. up to three hours of
         // sleeping inside one HTTP request a human is waiting on.
-        expect(INTERACTIVE_RETRY_PROFILE).toEqual({transient: 0, rateLimit: 0});
         expect(INTERACTIVE_REQUEST_POLICY.retries).toEqual({transient: 0, rateLimit: 0});
         expect(INTERACTIVE_REQUEST_POLICY.deadline).toBeUndefined();
     });
@@ -415,6 +419,18 @@ describe('assertRunTimeRemaining (#283)', () => {
             assertRunTimeRemaining(INTERACTIVE_REQUEST_POLICY, 'https://api/x'),
         ).not.toThrow();
     });
+
+    it('is TOTAL — an unreadable remaining time stops the run rather than slipping the guard', () => {
+        // `remaining <= 0` alone fails OPEN on NaN, silently restoring the unbounded behaviour
+        // the deadline exists to remove. `GitRunDeadline` is a public interface anything may
+        // implement, so "Date.now() can't be NaN" does not cover it — the graduated rule is to
+        // reject an unparseable operand explicitly.
+        for (const bad of [NaN, Infinity, -Infinity]) {
+            expect(() => assertRunTimeRemaining(withRemaining(bad), 'https://api/x')).toThrow(
+                GitRunDeadlineError,
+            );
+        }
+    });
 });
 
 describe('sleepWithinRun (#283)', () => {
@@ -460,6 +476,16 @@ describe('sleepWithinRun (#283)', () => {
         const pending = sleepWithinRun(INTERACTIVE_REQUEST_POLICY, 5_000, 'https://api/x');
         await vi.advanceTimersByTimeAsync(5_000);
         await expect(pending).resolves.toBeUndefined();
+    });
+
+    it('is TOTAL — an unreadable remaining time refuses the pause', async () => {
+        // `NaN >= NaN` is false, so without the finiteness check the pause would be taken.
+        vi.useFakeTimers();
+        const timer = vi.spyOn(globalThis, 'setTimeout');
+        await expect(sleepWithinRun(withRemaining(NaN), 5_000, 'https://api/x')).rejects.toThrow(
+            GitRunDeadlineError,
+        );
+        expect(timer).not.toHaveBeenCalled();
     });
 });
 

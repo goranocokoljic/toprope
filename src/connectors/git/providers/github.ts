@@ -124,6 +124,10 @@ async function fetchGitHub(
             // same backoff. Wrapped so the in-run repo retry (#272) can classify it; the message
             // is preserved verbatim. A GIT_REQUEST_TIMEOUT_MS abort lands here too, deliberately:
             // a stalled socket is that same outage with no response at all (#283).
+            // Disarmed BEFORE the backoff, not just by the `finally`: the pause is minutes
+            // long, and leaving the timer armed across it would make "cleared the moment
+            // `fetch` settles" untrue on exactly the path most likely to drift (#283 review).
+            timeout.clear();
             if (transientRetries < policy.retries.transient) {
                 await sleepWithinRun(policy, serverErrorDelayMs(transientRetries, null), url);
                 transientRetries++;
@@ -135,6 +139,9 @@ async function fetchGitHub(
                 {cause: err},
             );
         } finally {
+            // Idempotent — `clearTimeout` on an already-cleared handle is a no-op — so the
+            // catch path clearing early and this clearing again is safe, and this stays the
+            // one guarantee that no path leaves a signal armed over an unread body.
             timeout.clear();
         }
 

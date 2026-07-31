@@ -1781,11 +1781,15 @@ async function fetchProviderData(
                 return {value, error: null};
             } catch (err) {
                 const message = err instanceof Error ? err.message : String(err);
-                // The deadline reached this fetch, wherever it was raised — the request layer
-                // (`assertRunTimeRemaining`/`sleepWithinRun`) or the pause refusal below.
+                // The deadline actually ENDED this fetch — raised by the request layer, from
+                // `assertRunTimeRemaining` (the clock passed before a request) or from
+                // `sleepWithinRun` (a request-level pause the clock could not finish).
                 // Recorded on the RUN rather than left to the loop, because the caller that
                 // needs it is the post-loop check, not this one: a deadline that lands on the
                 // LAST repo's fetch has no next iteration to notice it (#283 review, SO-1).
+                //
+                // This is the ONLY site that sets it, and that is the point — see the pause
+                // refusal below for the case that looks similar and must not.
                 if (err instanceof GitRunDeadlineError) deadlineStopped = true;
                 if (attempt >= GIT_REPO_RETRY_DELAYS_MS.length || !isRetryableGitFetchError(err)) {
                     return {value: null, error: message};
@@ -1804,8 +1808,18 @@ async function fetchProviderData(
                 // Says WHY there was no retry. The bare fault message reads as "one 503 and it
                 // gave up", which sends the operator to the provider instead of to the run's
                 // length — the opposite of the diagnosis.
+                //
+                // Deliberately does NOT set `deadlineStopped`. A refused PAUSE is not a spent
+                // DEADLINE: the fault that ended this fetch was a retryable provider fault (the
+                // guard above proved it), the clock has NOT passed, and the run is entitled to
+                // finish. Conflating the two escalated every BEST-EFFORT failure in the last
+                // five minutes — a PR list or one review-comment 503 — into `commitsComplete =
+                // false`, discarding a whole provider's successfully-fetched run and holding
+                // its cursor, which is precisely the #231 trade this file spends paragraphs
+                // refusing to make for those fetches. If the clock really is spent, the next
+                // request trips `assertRunTimeRemaining` and the flag is set above, where the
+                // claim is true.
                 if (runBudget.deadline.remainingMs() <= delay) {
-                    deadlineStopped = true;
                     return {
                         value: null,
                         error:
@@ -1882,6 +1896,13 @@ async function fetchProviderData(
     if (repoList.error === null) {
         repoNames = repoList.value.filter((r) => !r.isArchived).map((r) => r.name);
     } else {
+        // A wall-clock stop during the LISTING gets the deadline line too, not just the bare
+        // fetch failure (#283 review, SO-3/SEC-2). This return is BEFORE the post-loop block
+        // that normally turns `deadlineStopped` into an outcome, so without this the flag was
+        // set and then discarded — leaving a third, unlabelled wall-clock shape that reads as
+        // a provider-health failure, which is exactly what `providerNotReachedLine` exists to
+        // prevent. No repo was reached, so the count is 0 of 0 candidates.
+        if (deadlineStopped) errors.push(runDeadlineLine(providerType, 0, 0));
         errors.push(`[${providerType}] Failed to list repos: ${repoList.error}`);
         return noWindowCovered();
     }
@@ -2086,7 +2107,15 @@ async function fetchProviderData(
                 diffs = [];
                 try {
                     diffs = await provider.getCommitDiff(repoName, rawCommit.sha);
-                } catch {
+                } catch (err) {
+                    // A wall-clock stop is NOT one of the faults this swallows (#283 review,
+                    // SEC-3). Everything else here is "one commit's diff is unavailable", which
+                    // #271 deliberately tolerates; a deadline is a statement about the RUN, and
+                    // absorbing it here would be the one path where it neither sets
+                    // `deadlineStopped` nor propagates. Unreachable today — every in-tree
+                    // provider supplies `diffs`, so this branch needs a future diff-less one —
+                    // which is exactly why it is worth closing before that provider exists.
+                    if (err instanceof GitRunDeadlineError) throw err;
                     // Diff fetch failed — use empty diffs; commit still counts. Swallowing the
                     // fault is #271's preserved semantics (one bad diff must not fail the repo),
                     // but the commit's file-level metrics are now computed from nothing and the

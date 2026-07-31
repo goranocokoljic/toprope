@@ -25,6 +25,7 @@ import {runMigrations} from '../../../src/storage/migrator';
 import {addTeam} from '../../../src/registry/teams';
 import {addDeveloper} from '../../../src/registry/developers';
 import {
+    GIT_REPO_RETRY_DELAYS_MS,
     GIT_RUN_WALL_CLOCK_BUDGET_MS,
     GitSync,
     RUN_DEADLINE_PREFIX,
@@ -138,7 +139,20 @@ function readState(db: Database.Database, key: string): string | undefined {
 function snapshotCount(db: Database.Database): number {
     const snapshots = (db.prepare('SELECT COUNT(*) AS n FROM git_snapshots').get() as {n: number}).n;
     const raw = (db.prepare('SELECT COUNT(*) AS n FROM raw_author_daily').get() as {n: number}).n;
+    // A SUM is right for the drop assertions (`toBe(0)` needs both empty) but too weak for a
+    // positive control, where `> 0` on the sum would tolerate the projection being lost while
+    // the raw rows landed. The positive controls use `expectBothWritten` instead.
     return snapshots + raw;
+}
+
+/** Both tables non-empty — the source of record AND the projection over it. */
+function expectBothWritten(db: Database.Database): void {
+    expect(
+        (db.prepare('SELECT COUNT(*) AS n FROM raw_author_daily').get() as {n: number}).n,
+    ).toBeGreaterThan(0);
+    expect(
+        (db.prepare('SELECT COUNT(*) AS n FROM git_snapshots').get() as {n: number}).n,
+    ).toBeGreaterThan(0);
 }
 
 describe('run wall-clock budget (#283)', () => {
@@ -244,6 +258,12 @@ describe('run wall-clock budget (#283)', () => {
         expect(result.errors).toContain(providerNotReachedLine('gitlab'));
         expect(result.errors.some((e) => e.includes('0 of 0'))).toBe(false);
         expect(result.errors.some((e) => e.includes('Failed to list repos'))).toBe(false);
+        // A FAILURE like its sibling, not an advisory: this provider's window is entirely
+        // uncovered and its cursor is held, so the run must go red and `sync-pipeline` must be
+        // allowed its retry. Asserted on the classifier, not on `toContain` — which is
+        // self-referential and would survive the line being re-prefixed as an advisory.
+        expect(isAdvisoryError(providerNotReachedLine('gitlab'))).toBe(false);
+        expect(providerNotReachedLine('gitlab').startsWith(RUN_DEADLINE_PREFIX)).toBe(true);
         // Completeness is per PROVIDER, and the deadline does not change that: github covered
         // every one of its repos before the clock ran out, so its cursor advances and its data
         // is kept. Only gitlab — whose window was not touched at all — is held. Blanket-holding
@@ -333,7 +353,7 @@ describe('run wall-clock budget (#283)', () => {
         expect(result.errors.filter((e) => !isAdvisoryError(e))).toHaveLength(0);
         expect(result.errors.some((e) => e.startsWith(RUN_DEADLINE_PREFIX))).toBe(false);
         expect(readState(db, FORWARD_KEY)).toBe(result.lastSyncTime);
-        expect(snapshotCount(db)).toBeGreaterThan(0);
+        expectBothWritten(db);
     });
 
     it('refuses a repo-retry pause the remaining budget cannot absorb, and says why', async () => {
@@ -370,6 +390,51 @@ describe('run wall-clock budget (#283)', () => {
         expect(readState(db, FORWARD_KEY)).toBeUndefined();
     });
 
+    it('does NOT discard the run when a BEST-EFFORT fetch merely loses its retry pause', async () => {
+        // A refused PAUSE is not a spent DEADLINE. The fault here is an ordinary retryable
+        // 503 on the PR list — a best-effort fetch that by design records an error and leaves
+        // `commitsComplete` alone (holding the cursor for it would force an additive commit
+        // re-fetch, which #231 weighed and rejected). The clock has NOT passed; it is simply
+        // too short to afford a 5-minute pause.
+        //
+        // Conflating the two cost a whole provider's run: every commit fetched over four
+        // hours discarded, the cursor held, a stall recorded — for one tolerated 503.
+        seedAlice(db);
+        const createGitProvider = await getCreateGitProvider();
+        const getPullRequests = vi.fn().mockImplementation(async () => {
+            // Leave less than the first repo-retry pause on the clock, so the pause is refused
+            // — but the deadline itself has NOT passed. Derived from the constant, so a change
+            // to the retry schedule cannot silently turn this into the other case.
+            vi.setSystemTime(
+                new Date(
+                    Date.now() + GIT_RUN_WALL_CLOCK_BUDGET_MS - GIT_REPO_RETRY_DELAYS_MS[0] / 2,
+                ),
+            );
+            throw new GitProviderFetchError('GitHub API server error 503: /pulls', 503);
+        });
+        createGitProvider.mockReturnValue(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('only-repo')]),
+                getCommits: vi.fn().mockResolvedValue([makeCommit('c-1')]),
+                getPullRequests,
+            }),
+        );
+
+        const result = await runSync(db);
+
+        // One attempt: the pause was refused, and the message says why.
+        expect(getPullRequests).toHaveBeenCalledTimes(1);
+        expect(
+            result.errors.some((e) => e.includes("wall-clock budget could not absorb the pause")),
+        ).toBe(true);
+        // The run is NOT reported as cut off — it was not.
+        expect(result.errors.some((e) => e.startsWith(RUN_DEADLINE_PREFIX))).toBe(false);
+        // And the commits it did fetch are KEPT, cursor advanced — the pre-#283 behaviour for
+        // a best-effort failure, unchanged as AC4 requires.
+        expect(readState(db, FORWARD_KEY)).toBe(result.lastSyncTime);
+        expectBothWritten(db);
+    });
+
     it('lets a run that stays inside its budget finish normally', async () => {
         // Positive control for the whole file: without it every assertion above would pass
         // against a deadline that fired on every run.
@@ -390,7 +455,7 @@ describe('run wall-clock budget (#283)', () => {
 
         expect(result.errors.filter((e) => !isAdvisoryError(e))).toHaveLength(0);
         expect(result.errors.some((e) => e.startsWith(RUN_DEADLINE_PREFIX))).toBe(false);
-        expect(snapshotCount(db)).toBeGreaterThan(0);
+        expectBothWritten(db);
         expect(readState(db, FORWARD_KEY)).toBe(result.lastSyncTime);
     });
 });

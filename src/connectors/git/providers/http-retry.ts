@@ -127,33 +127,6 @@ export const SYNC_RETRY_PROFILE: GitRetryProfile = {
 };
 
 /**
- * What an INTERACTIVE caller gets: no sleeping at all, on either budget.
- *
- * Zero on BOTH halves, for the one reason {@link PROBE_SERVER_ERROR_RETRIES} states at
- * length — the caller is answering "is this reachable right now" inside a single HTTP
- * request a human (or a browser, or a proxy) is waiting on, and every pause available here
- * is measured in minutes or hours, not seconds. Three callers take it, and the second and
- * third are what #283 added:
- *   - `checkAccess()` — `toprope doctor` and the admin test-connection route;
- *   - `listRepos()` on `GET /api/admin/git/providers/:id/repos`, the repo-scope picker;
- *   - `listRepos()` in `toprope doctor`, which enumerates repos to verify configured slugs.
- *
- * It also disables GitHub's PRE-EMPTIVE rate-limit pause, which is neither a retry nor a
- * failure — it fires after a 200 when `x-ratelimit-remaining` is low and sleeps to the reset
- * instant, up to {@link MAX_RATE_LIMIT_DELAY_MS}. A retry-count override alone would have
- * left that third hour-long sleep on the interactive path.
- *
- * The trade is the same one {@link PROBE_SERVER_ERROR_RETRIES} names: an interactive call
- * reports a one-off blip as a failure. That is the right answer for a cheap, idempotent,
- * re-runnable read — and the sync, where a blip costs hours, still gets
- * {@link SYNC_RETRY_PROFILE}.
- */
-export const INTERACTIVE_RETRY_PROFILE: GitRetryProfile = {
-    transient: PROBE_SERVER_ERROR_RETRIES,
-    rateLimit: 0,
-};
-
-/**
  * A wall-clock deadline for one sync RUN, which the request layer consults on the same clock
  * the repo-level pauses are bounded by (#283).
  *
@@ -230,8 +203,37 @@ export interface GitRequestPolicy {
 /** The policy every sync fetch takes, unless the caller supplies a run deadline as well. */
 export const SYNC_REQUEST_POLICY: GitRequestPolicy = {retries: SYNC_RETRY_PROFILE};
 
-/** The policy every interactive probe/listing takes — see {@link INTERACTIVE_RETRY_PROFILE}. */
-export const INTERACTIVE_REQUEST_POLICY: GitRequestPolicy = {retries: INTERACTIVE_RETRY_PROFILE};
+/**
+ * What an INTERACTIVE caller gets: no sleeping at all, on either budget.
+ *
+ * Zero on BOTH halves, for the one reason {@link PROBE_SERVER_ERROR_RETRIES} states at
+ * length — the caller is answering "is this reachable right now" inside a single HTTP request
+ * a human (or a browser, or a proxy) is waiting on, and every pause available here is measured
+ * in minutes or hours, not seconds. Three callers take it, and the second and third are what
+ * #283 added:
+ *   - `checkAccess()` — `toprope doctor` and the admin test-connection route;
+ *   - `listRepos()` on `GET /api/admin/git/providers/:id/repos`, the repo-scope picker;
+ *   - `listRepos()` in `toprope doctor`, which enumerates repos to verify configured slugs.
+ *
+ * It also disables GitHub's PRE-EMPTIVE rate-limit pause, which is neither a retry nor a
+ * failure — it fires after a 200 when `x-ratelimit-remaining` is low and sleeps to the reset
+ * instant, up to {@link MAX_RATE_LIMIT_DELAY_MS}. A retry-count override alone would have left
+ * that third hour-long sleep on the interactive path.
+ *
+ * The trade is the same one {@link PROBE_SERVER_ERROR_RETRIES} names: an interactive call
+ * reports a one-off blip as a failure — and, since it no longer waits out a 429/403 rate
+ * limit, reports being rate-limited as a failure too. That is the right answer for a cheap,
+ * idempotent, re-runnable read, but it puts weight on the REMEDIATION copy: see
+ * `gitProviderFixHint`, which must recognise a rate limit before it blames the token's scopes.
+ *
+ * Written inline rather than as a named `GitRetryProfile` constant: there is exactly one
+ * interactive shape and nothing composes it, so a separate export would have had no consumer
+ * but this line. `SYNC_RETRY_PROFILE` earns its name because `sync.ts` composes it with a
+ * run deadline.
+ */
+export const INTERACTIVE_REQUEST_POLICY: GitRequestPolicy = {
+    retries: {transient: PROBE_SERVER_ERROR_RETRIES, rateLimit: 0},
+};
 
 /**
  * Ceiling on how long ONE HTTP request may take to produce a RESPONSE, enforced by an
@@ -347,7 +349,12 @@ export class GitRunDeadlineError extends Error {
  */
 export function assertRunTimeRemaining(policy: GitRequestPolicy, url: string): void {
     const remaining = policy.deadline?.remainingMs();
-    if (remaining !== undefined && remaining <= 0) {
+    if (remaining === undefined) return;
+    // TOTAL, per the graduated rule: a non-finite reading is rejected explicitly rather than
+    // left to compare false. `remaining <= 0` alone fails OPEN on `NaN`, which would silently
+    // restore the unbounded behaviour this exists to remove — and `GitRunDeadline` is a public
+    // interface anything may implement, so "Date.now() can't be NaN" does not cover it.
+    if (!Number.isFinite(remaining) || remaining <= 0) {
         throw new GitRunDeadlineError(
             `git sync run exceeded its wall-clock budget before requesting ${url}`,
         );
@@ -370,10 +377,13 @@ export async function sleepWithinRun(
     url: string,
 ): Promise<void> {
     const remaining = policy.deadline?.remainingMs();
-    if (remaining !== undefined && delayMs >= remaining) {
+    // Total on both operands, per the graduated rule — `NaN >= NaN` is false, so an
+    // unparseable reading would slip the guard and take the pause.
+    if (remaining !== undefined && (!Number.isFinite(remaining) || delayMs >= remaining)) {
         throw new GitRunDeadlineError(
-            `git sync run has ${Math.max(remaining, 0)} ms of its wall-clock budget left, ` +
-                `less than the ${delayMs} ms retry pause requested for ${url}`,
+            `git sync run has ${Number.isFinite(remaining) ? Math.max(remaining, 0) : 'an unreadable amount of'} ` +
+                `ms of its wall-clock budget left, less than the ${delayMs} ms retry pause ` +
+                `requested for ${url}`,
         );
     }
     await sleep(delayMs);

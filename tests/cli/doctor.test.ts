@@ -4,7 +4,12 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import {runMigrations} from '../../src/storage/migrator';
-import {runDoctor, exactConfiguredRepos, findMissingRepos} from '../../src/cli/doctor';
+import {
+    runDoctor,
+    exactConfiguredRepos,
+    findMissingRepos,
+    gitProviderFixHint,
+} from '../../src/cli/doctor';
 import {createProvider} from '../../src/connectors/git/providers/store';
 import {loadServerKey} from '../../src/connectors/git/providers/secret';
 import {INTERACTIVE_REQUEST_POLICY} from '../../src/connectors/git/providers/http-retry';
@@ -652,5 +657,55 @@ describe('configured repo verification helpers', () => {
 
     it('matches a short slug against a namespaced repo name (GitLab)', () => {
         expect(findMissingRepos(['myrepo'], ['group/myrepo'])).toEqual([]);
+    });
+});
+
+describe('gitProviderFixHint — rate limit vs credentials (#283)', () => {
+    it('reads a GitHub 403 rate limit as a rate limit, NOT as missing token scopes', () => {
+        // GitHub signals its PRIMARY rate limit with 403, not 429, and since #283 an
+        // interactive client no longer waits one out — so this message really does reach the
+        // hint. The scope rule matches on a bare ' 403'/'forbidden' substring, so without an
+        // earlier rate-limit rule an admin is told to rotate a perfectly good PAT because the
+        // nightly sync spent the org's quota.
+        const message =
+            'GitHub API forbidden (403): https://api.github.com/orgs/acme/repos: ' +
+            '{"message":"API rate limit exceeded for user ID 1."}';
+        const hint = gitProviderFixHint('github', message);
+
+        expect(hint).toMatch(/rate limited/i);
+        expect(hint).not.toMatch(/read scopes/);
+    });
+
+    it('reads an exhausted rate-limit budget on any provider as a rate limit', () => {
+        // The wording all three throw once the budget is spent — on an interactive client that
+        // is after ZERO retries, which is the new common case.
+        for (const type of ['github', 'bitbucket', 'gitlab'] as const) {
+            const hint = gitProviderFixHint(
+                type,
+                'Rate limit exceeded after 0 retries: https://api/x',
+            );
+            expect(hint).toMatch(/rate limited/i);
+        }
+    });
+
+    it('still blames scopes for a 403 that is NOT a rate limit', () => {
+        // The positive control: the pre-existing rule must keep working for the case it was
+        // written for, or this fix would have traded one mis-diagnosis for another.
+        const hint = gitProviderFixHint(
+            'github',
+            'GitHub API forbidden (403): https://api.github.com/orgs/acme/repos: ' +
+                '{"message":"Resource not accessible by personal access token"}',
+        );
+        expect(hint).toMatch(/read scopes/);
+        expect(hint).not.toMatch(/rate limited/i);
+    });
+
+    it('leaves 401 and 404 untouched', () => {
+        expect(gitProviderFixHint('github', 'GitHub API error 401: bad token')).toMatch(
+            /credentials invalid or expired/,
+        );
+        expect(gitProviderFixHint('gitlab', 'GitLab API error 404: nope')).toMatch(
+            /not found/,
+        );
     });
 });

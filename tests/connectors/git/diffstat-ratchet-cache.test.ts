@@ -27,6 +27,7 @@ import {
     GIT_REPO_RETRY_DELAYS_MS,
     GIT_RUN_WALL_CLOCK_BUDGET_MS,
     GitSync,
+    RUN_DEADLINE_PREFIX,
     isAdvisoryError,
     syncStateKey,
 } from '../../../src/connectors/git/sync';
@@ -707,7 +708,11 @@ describe('#273 per-commit diffstat ratchet cache', () => {
         const first = await runSync(db, BITBUCKET_CONFIG);
 
         // #231 in full: the window was not covered, so nothing was written and no cursor moved.
-        expect(first.errors.some((e) => e.includes('wall-clock budget'))).toBe(true);
+        // The PREFIX, not a 'wall-clock budget' substring: the pause-refusal suffix contains
+        // that phrase too, so the looser match could not tell which mechanism stopped the run
+        // — and the point of this test is that `assertRunTimeRemaining` fired inside the
+        // provider.
+        expect(first.errors.some((e) => e.startsWith(RUN_DEADLINE_PREFIX))).toBe(true);
         expect(countRows(db, 'raw_author_daily')).toBe(0);
         expect(countRows(db, 'git_snapshots')).toBe(0);
         expect(

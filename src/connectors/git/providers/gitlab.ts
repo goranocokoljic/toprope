@@ -71,6 +71,9 @@ async function fetchGitLab(
             // A transport fault is the same outage as a 503, seen one layer down — same budget,
             // same backoff. Wrapped so the in-run repo retry (#272) can classify it; the message
             // is preserved verbatim. A GIT_REQUEST_TIMEOUT_MS abort lands here too (#283).
+            // Disarmed BEFORE the minutes-long backoff, not just by the `finally` — see the
+            // identical note in `github.ts` (#283 review).
+            timeout.clear();
             if (transientRetries < policy.retries.transient) {
                 await sleepWithinRun(policy, serverErrorDelayMs(transientRetries, null), url);
                 transientRetries++;
@@ -82,6 +85,8 @@ async function fetchGitLab(
                 {cause: err},
             );
         } finally {
+            // Idempotent, so clearing twice is safe; this stays the one guarantee no path
+            // leaves a signal armed over an unread body.
             timeout.clear();
         }
 
