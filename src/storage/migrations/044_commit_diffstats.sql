@@ -69,7 +69,23 @@
 -- whole window and re-asked. The remedy is that this table is disposable: deleting the
 -- affected rows (or the container's whole set) makes the next sync re-fetch them.
 --     DELETE FROM commit_diffstats WHERE provider = ? AND container = ?;   -- and/or AND repo = ?
--- The provider delete cascade (#264) issues exactly that statement for its container.
+-- Since #286 that statement has an operator surface and does NOT require opening sqlite3
+-- against the production database:
+--     toprope git cache clear [--provider <t>] [--container <c>] [--repo <r>] [--all]
+-- with every scope flag optional and composing (omitting one widens the scope; the unscoped
+-- form additionally requires --all). `toprope doctor` reports the table's row count, its share
+-- of `absent` markers and the bytes its `entries` occupy, which is the signal that says whether
+-- a purge is worth issuing.
+--
+-- READ THE BOUND ON THAT REMEDY, which the paragraph above states and #286 makes operator-
+-- visible: clearing only causes a RE-FETCH of commits a later sync walks again. On a run that
+-- COMPLETED, the forward cursor advanced past the window and the next run's `since` starts at
+-- that cursor, so the deleted answers' contribution to raw_author_daily — and to the
+-- git_snapshots projected from it — is untouched by the purge. Correcting that needs the span
+-- re-imported (delete + re-add the provider so the #264 cascade retracts its raw rows first,
+-- then "sync older history"), which is the same repair `sync.ts` prescribes for the equivalent
+-- permanent understatement under DIFFS_NOT_SUPPLIED_PREFIX.
+-- The provider delete cascade (#264) issues the same DELETE for its container.
 --
 -- THIS TABLE IS PART OF THE GIT-DATA RESET CONTRACT — a future reset MUST clear it. Migrations
 -- 042 and 043 established the project's remedy for wrong git data: empty `git_snapshots` /
@@ -92,7 +108,7 @@
 -- taken deliberately: the file-level entries are what `code_churn_rate` and `ai_signature_score`
 -- are computed from, and a deployment that cannot accept storing them should not enable git
 -- analysis at all. Excluding a repo after the fact stops it being listed; it does NOT retract
--- rows already cached — use the DELETE above.
+-- rows already cached — run `toprope git cache clear --repo <name>` (#286).
 
 CREATE TABLE IF NOT EXISTS commit_diffstats (
     -- Provider family. Closed set, DB-enforced — same vocabulary as git_providers.
@@ -125,9 +141,17 @@ CREATE TABLE IF NOT EXISTS commit_diffstats (
     PRIMARY KEY (provider, container, repo, sha)
 );
 
--- NO SECONDARY INDEX, deliberately. Both access patterns are left-prefix seeks on the PRIMARY
--- KEY index SQLite creates for the declaration above:
+-- NO SECONDARY INDEX, deliberately. Both HOT access patterns are left-prefix seeks on the
+-- PRIMARY KEY index SQLite creates for the declaration above:
 --   * the batch read — `provider = ? AND container = ? AND repo = ? AND sha IN (...)` — uses all
 --     four columns;
 --   * the delete cascade (#264) — `provider = ? AND container = ?` — uses the leading two.
 -- A second index on the same prefix would cost every per-commit write and buy nothing.
+--
+-- #286 added two patterns that are NOT left-prefix seeks, and the conclusion is unchanged for
+-- both: `toprope git cache clear` may be scoped by `repo` (or `container`) alone, and the
+-- `toprope doctor` size line is an unscoped aggregate that reads every `entries` blob. Both are
+-- interactive, once-per-invocation, operator-initiated commands — never a sync, never a request
+-- handler — so they are the exact workload a full scan is acceptable for, and indexing them
+-- would tax the per-commit write path that is the hot one. Recorded here so the next reader
+-- sees the trade rather than an out-of-date claim that no such pattern exists.

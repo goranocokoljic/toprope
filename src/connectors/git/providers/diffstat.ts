@@ -30,12 +30,12 @@ import type {CommitDiffstat, CommitDiffstatCache, GitFileDiff} from './types.js'
  * doctor`, the admin test-connection and repo-listing routes) — those never walk commits, so
  * they behave exactly as they did before #273.
  */
-export function loadDiffstats(
+export async function loadDiffstats(
     cache: CommitDiffstatCache | undefined,
     repo: string,
     shas: readonly string[],
-): Map<string, CommitDiffstat> {
-    return cache?.load(repo, shas) ?? new Map();
+): Promise<Map<string, CommitDiffstat>> {
+    return (await cache?.load(repo, shas)) ?? new Map();
 }
 
 /**

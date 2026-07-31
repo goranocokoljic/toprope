@@ -200,8 +200,14 @@ export interface CommitDiffstatCache {
      * one per commit. Callers load the repo's whole set before their per-commit loop and do
      * in-memory lookups inside it. Missing/undecodable rows are simply absent from the map,
      * which reads as a MISS and re-fetches.
+     *
+     * ASYNC so an implementation can yield the event loop between chunks (#286). The input is
+     * a whole repo's commit window, and a monorepo's worth of row decoding done in one
+     * synchronous burst stalls every in-flight request in the process that also serves
+     * Fastify. Awaiting it costs a caller nothing: it already sits immediately before an
+     * O(commits) loop of network fetches.
      */
-    load(repo: string, shas: readonly string[]): Map<string, CommitDiffstat>;
+    load(repo: string, shas: readonly string[]): Promise<Map<string, CommitDiffstat>>;
     /**
      * Record one commit's diffstat, immediately and durably — outside any run-level
      * transaction. That is the ratchet: the row must survive a run that later fails and drops

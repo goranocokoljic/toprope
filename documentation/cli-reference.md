@@ -79,6 +79,8 @@ Each prints `N written, M skipped`; non-zero exit if any connector reported erro
 | Command | Description |
 |---|---|
 | `toprope git set-history-floor --provider <github\|bitbucket\|gitlab> --container <name> --at <iso> [--force]` | Declare how far back a **legacy** git provider has already synced. |
+| `toprope git cache clear [--provider <t>] [--container <c>] [--repo <r>] [--all]` | Clear cached per-commit diffstats. Scope flags compose; omitting one widens. |
+| `toprope git clear-reset-notice` | Acknowledge the git-data reset a migration performed, once the rebuild is done. |
 
 Only needed for providers first synced before Toprope recorded a history floor. Those
 providers have no record of how far back their first sync reached, and it cannot be
@@ -104,6 +106,42 @@ span in between is stranded. The command echoes what it armed — read it back.
 (that refusal means the `--provider`/`--container` spelling doesn't match a connected
 provider — fix the spelling, don't force it), and forcing over a floor that a real sync
 earned will corrupt the backfill's disjointness.
+
+### Clearing the diffstat cache
+
+Toprope permanently memoizes each commit's diffstat under `(provider, container, repo, sha)`,
+so a sync that fails after hours of per-commit fetching keeps the work it already did. A
+commit's diffstat is immutable, so the memo never goes stale and **clearing it never loses
+data** — the only cost is that a later sync re-fetches those commits, one API call each.
+
+`toprope doctor` reports the cache's size (`commit_diffstats: N rows (M absent), X of stored
+file paths`). Clear it when you need to:
+
+- **Stop retaining a repo's file inventory.** Adding a repo to `exclude_repos` stops collection
+  but does *not* retract paths already cached. `toprope git cache clear --repo <name>` does.
+- **Discard a frozen answer whose window will be re-walked.** A 404 that meant "you may not see
+  this" rather than "this has no diffstat", a 404 on page 2+ of a paged diff, or a 200 silently
+  truncated by a proxy is recorded as a fact about the commit. If the run that recorded it was
+  later held or failed, clearing makes the next sync re-ask.
+
+```bash
+toprope git cache clear --provider github --container acme --repo acme/payments
+toprope git cache clear --all          # the whole table; --all is required for the empty scope
+```
+
+Scope flags compose and omitting one **widens** the scope. `--container` is matched
+case-insensitively (it is normalized the same way it is stored); `--repo` is matched
+**exactly** as the provider spells it (GitHub name, Bitbucket slug, GitLab
+`path_with_namespace`) and is case-sensitive.
+
+**Clearing does not correct a number that is already wrong.** A run that *completed* advanced
+the provider's forward cursor past its window, and the next run starts from that cursor — so
+the deleted answers' contribution to `files_changed`, `code_churn_rate` and
+`ai_signature_score` is unchanged by the purge. Correcting that needs the span re-imported:
+delete and re-add the provider in the admin UI (the delete cascade retracts the container's raw
+rows and re-projects the affected days before purging its cursors, so the re-import lands on an
+empty span), then run "sync older history" for anything older than the first-sync window. A
+config-file provider cannot be deleted and has no supported repair today.
 
 ## Expenses
 

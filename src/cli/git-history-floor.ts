@@ -1,7 +1,6 @@
 import type Database from 'better-sqlite3';
 import {declareEarliestSyncedFloor} from '../connectors/git/sync';
-import {normalizeContainer} from '../connectors/git/providers/container';
-import {GIT_PROVIDER_TYPES} from '../connectors/git/providers/types';
+import {parseContainer, parseProviderType} from './git-args';
 
 /**
  * `toprope git set-history-floor` — the admin recovery path for a LEGACY git provider's
@@ -38,30 +37,22 @@ export function setHistoryFloor(
     input: SetHistoryFloorInput,
     now: string,
 ): SetHistoryFloorResult {
-    // Runtime allowlist: the value arrives as an arbitrary CLI string, so the
-    // compile-time union proves nothing at this trust boundary. An unrecognized one
-    // would otherwise key a sync_state row matching no provider — a write that
-    // "succeeds" while doing nothing.
-    const providerType = GIT_PROVIDER_TYPES.find((t) => t === input.provider);
-    if (!providerType) {
-        return {
-            ok: false,
-            message: `unknown provider type: ${input.provider} (expected one of: ${GIT_PROVIDER_TYPES.join(', ')})`,
-        };
+    // Both terms go through the shared `./git-args` parsers (#286), which own the runtime
+    // allowlist and the container canonicalization for every git admin command. An
+    // unrecognized provider would otherwise key a sync_state row matching no provider — a
+    // write that "succeeds" while doing nothing — and a trim-only container would build
+    // `…:Wireless_Media`, find nothing, and report "has never synced" about a provider that
+    // has, which is the exact false state claim the canonicalization exists to prevent.
+    const provider = parseProviderType(input.provider);
+    if (!provider.ok) {
+        return {ok: false, message: provider.message};
     }
-    // Canonicalize before the key is built: '--container " acme "' would otherwise key
-    // a provider that cannot exist, and the miss would be reported as a state fact
-    // ("floor already recorded") rather than as the typo it is.
-    //
-    // Through the SHARED `normalizeContainer` (#266), not a local `.trim()`: every
-    // `git_last_sync:`/`git_earliest_sync:` key is built from the casefolded container, so a
-    // trim-only canonicalization here would read `…:Wireless_Media`, find nothing, and report
-    // "has never synced" about a provider that has — the exact false state claim this
-    // canonicalization exists to prevent, and a second copy of the container rule (#266 AC9).
-    const container = normalizeContainer(input.container);
-    if (container === '') {
-        return {ok: false, message: '--container must not be empty'};
+    const providerType = provider.value;
+    const parsedContainer = parseContainer(input.container);
+    if (!parsedContainer.ok) {
+        return {ok: false, message: parsedContainer.message};
     }
+    const container = parsedContainer.value;
 
     const result = declareEarliestSyncedFloor(db, providerType, container, input.at, now, {
         force: input.force,

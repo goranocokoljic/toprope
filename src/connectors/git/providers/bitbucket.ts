@@ -307,7 +307,7 @@ export class BitbucketProvider implements GitProvider {
         // The whole repo's already-known diffstats, resolved in ONE batched query rather than
         // a point read per commit (#273). Empty map when no cache was supplied — every probe
         // path (doctor, test-connection) omits it, and behaves exactly as before.
-        const cached = loadDiffstats(this.diffstatCache, repo, collected.map((c) => c.hash));
+        const cached = await loadDiffstats(this.diffstatCache, repo, collected.map((c) => c.hash));
         for (const raw of collected) {
             const {name, email} = parseRawAuthor(raw.author.raw);
             const username = raw.author.user?.nickname ?? raw.author.user?.account_id ?? '';

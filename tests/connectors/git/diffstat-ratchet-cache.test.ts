@@ -19,6 +19,7 @@
 import {describe, it, expect, beforeEach, afterEach, vi} from 'vitest';
 import Database from 'better-sqlite3';
 import path from 'path';
+import {setImmediate as setImmediateReal} from 'node:timers';
 import {runMigrations} from '../../../src/storage/migrator';
 import {addTeam} from '../../../src/registry/teams';
 import {addDeveloper} from '../../../src/registry/developers';
@@ -32,10 +33,13 @@ import {
     syncStateKey,
 } from '../../../src/connectors/git/sync';
 import {
+    countDiffstats,
     createCommitDiffstatCache,
     deleteContainerDiffstats,
+    deleteDiffstats,
 } from '../../../src/connectors/git/diffstat-cache';
 import {resolveCommitDiffstat} from '../../../src/connectors/git/providers/diffstat';
+import {READ_CHUNK_SIZE} from '../../../src/connectors/git/raw-author-daily';
 import {
     GitProviderFetchError,
     MAX_SERVER_ERROR_RETRIES,
@@ -460,22 +464,20 @@ function cachedRows(db: Database.Database): CachedRow[] {
 }
 
 /**
- * How many diffstats are cached for one `(provider, container)`. A local helper rather than a
- * module export: the production module has no caller for it, and a test-only export widens its
- * public API for nothing (the graduated "don't build scope without a production caller" rule).
+ * How many diffstats are cached for one `(provider, container)`.
+ *
+ * Delegates to the PRODUCTION `countDiffstats` rather than re-issuing the COUNT: #286 gave
+ * that function a real caller (`toprope doctor` reports the cache's size, and the purge
+ * command reports what it is about to remove), so a second hand-rolled copy here would be the
+ * graduated "reuse the canonical helper" rule broken in the test suite — and would keep
+ * passing if the shipped counter started scoping wrongly.
  */
-function countDiffstats(
+function cachedCount(
     db: Database.Database,
     provider: GitProviderType,
     container: string,
 ): number {
-    return (
-        db
-            .prepare(
-                'SELECT COUNT(*) AS n FROM commit_diffstats WHERE provider = ? AND container = ?',
-            )
-            .get(provider, container) as {n: number}
-    ).n;
+    return countDiffstats(db, {provider, container}).rows;
 }
 
 /** Move the whole diffstat cache between two databases — the "already ratcheted" setup. */
@@ -981,28 +983,30 @@ describe('#273 per-commit diffstat ratchet cache', () => {
         vi.stubGlobal('fetch', bitbucketFetch(log));
 
         await runSync(db, BITBUCKET_CONFIG);
-        expect(countDiffstats(db, 'bitbucket', 'test-ws')).toBe(SHAS.length);
-        expect(countDiffstats(db, 'bitbucket', 'other-ws')).toBe(0);
+        expect(cachedCount(db, 'bitbucket', 'test-ws')).toBe(SHAS.length);
+        expect(cachedCount(db, 'bitbucket', 'other-ws')).toBe(0);
 
         const cache = createCommitDiffstatCache(db, 'bitbucket', 'test-ws');
         // A DIFFERENT repo in the same workspace, with the same sha names, starts cold — a
         // regression dropping `repo` from the WHERE clause would serve one repo's churn for
         // another's identically-named commit.
-        expect(cache.load('repo2', SHAS).size).toBe(0);
-        expect(cache.load('repo1', SHAS).size).toBe(SHAS.length);
+        expect((await cache.load('repo2', SHAS)).size).toBe(0);
+        expect((await cache.load('repo1', SHAS)).size).toBe(SHAS.length);
         // A different workspace whose API happens to serve the same repo/sha names, likewise.
-        expect(createCommitDiffstatCache(db, 'bitbucket', 'other-ws').load('repo1', SHAS).size).toBe(0);
+        expect(
+            (await createCommitDiffstatCache(db, 'bitbucket', 'other-ws').load('repo1', SHAS)).size,
+        ).toBe(0);
         // …and a different PROVIDER FAMILY with a colliding container/repo/sha. Mirrored repos
         // really do share shas across providers, so `provider = ?` in the WHERE clause is load
         // bearing, not decorative.
         const mirrored = createCommitDiffstatCache(db, 'github', 'test-ws');
-        expect(mirrored.load('repo1', SHAS).size).toBe(0);
+        expect((await mirrored.load('repo1', SHAS)).size).toBe(0);
         mirrored.put('repo1', SHAS[0], {additions: 1, deletions: 0, entries: [], absent: false});
-        expect(cache.load('repo1', [SHAS[0]]).get(SHAS[0])?.additions).not.toBe(1);
+        expect((await cache.load('repo1', [SHAS[0]])).get(SHAS[0])?.additions).not.toBe(1);
         // …and the same workspace spelled differently resolves to the SAME rows (#266
         // normalization — the value compared is the value persisted).
         expect(
-            createCommitDiffstatCache(db, 'bitbucket', '  TEST-WS ').load('repo1', SHAS).size,
+            (await createCommitDiffstatCache(db, 'bitbucket', '  TEST-WS ').load('repo1', SHAS)).size,
         ).toBe(SHAS.length);
 
         db.close();
@@ -1032,7 +1036,7 @@ describe('#273 per-commit diffstat ratchet cache', () => {
         // on a success (or a refusal) would make the advisory permanently true in production
         // and no test would notice — the operator signal dead in the opposite direction.
         expect(first.errors.some((e) => e.startsWith(DIFFSTAT_CACHE_DEGRADED_PREFIX))).toBe(false);
-        expect(countDiffstats(db, 'bitbucket', 'test-ws')).toBe(SHAS.length);
+        expect(cachedCount(db, 'bitbucket', 'test-ws')).toBe(SHAS.length);
 
         // …and it is actually reused: reset the cursor so the same window is re-walked, and no
         // per-commit request is made.
@@ -1040,7 +1044,7 @@ describe('#273 per-commit diffstat ratchet cache', () => {
         log.reset();
         await runSync(db, BITBUCKET_CONFIG);
         expect(log.all).toEqual([]);
-        expect(countDiffstats(db, 'bitbucket', 'test-ws')).toBe(SHAS.length);
+        expect(cachedCount(db, 'bitbucket', 'test-ws')).toBe(SHAS.length);
 
         db.close();
     });
@@ -1104,7 +1108,7 @@ describe('#273 per-commit diffstat ratchet cache', () => {
         // Positive control: rows really were written and then removed, so the zero below is a
         // DELETION rather than a run that never cached anything.
         expect(log.ok).toHaveLength(SHAS.length);
-        expect(countDiffstats(db, 'bitbucket', 'test-ws')).toBe(0);
+        expect(cachedCount(db, 'bitbucket', 'test-ws')).toBe(0);
         db.close();
     });
 
@@ -1162,7 +1166,7 @@ describe('#273 per-commit diffstat ratchet cache', () => {
         );
         // …yet two diffstats were written before the failure, and both are retracted anyway.
         expect(log.ok).toEqual([SHAS[0], SHAS[1]]);
-        expect(countDiffstats(db, 'bitbucket', 'test-ws')).toBe(0);
+        expect(cachedCount(db, 'bitbucket', 'test-ws')).toBe(0);
         db.close();
     });
 
@@ -1239,7 +1243,7 @@ describe('#273 per-commit diffstat ratchet cache', () => {
         });
         afterEach(() => db.close());
 
-        it('is TOTAL — a blank container degrades to a dead cache rather than throwing', () => {
+        it('is TOTAL — a blank container degrades to a dead cache rather than throwing', async () => {
             // A blank container is not an attribution key, so nothing may be stored under one.
             // But refusing it by THROWING would be the single unguarded call in a module whose
             // contract is that it cannot break a sync: the throw lands on the pipeline's
@@ -1250,7 +1254,7 @@ describe('#273 per-commit diffstat ratchet cache', () => {
                 cache.put('repo1', 'sha1', {additions: 1, deletions: 0, entries: [], absent: false}),
             ).not.toThrow();
             expect(countRows(db, 'commit_diffstats')).toBe(0);
-            expect(cache.load('repo1', ['sha1']).size).toBe(0);
+            expect((await cache.load('repo1', ['sha1'])).size).toBe(0);
             // A CHECK violation IS a swallowed database fault, unlike the deterministic
             // refusals below — the write was attempted and the database rejected it.
             expect(cache.faults()).toBe(1);
@@ -1280,20 +1284,20 @@ describe('#273 per-commit diffstat ratchet cache', () => {
                 absent: false,
             });
 
-            expect(countDiffstats(db, 'github', 'org')).toBe(0);
+            expect(cachedCount(db, 'github', 'org')).toBe(0);
             // A deterministic refusal is NOT a cache fault: it says this commit's data cannot
             // be stored, not that the cache is unhealthy. Counting it would make the operator
             // advisory fire on every run forever for one un-nameable file entry.
             expect(cache.faults()).toBe(0);
         });
 
-        it('round-trips a diffstat, whole and idempotently', () => {
+        it('round-trips a diffstat, whole and idempotently', async () => {
             const cache = createCommitDiffstatCache(db, 'github', 'org');
             const value = {additions: 7, deletions: 2, entries: [...FILES], absent: false};
             cache.put('repo1', 'sha1', value);
             cache.put('repo1', 'sha1', value);
-            expect(countDiffstats(db, 'github', 'org')).toBe(1);
-            const decoded = cache.load('repo1', ['sha1']).get('sha1');
+            expect(cachedCount(db, 'github', 'org')).toBe(1);
+            const decoded = (await cache.load('repo1', ['sha1'])).get('sha1');
             expect(decoded).toEqual(value);
             // Nothing here failed, so the counter that drives the operator advisory must be
             // ZERO. Without this the counter could be moved out of its `catch` (or added to
@@ -1308,12 +1312,12 @@ describe('#273 per-commit diffstat ratchet cache', () => {
             );
         });
 
-        it('normalizes an absent marker to zero stats and no entries', () => {
+        it('normalizes an absent marker to zero stats and no entries', async () => {
             const cache = createCommitDiffstatCache(db, 'github', 'org');
             // A caller passing stats alongside `absent` is incoherent; the row must not record
             // both "no diffstat exists" and "here are its changed lines".
             cache.put('repo1', 'sha1', {additions: 9, deletions: 9, entries: [...FILES], absent: true});
-            expect(cache.load('repo1', ['sha1']).get('sha1')).toEqual({
+            expect((await cache.load('repo1', ['sha1'])).get('sha1')).toEqual({
                 additions: 0,
                 deletions: 0,
                 entries: [],
@@ -1321,7 +1325,7 @@ describe('#273 per-commit diffstat ratchet cache', () => {
             });
         });
 
-        it('reads a batch far larger than one bound-parameter chunk in full', () => {
+        it('reads a batch far larger than one bound-parameter chunk in full', async () => {
             // 900 shas exceeds the canonical READ_CHUNK_SIZE, so this fails if the chunking is
             // wrong — and it would also fail as a single 900-parameter statement on an older
             // SQLite build.
@@ -1330,7 +1334,7 @@ describe('#273 per-commit diffstat ratchet cache', () => {
             for (const sha of shas) {
                 cache.put('repo1', sha, {additions: 1, deletions: 0, entries: [], absent: false});
             }
-            const loaded = cache.load('repo1', shas);
+            const loaded = await cache.load('repo1', shas);
             expect(loaded.size).toBe(900);
             expect(loaded.get('sha-899')).toEqual({
                 additions: 1,
@@ -1339,12 +1343,73 @@ describe('#273 per-commit diffstat ratchet cache', () => {
                 absent: false,
             });
             // A repeated sha must not inflate a chunk past the bind limit either.
-            expect(cache.load('repo1', [...shas, ...shas]).size).toBe(900);
+            expect((await cache.load('repo1', [...shas, ...shas])).size).toBe(900);
         });
 
-        it('rejects every undecodable entries shape, not just a torn one', () => {
+        it('yields the event loop between chunks, and only between them (#286)', async () => {
+            // `load` runs in the process that also serves Fastify, over a WHOLE repo's commit
+            // window. Its cost is a row decode plus an uncapped `JSON.parse` per commit, so on
+            // a monorepo one synchronous burst is a multi-second stall of every in-flight
+            // request — at the start of every repo.
+            //
+            // The observation is an immediate callback armed BEFORE the load and resolved
+            // DURING it: nothing scheduled on the event loop can run at all while a
+            // synchronous function holds the thread, so `ranDuringLoad` reports false the
+            // moment the yield is removed.
+            //
+            // Probed with the `node:timers` binding for the same reason the implementation
+            // uses it, and this test is where that choice is load-bearing: this whole FILE
+            // runs under `vi.useFakeTimers()` (a 503 costs the request layer five backoff
+            // sleeps plus two repo-retry pauses), so a yield bound to the faked global would
+            // never resolve and this test — and every future one that reads a repo wider than
+            // one chunk — would hang instead of failing.
+            const cache = createCommitDiffstatCache(db, 'gitlab', 'grp');
+            const shas = Array.from({length: READ_CHUNK_SIZE * 3}, (_, i) => `sha-${i}`);
+            for (const sha of shas) {
+                cache.put('repo1', sha, {additions: 1, deletions: 0, entries: [], absent: false});
+            }
+
+            let loadFinished = false;
+            const ranDuringLoad = vi.fn(() => !loadFinished);
+            const interleaved = new Promise<boolean>((resolve) => {
+                setImmediateReal(() => resolve(ranDuringLoad()));
+            });
+            // The BATCHING half of the same contract, counted on the same load. Yielding and
+            // batching are independent: reverting to a point read per sha with a yield every
+            // 500 keeps the results correct AND keeps this test's timing assertions green,
+            // while silently restoring the O(commits) round trips the table exists to remove.
+            // Only a statement count can fail on that.
+            const prepare = vi.spyOn(db, 'prepare');
+            const loaded = await cache.load('repo1', shas);
+            loadFinished = true;
+            expect(prepare).toHaveBeenCalledTimes(3);
+            prepare.mockRestore();
+
+            expect(loaded.size).toBe(shas.length);
+            expect(ranDuringLoad).toHaveBeenCalled();
+            await expect(interleaved).resolves.toBe(true);
+
+            // …and only BETWEEN chunks. A single-chunk read — every probe, every small repo —
+            // must not pay a turn of the loop it does not need, so the same observation run
+            // over one chunk's worth of shas must come back FALSE. Without this the yield
+            // could migrate to the top of the function and the assertion above would not
+            // notice.
+            let singleFinished = false;
+            const single = new Promise<boolean>((resolve) => {
+                setImmediateReal(() => resolve(!singleFinished));
+            });
+            await cache.load('repo1', shas.slice(0, READ_CHUNK_SIZE));
+            singleFinished = true;
+            await expect(single).resolves.toBe(false);
+        });
+
+        it('rejects every undecodable entries shape, not just a torn one', async () => {
             const cache = createCommitDiffstatCache(db, 'github', 'org');
             const bad = [
+                // Not JSON at all — a value torn by a partial write or a hand edit. The
+                // `JSON.parse` throw must become a MISS (re-fetch and overwrite), not escape
+                // `load` and cost the run its whole window.
+                '[{"path":"a.ts",',
                 // Not an array at all.
                 '{"path":"a.ts"}',
                 // An array of primitives.
@@ -1365,15 +1430,15 @@ describe('#273 per-commit diffstat ratchet cache', () => {
                 const sha = `bad-${i}`;
                 cache.put('repo1', sha, {additions: 1, deletions: 0, entries: [], absent: false});
                 db.prepare('UPDATE commit_diffstats SET entries = ? WHERE sha = ?').run(entries, sha);
-                expect(cache.load('repo1', [sha]).size, entries).toBe(0);
+                expect((await cache.load('repo1', [sha])).size, entries).toBe(0);
             }
         });
 
-        it('treats a fractional stored total as a MISS — INTEGER affinity lets one past the CHECK', () => {
+        it('treats a fractional stored total as a MISS — INTEGER affinity lets one past the CHECK', async () => {
             const cache = createCommitDiffstatCache(db, 'github', 'org');
             cache.put('repo1', 'sha1', {additions: 1, deletions: 0, entries: [], absent: false});
             db.prepare("UPDATE commit_diffstats SET additions = 1.5 WHERE sha = 'sha1'").run();
-            expect(cache.load('repo1', ['sha1']).size).toBe(0);
+            expect((await cache.load('repo1', ['sha1'])).size).toBe(0);
         });
 
         it('a cache write can never fail a sync — every nonsensical put is swallowed, not thrown', () => {
@@ -1386,10 +1451,10 @@ describe('#273 per-commit diffstat ratchet cache', () => {
             expect(() => cache.put('repo1', '', value)).not.toThrow();
             expect(() => cache.put('repo1', 'sha1', {...value, additions: -1})).not.toThrow();
             expect(() => cache.put('repo1', 'sha2', {...value, deletions: Number.NaN})).not.toThrow();
-            expect(countDiffstats(db, 'github', 'org')).toBe(0);
+            expect(cachedCount(db, 'github', 'org')).toBe(0);
         });
 
-        it('neither method throws when the table itself is gone — including at construction', () => {
+        it('neither method throws when the table itself is gone — including at construction', async () => {
             // The general form of the guarantee above: SQLITE_BUSY against a second connection,
             // a full disk, a schema the process did not expect. A missing table is the
             // reproducible stand-in — before #273 the fetch phase issued no DB calls at all, so
@@ -1404,18 +1469,21 @@ describe('#273 per-commit diffstat ratchet cache', () => {
             expect(() =>
                 cache.put('repo1', 'sha1', {additions: 1, deletions: 0, entries: [], absent: false}),
             ).not.toThrow();
-            expect(cache.load('repo1', ['sha1']).size).toBe(0);
+            // A REJECTION is the async form of a throw, and would escape `getCommits` exactly
+            // as a synchronous one did — so the never-throw contract has to be asserted as
+            // "resolves", not merely "does not throw synchronously".
+            await expect(cache.load('repo1', ['sha1'])).resolves.toEqual(new Map());
             expect(cache.faults()).toBe(2);
         });
 
-        it('load short-circuits on an empty request instead of issuing a query', () => {
+        it('load short-circuits on an empty request instead of issuing a query', async () => {
             const cache = createCommitDiffstatCache(db, 'github', 'org');
-            expect(cache.load('repo1', []).size).toBe(0);
-            expect(cache.load('', ['sha1']).size).toBe(0);
+            expect((await cache.load('repo1', [])).size).toBe(0);
+            expect((await cache.load('', ['sha1'])).size).toBe(0);
             expect(cache.faults()).toBe(0);
         });
 
-        it('load survives a non-string sha without blanking the rest of the repo', () => {
+        it('load survives a non-string sha without blanking the rest of the repo', async () => {
             // The shas come off an unchecked cast of the provider's commit-list JSON, so a row
             // missing `sha` yields `undefined` — which better-sqlite3 refuses to bind. Without
             // the type filter that throw lands in `load`'s catch and returns an EMPTY map, so
@@ -1423,7 +1491,7 @@ describe('#273 per-commit diffstat ratchet cache', () => {
             const cache = createCommitDiffstatCache(db, 'github', 'org');
             cache.put('repo1', 'good', {additions: 1, deletions: 0, entries: [], absent: false});
             const shas = ['good', undefined, 42, ''] as unknown as string[];
-            expect([...cache.load('repo1', shas).keys()]).toEqual(['good']);
+            expect([...(await cache.load('repo1', shas)).keys()]).toEqual(['good']);
             expect(cache.faults()).toBe(0);
         });
 
@@ -1443,9 +1511,145 @@ describe('#273 per-commit diffstat ratchet cache', () => {
 
             expect(deleteContainerDiffstats(db, 'bitbucket', 'ws-a')).toBe(1);
 
-            expect(countDiffstats(db, 'bitbucket', 'ws-a')).toBe(0);
-            expect(countDiffstats(db, 'bitbucket', 'ws-b')).toBe(1);
-            expect(countDiffstats(db, 'github', 'ws-a')).toBe(1);
+            expect(cachedCount(db, 'bitbucket', 'ws-a')).toBe(0);
+            expect(cachedCount(db, 'bitbucket', 'ws-b')).toBe(1);
+            expect(cachedCount(db, 'github', 'ws-a')).toBe(1);
+        });
+
+        it('deleteContainerDiffstats FAILS CLOSED on a container that is not one', () => {
+            // #286 routed this through a builder that DROPS an absent scope member — and a
+            // dropped `container` predicate turns "retract this workspace" into "retract every
+            // workspace this provider family ever cached", inside the #264 cascade's write
+            // transaction. `normalizeContainer` is total over untrusted input by design
+            // (`resolveGitProviderConfigs` yields entries whose container may be absent or not
+            // even a string), so this is the value that reaches here, not a hypothetical.
+            for (const container of ['ws-a', 'ws-b']) {
+                createCommitDiffstatCache(db, 'bitbucket', container).put('r', 's', {
+                    additions: 1,
+                    deletions: 0,
+                    entries: [],
+                    absent: false,
+                });
+            }
+            for (const blank of [undefined, null, '', '   ']) {
+                expect(
+                    deleteContainerDiffstats(db, 'bitbucket', blank as unknown as string),
+                ).toBe(0);
+            }
+            expect(countDiffstats(db, {provider: 'bitbucket'}).rows).toBe(2);
+        });
+
+        // --- The scoped purge and size report behind `toprope git cache clear` (#286) -------
+
+        describe('deleteDiffstats / countDiffstats', () => {
+            /** Four rows spanning both containers and both repos of one provider, plus a second
+             *  provider — so every omitted scope member is provably WIDENING rather than
+             *  matching by luck on a single-row fixture. */
+            beforeEach(() => {
+                for (const [provider, container, repo, sha] of [
+                    ['bitbucket', 'ws-a', 'api', 's1'],
+                    ['bitbucket', 'ws-a', 'web', 's2'],
+                    ['bitbucket', 'ws-b', 'api', 's3'],
+                    ['github', 'ws-a', 'api', 's4'],
+                ] as const) {
+                    createCommitDiffstatCache(db, provider, container).put(repo, sha, {
+                        additions: 1,
+                        deletions: 0,
+                        entries: [{path: 'a.ts', additions: 1, deletions: 0, status: 'added'}],
+                        absent: false,
+                    });
+                }
+                createCommitDiffstatCache(db, 'bitbucket', 'ws-a').put('api', 's5', {
+                    additions: 0,
+                    deletions: 0,
+                    entries: [],
+                    absent: true,
+                });
+            });
+
+            it('narrows on each column, and widens over every one omitted', () => {
+                expect(countDiffstats(db).rows).toBe(5);
+                expect(countDiffstats(db, {provider: 'bitbucket'}).rows).toBe(4);
+                expect(countDiffstats(db, {provider: 'bitbucket', container: 'ws-a'}).rows).toBe(3);
+                // Repo alone spans providers AND containers — the "I excluded this repo
+                // everywhere" case, which is why it is not required to be paired.
+                expect(countDiffstats(db, {repo: 'api'}).rows).toBe(4);
+                expect(
+                    countDiffstats(db, {provider: 'bitbucket', container: 'ws-a', repo: 'api'}).rows,
+                ).toBe(2);
+            });
+
+            it('counts the absent markers and the stored path bytes separately', () => {
+                const all = countDiffstats(db);
+                // The 404 markers are what a purge aimed at a frozen permission revocation is
+                // aimed at, so they cannot be folded into the total.
+                expect(all.absent).toBe(1);
+                // '[]' for the absent row plus four real entry lists — asserted as the real
+                // byte total, not merely > 0, so a regression summing the wrong column shows.
+                const entryBytes = (
+                    db.prepare('SELECT SUM(length(entries)) AS n FROM commit_diffstats').get() as {
+                        n: number;
+                    }
+                ).n;
+                expect(all.entryBytes).toBe(entryBytes);
+                expect(countDiffstats(db, {provider: 'github'}).entryBytes).toBeLessThan(entryBytes);
+            });
+
+            it('never reports a row count it could not read', () => {
+                // A `SUM()` that cannot be narrowed degrades to 0 — an honest "none seen".
+                // A ROW COUNT must NOT, because `diffstatCacheSummary` renders 0 as "nothing
+                // cached yet": a positive emptiness claim inferred from a read that produced
+                // nothing, over a table that is not empty (the graduated #235 rule). So the
+                // unreadable case throws, and the summary turns that into "size could not be
+                // read" rather than into an all-clear.
+                db.exec('DROP TABLE commit_diffstats');
+                expect(() => countDiffstats(db)).toThrow();
+            });
+
+            it('cannot be handed a fractional absent — the CHECK, not the reader, excludes it', () => {
+                // Pinning WHY the narrowing on `absent` is unreachable, because the sibling
+                // narrowing on `additions` is very much reachable: `CHECK (additions >= 0)`
+                // is satisfied by 1.5, which is exactly the hazard the read path tests above
+                // ("treats a fractional stored total as a MISS"). `absent IN (0, 1)` admits
+                // no such value, so `SUM(absent)` is integral by the schema. If a future
+                // migration relaxes that CHECK, this test goes green while `countDiffstats`
+                // silently starts reporting `0 absent` over real 404 markers — so it is the
+                // tripwire on the assumption, not decoration.
+                expect(() =>
+                    db.prepare("UPDATE commit_diffstats SET absent = 0.5 WHERE sha = 's5'").run(),
+                ).toThrow(/CHECK constraint failed: absent/);
+                expect(countDiffstats(db).absent).toBe(1);
+            });
+
+            it('matches the container case-insensitively and the repo case-SENSITIVELY', () => {
+                // Container goes through the shared `normalizeContainer`, so the value compared
+                // is the value persisted (#255). Repo does not: repo identifiers are
+                // case-sensitive on all three providers, so folding would purge `api` on a
+                // command that named `API`.
+                expect(countDiffstats(db, {container: '  WS-A '}).rows).toBe(4);
+                expect(countDiffstats(db, {repo: 'API'}).rows).toBe(0);
+                expect(deleteDiffstats(db, {repo: 'API'})).toBe(0);
+                expect(countDiffstats(db).rows).toBe(5);
+            });
+
+            it('deletes exactly the scope it is given, and the empty scope clears the table', () => {
+                expect(deleteDiffstats(db, {provider: 'bitbucket', container: 'ws-a', repo: 'web'})).toBe(1);
+                expect(countDiffstats(db).rows).toBe(4);
+                expect(deleteDiffstats(db, {repo: 'api'})).toBe(4);
+                expect(countDiffstats(db).rows).toBe(0);
+
+                // The unscoped form is REQUIRED to exist, not merely tolerated: migration 044
+                // states that any future git-data reset must clear this table outright, or the
+                // resync replays the cached answers the reset was run to discard.
+                createCommitDiffstatCache(db, 'github', 'org').put('r', 's', {
+                    additions: 1,
+                    deletions: 0,
+                    entries: [],
+                    absent: false,
+                });
+                expect(deleteDiffstats(db, {})).toBe(1);
+                expect(countDiffstats(db).rows).toBe(0);
+            });
         });
     });
 });

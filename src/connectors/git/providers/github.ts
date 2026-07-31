@@ -511,7 +511,7 @@ export class GitHubProvider implements GitProvider {
         // The whole repo's already-known commit stats, resolved in ONE batched query rather
         // than a point read per commit (#273). Empty map when no cache was supplied — every
         // probe path (doctor, test-connection) omits it, and behaves exactly as before.
-        const cached = loadDiffstats(this.diffstatCache, repo, summaries.map((s) => s.sha));
+        const cached = await loadDiffstats(this.diffstatCache, repo, summaries.map((s) => s.sha));
         for (const summary of summaries) {
             try {
                 // A HIT PRODUCES EXACTLY WHAT A FETCH PRODUCES, in both directions, which is

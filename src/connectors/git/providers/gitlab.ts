@@ -258,7 +258,7 @@ export class GitLabProvider implements GitProvider {
         // The whole repo's already-known diffs, resolved in ONE batched query rather than a
         // point read per commit (#273). Empty map when no cache was supplied — every probe
         // path (doctor, test-connection) omits it, and behaves exactly as before.
-        const cached = loadDiffstats(this.diffstatCache, repo, raw.map((c) => c.id));
+        const cached = await loadDiffstats(this.diffstatCache, repo, raw.map((c) => c.id));
         for (const c of raw) {
             // Cache-or-fetch, including the 404-is-an-answer rule (GitLab 404s the diff of an
             // initial commit) and the write-through, lives in the shared helper — Bitbucket
