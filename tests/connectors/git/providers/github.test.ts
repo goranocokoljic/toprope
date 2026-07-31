@@ -61,10 +61,15 @@ function makeCommitDetailFixture(
         // different logins and split one author across two `raw_author_daily` identities — and
         // with identical fixtures a regression that read the detail's copy passed every test.
         author: {login: 'detail-alice'},
+        // Deliberately SKEWED from the `files` sum below (35/7, not 40/10). GitHub caps
+        // `files` at 300 per commit while `stats` covers the whole commit, so the totals must
+        // come from `stats` and must never be re-derived from the file list — with the two
+        // agreeing, a regression that summed `files` passed every assertion in this file
+        // (#288 review cycle 2, TST-4).
         stats: {additions: 40, deletions: 10, total: 50},
         files: [
             {filename: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'},
-            {filename: 'src/bar.ts', additions: 10, deletions: 5, status: 'added'},
+            {filename: 'src/bar.ts', additions: 5, deletions: 2, status: 'added'},
         ],
         ...overrides,
     };
@@ -260,8 +265,13 @@ describe('GitHubProvider', () => {
                 // re-request the identical /commits/{sha} URL (#271).
                 diffs: [
                     {path: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'},
-                    {path: 'src/bar.ts', additions: 10, deletions: 5, status: 'added'},
+                    {path: 'src/bar.ts', additions: 5, deletions: 2, status: 'added'},
                 ],
+                // The detail carried real `stats`, so the totals above are an OBSERVATION
+                // rather than zero-by-absence (#288). Asserted here, in the one exhaustive
+                // shape test, so a regression that stopped setting the flag on the happy path
+                // — which would make every commit look unobserved to the sync — fails loudly.
+                churnObserved: true,
             });
         });
 
@@ -325,8 +335,9 @@ describe('GitHubProvider', () => {
 
             expect(commits[0].additions).toBe(9999);
             expect(commits[0].deletions).toBe(8888);
-            // …while the exposed diffs remain just the (partial) file list.
-            expect(commits[0].diffs?.reduce((s, d) => s + d.additions, 0)).toBe(40);
+            // …while the exposed diffs remain just the (partial) file list, which sums to
+            // LESS than the totals — the whole point of not re-deriving them.
+            expect(commits[0].diffs?.reduce((s, d) => s + d.additions, 0)).toBe(35);
         });
 
         it('follows Link header pagination for commit list', async () => {
@@ -770,8 +781,9 @@ describe('GitHubProvider', () => {
 
         it('recovers AND memoizes when the body is malformed but its stats are real', async () => {
             // The other side of the throw above, and the positive control for the whole #273
-            // ratchet: because the recovery path now always has real stats, the `put` is
-            // unconditional again. Deleting it would silently disable the ratchet.
+            // ratchet: because the recovery path only ever reaches the `put` with real stats in
+            // hand (the throw sends the alternative away), the memo gate #288 added is always
+            // satisfied here. Deleting the `put` would silently disable the ratchet.
             const put = vi.fn();
             const cache = {load: vi.fn().mockReturnValue(new Map()), put};
             const cachingProvider = new GitHubProvider(CONFIG, {diffstatCache: cache});
@@ -829,10 +841,319 @@ describe('GitHubProvider', () => {
                 deletions: 10,
                 entries: [
                     {path: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'},
-                    {path: 'src/bar.ts', additions: 10, deletions: 5, status: 'added'},
+                    {path: 'src/bar.ts', additions: 5, deletions: 2, status: 'added'},
                 ],
                 absent: false,
             });
+        });
+
+        it('KEEPS but does not memoize a usable commit whose detail carries no stats', async () => {
+            // #288, the shape #275 left open and the one this issue exists to settle. GitHub's
+            // published response schema does not mark `stats` required, so an absent `stats` is
+            // not evidence of a malformed body and must not throw — a throw would hold the
+            // provider's forward cursor forever on a shape every re-fetch reproduces.
+            //
+            // What it must NOT do is memoize the zero. `commit_diffstats` has no invalidation,
+            // so a row written here answers for this commit on every later run, in place of the
+            // well-formed detail that would have contradicted it — which is exactly the
+            // "a later well-formed fetch would contradict it" case.
+            const put = vi.fn();
+            const cache = {load: vi.fn().mockReturnValue(new Map()), put};
+            const cachingProvider = new GitHubProvider(CONFIG, {diffstatCache: cache});
+            vi.stubGlobal(
+                'fetch',
+                makeFetchMock([
+                    {body: [makeCommitListFixture('aaa111')]},
+                    // A usable `commit` object — so the malformed-body throw does not fire —
+                    // and NO `stats`/`files` key at all.
+                    {
+                        body: {
+                            sha: 'aaa111',
+                            commit: {
+                                author: {
+                                    name: 'Alice',
+                                    email: 'alice@example.com',
+                                    date: '2024-01-15T10:00:00Z',
+                                },
+                                message: 'feat: add feature',
+                            },
+                            author: {login: 'detail-alice'},
+                        },
+                    },
+                ]),
+            );
+
+            const onDrop = vi.fn();
+            const commits = await cachingProvider.getCommits('my-repo', '', '', undefined, onDrop);
+
+            // 1. The commit is KEPT, with its real identity — it is not a drop and not a throw.
+            expect(commits).toHaveLength(1);
+            expect(commits[0].sha).toBe('aaa111');
+            expect(commits[0].date).toBe('2024-01-15T10:00:00Z');
+            expect(onDrop).not.toHaveBeenCalled();
+            // 2. Churn is zero BY ABSENCE — the only value the required numeric field can hold.
+            expect(commits[0].additions).toBe(0);
+            expect(commits[0].deletions).toBe(0);
+            // 3. NOTHING is memoized, so a later run re-asks the endpoint.
+            expect(put).not.toHaveBeenCalled();
+            // 4. And the zero is not silent — the row says the totals were not observed.
+            expect(commits[0].churnObserved).toBe(false);
+            // 5. `diffs` stays `[]`, NOT undefined. `undefined` would send the sync's
+            // `getCommitDiff` fallback back to this same endpoint for the same sha (one wasted
+            // request per degraded commit per run) and file the provider under
+            // DIFFS_NOT_SUPPLIED_PREFIX, which diagnoses a contract violation that did not
+            // happen.
+            expect(commits[0].diffs).toEqual([]);
+        });
+
+        it('treats an OBSERVED zero as observed — it memoizes and flags nothing', async () => {
+            // The control that gives the test above its meaning, and the empirical distinction
+            // the whole #288 decision rests on: a genuinely empty commit returns
+            // `stats: {additions: 0, deletions: 0, total: 0}` — a PRESENT key — so absence and
+            // observed-zero are distinguishable in the body. Gate the memo on
+            // `additions === 0` instead of on the shape of `stats` and only this test fails.
+            const put = vi.fn();
+            const cache = {load: vi.fn().mockReturnValue(new Map()), put};
+            const cachingProvider = new GitHubProvider(CONFIG, {diffstatCache: cache});
+            vi.stubGlobal(
+                'fetch',
+                makeFetchMock([
+                    {body: [makeCommitListFixture('aaa111')]},
+                    {
+                        body: makeCommitDetailFixture('aaa111', {
+                            stats: {additions: 0, deletions: 0, total: 0},
+                            files: [],
+                        }),
+                    },
+                ]),
+            );
+
+            const commits = await cachingProvider.getCommits('my-repo', '', '');
+
+            expect(commits).toHaveLength(1);
+            expect(commits[0].additions).toBe(0);
+            expect(commits[0].churnObserved).toBe(true);
+            // Observed, so it IS memoized — re-asking would return the same zero forever.
+            expect(put).toHaveBeenCalledWith('my-repo', 'aaa111', {
+                additions: 0,
+                deletions: 0,
+                entries: [],
+                absent: false,
+            });
+        });
+
+        it.each([
+            ['an explicit null', null],
+            ['an empty object', {}],
+            ['non-numeric values', {additions: '40', deletions: '10', total: '50'}],
+            ['a NaN total', {additions: Number.NaN, deletions: 0, total: Number.NaN}],
+            ['a fractional count', {additions: 4.5, deletions: 0, total: 4.5}],
+            ['a negative count', {additions: -5, deletions: 0, total: -5}],
+            [
+                'a count past the safe-integer ceiling',
+                {additions: Number.MAX_SAFE_INTEGER + 2, deletions: 0, total: 0},
+            ],
+            // The `deletions` conjunct decides this row and nothing else in the repo (#288
+            // review cycle 3, TST-288-A). Every case above puts the offending value in
+            // `additions`, which short-circuits the `&&` — so deleting
+            // `isCommitCount(rawStats.deletions)` from the guard left the whole 974-test git
+            // suite green, while `deletions: 4.5` would still reach `raw_author_daily` and
+            // throw inside the run's all-providers write transaction.
+            ['a malformed deletions beside a good additions', {additions: 40, deletions: -3, total: 37}],
+        ])('treats stats as UNOBSERVED when the body carries %s', async (_label, stats) => {
+            // #288 review cycle 1 (SO-1 / SEC-1 / SEC-3). The guard used to be
+            // `stats === undefined`, which recognizes exactly ONE spelling of an absence the
+            // issue itself says GitHub does not document. Every input here satisfies
+            // `!== undefined`, so under that guard each one took the memoize branch and wrote a
+            // fabricated `0`/`0` into a table with no invalidation — the precise outcome this
+            // issue exists to prevent, reintroduced through the spellings the guard did not
+            // enumerate. `'40'` is the sharpest of the shape cases: typed `number` by the
+            // unchecked cast, it string-concatenates through the analyzer's `reduce` and reaches
+            // `raw_author_daily` as a garbage integer; `4.5` throws there, inside the run's
+            // write transaction.
+            //
+            // The last two are the DOMAIN cases (#288 review cycle 2, SO-1/SEC-1/TST-1), which a
+            // shape-only `Number.isInteger` waved through while calling itself parity with
+            // `raw_author_daily` — which enforces `>= 0`. A negative is the worse of the two: it
+            // would be flagged OBSERVED (so no advisory names it), silently refused by the memo
+            // (`diffstat-cache` drops a non-count without counting a fault), and still summed
+            // into the developer-day, where a net-negative throws inside the write transaction
+            // on every run forever. Above the safe-integer ceiling the value clears every
+            // integrality test and fails at better-sqlite3 bind time instead. Both are why the
+            // predicate is the SHARED `isCommitCount` rather than a local test.
+            //
+            // Revert the guard to `=== undefined`, or drop either bound from `isCommitCount`,
+            // and cases here fail; nothing else in the suite does.
+            const put = vi.fn();
+            const cache = {load: vi.fn().mockReturnValue(new Map()), put};
+            const cachingProvider = new GitHubProvider(CONFIG, {diffstatCache: cache});
+            vi.stubGlobal(
+                'fetch',
+                makeFetchMock([
+                    {body: [makeCommitListFixture('aaa111')]},
+                    {body: makeCommitDetailFixture('aaa111', {stats, files: []})},
+                ]),
+            );
+
+            const commits = await cachingProvider.getCommits('my-repo', '', '');
+
+            // The commit is still kept — an unrecognized shape degrades, it does not throw.
+            expect(commits).toHaveLength(1);
+            expect(commits[0].churnObserved).toBe(false);
+            // …and the fabricated zero never reaches the totals or the memo.
+            expect(commits[0].additions).toBe(0);
+            expect(commits[0].deletions).toBe(0);
+            expect(put).not.toHaveBeenCalled();
+        });
+
+        it('THROWS on an unusable commit object plus a null stats, not just an absent one', async () => {
+            // The same widening applied to the #275 malformed-body guard, which shares the
+            // `stats` classification. A body with NEITHER a usable `commit` NOR observable stats
+            // is malformed however the second half is spelled; keying on `=== undefined` let
+            // `{commit: null, stats: null}` — a body with no evidence of usability at all — be
+            // silently recovered as a zero-churn commit.
+            const put = vi.fn();
+            const cache = {load: vi.fn().mockReturnValue(new Map()), put};
+            const cachingProvider = new GitHubProvider(CONFIG, {diffstatCache: cache});
+            vi.stubGlobal(
+                'fetch',
+                makeFetchMock([
+                    {body: [makeCommitListFixture('aaa111')]},
+                    {body: {sha: 'aaa111', commit: null, author: null, stats: null}},
+                ]),
+            );
+
+            const err: unknown = await cachingProvider
+                .getCommits('my-repo', '', '')
+                .then(() => null)
+                .catch((e: unknown) => e);
+
+            expect(err).toBeInstanceOf(Error);
+            expect((err as Error).message).toContain('malformed response');
+            expect(isRetryableGitFetchError(err)).toBe(true);
+            expect(put).not.toHaveBeenCalled();
+        });
+
+        it('withholds the memo on absent stats even when the detail DID carry files', async () => {
+            // The gate is `stats`, not the whole body. A detail with real `files` but no `stats`
+            // is the worst thing to memoize: the row would carry genuine `entries` beside a
+            // fabricated `0`/`0`, so it would LOOK observed on every later read. The file list is
+            // still handed back on `GitCommit.diffs` — it was really fetched — but no row is
+            // written and the commit is flagged unobserved.
+            const put = vi.fn();
+            const cache = {load: vi.fn().mockReturnValue(new Map()), put};
+            const cachingProvider = new GitHubProvider(CONFIG, {diffstatCache: cache});
+            vi.stubGlobal(
+                'fetch',
+                makeFetchMock([
+                    {body: [makeCommitListFixture('aaa111')]},
+                    {
+                        body: {
+                            sha: 'aaa111',
+                            commit: {
+                                author: {
+                                    name: 'Alice',
+                                    email: 'alice@example.com',
+                                    date: '2024-01-15T10:00:00Z',
+                                },
+                                message: 'feat: add feature',
+                            },
+                            author: {login: 'detail-alice'},
+                            files: [
+                                {filename: 'src/foo.ts', additions: 12, deletions: 3, status: 'modified'},
+                            ],
+                        },
+                    },
+                ]),
+            );
+
+            const commits = await cachingProvider.getCommits('my-repo', '', '');
+
+            expect(put).not.toHaveBeenCalled();
+            expect(commits[0].churnObserved).toBe(false);
+            // The file detail is NOT discarded — `diffs` is what spares the sync a second
+            // request for the same endpoint, and it is real here even though the totals are not.
+            expect(commits[0].diffs).toEqual([
+                {path: 'src/foo.ts', additions: 12, deletions: 3, status: 'modified'},
+            ]);
+            // The totals are still zero: they are NEVER re-derived from `files`, which GitHub
+            // truncates at 300 per page.
+            expect(commits[0].additions).toBe(0);
+        });
+
+        it('never flags a DROPPED commit as unobserved — the two reports are exclusive', async () => {
+            // #288 review cycle 1, TST-4. A commit with no usable author date is dropped at the
+            // guard ABOVE the churn classification, so it never reaches the flag. That ordering
+            // is what stops one sha producing both a "commit dropped" line (it is missing) and a
+            // "churn unobserved" line (its developer-day is short) — two advisories with
+            // different remedies, one of which would be describing a day that was never written.
+            //
+            // The fixture is deliberately BOTH: dateless on both copies AND stats-less.
+            const dateless = {author: null, message: 'unattributable'};
+            vi.stubGlobal(
+                'fetch',
+                makeFetchMock([
+                    {body: [{sha: 'aaa111', commit: dateless, author: null}]},
+                    {body: {sha: 'aaa111', commit: dateless, author: null}},
+                ]),
+            );
+
+            const onDrop = vi.fn();
+            const commits = await provider.getCommits('my-repo', '', '', undefined, onDrop);
+
+            // Dropped, so there is no row at all to carry a flag.
+            expect(commits).toEqual([]);
+            expect(onDrop).toHaveBeenCalledWith({
+                sha: 'aaa111',
+                reason: NO_AUTHOR_DATE_DROP_REASON,
+            });
+        });
+
+        it('leaves a cache HIT unflagged — a warm run must not report every commit', async () => {
+            // #288 review cycle 2, TST-3. The hit path deliberately omits `churnObserved`, and
+            // the comment there makes a load-bearing claim about why ("every row this can hit is
+            // an observation"). The sync filters on `churnObserved === false`, so a hit row that
+            // ever acquired the flag would emit a COMMIT_CHURN_UNKNOWN line for every warm commit
+            // on every warm run — the advisory going loud on healthy data, which is how an
+            // operator learns to ignore it.
+            const cache = {
+                load: vi
+                    .fn()
+                    .mockReturnValue(
+                        new Map([['aaa111', {additions: 5, deletions: 1, entries: [], absent: false}]]),
+                    ),
+                put: vi.fn(),
+            };
+            const cachingProvider = new GitHubProvider(CONFIG, {diffstatCache: cache});
+            const fetchMock = makeFetchMock([{body: [makeCommitListFixture('aaa111')]}]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            const commits = await cachingProvider.getCommits('my-repo', '', '');
+
+            // The memo really was served — one request, no detail fetch — so this is the hit
+            // path and not a silent fall-through to the miss path.
+            expect(fetchMock).toHaveBeenCalledTimes(1);
+            expect(commits[0].additions).toBe(5);
+            // …and the row does not claim the churn went unobserved.
+            expect(commits[0].churnObserved).not.toBe(false);
+        });
+
+        it('flags and withholds the memo with no cache attached at all', async () => {
+            // Every probe path (doctor, test-connection) constructs the provider with no
+            // diffstat cache. The classification must not depend on one being present.
+            vi.stubGlobal(
+                'fetch',
+                makeFetchMock([
+                    {body: [makeCommitListFixture('aaa111')]},
+                    {body: makeCommitDetailFixture('aaa111', {stats: undefined, files: undefined})},
+                ]),
+            );
+
+            const commits = await provider.getCommits('my-repo', '', '');
+
+            expect(commits).toHaveLength(1);
+            expect(commits[0].additions).toBe(0);
+            expect(commits[0].churnObserved).toBe(false);
         });
 
         it('drops nothing when no drop listener is supplied — a short list is still short', async () => {
@@ -1316,8 +1637,8 @@ describe('GitHubProvider', () => {
             });
             expect(diffs[1]).toEqual({
                 path: 'src/bar.ts',
-                additions: 10,
-                deletions: 5,
+                additions: 5,
+                deletions: 2,
                 status: 'added',
             });
         });

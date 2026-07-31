@@ -46,6 +46,12 @@
 import type Database from 'better-sqlite3';
 import {setImmediate as setImmediateReal} from 'node:timers';
 import {normalizeContainer} from './providers/container.js';
+// The canonical non-negative-safe-integer test, aliased rather than re-declared (#288):
+// the provider that produces these counts classifies them with this same predicate
+// before deciding whether to memoize at all, and a value one accepted while the other
+// refused would be dropped here silently (this module deliberately does not count that
+// as a fault) while still being reported upstream as observed.
+import {isCommitCount as isCount} from './providers/diffstat.js';
 import {chunk, READ_CHUNK_SIZE} from './raw-author-daily.js';
 import type {
     CommitDiffstat,
@@ -91,11 +97,6 @@ function yieldToEventLoop(): Promise<void> {
     return new Promise<void>((resolve) => {
         setImmediateReal(resolve);
     });
-}
-
-/** A non-negative integer, as every stored count must be. Narrows `unknown`. */
-function isCount(value: unknown): value is number {
-    return typeof value === 'number' && Number.isInteger(value) && value >= 0;
 }
 
 /**

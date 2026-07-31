@@ -95,6 +95,40 @@ export interface GitCommit {
      * (as `fetchProviderData` does when namespacing).
      */
     diffs?: GitFileDiff[];
+    /**
+     * Were `additions`/`deletions` above actually OBSERVED, or are they zero BY ABSENCE (#288)?
+     *
+     * `undefined` — the default, and what every provider that does not set it means — is
+     * "observed". `false` is the one interesting value: the commit is real and is being
+     * returned, but the response the provider read did not carry its line counts, so the two
+     * required numbers above are `0` because nothing better is expressible, NOT because the
+     * commit changed nothing. An empty commit is the `undefined`/`0` case, not this one.
+     *
+     * A FIELD rather than a listener, unlike `GitCommitDropListener`, and the difference is the
+     * whole reason that one is a channel: a DROPPED commit is not in the result, so there is no
+     * object to hang the fact on. This commit IS in the result. Hanging it here also makes the
+     * distinction structural instead of positional — a dropped commit can never carry this
+     * flag, so the two reports can never both fire for one sha.
+     *
+     * Two consumers, and both matter:
+     *   - the provider itself must not MEMOIZE such a commit. `commit_diffstats` has no
+     *     invalidation, so a row written for it would answer on every later run in place of the
+     *     well-formed fetch that would contradict it (#288's central rule). GitHub's `getCommits`
+     *     therefore sets this flag and skips its `put` on one condition, in one place.
+     *   - the sync must SAY SO. `raw_author_daily` is additive and append-only with the cursor
+     *     advanced past the window, so once the run's window is recorded as covered the
+     *     developer-day's `lines_added`/`lines_removed` are permanently short — see
+     *     `COMMIT_CHURN_UNKNOWN_PREFIX` in `sync.ts`.
+     *
+     * Only GitHub can currently set it: its commit-detail response carries `stats`, and GitHub's
+     * published schema does not mark that required (see the guard in `providers/github.ts` for
+     * the evidence). Bitbucket and GitLab derive their totals by summing a diffstat resource,
+     * whose deterministic 404 is already a documented `[]` answer — though note that a silently
+     * truncated 200 there sums to zero and is currently indistinguishable from an observation,
+     * which is the same defect class and would be reported through this same flag if it were
+     * ever detected.
+     */
+    churnObserved?: boolean;
 }
 
 export interface GitPR {
@@ -440,6 +474,12 @@ export interface GitProvider {
     //     GitHub is pinned against this at its own boundary (see `isAttributableDate`); the
     //     durable fix is a shared pin or a per-row skip at the write boundary, tracked in #290.
     //     Do not read GitHub's pin as protecting the run.
+    //
+    // A commit the implementation DOES return but whose LINE COUNTS it could not observe is
+    // neither of the above — not a throw (the response is well-formed by the endpoint's own
+    // contract, so retrying recovers nothing and holding the cursor bricks the provider) and
+    // not a drop (the commit is imported). It is reported on the returned row itself: see
+    // {@link GitCommit.churnObserved} (#288).
     getCommits(
         repo: string,
         since: string,
