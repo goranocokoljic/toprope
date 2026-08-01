@@ -50,8 +50,11 @@ function parseRawAuthor(raw: string): {name: string; email: string} {
  * the run report success, and the cursor advance over the whole untouched window. That is a
  * worse outcome than the NaN case, produced by a value the parseability check waves through, so
  * the shape is pinned as well: an ordinary year is four digits, and `toISOString()` renders
- * anything else with a leading `+`/`-` sign. The ORDERING of the two parsed bounds is checked by
- * the caller, because it is a property of the pair rather than of either value.
+ * anything else with a leading `+`/`-` sign. The pin is on the ROUND-TRIPPED year, not on how
+ * the input was spelled — this is a bound check, not an input-format contract, so a value like
+ * `Jan 1 2024` that `Date` accepts is fine here (it compares correctly, which is all the walk
+ * needs). The ORDERING of the two parsed bounds is checked by the caller, because it is a
+ * property of the pair rather than of either value.
  *
  * A BLANK value is "no bound", not a refusal, and that is load-bearing rather than lenient:
  * `sync.ts` passes `since: ''` for a first sync with no configured window, meaning walk
@@ -79,9 +82,10 @@ function parseRawAuthor(raw: string): {name: string; email: string} {
  * `fetchProviderData`; that hoist is #309. Nor is this a fourth spelling that should have
  * delegated today: `isUtcIsoInstant`
  * (`sync.ts`) and `UTC_ISO_INSTANT_RE` (`raw-author-daily.ts`) are both module-private and both
- * additionally pin `.SSSZ` plus a round-trip, which would refuse bound forms this walk accepts,
- * and importing from `sync.ts` here would invert the layering. If a fourth site appears, extract
- * one shared predicate rather than adding to the census.
+ * pin `.SSSZ` (with `isUtcIsoInstant` adding a `toISOString()` round-trip on top), which alone
+ * would refuse bound forms this walk accepts and the tests pass — and importing from `sync.ts`
+ * here would invert the layering. If a fourth site appears, extract one shared predicate rather
+ * than adding to the census.
  */
 function parseCommitBound(value: string, label: 'since' | 'until'): Date | null {
     if (!value) return null;
@@ -318,11 +322,23 @@ export class BitbucketProvider implements GitProvider {
         // and the operator sees which state key to repair. Only when BOTH bounds exist — a blank
         // one is "no bound", which cannot be inverted.
         if (sinceDate && untilDate && sinceDate.getTime() > untilDate.getTime()) {
+            // WHAT THE MESSAGE MAY AND MAY NOT SAY. The likeliest cause is a host clock that ran
+            // ahead when the cursor was stamped and has since been corrected, so the first thing
+            // it names is the clock — an operator told only "check git_last_sync" concludes the
+            // cursor is too new and lowers it, and re-importing an already-covered span is the
+            // permanent double-count #262 documents (`mergeDailyAcrossRuns` ADDS commit metrics
+            // on a premise of disjoint windows and `upsertRawAuthorDaily` has no dedup guard).
+            // So the line says explicitly what must NOT be done. It also states the blast radius,
+            // because this refusal stalls EVERY repo of the provider until the value is corrected
+            // — better than the silent alternative it replaces, but not something to discover.
             throw new Error(
                 'Bitbucket commit window is inverted ("since" is after "until") — refusing to ' +
                     'walk the repository with a window no commit can satisfy, which would ' +
-                    'record an untouched span as covered. Check the git_last_sync / ' +
-                    'git_earliest_sync sync_state rows for this provider.',
+                    'record an untouched span as covered. Every repo of this provider is ' +
+                    'stalled until it is corrected. Usual cause: the host clock ran ahead when ' +
+                    'the git_last_sync sync_state row was stamped. Do NOT move that cursor ' +
+                    'BACKWARD by hand — re-importing an already-covered span permanently ' +
+                    'doubles its commit metrics; correct the clock and let the cursor stand.',
             );
         }
         // READ ONCE, so every row of the walk is judged against the same instant (#304). A

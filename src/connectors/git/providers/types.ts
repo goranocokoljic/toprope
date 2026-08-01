@@ -311,25 +311,24 @@ export interface GitFetchProgress {
      * getCommits), where a forward run's `1200 commits found (1201 scanned)` read identically
      * to a benign approach while a day was permanently short.
      *
-     * That statement is now TOTAL over the rows in an EMITTED `scanned`, which is what #304
-     * closed and why the caveat #292 recorded here is gone. Two exclusions used to sit outside
-     * it, both on Bitbucket: a future-dated row, which `until` excludes on every run in flight,
-     * went unreported (it now travels as {@link FUTURE_AUTHOR_DATE_DROP_REASON}); and the rows
-     * after the `since` cutoff on the page that trips it were counted by a per-page increment and
-     * then abandoned unexamined (that page's tail is now run through the date gate before the
-     * walk breaks, so an undatable row in it is reported like any other).
+     * #304 closed the ONE exclusion that sat inside an emitted count, which is why the caveat
+     * #292 recorded here is gone: a future-dated row, which `until` excludes on every run in
+     * flight, was counted on an ordinary page and reported nowhere. It now travels as
+     * {@link FUTURE_AUTHOR_DATE_DROP_REASON}.
      *
-     * "In an emitted `scanned`" is the exact bound, not a hedge, and it is what keeps the rule
-     * narrow in the way it has always needed to be: it is about EMITTED counts, not rows. The
-     * cutoff page is never emitted, so its rows sit outside the claim in BOTH directions — a drop
-     * reported from its tail arrives with no divergence to explain it, and a datable in-window row
-     * in that tail is still discarded with nothing said (see `getCommits` below, which names that
-     * residue rather than claiming it away). A producer adding a further decline path must
-     * likewise give it a channel or keep it out of every emitted count. And "window-filtered" does
-     * not promise the row comes back — an excess reads as "still approaching the window, or a loss
-     * the run states when it completes", where that report is the BOUNDED sample
-     * {@link GitCommitDropListener} describes, and a run that fails mid-walk discards it along
-     * with the attempt. It is never, on its own, proof that nothing was lost.
+     * The claim is about EMITTED counts, not rows, and that is the exact bound rather than a
+     * hedge. Bitbucket's cutoff page is never emitted — the `break` sits above the tick — so its
+     * rows are outside the claim in BOTH directions, before #304 and after it. What #304 changed
+     * there is the ROW's fate, not the count's: an undatable row in that page's tail is now
+     * reported (arriving with no divergence to explain it, which is fine — the claim runs one
+     * way), while a datable in-window row in the same tail is still discarded with nothing said.
+     * See `getCommits` below, which names that residue rather than claiming it away. A producer
+     * adding a further decline path must likewise give it a channel or keep it out of every
+     * emitted count. And "window-filtered" does not promise the row comes back — an excess reads
+     * as "still approaching the window, or a loss the run states when it completes", where that
+     * report is the BOUNDED sample {@link GitCommitDropListener} describes, and a run that fails
+     * mid-walk discards it along with the attempt. It is never, on its own, proof that nothing
+     * was lost.
      *
      * Two limits on what a moving count proves, both deliberate and neither fixed here.
      * It advances only BETWEEN requests: `fetchBitbucket`'s rate-limit and 5xx backoff
@@ -415,40 +414,37 @@ export const UNATTRIBUTABLE_DATE_DROP_REASON = 'the author date is present but i
  * the window" divergence forever (see {@link GitFetchProgress.scanned}).
  *
  * THE OTHER TWO PROVIDERS ARE NOT IMMUNE, THEY ARE WORSE, and this reason must not be read as
- * evidence otherwise. GitHub and GitLab push the window to the server, but that server window
- * filters on the COMMITTER date (stated again at `getCommits` below), while the day key this
- * pipeline derives comes from the AUTHOR date — `github.ts` reads `commit.author.date` and
- * `gitlab.ts` reads `authored_date`, and neither re-filters it in memory. A commit whose author
- * date is 2099 and whose committer date is today (a `--date=` override, a rebase of imported
- * history) is therefore RETURNED by their windows, accepted by `isAttributableDate` — `isUtcDay`
- * has no upper bound — and written to `raw_author_daily` as a `2099-01-01` day, permanently,
- * under the append-only rule. So the same physical defect is REPORTED here and SILENTLY IMPORTED
- * there. That gap is real and open — tracked as #309 — and closing it belongs at the write
- * boundary for all three providers at once (the same argument #302 made for the PR dates), not
- * in this constant.
+ * evidence otherwise: on them a future-dated commit is IMPORTED as a future developer-day rather
+ * than reported. Tracked as #309, which carries the evidence (their server windows filter on the
+ * COMMITTER date while the day key comes from the AUTHOR date) and the argument that the fix
+ * belongs at the write boundary for all three at once, as #302's did for the PR dates.
  *
- * WHY IT IS ON THIS CHANNEL rather than a throw, which is the question {@link GitCommitDrop}
- * makes every reason answer. Re-fetching returns the identical row with the identical date, so a
- * retry recovers nothing and holding the cursor would stall the provider forever — exactly the
- * test the other two pass. What differs is HOW recoverable it is, and the sentence says so
- * plainly rather than borrowing the other two's "unusable response" wording, because the honest
- * answer depends on the size of the skew:
+ * WHICH TIMESTAMP BITBUCKET'S OWN `date` FIELD IS, said plainly because the contrast above leans
+ * on it: unknown. Its commit payload exposes ONE `date` (`RawCommit` in `bitbucket.ts`), with no
+ * author/committer split, and this pipeline treats every provider's single day key as the author
+ * date. So this walk excludes on whatever that field holds. That does not weaken the report — a
+ * row this walk cannot place inside any requestable window is worth naming whichever timestamp
+ * named it — but do not read the #309 contrast as proven for Bitbucket specifically.
+ *
+ * WHY IT IS ON THIS CHANNEL rather than a throw: it passes the test {@link GitCommitDrop} states
+ * once for every reason (re-fetching returns the identical row, so no retry and no cursor hold
+ * helps). What differs is HOW recoverable it is, and the sentence says so plainly rather than
+ * borrowing the other two's "unusable response" wording, because the honest answer depends on
+ * the size of the skew:
  *   - Smaller than the gap to the next run: the next run's `until` reaches past the date and its
  *     `since` is older than the row, so the commit is simply COLLECTED then. The report was true
  *     when made ("this run excluded it") and the condition clears itself.
  *   - Larger: by the time wall-clock passes the date, the forward cursor — and with it the
  *     `since` cutoff — has moved past the commit's position in the newest-first list, so the
  *     walk stops before reaching it and the loss is permanent in practice.
- * The reason therefore states the CONDITION rather than a verdict. Do not tighten it back into
- * "never": an operator who is told a self-healing skew is a permanent loss stops trusting the
- * whole channel. What the operator does either way is the same and is what the wording points
- * at: go look at the commit's timestamp (clock skew, `git commit --date=`, imported or rewritten
- * history), not at a truncated response.
- *
- * SMALL SKEW IS DELIBERATELY NOT SILENT EITHER, per the first bullet: it is still reported, and
- * the wording is what keeps that honest. Reporting only "large" skew would need a horizon
- * constant nothing in the pipeline can derive, and the case it would silence is the one where
- * the operator's clock is broken.
+ * The reason therefore states the CONDITION rather than a verdict, and stops there — the
+ * recovery arithmetic is these two bullets' job, not the operator's terminal's. Do not tighten
+ * it back into "never": an operator told a self-healing skew is a permanent loss stops trusting
+ * the whole channel. Nor is the small skew silenced — that would need a horizon constant nothing
+ * in the pipeline can derive, and the case it would silence is the broken operator clock. What
+ * the operator does is the same for both sizes and is what the wording points at: go look at the
+ * commit's timestamp (clock skew, `git commit --date=`, imported or rewritten history), not at a
+ * truncated response.
  *
  * WHAT IT COSTS ON THIS PROVIDER, which is more than the other two reasons cost. `getCommits`
  * below records that a Bitbucket drop is re-reported on EVERY run and that a repeat therefore
@@ -456,16 +452,12 @@ export const UNATTRIBUTABLE_DATE_DROP_REASON = 'the author date is present but i
  * property in its strongest form: a future-dated row is by definition newer than `since`, so it
  * never trips the cutoff, and Bitbucket lists newest-first, so it sits at the HEAD of every walk
  * indefinitely. It also rides {@link GitCommitDrop}'s channel into `sync.ts`'s permanent-loss
- * advisory tier, which for the self-healing skew above over-ranks it for the one run before it
- * clears. Both are known and deliberately not fixed here: suppressing the repeat needs the
+ * advisory tier, whose own definition ("the cursor has been recorded as covering the window it
+ * happened in") fits neither this reason's self-healing case nor the cutoff-page tail. Both are
+ * known and deliberately not fixed here — tracked as #310: suppressing the repeat needs the
  * persisted per-loss ledger `GitCommitDropListener` says the system does not have, and splitting
  * the tier needs a second advisory sentinel threaded through the staging, ranking and admin
  * surfaces.
- *
- * The sentence itself stops at the CONDITION and does not narrate the recovery arithmetic — the
- * two bullets above are its home, and an operator's next step is the same either way. Keeping
- * "only a run started after that date can" is deliberate all the same: without it the sentence
- * reads as a permanent loss, which for the common small skew it is not.
  */
 export const FUTURE_AUTHOR_DATE_DROP_REASON = 'the author date is later than both the end of the window this run requested and the current time, so no run in flight could include the commit — only one started after that date can';
 
@@ -501,12 +493,12 @@ export type GitCommitDropReason = (typeof COMMIT_DROP_REASONS)[number];
  * #275 such a commit vanished with nothing in `errors[]`, no trace in the sync log, and a
  * cursor already advanced past it. ONE reason qualifies that word rather than sharing it
  * outright — {@link FUTURE_AUTHOR_DATE_DROP_REASON} (#304) describes a commit no run IN FLIGHT
- * can admit, which a run started after the date could in principle admit and in practice does
- * not (its walk stops at a much newer cutoff first). It travels here because it meets the test
- * this channel actually imposes: re-fetching returns the identical row, so a retry heals nothing
- * and a cursor hold would stall the provider forever. Read the per-reason sentence, not this
- * paragraph, for how recoverable a given drop is. This type is the CANONICAL statement of that
- * decision —
+ * can admit, which a run started after the date CAN admit for a small skew and in practice will
+ * not for a large one (by then the walk stops at a much newer cutoff first). It travels here
+ * because it meets the test this channel actually imposes: re-fetching returns the identical row,
+ * so a retry heals nothing and a cursor hold would stall the provider forever. Read the
+ * per-reason sentence, not this paragraph, for how recoverable a given drop is. This type is the
+ * CANONICAL statement of that decision —
  * the sites that act on it (`COMMITS_DROPPED_PREFIX` in `sync.ts`, and the drop report in each
  * of `github.ts` / `gitlab.ts` / `bitbucket.ts` since #290) cite it rather than re-deriving it.
  */

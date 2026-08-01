@@ -935,6 +935,13 @@ describe('BitbucketProvider', () => {
 
                 const walk = provider.getCommits('my-repo', since, until);
                 await expect(walk).rejects.toThrow(new RegExp(`"${label}"`));
+                // THE REFUSAL CLASS, not just the bound name — without it, half this table is
+                // green for the wrong reason. An expanded-year `since` paired with an ordinary
+                // `until` is ALSO an inverted window (year 10000 > 2024), and that guard's message
+                // names "since" and git_last_sync too — so with the shape pin deleted this row
+                // still passed. Pinning the sentence the shape check owns is what makes each row
+                // fail for the check it is named after.
+                await expect(walk).rejects.toThrow(/four-digit-year/);
                 // The message names the bound and the state keys that hold it, and NEVER the
                 // OFFENDING value: it reaches an operator terminal and `sync_logs.errors` through
                 // the caller's `Failed to fetch commits:` line, and the bounds are read from
@@ -976,9 +983,13 @@ describe('BitbucketProvider', () => {
             // zero-length span, which is a legitimate no-op the cursor logic can produce, not a
             // corrupt cursor. Refusing it would fail a run that is behaving correctly.
             const instant = '2026-01-01T00:00:00.000Z';
-            vi.stubGlobal('fetch', makeFetchMock([{body: pagedResponse([])}]));
+            const fetchMock = makeFetchMock([{body: pagedResponse([])}]);
+            vi.stubGlobal('fetch', fetchMock);
 
             await expect(provider.getCommits('my-repo', instant, instant)).resolves.toEqual([]);
+            // It WALKED — `[]` here is an empty repo, not a refusal that happened to return the
+            // same value. Without this the test would pass against a short-circuit.
+            expect(fetchMock).toHaveBeenCalled();
         });
 
         it('drops an unattributable date BEFORE the diffstat fan-out, so it costs no request', async () => {
