@@ -306,23 +306,24 @@ export interface GitFetchProgress {
      *
      * WHAT A DIVERGENCE MEANS, now that it means one thing (#292). Every `scanned - done` a
      * producer EMITS is window-filtered rows plus rows it reported through
-     * {@link GitCommitDropListener} — so an excess is either a walk still approaching its
-     * window (benign, and the entire point of this field) or a loss the run will state in its
-     * report. It is never, on its own, evidence that something vanished unrecorded. That was
-     * not true when this field was introduced: Bitbucket's `until` filter let a row it could
-     * not parse fall through both bounds and out of the walk with nothing reported (the gate in
-     * `bitbucket.ts` getCommits has the mechanism), so a forward run's `1200 commits found
-     * (1201 scanned)` read identically to the benign case while a day was permanently short.
+     * {@link GitCommitDropListener} — so an excess is a walk still approaching its window
+     * (benign, and the entire point of this field), or a loss the run's report will state. It
+     * is never, on its own, evidence that something vanished unrecorded, which is what
+     * Bitbucket's pre-#290 Invalid-Date fall-through made it (see the gate in `bitbucket.ts`
+     * getCommits): a forward run's `1200 commits found (1201 scanned)` read identically to the
+     * benign case while a day was permanently short.
      *
-     * Read EMITS and WILL STATE strictly; neither is stronger than it sounds. The guarantee is
-     * about published values, not about rows — a producer may decline a row by a path it never
-     * publishes a count for, as Bitbucket's `break paging` does with the tail of its cutoff
-     * page, which is exactly why it skips that page's emission. And the loss is stated when the
-     * run REPORTS, not while it is in flight: a divergence read at minute 4 of a 40-minute walk
-     * has nothing to cross-reference yet, and on the admin path the eventual record is the
-     * BOUNDED sample described on {@link GitCommitDropListener}, not the full list. A producer
-     * that adds a further way to decline a row must either give it a channel or keep it out of
-     * every emitted count, or the first paragraph becomes false again.
+     * Three limits on that, none of them stronger than it sounds. It is about EMITTED counts,
+     * not rows — a producer may decline a row by a path it publishes no count for, as
+     * Bitbucket's `break paging` does with the tail of its cutoff page, which is exactly why it
+     * skips that page's emission; a producer adding a further decline path must give it a
+     * channel or keep it out of every emitted count. The loss is stated when the run REPORTS,
+     * so a divergence read mid-walk has nothing to cross-reference yet, and on the admin path
+     * the eventual record is the BOUNDED sample {@link GitCommitDropListener} describes. And it
+     * assumes the CALLER supplied an `onDrop`: the two listeners are independently optional, so
+     * a caller taking progress without a drop sink opts out of the guarantee and must not
+     * render `scanned` — which is why the sync wires `onDrop` unconditionally while
+     * `onProgress` is observer-only (see `sync.ts`).
      *
      * Two limits on what a moving count proves, both deliberate and neither fixed here.
      * It advances only BETWEEN requests: `fetchBitbucket`'s rate-limit and 5xx backoff

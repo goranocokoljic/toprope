@@ -249,16 +249,11 @@ export class BitbucketProvider implements GitProvider {
         // REPORTS is therefore window-filtered rows plus `onDrop`-reported rows, which is why
         // it no longer hedges that `scanned` is "an upper bound on filtered rows" (#292): that
         // hedge covered the pre-#290 Invalid-Date fall-through, a third exit that reported
-        // nothing at all.
-        //
-        // SCOPED TO WHAT IS REPORTED, and not extendable to rows. `break paging` below abandons
-        // the rest of its page unexamined, already counted here — see the whole-page increment
-        // and its note. Those rows leave by neither exit. They stay outside this claim only
-        // because the break also skips that page's emission, so no divergence is ever published
-        // for them; whoever adds a report after the break falsifies this paragraph, not merely
-        // the count. Their exclusion instead rests on the endpoint's ordering agreeing with the
-        // field compared below — an assumption this walk cannot verify, and the reason the
-        // paragraph claims nothing about them either way.
+        // nothing at all. Scoped to what is REPORTED, not to rows — the tail `break paging`
+        // abandons is counted here and leaves by neither exit; see the whole-page increment
+        // below for why no consumer can observe it. Its exclusion rests instead on the
+        // endpoint's ordering agreeing with the field compared below, which this walk cannot
+        // verify, so the claim says nothing about those rows either way.
         let scanned = 0;
         let nextUrl: string | null =
             `${BASE_URL}/repositories/${this.workspace}/${repo}/commits?pagelen=100`;

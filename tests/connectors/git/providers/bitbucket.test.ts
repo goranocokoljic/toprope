@@ -137,10 +137,8 @@ describe('BitbucketProvider', () => {
     afterEach(() => {
         vi.restoreAllMocks();
         vi.useRealTimers();
-        // `restoreAllMocks` does NOT undo `stubGlobal`, and `unstubGlobals` is not set in
-        // vitest.config.ts. Every test here re-stubs before use, so this changes nothing today —
-        // it is here so a future test that FORGETS to stub fails instead of silently inheriting
-        // the previous test's `fetchMock` and passing for the wrong reason (#292 review TST-3).
+        // `stubGlobal` survives `restoreAllMocks`, so a future test that forgets to stub fails
+        // loudly instead of inheriting the previous test's `fetchMock` (#292 review TST-3).
         vi.unstubAllGlobals();
     });
 
@@ -625,18 +623,29 @@ describe('BitbucketProvider', () => {
             ]);
         });
 
-        it('does not report the page that hits the since cutoff — that tick is unobservable', async () => {
+        it('does not report the page that hits the since cutoff, and abandons its tail unexamined', async () => {
             // `break paging` skips the listing report on the cutoff page, deliberately:
             // the fan-out seed below it runs in the same synchronous block and would
             // overwrite the tick before any poller could read it, so restructuring the
             // walk to reach it would be churn for nothing (#270 review OR-1). What must
             // hold is that the cutoff BEHAVIOR is unchanged and the fan-out still ticks.
+            //
+            // `undatable` sits AFTER the cutoff row, which is the BOUND on the claim
+            // `getCommits` and `GitFetchProgress.scanned` make since #292 — every REPORTED
+            // divergence is window-filtered rows plus `onDrop`-reported rows. `scanned` is
+            // incremented for the whole page, so this row is counted, never examined, never
+            // in `collected`, and never routed to `onDrop`: it leaves by neither exit. What
+            // keeps the claim true is that the break also skips this page's emission, so no
+            // divergence is ever published for it — which is what the tick assertion below
+            // pins. A change that emits a tick after the break would publish a `scanned` no
+            // channel accounts for, and fails here.
             const fetchMock = makeFetchMock([
                 {
                     body: pagedResponse(
                         [
                             makeCommitFixture('aaa', {date: '2024-01-20T00:00:00+00:00'}),
                             makeCommitFixture('bbb', {date: '2023-12-01T00:00:00+00:00'}),
+                            makeCommitFixture('undatable', {date: 'not-a-date'}),
                         ],
                         'https://api.bitbucket.org/2.0/next',
                     ),
@@ -645,15 +654,21 @@ describe('BitbucketProvider', () => {
             ]);
             vi.stubGlobal('fetch', fetchMock);
 
+            const onDrop = vi.fn();
             const onProgress = vi.fn();
             const commits = await provider.getCommits(
                 'my-repo',
                 '2024-01-01T00:00:00Z',
                 '2024-12-31T23:59:59Z',
                 onProgress,
+                onDrop,
             );
 
             expect(commits.map((c) => c.sha)).toEqual(['aaa']);
+            // Current behavior, recorded rather than endorsed — and the ONE assertion this
+            // test alone makes. Compare the parameterized test above, where the identical
+            // row placed BEFORE any cutoff is reported.
+            expect(onDrop).not.toHaveBeenCalled();
             expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
                 {done: 0, total: 1},
                 {done: 1, total: 1},
@@ -662,22 +677,18 @@ describe('BitbucketProvider', () => {
 
         // --- commit-date pin (#290) ---
 
-        // Both flavors of undatable row, driven through ONE body rather than two near-identical
-        // tests, because the gate does not branch on which flavor it got: `isAttributableDate`
-        // is a single conjunction and `commitDropReason` classifies both through the same
-        // present-but-unusable arm, so a second copy of this body would assert the same three
-        // values against the same code path (#292 review OR-1/SO-1/TST-2). They are BOTH kept
-        // as fixtures because they fail different WEAKENINGS of the gate, which is the only
-        // axis on which they differ:
-        //   - the expanded year is a VALID `Date` that `Date.parse` accepts, so it is what
-        //     catches a regression to a bare parse check — and it is what `git commit
-        //     --date=@999999999999` really produces;
-        //   - `'not-a-date'` is the literal Invalid Date #292 names, whose comparisons are
-        //     `false` against BOTH bounds; it is the shape that used to fall out of the walk
-        //     retained by nothing and reported by nothing, at a window with both bounds set.
-        // Do NOT read the pair as "one of these covers something the other cannot see at all":
-        // removing the gate outright fails this test under either fixture, and fails the
-        // Bitbucket cases in `commit-date-contract.test.ts` too.
+        // ONE body, two fixtures: the gate does not branch on which flavor of undatable it got
+        // (`isAttributableDate` is a single conjunction, and `commitDropReason` classifies both
+        // through the same present-but-unusable arm), so a second copy of this body would assert
+        // the same three values against the same code path.
+        //   - The expanded year is a VALID `Date` that `Date.parse` accepts, so it is the only
+        //     one of the two that catches a regression to a bare parse check — and it is what
+        //     `git commit --date=@999999999999` really produces.
+        //   - `'not-a-date'` catches no weakening the expanded year misses; it is here because
+        //     it is the input class #292 names and the one `commit-date-contract.test.ts`
+        //     deliberately excludes — the literal Invalid Date, whose comparisons are `false`
+        //     against BOTH bounds, which is what used to make it fall out of a bounded walk
+        //     retained by nothing and reported by nothing.
         it.each([
             ['an ISO expanded year', '+033658-09-27T01:46:39.000Z'],
             ['an unparseable string', 'not-a-date'],
@@ -757,69 +768,6 @@ describe('BitbucketProvider', () => {
             // One commit-list request + one diffstat request. A third call would mean the bad
             // commit reached the fan-out.
             expect(fetchMock).toHaveBeenCalledTimes(2);
-        });
-
-        // --- the bound on what the #276 counts claim (#292) ---
-
-        it('abandons the cutoff page tail unexamined and reports no divergence for it', async () => {
-            // THE LIMIT OF THE "every reported divergence is filtered rows plus reported drops"
-            // claim `getCommits` and `GitFetchProgress.scanned` now make, pinned so the claim
-            // cannot be widened by accident.
-            //
-            // `scanned` is incremented for the WHOLE page before the row loop, and `break paging`
-            // then abandons everything after the cutoff row. Those rows leave by NEITHER exit:
-            // counted, never examined, never in `collected`, never routed to `onDrop`. `undatable`
-            // below is exactly such a row — placed AFTER the pre-`since` row, so the gate never
-            // sees it. Their exclusion rests on the endpoint's ordering, which this walk cannot
-            // verify, not on either channel.
-            //
-            // What keeps the claim true anyway is that the break also skips that page's emission,
-            // so no divergence is ever published for the tail. A change that emits a tick after
-            // the break — which the walk's own comment invites, on the assumption it is merely an
-            // over-count — would publish a `scanned` no channel accounts for. Verified: adding
-            // that emission fails this test. It also fails the `since`-cutoff test above, so that
-            // half is belt-and-braces; the assertion ONLY this test makes is the `onDrop` one —
-            // that an undatable row past the cutoff is silently abandoned, which is the residue
-            // itself rather than its unobservability.
-            const fetchMock = makeFetchMock([
-                {
-                    body: pagedResponse([
-                        makeCommitFixture('inside', {date: '2024-01-20T00:00:00+00:00'}),
-                        makeCommitFixture('pre-since', {date: '2023-12-01T00:00:00+00:00'}),
-                        makeCommitFixture('undatable', {date: 'not-a-date'}),
-                    ]),
-                },
-                {body: pagedResponse(makeDiffstatFixture())}, // diffstat for inside
-            ]);
-            vi.stubGlobal('fetch', fetchMock);
-
-            const onDrop = vi.fn();
-            const onProgress = vi.fn();
-            const commits = await provider.getCommits(
-                'my-repo',
-                '2024-01-01T00:00:00Z',
-                '2024-02-01T00:00:00Z',
-                onProgress,
-                onDrop,
-            );
-
-            expect(commits.map((c) => c.sha)).toEqual(['inside']);
-            // Current behavior, recorded rather than endorsed: the undatable row past the cutoff
-            // is NOT reported. Compare the parameterized test above, where the identical row
-            // placed before any cutoff is.
-            expect(onDrop).not.toHaveBeenCalled();
-            // …and nothing publishes a count for it. The cutoff page emits no listing tick at
-            // all, so `scanned` is never handed to a consumer with the tail folded into it.
-            const listingTicks = onProgress.mock.calls
-                .map((c) => c[0] as {done: number; total: number | null; scanned?: number})
-                .filter((p) => p.total === null);
-            expect(listingTicks).toEqual([]);
-            // The fan-out ticks that DO fire carry no `scanned` — past listing, every row in the
-            // set was kept, so there is no divergence to express.
-            expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
-                {done: 0, total: 1},
-                {done: 1, total: 1},
-            ]);
         });
 
         it('reports the PR-list page that hits the since cutoff', async () => {
