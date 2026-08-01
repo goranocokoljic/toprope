@@ -424,7 +424,7 @@ describe('unreturned commits are never silent (#275)', () => {
             // itself inspected.
             expect(dropLine).toContain(`2 because ${NO_AUTHOR_DATE_DROP_REASON}`);
             expect(dropLine).toContain(`1 because ${UNATTRIBUTABLE_DATE_DROP_REASON}`);
-            expect(dropLine).toContain('no author date on either');
+            expect(dropLine).toContain('no author date on any copy');
             expect(dropLine).toContain('the author date is present but');
             // The dateless shas sit inside the dateless group, not the other one.
             const datelessAt = dropLine!.indexOf(NO_AUTHOR_DATE_DROP_REASON);

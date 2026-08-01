@@ -340,6 +340,13 @@ describe('upsertRawAuthorDaily + readers (#252)', () => {
         };
         expect(codeOf(() => upsertRawAuthorDaily(db, input({raw_author_key: '  '}), '2026-07-01T10:00:00.000Z'))).toBe('invalid_key');
         expect(codeOf(() => upsertRawAuthorDaily(db, input({date: '2026-7-1'}), '2026-07-01T10:00:00.000Z'))).toBe('invalid_date');
+        // A conforming 10-char PREFIX with trailing junk — the one input class that distinguishes
+        // the shared `isUtcDay`'s anchored regex from an unanchored one (#290). Every other
+        // negative fixture here and in the projection's suite is malformed from character 1, so
+        // relaxing `DATE_RE` would keep them all green while this instant slipped past the typed
+        // guard into the schema's fully-anchored GLOB — a raw SQLITE_CONSTRAINT thrown from inside
+        // the run's all-providers write transaction, which is the stall #290 exists to prevent.
+        expect(codeOf(() => upsertRawAuthorDaily(db, input({date: '2026-07-01T10:00:00.000Z'}), '2026-07-01T10:00:00.000Z'))).toBe('invalid_date');
         expect(codeOf(() => upsertRawAuthorDaily(db, input(), 'not-a-date'))).toBe('invalid_instant');
     });
 

@@ -68,7 +68,9 @@ const EXPANDED_YEAR_DATE = '+033658-09-27T01:46:39.000Z';
  * other endpoint (repo list, per-commit diff/diffstat, PR list) keeps the canonical fixture. For
  * GitHub the commit DETAIL endpoint is overridden too, for the bad sha only — its generic detail
  * route echoes a good date for any sha, which would otherwise rescue the commit through the
- * detail-preferred branch and make the test vacuous.
+ * detail-preferred branch. That omission fails loudly rather than silently (the rescued commit
+ * lands in `commits` and no drop is reported, so both assertions break) — unlike some route
+ * omissions, which degrade to an empty page; see `provider-fetch-fixtures.ts`.
  */
 function badDateRoutes(type: GitProviderType, badDate: string | undefined): Route[] {
     const gitlabRow = (id: string, date: string | undefined): Record<string, unknown> => ({

@@ -67,9 +67,18 @@ export function isAttributableDate(date: unknown): boolean {
     );
 }
 
-/** Was a date STRING supplied at all, as opposed to absent/null/blank? */
+/**
+ * Was a date supplied at all, as opposed to absent/null/blank?
+ *
+ * Deliberately NOT `typeof date === 'string'`. {@link isAttributableDate} is total over
+ * `unknown` precisely because a response body can hold a number or an array where the interface
+ * claims a string — and such a body DID carry a date, just not one this pipeline can key on.
+ * Classifying it as "no date" would send the operator hunting for a truncated response over a
+ * commit that is sitting right there in the payload, which is the exact inversion the two
+ * reasons exist to prevent.
+ */
 function hasDate(date: unknown): boolean {
-    return typeof date === 'string' && date !== '';
+    return date !== undefined && date !== null && date !== '';
 }
 
 /**
@@ -83,16 +92,22 @@ function hasDate(date: unknown): boolean {
  * next step differs: absent on every copy means a truncated response, while present-but-unusable
  * means a real commit whose timestamp this pipeline cannot key on.
  *
- * `typeof … === 'string' && !== ''`, not `!== undefined`: `date: null` and `date: ''` are what a
- * truncated or garbled body actually yields, and calling those "present but unattributable" sends
- * the operator looking for a real commit with an odd timestamp — the precise opposite of the truth,
- * and it inverts the only distinction the two reasons exist to draw.
+ * "Present" is `!== undefined && !== null && !== ''`, not `!== undefined` alone: `date: null` and
+ * `date: ''` are what a truncated or garbled body actually yields, and calling those "present but
+ * unattributable" sends the operator looking for a real commit with an odd timestamp — the precise
+ * opposite of the truth, and it inverts the only distinction the two reasons exist to draw. See
+ * {@link hasDate} for why it is not a `typeof === 'string'` test either.
+ *
+ * The first candidate is a REQUIRED parameter rather than part of the rest, so a call with no
+ * arguments cannot compile. `[].some(…)` is `false`, which would make a zero-arity call assert
+ * "no date was present" — a positive claim about a body nobody looked at, landing on the reason
+ * whose remedy is "go find the truncated response".
  *
  * Call this ONLY once {@link isAttributableDate} has refused every candidate; on an attributable
  * input it would name a drop that is not happening.
  */
-export function commitDropReason(...candidates: unknown[]): GitCommitDropReason {
-    return candidates.some(hasDate)
+export function commitDropReason(first: unknown, ...rest: unknown[]): GitCommitDropReason {
+    return [first, ...rest].some(hasDate)
         ? UNATTRIBUTABLE_DATE_DROP_REASON
         : NO_AUTHOR_DATE_DROP_REASON;
 }

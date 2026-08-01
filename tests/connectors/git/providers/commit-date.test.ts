@@ -75,6 +75,17 @@ describe('commitDropReason', () => {
         expect(commitDropReason(value)).toBe(NO_AUTHOR_DATE_DROP_REASON);
     });
 
+    it.each([
+        ['a number', 1_705_312_800_000],
+        ['a single-element array', ['2024-01-15T10:00:00.000Z']],
+    ])('names the unusable-timestamp reason for %s — the body DID carry a date', (_label, value) => {
+        // The sibling block above proves `isAttributableDate` refuses these. They must not then be
+        // classified as a truncated response: the payload is sitting right there with a date in
+        // it, and sending the operator to look for a missing one inverts the only distinction the
+        // two reasons draw. This is the arm a `typeof === 'string'` presence test gets wrong.
+        expect(commitDropReason(value)).toBe(UNATTRIBUTABLE_DATE_DROP_REASON);
+    });
+
     it('reports unusable when ANY consulted copy carried a date', () => {
         // GitHub holds two copies (detail response, list row) and consults both. If either had a
         // date, the commit is a real one with a timestamp this pipeline cannot key on — not a

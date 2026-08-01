@@ -526,9 +526,11 @@ describe('GitLabProvider', () => {
         // --- commit-date pin (#290) ---
 
         it('drops an unattributable authored_date before the diff fan-out and reports it', async () => {
-            // The fetch mock is SEQUENTIAL, so supplying exactly one diff response is itself the
-            // assertion that the gate runs first: a gate placed after the fan-out would consume
-            // this response for the bad commit and leave the good one with nothing.
+            // The assertions that catch a gate moved AFTER the fan-out are the request COUNT and
+            // the progress array below — NOT the response budget and not `additions`. `usable`
+            // preserves list order and `good` is index 0, so it consumes the single diff response
+            // either way; and `makeFetchMock` serves `{body: []}` once the scripted responses run
+            // out rather than throwing, so the bad commit's extra request would resolve benignly.
             const fetchMock = makeFetchMock([
                 {
                     body: [

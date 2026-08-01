@@ -39,6 +39,12 @@ const RAW_AUTHOR_PROVIDERS: readonly GitProviderType[] = ['github', 'bitbucket',
 // the agreement was enforced only by a comment. Tightening one copy silently diverged the gate
 // from the refusal it exists to prevent — which is a permanent stall of the whole git connector,
 // since this refusal throws inside the run's all-providers write transaction.
+//
+// SCOPED TO THIS PIPELINE, not a repo-wide census. The chain that had to agree is provider gate →
+// this validator → projection scan → the schema CHECK, and that chain now shares one predicate.
+// Unrelated `^\d{4}-\d{2}-\d{2}$` literals still exist at other boundaries (the dashboard range
+// params, self-report, the cursor transformer); they validate different inputs against their own
+// extra rules and are deliberately not folded in here.
 
 /**
  * Anchored UTC-ISO-instant shape. Deliberately stricter than `Date.parse`: expanded

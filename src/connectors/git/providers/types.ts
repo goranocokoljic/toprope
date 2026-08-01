@@ -313,8 +313,13 @@ export interface GitFetchProgress {
      * re-pages from HEAD with a fresh counter, so the number legitimately restarts at 0.
      *
      * ABSENT means "no distinction to draw", not "zero": GitHub and GitLab pass
-     * `since`/`until` to the server, so every row they scan is a row they keep and a second
-     * copy of `done` would be noise. Reported unconditionally by an implementation that
+     * `since`/`until` to the server, so essentially every row they scan is a row they keep and
+     * a second copy of `done` would be noise. (Since #290 that is no longer exactly true of
+     * GitLab — its author-date gate drops a row the server handed over — but a shape anomaly
+     * is rare enough that a permanent second counter would be noise for the one run in
+     * thousands where the two differ. The drop itself travels on `onDrop`, which is the
+     * channel that matters; `scanned` is for a filter that runs on EVERY row, which is
+     * Bitbucket's `until` walk.) Reported unconditionally by an implementation that
      * does filter, INCLUDING when it currently equals `done` — suppressing the redundant
      * case is the consumer's call, exactly as with a `total` of 0 (see
      * `GitSyncProgress.repo_step`).
@@ -355,7 +360,14 @@ export type GitFetchProgressListener = (progress: GitFetchProgress) => void;
  * pairing is the project's rule: a runtime allowlist at the trust boundary, not a
  * compile-time union alone.
  */
-export const NO_AUTHOR_DATE_DROP_REASON = 'no author date on either the commit list row or the commit detail response, so the commit cannot be attributed to a day';
+// PROVIDER-NEUTRAL wording since #290. It used to name "the commit list row or the commit
+// detail response", which described the two copies GitHub consults — correct while GitHub was
+// the only producer, and misdirection now that GitLab and Bitbucket emit this same sentence
+// through the shared classifier while holding ONE copy and fetching no detail endpoint at all.
+// This string is not a comment: `sync.ts` groups drops per reason and prints it verbatim to
+// stdout, into `sync_logs.errors`, and into `git_providers.last_sync_advisories`, so a
+// GitHub-shaped noun sends a Bitbucket operator to look at a response nothing ever requested.
+export const NO_AUTHOR_DATE_DROP_REASON = 'no author date on any copy of the commit the provider returned, so the commit cannot be attributed to a day';
 
 export const UNATTRIBUTABLE_DATE_DROP_REASON = 'the author date is present but is not a day the pipeline can key on, so the commit cannot be attributed to a day';
 
@@ -389,8 +401,8 @@ export type GitCommitDropReason = (typeof COMMIT_DROP_REASONS)[number];
  * The loss is therefore PERMANENT, which is exactly why it has to be said out loud: before
  * #275 such a commit vanished with nothing in `errors[]`, no trace in the sync log, and a
  * cursor already advanced past it. This type is the CANONICAL statement of that decision —
- * the sites that act on it (`COMMITS_DROPPED_PREFIX` in `sync.ts`, the drop report in
- * `github.ts`) cite it rather than re-deriving it.
+ * the sites that act on it (`COMMITS_DROPPED_PREFIX` in `sync.ts`, and the drop report in each
+ * of `github.ts` / `gitlab.ts` / `bitbucket.ts` since #290) cite it rather than re-deriving it.
  */
 export interface GitCommitDrop {
     /** The sha as it appeared in the provider's own commit list. */
@@ -465,8 +477,13 @@ export interface GitProvider {
     // hold.
     //
     // ALL THREE IMPLEMENTATIONS HONOR THAT IN FULL since #290 — the rule above has no exception
-    // list any more, so a clean `errors[]` really does mean no COMMIT was silently lost. The
-    // specific thing every one of them must gate is the AUTHOR DATE: `raw_author_daily`'s
+    // list any more, so no commit is silently lost BY A PROVIDER'S `getCommits`. That is the
+    // whole of the claim: it is about this seam, not about the run. One frame downstream the
+    // sync still drops a commit whose author has neither a login nor an email — `analyzer.ts`
+    // skips it and `retentionKeyFor` returns null for it (`sync.ts`), both with nothing in
+    // `errors[]` and the cursor advancing — so a clean `errors[]` does NOT by itself prove the
+    // window is fully retained. The specific thing every one of them must gate is the AUTHOR
+    // DATE: `raw_author_daily`'s
     // validator THROWS on a day it cannot key on, inside the run's single all-providers write
     // transaction, so an unpinned provider does not merely lose its own commit — it rolls back
     // every OTHER provider's window too, identically, on every subsequent run. The gate is
@@ -496,10 +513,20 @@ export interface GitProvider {
     // ordering: Bitbucket cannot window-filter a row whose date it cannot parse, so its gate runs
     // BEFORE the filter and an out-of-window row with an unusable date IS reported. Gating after
     // the filter would restore the silent loss this listener exists to prevent, so the report is
-    // the lesser evil — but note what it costs an operator. Bitbucket's endpoint takes no server
-    // date bounds, so every backfill/catch-up chunk re-pages HEAD→since; one bad-dated commit near
-    // HEAD is therefore re-reported once per chunk, each time against a window it was never in.
-    // A repeated Bitbucket drop advisory naming the same sha is that, not N separate losses.
+    // the lesser evil — but note exactly what it costs an operator, because it is more than noise.
+    // Bitbucket's endpoint takes no server date bounds, so EVERY run re-pages HEAD→since (not just
+    // a backfill chunk — a forward run stops only at the first commit OLDER than `since`). A
+    // bad-dated commit in that walked prefix is therefore re-reported on every sync, indefinitely,
+    // and an ISO expanded year sorts to the head of the newest-first list permanently, so it never
+    // leaves. GitHub and GitLab do not share this: their windows are server-side and filter on
+    // COMMITTER date, so the same commit ages out and is reported once. Two consequences follow,
+    // and neither clears on its own: `toprope sync git` exits non-zero whenever `errors[]` is
+    // non-empty and advisories share that array, so one such commit makes the CLI permanently red
+    // for a run that succeeded; and `last_sync_advisories` is bounded, so the repeat occupies
+    // budget other repos' genuine drops need. A repeated Bitbucket drop naming the same sha is
+    // ONE permanent loss restated, not N losses. Suppressing the repeat needs a persisted
+    // per-container set of already-reported shas — deliberately not built here, since a durable
+    // per-loss ledger is exactly what {@link GitCommitDropListener} says the system does not have.
     //
     // A commit the implementation DOES return but whose LINE COUNTS it could not observe is
     // neither of the above — not a throw (the response is well-formed by the endpoint's own
