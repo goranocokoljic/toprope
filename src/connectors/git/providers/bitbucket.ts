@@ -50,7 +50,12 @@ function parseRawAuthor(raw: string): {name: string; email: string} {
  * the run report success, and the cursor advance over the whole untouched window. That is a
  * worse outcome than the NaN case, produced by a value the parseability check waves through, so
  * the shape is pinned as well: an ordinary year is four digits, and `toISOString()` renders
- * anything else with a leading `+`/`-` sign.
+ * anything else with a leading `+`/`-` sign. The ORDERING of the two parsed bounds is checked by
+ * the caller, because it is a property of the pair rather than of either value.
+ *
+ * A BLANK value is "no bound", not a refusal, and that is load-bearing rather than lenient:
+ * `sync.ts` passes `since: ''` for a first sync with no configured window, meaning walk
+ * everything. Removing the early return would refuse every first sync.
  *
  * FAIL-CLOSED by throwing rather than by falling back to "no bound": the caller (`sync.ts`)
  * treats a throw out of `getCommits` as an un-covered window — it records the failure and HOLDS
@@ -65,6 +70,18 @@ function parseRawAuthor(raw: string): {name: string; email: string} {
  * are the two `sync_state` rows these bounds are read from; naming them leaks nothing (that is
  * the whole reason the value itself is withheld) and is the difference between an unexplained
  * brick and a two-minute repair.
+ *
+ * SCOPE, said out loud so the next reader does not over-read it: this guards THIS walk's two
+ * bounds and nothing else. `getPullRequests` below, and both bounds on `github.ts`/`gitlab.ts`
+ * (which push them to the server rather than comparing in memory), still take the values
+ * unchecked. Those are a different failure mode — an over-fetch, or a provider 4xx that already
+ * fails closed — and closing them belongs where the two strings are DERIVED, one layer up in
+ * `fetchProviderData`; that hoist is #309. Nor is this a fourth spelling that should have
+ * delegated today: `isUtcIsoInstant`
+ * (`sync.ts`) and `UTC_ISO_INSTANT_RE` (`raw-author-daily.ts`) are both module-private and both
+ * additionally pin `.SSSZ` plus a round-trip, which would refuse bound forms this walk accepts,
+ * and importing from `sync.ts` here would invert the layering. If a fourth site appears, extract
+ * one shared predicate rather than adding to the census.
  */
 function parseCommitBound(value: string, label: 'since' | 'until'): Date | null {
     if (!value) return null;
@@ -289,6 +306,25 @@ export class BitbucketProvider implements GitProvider {
     ): Promise<GitCommit[]> {
         const sinceDate = parseCommitBound(since, 'since');
         const untilDate = parseCommitBound(until, 'until');
+        // AN INVERTED WINDOW IS THE SAME DEFECT AS AN UNPARSEABLE BOUND, and the reachable one
+        // (#304 review cycle 2). Each bound above can be individually perfect while the PAIR is
+        // impossible, and `catchUpUntil` in `sync.ts` says in its own docstring that a `since`
+        // at or after `now` — a host clock that jumped, a hand-edited cursor — is a state it
+        // expects; its remedy clamps `until` to `now`, which MANUFACTURES `since > until`. The
+        // walk would then set `reachedCutoff` on the very first row, break before any listing
+        // tick is emitted, return an empty list as a success, and let the run record the window
+        // as covered — so the span between the last honest sync and now is skipped with no drop,
+        // no error and no divergence to read. Refuse instead: the caller holds the cursor (#231)
+        // and the operator sees which state key to repair. Only when BOTH bounds exist — a blank
+        // one is "no bound", which cannot be inverted.
+        if (sinceDate && untilDate && sinceDate.getTime() > untilDate.getTime()) {
+            throw new Error(
+                'Bitbucket commit window is inverted ("since" is after "until") — refusing to ' +
+                    'walk the repository with a window no commit can satisfy, which would ' +
+                    'record an untouched span as covered. Check the git_last_sync / ' +
+                    'git_earliest_sync sync_state rows for this provider.',
+            );
+        }
         // READ ONCE, so every row of the walk is judged against the same instant (#304). A
         // per-row `Date.now()` would let two identically-dated rows on the same page classify
         // differently if the clock crossed their date between them — a difference no operator
@@ -384,10 +420,8 @@ export class BitbucketProvider implements GitProvider {
                     // would drown the real losses (see `GitProvider.getCommits`). This one is not
                     // that: `until` is derived from the run's start, so no run in flight has a
                     // window reaching past `now`, and the row is excluded by every one of them.
-                    // Left unreported it produced a permanent `+1` divergence on EVERY subsequent
-                    // run — Bitbucket re-pages from HEAD each time and the row is newer than
-                    // `since`, so it never trips the cutoff — which reads exactly like the benign
-                    // "still approaching the window" case.
+                    // What it cost to leave unreported, and what reporting it costs on this
+                    // provider, are both on {@link FUTURE_AUTHOR_DATE_DROP_REASON}.
                     //
                     // `>` and not `>=`: a row stamped exactly `now` is the boundary this run's
                     // `until` was about to include, not a future date.

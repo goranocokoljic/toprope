@@ -215,8 +215,11 @@ export const DIFFS_NOT_SUPPLIED_PREFIX = 'Provider supplied no commit diffs:';
  * sentinel is deliberately not renamed for it — it is matched by `isAdvisoryError` and
  * `isPermanentLossAdvisory`, persisted into `sync_logs.errors` and `last_sync_advisories`, and
  * asserted verbatim across the suite, so widening the word would cost more than it buys. What
- * carries the distinction is the grouped reason the line ends with, which is why the body below
- * pushes "can this come back?" onto the reason rather than answering it for the whole line.
+ * carries the distinction is the grouped reason the line ends with — the body says nothing at all
+ * about whether a given drop can come back, because only the reason knows. (It said "nothing
+ * re-asks them" until #304, which was true of two reasons and false of the third; the replacement
+ * is silence rather than a per-reason clause, since `${groups}` renders the reasons two clauses
+ * later and would only be restating them.)
  *
  * The body also says only that the commits could not be imported BY THIS RUN, never that they
  * belonged to the covered window. Since #304 one of the reporting paths — Bitbucket's cutoff-page
@@ -2958,9 +2961,7 @@ async function fetchProviderData(
             `commit(s) the provider listed could not be imported by this run, whose window is ` +
             `now recorded as covered. There is no targeted re-fetch: ` +
             `"sync older history" only extends STRICTLY older than the earliest synced ` +
-            `instant, so it cannot reach a forward window. Whether an ordinary later run could ` +
-            `reach one of these at all is what its reason says — a date this pipeline cannot ` +
-            `key on is the same on every re-fetch, so nothing re-asks those. ${groups}.`
+            `instant, so it cannot reach a forward window. ${groups}.`
         );
     });
 

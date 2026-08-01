@@ -695,8 +695,8 @@ describe('GitSync', () => {
                                 onDrop?: (d: {sha: string; reason: string}) => void,
                             ) => {
                                 duringFetch?.();
-                                // ALSO report a dropped commit (#275). The drop advisory claims
-                                // "the window this run has now recorded as covered", which is false
+                                // ALSO report a dropped commit (#275). The drop advisory claims the
+                                // run's "window is now recorded as covered", which is false
                                 // on every path this describe block exercises — a deleted
                                 // container advances no cursor and writes nothing. The claim is
                                 // suppressed by the advisory being staged INSIDE the
@@ -867,6 +867,12 @@ describe('GitSync', () => {
             expect(dropLine).toBeDefined();
             expect(dropLine).toContain(`1 because ${FUTURE_AUTHOR_DATE_DROP_REASON}`);
             expect(dropLine).not.toContain('<unrecognized drop reason>');
+            // The BODY's claim, which nothing else asserts: it says only that the commits could
+            // not be imported by this run, never that a later one cannot re-ask them — that is
+            // per-reason and false for this one. Reverting the sentence to the pre-#304 "nothing
+            // re-asks them" left the whole suite green before this line existed.
+            expect(dropLine).toContain('could not be imported by this run');
+            expect(dropLine).not.toContain('nothing re-asks');
         });
 
         // Positive control for the assertions above: with the row INTACT the same run writes a
