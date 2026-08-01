@@ -24,7 +24,38 @@ import {
     isoWeekLabel,
     isoWeekRange,
     priorIsoWeek,
+    isUtcDay,
 } from '../../src/aggregation/dates';
+
+/**
+ * `isUtcDay` stopped being a local helper in #290: it is now the SINGLE home of the anchored
+ * UTC-day shape, read by `raw_author_daily`'s write boundary and date-read filter, by the
+ * projection's scan filter, and by the commit-date gate all three git providers call. It had no
+ * direct test, and every indirect negative fixture is malformed from character 1 — so the ANCHORS,
+ * the property the whole consolidation rests on, were invisible to the suite.
+ */
+describe('isUtcDay', () => {
+    it.each(['2026-07-01', '2024-01-15', '0001-01-01'])('accepts the bare UTC day %s', (day) => {
+        expect(isUtcDay(day)).toBe(true);
+    });
+
+    it.each([
+        // The load-bearing case: a conforming 10-char prefix with trailing junk. Only the
+        // trailing `$` rejects it. Drop that anchor and the store's typed `invalid_date` guard
+        // stops firing, handing an instant to a schema CHECK that is fully anchored — a raw
+        // SQLITE_CONSTRAINT from inside the git run's all-providers write transaction.
+        ['a full ISO instant', '2026-07-01T10:00:00.000Z'],
+        ['a day with a trailing space', '2026-07-01 '],
+        // The mirror case, which only the leading `^` rejects.
+        ['a day with a leading space', ' 2026-07-01'],
+        ['an unpadded month/day', '2026-7-1'],
+        ['a slash-separated day', '2026/07/01'],
+        ['the empty string', ''],
+        ['a non-date word', 'yesterday'],
+    ])('rejects %s', (_label, value) => {
+        expect(isUtcDay(value)).toBe(false);
+    });
+});
 
 describe('isoWeekStart', () => {
     // 2026-05-04 is a Monday; 2026-05-10 the Sunday that closes that ISO week.

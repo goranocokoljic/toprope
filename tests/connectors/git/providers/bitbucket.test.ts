@@ -7,7 +7,10 @@ import {
     PROBE_SERVER_ERROR_RETRIES,
     isRetryableGitFetchError,
 } from '../../../../src/connectors/git/providers/http-retry';
-import type {BitbucketProviderConfig} from '../../../../src/connectors/git/providers/types';
+import {
+    UNATTRIBUTABLE_DATE_DROP_REASON,
+    type BitbucketProviderConfig,
+} from '../../../../src/connectors/git/providers/types';
 
 const CONFIG_APP_PASSWORD: BitbucketProviderConfig = {
     type: 'bitbucket',
@@ -650,6 +653,78 @@ describe('BitbucketProvider', () => {
                 {done: 0, total: 1},
                 {done: 1, total: 1},
             ]);
+        });
+
+        // --- commit-date pin (#290) ---
+
+        it('keeps walking past an unattributable date instead of treating it as the since cutoff', async () => {
+            // THE REGRESSION THIS EXISTS FOR. The gate has to `continue`, never `break paging`:
+            // the cutoff below it relies on the endpoint's newest-first ORDER, and a row this
+            // walk cannot date says nothing about where in that order it sits. Breaking on it
+            // would silently discard the rest of a window the run then records as fully covered
+            // — which is exactly the #231 hole `onDrop` exists to make impossible. The bad row is
+            // therefore placed BETWEEN two in-window commits, so a `break` loses `after`.
+            const fetchMock = makeFetchMock([
+                {
+                    body: pagedResponse([
+                        makeCommitFixture('before', {date: '2024-01-20T00:00:00+00:00'}),
+                        makeCommitFixture('bad', {date: '+033658-09-27T01:46:39.000Z'}),
+                        makeCommitFixture('after', {date: '2024-01-10T00:00:00+00:00'}),
+                    ]),
+                },
+                {body: pagedResponse(makeDiffstatFixture())}, // diffstat for before
+                {body: pagedResponse(makeDiffstatFixture())}, // diffstat for after
+            ]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            const onDrop = vi.fn();
+            const onProgress = vi.fn();
+            const commits = await provider.getCommits(
+                'my-repo',
+                '2024-01-01T00:00:00Z',
+                '2024-02-01T00:00:00Z',
+                onProgress,
+                onDrop,
+            );
+
+            expect(commits.map((c) => c.sha)).toEqual(['before', 'after']);
+            expect(onDrop.mock.calls.map((c) => c[0])).toEqual([
+                {sha: 'bad', reason: UNATTRIBUTABLE_DATE_DROP_REASON},
+            ]);
+            // The dropped row was HANDED over, so it still counts toward `scanned` — the
+            // divergence from `done` is window-filtered rows plus reported drops, and this pins
+            // that the drop path did not quietly stop counting.
+            const listingTicks = onProgress.mock.calls
+                .map((c) => c[0] as {done: number; total: number | null; scanned?: number})
+                .filter((p) => p.total === null);
+            expect(listingTicks).toEqual([{done: 2, total: null, scanned: 3}]);
+        });
+
+        it('drops an unattributable date BEFORE the diffstat fan-out, so it costs no request', async () => {
+            // The assertion that catches a gate moved AFTER the fan-out is the request COUNT
+            // below, not `additions`: `good` is first in the page, so it would consume the single
+            // diffstat response either way and still report 40. Do not drop the count assertion
+            // believing the churn one covers it.
+            const fetchMock = makeFetchMock([
+                {
+                    body: pagedResponse([
+                        makeCommitFixture('good'),
+                        makeCommitFixture('bad', {date: 'not-a-date'}),
+                    ]),
+                },
+                {body: pagedResponse(makeDiffstatFixture())}, // the ONLY diffstat response
+            ]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            const onDrop = vi.fn();
+            const commits = await provider.getCommits('my-repo', '', '', undefined, onDrop);
+
+            expect(commits.map((c) => c.sha)).toEqual(['good']);
+            expect(commits[0].additions).toBe(40);
+            expect(onDrop).toHaveBeenCalledTimes(1);
+            // One commit-list request + one diffstat request. A third call would mean the bad
+            // commit reached the fan-out.
+            expect(fetchMock).toHaveBeenCalledTimes(2);
         });
 
         it('reports the PR-list page that hits the since cutoff', async () => {

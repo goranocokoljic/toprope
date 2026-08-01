@@ -20,6 +20,7 @@
 
 import type Database from 'better-sqlite3';
 import {randomUUID} from 'crypto';
+import {isUtcDay} from '../../aggregation/dates.js';
 import {isBlankContainer} from './providers/container.js';
 import type {GitProviderType} from './providers/types.js';
 
@@ -31,8 +32,19 @@ import type {GitProviderType} from './providers/types.js';
  */
 const RAW_AUTHOR_PROVIDERS: readonly GitProviderType[] = ['github', 'bitbucket', 'gitlab'];
 
-/** Anchored UTC-day shape (YYYY-MM-DD), matching the schema's GLOB. */
-const UTC_DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+// The anchored UTC-day shape (YYYY-MM-DD) this store enforces — matching the schema's GLOB — is
+// {@link isUtcDay}, imported rather than restated (#290). It was a local `UTC_DAY_RE` here, a
+// byte-identical one in `projection.ts`, and a third in `aggregation/dates.ts`; the provider gates
+// that keep an unusable day OUT of this validator were documented as agreeing with this copy, but
+// the agreement was enforced only by a comment. Tightening one copy silently diverged the gate
+// from the refusal it exists to prevent — which is a permanent stall of the whole git connector,
+// since this refusal throws inside the run's all-providers write transaction.
+//
+// SCOPED TO THIS PIPELINE, not a repo-wide census. The chain that had to agree is provider gate →
+// this validator → projection scan → the schema CHECK, and that chain now shares one predicate.
+// Unrelated `^\d{4}-\d{2}-\d{2}$` literals still exist at other boundaries (the dashboard range
+// params, self-report, the cursor transformer); they validate different inputs against their own
+// extra rules and are deliberately not folded in here.
 
 /**
  * Anchored UTC-ISO-instant shape. Deliberately stricter than `Date.parse`: expanded
@@ -395,7 +407,7 @@ function assertValidInput(row: RawAuthorDailyInput, observedAt: string): void {
             `raw_author_key must be namespaced by its provider (${row.provider}:…), got: ${row.raw_author_key}`,
         );
     }
-    if (!UTC_DAY_RE.test(row.date)) {
+    if (!isUtcDay(row.date)) {
         throw new RawAuthorDailyError('invalid_date', `date must be a UTC YYYY-MM-DD day, got: ${row.date}`);
     }
     if (!UTC_ISO_INSTANT_RE.test(observedAt)) {
@@ -599,7 +611,7 @@ export function readRawDailyForKeys(db: Database.Database, keys: string[]): RawA
  * One statement per chunk of dates; served by `idx_raw_author_daily_date`.
  */
 export function readRawDailyForDates(db: Database.Database, dates: string[]): RawAuthorDailyRecord[] {
-    const wanted = dates.filter((d) => UTC_DAY_RE.test(d));
+    const wanted = dates.filter((d) => isUtcDay(d));
     if (wanted.length === 0) return [];
 
     const rows: RawAuthorDailyRecord[] = [];

@@ -702,7 +702,7 @@ describe('GitHubProvider', () => {
                 sha: 'aaa111',
                 reason: NO_AUTHOR_DATE_DROP_REASON,
             });
-            expect(onDrop.mock.calls[0][0].reason).toContain('no author date on either');
+            expect(onDrop.mock.calls[0][0].reason).toContain('no author date on any copy');
         });
 
         it('drops a commit whose date is PRESENT but unattributable, with its own reason', async () => {

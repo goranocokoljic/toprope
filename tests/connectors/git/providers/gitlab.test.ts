@@ -6,7 +6,10 @@ import {
     PROBE_SERVER_ERROR_RETRIES,
     isRetryableGitFetchError,
 } from '../../../../src/connectors/git/providers/http-retry';
-import type {GitLabProviderConfig} from '../../../../src/connectors/git/providers/types';
+import {
+    UNATTRIBUTABLE_DATE_DROP_REASON,
+    type GitLabProviderConfig,
+} from '../../../../src/connectors/git/providers/types';
 
 const CONFIG_PAT: GitLabProviderConfig = {
     type: 'gitlab',
@@ -517,6 +520,56 @@ describe('GitLabProvider', () => {
                 {done: 0, total: 2},
                 {done: 1, total: 2},
                 {done: 2, total: 2},
+            ]);
+        });
+
+        // --- commit-date pin (#290) ---
+
+        it('drops an unattributable authored_date before the diff fan-out and reports it', async () => {
+            // The assertions that catch a gate moved AFTER the fan-out are the request COUNT and
+            // the progress array below — NOT the response budget and not `additions`. `usable`
+            // preserves list order and `good` is index 0, so it consumes the single diff response
+            // either way; and `makeFetchMock` serves `{body: []}` once the scripted responses run
+            // out rather than throwing, so the bad commit's extra request would resolve benignly.
+            const fetchMock = makeFetchMock([
+                {
+                    body: [
+                        makeCommitFixture('good'),
+                        // `git commit --date=@999999999999`. Before #290 this reached
+                        // `raw_author_daily`'s validator, which throws inside the run's single
+                        // all-providers write transaction — rolling back every OTHER provider's
+                        // window too, on every subsequent run.
+                        makeCommitFixture('bad', {authored_date: '+033658-09-27T01:46:39.000Z'}),
+                    ],
+                },
+                {body: [makeDiffEntryFixture()]}, // the ONLY diff response
+            ]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            const onDrop = vi.fn();
+            const onProgress = vi.fn();
+            const commits = await provider.getCommits(
+                'test-group/my-repo',
+                '',
+                '',
+                onProgress,
+                onDrop,
+            );
+
+            expect(commits.map((c) => c.sha)).toEqual(['good']);
+            expect(commits[0].additions).toBe(2);
+            expect(onDrop.mock.calls.map((c) => c[0])).toEqual([
+                {sha: 'bad', reason: UNATTRIBUTABLE_DATE_DROP_REASON},
+            ]);
+            // One commit-list request + one diff request. A third would mean the dropped commit
+            // still cost a round trip.
+            expect(fetchMock).toHaveBeenCalledTimes(2);
+            // `total` counts the work actually about to happen, so `done` still reaches it — a
+            // counter that stalled at 1/2 forever is what the caller renders as a hung repo.
+            expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
+                {done: 2, total: null},
+                {done: 0, total: 1},
+                {done: 1, total: 1},
             ]);
         });
 
