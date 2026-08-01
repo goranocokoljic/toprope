@@ -22,8 +22,26 @@ export interface DailyGitMetrics {
 const COMMIT_BURST_WINDOW_MINUTES = 30;
 const COMMIT_BURST_MIN_COUNT = 3;
 
-function toDateString(isoDate: string): string {
-    return isoDate.slice(0, 10);
+/**
+ * The day key this pipeline attributes an ISO timestamp to.
+ *
+ * TOTAL over `unknown`, not over `string` (#302). Every timestamp reaching here is a field of a
+ * response body the providers cast rather than validate, so `pr.createdAt` can be `null` or a
+ * number at runtime however the interface types it — and a bare `.slice` on one of those throws
+ * a `TypeError` out of `aggregateDailyMetrics`, which is not inside the run's `try`. That kills
+ * the whole run before any provider's cursor advances and recurs identically next run: the same
+ * permanent-stall geometry the write-boundary skip exists to close, reached one frame earlier.
+ *
+ * A non-string yields `''`, which is NOT a day the store will accept — so the row is skipped and
+ * REPORTED by the write boundary rather than silently vanishing here. Deliberately not
+ * `String(isoDate).slice(0, 10)`: `String(['2024-01-15T00:00:00Z'])` is a perfectly well-formed
+ * day, so coercing would let an odd JSON body manufacture a valid-looking key out of a value
+ * nobody can attribute — the same coercion hazard `isAttributableDate` puts its `typeof` first
+ * for. `''` cannot be produced that way, and the one string that does produce it (`createdAt:
+ * ''`) is unattributable for the same reason, so folding them together loses no distinction.
+ */
+function toDateString(isoDate: unknown): string {
+    return typeof isoDate === 'string' ? isoDate.slice(0, 10) : '';
 }
 
 // Detect bursts across a developer's full commit stream (so bursts spanning
@@ -161,6 +179,15 @@ export function aggregateDailyMetrics(
         }
     }
 
+    // How many of a (login, day)'s merged PRs had a MEASURABLE time-to-merge (#302).
+    //
+    // Tracked separately from `prs_merged` because the two legitimately differ: a PR whose
+    // `createdAt` or `mergedAt` is unparseable still merged (it counts), but its duration is
+    // unknown and must not enter the mean. Reusing `prs_merged` as the divisor — which the
+    // in-place rolling average used to do — would weight the surviving samples by a count that
+    // includes the ones never added, quietly dragging the average toward zero.
+    const measuredMergeTimes = new Map<string, number>();
+
     // Process PR metrics
     for (const pr of pullRequests) {
         const login = pr.authorLogin;
@@ -194,14 +221,28 @@ export function aggregateDailyMetrics(
             const mergedMetrics = devMetrics.get(mergedDate)!;
             mergedMetrics.prs_merged++;
 
-            // Rolling average of time-to-merge
-            if (mergedMetrics.avg_time_to_merge_hours === null) {
-                mergedMetrics.avg_time_to_merge_hours = timeToMergeHours;
-            } else {
+            // Rolling average of time-to-merge, over the MEASURABLE samples only (#302).
+            //
+            // An unparseable `createdAt` or `mergedAt` makes this subtraction NaN, and the write
+            // boundary refuses a NaN metric — so before this guard ONE malformed PR timestamp
+            // cost the whole merged-day row, including its commits, and could do so on a day
+            // whose own date was perfectly fine (a bad `createdAt` poisons the row keyed by
+            // `mergedAt`). `avg_time_to_merge_hours` is nullable precisely to mean "not known",
+            // so leaving it alone is the honest answer and it costs nothing else. The write
+            // boundary still refuses a NaN that reaches it by any other route — this narrows
+            // what that skip has to swallow, it does not replace it.
+            if (Number.isFinite(timeToMergeHours)) {
+                // NUL-separated: a login is free-form provider text, so a space separator would
+                // let ('a b', 'x') and ('a', 'b x') resolve to one shared sample counter.
+                const sampleKey = `${login}\u0000${mergedDate}`;
+                const samples = (measuredMergeTimes.get(sampleKey) ?? 0) + 1;
+                measuredMergeTimes.set(sampleKey, samples);
                 mergedMetrics.avg_time_to_merge_hours =
-                    (mergedMetrics.avg_time_to_merge_hours * (mergedMetrics.prs_merged - 1) +
-                        timeToMergeHours) /
-                    mergedMetrics.prs_merged;
+                    samples === 1
+                        ? timeToMergeHours
+                        : ((mergedMetrics.avg_time_to_merge_hours ?? 0) * (samples - 1) +
+                              timeToMergeHours) /
+                          samples;
             }
         }
     }

@@ -63,14 +63,30 @@ const UTC_ISO_INSTANT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
  */
 export const READ_CHUNK_SIZE = 500;
 
+/**
+ * Every reason this store can refuse a row, as a RUNTIME allowlist.
+ *
+ * An array rather than a bare union because the code now travels out of this module and is
+ * interpolated into an operator-facing advisory line (`AUTHOR_DAYS_SKIPPED_PREFIX` in
+ * `sync.ts`, #302). The graduated rule is explicit that a TypeScript union is not a control at
+ * a boundary a value crosses, and this one crosses two — module and process, since the line is
+ * printed to a terminal, persisted into `sync_logs.errors` and stored on
+ * `git_providers.last_sync_advisories`. `sync.ts` checks membership here before rendering.
+ *
+ * The union is DERIVED from this array rather than declared beside it, so the compile-time
+ * type and the runtime allowlist cannot drift: adding a code to one adds it to both.
+ */
+export const RAW_AUTHOR_DAILY_ERROR_CODES = [
+    'invalid_provider',
+    'invalid_container',
+    'invalid_key',
+    'invalid_date',
+    'invalid_instant',
+    'invalid_metric',
+] as const;
+
 /** Why a raw-author write refused. Typed so callers map it instead of leaking a raw DB error. */
-export type RawAuthorDailyErrorCode =
-    | 'invalid_provider'
-    | 'invalid_container'
-    | 'invalid_key'
-    | 'invalid_date'
-    | 'invalid_instant'
-    | 'invalid_metric';
+export type RawAuthorDailyErrorCode = (typeof RAW_AUTHOR_DAILY_ERROR_CODES)[number];
 
 /** A fail-closed refusal from the raw-author store — the input never reached SQLite. */
 export class RawAuthorDailyError extends Error {
@@ -375,9 +391,52 @@ const RATE_FIELDS: readonly (keyof DailyGitMetrics)[] = [
     'code_churn_rate', 'ai_signature_score', 'avg_commit_size',
 ];
 
-function assertValidInput(row: RawAuthorDailyInput, observedAt: string): void {
+/** What is wrong with a row this store will not accept. See {@link findRawAuthorDailyDefect}. */
+export interface RawAuthorDailyDefect {
+    code: RawAuthorDailyErrorCode;
+    /** Operator-readable, and it INTERPOLATES THE OFFENDING VALUE — see the caller warning. */
+    message: string;
+}
+
+/** Brevity only — one `return defect(...)` per rule reads as the rule, not as object literals. */
+function defect(code: RawAuthorDailyErrorCode, message: string): RawAuthorDailyDefect {
+    return {code, message};
+}
+
+/**
+ * The first defect that would make {@link upsertRawAuthorDaily} refuse this row, or `null` if
+ * the row is writable — the same decision {@link assertValidInput} makes, without the throw.
+ *
+ * WHY IT EXISTS (#302). This validator runs inside the git sync's SINGLE all-providers write
+ * transaction, so a throw does not cost one row: it rolls back every provider's window, no
+ * cursor advances, and the identical input recurs on the next run — a permanent stall of the
+ * whole git connector. #275/#290 closed that door for the commit author date by gating it at
+ * each provider, but three more dates reach here ungated (`pr.createdAt`, `pr.mergedAt`,
+ * `comment.createdAt`, keyed into a day by `analyzer.ts`) plus the NaN
+ * `avg_time_to_merge_hours` those timestamps compute. A fourth and fifth provider gate would
+ * not close the class; asking THIS function, at the write boundary, is total over every field
+ * it validates and over every future provider.
+ *
+ * ONE BODY, TWO CALLERS. The throwing form now delegates here rather than restating the rules,
+ * so the sync's per-row skip and the store's refusal can never disagree about what is writable
+ * — a second copy is exactly how the #290 gate/store agreement drifted before it was made
+ * structural.
+ *
+ * FIRST defect, not all of them: the caller acts identically on any defect (skip the row and
+ * report it), so enumerating the rest would cost a full pass to say nothing more.
+ *
+ * CALLER WARNING — {@link RawAuthorDailyDefect.message} embeds the offending value, which is
+ * response-derived and unvalidated. It is fine in a thrown `Error`, and it is NOT fine pasted
+ * into a line that reaches a terminal, `sync_logs.errors` or the admin UI. Render
+ * {@link RawAuthorDailyDefect.code} there instead — that is what
+ * {@link RAW_AUTHOR_DAILY_ERROR_CODES} is an allowlist for.
+ */
+export function findRawAuthorDailyDefect(
+    row: RawAuthorDailyInput,
+    observedAt: string,
+): RawAuthorDailyDefect | null {
     if (!RAW_AUTHOR_PROVIDERS.includes(row.provider)) {
-        throw new RawAuthorDailyError('invalid_provider', `Unknown git provider: ${String(row.provider)}`);
+        return defect('invalid_provider', `Unknown git provider: ${String(row.provider)}`);
     }
     // The container is half the attribution key (#264). A blank one would merge two
     // provider instances back into one bucket — the exact defect the column removes — and
@@ -388,13 +447,13 @@ function assertValidInput(row: RawAuthorDailyInput, observedAt: string): void {
     // duplicate guard cannot disagree about what an empty container is — and it is total over a
     // non-string too (`normalizeContainer` yields `''`), so no separate `typeof` disjunct is needed.
     if (isBlankContainer(row.container)) {
-        throw new RawAuthorDailyError(
+        return defect(
             'invalid_container',
             `container must be a non-blank string (the provider's org/workspace/group), got: ${String(row.container)}`,
         );
     }
     if (!row.raw_author_key || !row.raw_author_key.trim()) {
-        throw new RawAuthorDailyError('invalid_key', 'raw_author_key must be a non-blank string');
+        return defect('invalid_key', 'raw_author_key must be a non-blank string');
     }
     // The key must carry the SAME provider as the column. readRawDailyForKeys relies on
     // a key embedding its own provider to justify querying without a provider predicate;
@@ -402,16 +461,16 @@ function assertValidInput(row: RawAuthorDailyInput, observedAt: string): void {
     // mismatched pair writes a second row (the UNIQUE triple includes provider) that the
     // key-read would then return as cross-provider contamination.
     if (!row.raw_author_key.startsWith(`${row.provider}:`)) {
-        throw new RawAuthorDailyError(
+        return defect(
             'invalid_key',
             `raw_author_key must be namespaced by its provider (${row.provider}:…), got: ${row.raw_author_key}`,
         );
     }
     if (!isUtcDay(row.date)) {
-        throw new RawAuthorDailyError('invalid_date', `date must be a UTC YYYY-MM-DD day, got: ${row.date}`);
+        return defect('invalid_date', `date must be a UTC YYYY-MM-DD day, got: ${String(row.date)}`);
     }
     if (!UTC_ISO_INSTANT_RE.test(observedAt)) {
-        throw new RawAuthorDailyError('invalid_instant', `observedAt must be a UTC ISO instant, got: ${observedAt}`);
+        return defect('invalid_instant', `observedAt must be a UTC ISO instant, got: ${observedAt}`);
     }
     // Range-validate the metrics here rather than letting the schema CHECKs surface a raw
     // SQLITE_CONSTRAINT — and because NaN binds as NULL into a NOT NULL column, which
@@ -419,20 +478,36 @@ function assertValidInput(row: RawAuthorDailyInput, observedAt: string): void {
     for (const field of COUNTER_FIELDS) {
         const value = row[field];
         if (!Number.isInteger(value) || (value as number) < 0) {
-            throw new RawAuthorDailyError('invalid_metric', `${field} must be a non-negative integer, got: ${String(value)}`);
+            return defect('invalid_metric', `${field} must be a non-negative integer, got: ${String(value)}`);
         }
     }
     for (const field of RATE_FIELDS) {
         if (!Number.isFinite(row[field])) {
-            throw new RawAuthorDailyError('invalid_metric', `${field} must be a finite number, got: ${String(row[field])}`);
+            return defect('invalid_metric', `${field} must be a finite number, got: ${String(row[field])}`);
         }
     }
     if (row.avg_time_to_merge_hours !== null && !Number.isFinite(row.avg_time_to_merge_hours)) {
-        throw new RawAuthorDailyError(
+        return defect(
             'invalid_metric',
             `avg_time_to_merge_hours must be a finite number or null, got: ${String(row.avg_time_to_merge_hours)}`,
         );
     }
+    return null;
+}
+
+/**
+ * Refuse this row, by throwing {@link RawAuthorDailyError} — the shape every existing caller of
+ * {@link upsertRawAuthorDaily} is written against.
+ *
+ * A three-line delegation to {@link findRawAuthorDailyDefect} rather than a second copy of the
+ * rules: the sync's per-row skip (#302) and this refusal decide the SAME question, and the one
+ * thing that must never happen is for them to disagree — a row the skip lets through and this
+ * throws on rolls back every provider's window, which is the whole failure the skip exists to
+ * prevent. Sharing the body makes that structural instead of a promise.
+ */
+function assertValidInput(row: RawAuthorDailyInput, observedAt: string): void {
+    const found = findRawAuthorDailyDefect(row, observedAt);
+    if (found) throw new RawAuthorDailyError(found.code, found.message);
 }
 
 const SELECT_COLUMNS = `id, provider, container, raw_author_key, author_login, author_email, author_display_name,

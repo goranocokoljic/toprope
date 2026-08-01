@@ -246,3 +246,91 @@ describe('aggregateDailyMetrics - review comments given', () => {
         expect(result.get('alice')!.get('2024-01-15')?.review_comments_given ?? 0).toBe(0);
     });
 });
+
+/**
+ * #302 — the analyzer must not manufacture a value the write boundary will refuse.
+ *
+ * Every date here reaches `raw_author_daily`: the day key verbatim, and
+ * `avg_time_to_merge_hours` as `new Date(mergedAt) - new Date(createdAt)`. The store refuses a
+ * malformed day and a NaN metric by THROWING, inside the sync's single all-providers write
+ * transaction — so the sync now skips such a row instead. These tests pin the two places where
+ * the analyzer can keep that skip from costing more than the malformed value itself.
+ */
+describe('aggregateDailyMetrics - unusable PR timestamps (#302)', () => {
+    it('leaves avg_time_to_merge null rather than NaN when createdAt is unparseable', () => {
+        // The merged day is WELL FORMED and carries the day's commits. Poisoning it with a NaN
+        // would make the write boundary refuse the whole row — losing real commit data over a
+        // metric that is nullable precisely to mean "not known".
+        const result = aggregateDailyMetrics(
+            [makeCommit({date: '2024-01-16T09:00:00Z'})],
+            [makePR({createdAt: 'not-a-date', mergedAt: '2024-01-16T10:00:00Z'})],
+        );
+        const mergedDay = result.get('alice')!.get('2024-01-16')!;
+
+        expect(mergedDay.commits).toBe(1);
+        expect(mergedDay.prs_merged).toBe(1);
+        expect(mergedDay.avg_time_to_merge_hours).toBeNull();
+        expect(Number.isNaN(mergedDay.avg_time_to_merge_hours as number)).toBe(false);
+    });
+
+    it('averages only the MEASURABLE merge times, not one per merged PR', () => {
+        // Two PRs merge on the same day; one has an unusable createdAt. Dividing by prs_merged
+        // (= 2) would report 5h for a single 10h observation. The divisor must be the number of
+        // samples actually added.
+        const result = aggregateDailyMetrics(
+            [],
+            [
+                makePR({id: '1', createdAt: '2024-01-16T00:00:00Z', mergedAt: '2024-01-16T10:00:00Z'}),
+                makePR({id: '2', createdAt: 'not-a-date', mergedAt: '2024-01-16T12:00:00Z'}),
+            ],
+        );
+        const mergedDay = result.get('alice')!.get('2024-01-16')!;
+
+        expect(mergedDay.prs_merged).toBe(2);
+        expect(mergedDay.avg_time_to_merge_hours).toBeCloseTo(10, 6);
+    });
+
+    it('still averages every merge time when all of them are measurable', () => {
+        const result = aggregateDailyMetrics(
+            [],
+            [
+                makePR({id: '1', createdAt: '2024-01-16T00:00:00Z', mergedAt: '2024-01-16T10:00:00Z'}),
+                makePR({id: '2', createdAt: '2024-01-16T08:00:00Z', mergedAt: '2024-01-16T12:00:00Z'}),
+            ],
+        );
+        expect(result.get('alice')!.get('2024-01-16')!.avg_time_to_merge_hours).toBeCloseTo(7, 6);
+    });
+
+    it('keys a NON-STRING date to an empty day instead of throwing out of the whole run', () => {
+        // The input class ONLY the totality of `toDateString` handles. `AnalysisPR.createdAt` is
+        // typed `string`, but it is a field of a response body the providers cast rather than
+        // validate — `created_at: null` is a real shape. A bare `.slice` throws a TypeError from
+        // here, which is outside the sync's try: the whole run dies before any provider's cursor
+        // advances, and does it again next run. Revert the `typeof` guard and this test throws.
+        const result = aggregateDailyMetrics(
+            [],
+            [makePR({createdAt: null as unknown as string, mergedAt: null})],
+        );
+        expect([...result.get('alice')!.keys()]).toEqual(['']);
+        expect(result.get('alice')!.get('')!.prs_opened).toBe(1);
+    });
+
+    it('does NOT coerce an array date into a well-formed-looking day', () => {
+        // `String(['2024-01-15T00:00:00Z'])` is a perfectly valid day, so a coercing
+        // `String(x).slice(0, 10)` would let an odd JSON body manufacture a key nobody can
+        // attribute — and the write boundary would accept it. It must stay unattributable.
+        const result = aggregateDailyMetrics(
+            [],
+            [makePR({createdAt: ['2024-01-15T00:00:00Z'] as unknown as string, mergedAt: null})],
+        );
+        expect([...result.get('alice')!.keys()]).toEqual(['']);
+    });
+
+    it('keys a review comment with a non-string date to an empty day too', () => {
+        const comments: AnalysisReviewComment[] = [
+            {authorLogin: 'bob', createdAt: undefined as unknown as string},
+        ];
+        const result = aggregateDailyMetrics([], [], 48, comments);
+        expect([...result.get('bob')!.keys()]).toEqual(['']);
+    });
+});

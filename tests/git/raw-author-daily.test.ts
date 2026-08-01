@@ -15,6 +15,8 @@ import {
     containerRawDailyDates,
     deleteContainerRawDaily,
     RawAuthorDailyError,
+    findRawAuthorDailyDefect,
+    RAW_AUTHOR_DAILY_ERROR_CODES,
     type DailyGitMetrics,
     type RawAuthorDailyInput,
 } from '../../src/connectors/git/raw-author-daily';
@@ -718,5 +720,120 @@ describe('upsertRawAuthorDaily + readers (#252)', () => {
             const rows = readRawDailyForDates(db, ['2026-07-01']);
             expect(rows.map((r) => [r.provider, r.commits])).toEqual([['gitlab', 8]]);
         });
+    });
+});
+
+/**
+ * #302 — the same refusal, asked instead of suffered.
+ *
+ * `upsertRawAuthorDaily` throws INSIDE the git sync's single all-providers write transaction,
+ * so a row it refuses does not cost a row: it rolls back every provider's window and recurs
+ * identically on every run. The sync therefore asks this function first and skips the row. The
+ * property that makes that safe is AGREEMENT — a row this returns `null` for must be one the
+ * throwing form accepts, and vice versa — which is why the two share a body rather than a rule
+ * list, and why the table below drives both forms over the same inputs.
+ */
+describe('findRawAuthorDailyDefect — the non-throwing form of the write boundary (#302)', () => {
+    const OBSERVED = '2026-07-01T10:00:00.000Z';
+
+    /** Every refusal class the validator can reach, with the code it must report. */
+    const REFUSALS: Array<{name: string; row: RawAuthorDailyInput; observedAt: string; code: string}> = [
+        {
+            name: 'an unknown provider',
+            row: input({provider: 'perforce' as never, raw_author_key: 'perforce:login:x'}),
+            observedAt: OBSERVED,
+            code: 'invalid_provider',
+        },
+        {name: 'a blank container', row: input({container: '   '}), observedAt: OBSERVED, code: 'invalid_container'},
+        {name: 'a blank key', row: input({raw_author_key: '  '}), observedAt: OBSERVED, code: 'invalid_key'},
+        {
+            name: 'a key not namespaced by its provider',
+            row: input({raw_author_key: 'gitlab:login:alice'}),
+            observedAt: OBSERVED,
+            code: 'invalid_key',
+        },
+        // The three PR/comment doors #302 exists for: `analyzer.ts` derives the day with a bare
+        // 10-char slice of `pr.createdAt` / `pr.mergedAt` / `comment.createdAt`, so an expanded
+        // ISO year arrives here looking exactly like this.
+        {name: 'an expanded-year day slice', row: input({date: '+033658-0'}), observedAt: OBSERVED, code: 'invalid_date'},
+        {name: 'an unparseable day slice', row: input({date: 'not-a-dat'}), observedAt: OBSERVED, code: 'invalid_date'},
+        // What a NON-STRING `pr.createdAt` becomes: `toDateString` refuses to coerce it, so the
+        // day is empty rather than a value an odd JSON body manufactured.
+        {name: 'an empty day', row: input({date: ''}), observedAt: OBSERVED, code: 'invalid_date'},
+        {name: 'a non-ISO observedAt', row: input(), observedAt: 'not-a-date', code: 'invalid_instant'},
+        // The FOURTH door, and the one no date check catches: `new Date(mergedAt) -
+        // new Date(createdAt)` is NaN whenever either operand is unparseable, on a row whose own
+        // day may be perfectly well-formed.
+        {
+            name: 'a NaN avg_time_to_merge_hours',
+            row: input({avg_time_to_merge_hours: Number.NaN}),
+            observedAt: OBSERVED,
+            code: 'invalid_metric',
+        },
+        {
+            name: 'a negative counter',
+            row: input({commits: -1}),
+            observedAt: OBSERVED,
+            code: 'invalid_metric',
+        },
+        {
+            name: 'a non-finite rate',
+            row: input({code_churn_rate: Number.POSITIVE_INFINITY}),
+            observedAt: OBSERVED,
+            code: 'invalid_metric',
+        },
+    ];
+
+    it('returns null for a row the throwing form accepts', () => {
+        const db = new Database(':memory:');
+        try {
+            runMigrations(db, MIGRATIONS_DIR);
+            expect(findRawAuthorDailyDefect(input(), OBSERVED)).toBeNull();
+            expect(() => upsertRawAuthorDaily(db, input(), OBSERVED)).not.toThrow();
+        } finally {
+            db.close();
+        }
+    });
+
+    for (const refusal of REFUSALS) {
+        it(`reports ${refusal.name} with the SAME code the throwing form raises`, () => {
+            const db = new Database(':memory:');
+            try {
+                runMigrations(db, MIGRATIONS_DIR);
+                const defect = findRawAuthorDailyDefect(refusal.row, refusal.observedAt);
+                expect(defect?.code).toBe(refusal.code);
+
+                let thrownCode: string | undefined;
+                try {
+                    upsertRawAuthorDaily(db, refusal.row, refusal.observedAt);
+                } catch (e) {
+                    expect(e).toBeInstanceOf(RawAuthorDailyError);
+                    thrownCode = (e as RawAuthorDailyError).code;
+                }
+                // Agreement in BOTH directions: the same code, and the throw really happened —
+                // a form that silently accepted this row would leave `thrownCode` undefined.
+                expect(thrownCode).toBe(defect?.code);
+            } finally {
+                db.close();
+            }
+        });
+    }
+
+    it('reports only codes on the runtime allowlist, which is what the advisory renders', () => {
+        // `sync.ts` interpolates the code into an operator-facing line and allowlists it against
+        // this array first. A code the validator can produce but the array omits would render as
+        // `<unrecognized refusal code>` and tell the operator nothing.
+        for (const refusal of REFUSALS) {
+            const defect = findRawAuthorDailyDefect(refusal.row, refusal.observedAt);
+            expect(RAW_AUTHOR_DAILY_ERROR_CODES).toContain(defect!.code);
+        }
+    });
+
+    it('embeds the offending VALUE in the message, which is why the advisory renders the code', () => {
+        // Pinned so the caller warning on `findRawAuthorDailyDefect` stays true: if the message
+        // ever stopped carrying the raw value, `sanitizeRefusalCode` would be protecting nothing
+        // and the line could safely say more. It does carry it, so it must not be pasted through.
+        const defect = findRawAuthorDailyDefect(input({date: '+033658-0'}), OBSERVED);
+        expect(defect!.message).toContain('+033658-0');
     });
 });

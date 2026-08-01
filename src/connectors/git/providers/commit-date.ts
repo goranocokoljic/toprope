@@ -18,13 +18,20 @@
  * here; that is what lets `GitProvider.getCommits` state the rule without an exception list.
  *
  * WHAT THIS DOES NOT CLOSE, said here so the docstring above is not read as more than it is. This
- * module gates the COMMIT AUTHOR DATE. The same rollback is still reachable through the PR and
- * review-comment day keys (`toDateString(pr.createdAt / pr.mergedAt / comment.createdAt)` in
- * `analyzer.ts`, which key a metrics row that reaches the store verbatim) and through the NaN
- * `avg_time_to_merge_hours` those two timestamps compute. No provider gates any of them. Closing
- * that class needs a per-row skip at the WRITE boundary rather than a fifth gate here — total over
- * every date field and every future provider, and a data-integrity decision of #231/#235's weight,
- * so it is tracked separately in #302. Do not read this module as protecting the run outright.
+ * module gates the COMMIT AUTHOR DATE, and nothing else. The PR and review-comment day keys
+ * (`toDateString(pr.createdAt / pr.mergedAt / comment.createdAt)` in `analyzer.ts`) and the NaN
+ * `avg_time_to_merge_hours` those two timestamps compute still reach the store ungated by any
+ * provider. What changed in #302 is what happens NEXT: the rollback they used to cause is gone.
+ * The sync now asks `findRawAuthorDailyDefect` — the same body the store's refusal delegates to —
+ * for every row before writing it, skips the ones the store would refuse, and reports them under
+ * `AUTHOR_DAYS_SKIPPED_PREFIX`. That is total over every field the store validates and over every
+ * future provider, which is why it is a write-boundary skip and not a fourth gate here.
+ *
+ * So the division of labour is: the write boundary keeps ONE bad value from costing the run, and
+ * this module keeps a bad AUTHOR DATE from costing more than the one commit it belongs to — and,
+ * unlike the skip, it can still name that commit's sha (`onDrop`), because down there the row is
+ * keyed by (author, day) and the commits have already been summed into it. Do not read either as
+ * making the other redundant.
  */
 
 import {isUtcDay} from '../../../aggregation/dates.js';
