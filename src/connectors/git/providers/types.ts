@@ -304,6 +304,24 @@ export interface GitFetchProgress {
      * left an operator unable to tell a walk still approaching its window from a hang —
      * the exact symptom #270 exists to remove.
      *
+     * WHAT A DIVERGENCE MEANS (#292). On the commit walk, a `scanned - done` a producer EMITS
+     * is rows this call's window filtered out, plus — for a caller that supplied one — rows it
+     * reported through {@link GitCommitDropListener}. It is not the silent third exit
+     * Bitbucket's pre-#290 Invalid-Date fall-through added (see the gate in `bitbucket.ts`
+     * getCommits), where a forward run's `1200 commits found (1201 scanned)` read identically
+     * to a benign approach while a day was permanently short.
+     *
+     * Read that as narrowly as it is written. It is about EMITTED counts, not rows: a producer
+     * may decline a row on a path it publishes no count for, which is why the emission Bitbucket
+     * skips on its cutoff page is load-bearing rather than incidental, and a producer adding a
+     * further decline path must give it a channel or keep it out of every emitted count. And
+     * "window-filtered" does not promise the row comes back — one excluded on the `until` side
+     * by a date no later run will admit (a future-dated commit) is excluded permanently with
+     * nothing reported. Both exclusions are #304. So an excess reads as "still approaching the
+     * window, or a loss the run states when it completes" — where that report is the BOUNDED
+     * sample {@link GitCommitDropListener} describes, and a run that fails mid-walk discards it
+     * along with the attempt. It is never, on its own, proof that nothing was lost.
+     *
      * Two limits on what a moving count proves, both deliberate and neither fixed here.
      * It advances only BETWEEN requests: `fetchBitbucket`'s rate-limit and 5xx backoff
      * sleeps silently (see `http-retry.ts`), so a 429 on this request-dense walk still

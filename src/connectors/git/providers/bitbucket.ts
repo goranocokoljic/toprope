@@ -243,11 +243,12 @@ export class BitbucketProvider implements GitProvider {
         const collected: RawCommit[] = [];
         // Rows this walk has been HANDED, as opposed to the ones it keeps in `collected`.
         // The INTENDED reason the two differ is the in-memory `until` filter below, and
-        // telling them apart is the whole of #276 — see `GitFetchProgress.scanned`. Since #290
-        // it is not the only reason, but the other one is now REPORTED rather than silent: a row
-        // whose date the pipeline cannot key on is counted here, routed to `onDrop`, and left out
-        // of `collected`. The divergence is therefore window-filtered rows plus reported drops —
-        // still an upper bound on filtered rows, never a silent loss.
+        // telling them apart is the whole of #276. Since #290 it is not the only reason: a row
+        // whose date the pipeline cannot key on is counted here, routed to `onDrop`, and left
+        // out of `collected` — reported, not the silent third exit it used to take. So a
+        // divergence this walk EMITS is window-filtered rows plus, for a caller that supplied
+        // `onDrop`, rows reported there (#292). See `GitFetchProgress.scanned` for what that
+        // does and does not prove — two exclusions it does not make recoverable are #304.
         let scanned = 0;
         let nextUrl: string | null =
             `${BASE_URL}/repositories/${this.workspace}/${repo}/commits?pagelen=100`;
