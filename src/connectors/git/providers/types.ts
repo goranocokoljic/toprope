@@ -304,19 +304,25 @@ export interface GitFetchProgress {
      * left an operator unable to tell a walk still approaching its window from a hang —
      * the exact symptom #270 exists to remove.
      *
-     * WHAT A DIVERGENCE MEANS, now that it means one thing (#292). `scanned - done` is
-     * window-filtered rows plus rows the producer reported through
-     * {@link GitCommitDropListener}, and nothing else — so an excess is either a walk still
-     * approaching its window (benign, and the entire point of this field) or a loss that is
-     * ALREADY stated in `errors[]` / `last_sync_advisories`. It is never, on its own, evidence
-     * that something vanished. That was not true when this field was introduced: Bitbucket's
-     * filter compared a `new Date(row.date)` that an unparseable date made an Invalid Date,
-     * which is `false` against BOTH bounds, so such a row left the walk by a third exit that
-     * recorded nothing. A forward run's `1200 commits found (1201 scanned)` therefore read
-     * identically to the benign case while a day was permanently short. Pinning the day shape
-     * before the window comparison (#290) closed that exit; #292 is where the docs stop hedging
-     * about it. A producer that adds a THIRD way to decline a row must give it a channel too,
-     * or this sentence becomes false again.
+     * WHAT A DIVERGENCE MEANS, now that it means one thing (#292). Every `scanned - done` a
+     * producer EMITS is window-filtered rows plus rows it reported through
+     * {@link GitCommitDropListener} — so an excess is either a walk still approaching its
+     * window (benign, and the entire point of this field) or a loss the run will state in its
+     * report. It is never, on its own, evidence that something vanished unrecorded. That was
+     * not true when this field was introduced: Bitbucket's `until` filter let a row it could
+     * not parse fall through both bounds and out of the walk with nothing reported (the gate in
+     * `bitbucket.ts` getCommits has the mechanism), so a forward run's `1200 commits found
+     * (1201 scanned)` read identically to the benign case while a day was permanently short.
+     *
+     * Read EMITS and WILL STATE strictly; neither is stronger than it sounds. The guarantee is
+     * about published values, not about rows — a producer may decline a row by a path it never
+     * publishes a count for, as Bitbucket's `break paging` does with the tail of its cutoff
+     * page, which is exactly why it skips that page's emission. And the loss is stated when the
+     * run REPORTS, not while it is in flight: a divergence read at minute 4 of a 40-minute walk
+     * has nothing to cross-reference yet, and on the admin path the eventual record is the
+     * BOUNDED sample described on {@link GitCommitDropListener}, not the full list. A producer
+     * that adds a further way to decline a row must either give it a channel or keep it out of
+     * every emitted count, or the first paragraph becomes false again.
      *
      * Two limits on what a moving count proves, both deliberate and neither fixed here.
      * It advances only BETWEEN requests: `fetchBitbucket`'s rate-limit and 5xx backoff

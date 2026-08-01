@@ -245,15 +245,20 @@ export class BitbucketProvider implements GitProvider {
         // The INTENDED reason the two differ is the in-memory `until` filter below, and
         // telling them apart is the whole of #276 — see `GitFetchProgress.scanned`. Since #290
         // it is not the only reason: a row whose date the pipeline cannot key on is counted
-        // here, routed to `onDrop`, and left out of `collected`.
+        // here, routed to `onDrop`, and left out of `collected`. Every divergence this walk
+        // REPORTS is therefore window-filtered rows plus `onDrop`-reported rows, which is why
+        // it no longer hedges that `scanned` is "an upper bound on filtered rows" (#292): that
+        // hedge covered the pre-#290 Invalid-Date fall-through, a third exit that reported
+        // nothing at all.
         //
-        // The divergence is therefore window-filtered rows plus dropped rows, and since #292
-        // that list is EXHAUSTIVE — every row this loop declines to keep leaves by one of those
-        // two exits, and each has its own channel (a later run's window; `onDrop`). No residue
-        // is unaccounted for, which is why this no longer calls itself an upper bound on
-        // filtered rows: that hedge existed only to cover the third, silent exit the pre-#290
-        // Invalid-Date fall-through took. `scanned > done` now always resolves to something the
-        // operator can read somewhere else, never to a commit nothing recorded.
+        // SCOPED TO WHAT IS REPORTED, and not extendable to rows. `break paging` below abandons
+        // the rest of its page unexamined, already counted here — see the whole-page increment
+        // and its note. Those rows leave by neither exit. They stay outside this claim only
+        // because the break also skips that page's emission, so no divergence is ever published
+        // for them; whoever adds a report after the break falsifies this paragraph, not merely
+        // the count. Their exclusion instead rests on the endpoint's ordering agreeing with the
+        // field compared below — an assumption this walk cannot verify, and the reason the
+        // paragraph claims nothing about them either way.
         let scanned = 0;
         let nextUrl: string | null =
             `${BASE_URL}/repositories/${this.workspace}/${repo}/commits?pagelen=100`;
