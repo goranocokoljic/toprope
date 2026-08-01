@@ -15,8 +15,7 @@ import type {
     GitCommitDropListener,
     GitProviderClientOptions,
 } from './types.js';
-import {NO_AUTHOR_DATE_DROP_REASON, UNATTRIBUTABLE_DATE_DROP_REASON} from './types.js';
-import {isUtcDay} from '../../../aggregation/dates.js';
+import {commitDropReason, isAttributableDate} from './commit-date.js';
 import {normalizeContainer} from './container.js';
 import {isCommitCount, loadDiffstats} from './diffstat.js';
 import type {GitRequestPolicy} from './http-retry.js';
@@ -36,47 +35,6 @@ import {
 const BASE_URL = 'https://api.github.com';
 // Pause proactively when remaining requests drops below this threshold
 const RATE_LIMIT_PAUSE_THRESHOLD = 100;
-
-/**
- * Can this author date be attributed to a day by the pipeline downstream (#275)?
- *
- * WHY IT IS PINNED HERE. The day key is derived by a bare `isoDate.slice(0, 10)`
- * (`analyzer.ts`, `churn.ts`), and the write boundary then hard-rejects anything that is not
- * a `YYYY-MM-DD` day — by THROWING, inside the run's single all-providers write transaction,
- * which rolls back every provider's window and re-throws identically on every subsequent run.
- * So an ISO 8601 expanded year (`+033658-09-27T…`, which `git commit --date=@999999999999`
- * produces) has to be caught HERE, where it costs one reported commit, rather than one frame
- * down where it bricks the whole git connector. Same hazard class as #233's expanded-year
- * watermark, and the same fix: pin the shape at the boundary.
- *
- * WHAT IT PINS, exactly — it validates the DAY KEY the pipeline will actually derive, using
- * the same predicate the store validates with (`isUtcDay`, whose regex is byte-identical to
- * `raw-author-daily.ts`'s `UTC_DAY_RE`). That agreement is the point, so this is deliberately
- * NOT stricter than the store:
- *   - `typeof` first, because `.test()` COERCES — an array from an odd JSON body would
- *     stringify into a matching value and sail through.
- *   - `isUtcDay` on the sliced day, so this asks the SAME question the store asks.
- *   - `Date.parse` finite, because the shape check alone accepts `9999-99-99T00:00:00Z`. This
- *     one conjunct IS stricter than the store, on purpose: `analyzer.ts` orders commits by
- *     `new Date(c.date).getTime()`, and a NaN there makes the comparator non-total — the
- *     graduated determinism rule. A day the store accepts is worth nothing if the sort that
- *     reads it is undefined.
- * Calendar validity (`2024-02-30`) and UTC-ness (an `-05:00` offset attributes to the
- * offset-local day) are NOT pinned, because the store accepts both: rejecting them here would
- * DROP commits the store would have stored, trading a small mis-attribution for a real loss.
- * A bare day with no time (`2024-01-15`) is accepted for the same reason — no reader in this
- * pipeline consumes the time component (every one of them is `slice(0, 10)` or a parsed
- * instant), so rejecting it would lose a commit the store would have keyed correctly.
- * Both remaining gaps are pre-existing and shared by all three providers; fixing them belongs
- * at the write boundary, for every provider at once.
- */
-function isAttributableDate(date: string | undefined): boolean {
-    return (
-        typeof date === 'string' &&
-        isUtcDay(date.slice(0, 10)) &&
-        Number.isFinite(Date.parse(date))
-    );
-}
 
 function parseNextLink(header: string | null): string | null {
     if (!header) return null;
@@ -675,25 +633,20 @@ export class GitHubProvider implements GitProvider {
                     // heals). `summary.sha`, the spelling GitHub's own commit list used, so the
                     // operator can look the commit up.
                     //
-                    // The two reasons are distinguished by whether a date was PRESENT at all,
-                    // because the operator's next step differs: absent on both copies means a
-                    // truncated response, while present-but-unusable means a real commit whose
-                    // timestamp this pipeline cannot key on. Critically, the unusable case must
-                    // be caught here and not left to pass — see `isAttributableDate` above, and
-                    // `UTC_DAY_RE` in `raw-author-daily.ts`, for what it does one frame down if
-                    // it escapes.
-                    // `typeof … === 'string' && !== ''`, not `!== undefined`: `date: null` and
-                    // `date: ''` are what a truncated or garbled body actually yields, and
-                    // calling those "present but unattributable" sends the operator looking for
-                    // a real commit with an odd timestamp — the precise opposite of the truth,
-                    // and it inverts the only distinction the two reasons exist to draw.
-                    const hasDate = (d: unknown): boolean => typeof d === 'string' && d !== '';
+                    // Which reason applies is decided by the SHARED classifier (#290), not by a
+                    // local copy of the present-vs-absent test: GitLab and Bitbucket now draw the
+                    // same distinction, and three copies of it would be three chances to invert
+                    // the only thing the two reasons exist to say. BOTH copies of the date are
+                    // handed over, because both were consulted above. Critically, the unusable
+                    // case must be caught here and not left to pass — see `isAttributableDate`
+                    // and `isUtcDay`, whose refusal one frame down is a throw inside the run's
+                    // all-providers write transaction.
                     onDrop?.({
                         sha: summary.sha,
-                        reason:
-                            hasDate(detailCommit?.author?.date) || hasDate(listCommit?.author?.date)
-                                ? UNATTRIBUTABLE_DATE_DROP_REASON
-                                : NO_AUTHOR_DATE_DROP_REASON,
+                        reason: commitDropReason(
+                            detailCommit?.author?.date,
+                            listCommit?.author?.date,
+                        ),
                     });
                     continue;
                 }

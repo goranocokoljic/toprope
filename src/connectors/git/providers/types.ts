@@ -464,24 +464,21 @@ export interface GitProvider {
     // must THROW instead, so the fault reaches the in-run repo retry and then #231's cursor
     // hold.
     //
-    // THREE KNOWN EXCEPTIONS, stated rather than implied — the rule above is not yet true of
-    // every implementation, and a reader must not infer from a clean `errors[]` that no
-    // provider dropped anything:
-    //   - Bitbucket's in-memory `until` filter legitimately removes commits outside the
-    //     requested window; those were never in this call's result set (#276).
-    //   - Bitbucket ALSO drops a commit whose `date` is missing or unparseable, silently: its
-    //     filter compares `new Date(c.date)` and an Invalid Date fails both bounds, so the
-    //     commit falls through and is neither retained nor reported. That is the same defect
-    //     class this listener exists for, not a window filter — it is simply not wired up
-    //     here yet. Only GitHub currently honors the rule in full.
-    //   - GitLab has the mirror gap and it is SHARPER than a silent drop: `gitlab.ts` pushes
-    //     `authored_date` with no shape check at all, so a commit whose date is not a
-    //     `YYYY-MM-DD…` day reaches `raw_author_daily`'s validator, which THROWS — inside the
-    //     run's single all-providers write transaction. One such GitLab commit therefore rolls
-    //     back the windows of every OTHER provider in the run too, identically, on every run.
-    //     GitHub is pinned against this at its own boundary (see `isAttributableDate`); the
-    //     durable fix is a shared pin or a per-row skip at the write boundary, tracked in #290.
-    //     Do not read GitHub's pin as protecting the run.
+    // ALL THREE IMPLEMENTATIONS HONOR THAT IN FULL since #290 — the rule above has no exception
+    // list any more, so a clean `errors[]` really does mean no commit was silently lost. The
+    // specific thing every one of them must gate is the AUTHOR DATE: `raw_author_daily`'s
+    // validator THROWS on a day it cannot key on, inside the run's single all-providers write
+    // transaction, so an unpinned provider does not merely lose its own commit — it rolls back
+    // every OTHER provider's window too, identically, on every subsequent run. The gate is
+    // `isAttributableDate` in `commit-date.ts`, ONE predicate shared by all three (and resting on
+    // the same `isUtcDay` the store validates with), because a per-provider copy is what let the
+    // agreement drift in the first place. A new implementation must call it;
+    // `tests/connectors/git/providers/commit-date-contract.test.ts` is table-driven over
+    // `GIT_PROVIDER_TYPES` and fails for one that does not.
+    //
+    // NOT a drop, and deliberately not reported as one: Bitbucket's in-memory `until` filter
+    // removes commits outside the requested window (#276). Those were never in this call's result
+    // set, so reporting them would drown the real losses in noise.
     //
     // A commit the implementation DOES return but whose LINE COUNTS it could not observe is
     // neither of the above — not a throw (the response is well-formed by the endpoint's own

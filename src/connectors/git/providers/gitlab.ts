@@ -12,8 +12,10 @@ import type {
     GitAuthor,
     GitLabProviderConfig,
     GitFetchProgressListener,
+    GitCommitDropListener,
     GitProviderClientOptions,
 } from './types.js';
+import {commitDropReason, isAttributableDate} from './commit-date.js';
 import {normalizeContainer} from './container.js';
 import {loadDiffstats, resolveCommitDiffstat} from './diffstat.js';
 import type {GitRequestPolicy} from './http-retry.js';
@@ -224,6 +226,7 @@ export class GitLabProvider implements GitProvider {
         since: string,
         until: string,
         onProgress?: GitFetchProgressListener,
+        onDrop?: GitCommitDropListener,
     ): Promise<GitCommit[]> {
         const params = new URLSearchParams({ per_page: String(PER_PAGE) });
         if (since) params.set('since', since);
@@ -248,18 +251,39 @@ export class GitLabProvider implements GitProvider {
             if (hasNextPage) page = parseInt(nextPage!, 10);
         }
 
+        // PIN THE DAY SHAPE HERE (#290), before any per-commit work. Until this gate existed
+        // `authored_date` was pushed through unchecked, so a commit GitLab dates with an ISO
+        // expanded year reached `raw_author_daily`'s validator, which THROWS — inside the run's
+        // single all-providers write transaction, rolling back every OTHER provider's window too,
+        // identically, on every subsequent run. The predicate is the shared one, so this gate and
+        // the store's refusal can never disagree about which days are keyable.
+        //
+        // A drop, not a throw: the response is well-formed and re-fetching yields the identical
+        // unusable date forever, so holding the provider's cursor would brick it rather than heal
+        // it (see {@link GitCommitDrop}). Partitioned BEFORE the diff fan-out rather than skipped
+        // inside it, so a dropped commit costs neither a diffstat lookup nor a diff request — and
+        // so `total` below counts the work actually about to happen and `done` still reaches it.
+        const usable: RawCommit[] = [];
+        for (const c of raw) {
+            if (isAttributableDate(c.authored_date)) {
+                usable.push(c);
+                continue;
+            }
+            onDrop?.({sha: c.id, reason: commitDropReason(c.authored_date)});
+        }
+
         // The per-commit diff fetch is the O(commits) cost of this call — report each
         // one so an observer's counter ticks during it, not only once it returns. It is
         // also the ONLY diff walk a sync makes per commit (the walk is itself paged, so a
         // very wide commit still costs >1 request): `diffs` below hands this exact result
         // to the caller so it does not re-walk the same endpoint (#271).
         const commits: GitCommit[] = [];
-        onProgress?.({done: 0, total: raw.length});
+        onProgress?.({done: 0, total: usable.length});
         // The whole repo's already-known diffs, resolved in ONE batched query rather than a
         // point read per commit (#273). Empty map when no cache was supplied — every probe
         // path (doctor, test-connection) omits it, and behaves exactly as before.
-        const cached = await loadDiffstats(this.diffstatCache, repo, raw.map((c) => c.id));
-        for (const c of raw) {
+        const cached = await loadDiffstats(this.diffstatCache, repo, usable.map((c) => c.id));
+        for (const c of usable) {
             // Cache-or-fetch, including the 404-is-an-answer rule (GitLab 404s the diff of an
             // initial commit) and the write-through, lives in the shared helper — Bitbucket
             // reaches its diffstat the same way and the two must not drift on WHICH faults
@@ -290,7 +314,7 @@ export class GitLabProvider implements GitProvider {
             });
             // Every iteration pushes, so the commit count IS the processed count —
             // no separate counter to keep in step.
-            onProgress?.({done: commits.length, total: raw.length});
+            onProgress?.({done: commits.length, total: usable.length});
         }
 
         return commits;

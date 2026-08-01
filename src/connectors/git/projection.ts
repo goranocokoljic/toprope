@@ -42,10 +42,8 @@ import {
     type DailyGitMetrics,
     type RawAuthorDailyRecord,
 } from './raw-author-daily.js';
+import {isUtcDay} from '../../aggregation/dates.js';
 import type {GitProviderType} from './providers/types.js';
-
-/** Anchored UTC-day shape (YYYY-MM-DD) — the same pin `raw_author_daily` enforces. */
-const UTC_DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 interface DeveloperLookupRow {
     id: string;
@@ -375,10 +373,13 @@ export function projectSnapshots(db: Database.Database, target: ProjectionTarget
 
     const wholeDayRebuild = 'dates' in target;
     // Drop malformed days rather than letting one bad string widen or corrupt the scan;
-    // `raw_author_daily.date` is shape-pinned, so a non-matching day can match nothing.
+    // `raw_author_daily.date` is shape-pinned, so a non-matching day can match nothing. The pin is
+    // `isUtcDay` — the SAME predicate the store validates with, imported rather than restated as a
+    // local regex (#290), so "a non-matching day can match nothing" stays true by construction
+    // instead of by two copies happening to agree.
     const requestedDates = wholeDayRebuild
-        ? target.dates.filter((d) => UTC_DAY_RE.test(d))
-        : target.cells.map((c) => c.date).filter((d) => UTC_DAY_RE.test(d));
+        ? target.dates.filter((d) => isUtcDay(d))
+        : target.cells.map((c) => c.date).filter((d) => isUtcDay(d));
     const dates = [...new Set(requestedDates)].sort();
     if (dates.length === 0) return empty;
 

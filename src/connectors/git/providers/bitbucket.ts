@@ -11,8 +11,10 @@ import type {
     GitAuthor,
     BitbucketProviderConfig,
     GitFetchProgressListener,
+    GitCommitDropListener,
     GitProviderClientOptions,
 } from './types.js';
+import {commitDropReason, isAttributableDate} from './commit-date.js';
 import {normalizeContainer} from './container.js';
 import {loadDiffstats, resolveCommitDiffstat} from './diffstat.js';
 import type {GitRequestPolicy} from './http-retry.js';
@@ -233,6 +235,7 @@ export class BitbucketProvider implements GitProvider {
         since: string,
         until: string,
         onProgress?: GitFetchProgressListener,
+        onDrop?: GitCommitDropListener,
     ): Promise<GitCommit[]> {
         const sinceDate = since ? new Date(since) : null;
         const untilDate = until ? new Date(until) : null;
@@ -240,12 +243,11 @@ export class BitbucketProvider implements GitProvider {
         const collected: RawCommit[] = [];
         // Rows this walk has been HANDED, as opposed to the ones it keeps in `collected`.
         // The INTENDED reason the two differ is the in-memory `until` filter below, and
-        // telling them apart is the whole of #276 — see `GitFetchProgress.scanned`. Note it
-        // is not the only reason: a row whose `date` does not parse yields an Invalid Date
-        // that compares false against BOTH bounds, so it is counted here and silently
-        // dropped from `collected` (a pre-existing gap — that loss is not routed to the
-        // #275 drop reporter). The divergence is therefore an upper bound on filtered rows,
-        // not an exact count of them.
+        // telling them apart is the whole of #276 — see `GitFetchProgress.scanned`. Since #290
+        // it is not the only reason, but the other one is now REPORTED rather than silent: a row
+        // whose date the pipeline cannot key on is counted here, routed to `onDrop`, and left out
+        // of `collected`. The divergence is therefore window-filtered rows plus reported drops —
+        // still an upper bound on filtered rows, never a silent loss.
         let scanned = 0;
         let nextUrl: string | null =
             `${BASE_URL}/repositories/${this.workspace}/${repo}/commits?pagelen=100`;
@@ -265,6 +267,23 @@ export class BitbucketProvider implements GitProvider {
             scanned += page.values.length;
 
             for (const c of page.values) {
+                // PIN THE DAY SHAPE HERE (#290), before the window comparison rather than after
+                // it. Both bounds below compare a `new Date(c.date)`, and an Invalid Date compares
+                // FALSE against each of them — so before this gate an unusable date fell through
+                // the whole filter and vanished from `collected` with nothing reported, which is
+                // the very defect class `onDrop` exists for. Gating first also makes the two
+                // outcomes distinguishable: out-of-window is a filter (the commit is not part of
+                // this call's result set), unattributable is a permanent loss that must be said
+                // out loud.
+                //
+                // `continue`, never `break paging`: the `since` cutoff below relies on the
+                // endpoint's newest-first ORDER, and a row this walk cannot date says nothing
+                // about where in that order it sits. Breaking on it would discard the rest of a
+                // window the run then records as fully covered.
+                if (!isAttributableDate(c.date)) {
+                    onDrop?.({sha: c.hash, reason: commitDropReason(c.date)});
+                    continue;
+                }
                 const commitDate = new Date(c.date);
                 if (sinceDate && commitDate < sinceDate) {
                     break paging;
