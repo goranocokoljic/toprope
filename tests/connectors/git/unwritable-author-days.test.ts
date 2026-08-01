@@ -32,6 +32,7 @@ import {
     LEGACY_CELLS_SKIPPED_PREFIX,
     PR_RECORDS_SKIPPED_PREFIX,
     isAdvisoryError,
+    sanitizeAdvisoryLabel,
     isPermanentLossAdvisory,
     rankAdvisories,
     syncStateKey,
@@ -101,7 +102,9 @@ interface GitHubPRFields {
     login?: string;
     /** `unknown`, because the point of several cases below is a body whose field is NOT a string. */
     created_at: unknown;
-    merged_at: string | null;
+    merged_at: unknown;
+    /** Same reason: an omitted `state` arrives `undefined` through GitHub's cast. */
+    state?: unknown;
 }
 
 /**
@@ -123,7 +126,7 @@ function githubPRRoutes(pr: GitHubPRFields): Route[] {
                     number: 1,
                     title: 'feat: work',
                     user: {login: pr.login ?? 'alice-gh'},
-                    state: 'closed',
+                    state: 'state' in pr ? pr.state : 'closed',
                     created_at: pr.created_at,
                     merged_at: pr.merged_at,
                     closed_at: pr.merged_at,
@@ -356,7 +359,7 @@ describe('#302 an unwritable author-day costs that row, not the run', () => {
             const prLine = prLineOf(result.errors);
             expect(prLine).toContain('[github/test-org]');
             expect(prLine).toContain('1 PR(s)');
-            expect(prLine).toContain('refused as missing_created_at');
+            expect(prLine).toContain('refused as unstorable_created_at');
             expect(prLine).toContain('repo1#1');
             expect(countRows(db, 'pr_records')).toBe(0);
         });
@@ -586,6 +589,87 @@ describe('#302 an unwritable author-day costs that row, not the run', () => {
             } finally {
                 store.close();
             }
+        });
+    });
+
+    describe('the OTHER write in the transaction (pr_records)', () => {
+        /**
+         * Every non-`missing_created_at` arm of `findPRRecordDefect`, driven end to end.
+         *
+         * Each is a `NOT NULL` column (or a nullable one whose non-string value `toUtcIso` passes
+         * through untouched to the bind) filled from a field GitHub CASTS rather than validates.
+         * Before cycle 1's fix each threw out of `insertMany` and rolled back every provider's
+         * window; the existing date fixtures could not reach them, because they only ever use a
+         * string or `null` — precisely the input class the old and new forms agree on.
+         */
+        const PR_BIND_FAULTS: Array<{name: string; pr: GitHubPRFields; code: string}> = [
+            {
+                name: 'an object merged_at',
+                pr: {created_at: PR_CREATED, merged_at: {}},
+                code: 'unstorable_merged_at',
+            },
+            {
+                name: 'an omitted state',
+                pr: {created_at: PR_CREATED, merged_at: null, state: undefined},
+                code: 'unstorable_state',
+            },
+        ];
+
+        for (const fault of PR_BIND_FAULTS) {
+            it(`skips the PR for ${fault.name}, leaving GitLab's window committed`, async () => {
+                seedAlice(db);
+                vi.stubGlobal(
+                    'fetch',
+                    makeCountingFetch([...githubPRRoutes(fault.pr), ...gitlabRoutes()]).fetchMock,
+                );
+
+                const result = await runSync(db, [GITHUB_CONFIG, GITLAB_CONFIG]);
+
+                expect(result.errors.some((e) => /transaction rolled back/.test(e))).toBe(false);
+                expect(rowsFor(db, 'gitlab')[0].commits).toBe(3);
+                expect(cursorOf(db, GITLAB_CURSOR)).toBeDefined();
+                expect(countRows(db, 'pr_records')).toBe(0);
+                expect(prLineOf(result.errors)).toContain(`refused as ${fault.code}`);
+                expect(prLineOf(result.errors)).toContain('repo1#1');
+            });
+        }
+
+        it('strips the invisible reordering characters a newline check does not catch', () => {
+            // The input class ONLY the widened character class handles. U+202E (RLO) visually
+            // reverses everything after it — an author login carrying one can make the refusal
+            // code render as something else entirely — and U+2028 is a LINE TERMINATOR to several
+            // renderers, so a C0-only strip leaves "this advisory is exactly one entry" half
+            // true. Neither is a control character in the C0/DEL sense, so the `\n` fixture above
+            // passes with or without them.
+            expect(sanitizeAdvisoryLabel('alice\u202Egnp.exe')).toBe('alice?gnp.exe');
+            expect(sanitizeAdvisoryLabel('alice\u2028forged')).toBe('alice?forged');
+            expect(sanitizeAdvisoryLabel('alice\u200Bbob')).toBe('alice?bob');
+            // …while a legitimate non-ASCII name is left intact, which is why this is a strip
+            // and not an allowlist.
+            expect(sanitizeAdvisoryLabel('Ana María 田中')).toBe('Ana María 田中');
+        });
+
+        it('truncates by CODE POINT, so an astral character is never cut in half', () => {
+            // The input class only the code-point cut handles: 59 ASCII characters then an
+            // astral pair straddling the 60-unit boundary. A UTF-16 `slice` keeps the high
+            // surrogate alone, which is an unpaired surrogate in a string this pipeline
+            // JSON-stringifies into a TEXT column.
+            const label = `${'a'.repeat(59)}👍tail`;
+            const cut = sanitizeAdvisoryLabel(label);
+            expect(cut).toBe(`${'a'.repeat(59)}👍…`);
+            expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(cut)).toBe(false);
+            // The cap is what is pinned, not an arbitrary ceiling: 60 code points plus the mark.
+            expect([...cut]).toHaveLength(61);
+        });
+
+        it('renders a non-string repo/prId as <non-string> instead of throwing on it', async () => {
+            // `SkippedPRRecord.repo`/`prId` are `unknown` precisely because the refusal may be
+            // that they are NOT strings, and the advisory still has to render. Unit-level: no
+            // provider produces a non-string repo name today, so driving it through a run would
+            // be pinning a fixture rather than the branch.
+            expect(sanitizeAdvisoryLabel(undefined)).toBe('<non-string>');
+            expect(sanitizeAdvisoryLabel(42)).toBe('<non-string>');
+            expect(sanitizeAdvisoryLabel(null)).toBe('<non-string>');
         });
     });
 

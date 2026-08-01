@@ -3,12 +3,20 @@
  *
  * WHY IT IS PINNED AT THE PROVIDER BOUNDARY. The day key is derived by a bare
  * `isoDate.slice(0, 10)` (`analyzer.ts`, `churn.ts`), and the write boundary then hard-rejects
- * anything that is not a `YYYY-MM-DD` day — by THROWING, inside the run's single all-providers
- * write transaction, which rolls back every provider's window and re-throws identically on every
- * subsequent run. So an ISO 8601 expanded year (`+033658-09-27T…`, which
- * `git commit --date=@999999999999` produces) has to be caught HERE, where it costs one reported
- * commit, rather than one frame down where it bricks the whole git connector. Same hazard class as
- * #233's expanded-year watermark, and the same fix: pin the shape at the boundary.
+ * anything that is not a `YYYY-MM-DD` day. Until #302 that rejection was a THROW inside the run's
+ * single all-providers write transaction, which rolled back every provider's window and re-threw
+ * identically on every subsequent run — so an ISO 8601 expanded year (`+033658-09-27T…`, which
+ * `git commit --date=@999999999999` produces) had to be caught HERE or it bricked the whole git
+ * connector one frame down. Same hazard class as #233's expanded-year watermark, and the same
+ * fix: pin the shape at the boundary.
+ *
+ * #302 REMOVED THAT TAIL BUT NOT THIS GATE'S JOB. The sync now asks the same validator before
+ * writing and skips the row, so an ungated date costs its author-day rather than the run. What
+ * it cannot do is NAME the commit: down there the row is keyed by (author, day) and the shas
+ * were folded into its counters before the store saw it, so the loss is reported as "this author,
+ * this unusable day" and nothing more. Catching it here still costs exactly one commit AND puts
+ * its sha on `onDrop`, which is the difference between an operator who can look the commit up and
+ * one who cannot.
  *
  * WHY IT IS ONE MODULE rather than a copy per provider (#290). #275 pinned only GitHub, and
  * documented the agreement between its gate and the store's `UTC_DAY_RE` in a COMMENT — which

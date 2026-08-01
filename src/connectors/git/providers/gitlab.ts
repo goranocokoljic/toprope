@@ -253,10 +253,13 @@ export class GitLabProvider implements GitProvider {
 
         // PIN THE DAY SHAPE HERE (#290), before any per-commit work. Until this gate existed
         // `authored_date` was pushed through unchecked, so a commit GitLab dates with an ISO
-        // expanded year reached `raw_author_daily`'s validator, which THROWS — inside the run's
-        // single all-providers write transaction, rolling back every OTHER provider's window too,
-        // identically, on every subsequent run. The predicate is the shared one, so this gate and
-        // the store's refusal can never disagree about which days are keyable.
+        // expanded year reached `raw_author_daily`'s validator, which then THREW — inside the
+        // run's single all-providers write transaction, rolling back every OTHER provider's
+        // window too, identically, on every subsequent run. Since #302 the sync asks that
+        // validator first and SKIPS the row, so the rollback is gone; the commit is still lost,
+        // and the skip can name only the author-day, never this sha. The predicate is the shared
+        // one, so this gate and the store's refusal can never disagree about which days are
+        // keyable.
         //
         // A drop, not a throw: the response is well-formed and re-fetching yields the identical
         // unusable date forever, so holding the provider's cursor would brick it rather than heal

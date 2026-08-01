@@ -39,6 +39,13 @@ const COMMIT_BURST_MIN_COUNT = 3;
  * nobody can attribute — the same coercion hazard `isAttributableDate` puts its `typeof` first
  * for. `''` cannot be produced that way, and the one string that does produce it (`createdAt:
  * ''`) is unattributable for the same reason, so folding them together loses no distinction.
+ *
+ * SCOPED TO THE PR AND REVIEW-COMMENT DATES, which is the half nothing else gates. A COMMIT date
+ * reaching this function has already passed `isAttributableDate` at its provider, and it had
+ * better have: `calculateDailyChurnRates` (`churn.ts`) still slices `commit.date` bare, and it
+ * runs BEFORE this function is ever asked about a commit — so totality here does not make
+ * `aggregateDailyMetrics` total over a non-string commit date. The provider gate is what covers
+ * that path; do not read this as covering it.
  */
 function toDateString(isoDate: unknown): string {
     return typeof isoDate === 'string' ? isoDate.slice(0, 10) : '';

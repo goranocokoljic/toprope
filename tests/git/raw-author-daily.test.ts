@@ -17,6 +17,7 @@ import {
     RawAuthorDailyError,
     findRawAuthorDailyDefect,
     RAW_AUTHOR_DAILY_ERROR_CODES,
+    ROW_LEVEL_REFUSALS,
     type DailyGitMetrics,
     type RawAuthorDailyInput,
 } from '../../src/connectors/git/raw-author-daily';
@@ -835,5 +836,116 @@ describe('findRawAuthorDailyDefect — the non-throwing form of the write bounda
         // and the line could safely say more. It does carry it, so it must not be pasted through.
         const defect = findRawAuthorDailyDefect(input({date: '+033658-0'}), OBSERVED);
         expect(defect!.message).toContain('+033658-0');
+    });
+});
+
+/**
+ * #302 — which refusals the git sync may SKIP, and which must still roll the run back.
+ *
+ * The sync asks `findRawAuthorDailyDefect` before every write and skips a row-level refusal
+ * rather than letting it throw inside the run's single all-providers write transaction. That is
+ * only safe for a refusal decided by a value THIS ROW carries: a defect in a run- or
+ * provider-level operand refuses every row, so skipping it would discard the entire window
+ * fail-open with the cursor advanced and the run reported clean — the exact inversion of the
+ * fail-closed behaviour `providers/config.ts` relies on.
+ *
+ * Asserted here rather than end to end because that is where the distinction is decidable. The
+ * complement direction IS driven through a real two-provider run
+ * (`tests/connectors/git/unwritable-author-days.test.ts`, the corrupted-clock case, which pins
+ * that a run-level `invalid_instant` rolls back and holds BOTH cursors) and `invalid_date` is
+ * driven end to end several times over. `invalid_metric` has no end-to-end route left: every
+ * NaN that could reach a metric is closed upstream — the analyzer's `prMergeDurationHours` for
+ * the merge duration, and the shared `isCommitCount` predicate at each provider for the commit
+ * counts. Its membership is defence-in-depth for a route that does not currently exist, which
+ * is exactly why it needs pinning HERE: nothing else would notice it being dropped.
+ */
+describe('ROW_LEVEL_REFUSALS — what the sync may skip (#302)', () => {
+    it('holds exactly the two refusals a single row can be solely responsible for', () => {
+        expect([...ROW_LEVEL_REFUSALS].sort()).toEqual([
+            'invalid_date',
+            'invalid_identity',
+            'invalid_metric',
+        ]);
+    });
+
+    it('excludes every refusal decided by a run- or provider-level operand', () => {
+        // Named individually rather than by set-difference, so ADDING a code to
+        // RAW_AUTHOR_DAILY_ERROR_CODES cannot quietly satisfy this assertion.
+        for (const runLevel of ['invalid_instant', 'invalid_provider', 'invalid_container', 'invalid_key'] as const) {
+            expect(ROW_LEVEL_REFUSALS).not.toContain(runLevel);
+        }
+    });
+
+    it('classifies every code the validator can produce, one way or the other', () => {
+        // The gap this closes: a NEW refusal code lands in neither list, is therefore not
+        // row-level, and silently becomes fail-closed — which may be right, but must be a
+        // decision rather than an omission. This fails until someone makes it.
+        const runLevel = ['invalid_instant', 'invalid_provider', 'invalid_container', 'invalid_key'];
+        for (const code of RAW_AUTHOR_DAILY_ERROR_CODES) {
+            expect(ROW_LEVEL_REFUSALS.includes(code) || runLevel.includes(code)).toBe(true);
+        }
+    });
+
+    it('checks the run-level operand FIRST, so the split cannot depend on the row mix', () => {
+        // `findRawAuthorDailyDefect` returns the FIRST defect. With `observedAt` checked after
+        // the date, a run whose clock is corrupt AND whose every row also carries a bad date
+        // reported `invalid_date` for all of them — so every row was skipped, nothing reached
+        // the throw, and the run-level fault advanced the cursor and reported `ok`.
+        const bothWrong = findRawAuthorDailyDefect(input({date: 'not-a-day'}), 'not-an-instant');
+        expect(bothWrong?.code).toBe('invalid_instant');
+        expect(ROW_LEVEL_REFUSALS).not.toContain(bothWrong!.code);
+    });
+});
+
+/**
+ * #302 review cycle 2 (SEC-1) — the identity columns are part of the row the validator covers.
+ *
+ * `upsertRawAuthorDaily` DEREFERENCES all three inside the shared write transaction (`bestKnown`
+ * and `normalizeEmail` both do `(x ?? '').trim()`), so a non-string, non-null value is a
+ * `TypeError` thrown from inside it — the same permanent stall as an unusable date, reached by a
+ * different field of the same body. `analysis-types.ts` builds `authorName` with `||`, which
+ * only filters falsy, so `{}` / `[]` / `42` survive from a cast response body.
+ */
+describe('findRawAuthorDailyDefect covers the identity columns (#302)', () => {
+    const OBSERVED = '2026-07-01T10:00:00.000Z';
+    const FIELDS = ['author_login', 'author_email', 'author_display_name'] as const;
+
+    for (const field of FIELDS) {
+        it(`refuses a non-string ${field}, which the upsert would have .trim()ed`, () => {
+            const db = new Database(':memory:');
+            try {
+                runMigrations(db, MIGRATIONS_DIR);
+                const row = input({[field]: {} as never});
+                expect(findRawAuthorDailyDefect(row, OBSERVED)?.code).toBe('invalid_identity');
+                // The input class only this guard handles: without it the throw below is a
+                // TypeError from inside the transaction, not a typed refusal.
+                expect(() => upsertRawAuthorDaily(db, row, OBSERVED)).toThrow();
+            } finally {
+                db.close();
+            }
+        });
+
+        it(`still accepts a null ${field}, which is the normal shape for a PR-only author`, () => {
+            const db = new Database(':memory:');
+            try {
+                runMigrations(db, MIGRATIONS_DIR);
+                const row = input({[field]: null});
+                expect(findRawAuthorDailyDefect(row, OBSERVED)).toBeNull();
+                expect(() => upsertRawAuthorDaily(db, row, OBSERVED)).not.toThrow();
+            } finally {
+                db.close();
+            }
+        });
+    }
+
+    it('is ROW-level, so one odd display name costs its author-day and not the run', () => {
+        // Its own code rather than `invalid_key`, and that is the whole point: `invalid_key` is
+        // decided partly by `provider` (the namespacing rule), so it refuses every row of a
+        // provider at once and is fail-closed. Folding the identity check into it would have made
+        // a single odd display name roll back every provider's window.
+        const found = findRawAuthorDailyDefect(input({author_display_name: 42 as never}), OBSERVED);
+        expect(found?.code).toBe('invalid_identity');
+        expect(ROW_LEVEL_REFUSALS).toContain('invalid_identity');
+        expect(ROW_LEVEL_REFUSALS).not.toContain('invalid_key');
     });
 });

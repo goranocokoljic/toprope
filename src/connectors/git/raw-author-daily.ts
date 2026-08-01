@@ -80,6 +80,7 @@ export const RAW_AUTHOR_DAILY_ERROR_CODES = [
     'invalid_provider',
     'invalid_container',
     'invalid_key',
+    'invalid_identity',
     'invalid_date',
     'invalid_instant',
     'invalid_metric',
@@ -386,6 +387,14 @@ const COUNTER_FIELDS: readonly (keyof DailyGitMetrics)[] = [
     'prs_opened', 'prs_merged', 'review_comments_given', 'commit_burst_count',
 ];
 
+/**
+ * The nullable identity columns. Every one is dereferenced with `.trim()` by the upsert, inside
+ * the run's shared write transaction — see the check for why that makes them validator business.
+ */
+const IDENTITY_FIELDS: readonly (keyof RawAuthorIdentity)[] = [
+    'author_login', 'author_email', 'author_display_name',
+];
+
 /** Rate/score fields: any finite real, but never NaN/Infinity. */
 const RATE_FIELDS: readonly (keyof DailyGitMetrics)[] = [
     'code_churn_rate', 'ai_signature_score', 'avg_commit_size',
@@ -395,20 +404,28 @@ const RATE_FIELDS: readonly (keyof DailyGitMetrics)[] = [
  * The refusals that are a property of the ROW, as opposed to of the run or the provider (#302).
  *
  * The distinction decides whether a caller may SKIP the row or must let the refusal throw.
- * `invalid_date` and `invalid_metric` are the only two evaluated against a value the row alone
- * carries — a day key derived from that PR's timestamp, a metric computed from that author's
- * activity. Re-fetching returns the identical unusable value, so holding the cursor for them
- * would brick the provider without saving anything, and skipping is the lesser loss.
+ * These three are the ones evaluated against a value the row ALONE carries — a day key derived
+ * from that PR's timestamp, an identity column off that author's own commit, a metric computed
+ * from that author's activity. Re-fetching returns the identical unusable value, so holding the
+ * cursor for them would brick the provider without saving anything, and skipping is the lesser
+ * loss.
  *
- * The other four are evaluated against operands that are CONSTANT for a whole run
- * (`observedAt`) or a whole provider (`provider`, `container`, and the namespacing half of
- * `raw_author_key`). A defect in one of those refuses EVERY row, so skipping would discard the
- * entire window fail-open with the cursor advanced and the run reported clean — the exact
- * inversion of the fail-closed behaviour that made a config typo loud. Those must still throw,
- * roll the transaction back and hold the cursor: unlike a bad date, they describe something an
- * operator can fix, after which the window re-covers intact.
+ * The others are evaluated against operands that are CONSTANT for a whole run (`observedAt`) or
+ * a whole provider (`provider`, `container`, and the namespacing half of `raw_author_key`). A
+ * defect in one of those refuses EVERY row, so skipping would discard the entire window
+ * fail-open with the cursor advanced and the run reported clean — the exact inversion of the
+ * fail-closed behaviour that made a config typo loud. Those must still throw, roll the
+ * transaction back and hold the cursor: unlike a bad date, they describe something an operator
+ * can fix, after which the window re-covers intact.
+ *
+ * `tests/git/raw-author-daily.test.ts` fails if any code in {@link RAW_AUTHOR_DAILY_ERROR_CODES}
+ * appears in neither class, so a new refusal cannot become fail-closed by omission.
  */
-export const ROW_LEVEL_REFUSALS: readonly RawAuthorDailyErrorCode[] = ['invalid_date', 'invalid_metric'];
+export const ROW_LEVEL_REFUSALS: readonly RawAuthorDailyErrorCode[] = [
+    'invalid_date',
+    'invalid_identity',
+    'invalid_metric',
+];
 
 /** What is wrong with a row this store will not accept. See {@link findRawAuthorDailyDefect}. */
 export interface RawAuthorDailyDefect {
@@ -454,6 +471,19 @@ export function findRawAuthorDailyDefect(
     row: RawAuthorDailyInput,
     observedAt: string,
 ): RawAuthorDailyDefect | null {
+    // RUN- AND PROVIDER-LEVEL RULES FIRST, before any row-level one (#302 review cycle 2, SEC-3).
+    //
+    // This returns the FIRST defect, and the sync skips a row-level refusal but lets a
+    // run/provider-level one throw. Order therefore decides which of the two a row that violates
+    // BOTH is reported as — and with `observedAt` checked after `date`, a run whose clock is
+    // corrupt AND whose every row also carries a bad date returned `invalid_date` for all of
+    // them, so every row was skipped, nothing ever reached the throw, and the run-level defect
+    // the split exists to make loud advanced the cursor and reported `ok`. Evaluating the
+    // run-level rules first makes the split a property of the RULES rather than of which rows
+    // happened to be in the batch.
+    if (!UTC_ISO_INSTANT_RE.test(observedAt)) {
+        return defect('invalid_instant', `observedAt must be a UTC ISO instant, got: ${observedAt}`);
+    }
     if (!RAW_AUTHOR_PROVIDERS.includes(row.provider)) {
         return defect('invalid_provider', `Unknown git provider: ${String(row.provider)}`);
     }
@@ -488,8 +518,36 @@ export function findRawAuthorDailyDefect(
     if (!isUtcDay(row.date)) {
         return defect('invalid_date', `date must be a UTC YYYY-MM-DD day, got: ${String(row.date)}`);
     }
-    if (!UTC_ISO_INSTANT_RE.test(observedAt)) {
-        return defect('invalid_instant', `observedAt must be a UTC ISO instant, got: ${observedAt}`);
+    // THE IDENTITY COLUMNS, which this validator did not cover until #302 review cycle 2 (SEC-1).
+    //
+    // They are the third unvalidated bind in the SAME row the date rules above were made total
+    // for, and they are worse than a bind: `upsertRawAuthorDaily` DEREFERENCES all three inside
+    // the shared write transaction — `bestKnown` and `normalizeEmail` both do `(x ?? '').trim()`
+    // — so a non-string, non-null value is a `TypeError` thrown from inside `insertMany`, which
+    // is the exact permanent-stall geometry this issue exists to close, reached by a different
+    // field of the same body.
+    //
+    // Reachable, not theoretical: `analysis-types.ts` builds `authorName` with `||`, which only
+    // filters falsy, so `{}` / `[]` / `42` survive from a cast response body. And
+    // `author_display_name` is the sharpest of the three because nothing touches it before the
+    // bind — `rawAuthorKeyFor` would already have thrown on a non-string login (earlier, and
+    // OUTSIDE the transaction, where it costs one provider rather than the run), and it only
+    // reads the email when the login is blank.
+    //
+    // ITS OWN CODE, not `invalid_key`, even though both are about identity. `invalid_key` is
+    // decided partly by `provider` — the namespacing rule — so it is refused for every row of a
+    // provider at once and is therefore NOT row-level. This one is: the value comes from one
+    // author's own commit, and re-fetching returns the identical body. Folding it into
+    // `invalid_key` would have made a single odd display name roll back every provider's window,
+    // which is the failure this whole issue exists to close.
+    for (const field of IDENTITY_FIELDS) {
+        const value = row[field];
+        if (value !== null && typeof value !== 'string') {
+            return defect(
+                'invalid_identity',
+                `${field} must be a string or null, got: ${typeof value}`,
+            );
+        }
     }
     // Range-validate the metrics here rather than letting the schema CHECKs surface a raw
     // SQLITE_CONSTRAINT — and because NaN binds as NULL into a NOT NULL column, which

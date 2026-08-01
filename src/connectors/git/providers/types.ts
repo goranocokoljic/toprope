@@ -501,10 +501,14 @@ export interface GitProvider {
     // skips it and `retentionKeyFor` returns null for it (`sync.ts`), both with nothing in
     // `errors[]` and the cursor advancing — so a clean `errors[]` does NOT by itself prove the
     // window is fully retained. The specific thing every one of them must gate is the AUTHOR
-    // DATE: `raw_author_daily`'s
-    // validator THROWS on a day it cannot key on, inside the run's single all-providers write
-    // transaction, so an unpinned provider does not merely lose its own commit — it rolls back
-    // every OTHER provider's window too, identically, on every subsequent run. The gate is
+    // DATE: `raw_author_daily`'s validator refuses a day it cannot key on. Until #302 that
+    // refusal was a THROW inside the run's single all-providers write transaction, so an
+    // unpinned provider did not merely lose its own commit — it rolled back every OTHER
+    // provider's window too, identically, on every subsequent run. The sync now asks the same
+    // validator up front and SKIPS the row instead, so that tail is gone; what an ungated date
+    // still costs is the commit, silently as far as this seam is concerned — the skip can name
+    // only the author-day, never the sha. Gating here is what keeps the sha nameable, and it is
+    // why the rule below is unchanged by #302. The gate is
     // `isAttributableDate` in `commit-date.ts`, ONE predicate shared by all three (and resting on
     // the same `isUtcDay` the store validates with), because a per-provider copy is what let the
     // agreement drift in the first place. A new implementation must call it;
