@@ -14,6 +14,7 @@ import type {
     GitCommitDropListener,
     GitProviderClientOptions,
 } from './types.js';
+import {FUTURE_AUTHOR_DATE_DROP_REASON} from './types.js';
 import {commitDropReason, isAttributableDate} from './commit-date.js';
 import {normalizeContainer} from './container.js';
 import {loadDiffstats, resolveCommitDiffstat} from './diffstat.js';
@@ -28,6 +29,76 @@ function parseRawAuthor(raw: string): {name: string; email: string} {
         return {name: match[1].trim(), email: match[2].trim()};
     }
     return {name: raw.trim(), email: ''};
+}
+
+/**
+ * One end of the in-memory commit window, or `null` when the caller passed none (#304).
+ *
+ * TOTAL over what it is handed, which is the point of it existing at all. Both bounds are
+ * compared against a `Date` in the walk below, and an Invalid Date compares FALSE against every
+ * operator — so a `until` this function did not refuse would make `commitDate <= untilDate`
+ * false for EVERY row and silently exclude the whole window, while `scanned` climbed and the run
+ * reported success. That is the exact silent-exclusion class #304 exists to remove, one level up
+ * from the rows it is about, and it is the graduated "make each bound total; reject an
+ * unparseable operand explicitly rather than letting NaN compare false" rule (#233).
+ *
+ * BOTH HALVES OF THAT RULE, because the NaN half alone would not have caught the value #233 was
+ * actually about. An ISO 8601 expanded year (`+010000-01-01T00:00:00.000Z`, what
+ * `git commit --date=@999999999999` and a mis-copied watermark produce) parses to a perfectly
+ * finite instant, so it sails through a `Number.isNaN` test — and as a `since` it is in the
+ * FUTURE, which makes the walk's very first row trip the cutoff, `collected` come back empty,
+ * the run report success, and the cursor advance over the whole untouched window. That is a
+ * worse outcome than the NaN case, produced by a value the parseability check waves through, so
+ * the shape is pinned as well: an ordinary year is four digits, and `toISOString()` renders
+ * anything else with a leading `+`/`-` sign. The pin is on the ROUND-TRIPPED year, not on how
+ * the input was spelled — this is a bound check, not an input-format contract, so a value like
+ * `Jan 1 2024` that `Date` accepts is fine here (it compares correctly, which is all the walk
+ * needs). The ORDERING of the two parsed bounds is checked by the caller, because it is a
+ * property of the pair rather than of either value.
+ *
+ * A BLANK value is "no bound", not a refusal, and that is load-bearing rather than lenient:
+ * `sync.ts` passes `since: ''` for a first sync with no configured window, meaning walk
+ * everything. Removing the early return would refuse every first sync.
+ *
+ * FAIL-CLOSED by throwing rather than by falling back to "no bound": the caller (`sync.ts`)
+ * treats a throw out of `getCommits` as an un-covered window — it records the failure and HOLDS
+ * the provider's cursor (#231), so the window is re-fetched once the bad value is fixed.
+ * Substituting `null` would do the opposite: walk the repo's entire history, record it as the
+ * requested window, and advance the cursor over data nobody asked for.
+ *
+ * The offending VALUE is deliberately not interpolated into the message, but the STATE KEYS that
+ * hold it are. The message reaches an operator terminal and `sync_logs.errors` through the
+ * caller's `Failed to fetch commits:` line, and it is the only signal they get for a fault that
+ * repeats identically forever — so it has to point somewhere. `git_last_sync`/`git_earliest_sync`
+ * are the two `sync_state` rows these bounds are read from; naming them leaks nothing (that is
+ * the whole reason the value itself is withheld) and is the difference between an unexplained
+ * brick and a two-minute repair.
+ *
+ * SCOPE, said out loud so the next reader does not over-read it: this guards THIS walk's two
+ * bounds and nothing else. `getPullRequests` below, and both bounds on `github.ts`/`gitlab.ts`
+ * (which push them to the server rather than comparing in memory), still take the values
+ * unchecked. Those are a different failure mode — an over-fetch, or a provider 4xx that already
+ * fails closed — and closing them belongs where the two strings are DERIVED, one layer up in
+ * `fetchProviderData`; that hoist is #309. Nor is this a fourth spelling that should have
+ * delegated today: `isUtcIsoInstant`
+ * (`sync.ts`) and `UTC_ISO_INSTANT_RE` (`raw-author-daily.ts`) are both module-private and both
+ * pin `.SSSZ` (with `isUtcIsoInstant` adding a `toISOString()` round-trip on top), which alone
+ * would refuse bound forms this walk accepts and the tests pass — and importing from `sync.ts`
+ * here would invert the layering. If a fourth site appears, extract one shared predicate rather
+ * than adding to the census.
+ */
+function parseCommitBound(value: string, label: 'since' | 'until'): Date | null {
+    if (!value) return null;
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime()) || !/^\d{4}-/.test(parsed.toISOString())) {
+        throw new Error(
+            `Bitbucket commit window bound "${label}" is not a plain four-digit-year UTC ` +
+                'instant — refusing to walk the repository with a bound whose comparisons ' +
+                'would silently exclude every row. Check the git_last_sync / git_earliest_sync ' +
+                'sync_state rows for this provider.',
+        );
+    }
+    return parsed;
 }
 
 function globMatch(pattern: string, str: string): boolean {
@@ -237,8 +308,48 @@ export class BitbucketProvider implements GitProvider {
         onProgress?: GitFetchProgressListener,
         onDrop?: GitCommitDropListener,
     ): Promise<GitCommit[]> {
-        const sinceDate = since ? new Date(since) : null;
-        const untilDate = until ? new Date(until) : null;
+        const sinceDate = parseCommitBound(since, 'since');
+        const untilDate = parseCommitBound(until, 'until');
+        // AN INVERTED WINDOW IS THE SAME DEFECT AS AN UNPARSEABLE BOUND, and the reachable one
+        // (#304 review cycle 2). Each bound above can be individually perfect while the PAIR is
+        // impossible, and `catchUpUntil` in `sync.ts` says in its own docstring that a `since`
+        // at or after `now` — a host clock that jumped, a hand-edited cursor — is a state it
+        // expects; its remedy clamps `until` to `now`, which MANUFACTURES `since > until`. The
+        // walk would then set `reachedCutoff` on the very first row, break before any listing
+        // tick is emitted, return an empty list as a success, and let the run record the window
+        // as covered — so the span between the last honest sync and now is skipped with no drop,
+        // no error and no divergence to read. Refuse instead: the caller holds the cursor (#231)
+        // and the operator sees which state key to repair. Only when BOTH bounds exist — a blank
+        // one is "no bound", which cannot be inverted.
+        if (sinceDate && untilDate && sinceDate.getTime() > untilDate.getTime()) {
+            // WHAT THE MESSAGE MAY AND MAY NOT SAY. The likeliest cause is a host clock that ran
+            // ahead when the cursor was stamped and has since been corrected, so the first thing
+            // it names is the clock — an operator told only "check git_last_sync" concludes the
+            // cursor is too new and lowers it, and re-importing an already-covered span is the
+            // permanent double-count #262 documents (`mergeDailyAcrossRuns` ADDS commit metrics
+            // on a premise of disjoint windows and `upsertRawAuthorDaily` has no dedup guard).
+            // So the line says explicitly what must NOT be done. It also states the blast radius,
+            // because this refusal stalls EVERY repo of the provider until the value is corrected
+            // — better than the silent alternative it replaces, but not something to discover.
+            throw new Error(
+                'Bitbucket commit window is inverted ("since" is after "until") — refusing to ' +
+                    'walk the repository with a window no commit can satisfy, which would ' +
+                    'record an untouched span as covered. Every repo of this provider is ' +
+                    'stalled until it is corrected. Usual cause: the host clock ran ahead when ' +
+                    'the git_last_sync sync_state row was stamped. Do NOT move that cursor ' +
+                    'BACKWARD by hand — re-importing an already-covered span permanently ' +
+                    'doubles its commit metrics; correct the clock and let the cursor stand.',
+            );
+        }
+        // READ ONCE, so every row of the walk is judged against the same instant (#304). A
+        // per-row `Date.now()` would let two identically-dated rows on the same page classify
+        // differently if the clock crossed their date between them — a difference no operator
+        // could explain and no test could pin.
+        //
+        // This is the ceiling on what any run could ask for, which is what makes the future-date
+        // report below honest: `until` is derived from the moment the run started, so a date
+        // after `now` is after every window in flight, not merely after this one.
+        const nowMs = Date.now();
 
         const collected: RawCommit[] = [];
         // Rows this walk has been HANDED, as opposed to the ones it keeps in `collected`.
@@ -247,25 +358,31 @@ export class BitbucketProvider implements GitProvider {
         // whose date the pipeline cannot key on is counted here, routed to `onDrop`, and left
         // out of `collected` — reported, not the silent third exit it used to take. So a
         // divergence this walk EMITS is window-filtered rows plus, for a caller that supplied
-        // `onDrop`, rows reported there (#292). See `GitFetchProgress.scanned` for what that
-        // does and does not prove — two exclusions it does not make recoverable are #304.
+        // `onDrop`, rows reported there (#292), and since #304 that account is TOTAL over the
+        // rows of every page this walk EMITS a count for. The cutoff page is the bound on that,
+        // in both directions, and is deliberately never emitted — see the break below and
+        // `GitFetchProgress.scanned` for what the number does and does not prove.
         let scanned = 0;
         let nextUrl: string | null =
             `${BASE_URL}/repositories/${this.workspace}/${repo}/commits?pagelen=100`;
 
-        paging: while (nextUrl) {
+        while (nextUrl) {
             const res = await fetchBitbucket(nextUrl, this.authHeaders, this.policy);
             const page = (await res.json()) as RawPagedResponse<RawCommit>;
 
-            // Counted for the WHOLE page before the filter runs, so the number is the same
-            // whether the loop below breaks out or not. On the page that trips the `since`
-            // cutoff this over-counts: the rows after the break were returned but never
-            // examined. That value is unobservable rather than harmless — `break paging`
-            // skips this page's report (see below) and the next emission omits `scanned`
-            // entirely, so no consumer can read it. Moving or adding a report after the
-            // break would expose the over-count; count per row inside the loop if that
-            // ever happens.
+            // Counted for the WHOLE page, which is honest since #304 because every row of every
+            // page — including the one that trips the `since` cutoff — is now examined by the
+            // loop below before the walk stops. It used to over-count exactly that page's tail:
+            // the loop `break`ed out of the paging loop mid-page, so the abandoned rows were
+            // counted, never gated, and never reported. That was contained only because the same
+            // break skipped the page's emission, and "contained" rested on the endpoint's
+            // newest-first ORDER agreeing with the author-date field the cutoff compares — which
+            // is the very premise the gate below refuses to assume for a row it cannot date.
             scanned += page.values.length;
+
+            // Set by the cutoff row; breaks the PAGING loop after this page's rows have all been
+            // through the gate (#304), which is why there is no labelled break any more.
+            let reachedCutoff = false;
 
             for (const c of page.values) {
                 // PIN THE DAY SHAPE HERE (#290), before the window comparison rather than after
@@ -277,22 +394,61 @@ export class BitbucketProvider implements GitProvider {
                 // this call's result set), unattributable is a permanent loss that must be said
                 // out loud.
                 //
-                // `continue`, never `break paging`: the `since` cutoff below relies on the
+                // `continue`, never a break: the `since` cutoff below relies on the
                 // endpoint's newest-first ORDER, and a row this walk cannot date says nothing
                 // about where in that order it sits. Breaking on it would discard the rest of a
                 // window the run then records as fully covered.
+                //
+                // RUN FOR THE CUTOFF PAGE'S TAIL TOO since #304 — this gate is above the
+                // `reachedCutoff` guard deliberately, and it is the same argument one step
+                // further: a row after the cutoff cannot be called out-of-window either, because
+                // "it is after the cutoff row" is a statement about the endpoint's order and this
+                // row's own date is unreadable. Before #304 that tail was abandoned mid-page, so
+                // an undatable row sitting in it was the one member of its class the walk lost in
+                // silence.
                 if (!isAttributableDate(c.date)) {
                     onDrop?.({sha: c.hash, reason: commitDropReason(c.date)});
                     continue;
                 }
+                // Past the cutoff, and this row is DATABLE — so the endpoint's newest-first order,
+                // which is the only thing the stop above rests on, covers it and nothing below
+                // runs. Not collected: that would make the retained set depend on where the page
+                // boundary happened to fall, since the identical row one page later is never seen
+                // at all. Not future-date-reported either: a datable row here is out of window by
+                // the same premise the break trusts, so reporting it would describe an ordering
+                // violation as a lost commit and send the operator after the wrong thing. What
+                // that costs when the premise DOES fail — an in-window row discarded silently —
+                // is stated in full on `GitProvider.getCommits`; it is the pre-#304 behavior,
+                // written down rather than inherited from where the break used to sit.
+                if (reachedCutoff) {
+                    continue;
+                }
                 const commitDate = new Date(c.date);
                 if (sinceDate && commitDate < sinceDate) {
-                    break paging;
+                    reachedCutoff = true;
+                    continue;
                 }
                 if (!untilDate || commitDate <= untilDate) {
                     collected.push(c);
+                } else if (commitDate.getTime() > nowMs) {
+                    // EXCLUDED BY `until` AND AHEAD OF THE CLOCK (#304). The ordinary `until`
+                    // exclusion is not reported — it is a row a later run covers, and reporting it
+                    // would drown the real losses (see `GitProvider.getCommits`). This one is not
+                    // that: `until` is derived from the run's start, so no run in flight has a
+                    // window reaching past `now`, and the row is excluded by every one of them.
+                    // What it cost to leave unreported, and what reporting it costs on this
+                    // provider, are both on {@link FUTURE_AUTHOR_DATE_DROP_REASON}.
+                    //
+                    // `>` and not `>=`: a row stamped exactly `now` is the boundary this run's
+                    // `until` was about to include, not a future date.
+                    onDrop?.({sha: c.hash, reason: FUTURE_AUTHOR_DATE_DROP_REASON});
                 }
             }
+
+            // AFTER the row loop, so the cutoff page's tail is gated (above) before the walk
+            // stops — the whole of #304's second half. The stop itself is unchanged: the
+            // endpoint is newest-first, so everything past the cutoff row is older than `since`.
+            if (reachedCutoff) break;
 
             // BOTH numbers, because on this provider they are genuinely different facts
             // (#276): `done` is rows retained, `scanned` is rows the endpoint handed over.
@@ -309,9 +465,10 @@ export class BitbucketProvider implements GitProvider {
             // label's decision, not this walk's (see `GitFetchProgress.scanned`).
             //
             // Deliberately NOT reported on the page that trips the `since` cutoff: the
-            // `break paging` skips it, and the seed below would overwrite it in the same
+            // `break` above skips it, and the seed below would overwrite it in the same
             // synchronous block anyway, so restructuring the walk to reach it would buy
-            // an emission no consumer can ever observe (#270 review OR-1).
+            // an emission no consumer can ever observe (#270 review OR-1). #304 changed what
+            // that page's rows DO — they are all gated now — not whether it reports.
             onProgress?.({done: collected.length, total: null, scanned});
             nextUrl = page.next ?? null;
         }

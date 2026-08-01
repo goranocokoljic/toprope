@@ -207,6 +207,25 @@ export const DIFFS_NOT_SUPPLIED_PREFIX = 'Provider supplied no commit diffs:';
  *
  * Emitted only for a run whose data was actually KEPT — see the emit site and the rollback
  * handler. A discarded window is re-fetched, so calling its drops permanent would be a lie.
+ *
+ * "UNATTRIBUTABLE" IN THE SENTINEL IS THE HEADLINE FOR THE CHANNEL, not a claim about every
+ * reason on it, and since #304 that distinction is real: {@link FUTURE_AUTHOR_DATE_DROP_REASON}
+ * describes a commit whose date is perfectly usable and merely ahead of every window a run can
+ * request, so THIS run did not attribute it while a run started after that date could. The
+ * sentinel is deliberately not renamed for it — it is matched by `isAdvisoryError` and
+ * `isPermanentLossAdvisory`, persisted into `sync_logs.errors` and `last_sync_advisories`, and
+ * asserted verbatim across the suite, so widening the word would cost more than it buys. What
+ * carries the distinction is the grouped reason the line ends with — the body says nothing at all
+ * about whether a given drop can come back, because only the reason knows. (It said "nothing
+ * re-asks them" until #304, which was true of two reasons and false of the third; the replacement
+ * is silence rather than a per-reason clause, since `${groups}` renders the reasons two clauses
+ * later and would only be restating them.)
+ *
+ * The body also says only that the commits could not be imported BY THIS RUN, never that they
+ * belonged to the covered window. Since #304 one of the reporting paths — Bitbucket's cutoff-page
+ * tail — reports rows that are, by the endpoint's own ordering, almost certainly OLDER than the
+ * window's floor, so a line claiming they were lost from inside it would have an operator sizing
+ * a repair against a hole that is not there.
  */
 export const COMMITS_DROPPED_PREFIX = 'Commits dropped as unattributable:';
 
@@ -2939,8 +2958,8 @@ async function fetchProviderData(
         );
         return (
             `${COMMITS_DROPPED_PREFIX} [${providerType}/${droppedRepo}] ${drops.length} ` +
-            `commit(s) the provider listed could not be imported, and this run has recorded ` +
-            `its window as covered — nothing re-asks them. There is no targeted re-fetch: ` +
+            `commit(s) the provider listed could not be imported by this run, whose window is ` +
+            `now recorded as covered. There is no targeted re-fetch: ` +
             `"sync older history" only extends STRICTLY older than the earliest synced ` +
             `instant, so it cannot reach a forward window. ${groups}.`
         );

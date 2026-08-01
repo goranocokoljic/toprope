@@ -39,7 +39,10 @@ import {loadServerKey} from '../../../src/connectors/git/providers/secret';
 import {SYNC_RETRY_PROFILE} from '../../../src/connectors/git/providers/http-retry';
 import type {GitConnectorConfig} from '../../../src/config/types';
 import type {GitProvider, GitProviderConfig, GitRepo, GitCommit, GitFetchProgress, GitPR, GitReviewComment, GitFileDiff} from '../../../src/connectors/git/providers/types';
-import {NO_AUTHOR_DATE_DROP_REASON} from '../../../src/connectors/git/providers/types';
+import {
+    FUTURE_AUTHOR_DATE_DROP_REASON,
+    NO_AUTHOR_DATE_DROP_REASON,
+} from '../../../src/connectors/git/providers/types';
 
 // Stub createGitProvider (so no network) but keep validateGitProviderConfig real,
 // so the store/codec that seed DB providers in the integration tests below work.
@@ -692,8 +695,8 @@ describe('GitSync', () => {
                                 onDrop?: (d: {sha: string; reason: string}) => void,
                             ) => {
                                 duringFetch?.();
-                                // ALSO report a dropped commit (#275). The drop advisory claims
-                                // "this run has recorded its window as covered", which is false
+                                // ALSO report a dropped commit (#275). The drop advisory claims the
+                                // run's "window is now recorded as covered", which is false
                                 // on every path this describe block exercises — a deleted
                                 // container advances no cursor and writes nothing. The claim is
                                 // suppressed by the advisory being staged INSIDE the
@@ -844,6 +847,32 @@ describe('GitSync', () => {
             expect(dropLine).toContain('<unrecognized drop reason>');
             expect(dropLine).not.toContain('ghp_SECRET');
             expect(dropLine).not.toContain('rate limit exceeded');
+        });
+
+        // The other half of that allowlist, and the one a new reason can silently fail (#304).
+        // `sanitizeDropReason` checks membership of COMMIT_DROP_REASONS, so a reason declared as
+        // a constant and used by a provider but never added to that tuple reaches the operator as
+        // `<unrecognized drop reason>` — a real loss reported as a malformed one, with no
+        // compile error anywhere. Only an end-to-end run through the sink can catch it.
+        it('renders the future-author-date reason verbatim — the allowlist knows every declared reason', async () => {
+            seedDev(db, 'alice');
+            insertProviderRow(db, 'db-org');
+            const result = await runWithOneCommit(
+                db,
+                [DB_PROVIDER],
+                undefined,
+                FUTURE_AUTHOR_DATE_DROP_REASON,
+            );
+            const dropLine = result.errors.find((e) => e.startsWith(COMMITS_DROPPED_PREFIX));
+            expect(dropLine).toBeDefined();
+            expect(dropLine).toContain(`1 because ${FUTURE_AUTHOR_DATE_DROP_REASON}`);
+            expect(dropLine).not.toContain('<unrecognized drop reason>');
+            // The BODY's claim, which nothing else asserts: it says only that the commits could
+            // not be imported by this run, never that a later one cannot re-ask them — that is
+            // per-reason and false for this one. Reverting the sentence to the pre-#304 "nothing
+            // re-asks them" left the whole suite green before this line existed.
+            expect(dropLine).toContain('could not be imported by this run');
+            expect(dropLine).not.toContain('nothing re-asks');
         });
 
         // Positive control for the assertions above: with the row INTACT the same run writes a

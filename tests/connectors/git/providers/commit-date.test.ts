@@ -11,9 +11,21 @@ import {
     isAttributableDate,
 } from '../../../../src/connectors/git/providers/commit-date';
 import {
+    COMMIT_DROP_REASONS,
     NO_AUTHOR_DATE_DROP_REASON,
     UNATTRIBUTABLE_DATE_DROP_REASON,
 } from '../../../../src/connectors/git/providers/types';
+
+describe('COMMIT_DROP_REASONS', () => {
+    it('keeps every reason distinct, so grouping cannot merge two operator next-steps', () => {
+        // `formatLossGroups` (sync.ts) keys its groups on the reason STRING, so two members that
+        // ever became equal — a copy-paste when a fourth is added beside the #304 one — would
+        // silently fold two different "what do I do about this" answers into one advisory group
+        // while every test comparing against the constants stayed green. Asserted over the whole
+        // tuple rather than as a pair, so it also covers the member that does not exist yet.
+        expect(new Set(COMMIT_DROP_REASONS).size).toBe(COMMIT_DROP_REASONS.length);
+    });
+});
 
 describe('isAttributableDate', () => {
     it.each([

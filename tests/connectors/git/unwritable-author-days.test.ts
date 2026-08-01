@@ -613,8 +613,8 @@ describe('#302 an unwritable author-day costs that row, not the run', () => {
         });
 
         it('does NOT claim the window was recorded when the write transaction rolls back', async () => {
-            // The line says "this run has recorded its window as covered — nothing re-asks
-            // them", which is only true of a run that committed. Staged on the cursor advance
+            // The line says the commits "could not be imported by this run, whose window is now
+            // recorded as covered", which is only true of a run that committed. Staged on the cursor advance
             // and pushed after the commit, exactly like the drop advisory. Kept alongside the
             // sharper case above because it covers a DIFFERENT discard path (a failure before
             // the advances rather than after them) — but note it cannot fail for the staging
