@@ -41,6 +41,7 @@ import {
     UNATTRIBUTABLE_DATE_DROP_REASON,
 } from '../../../src/connectors/git/providers/types';
 import {MAX_SERVER_ERROR_RETRIES} from '../../../src/connectors/git/providers/http-retry';
+import {MAX_STORED_COLUMN_CHARS} from '../../../src/connectors/git/providers/store';
 import type {GitProviderConfig} from '../../../src/connectors/git/providers/types';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../../src/storage/migrations');
@@ -981,6 +982,43 @@ describe('unreturned commits are never silent (#275)', () => {
             expect(churnLine).not.toContain('BOOM');
             expect(churnLine).not.toContain('[31m');
             expect(churnLine!.split('\n')).toHaveLength(1);
+        });
+
+        it('fits inside the per-line storage cap at its longest realistic shape', async () => {
+            // #289 sizes `MAX_STORED_COLUMN_CHARS` so the lines that carry an OPERATOR
+            // INSTRUCTION arrive whole. This line is the longest one the pipeline emits — it
+            // embeds `permanentSpanRepair()` AND a five-sha sample — and it is also ranked to
+            // the front of the bounded column as permanent loss, so a cap that cuts it mangles
+            // exactly the report the ranking exists to protect.
+            //
+            // Measured against the REAL emitted line at its worst realistic inputs (full
+            // 40-hex shas, a long repo path, the `(+N more)` tail), not against an estimate of
+            // the prose: it is the line length that has to fit, not the repair paragraph.
+            seedAlice(db);
+            // Long but slash-free: the GitHub harness routes list calls by a single path
+            // segment. A GitLab group path is longer still, which the constant's headroom
+            // covers — see MAX_STORED_COLUMN_CHARS.
+            const longRepo = 'platform-infrastructure-service-mesh-control-plane';
+            const shas = Array.from({length: 9}, (_, i) =>
+                String(i + 1).repeat(40).slice(0, 40),
+            );
+            stubGitHub(
+                [],
+                Object.fromEntries(shas.map((s) => [s, {body: statlessDetail(s)}])),
+                [longRepo],
+                {[longRepo]: {body: shas.map((s) => listRow(s))}},
+            );
+
+            const result = await runSync(db);
+
+            const churnLine = churnLineOf(result.errors);
+            expect(churnLine).toBeDefined();
+            expect(churnLine).toContain('(+4 more)');
+            expect(churnLine!.length).toBeLessThanOrEqual(MAX_STORED_COLUMN_CHARS);
+            // The tail is the part a tight cap eats first, and it is the part an operator uses
+            // to verify the loss — assert it survived rather than only asserting the total.
+            expect(churnLine!.endsWith('.')).toBe(true);
+            expect(churnLine).toContain(shas[0]);
         });
     });
 });

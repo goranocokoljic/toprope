@@ -2626,8 +2626,31 @@ describe('AdminGitProviders — last-sync advisories (#289)', () => {
         const panel = await screen.findByTestId('sync-advisories');
         expect(panel).toHaveTextContent(syncAdvisoryHeading(1, 'error'));
         expect(panel.textContent).not.toContain('the sync itself did not fail');
+        // A literal, not only the builder: asserting against the function that produced the
+        // text passes for any rewording, including one that drops the qualifier entirely.
+        expect(panel.textContent).toContain('reported separately from the failure above');
         // Still amber, not red: the advisory is not the failure.
         expect(panel.className).toContain('warning');
+    });
+
+    it('makes no not-failed claim for a status it does not recognize', async () => {
+        // `last_sync_status` is unvalidated wire data on a column whose CHECK admits a wider
+        // set than the two values the writer produces. "the sync itself did not fail" is a
+        // positive claim about the run, so an unrecognized value must fall through to a
+        // claim-free qualifier rather than default into the reassuring branch.
+        providers = [
+            {
+                ...structuredClone(DB_GITHUB),
+                last_sync_status: 'never' as unknown as 'ok',
+                last_sync_advisories: [DROP_LINE],
+            },
+        ];
+        renderPage();
+
+        const panel = await screen.findByTestId('sync-advisories');
+        expect(panel.textContent).toContain('Last manual sync reported 1 advisory line(s)');
+        expect(panel.textContent).not.toContain('the sync itself did not fail');
+        expect(panel.textContent).not.toContain('reported separately from the failure above');
     });
 
     it('keeps the last run\'s advisories visible while a new run is in flight', async () => {

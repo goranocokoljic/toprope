@@ -575,19 +575,37 @@ export interface SyncOutcome {
 export const MAX_STORED_ADVISORIES = 20;
 
 /**
- * How many characters of ONE advisory line this row will store.
+ * How many characters of ONE stored text value this row will keep — one advisory line, or
+ * the whole `last_sync_error` summary.
  *
  * The second axis of the same bound, and not redundant with the line cap: a single line can
  * be arbitrarily long on its own. `UNMATCHED_AUTHORS_PREFIX` joins the WHOLE unmatched-author
  * set into one entry, and on the first sync of a not-yet-mapped org that is every author in
  * the history — ~70-100 KB for a 2,000-author org, which passes a 20-LINE cap untouched.
  *
- * Together the two caps bound the column at roughly `20 × 2 KB` ≈ 40 KB worst case, with the
- * realistic case far below it (most lines are a few hundred bytes). 2 KB is chosen to sit
- * above the longest single-purpose advisory the pipeline emits — the ~1.5 KB permanent-span
- * repair prose — so the lines that carry an operator instruction arrive whole.
+ * It governs BOTH columns because the hazard is the row, not the column: `last_sync_error` is
+ * written by the same statement, from the same per-repo fan-out (one entry per failed repo
+ * fetch, joined), and served by the same `GET /api/admin/git/providers` on the same 1s poll —
+ * so a 500-repo org with an expired token would ship a megabyte-scale row once a second. A
+ * bound that stopped at the advisory column would be a bound on the smaller of two identical
+ * hazards. The invariant to hold is "this row is bounded".
+ *
+ * SIZED FROM A MEASUREMENT, not from an estimate of the prose. The longest single-purpose
+ * advisory is `COMMIT_CHURN_UNKNOWN_PREFIX`, which embeds the permanent-span repair
+ * instruction AND a five-sha sample: at its worst realistic inputs (full 40-hex shas, a long
+ * repo path, a `(+N more)` tail) the emitted LINE measures ~2.15 KB — the repair prose alone
+ * is only ~0.8 KB, so sizing against the paragraph rather than the line is what put an
+ * earlier 2 KB cap underneath it. That is also the line `rankAdvisories` moves to the FRONT
+ * as permanent loss, so a cap below it would mangle precisely the report the ranking exists
+ * to protect, cutting the `Affected: <shas>` tail an operator verifies the loss with. 4 KB
+ * leaves ~1.8 KB of headroom for a longer container path or a future sentence, and
+ * `tests/connectors/git/commit-loss.test.ts` pins the real line against this constant so the
+ * next sentence added to that advisory fails a test rather than silently losing its tail.
+ *
+ * Together the two caps bound the advisory column at roughly `20 × 4 KB` ≈ 80 KB worst case,
+ * with the realistic case far below it (most lines are a few hundred bytes).
  */
-export const MAX_STORED_ADVISORY_CHARS = 2_000;
+export const MAX_STORED_COLUMN_CHARS = 4_000;
 
 /**
  * The line appended in place of the advisories the cap dropped.
@@ -614,26 +632,34 @@ export function advisoriesTruncatedLine(omitted: number): string {
 }
 
 /**
- * The marker appended to one line the character cap cut.
+ * The marker appended to one stored value the character cap cut.
  *
- * Same reason as {@link advisoriesTruncatedLine}: a silently shortened line reads as a
+ * Same reason as {@link advisoriesTruncatedLine}: a silently shortened value reads as a
  * complete one, and these lines can end in an operator instruction.
  */
-export function advisoryLineTruncatedSuffix(): string {
-    return `… [line truncated at ${MAX_STORED_ADVISORY_CHARS} characters — see the server log]`;
+export function columnTextTruncatedSuffix(): string {
+    return `… [truncated at ${MAX_STORED_COLUMN_CHARS} characters — see the server log]`;
+}
+
+/**
+ * The character cap, applied to one stored text value.
+ *
+ * Sliced with `Array.from` rather than `String.prototype.slice` so the cut lands on a code
+ * POINT boundary: cutting by UTF-16 code unit can leave a lone surrogate, which round-trips
+ * through JSON intact and then renders as U+FFFD in the provider row.
+ */
+function boundStoredText(value: string): string {
+    const points = Array.from(value);
+    return points.length <= MAX_STORED_COLUMN_CHARS
+        ? value
+        : points.slice(0, MAX_STORED_COLUMN_CHARS).join('') + columnTextTruncatedSuffix();
 }
 
 // Apply both caps, naming what each one dropped. Kept beside the constants they enforce so
 // the "no silent caps" property is one function, not a rule spread across call sites.
 // Assumes an importance-ordered input — see MAX_STORED_ADVISORIES.
 function boundAdvisories(advisories: readonly string[]): string[] {
-    const kept = advisories
-        .slice(0, MAX_STORED_ADVISORIES)
-        .map((line) =>
-            line.length <= MAX_STORED_ADVISORY_CHARS
-                ? line
-                : line.slice(0, MAX_STORED_ADVISORY_CHARS) + advisoryLineTruncatedSuffix(),
-        );
+    const kept = advisories.slice(0, MAX_STORED_ADVISORIES).map(boundStoredText);
     const omitted = advisories.length - kept.length;
     return omitted > 0 ? [...kept, advisoriesTruncatedLine(omitted)] : kept;
 }
@@ -664,10 +690,16 @@ export function recordSyncOutcome(db: Database.Database, id: string, outcome: Sy
             `Refusing to record unknown sync status: "${String(outcome.status)}"`,
         );
     }
-    // On error a non-null message is mandatory (see doc); on ok it is always NULL.
+    // On error a non-null message is mandatory (see doc); on ok it is always NULL. Bounded by
+    // the SAME cap as an advisory line: this column is fed by the same per-repo fan-out, in
+    // the same UPDATE, and served on the same 1s poll — see MAX_STORED_COLUMN_CHARS.
     const errorText =
         outcome.status === 'error'
-            ? (outcome.error && outcome.error.trim() !== '' ? outcome.error : 'Sync failed (no error message)')
+            ? boundStoredText(
+                  outcome.error && outcome.error.trim() !== ''
+                      ? outcome.error
+                      : 'Sync failed (no error message)',
+              )
             : null;
     const advisoriesText = encodeStringArrayColumn(boundAdvisories(outcome.advisories ?? []));
     const changes = db

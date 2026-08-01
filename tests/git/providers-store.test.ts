@@ -5,11 +5,11 @@ import {runMigrations} from '../../src/storage/migrator';
 import {loadServerKey, type ServerKeyResult} from '../../src/connectors/git/providers/secret';
 import {
     advisoriesTruncatedLine,
-    advisoryLineTruncatedSuffix,
+    columnTextTruncatedSuffix,
     createProvider,
     deleteProvider,
     MAX_STORED_ADVISORIES,
-    MAX_STORED_ADVISORY_CHARS,
+    MAX_STORED_COLUMN_CHARS,
     findProviderByTypeContainer,
     getDecryptedConfig,
     getProvider,
@@ -703,7 +703,7 @@ describe('provider store — recordSyncOutcome advisories (#289)', () => {
         // line — which a 20-LINE cap passes untouched, into a row the admin list serves for
         // every provider on every 1s poll while a sync is in flight.
         const rec = createProvider(db, keyOk(), {config: GITHUB});
-        const huge = `${DROP_LINE} ${'x'.repeat(MAX_STORED_ADVISORY_CHARS * 3)}`;
+        const huge = `${DROP_LINE} ${'x'.repeat(MAX_STORED_COLUMN_CHARS * 3)}`;
         recordSyncOutcome(db, rec.id, {status: 'ok', at: '2026-07-07T10:00:00.000Z', advisories: [huge]});
 
         const stored = toPublicProvider(getProvider(db, rec.id)!).last_sync_advisories;
@@ -711,17 +711,72 @@ describe('provider store — recordSyncOutcome advisories (#289)', () => {
         expect(stored).toHaveLength(1);
         expect(stored[0].startsWith(DROP_LINE)).toBe(true);
         // …bounded…
-        expect(stored[0]).toHaveLength(MAX_STORED_ADVISORY_CHARS + advisoryLineTruncatedSuffix().length);
+        expect(stored[0]).toHaveLength(MAX_STORED_COLUMN_CHARS + columnTextTruncatedSuffix().length);
         // …and not silently: a shortened line must not read as a complete one.
-        expect(stored[0].endsWith(advisoryLineTruncatedSuffix())).toBe(true);
+        expect(stored[0].endsWith(columnTextTruncatedSuffix())).toBe(true);
     });
 
     it('leaves a line exactly at the character cap untouched', () => {
         const rec = createProvider(db, keyOk(), {config: GITHUB});
-        const exact = 'y'.repeat(MAX_STORED_ADVISORY_CHARS);
+        const exact = 'y'.repeat(MAX_STORED_COLUMN_CHARS);
         recordSyncOutcome(db, rec.id, {status: 'ok', at: '2026-07-07T10:00:00.000Z', advisories: [exact]});
         // `<=` not `<` on this axis too.
         expect(toPublicProvider(getProvider(db, rec.id)!).last_sync_advisories).toEqual([exact]);
+    });
+
+    it('bounds the error column by the same cap, and not silently', () => {
+        // The bound is on the ROW, not on the new column. `last_sync_error` is fed by the same
+        // per-repo fan-out (one "[org/repo-N] Failed to fetch commits: …" line per failed repo,
+        // joined), written by the same UPDATE, and served by `GET /api/admin/git/providers` for
+        // EVERY provider on the 1s poll — so an expired token on a 500-repo org is the same
+        // megabyte-scale hazard the advisory cap was added for. Bounding one column and not its
+        // sibling would leave the larger, more likely case unbounded.
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        const perRepo = Array.from(
+            {length: 400},
+            (_, i) => `[github/repo-${i}] Failed to fetch commits: 401 Bad credentials`,
+        ).join('; ');
+        expect(perRepo.length).toBeGreaterThan(MAX_STORED_COLUMN_CHARS);
+
+        recordSyncOutcome(db, rec.id, {
+            status: 'error',
+            at: '2026-07-07T10:00:00.000Z',
+            error: perRepo,
+        });
+
+        const stored = getProvider(db, rec.id)!.last_sync_error!;
+        expect(stored).toHaveLength(MAX_STORED_COLUMN_CHARS + columnTextTruncatedSuffix().length);
+        // The head survives, so the row still names what failed…
+        expect(stored.startsWith('[github/repo-0] Failed to fetch commits')).toBe(true);
+        // …and a shortened summary must not read as the complete failure list.
+        expect(stored.endsWith(columnTextTruncatedSuffix())).toBe(true);
+    });
+
+    it('leaves an error message under the cap byte-identical', () => {
+        // The negative control for the bound above: the ordinary single-line failure — which is
+        // what nearly every real error outcome is — must not gain a marker or lose a character.
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        const message = '[github/api] Failed to fetch commits: 401 Bad credentials';
+        recordSyncOutcome(db, rec.id, {status: 'error', at: '2026-07-07T10:00:00.000Z', error: message});
+        expect(getProvider(db, rec.id)!.last_sync_error).toBe(message);
+    });
+
+    it('cuts an over-long value on a code-point boundary, never mid-surrogate', () => {
+        // Slicing by UTF-16 code unit can leave a LONE surrogate at the cut. It round-trips
+        // through JSON intact (well-formed since ES2019) and then renders as U+FFFD in the
+        // provider row, so the corruption is invisible until an operator reads the line. The
+        // emoji is two code units, so a code-unit slice at an odd offset splits one.
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        const line = '🚀'.repeat(MAX_STORED_COLUMN_CHARS + 50);
+        recordSyncOutcome(db, rec.id, {status: 'ok', at: '2026-07-07T10:00:00.000Z', advisories: [line]});
+
+        const stored = toPublicProvider(getProvider(db, rec.id)!).last_sync_advisories[0];
+        const body = stored.slice(0, stored.length - columnTextTruncatedSuffix().length);
+        expect(Array.from(body)).toHaveLength(MAX_STORED_COLUMN_CHARS);
+        expect(body).toBe('🚀'.repeat(MAX_STORED_COLUMN_CHARS));
+        expect(body).not.toContain('�');
+        // No unpaired surrogate anywhere in the stored value.
+        expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(stored)).toBe(false);
     });
 
     it('surfaces a malformed stored value as its raw text rather than failing the row', () => {

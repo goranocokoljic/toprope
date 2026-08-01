@@ -570,10 +570,19 @@ function ProbeResultView({result}: {result: GitProviderProbeResult}): JSX.Elemen
  * themselves use.
  */
 export function syncAdvisoryHeading(count: number, status: string | null): string {
+    // `ok` is named EXPLICITLY and every other value falls through to a claim-free qualifier,
+    // rather than `!== 'error'` defaulting into the reassuring branch. `status` here is
+    // unvalidated wire data — the column is CHECK-constrained to a wider set (`never`, plus
+    // whatever a hand-edited row or a future writer holds) than the two values
+    // `recordSyncOutcome` can write — and "the sync itself did not fail" is exactly the
+    // positive claim that must not be inferred from a value this function does not recognize.
+    // Same reasoning, and the same shape, as `syncTerminalAnnouncement` above.
     const qualifier =
-        status === 'error'
-            ? 'reported separately from the failure above'
-            : 'the sync itself did not fail';
+        status === 'ok'
+            ? 'the sync itself did not fail'
+            : status === 'error'
+              ? 'reported separately from the failure above'
+              : 'reported by the last run';
     return `Last manual sync reported ${count} advisory line(s) — ${qualifier}`;
 }
 

@@ -641,6 +641,17 @@ export function registerAdminGitProviderRoutes(
                 for (const entry of result.errors) {
                     (isAdvisoryError(entry) ? advisories : genuineErrors).push(entry);
                 }
+                if (genuineErrors.length > 0) {
+                    // The same contract as the advisory log below, for the same reason:
+                    // `last_sync_error` is bounded too (MAX_STORED_COLUMN_CHARS), and its
+                    // truncation marker sends the operator here. A systemic failure on a
+                    // large org is ONE LINE PER REPO, so the truncated case is the one that
+                    // matters — this is the write that keeps the omitted repos recoverable.
+                    request.log.error(
+                        {providerId: id, errors: genuineErrors},
+                        'git sync completed with errors',
+                    );
+                }
                 if (advisories.length > 0) {
                     // Not decoration, and not merely "also logged": the row's advisory
                     // column is BOUNDED (`MAX_STORED_ADVISORIES`), and its truncation line
