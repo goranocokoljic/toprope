@@ -115,6 +115,9 @@ describe('migration 039 — git_providers schema (#193)', () => {
                 'token_ciphertext', 'token_meta', 'token_last4', 'repos_include', 'repos_exclude',
                 'enabled', 'created_at', 'updated_at', 'created_by', 'last_sync_at',
                 'last_sync_status', 'last_sync_error',
+                // Added by migration 045 (#289) — the advisory half of a run's report, kept
+                // out of `last_sync_error` so it can be recorded without turning the row red.
+                'last_sync_advisories',
             ].sort(),
         );
     });

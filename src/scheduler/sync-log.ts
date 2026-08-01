@@ -21,6 +21,7 @@
 import type Database from 'better-sqlite3';
 import {randomUUID} from 'crypto';
 import {isAdvisoryError} from '../connectors/git/sync';
+import {decodeStringArrayColumn, encodeStringArrayColumn} from '../storage/string-array-column';
 
 export interface SyncLog {
     id: string;
@@ -119,7 +120,7 @@ function reapAbandonedSyncLogs(db: Database.Database, connector: string, at: str
         `UPDATE sync_logs
          SET finished_at = ?, error_count = 1, errors = ?, status = 'error'
          WHERE connector = ? AND status = 'running' AND started_at < ?`,
-    ).run(at, JSON.stringify([ABANDONED_RUN_ERROR]), connector, cutoff);
+    ).run(at, encodeStringArrayColumn([ABANDONED_RUN_ERROR]), connector, cutoff);
 }
 
 export function startSyncLog(db: Database.Database, connector: string): string {
@@ -160,7 +161,7 @@ export function finishSyncLog(
         opts.records_written,
         opts.records_skipped,
         opts.errors.length,
-        opts.errors.length > 0 ? JSON.stringify(opts.errors) : null,
+        encodeStringArrayColumn(opts.errors),
         status,
         id,
     );
@@ -170,19 +171,16 @@ export function finishSyncLog(
  * The `errors` column as an array, or `null`. The single decoder — every reader below goes
  * through it.
  *
- * Tolerant on purpose: `errors` is plain TEXT with no CHECK constraint, so one hand-edited or
- * legacy row must not make the whole log unreadable, and an unparseable blob is surfaced as its
- * raw text rather than silently dropped.
+ * The parse itself is the shared JSON-string-array codec (#289), which
+ * `git_providers.last_sync_advisories` uses too; both columns are untyped TEXT with no CHECK
+ * constraint, so both need the same tolerance (an unparseable blob surfaces as its raw text
+ * rather than being dropped) and there is no reason for two answers to that question. The
+ * null handling stays here because it is column-specific: `sync_logs` distinguishes "this run
+ * recorded nothing" as `null`, where the provider DTO flattens it to `[]`.
  */
 function decodeErrors(raw: string | null): string[] | null {
     if (!raw) return null;
-    try {
-        const parsed = JSON.parse(raw) as unknown;
-        if (Array.isArray(parsed)) return parsed.map((e) => String(e));
-    } catch {
-        // fall through — an unparseable blob is surfaced as-is below rather than thrown away
-    }
-    return [raw];
+    return decodeStringArrayColumn(raw);
 }
 
 export function getRecentSyncLogs(db: Database.Database, limit = 50): SyncLog[] {

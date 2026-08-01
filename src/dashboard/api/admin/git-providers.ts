@@ -39,6 +39,7 @@ import {sameContainer} from '../../../connectors/git/providers/container';
 import {
     GitSync,
     isAdvisoryError,
+    rankAdvisories,
     FIRST_SYNC_WINDOW_MIN_MONTHS,
     FIRST_SYNC_WINDOW_MAX_MONTHS,
     FIRST_SYNC_WINDOW_DEFAULT_MONTHS,
@@ -365,6 +366,9 @@ function configProviderToDto(config: GitProviderConfig): AdminGitProviderDto {
         last_sync_at: null,
         last_sync_status: null,
         last_sync_error: null,
+        // Config providers have no row to record an outcome on: the scoped sync routes
+        // 409 them, so no run ever writes here (#289).
+        last_sync_advisories: [],
         active_sync: null,
         // Config rows are read-only and never show the window input.
         first_sync_pending: false,
@@ -620,22 +624,91 @@ export function registerAdminGitProviderRoutes(
                 // not flip a provider that synced fine to red. The auto-create SUMMARY
                 // (#256) is advisory on the same terms — it reports what was onboarded.
                 // Auto-create FAILURE lines carry neither prefix on purpose and stay
-                // classified as genuine errors. Classify and surface only those.
-                const genuineErrors = result.errors.filter((e) => !isAdvisoryError(e));
+                // classified as genuine errors.
+                //
+                // ONE pass, not two complementary filters (#289): every entry lands in
+                // exactly one list by construction, so the red/green decision and the
+                // advisory report can never disagree about an entry — no line can be both
+                // counted as a failure and stored as an advisory, and none can be dropped
+                // by both. Advisories used to be classified out and then discarded: the
+                // `ok` branch NULLs `last_sync_error`, and this route writes no `sync_logs`
+                // row and returns `{status: 'running'}` long before the run settles, so an
+                // irreversible commit drop (#275) left NO trace on the one interactive path
+                // an operator drives. They are now recorded on their own column, which is
+                // independent of the status — visible without being red.
+                const advisories: string[] = [];
+                const genuineErrors: string[] = [];
+                for (const entry of result.errors) {
+                    (isAdvisoryError(entry) ? advisories : genuineErrors).push(entry);
+                }
                 if (genuineErrors.length > 0) {
+                    // The same contract as the advisory log below, for the same reason:
+                    // `last_sync_error` is bounded too (MAX_STORED_COLUMN_CHARS), and its
+                    // truncation marker sends the operator here. A systemic failure on a
+                    // large org is ONE LINE PER REPO, so the truncated case is the one that
+                    // matters — this is the write that keeps the omitted repos recoverable.
+                    request.log.error(
+                        {providerId: id, errors: genuineErrors},
+                        'git sync completed with errors',
+                    );
+                }
+                if (advisories.length > 0) {
+                    // Not decoration, and not merely "also logged": the row's advisory
+                    // column is BOUNDED (`MAX_STORED_ADVISORIES`), and its truncation line
+                    // tells the operator the omitted lines are in the server log. This is
+                    // the write that makes that true, so it is a contract, not a courtesy —
+                    // it logs the COMPLETE, unranked, unbounded set, keyed by provider id.
+                    request.log.warn(
+                        {providerId: id, advisories},
+                        'git sync completed with advisories',
+                    );
+                }
+                // ONE call, not a branch per status: `error` is ignored (and the column
+                // NULLed) on `ok`, so the two branches differed only in the status they
+                // passed — and a field added to one of them and not the other is exactly
+                // how the advisory column would come to be written on one path only.
+                //
+                // Wrapped, and NOT allowed to fall through to the sibling `.catch`. That
+                // handler exists for a run that threw, and it records `status: 'error'` with
+                // no advisories — so a throw from THIS write (a transient DB fault, say)
+                // would land there and persist two lies about a run that actually succeeded:
+                // a red status, and an empty advisory column that just discarded the
+                // permanent-loss report this line was in the middle of storing. The log
+                // above already holds the full set, which is what makes returning here safe.
+                try {
                     recordSyncOutcome(db, id, {
-                        status: 'error',
+                        status: genuineErrors.length > 0 ? 'error' : 'ok',
                         at: new Date().toISOString(),
                         error: genuineErrors.join('; '),
+                        // Importance-ordered, because the store's cap truncates the tail and
+                        // arrival order buries the permanent-loss lines behind every healed
+                        // retry the run reported.
+                        advisories: rankAdvisories(advisories),
                     });
-                } else {
-                    recordSyncOutcome(db, id, {status: 'ok', at: new Date().toISOString()});
+                } catch (recordErr) {
+                    request.log.error(
+                        {err: recordErr, providerId: id},
+                        'failed to record git sync outcome',
+                    );
                 }
             })
             .catch((err: unknown) => {
                 // A thrown failure (e.g. an unexpected pipeline crash) is still
                 // recorded as a status=error outcome, not lost.
+                //
+                // No advisories are passed, which CLEARS the column — deliberately. A run
+                // that threw produced no `SyncResult`, so this route knows of no advisory
+                // for it, and every one of these columns describes THE LAST RUN. Leaving
+                // the previous run's report standing beside this run's timestamp would
+                // attribute it to a run that never reported it. Note this can discard a
+                // report the run had ALREADY committed — the throw may land after a cursor
+                // advance — which is the other half of why the log below is unconditional.
                 const message = err instanceof Error ? err.message : String(err);
+                // Same contract as the two logs above: `message` is stored through the same
+                // character bound, whose truncation marker says "see the server log". This
+                // is the only path that would otherwise leave NO trace of the run at all —
+                // it writes no `sync_logs` row and returned `{status: 'running'}` long ago.
+                request.log.error({err, providerId: id}, 'git sync run threw');
                 try {
                     recordSyncOutcome(db, id, {
                         status: 'error',

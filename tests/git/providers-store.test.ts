@@ -4,8 +4,12 @@ import path from 'path';
 import {runMigrations} from '../../src/storage/migrator';
 import {loadServerKey, type ServerKeyResult} from '../../src/connectors/git/providers/secret';
 import {
+    advisoriesTruncatedLine,
+    columnTextTruncatedSuffix,
     createProvider,
     deleteProvider,
+    MAX_STORED_ADVISORIES,
+    MAX_STORED_COLUMN_CHARS,
     findProviderByTypeContainer,
     getDecryptedConfig,
     getProvider,
@@ -604,5 +608,204 @@ describe('provider store — recordSyncOutcome (#199)', () => {
         ).toThrow(GitProviderStoreError);
         // The row is untouched — no partial write from the rejected status.
         expect(getProvider(db, rec.id)?.last_sync_status).toBeNull();
+    });
+});
+
+/**
+ * The advisory column (#289): the half of a run's report that must be VISIBLE without being
+ * RED. Its whole reason to exist is that the `ok` branch NULLs `last_sync_error`, so before
+ * this an advisory recorded on the scoped admin path was indistinguishable from no advisory.
+ */
+describe('provider store — recordSyncOutcome advisories (#289)', () => {
+    const DROP_LINE = 'Commits dropped as unattributable: [github/api] 3 commit(s)';
+
+    it('stores advisories on an OK outcome without populating the error column', () => {
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        expect(rec.last_sync_advisories).toBeNull();
+
+        recordSyncOutcome(db, rec.id, {
+            status: 'ok',
+            at: '2026-07-07T10:00:00.000Z',
+            advisories: [DROP_LINE],
+        });
+
+        const after = getProvider(db, rec.id);
+        expect(after?.last_sync_status).toBe('ok');
+        // Visible…
+        expect(toPublicProvider(after!).last_sync_advisories).toEqual([DROP_LINE]);
+        // …and not red. Both halves matter: a fix that wrote the line into `last_sync_error`
+        // would satisfy "durably recorded" and break the classification the route exists to keep.
+        expect(after?.last_sync_error).toBeNull();
+    });
+
+    it('stores advisories alongside a failure on an ERROR outcome', () => {
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        recordSyncOutcome(db, rec.id, {
+            status: 'error',
+            at: '2026-07-07T11:00:00.000Z',
+            error: 'GitHub API error 401',
+            advisories: [DROP_LINE],
+        });
+
+        const pub = toPublicProvider(getProvider(db, rec.id)!);
+        expect(pub.last_sync_status).toBe('error');
+        expect(pub.last_sync_error).toBe('GitHub API error 401');
+        expect(pub.last_sync_advisories).toEqual([DROP_LINE]);
+    });
+
+    it('clears a prior run\'s advisories when a later run reports none', () => {
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        recordSyncOutcome(db, rec.id, {
+            status: 'ok',
+            at: '2026-07-07T10:00:00.000Z',
+            advisories: [DROP_LINE],
+        });
+        recordSyncOutcome(db, rec.id, {status: 'ok', at: '2026-07-07T12:00:00.000Z'});
+
+        // The column describes the LAST run, exactly like `last_sync_error` beside it: a stale
+        // drop line standing next to a newer timestamp attributes it to a run that never
+        // reported it, and nothing would ever clear it.
+        expect(getProvider(db, rec.id)?.last_sync_advisories).toBeNull();
+        expect(toPublicProvider(getProvider(db, rec.id)!).last_sync_advisories).toEqual([]);
+    });
+
+    it('caps the stored list and says how many lines it dropped', () => {
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        const overflow = 7;
+        const lines = Array.from(
+            {length: MAX_STORED_ADVISORIES + overflow},
+            (_, i) => `${DROP_LINE} #${i}`,
+        );
+        recordSyncOutcome(db, rec.id, {status: 'ok', at: '2026-07-07T10:00:00.000Z', advisories: lines});
+
+        const stored = toPublicProvider(getProvider(db, rec.id)!).last_sync_advisories;
+        // Capped… (the cap + one line about the cap)
+        expect(stored).toHaveLength(MAX_STORED_ADVISORIES + 1);
+        expect(stored.slice(0, MAX_STORED_ADVISORIES)).toEqual(lines.slice(0, MAX_STORED_ADVISORIES));
+        // …but never SILENTLY: the reader is told the count it is not seeing. Asserted against
+        // the builder, not a copy of its wording, so a reword cannot quietly pass this.
+        expect(stored[MAX_STORED_ADVISORIES]).toBe(advisoriesTruncatedLine(overflow));
+        expect(stored[MAX_STORED_ADVISORIES]).toContain(String(overflow));
+    });
+
+    it('stores a list exactly at the cap with no truncation line', () => {
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        const lines = Array.from({length: MAX_STORED_ADVISORIES}, (_, i) => `${DROP_LINE} #${i}`);
+        recordSyncOutcome(db, rec.id, {status: 'ok', at: '2026-07-07T10:00:00.000Z', advisories: lines});
+
+        // The boundary: `<=` not `<`, so a full-but-not-over list is not reported as truncated.
+        expect(toPublicProvider(getProvider(db, rec.id)!).last_sync_advisories).toEqual(lines);
+    });
+
+    it('truncates one over-long line without dropping it, and says so', () => {
+        // The second axis of the bound. UNMATCHED_AUTHORS_PREFIX joins the WHOLE unmatched set
+        // into ONE entry, so a first sync of a 2,000-author org writes ~70-100 KB in a single
+        // line — which a 20-LINE cap passes untouched, into a row the admin list serves for
+        // every provider on every 1s poll while a sync is in flight.
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        const huge = `${DROP_LINE} ${'x'.repeat(MAX_STORED_COLUMN_CHARS * 3)}`;
+        recordSyncOutcome(db, rec.id, {status: 'ok', at: '2026-07-07T10:00:00.000Z', advisories: [huge]});
+
+        const stored = toPublicProvider(getProvider(db, rec.id)!).last_sync_advisories;
+        // Kept, not dropped — the line still identifies what it is about…
+        expect(stored).toHaveLength(1);
+        expect(stored[0].startsWith(DROP_LINE)).toBe(true);
+        // …bounded…
+        expect(stored[0]).toHaveLength(MAX_STORED_COLUMN_CHARS + columnTextTruncatedSuffix().length);
+        // …and not silently: a shortened line must not read as a complete one.
+        expect(stored[0].endsWith(columnTextTruncatedSuffix())).toBe(true);
+    });
+
+    it('leaves a line exactly at the character cap untouched', () => {
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        const exact = 'y'.repeat(MAX_STORED_COLUMN_CHARS);
+        recordSyncOutcome(db, rec.id, {status: 'ok', at: '2026-07-07T10:00:00.000Z', advisories: [exact]});
+        // `<=` not `<` on this axis too.
+        expect(toPublicProvider(getProvider(db, rec.id)!).last_sync_advisories).toEqual([exact]);
+    });
+
+    it('bounds the error column by the same cap, and not silently', () => {
+        // The bound is on the ROW, not on the new column. `last_sync_error` is fed by the same
+        // per-repo fan-out (one "[org/repo-N] Failed to fetch commits: …" line per failed repo,
+        // joined), written by the same UPDATE, and served by `GET /api/admin/git/providers` for
+        // EVERY provider on the 1s poll — so an expired token on a 500-repo org is the same
+        // megabyte-scale hazard the advisory cap was added for. Bounding one column and not its
+        // sibling would leave the larger, more likely case unbounded.
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        const perRepo = Array.from(
+            {length: 400},
+            (_, i) => `[github/repo-${i}] Failed to fetch commits: 401 Bad credentials`,
+        ).join('; ');
+        expect(perRepo.length).toBeGreaterThan(MAX_STORED_COLUMN_CHARS);
+
+        recordSyncOutcome(db, rec.id, {
+            status: 'error',
+            at: '2026-07-07T10:00:00.000Z',
+            error: perRepo,
+        });
+
+        const stored = getProvider(db, rec.id)!.last_sync_error!;
+        expect(stored).toHaveLength(MAX_STORED_COLUMN_CHARS + columnTextTruncatedSuffix().length);
+        // The head survives, so the row still names what failed…
+        expect(stored.startsWith('[github/repo-0] Failed to fetch commits')).toBe(true);
+        // …and a shortened summary must not read as the complete failure list.
+        expect(stored.endsWith(columnTextTruncatedSuffix())).toBe(true);
+    });
+
+    it('leaves an error message under the cap byte-identical', () => {
+        // The negative control for the bound above: the ordinary single-line failure — which is
+        // what nearly every real error outcome is — must not gain a marker or lose a character.
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        const message = '[github/api] Failed to fetch commits: 401 Bad credentials';
+        recordSyncOutcome(db, rec.id, {status: 'error', at: '2026-07-07T10:00:00.000Z', error: message});
+        expect(getProvider(db, rec.id)!.last_sync_error).toBe(message);
+    });
+
+    it('cuts an over-long value on a code-point boundary, never mid-surrogate', () => {
+        // Slicing by UTF-16 code unit can leave a LONE surrogate at the cut. It round-trips
+        // through JSON intact (well-formed since ES2019) and then renders as U+FFFD in the
+        // provider row, so the corruption is invisible until an operator reads the line. The
+        // emoji is two code units, so a code-unit slice at an odd offset splits one.
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        const line = '🚀'.repeat(MAX_STORED_COLUMN_CHARS + 50);
+        recordSyncOutcome(db, rec.id, {status: 'ok', at: '2026-07-07T10:00:00.000Z', advisories: [line]});
+
+        const stored = toPublicProvider(getProvider(db, rec.id)!).last_sync_advisories[0];
+        const body = stored.slice(0, stored.length - columnTextTruncatedSuffix().length);
+        expect(Array.from(body)).toHaveLength(MAX_STORED_COLUMN_CHARS);
+        expect(body).toBe('🚀'.repeat(MAX_STORED_COLUMN_CHARS));
+        expect(body).not.toContain('�');
+        // No unpaired surrogate anywhere in the stored value.
+        expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(stored)).toBe(false);
+    });
+
+    it('surfaces a malformed stored value as its raw text rather than failing the row', () => {
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        // Reachable from a hand-edited row: the column is untyped TEXT with no CHECK.
+        db.prepare('UPDATE git_providers SET last_sync_advisories = ? WHERE id = ?').run(
+            'half-written {',
+            rec.id,
+        );
+        expect(toPublicProvider(getProvider(db, rec.id)!).last_sync_advisories).toEqual([
+            'half-written {',
+        ]);
+    });
+
+    it('reports no advisories for column values a `=== null` guard would let through', () => {
+        // The two inputs only the TYPE guard handles. A `record.last_sync_advisories === null`
+        // test passes both straight into the tolerant decoder, which returns a one-entry list
+        // — and the row then renders "reported 1 advisory line(s)" with a blank bullet on
+        // EVERY provider. `undefined` is the serious one: it is what `SELECT *` yields on a
+        // database where migration 045 has not been applied, and the record type is a cast,
+        // not a runtime check.
+        const rec = createProvider(db, keyOk(), {config: GITHUB});
+        db.prepare('UPDATE git_providers SET last_sync_advisories = ? WHERE id = ?').run('', rec.id);
+        expect(toPublicProvider(getProvider(db, rec.id)!).last_sync_advisories).toEqual([]);
+
+        const noColumn = {...getProvider(db, rec.id)!} as GitProviderRecord & {
+            last_sync_advisories?: string | null;
+        };
+        delete noColumn.last_sync_advisories;
+        expect(toPublicProvider(noColumn as GitProviderRecord).last_sync_advisories).toEqual([]);
     });
 });

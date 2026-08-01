@@ -30,7 +30,12 @@ import {
     COMMITS_DROPPED_PREFIX,
     COMMIT_CHURN_UNKNOWN_PREFIX,
     RETRY_HEALED_PREFIX,
+    LEGACY_CELLS_SKIPPED_PREFIX,
+    PROVIDER_DELETED_MID_RUN_PREFIX,
     isAdvisoryError,
+    isPermanentLossAdvisory,
+    isSelfHealedAdvisory,
+    rankAdvisories,
     stallStateKey,
     syncStateKey,
 } from '../../../src/connectors/git/sync';
@@ -39,6 +44,14 @@ import {
     UNATTRIBUTABLE_DATE_DROP_REASON,
 } from '../../../src/connectors/git/providers/types';
 import {MAX_SERVER_ERROR_RETRIES} from '../../../src/connectors/git/providers/http-retry';
+import {
+    MAX_STORED_COLUMN_CHARS,
+    createProvider,
+    getProvider,
+    recordSyncOutcome,
+    toPublicProvider,
+} from '../../../src/connectors/git/providers/store';
+import {loadServerKey} from '../../../src/connectors/git/providers/secret';
 import type {GitProviderConfig} from '../../../src/connectors/git/providers/types';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../../src/storage/migrations');
@@ -980,5 +993,160 @@ describe('unreturned commits are never silent (#275)', () => {
             expect(churnLine).not.toContain('[31m');
             expect(churnLine!.split('\n')).toHaveLength(1);
         });
+
+        it('fits inside the per-line storage cap at its longest realistic shape', async () => {
+            // #289 sizes `MAX_STORED_COLUMN_CHARS` so the lines that carry an OPERATOR
+            // INSTRUCTION arrive whole. This line is the longest one the pipeline emits — it
+            // embeds `permanentSpanRepair()` AND a five-sha sample — and it is also ranked to
+            // the front of the bounded column as permanent loss, so a cap that cuts it mangles
+            // exactly the report the ranking exists to protect.
+            //
+            // Measured against the REAL emitted line at its worst realistic inputs (full
+            // 40-hex shas, a long repo path, the `(+N more)` tail), not against an estimate of
+            // the prose: it is the line length that has to fit, not the repair paragraph.
+            seedAlice(db);
+            // Long but slash-free: the GitHub harness routes list calls by a single path
+            // segment. A GitLab group path is longer still, which the constant's headroom
+            // covers — see MAX_STORED_COLUMN_CHARS.
+            const longRepo = 'platform-infrastructure-service-mesh-control-plane';
+            const shas = Array.from({length: 9}, (_, i) =>
+                String(i + 1).repeat(40).slice(0, 40),
+            );
+            stubGitHub(
+                [],
+                Object.fromEntries(shas.map((s) => [s, {body: statlessDetail(s)}])),
+                [longRepo],
+                {[longRepo]: {body: shas.map((s) => listRow(s))}},
+            );
+
+            const result = await runSync(db);
+
+            const churnLine = churnLineOf(result.errors);
+            expect(churnLine).toBeDefined();
+            expect(churnLine).toContain('(+4 more)');
+            expect(churnLine!.length).toBeLessThanOrEqual(MAX_STORED_COLUMN_CHARS);
+            // TWO-SIDED. An upper bound alone cannot tell "the cap is comfortably above the
+            // line" from "the line collapsed and the cap is now sized against nothing" — and
+            // the constant's docstring cites this measurement as its justification, so the
+            // measurement itself is what has to stay pinned.
+            expect(churnLine!.length).toBeGreaterThan(2_000);
+            // The tail is the part a tight cap eats first, and it is the part an operator uses
+            // to verify the loss — assert it survived rather than only asserting the total.
+            expect(churnLine!.endsWith('.')).toBe(true);
+            expect(churnLine).toContain(shas[0]);
+
+            // Round-trip the REAL line through the store: "the emitted line fits" and "the
+            // store does not cut it" are two different claims, and only this composes them.
+            const db2 = makeDb();
+            try {
+                const key = loadServerKey({
+                    TOPROPE_SECRET_KEY: Buffer.alloc(32, 7).toString('base64'),
+                });
+                const rec = createProvider(db2, key, {config: CONFIG, createdBy: null});
+                recordSyncOutcome(db2, rec.id, {
+                    status: 'ok',
+                    at: '2026-08-01T00:00:00.000Z',
+                    advisories: [churnLine!],
+                });
+                expect(toPublicProvider(getProvider(db2, rec.id)!).last_sync_advisories).toEqual([
+                    churnLine,
+                ]);
+            } finally {
+                db2.close();
+            }
+        });
+    });
+});
+
+/**
+ * #289 — the ordering a BOUNDED advisory surface depends on.
+ *
+ * `git_providers.last_sync_advisories` keeps at most `MAX_STORED_ADVISORIES` lines and
+ * truncates the tail. That is only safe if the list arrives importance-first, and
+ * `SyncResult.errors` arrives close to the OPPOSITE order: every per-provider fetch-phase
+ * line is spliced in first — `RETRY_HEALED_PREFIX` once per healed fetch, so hundreds of them
+ * for a large org riding out rate limiting — while the permanent-loss lines are appended last,
+ * after the write transaction, because only then is the loss real.
+ *
+ * Unit-level rather than through a run, deliberately: producing 20+ real retry-heals requires
+ * two 5-and-15-minute sleeps per heal (`GIT_REPO_RETRY_DELAYS_MS`), so a run-level test of the
+ * over-cap case could only be built on faked time — and what needs pinning is the ordering
+ * rule itself, not the pipeline that feeds it.
+ */
+describe('rankAdvisories — importance order for a bounded surface (#289)', () => {
+    const healed = (n: number): string => `${RETRY_HEALED_PREFIX} [github/repo-${n}] commit fetch succeeded on attempt 2`;
+    const drop = `${COMMITS_DROPPED_PREFIX} [github/api] 3 commit(s)`;
+    const churn = `${COMMIT_CHURN_UNKNOWN_PREFIX} [github/api] 2 commit(s)`;
+
+    it('moves permanent-loss lines ahead of recoverable ones, so a tail cap cannot evict them', () => {
+        // The exact arrival shape of a rate-limited large-org run: noise first, loss last.
+        const arrived = [...Array.from({length: 25}, (_, i) => healed(i)), drop, churn];
+
+        const ranked = rankAdvisories(arrived);
+
+        // A 20-line tail cap applied to `arrived` keeps zero loss lines; applied to `ranked`
+        // it keeps both. That difference IS the finding this function exists to fix.
+        expect(arrived.slice(0, 20).filter((a) => isPermanentLossAdvisory(a))).toEqual([]);
+        expect(ranked.slice(0, 20).filter((a) => isPermanentLossAdvisory(a))).toEqual([drop, churn]);
+    });
+
+    it('is stable within each class and loses nothing', () => {
+        // An operator reading the retained set should see it in the order the run produced it,
+        // and ranking is a REORDER — never a filter. A rank that dropped the recoverable lines
+        // would pass the assertion above while quietly discarding the healed-retry report.
+        const arrived = [healed(0), drop, healed(1), churn, healed(2)];
+        expect(rankAdvisories(arrived)).toEqual([drop, churn, healed(0), healed(1), healed(2)]);
+        expect(rankAdvisories(arrived)).toHaveLength(arrived.length);
+    });
+
+    it('leaves a list with no permanent-loss line exactly as it arrived', () => {
+        const arrived = [healed(0), healed(1)];
+        expect(rankAdvisories(arrived)).toEqual(arrived);
+        expect(rankAdvisories([])).toEqual([]);
+    });
+
+    it('sinks self-healed lines BELOW the actionable ones, so the cap evicts them first', () => {
+        // Two tiers were not enough. `RETRY_HEALED_PREFIX` is the only class with unbounded
+        // cardinality — one line per healed fetch, per repo, per fetch kind — AND it arrives
+        // first (spliced in during fetch). Ranked as merely "not permanent" it fills the whole
+        // remainder of the surface, evicting the two lines that arrive last and carry an
+        // operator INSTRUCTION. This is the same shape as the test above, plus the actionable
+        // middle tier the two-tier fixture could not detect the loss of.
+        const deleted = `${PROVIDER_DELETED_MID_RUN_PREFIX} [github/api] provider removed mid-run`;
+        const legacy = `${LEGACY_CELLS_SKIPPED_PREFIX} [github/api] 4 legacy day(s) skipped`;
+        const arrived = [...Array.from({length: 25}, (_, i) => healed(i)), deleted, legacy, drop];
+
+        const ranked = rankAdvisories(arrived);
+        const kept = ranked.slice(0, 20);
+
+        // Permanent loss first, then the actionable middle tier — both inside a 20-line cap
+        // that arrival order, and two-tier ranking, would have spent entirely on healed lines.
+        expect(ranked.slice(0, 3)).toEqual([drop, deleted, legacy]);
+        expect(kept).toContain(deleted);
+        expect(kept).toContain(legacy);
+        expect(arrived.slice(0, 20)).not.toContain(deleted);
+        // Nothing is dropped — ranking is a reorder, and the healed lines keep their order.
+        expect(ranked).toHaveLength(arrived.length);
+        expect(ranked.slice(3)).toEqual(Array.from({length: 25}, (_, i) => healed(i)));
+    });
+
+    it('classifies a healed retry as self-healed and nothing else as self-healed', () => {
+        expect(isSelfHealedAdvisory(healed(0))).toBe(true);
+        expect(isSelfHealedAdvisory(drop)).toBe(false);
+        expect(isSelfHealedAdvisory(churn)).toBe(false);
+        expect(
+            isSelfHealedAdvisory(`${PROVIDER_DELETED_MID_RUN_PREFIX} [github/api] removed`),
+        ).toBe(false);
+        expect(isSelfHealedAdvisory(`${LEGACY_CELLS_SKIPPED_PREFIX} [github/api] 4 day(s)`)).toBe(
+            false,
+        );
+    });
+
+    it('classifies only the un-re-askable sentinels as permanent loss', () => {
+        // Both directions, against strings the code itself builds: a recoverable advisory
+        // ranked as permanent would push the real loss down and back under the cap.
+        expect(isPermanentLossAdvisory(drop)).toBe(true);
+        expect(isPermanentLossAdvisory(churn)).toBe(true);
+        expect(isPermanentLossAdvisory(healed(0))).toBe(false);
     });
 });

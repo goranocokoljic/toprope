@@ -1,0 +1,38 @@
+-- #289: git_providers.last_sync_advisories — the ADVISORY half of a scoped sync run's
+-- report, kept separate from `last_sync_error` so it can be recorded without turning the
+-- provider red.
+--
+-- `SyncResult.errors` carries two different things (see `isAdvisoryError` in
+-- connectors/git/sync.ts): FAILURES, which must flip the row to `last_sync_status = 'error'`,
+-- and ADVISORIES, which describe the steady state of a healthy sync (unmatched CI bots, an
+-- auto-create summary, a healed retry) or a loss the run could not prevent. Before this
+-- column the admin "Sync now" / "Sync older history" routes classified advisories out and
+-- recorded `status: 'ok'`, which NULLs `last_sync_error` — and those routes write no
+-- `sync_logs` row at all, so on the one interactive path an operator drives, an advisory was
+-- neither returned (the route is fire-and-forget), nor persisted, nor logged.
+--
+-- That matters most for `COMMITS_DROPPED_PREFIX` (#275), which reports an IRREVERSIBLE loss
+-- behind an already-advanced cursor: the whole purpose of that line is to be seen, and the
+-- surface an operator reaches for *after* noticing a problem was the one surface that
+-- discarded it.
+--
+-- Shape: JSON array of strings, or NULL for "the last run reported none" (the codec in
+-- storage/string-array-column.ts owns both directions; `sync_logs.errors` uses the same one).
+-- Deliberately NOT a CHECK-constrained or normalized shape — these are human-readable report
+-- lines, not a closed vocabulary, and the decoder is tolerant so a malformed value degrades
+-- to its raw text rather than making the row unreadable.
+--
+-- Scope: this column describes the LAST SCOPED run only, exactly like `last_sync_at` /
+-- `last_sync_status` / `last_sync_error` beside it — all four are written ONLY by the admin
+-- per-provider routes, never by the scheduler or the CLI, so a nightly run neither populates
+-- nor clears them. It is a report surface, not a ledger: the durable per-run history on the
+-- scheduled path stays `sync_logs.errors`, which no dashboard surface renders yet. An empty
+-- column is therefore "the last manual sync reported nothing", NOT "nothing has been lost" —
+-- the UI says "Last manual sync" for that reason.
+--
+-- Retention note: advisory text can embed third-party commit-author logins and emails (the
+-- unmatched-authors line names every author with no developer record — external contributors
+-- and bots). That data class already lives in `sync_logs.errors`; what is new here is that it
+-- is served by GET /api/admin/git/providers, which is admin-gated, and that its only expiry is
+-- the next scoped run reporting nothing. Deleting the provider drops the row with it.
+ALTER TABLE git_providers ADD COLUMN last_sync_advisories TEXT;

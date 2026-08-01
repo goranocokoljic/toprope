@@ -12,6 +12,7 @@ import {
     outcomeBelongsToRun,
     parseReposList,
     repoScopeLabel,
+    syncAdvisoryHeading,
     syncProgressLabel,
     syncStageAnnouncement,
     syncTerminalAnnouncement,
@@ -56,6 +57,7 @@ const DB_GITHUB: AdminGitProvider = {
     last_sync_at: '2026-07-01T10:00:00.000Z',
     last_sync_status: 'ok',
     last_sync_error: null,
+    last_sync_advisories: [],
     active_sync: null,
     first_sync_pending: false,
 };
@@ -80,6 +82,7 @@ const CONFIG_GITLAB: AdminGitProvider = {
     last_sync_at: null,
     last_sync_status: null,
     last_sync_error: null,
+    last_sync_advisories: [],
     active_sync: null,
     first_sync_pending: false,
 };
@@ -2567,6 +2570,153 @@ describe('AdminGitProviders — sync completion announced to assistive tech (#27
         );
         expect(live.textContent).not.toContain('Sync completed');
     }, 10000);
+});
+
+/**
+ * #289 — the provider row is the surface that RENDERS what a sync reported but did not fail
+ * on. The server half is worthless without it: an advisory persisted to a column nothing
+ * draws is the same invisibility, one layer down.
+ */
+describe('AdminGitProviders — last-sync advisories (#289)', () => {
+    const DROP_LINE =
+        'Commits dropped as unattributable: [github/api] 3 commit(s) — deadbeef, cafebabe';
+    const UNMATCHED_LINE = 'Unmatched authors (no developer record found): dependabot[bot]';
+
+    it('renders every advisory line the last run reported, without turning the row red', async () => {
+        providers = [
+            {...structuredClone(DB_GITHUB), last_sync_advisories: [DROP_LINE, UNMATCHED_LINE]},
+        ];
+        renderPage();
+
+        const panel = await screen.findByTestId('sync-advisories');
+        expect(panel).toHaveTextContent(syncAdvisoryHeading(2, 'ok'));
+        // Both lines in full — a summary count with the text truncated away would be a
+        // pointer to information the operator still cannot reach.
+        expect(panel).toHaveTextContent(DROP_LINE);
+        expect(panel).toHaveTextContent(UNMATCHED_LINE);
+
+        // The tone claim, asserted where it can actually fail. The status Badge below is
+        // driven purely by `last_sync_status`, so a Badge assertion cannot catch this panel
+        // being restyled `danger` — which would re-introduce in the UI the very
+        // misclassification the server-side `isAdvisoryError` split exists to prevent.
+        expect(panel.className).toContain('warning');
+        expect(panel.className).not.toContain('danger');
+
+        // …and the run is still reported as the success it was.
+        const row = (await screen.findByText('acme-org')).closest('tr') as HTMLElement;
+        expect(within(row).getByText('ok')).toBeInTheDocument();
+        expect(within(row).queryByText('error')).toBeNull();
+    });
+
+    it('does not claim the sync succeeded on a row whose run FAILED', async () => {
+        // Advisories are recorded on both outcomes on purpose — a run that fails can still
+        // have reported an irreversible loss before it did. A fixed "the sync itself did not
+        // fail" caption would then sit directly under an `error` badge and contradict it, on
+        // the one row where the operator most needs a coherent story.
+        providers = [
+            {
+                ...structuredClone(DB_GITHUB),
+                last_sync_status: 'error',
+                last_sync_error: 'GitHub API error 401',
+                last_sync_advisories: [DROP_LINE],
+            },
+        ];
+        renderPage();
+
+        const panel = await screen.findByTestId('sync-advisories');
+        expect(panel).toHaveTextContent(syncAdvisoryHeading(1, 'error'));
+        expect(panel.textContent).not.toContain('the sync itself did not fail');
+        // A literal, not only the builder: asserting against the function that produced the
+        // text passes for any rewording, including one that drops the qualifier entirely.
+        expect(panel.textContent).toContain('reported separately from the failure above');
+        // Still amber, not red: the advisory is not the failure.
+        expect(panel.className).toContain('warning');
+    });
+
+    it('makes no not-failed claim for a status it does not recognize', async () => {
+        // `last_sync_status` is unvalidated wire data on a column whose CHECK admits a wider
+        // set than the two values the writer produces. "the sync itself did not fail" is a
+        // positive claim about the run, so an unrecognized value must fall through to a
+        // claim-free qualifier rather than default into the reassuring branch.
+        providers = [
+            {
+                ...structuredClone(DB_GITHUB),
+                last_sync_status: 'never' as unknown as 'ok',
+                last_sync_advisories: [DROP_LINE],
+            },
+        ];
+        renderPage();
+
+        const panel = await screen.findByTestId('sync-advisories');
+        expect(panel.textContent).toContain('Last manual sync reported 1 advisory line(s)');
+        expect(panel.textContent).not.toContain('the sync itself did not fail');
+        expect(panel.textContent).not.toContain('reported separately from the failure above');
+    });
+
+    it('keeps the last run\'s advisories visible while a new run is in flight', async () => {
+        // The panel describes the last SETTLED manual run, exactly like the status Badge and
+        // timestamp beside it. Hiding it the moment a retry starts would make the drop report
+        // disappear at precisely the moment the operator acts on it.
+        providers = [
+            {
+                ...structuredClone(DB_GITHUB),
+                last_sync_advisories: [DROP_LINE],
+                active_sync: {
+                    started_at: '2026-07-13T10:00:00.000Z',
+                    progress: {
+                        stage: 'fetching',
+                        repos_total: 3,
+                        repos_processed: 1,
+                        current_repo: 'web',
+                        commits_fetched: 10,
+                        prs_fetched: 0,
+                        developers_matched: 0,
+                        repo_step: 'commits',
+                        repo_step_done: 5,
+                        repo_step_scanned: null,
+                        repo_step_total: 50,
+                    },
+                },
+            },
+        ];
+        renderPage();
+
+        expect(await screen.findByTestId('sync-advisories')).toHaveTextContent(DROP_LINE);
+        expect(screen.getByTestId('sync-progress')).toBeInTheDocument();
+    });
+
+    it('renders nothing when the last run reported no advisories', async () => {
+        // The negative control: DB_GITHUB's `last_sync_advisories` is `[]`, which is what
+        // every clean run stores. Without this, a panel rendered unconditionally (or one fed
+        // a fabricated line) would pass the test above.
+        providers = [structuredClone(DB_GITHUB)];
+        renderPage();
+        await screen.findByText('acme-org');
+        expect(screen.queryByTestId('sync-advisories')).toBeNull();
+    });
+
+    it('scopes the heading to the manual run the column actually describes', async () => {
+        // `last_sync_advisories`, like every `last_sync_*` column, is written only by the
+        // admin per-provider routes — the scheduler never touches them. "Last sync reported…"
+        // would therefore assert something about a nightly run this row knows nothing about,
+        // and (worse) an empty panel would read as "nothing was lost".
+        providers = [{...structuredClone(DB_GITHUB), last_sync_advisories: [DROP_LINE]}];
+        renderPage();
+        const panel = await screen.findByTestId('sync-advisories');
+        expect(panel).toHaveTextContent('Last manual sync reported');
+    });
+
+    it('is not a live region — the row already owns the announced sync lifecycle', async () => {
+        // #278 put ONE `role="status"` per row, in the "Last sync" cell, deliberately kept
+        // low-churn. An advisory list appearing on a poll is not a lifecycle event, and a
+        // second live region in the same row competes with the one that is.
+        providers = [{...structuredClone(DB_GITHUB), last_sync_advisories: [DROP_LINE]}];
+        renderPage();
+        const panel = await screen.findByTestId('sync-advisories');
+        expect(panel).not.toHaveAttribute('role');
+        expect(panel).not.toHaveAttribute('aria-live');
+        expect(panel.querySelector('[role="status"], [aria-live]')).toBeNull();
+    });
 });
 
 describe('AdminGitProviders — add-flow repo selection (#211)', () => {

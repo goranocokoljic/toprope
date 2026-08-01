@@ -30,6 +30,10 @@ import {providerConfigToRowFields, rowToProviderConfig, type GitProviderRow} fro
 import {decryptSecret, encryptSecret, type SecretMeta, type ServerKeyResult} from './secret.js';
 import {normalizeContainer, sameContainer} from './container.js';
 import type {GitProviderConfig, GitProviderType} from './types.js';
+import {
+    decodeStringArrayColumn,
+    encodeStringArrayColumn,
+} from '../../../storage/string-array-column.js';
 
 /** The mask shown in place of a secret — a fixed run of bullets, never key material. */
 const TOKEN_MASK = '••••';
@@ -95,6 +99,8 @@ export interface GitProviderRecord {
     last_sync_at: string | null;
     last_sync_status: string | null;
     last_sync_error: string | null;
+    /** JSON array of the last run's advisory lines, or NULL for none (#289). */
+    last_sync_advisories: string | null;
 }
 
 /**
@@ -125,6 +131,13 @@ export interface PublicGitProvider {
     last_sync_at: string | null;
     last_sync_status: string | null;
     last_sync_error: string | null;
+    /**
+     * The last run's ADVISORY lines — decoded, and `[]` (never null) when there were none
+     * (#289). Separate from `last_sync_error` because an advisory must be visible WITHOUT
+     * being a failure: a non-empty list here says nothing about `last_sync_status`, and a
+     * run can legitimately be `ok` with entries, or `error` with both.
+     */
+    last_sync_advisories: string[];
 }
 
 /** Create input: the validated provider shape (its `auth` carries the plaintext token) + audit/enable flags. */
@@ -305,8 +318,8 @@ export function createProvider(
                 id, type, container, url, include_subgroups, auth_method, auth_username,
                 token_ciphertext, token_meta, token_last4, repos_include, repos_exclude,
                 enabled, created_at, updated_at, created_by,
-                last_sync_at, last_sync_status, last_sync_error
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)`,
+                last_sync_at, last_sync_status, last_sync_error, last_sync_advisories
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL)`,
         ).run(
             id,
             fields.type,
@@ -522,6 +535,138 @@ export interface SyncOutcome {
     at: string;
     /** The failure summary on `status: 'error'`; ignored (cleared) on `'ok'`. */
     error?: string | null;
+    /**
+     * The run's ADVISORY lines (#289) — recorded on BOTH statuses, because a run that
+     * failed can still have reported an irreversible commit drop before it did, and that
+     * report must not be lost to the failure beside it.
+     *
+     * The caller classifies AND orders. `isAdvisoryError` (connectors/git/sync.ts) is the
+     * single classifier every consumer shares; this function persists what it is handed and
+     * does not re-derive the split, so passing a genuine failure here would hide it from the
+     * red/green surface. It is likewise handed the list MOST-IMPORTANT-FIRST — see
+     * {@link MAX_STORED_ADVISORIES} for why that matters and `rankAdvisories` (beside the
+     * sentinels, which is where their relative severity is knowable) for the ordering.
+     *
+     * Omitted (or empty) clears the column — this describes the LAST run, exactly like
+     * `error` beside it, so a run that reported nothing must not leave the previous run's
+     * advisories standing as if they were its own.
+     *
+     * @see isAdvisoryError in `src/connectors/git/sync.ts` — the classifier this trusts.
+     * @see rankAdvisories in `src/connectors/git/sync.ts` — the ordering this assumes.
+     */
+    advisories?: readonly string[];
+}
+
+/**
+ * How many advisory lines a provider row will store for one run.
+ *
+ * A bound, not a preference. Several sentinels emit ONE LINE PER REPO
+ * (`COMMITS_DROPPED_PREFIX` is per repo, and a systemic response-shape problem hits every
+ * repo at once), so an unbounded column would let a 500-repo org write hundreds of
+ * kilobytes into a row that `GET /api/admin/git/providers` then serves for EVERY provider
+ * on every 1s poll while a sync is in flight.
+ *
+ * The cap truncates the TAIL, which is only safe because the caller hands the list in
+ * importance order (`rankAdvisories`). Arrival order is close to the INVERSE of importance —
+ * the permanent-loss lines are appended after the write transaction, behind every healed-retry
+ * line the run produced — so a cap applied to the raw order would evict exactly the report
+ * this column exists to keep.
+ */
+export const MAX_STORED_ADVISORIES = 20;
+
+/**
+ * How many characters of ONE stored text value this row will keep — one advisory line, or
+ * the whole `last_sync_error` summary.
+ *
+ * The second axis of the same bound, and not redundant with the line cap: a single line can
+ * be arbitrarily long on its own. `UNMATCHED_AUTHORS_PREFIX` joins the WHOLE unmatched-author
+ * set into one entry, and on the first sync of a not-yet-mapped org that is every author in
+ * the history — ~70-100 KB for a 2,000-author org, which passes a 20-LINE cap untouched.
+ *
+ * It governs BOTH columns because the hazard is the row, not the column: `last_sync_error` is
+ * written by the same statement, from the same per-repo fan-out (one entry per failed repo
+ * fetch, joined), and served by the same `GET /api/admin/git/providers` on the same 1s poll —
+ * so a 500-repo org with an expired token would ship a megabyte-scale row once a second. A
+ * bound that stopped at the advisory column would be a bound on the smaller of two identical
+ * hazards. The invariant to hold is "this row is bounded".
+ *
+ * SIZED FROM A MEASUREMENT, not from an estimate of the prose. The longest single-purpose
+ * advisory is `COMMIT_CHURN_UNKNOWN_PREFIX`, which embeds the permanent-span repair
+ * instruction AND a five-sha sample: at its worst realistic inputs (full 40-hex shas, a long
+ * repo path, a `(+N more)` tail) the emitted LINE measures ~2.15 KB — the repair prose alone
+ * is only ~0.8 KB, so sizing against the paragraph rather than the line is what put an
+ * earlier 2 KB cap underneath it. That is also the line `rankAdvisories` moves to the FRONT
+ * as permanent loss, so a cap below it would mangle precisely the report the ranking exists
+ * to protect, cutting the `Affected: <shas>` tail an operator verifies the loss with. 4 KB
+ * leaves ~1.8 KB of headroom for a longer container path or future prose.
+ *
+ * `tests/connectors/git/commit-loss.test.ts` pins the real line against this constant from
+ * BOTH sides — it fails if the line outgrows the cap, and equally if the measurement this
+ * number was chosen from stops being true — and round-trips it through the store to prove the
+ * emitted line and the stored one are the same string. It is a bound, not an early warning:
+ * prose can still grow ~1.8 KB before anything fails. Re-measure rather than re-estimate if
+ * that headroom is spent.
+ *
+ * Together the two caps bound the advisory column at roughly `20 × 4 KB` ≈ 80 KB worst case,
+ * with the realistic case far below it (most lines are a few hundred bytes).
+ */
+export const MAX_STORED_COLUMN_CHARS = 4_000;
+
+/**
+ * The line appended in place of the advisories the cap dropped.
+ *
+ * Exported so a test asserts against the string the code actually emits rather than a copy
+ * of it, and so the truncation is never SILENT: a reader of the column is told the count it
+ * is not seeing and where the full set lives, instead of reading 20 lines as "that was all
+ * of them".
+ *
+ * The surface it names is a CONTRACT on the caller, not a guess: a caller that bounds this
+ * column must also write the complete, unbounded set to the server log for the same run.
+ * The one caller today — the admin scoped-sync route — does exactly that, and a route test
+ * pins it. Naming `toprope sync git` or `sync_logs.errors` here would be worse than saying
+ * nothing: neither holds THIS run's advisories (this column is only ever written by the
+ * scoped admin path, which is neither the CLI nor the scheduled path), so it would send an
+ * operator to look somewhere guaranteed to be empty.
+ */
+export function advisoriesTruncatedLine(omitted: number): string {
+    return (
+        `… and ${omitted} more advisory line(s) omitted — this row keeps at most ` +
+        `${MAX_STORED_ADVISORIES}. The complete set for this run was written to the server ` +
+        'log, keyed by this provider id.'
+    );
+}
+
+/**
+ * The marker appended to one stored value the character cap cut.
+ *
+ * Same reason as {@link advisoriesTruncatedLine}: a silently shortened value reads as a
+ * complete one, and these lines can end in an operator instruction.
+ */
+export function columnTextTruncatedSuffix(): string {
+    return `… [truncated at ${MAX_STORED_COLUMN_CHARS} characters — see the server log]`;
+}
+
+/**
+ * The character cap, applied to one stored text value.
+ *
+ * Sliced with `Array.from` rather than `String.prototype.slice` so the cut lands on a code
+ * POINT boundary: cutting by UTF-16 code unit can leave a lone surrogate, which round-trips
+ * through JSON intact and then renders as U+FFFD in the provider row.
+ */
+function boundStoredText(value: string): string {
+    const points = Array.from(value);
+    return points.length <= MAX_STORED_COLUMN_CHARS
+        ? value
+        : points.slice(0, MAX_STORED_COLUMN_CHARS).join('') + columnTextTruncatedSuffix();
+}
+
+// Apply both caps, naming what each one dropped. Kept beside the constants they enforce so
+// the "no silent caps" property is one function, not a rule spread across call sites.
+// Assumes an importance-ordered input — see MAX_STORED_ADVISORIES.
+function boundAdvisories(advisories: readonly string[]): string[] {
+    const kept = advisories.slice(0, MAX_STORED_ADVISORIES).map(boundStoredText);
+    const omitted = advisories.length - kept.length;
+    return omitted > 0 ? [...kept, advisoriesTruncatedLine(omitted)] : kept;
 }
 
 // Runtime allowlist for the outcome status (review-rule: allowlist at the write
@@ -531,12 +676,17 @@ const SYNC_OUTCOME_STATUSES: readonly SyncOutcomeStatus[] = ['ok', 'error'];
 
 /**
  * Persist the terminal result of a sync-now run (GC1.7 / #199) onto the provider
- * row: `last_sync_at`, `last_sync_status`(ok|error), and `last_sync_error`. On
- * `ok` the error column is cleared; on `error` a non-blank summary is stored (a
- * failed sync must surface its message to the UI, never a swallowed error — so a
- * missing/blank message is coerced to a generic non-null sentinel rather than
+ * row: `last_sync_at`, `last_sync_status`(ok|error), `last_sync_error`, and
+ * `last_sync_advisories`. On `ok` the error column is cleared; on `error` a non-blank
+ * summary is stored (a failed sync must surface its message to the UI, never a swallowed
+ * error — so a missing/blank message is coerced to a generic non-null sentinel rather than
  * left NULL, which the UI would read as "clean"). Returns true when the row
  * existed and was updated. Fail-closed on an unknown status.
+ *
+ * The advisory column is written on BOTH statuses and is INDEPENDENT of the red/green one
+ * (#289): recording an advisory must never be what turns a provider red, and a provider
+ * turning red must never be what discards its advisories. One UPDATE writes all four, so a
+ * row can never hold one run's status beside another run's report.
  */
 export function recordSyncOutcome(db: Database.Database, id: string, outcome: SyncOutcome): boolean {
     if (!SYNC_OUTCOME_STATUSES.includes(outcome.status)) {
@@ -545,16 +695,25 @@ export function recordSyncOutcome(db: Database.Database, id: string, outcome: Sy
             `Refusing to record unknown sync status: "${String(outcome.status)}"`,
         );
     }
-    // On error a non-null message is mandatory (see doc); on ok it is always NULL.
+    // On error a non-null message is mandatory (see doc); on ok it is always NULL. Bounded by
+    // the SAME cap as an advisory line: this column is fed by the same per-repo fan-out, in
+    // the same UPDATE, and served on the same 1s poll — see MAX_STORED_COLUMN_CHARS.
     const errorText =
         outcome.status === 'error'
-            ? (outcome.error && outcome.error.trim() !== '' ? outcome.error : 'Sync failed (no error message)')
+            ? boundStoredText(
+                  outcome.error && outcome.error.trim() !== ''
+                      ? outcome.error
+                      : 'Sync failed (no error message)',
+              )
             : null;
+    const advisoriesText = encodeStringArrayColumn(boundAdvisories(outcome.advisories ?? []));
     const changes = db
         .prepare(
-            'UPDATE git_providers SET last_sync_at = ?, last_sync_status = ?, last_sync_error = ? WHERE id = ?',
+            `UPDATE git_providers
+             SET last_sync_at = ?, last_sync_status = ?, last_sync_error = ?, last_sync_advisories = ?
+             WHERE id = ?`,
         )
-        .run(outcome.at, outcome.status, errorText, id).changes;
+        .run(outcome.at, outcome.status, errorText, advisoriesText, id).changes;
     return changes > 0;
 }
 
@@ -586,6 +745,21 @@ export function toPublicProvider(record: GitProviderRecord): PublicGitProvider {
         last_sync_at: record.last_sync_at,
         last_sync_status: record.last_sync_status,
         last_sync_error: record.last_sync_error,
+        // Flattened to `[]` rather than passed through as null: the wire field answers
+        // "what did the last run report", and one spelling of "nothing" is enough for a
+        // client that only ever wants to iterate it.
+        //
+        // Guarded on the TYPE, not on `=== null`, because the record is a `SELECT *` row
+        // cast to `GitProviderRecord` — a cast is not a runtime type. Two reachable values
+        // the narrower check would pass straight into the decoder: `undefined`, on a
+        // database where migration 045 has not been applied (the column does not exist, so
+        // the property is absent), and `''` from a hand-edited row. Both would come back
+        // out of the tolerant decoder as a one-entry list, and the UI would render a
+        // phantom advisory with a blank bullet on every provider.
+        last_sync_advisories:
+            typeof record.last_sync_advisories === 'string' && record.last_sync_advisories !== ''
+                ? decodeStringArrayColumn(record.last_sync_advisories)
+                : [],
     };
 }
 
