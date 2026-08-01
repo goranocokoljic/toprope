@@ -304,6 +304,20 @@ export interface GitFetchProgress {
      * left an operator unable to tell a walk still approaching its window from a hang —
      * the exact symptom #270 exists to remove.
      *
+     * WHAT A DIVERGENCE MEANS, now that it means one thing (#292). `scanned - done` is
+     * window-filtered rows plus rows the producer reported through
+     * {@link GitCommitDropListener}, and nothing else — so an excess is either a walk still
+     * approaching its window (benign, and the entire point of this field) or a loss that is
+     * ALREADY stated in `errors[]` / `last_sync_advisories`. It is never, on its own, evidence
+     * that something vanished. That was not true when this field was introduced: Bitbucket's
+     * filter compared a `new Date(row.date)` that an unparseable date made an Invalid Date,
+     * which is `false` against BOTH bounds, so such a row left the walk by a third exit that
+     * recorded nothing. A forward run's `1200 commits found (1201 scanned)` therefore read
+     * identically to the benign case while a day was permanently short. Pinning the day shape
+     * before the window comparison (#290) closed that exit; #292 is where the docs stop hedging
+     * about it. A producer that adds a THIRD way to decline a row must give it a channel too,
+     * or this sentence becomes false again.
+     *
      * Two limits on what a moving count proves, both deliberate and neither fixed here.
      * It advances only BETWEEN requests: `fetchBitbucket`'s rate-limit and 5xx backoff
      * sleeps silently (see `http-retry.ts`), so a 429 on this request-dense walk still

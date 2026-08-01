@@ -727,6 +727,64 @@ describe('BitbucketProvider', () => {
             expect(fetchMock).toHaveBeenCalledTimes(2);
         });
 
+        // --- the fall-through the #276 counts made visible (#292) ---
+
+        it('reports an UNPARSEABLE date scanned inside a bounded window instead of losing it', async () => {
+            // THE EXACT INPUT #292 IS ABOUT, and the one input class no other test here feeds.
+            // `new Date('not-a-date')` is an Invalid Date, and an Invalid Date compares FALSE
+            // against BOTH bounds below the gate — so with `since` AND `until` both set it
+            // neither trips `commitDate < sinceDate` nor satisfies `commitDate <= untilDate`.
+            // Before the gate it therefore fell out of the loop retained by nothing and reported
+            // by nothing, while the caller read the normal return as "window fully covered" and
+            // advanced the cursor past it (#231) — a permanent, invisible hole in `git_snapshots`.
+            //
+            // Distinct from the two #290 tests above, which cannot fail for this: the expanded-year
+            // fixture is a VALID far-future Date, so the window filter already removed it (wrongly,
+            // but not by fall-through), and the `'not-a-date'` one runs with both bounds EMPTY,
+            // where `!untilDate` short-circuits and the row is kept rather than lost. Only a
+            // bounded window plus an unparseable date reproduces the fall-through.
+            const fetchMock = makeFetchMock([
+                {
+                    body: pagedResponse([
+                        makeCommitFixture('kept-newer', {date: '2024-01-20T00:00:00+00:00'}),
+                        makeCommitFixture('bad', {date: 'not-a-date'}),
+                        makeCommitFixture('kept-older', {date: '2024-01-10T00:00:00+00:00'}),
+                    ]),
+                },
+                {body: pagedResponse(makeDiffstatFixture())}, // diffstat for kept-newer
+                {body: pagedResponse(makeDiffstatFixture())}, // diffstat for kept-older
+            ]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            const onDrop = vi.fn();
+            const onProgress = vi.fn();
+            const commits = await provider.getCommits(
+                'my-repo',
+                '2024-01-01T00:00:00Z',
+                '2024-02-01T00:00:00Z',
+                onProgress,
+                onDrop,
+            );
+
+            // Half one: excluded from the result, and the rows AFTER it still arrive — the gate
+            // `continue`s rather than reading an undatable row as the newest-first `since` cutoff.
+            expect(commits.map((c) => c.sha)).toEqual(['kept-newer', 'kept-older']);
+            // Half two: it is no longer silent. `'not-a-date'` is PRESENT but unusable, so it
+            // classifies as unattributable — not the truncated-response reason, whose remedy
+            // ("go find the garbled body") would send the operator somewhere else entirely.
+            expect(onDrop.mock.calls.map((c) => c[0])).toEqual([
+                {sha: 'bad', reason: UNATTRIBUTABLE_DATE_DROP_REASON},
+            ]);
+            // Half three, and what ties this to #276: the endpoint HANDED the row over, so it is
+            // counted in `scanned`. This is a forward-shaped run — every other row is inside the
+            // window — so the drop is the ONLY thing separating the two counts, which is precisely
+            // the `2 commits found (3 scanned)` line an operator now reads alongside the advisory.
+            const listingTicks = onProgress.mock.calls
+                .map((c) => c[0] as {done: number; total: number | null; scanned?: number})
+                .filter((p) => p.total === null);
+            expect(listingTicks).toEqual([{done: 2, total: null, scanned: 3}]);
+        });
+
         it('reports the PR-list page that hits the since cutoff', async () => {
             // Unlike the commit walk, getPullRequests reports BEFORE deciding whether to
             // stop, and there is a real `await` on the next iteration for a non-final
