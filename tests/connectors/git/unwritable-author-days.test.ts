@@ -30,11 +30,20 @@ import {
     COMMITS_DROPPED_PREFIX,
     GitSync,
     LEGACY_CELLS_SKIPPED_PREFIX,
+    PR_RECORDS_SKIPPED_PREFIX,
     isAdvisoryError,
     isPermanentLossAdvisory,
     rankAdvisories,
     syncStateKey,
 } from '../../../src/connectors/git/sync';
+import {
+    MAX_STORED_COLUMN_CHARS,
+    createProvider,
+    getProvider,
+    recordSyncOutcome,
+    toPublicProvider,
+} from '../../../src/connectors/git/providers/store';
+import {loadServerKey} from '../../../src/connectors/git/providers/secret';
 import {
     GITHUB_CONFIG,
     GITLAB_CONFIG,
@@ -72,10 +81,20 @@ function makeDb(): Database.Database {
     return db;
 }
 
-/** Resolvable by commit email on every provider, so cells actually project. */
+/**
+ * Resolvable by commit email on every provider, so cells actually project — AND by the github
+ * login the PR fixtures author under.
+ *
+ * That second half is load-bearing, not tidiness: `upsertPRRecord` only runs for a PR whose
+ * author resolves to a developer (`if (developerId) upsertPRRecord(...)`), so a fixture whose
+ * github id does not match `alice-gh` leaves the entire `pr_records` write path dark — and that
+ * path holds the run's OTHER unvalidated `NOT NULL` bind (#302 review cycle 1, SEC-1).
+ */
 function seedAlice(db: Database.Database): string {
     addTeam(db, 'eng');
-    return addDeveloper(db, 'alice', 'eng', AUTHOR_EMAIL, 'Alice').id;
+    const dev = addDeveloper(db, 'alice', 'eng', AUTHOR_EMAIL, 'Alice');
+    db.prepare(`UPDATE developers SET external_ids = '{"github":"alice-gh"}' WHERE id = ?`).run(dev.id);
+    return dev.id;
 }
 
 interface GitHubPRFields {
@@ -155,6 +174,15 @@ function skipLineOf(errors: string[]): string | undefined {
     return errors.find((e) => e.startsWith(AUTHOR_DAYS_SKIPPED_PREFIX));
 }
 
+function prLineOf(errors: string[]): string | undefined {
+    return errors.find((e) => e.startsWith(PR_RECORDS_SKIPPED_PREFIX));
+}
+
+function countRows(db: Database.Database, table: string): number {
+    return (db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as {n: number}).n;
+}
+
+
 interface RawRow {
     provider: string;
     date: string;
@@ -209,7 +237,7 @@ describe('#302 an unwritable author-day costs that row, not the run', () => {
     });
 
     describe('a malformed PR / review-comment date', () => {
-        it('costs GitHub one author-day row and leaves GitLab s whole window committed', async () => {
+        it("costs GitHub one author-day row and leaves GitLab's whole window committed", async () => {
             seedAlice(db);
             vi.stubGlobal(
                 'fetch',
@@ -249,7 +277,7 @@ describe('#302 an unwritable author-day costs that row, not the run', () => {
             expect(line).toContain('github:login:alice-gh');
         });
 
-        it('costs Bitbucket one author-day row and leaves GitLab s whole window committed', async () => {
+        it("costs Bitbucket one author-day row and leaves GitLab's whole window committed", async () => {
             seedAlice(db);
             vi.stubGlobal(
                 'fetch',
@@ -320,9 +348,20 @@ describe('#302 an unwritable author-day costs that row, not the run', () => {
             expect(github[0].commits).toBe(3);
             expect(cursorOf(db, GITHUB_CURSOR)).toBeDefined();
             expect(skipLineOf(result.errors)).toContain('refused as invalid_date');
+            // The day the row was refused FOR — `toDateString` yields `''` for a non-string, and
+            // the line has to name that rather than print an empty gap between two words.
+            expect(skipLineOf(result.errors)).toContain('github:login:alice-gh on <empty>');
+            // …and the OTHER write in the same transaction refused it too, rather than binding a
+            // NULL into `pr_records.created_at` and rolling the run back (review cycle 1, SEC-1).
+            const prLine = prLineOf(result.errors);
+            expect(prLine).toContain('[github/test-org]');
+            expect(prLine).toContain('1 PR(s)');
+            expect(prLine).toContain('refused as missing_created_at');
+            expect(prLine).toContain('repo1#1');
+            expect(countRows(db, 'pr_records')).toBe(0);
         });
 
-        it('costs the review comment s own row and nothing else', async () => {
+        it("costs the review comment's own row and nothing else", async () => {
             seedAlice(db);
             vi.stubGlobal(
                 'fetch',
@@ -350,7 +389,7 @@ describe('#302 an unwritable author-day costs that row, not the run', () => {
     });
 
     describe('the NaN avg_time_to_merge_hours door', () => {
-        it('keeps the merged day s commits when created_at is unparseable, reporting it unknown', async () => {
+        it("keeps the merged day's commits when created_at is unparseable, reporting it unknown", async () => {
             // The one case where the write-boundary skip alone is NOT enough. An unparseable
             // `createdAt` makes `mergedAt - createdAt` NaN, and that NaN lands on the row keyed
             // by `mergedAt` — a day whose OWN date is perfectly fine and which carries the day's
@@ -479,14 +518,145 @@ describe('#302 an unwritable author-day costs that row, not the run', () => {
         });
     });
 
-    describe('classification', () => {
-        const skipped = `${AUTHOR_DAYS_SKIPPED_PREFIX} [github/test-org] 1 author-day row(s)`;
+    describe('many skips in one run', () => {
+        /**
+         * Seven authors, each with one PR whose `created_at` is unusable — so one provider
+         * produces seven skipped author-days in a single run.
+         *
+         * Every other test in this file skips exactly ONE row, which leaves the grouping, the
+         * count above 1, the per-group sample cap and the `(+N more)` tail unexercised: replace
+         * the whole grouped render with a single ungrouped, uncapped join and they all stay green.
+         */
+        function manyBadPRRoutes(count: number): Route[] {
+            return [
+                {match: /\/repos\/test-org\/repo1\/pulls\/\d+\/comments/, body: []},
+                {match: /\/repos\/test-org\/repo1\/pulls\/\d+\/reviews/, body: []},
+                {
+                    match: /\/repos\/test-org\/repo1\/pulls\?/,
+                    body: Array.from({length: count}, (_, i) => ({
+                        number: i + 1,
+                        title: 'feat: work',
+                        user: {login: `dev-${i}`},
+                        state: 'open',
+                        created_at: EXPANDED_YEAR,
+                        merged_at: null,
+                        closed_at: null,
+                        updated_at: PR_MERGED,
+                        requested_reviewers: [],
+                    })),
+                },
+                ...githubRoutes(),
+            ];
+        }
 
-        it('is an advisory, so a run that skips a row is not retried forever', () => {
-            expect(isAdvisoryError(skipped)).toBe(true);
+        it('counts all of them, samples five, and tails the remainder', async () => {
+            seedAlice(db);
+            vi.stubGlobal('fetch', makeCountingFetch(manyBadPRRoutes(7)).fetchMock);
+
+            const line = skipLineOf((await runSync(db, [GITHUB_CONFIG])).errors)!;
+
+            expect(line).toContain('7 author-day row(s)');
+            expect(line).toContain('7 refused as invalid_date');
+            expect(line).toContain('(+2 more)');
+            // Exactly five named — the cap, not the count.
+            expect(line.match(/github:login:dev-\d/g)).toHaveLength(5);
         });
 
-        it('is a PERMANENT loss, so a bounded surface keeps it over an actionable line', () => {
+        it("stays inside the provider column's storage cap and survives the round-trip", async () => {
+            // `AUTHOR_DAYS_SKIPPED_PREFIX` is ranked to the FRONT of a bounded column
+            // (`PERMANENT_LOSS_ADVISORY_PREFIXES`), and the cap truncates the TAIL — which on
+            // this line is `groups`, the only actionable content. The sibling churn advisory is
+            // pinned the same way for the same reason (`commit-loss.test.ts`).
+            seedAlice(db);
+            vi.stubGlobal('fetch', makeCountingFetch(manyBadPRRoutes(7)).fetchMock);
+
+            const line = skipLineOf((await runSync(db, [GITHUB_CONFIG])).errors)!;
+            expect(line.length).toBeLessThanOrEqual(MAX_STORED_COLUMN_CHARS);
+            // …and it is really long enough for the cap to be a live question, not a formality.
+            expect(line.length).toBeGreaterThan(500);
+
+            // Round-trip the REAL line through the store: "the emitted line fits" and "the store
+            // does not cut it" are two different claims, and only this composes them.
+            const store = makeDb();
+            try {
+                const key = loadServerKey({TOPROPE_SECRET_KEY: Buffer.alloc(32, 7).toString('base64')});
+                const rec = createProvider(store, key, {config: GITHUB_CONFIG, createdBy: null});
+                recordSyncOutcome(store, rec.id, {status: 'ok', at: NOW, advisories: [line]});
+                expect(toPublicProvider(getProvider(store, rec.id)!).last_sync_advisories).toEqual([line]);
+            } finally {
+                store.close();
+            }
+        });
+    });
+
+    describe('a refusal that is NOT a property of the row', () => {
+        it('still rolls back and holds the cursor, instead of discarding the window fail-open', async () => {
+            // Four of the six refusal codes are decided by operands constant for the whole run
+            // (`observedAt`) or the whole provider (`provider`, `container`, the key's
+            // namespacing). Skipping those would discard EVERY row of EVERY provider, advance
+            // every cursor and report the run clean — strictly worse than the rollback this
+            // issue is about, and it would silently undo the fail-closed behaviour
+            // `providers/config.ts` explicitly relies on. So they must still throw.
+            //
+            // Driven through `observedAt`, which is `new Date().toISOString()` — the one
+            // run-level operand a real deployment can actually corrupt, by having a clock that
+            // reads an ISO 8601 expanded year (the same #233 hazard class as the commit dates
+            // above). A blank container cannot get this far: the factory refuses it by name
+            // before a provider is ever built.
+            seedAlice(db);
+            vi.setSystemTime(new Date(EXPANDED_YEAR));
+            vi.stubGlobal(
+                'fetch',
+                makeCountingFetch([
+                    ...githubPRRoutes({created_at: PR_CREATED, merged_at: PR_MERGED}),
+                    ...gitlabRoutes(),
+                ]).fetchMock,
+            );
+
+            const result = await runSync(db, [GITHUB_CONFIG, GITLAB_CONFIG]);
+
+            // Loud, not silent: the run reports a rollback…
+            expect(result.errors.some((e) => /transaction rolled back/.test(e))).toBe(true);
+            expect(result.errors.some((e) => /observedAt must be a UTC ISO instant/.test(e))).toBe(true);
+            // …NO cursor advanced, for either provider, so both windows re-cover once the
+            // operator fixes the clock…
+            expect(cursorOf(db, GITLAB_CURSOR)).toBeUndefined();
+            expect(cursorOf(db, GITHUB_CURSOR)).toBeUndefined();
+            expect(rawRows(db)).toHaveLength(0);
+            // …and it was NOT reported as a per-row skip, which would have claimed a permanent
+            // loss over a window that is in fact intact.
+            expect(skipLineOf(result.errors)).toBeUndefined();
+        });
+    });
+
+    describe('classification', () => {
+        it('is an advisory, so a run that skips a row is not retried forever', async () => {
+            // Driven through the REAL pipeline rather than a hand-built literal, so a reworded
+            // prefix cannot leave this passing against a line the code no longer emits.
+            seedAlice(db);
+            vi.stubGlobal(
+                'fetch',
+                makeCountingFetch(
+                    githubPRRoutes({created_at: null, merged_at: null}),
+                ).fetchMock,
+            );
+
+            const errors = (await runSync(db, [GITHUB_CONFIG])).errors;
+
+            expect(isAdvisoryError(skipLineOf(errors)!)).toBe(true);
+            expect(isAdvisoryError(prLineOf(errors)!)).toBe(true);
+        });
+
+        it('is a PERMANENT loss, so a bounded surface keeps it over an actionable line', async () => {
+            seedAlice(db);
+            vi.stubGlobal(
+                'fetch',
+                makeCountingFetch(
+                    githubPRRoutes({created_at: EXPANDED_YEAR, merged_at: null}),
+                ).fetchMock,
+            );
+
+            const skipped = skipLineOf((await runSync(db, [GITHUB_CONFIG])).errors)!;
             expect(isPermanentLossAdvisory(skipped)).toBe(true);
             const legacy = `${LEGACY_CELLS_SKIPPED_PREFIX} 2 cell(s)`;
             expect(rankAdvisories([legacy, skipped])).toEqual([skipped, legacy]);

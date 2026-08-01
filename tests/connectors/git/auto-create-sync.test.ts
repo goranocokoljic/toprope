@@ -563,3 +563,71 @@ describe('auto-create developers during sync (#256)', () => {
         });
     });
 });
+
+/**
+ * #302 — an author whose every row this run REFUSED must not be promoted off it.
+ *
+ * `retainedKeys` is the allowlist auto-create acts on, and it means "the raw author keys this
+ * run retained". Once the sync began skipping rows the store would refuse, adding the key
+ * before the per-day loop made that sentence false: an author with rows from an EARLIER run
+ * still in `raw_author_daily` — so still a candidate — would be promoted on the strength of a
+ * window that was never written.
+ *
+ * That prior-run row is the whole input class, and it is why this test needs two syncs: an
+ * author with no stored row at all is not a candidate either way, so a one-run version passes
+ * with the key added at either position.
+ */
+describe('auto-create ignores an author whose every row was refused (#302)', () => {
+    let db: Database.Database;
+
+    beforeEach(() => {
+        db = makeDb();
+        vi.resetAllMocks();
+        shaCounter = 0;
+    });
+
+    afterEach(() => {
+        db.close();
+        vi.restoreAllMocks();
+    });
+
+    /**
+     * An ISO 8601 expanded year — `toDateString` slices it to a day the store refuses.
+     *
+     * Reached through a COMMIT rather than a PR, deliberately: a PR-only author has no commit
+     * email, and unreviewed auto-create holds an email-less identity for the review queue
+     * anyway — so it would be un-promoted for a reason that has nothing to do with this issue,
+     * and the assertion could not discriminate. This suite mocks the provider, which is exactly
+     * the shape the write-boundary skip exists for: it must be total over what a provider
+     * returns, not conditional on every provider having gated its dates first.
+     */
+    const UNUSABLE_DATE = '+033658-09-27T00:00:00.000Z';
+
+    it('promotes the healthy author and NOT the one whose every row this run refused', async () => {
+        addTeam(db, 'discovered');
+
+        // Run 1, auto-create OFF: `dana` is retained, so a later run finds them as a candidate.
+        // That stored row is the whole input class — an author with NO stored row is not a
+        // candidate either way, so a one-run version of this test cannot discriminate.
+        await installProvider([
+            commitBy('alice', 'alice@corp.example'),
+            commitBy('dana', 'dana@corp.example'),
+        ]);
+        await new GitSync(config()).sync(db);
+        expect(listAuthorCandidates(db).map((c) => c.raw_author_key)).toContain('github:login:dana');
+
+        // Run 2, auto-create ON, and every row `dana` produces now carries an unusable date, so
+        // this run retains nothing for them. Alice is the positive control: the run really did
+        // promote, so the assertion below is about `dana` and not about auto-create being inert.
+        await installProvider([
+            commitBy('alice', 'alice@corp.example', 'sha-later', '2024-01-16'),
+            {...commitBy('dana', 'dana@corp.example', 'sha-bad'), date: UNUSABLE_DATE},
+        ]);
+        await new GitSync(
+            config({auto_create_developers: true, auto_create_team: 'discovered'}),
+        ).sync(db);
+
+        expect(developerNamed(db, 'alice')).toBeDefined();
+        expect(developerNamed(db, 'dana')).toBeUndefined();
+    });
+});

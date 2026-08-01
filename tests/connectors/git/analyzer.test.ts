@@ -1,5 +1,5 @@
 import {describe, it, expect} from 'vitest';
-import {aggregateDailyMetrics} from '../../../src/connectors/git/analyzer';
+import {aggregateDailyMetrics, prMergeDurationHours} from '../../../src/connectors/git/analyzer';
 import type {AnalysisCommit, AnalysisPR, AnalysisReviewComment} from '../../../src/connectors/git/analysis-types';
 
 function makeCommit(overrides: Partial<AnalysisCommit> = {}): AnalysisCommit {
@@ -273,6 +273,60 @@ describe('aggregateDailyMetrics - unusable PR timestamps (#302)', () => {
         expect(Number.isNaN(mergedDay.avg_time_to_merge_hours as number)).toBe(false);
     });
 
+    it('reports UNKNOWN, not a 54-year duration, when createdAt is null', () => {
+        // The input class only the `typeof` guard inside `prMergeDurationHours` handles.
+        // `new Date(null).getTime()` is 0 — the Unix EPOCH, not an Invalid Date — so a
+        // finiteness check passes it and a ~473,706-hour duration lands on the merged-day row,
+        // whose own date is perfectly well formed. Every downstream check accepts it, it is
+        // projected into git_snapshots, and nothing recomputes it. `Date.parse(null)` is NaN.
+        const result = aggregateDailyMetrics(
+            [],
+            [makePR({createdAt: null as unknown as string, mergedAt: '2024-01-16T10:00:00Z'})],
+        );
+        const mergedDay = result.get('alice')!.get('2024-01-16')!;
+        expect(mergedDay.prs_merged).toBe(1);
+        expect(mergedDay.avg_time_to_merge_hours).toBeNull();
+    });
+
+    it('reports UNKNOWN for an expanded-year createdAt instead of a negative duration', () => {
+        // `Date.parse('+033658-…')` is finite, so this survives every finiteness check and
+        // stores ≈ -31,600 years. It is refused because a PR cannot merge before it opened.
+        const result = aggregateDailyMetrics(
+            [],
+            [makePR({createdAt: '+033658-09-27T00:00:00.000Z', mergedAt: '2024-01-16T10:00:00Z'})],
+        );
+        expect(result.get('alice')!.get('2024-01-16')!.avg_time_to_merge_hours).toBeNull();
+    });
+
+    it('reports UNKNOWN for an array createdAt, which toString would make parseable', () => {
+        const result = aggregateDailyMetrics(
+            [],
+            [
+                makePR({
+                    createdAt: ['2024-01-16T00:00:00Z'] as unknown as string,
+                    mergedAt: '2024-01-16T10:00:00Z',
+                }),
+            ],
+        );
+        expect(result.get('alice')!.get('2024-01-16')!.avg_time_to_merge_hours).toBeNull();
+    });
+
+    it('averages only the MEASURABLE merge times even when the unmeasurable one is listed FIRST', () => {
+        // The ordering the sample counter exists for — and the COMMON one, since every provider
+        // lists PRs newest-first. Divide by `prs_merged` instead and this single 10h observation
+        // is reported as 5h; with the measurable PR first, that bug is invisible.
+        const result = aggregateDailyMetrics(
+            [],
+            [
+                makePR({id: '1', createdAt: 'not-a-date', mergedAt: '2024-01-16T12:00:00Z'}),
+                makePR({id: '2', createdAt: '2024-01-16T00:00:00Z', mergedAt: '2024-01-16T10:00:00Z'}),
+            ],
+        );
+        const mergedDay = result.get('alice')!.get('2024-01-16')!;
+        expect(mergedDay.prs_merged).toBe(2);
+        expect(mergedDay.avg_time_to_merge_hours).toBeCloseTo(10, 6);
+    });
+
     it('averages only the MEASURABLE merge times, not one per merged PR', () => {
         // Two PRs merge on the same day; one has an unusable createdAt. Dividing by prs_merged
         // (= 2) would report 5h for a single 10h observation. The divisor must be the number of
@@ -332,5 +386,45 @@ describe('aggregateDailyMetrics - unusable PR timestamps (#302)', () => {
         ];
         const result = aggregateDailyMetrics([], [], 48, comments);
         expect([...result.get('bob')!.keys()]).toEqual(['']);
+    });
+});
+
+/**
+ * #302 — the ONE time-to-merge rule, shared with `pr_records` in `sync.ts`.
+ *
+ * Two independent copies is how they came to disagree: for one `created_at: '+033658-…'` PR the
+ * store wrote `pr_records.time_to_merge_hours = NULL` and
+ * `raw_author_daily.avg_time_to_merge_hours = -277304070` from the same pair of timestamps.
+ */
+describe('prMergeDurationHours (#302)', () => {
+    it('measures a well-formed pair in hours', () => {
+        expect(prMergeDurationHours('2024-01-16T00:00:00Z', '2024-01-16T10:00:00Z')).toBe(10);
+    });
+
+    it('is null for an unparseable operand', () => {
+        expect(prMergeDurationHours('not-a-date', '2024-01-16T10:00:00Z')).toBeNull();
+        expect(prMergeDurationHours('2024-01-16T00:00:00Z', 'not-a-date')).toBeNull();
+    });
+
+    it('is null for a NON-STRING operand, which `new Date()` would resolve to the epoch', () => {
+        // `new Date(null).getTime() === 0`, so the old `new Date(x).getTime()` form returned a
+        // finite ~54-year duration here and stored it.
+        expect(prMergeDurationHours(null, '2024-01-16T10:00:00Z')).toBeNull();
+        expect(prMergeDurationHours(undefined, '2024-01-16T10:00:00Z')).toBeNull();
+        expect(prMergeDurationHours(0, '2024-01-16T10:00:00Z')).toBeNull();
+    });
+
+    it('is null for an ARRAY operand, whose toString would otherwise parse cleanly', () => {
+        expect(prMergeDurationHours(['2024-01-16T00:00:00Z'], '2024-01-16T10:00:00Z')).toBeNull();
+    });
+
+    it('is null when the PR merged before it was opened', () => {
+        // Finite, so every finiteness check passes it all the way into git_snapshots.
+        expect(prMergeDurationHours('2024-01-16T10:00:00Z', '2024-01-16T00:00:00Z')).toBeNull();
+        expect(prMergeDurationHours('+033658-09-27T00:00:00.000Z', '2024-01-16T10:00:00Z')).toBeNull();
+    });
+
+    it('admits a zero-length merge (opened and merged at the same instant)', () => {
+        expect(prMergeDurationHours('2024-01-16T10:00:00Z', '2024-01-16T10:00:00Z')).toBe(0);
     });
 });

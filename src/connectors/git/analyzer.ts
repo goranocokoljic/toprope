@@ -44,6 +44,37 @@ function toDateString(isoDate: unknown): string {
     return typeof isoDate === 'string' ? isoDate.slice(0, 10) : '';
 }
 
+/**
+ * How long a PR took to merge, in hours — or `null` when that is not KNOWN (#302).
+ *
+ * The ONE rule, shared with `pr_records`' `timeToMergeHours` in `sync.ts`, which delegates
+ * here. Two copies is how they came to disagree: for `created_at: '+033658-…'` the store wrote
+ * `pr_records.time_to_merge_hours = NULL` and `raw_author_daily.avg_time_to_merge_hours =
+ * -277304070` from the SAME pair of timestamps, because one rejected `ms < 0` and the other
+ * only asked `Number.isFinite`.
+ *
+ * `Date.parse`, gated by `typeof`, NOT `new Date(x).getTime()`. This is the same coercion
+ * hazard {@link toDateString} refuses, and it is easier to miss here because the result LOOKS
+ * fine: `new Date(null)` is the Unix EPOCH, not an Invalid Date, so a `null` `createdAt` and a
+ * real `mergedAt` yield a perfectly finite ~54-year duration that every downstream check
+ * accepts and stores. `Date.parse(null)` stringifies to `'null'` and is NaN, which is the
+ * honest answer; the `typeof` guard then also covers an array, whose `toString` would
+ * otherwise reproduce a parseable instant.
+ *
+ * `ms >= 0` because a PR cannot merge before it was opened, so a negative duration is a
+ * statement about the response, not about the PR — and unlike NaN it survives every
+ * finiteness check all the way into `git_snapshots`.
+ */
+export function prMergeDurationHours(createdAt: unknown, mergedAt: unknown): number | null {
+    const ms = toInstantMs(mergedAt) - toInstantMs(createdAt);
+    return Number.isFinite(ms) && ms >= 0 ? ms / 3_600_000 : null;
+}
+
+/** An instant as epoch ms, or NaN — total over `unknown`, for the reason above. */
+function toInstantMs(iso: unknown): number {
+    return typeof iso === 'string' ? Date.parse(iso) : Number.NaN;
+}
+
 // Detect bursts across a developer's full commit stream (so bursts spanning
 // midnight are not split), attributing each burst to the day of its first
 // commit. Returns burst counts keyed by date.
@@ -182,11 +213,18 @@ export function aggregateDailyMetrics(
     // How many of a (login, day)'s merged PRs had a MEASURABLE time-to-merge (#302).
     //
     // Tracked separately from `prs_merged` because the two legitimately differ: a PR whose
-    // `createdAt` or `mergedAt` is unparseable still merged (it counts), but its duration is
-    // unknown and must not enter the mean. Reusing `prs_merged` as the divisor — which the
-    // in-place rolling average used to do — would weight the surviving samples by a count that
-    // includes the ones never added, quietly dragging the average toward zero.
-    const measuredMergeTimes = new Map<string, number>();
+    // `createdAt` or `mergedAt` the pipeline cannot use still merged (it counts), but its
+    // duration is unknown and must not enter the mean. Reusing `prs_merged` as the divisor —
+    // which the in-place rolling average used to do — weights the surviving samples by a count
+    // that includes the ones never added: with an unmeasurable PR listed FIRST (the common
+    // order, since every provider lists PRs newest-first) a single 10h observation is reported
+    // as 5h.
+    //
+    // Keyed by the metrics OBJECT, not a synthesized `login + day` string. `mergedMetrics` is
+    // the row stored in `devMetrics`, one per (login, day) — already exactly this counter's
+    // grain — so an object key makes collision impossible by construction rather than by an
+    // argument about separator characters in a free-form provider login.
+    const measuredMergeTimes = new Map<DailyGitMetrics, number>();
 
     // Process PR metrics
     for (const pr of pullRequests) {
@@ -210,9 +248,7 @@ export function aggregateDailyMetrics(
         // prs_merged and time-to-merge on merged date
         if (pr.mergedAt) {
             const mergedDate = toDateString(pr.mergedAt);
-            const timeToMergeHours =
-                (new Date(pr.mergedAt).getTime() - new Date(pr.createdAt).getTime()) /
-                (1000 * 3600);
+            const timeToMergeHours = prMergeDurationHours(pr.createdAt, pr.mergedAt);
 
             if (!devMetrics.has(mergedDate)) {
                 devMetrics.set(mergedDate, emptyMetrics(login, mergedDate));
@@ -223,26 +259,24 @@ export function aggregateDailyMetrics(
 
             // Rolling average of time-to-merge, over the MEASURABLE samples only (#302).
             //
-            // An unparseable `createdAt` or `mergedAt` makes this subtraction NaN, and the write
-            // boundary refuses a NaN metric — so before this guard ONE malformed PR timestamp
-            // cost the whole merged-day row, including its commits, and could do so on a day
-            // whose own date was perfectly fine (a bad `createdAt` poisons the row keyed by
-            // `mergedAt`). `avg_time_to_merge_hours` is nullable precisely to mean "not known",
-            // so leaving it alone is the honest answer and it costs nothing else. The write
-            // boundary still refuses a NaN that reaches it by any other route — this narrows
-            // what that skip has to swallow, it does not replace it.
-            if (Number.isFinite(timeToMergeHours)) {
-                // NUL-separated: a login is free-form provider text, so a space separator would
-                // let ('a b', 'x') and ('a', 'b x') resolve to one shared sample counter.
-                const sampleKey = `${login}\u0000${mergedDate}`;
-                const samples = (measuredMergeTimes.get(sampleKey) ?? 0) + 1;
-                measuredMergeTimes.set(sampleKey, samples);
+            // A `createdAt` or `mergedAt` this pipeline cannot use makes the duration UNKNOWN,
+            // and the write boundary refuses a NaN metric — so before this guard ONE malformed
+            // PR timestamp cost the whole merged-day row, including its commits, and could do so
+            // on a day whose own date was perfectly fine (a bad `createdAt` poisons the row keyed
+            // by `mergedAt`). `avg_time_to_merge_hours` is nullable precisely to mean "not
+            // known", so leaving it alone is the honest answer and it costs nothing else. The
+            // write boundary still refuses a NaN that reaches it by any other route — this
+            // narrows what that skip has to swallow, it does not replace it.
+            //
+            // No `samples === 1` special case: at one sample the general expression below is
+            // `((null ?? 0) * 0 + t) / 1`, which IS `t`.
+            if (timeToMergeHours !== null) {
+                const samples = (measuredMergeTimes.get(mergedMetrics) ?? 0) + 1;
+                measuredMergeTimes.set(mergedMetrics, samples);
                 mergedMetrics.avg_time_to_merge_hours =
-                    samples === 1
-                        ? timeToMergeHours
-                        : ((mergedMetrics.avg_time_to_merge_hours ?? 0) * (samples - 1) +
-                              timeToMergeHours) /
-                          samples;
+                    ((mergedMetrics.avg_time_to_merge_hours ?? 0) * (samples - 1) +
+                        timeToMergeHours) /
+                    samples;
             }
         }
     }

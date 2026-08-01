@@ -391,6 +391,25 @@ const RATE_FIELDS: readonly (keyof DailyGitMetrics)[] = [
     'code_churn_rate', 'ai_signature_score', 'avg_commit_size',
 ];
 
+/**
+ * The refusals that are a property of the ROW, as opposed to of the run or the provider (#302).
+ *
+ * The distinction decides whether a caller may SKIP the row or must let the refusal throw.
+ * `invalid_date` and `invalid_metric` are the only two evaluated against a value the row alone
+ * carries — a day key derived from that PR's timestamp, a metric computed from that author's
+ * activity. Re-fetching returns the identical unusable value, so holding the cursor for them
+ * would brick the provider without saving anything, and skipping is the lesser loss.
+ *
+ * The other four are evaluated against operands that are CONSTANT for a whole run
+ * (`observedAt`) or a whole provider (`provider`, `container`, and the namespacing half of
+ * `raw_author_key`). A defect in one of those refuses EVERY row, so skipping would discard the
+ * entire window fail-open with the cursor advanced and the run reported clean — the exact
+ * inversion of the fail-closed behaviour that made a config typo loud. Those must still throw,
+ * roll the transaction back and hold the cursor: unlike a bad date, they describe something an
+ * operator can fix, after which the window re-covers intact.
+ */
+export const ROW_LEVEL_REFUSALS: readonly RawAuthorDailyErrorCode[] = ['invalid_date', 'invalid_metric'];
+
 /** What is wrong with a row this store will not accept. See {@link findRawAuthorDailyDefect}. */
 export interface RawAuthorDailyDefect {
     code: RawAuthorDailyErrorCode;

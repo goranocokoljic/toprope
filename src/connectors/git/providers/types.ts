@@ -511,18 +511,24 @@ export interface GitProvider {
     // `tests/connectors/git/providers/commit-date-contract.test.ts` is table-driven over
     // `GIT_PROVIDER_TYPES` and fails for one that does not.
     //
-    // THE ROLLBACK ITSELF IS NO LONGER REACHABLE FROM ANY DATE — but this gate is still only the
-    // commit author date's share of that, so do not read the two as the same claim. The other
-    // three dates arrive on {@link GitPR} / {@link GitReviewComment} rather than on a commit, so
-    // no provider gate and this listener never see them: `aggregateDailyMetrics` keys a metrics
-    // row on `toDateString(pr.createdAt)`, `toDateString(pr.mergedAt)` and
-    // `toDateString(comment.createdAt)` (`analyzer.ts`), and that day reaches
-    // `upsertRawAuthorDaily` verbatim, with `avg_time_to_merge_hours` a fourth door (NaN from an
-    // unparseable operand, refused as `invalid_metric` from the same transaction). #302 closed
-    // that class at the WRITE boundary instead of adding a fourth and fifth gate here: the sync
-    // asks `findRawAuthorDailyDefect` — the same body the store's refusal delegates to — for every
-    // row before writing it, and skips the ones it would refuse. That is total over every field
-    // the store validates and over every future provider, which no per-provider gate could be.
+    // READ THIS GATE AS THE COMMIT AUTHOR DATE'S SHARE OF A LARGER PROBLEM, not as the whole of
+    // it. The other three dates arrive on {@link GitPR} / {@link GitReviewComment} rather than on
+    // a commit, so no provider gate and this listener never see them: `aggregateDailyMetrics`
+    // keys a metrics row on `toDateString(pr.createdAt)`, `toDateString(pr.mergedAt)` and
+    // `toDateString(comment.createdAt)` (`analyzer.ts`), that day reaches `upsertRawAuthorDaily`
+    // verbatim, and `avg_time_to_merge_hours` is a fourth door. #302 closed that class at the
+    // WRITE boundaries instead of adding a fourth and fifth gate here: the sync asks
+    // `findRawAuthorDailyDefect` — the same body the store's refusal delegates to — for every raw
+    // row, and `findPRRecordDefect` for every `pr_records` row, and skips the ones either write
+    // would refuse. That is total over every field those two writes validate and over every
+    // future provider, which no per-provider gate could be.
+    //
+    // WHAT IT DOES NOT CLAIM. "A rollback is unreachable" is a claim about the whole transaction,
+    // and the transaction holds more writes than those two — anything a future write binds from
+    // an unvalidated response field can still throw inside it. What is closed is the DATE class
+    // specifically, at both writes it reaches. A run-level refusal (a blank container, a
+    // non-ISO `observedAt`) also still rolls back ON PURPOSE: see ROW_LEVEL_REFUSALS in
+    // `raw-author-daily.ts` for why skipping those would be strictly worse than the rollback.
     //
     // WHAT THAT MEANS FOR AN IMPLEMENTATION, since it changes what this gate buys. It does NOT
     // make the gate optional. An ungated bad date keys its own author-day bucket, so the write
