@@ -667,15 +667,30 @@ export function registerAdminGitProviderRoutes(
                 // NULLed) on `ok`, so the two branches differed only in the status they
                 // passed — and a field added to one of them and not the other is exactly
                 // how the advisory column would come to be written on one path only.
-                recordSyncOutcome(db, id, {
-                    status: genuineErrors.length > 0 ? 'error' : 'ok',
-                    at: new Date().toISOString(),
-                    error: genuineErrors.join('; '),
-                    // Importance-ordered, because the store's cap truncates the tail and
-                    // arrival order buries the permanent-loss lines behind every healed
-                    // retry the run reported.
-                    advisories: rankAdvisories(advisories),
-                });
+                //
+                // Wrapped, and NOT allowed to fall through to the sibling `.catch`. That
+                // handler exists for a run that threw, and it records `status: 'error'` with
+                // no advisories — so a throw from THIS write (a transient DB fault, say)
+                // would land there and persist two lies about a run that actually succeeded:
+                // a red status, and an empty advisory column that just discarded the
+                // permanent-loss report this line was in the middle of storing. The log
+                // above already holds the full set, which is what makes returning here safe.
+                try {
+                    recordSyncOutcome(db, id, {
+                        status: genuineErrors.length > 0 ? 'error' : 'ok',
+                        at: new Date().toISOString(),
+                        error: genuineErrors.join('; '),
+                        // Importance-ordered, because the store's cap truncates the tail and
+                        // arrival order buries the permanent-loss lines behind every healed
+                        // retry the run reported.
+                        advisories: rankAdvisories(advisories),
+                    });
+                } catch (recordErr) {
+                    request.log.error(
+                        {err: recordErr, providerId: id},
+                        'failed to record git sync outcome',
+                    );
+                }
             })
             .catch((err: unknown) => {
                 // A thrown failure (e.g. an unexpected pipeline crash) is still
@@ -685,8 +700,15 @@ export function registerAdminGitProviderRoutes(
                 // that threw produced no `SyncResult`, so this route knows of no advisory
                 // for it, and every one of these columns describes THE LAST RUN. Leaving
                 // the previous run's report standing beside this run's timestamp would
-                // attribute it to a run that never reported it.
+                // attribute it to a run that never reported it. Note this can discard a
+                // report the run had ALREADY committed — the throw may land after a cursor
+                // advance — which is the other half of why the log below is unconditional.
                 const message = err instanceof Error ? err.message : String(err);
+                // Same contract as the two logs above: `message` is stored through the same
+                // character bound, whose truncation marker says "see the server log". This
+                // is the only path that would otherwise leave NO trace of the run at all —
+                // it writes no `sync_logs` row and returned `{status: 'running'}` long ago.
+                request.log.error({err, providerId: id}, 'git sync run threw');
                 try {
                     recordSyncOutcome(db, id, {
                         status: 'error',

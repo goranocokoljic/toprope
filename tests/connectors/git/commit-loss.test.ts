@@ -30,8 +30,11 @@ import {
     COMMITS_DROPPED_PREFIX,
     COMMIT_CHURN_UNKNOWN_PREFIX,
     RETRY_HEALED_PREFIX,
+    LEGACY_CELLS_SKIPPED_PREFIX,
+    PROVIDER_DELETED_MID_RUN_PREFIX,
     isAdvisoryError,
     isPermanentLossAdvisory,
+    isSelfHealedAdvisory,
     rankAdvisories,
     stallStateKey,
     syncStateKey,
@@ -41,7 +44,14 @@ import {
     UNATTRIBUTABLE_DATE_DROP_REASON,
 } from '../../../src/connectors/git/providers/types';
 import {MAX_SERVER_ERROR_RETRIES} from '../../../src/connectors/git/providers/http-retry';
-import {MAX_STORED_COLUMN_CHARS} from '../../../src/connectors/git/providers/store';
+import {
+    MAX_STORED_COLUMN_CHARS,
+    createProvider,
+    getProvider,
+    recordSyncOutcome,
+    toPublicProvider,
+} from '../../../src/connectors/git/providers/store';
+import {loadServerKey} from '../../../src/connectors/git/providers/secret';
 import type {GitProviderConfig} from '../../../src/connectors/git/providers/types';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../../src/storage/migrations');
@@ -1015,10 +1025,35 @@ describe('unreturned commits are never silent (#275)', () => {
             expect(churnLine).toBeDefined();
             expect(churnLine).toContain('(+4 more)');
             expect(churnLine!.length).toBeLessThanOrEqual(MAX_STORED_COLUMN_CHARS);
+            // TWO-SIDED. An upper bound alone cannot tell "the cap is comfortably above the
+            // line" from "the line collapsed and the cap is now sized against nothing" — and
+            // the constant's docstring cites this measurement as its justification, so the
+            // measurement itself is what has to stay pinned.
+            expect(churnLine!.length).toBeGreaterThan(2_000);
             // The tail is the part a tight cap eats first, and it is the part an operator uses
             // to verify the loss — assert it survived rather than only asserting the total.
             expect(churnLine!.endsWith('.')).toBe(true);
             expect(churnLine).toContain(shas[0]);
+
+            // Round-trip the REAL line through the store: "the emitted line fits" and "the
+            // store does not cut it" are two different claims, and only this composes them.
+            const db2 = makeDb();
+            try {
+                const key = loadServerKey({
+                    TOPROPE_SECRET_KEY: Buffer.alloc(32, 7).toString('base64'),
+                });
+                const rec = createProvider(db2, key, {config: CONFIG, createdBy: null});
+                recordSyncOutcome(db2, rec.id, {
+                    status: 'ok',
+                    at: '2026-08-01T00:00:00.000Z',
+                    advisories: [churnLine!],
+                });
+                expect(toPublicProvider(getProvider(db2, rec.id)!).last_sync_advisories).toEqual([
+                    churnLine,
+                ]);
+            } finally {
+                db2.close();
+            }
         });
     });
 });
@@ -1068,6 +1103,43 @@ describe('rankAdvisories — importance order for a bounded surface (#289)', () 
         const arrived = [healed(0), healed(1)];
         expect(rankAdvisories(arrived)).toEqual(arrived);
         expect(rankAdvisories([])).toEqual([]);
+    });
+
+    it('sinks self-healed lines BELOW the actionable ones, so the cap evicts them first', () => {
+        // Two tiers were not enough. `RETRY_HEALED_PREFIX` is the only class with unbounded
+        // cardinality — one line per healed fetch, per repo, per fetch kind — AND it arrives
+        // first (spliced in during fetch). Ranked as merely "not permanent" it fills the whole
+        // remainder of the surface, evicting the two lines that arrive last and carry an
+        // operator INSTRUCTION. This is the same shape as the test above, plus the actionable
+        // middle tier the two-tier fixture could not detect the loss of.
+        const deleted = `${PROVIDER_DELETED_MID_RUN_PREFIX} [github/api] provider removed mid-run`;
+        const legacy = `${LEGACY_CELLS_SKIPPED_PREFIX} [github/api] 4 legacy day(s) skipped`;
+        const arrived = [...Array.from({length: 25}, (_, i) => healed(i)), deleted, legacy, drop];
+
+        const ranked = rankAdvisories(arrived);
+        const kept = ranked.slice(0, 20);
+
+        // Permanent loss first, then the actionable middle tier — both inside a 20-line cap
+        // that arrival order, and two-tier ranking, would have spent entirely on healed lines.
+        expect(ranked.slice(0, 3)).toEqual([drop, deleted, legacy]);
+        expect(kept).toContain(deleted);
+        expect(kept).toContain(legacy);
+        expect(arrived.slice(0, 20)).not.toContain(deleted);
+        // Nothing is dropped — ranking is a reorder, and the healed lines keep their order.
+        expect(ranked).toHaveLength(arrived.length);
+        expect(ranked.slice(3)).toEqual(Array.from({length: 25}, (_, i) => healed(i)));
+    });
+
+    it('classifies a healed retry as self-healed and nothing else as self-healed', () => {
+        expect(isSelfHealedAdvisory(healed(0))).toBe(true);
+        expect(isSelfHealedAdvisory(drop)).toBe(false);
+        expect(isSelfHealedAdvisory(churn)).toBe(false);
+        expect(
+            isSelfHealedAdvisory(`${PROVIDER_DELETED_MID_RUN_PREFIX} [github/api] removed`),
+        ).toBe(false);
+        expect(isSelfHealedAdvisory(`${LEGACY_CELLS_SKIPPED_PREFIX} [github/api] 4 day(s)`)).toBe(
+            false,
+        );
     });
 
     it('classifies only the un-re-askable sentinels as permanent loss', () => {

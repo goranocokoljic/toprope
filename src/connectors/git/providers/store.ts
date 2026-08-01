@@ -598,9 +598,14 @@ export const MAX_STORED_ADVISORIES = 20;
  * earlier 2 KB cap underneath it. That is also the line `rankAdvisories` moves to the FRONT
  * as permanent loss, so a cap below it would mangle precisely the report the ranking exists
  * to protect, cutting the `Affected: <shas>` tail an operator verifies the loss with. 4 KB
- * leaves ~1.8 KB of headroom for a longer container path or a future sentence, and
- * `tests/connectors/git/commit-loss.test.ts` pins the real line against this constant so the
- * next sentence added to that advisory fails a test rather than silently losing its tail.
+ * leaves ~1.8 KB of headroom for a longer container path or future prose.
+ *
+ * `tests/connectors/git/commit-loss.test.ts` pins the real line against this constant from
+ * BOTH sides — it fails if the line outgrows the cap, and equally if the measurement this
+ * number was chosen from stops being true — and round-trips it through the store to prove the
+ * emitted line and the stored one are the same string. It is a bound, not an early warning:
+ * prose can still grow ~1.8 KB before anything fails. Re-measure rather than re-estimate if
+ * that headroom is spent.
  *
  * Together the two caps bound the advisory column at roughly `20 × 4 KB` ≈ 80 KB worst case,
  * with the realistic case far below it (most lines are a few hundred bytes).

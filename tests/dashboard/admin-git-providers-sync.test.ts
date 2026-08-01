@@ -123,6 +123,7 @@ interface LogRecord {
     msg?: string;
     providerId?: string;
     advisories?: string[];
+    errors?: string[];
 }
 
 async function buildApp(
@@ -651,6 +652,70 @@ describe('admin git-provider sync-now API (#199)', () => {
                 expect(warned?.advisories?.some((a) => a.startsWith(COMMITS_DROPPED_PREFIX))).toBe(
                     true,
                 );
+            });
+
+            it('logs the complete failure list the error column\'s truncation marker points at', async () => {
+                // `last_sync_error` is bounded by the same character cap, and its marker names
+                // the server log too. A systemic failure is ONE LINE PER REPO, so the case the
+                // bound actually bites is the case an operator most needs the full list for —
+                // and this log is the only place it survives. Without this assertion the write
+                // can be deleted and the marker starts pointing at nothing.
+                const logs: LogRecord[] = [];
+                await app.close();
+                app = await buildApp(db, GIT_CONFIG, logs);
+                adminToken = await login(app, 'admin@test.com');
+
+                const id = await createGithub();
+                const createGitProvider = await getCreateGitProvider();
+                createGitProvider.mockReturnValue(
+                    makeMockProvider({
+                        listRepos: vi
+                            .fn()
+                            .mockRejectedValue(new Error('GitHub API error 401: bad token')),
+                    }),
+                );
+                expect((await triggerSync(id)).statusCode).toBe(202);
+                await waitForSyncStatus(id, 'error');
+
+                const logged = logs.find((l) => l.msg === 'git sync completed with errors');
+                expect(logged).toBeDefined();
+                expect(logged?.providerId).toBe(id);
+                expect(logged?.errors?.some((e) => e.includes('401: bad token'))).toBe(true);
+                // The two channels stay disjoint in the log exactly as they do in the row: a
+                // failure is not also reported as an advisory.
+                expect(logs.some((l) => l.msg === 'git sync completed with advisories')).toBe(false);
+            });
+
+            it('leaves a trace when the run THROWS, the one path with no other record', async () => {
+                // This path writes no `sync_logs` row and returned `{status:'running'}` long
+                // before the throw, so before the log there was nothing but a bounded
+                // `last_sync_error` — whose truncation marker names a log that was never
+                // written. The throw is raised from the sync itself, not from a provider call,
+                // so it rejects the promise rather than being collected into `result.errors`.
+                const logs: LogRecord[] = [];
+                await app.close();
+                app = await buildApp(db, GIT_CONFIG, logs);
+                adminToken = await login(app, 'admin@test.com');
+
+                const id = await createGithub();
+                // Spied on the pipeline itself rather than on a provider call: every provider
+                // fault is caught per-provider and COLLECTED into `result.errors`, so it
+                // settles through `.then`. Only a rejection of the run as a whole reaches the
+                // `.catch`, which is exactly why that arm is the one with no other trace.
+                const {GitSync} = await import('../../src/connectors/git/sync');
+                const spy = vi
+                    .spyOn(GitSync.prototype, 'syncProviders')
+                    .mockRejectedValue(new Error('pipeline crashed mid-run'));
+                expect((await triggerSync(id)).statusCode).toBe(202);
+                const row = await waitForSyncStatus(id, 'error').finally(() => spy.mockRestore());
+
+                expect(logs.some((l) => l.msg === 'git sync run threw' && l.providerId === id)).toBe(
+                    true,
+                );
+                // …and the row still carries the message rather than swallowing it.
+                expect(row.last_sync_error).toContain('pipeline crashed mid-run');
+                // The column describes the LAST run, and this run reported no advisory.
+                expect(row.last_sync_advisories).toEqual([]);
             });
 
             it('clears the previous run\'s advisories when a later run reports none', async () => {

@@ -387,6 +387,28 @@ export function isPermanentLossAdvisory(advisory: string): boolean {
 }
 
 /**
+ * The advisory sentinels that report a state which ALREADY RESOLVED ITSELF.
+ *
+ * The bottom tier, and the reason two tiers were not enough. `RETRY_HEALED_PREFIX` is the only
+ * class with unbounded cardinality — one line per healed fetch, per repo, per fetch kind — so
+ * on the rate-limited large-org run the ranking exists for it is also the class that FILLS the
+ * surface. Ranked as merely "not permanent" it sits at the head of the remainder (it is
+ * spliced in during fetch, before every post-commit line), and a 20-line cap then keeps twenty
+ * reports that the run recovered by itself while evicting `PROVIDER_DELETED_MID_RUN_PREFIX`
+ * and `LEGACY_CELLS_SKIPPED_PREFIX` — which arrive last and are the two remaining lines that
+ * carry an operator INSTRUCTION ("re-run sync older history for the affected window").
+ *
+ * A healed retry is the one advisory whose whole content is "nothing needs doing", so it is
+ * the correct thing to drop first.
+ */
+const SELF_HEALED_ADVISORY_PREFIXES: readonly string[] = [RETRY_HEALED_PREFIX];
+
+/** Does this advisory report a state that already resolved itself? */
+export function isSelfHealedAdvisory(advisory: string): boolean {
+    return SELF_HEALED_ADVISORY_PREFIXES.some((prefix) => advisory.startsWith(prefix));
+}
+
+/**
  * Order advisories most-important-first for a surface that can only keep some of them.
  *
  * Required because `errors` ARRIVAL order is close to the inverse of its importance order. A
@@ -399,13 +421,29 @@ export function isPermanentLossAdvisory(advisory: string): boolean {
  * themselves — which is why the ordering lives here, beside the sentinels whose relative
  * severity it encodes, rather than at the surface doing the truncating.
  *
+ * THREE tiers, not two. Ranking permanent loss to the front is only half the job: the middle
+ * tier holds the lines that report a recoverable state an operator must still ACT on
+ * (`PROVIDER_DELETED_MID_RUN_PREFIX`, `LEGACY_CELLS_SKIPPED_PREFIX` — both emitted last), and
+ * the bottom tier holds the self-healed ones, which are the only class numerous enough to
+ * fill the surface on their own. See SELF_HEALED_ADVISORY_PREFIXES.
+ *
  * STABLE within each class: two lines of the same importance keep their emitted order, so an
  * operator reading the retained set sees it in the order the run produced it.
+ *
+ * ONE pass over the input, and every entry lands in exactly one tier by construction — the
+ * same reason the route partitions advisory-vs-failure in one loop rather than with two
+ * complementary filters.
  */
 export function rankAdvisories(advisories: readonly string[]): string[] {
-    const permanent = advisories.filter((a) => isPermanentLossAdvisory(a));
-    const rest = advisories.filter((a) => !isPermanentLossAdvisory(a));
-    return [...permanent, ...rest];
+    const permanent: string[] = [];
+    const actionable: string[] = [];
+    const selfHealed: string[] = [];
+    for (const advisory of advisories) {
+        if (isPermanentLossAdvisory(advisory)) permanent.push(advisory);
+        else if (isSelfHealedAdvisory(advisory)) selfHealed.push(advisory);
+        else actionable.push(advisory);
+    }
+    return [...permanent, ...actionable, ...selfHealed];
 }
 
 /**
