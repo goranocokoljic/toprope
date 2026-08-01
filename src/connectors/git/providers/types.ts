@@ -465,7 +465,7 @@ export interface GitProvider {
     // hold.
     //
     // ALL THREE IMPLEMENTATIONS HONOR THAT IN FULL since #290 — the rule above has no exception
-    // list any more, so a clean `errors[]` really does mean no commit was silently lost. The
+    // list any more, so a clean `errors[]` really does mean no COMMIT was silently lost. The
     // specific thing every one of them must gate is the AUTHOR DATE: `raw_author_daily`'s
     // validator THROWS on a day it cannot key on, inside the run's single all-providers write
     // transaction, so an unpinned provider does not merely lose its own commit — it rolls back
@@ -476,9 +476,30 @@ export interface GitProvider {
     // `tests/connectors/git/providers/commit-date-contract.test.ts` is table-driven over
     // `GIT_PROVIDER_TYPES` and fails for one that does not.
     //
+    // READ THAT AS SCOPED TO THE COMMIT AUTHOR DATE, NOT TO THE HAZARD CLASS. The rollback above
+    // is reachable through three OTHER dates that no provider gates and this listener never sees,
+    // because they arrive on {@link GitPR} / {@link GitReviewComment} rather than on a commit:
+    // `aggregateDailyMetrics` keys a metrics row on `toDateString(pr.createdAt)`,
+    // `toDateString(pr.mergedAt)` and `toDateString(comment.createdAt)` (`analyzer.ts`), and that
+    // day reaches `upsertRawAuthorDaily` verbatim. `avg_time_to_merge_hours` is a fourth door:
+    // it is `new Date(mergedAt) - new Date(createdAt)`, so an unparseable operand yields NaN and
+    // the store's `invalid_metric` throws from the same transaction. Probability is lower — those
+    // timestamps are server-generated, not `git commit --date`-settable — but the cost is
+    // identical, and no gate here protects the run from them. The durable fix is a per-row skip at
+    // the WRITE boundary, which is total over every date field and every future provider; it is a
+    // data-integrity decision of #231/#235's weight (it decides that a malformed PR date silently
+    // costs a developer-day rather than holding the cursor) and is tracked separately in #302.
+    //
     // NOT a drop, and deliberately not reported as one: Bitbucket's in-memory `until` filter
     // removes commits outside the requested window (#276). Those were never in this call's result
-    // set, so reporting them would drown the real losses in noise.
+    // set, so reporting them would drown the real losses in noise. ONE EXCEPTION, forced by
+    // ordering: Bitbucket cannot window-filter a row whose date it cannot parse, so its gate runs
+    // BEFORE the filter and an out-of-window row with an unusable date IS reported. Gating after
+    // the filter would restore the silent loss this listener exists to prevent, so the report is
+    // the lesser evil — but note what it costs an operator. Bitbucket's endpoint takes no server
+    // date bounds, so every backfill/catch-up chunk re-pages HEAD→since; one bad-dated commit near
+    // HEAD is therefore re-reported once per chunk, each time against a window it was never in.
+    // A repeated Bitbucket drop advisory naming the same sha is that, not N separate losses.
     //
     // A commit the implementation DOES return but whose LINE COUNTS it could not observe is
     // neither of the above — not a throw (the response is well-formed by the endpoint's own

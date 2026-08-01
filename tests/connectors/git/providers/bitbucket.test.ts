@@ -701,9 +701,10 @@ describe('BitbucketProvider', () => {
         });
 
         it('drops an unattributable date BEFORE the diffstat fan-out, so it costs no request', async () => {
-            // Ordering matters beyond efficiency: the sequential fetch mock below supplies exactly
-            // one diffstat response, so a gate that ran after the fan-out would consume it for the
-            // bad commit and hand the good one an empty page.
+            // The assertion that catches a gate moved AFTER the fan-out is the request COUNT
+            // below, not `additions`: `good` is first in the page, so it would consume the single
+            // diffstat response either way and still report 40. Do not drop the count assertion
+            // believing the churn one covers it.
             const fetchMock = makeFetchMock([
                 {
                     body: pagedResponse([

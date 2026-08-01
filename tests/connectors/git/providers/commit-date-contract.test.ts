@@ -128,6 +128,12 @@ function badDateRoutes(type: GitProviderType, badDate: string | undefined): Rout
                     body: [gitlabRow(GOOD_SHA, COMMIT_DATE), gitlabRow(BAD_SHA, badDate)],
                 },
             ];
+        default:
+            // Tests are excluded from `tsconfig.json`, so an unhandled member of the union is NOT
+            // a compile error here — it falls off the end, returns `undefined`, and the caller's
+            // spread throws a bare `TypeError: undefined is not iterable`. That is the illegible
+            // failure the gate test below exists to replace, so name it here too.
+            throw new Error(`badDateRoutes has no fixture for provider type: ${String(type)}`);
     }
 }
 

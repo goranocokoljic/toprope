@@ -16,6 +16,15 @@
  * single home (`isUtcDay`, in `aggregation/dates.ts`) that the store and the projection also read,
  * so the agreement is enforced by the import graph instead of by prose. All three providers gate
  * here; that is what lets `GitProvider.getCommits` state the rule without an exception list.
+ *
+ * WHAT THIS DOES NOT CLOSE, said here so the docstring above is not read as more than it is. This
+ * module gates the COMMIT AUTHOR DATE. The same rollback is still reachable through the PR and
+ * review-comment day keys (`toDateString(pr.createdAt / pr.mergedAt / comment.createdAt)` in
+ * `analyzer.ts`, which key a metrics row that reaches the store verbatim) and through the NaN
+ * `avg_time_to_merge_hours` those two timestamps compute. No provider gates any of them. Closing
+ * that class needs a per-row skip at the WRITE boundary rather than a fifth gate here — total over
+ * every date field and every future provider, and a data-integrity decision of #231/#235's weight,
+ * so it is tracked separately in #302. Do not read this module as protecting the run outright.
  */
 
 import {isUtcDay} from '../../../aggregation/dates.js';
