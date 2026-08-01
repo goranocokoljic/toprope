@@ -178,16 +178,34 @@ export interface DistinctRawAuthor {
  *     matching the lowercased email lookup;
  *   - both blank → `null`, so a truly-anonymous commit is SKIPPED by the caller
  *     rather than collapsing every anonymous author into one `""` bucket.
+ *
+ * TOTAL OVER A NON-STRING, not merely over null/undefined (#302 review cycle 3, SO-1/SEC-1).
+ * `unknown` rather than `string | null` because the values arrive from a cast response body:
+ * `analysis-types.ts` builds `authorLogin` as `username || email` and `authorEmail` as
+ * `email || null`, and `||` filters only FALSY — so `{}` / `[]` / `42` survive. `.trim()` on
+ * one of those is a `TypeError` raised from `sync.ts`'s post-fetch loop, which sits in NO
+ * `try`: the per-provider catch closed at the fetch and the write transaction's has not
+ * opened. It therefore escapes the whole run — no provider's cursor advances, no advisory is
+ * emitted, and the next run replays the identical body. That is the permanent stall this
+ * issue exists to close, one field over from the dates it closed it for, and STRICTLY WORSE
+ * than the rollback: a rollback at least reports itself.
+ *
+ * A non-string is treated as ABSENT, exactly like `null`, so the key falls through to the
+ * other field. That keeps the row alive and carrying its offending value, which
+ * {@link findRawAuthorDailyDefect} then refuses as `invalid_identity` at the write boundary
+ * — so the loss costs one author-day and reaches the advisory surface, instead of the run.
+ * (Both non-string → `null` → the caller skips the author, the same as a truly-anonymous
+ * one; there is no identity left to report the day under.)
  */
 export function rawAuthorKeyFor(
     provider: GitProviderType,
-    login: string | null | undefined,
-    email: string | null | undefined,
+    login: unknown,
+    email: unknown,
 ): string | null {
-    const trimmedLogin = (login ?? '').trim();
+    const trimmedLogin = typeof login === 'string' ? login.trim() : '';
     if (trimmedLogin) return `${provider}:login:${trimmedLogin}`;
 
-    const trimmedEmail = (email ?? '').trim().toLowerCase();
+    const trimmedEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
     if (trimmedEmail) return `${provider}:email:${trimmedEmail}`;
 
     return null;
@@ -527,12 +545,20 @@ export function findRawAuthorDailyDefect(
     // is the exact permanent-stall geometry this issue exists to close, reached by a different
     // field of the same body.
     //
-    // Reachable, not theoretical: `analysis-types.ts` builds `authorName` with `||`, which only
-    // filters falsy, so `{}` / `[]` / `42` survive from a cast response body. And
-    // `author_display_name` is the sharpest of the three because nothing touches it before the
-    // bind — `rawAuthorKeyFor` would already have thrown on a non-string login (earlier, and
-    // OUTSIDE the transaction, where it costs one provider rather than the run), and it only
-    // reads the email when the login is blank.
+    // Reachable, not theoretical: `analysis-types.ts` builds `authorName`, `authorLogin` and
+    // `authorEmail` with `||`, which only filters falsy, so `{}` / `[]` / `42` survive from a
+    // cast response body.
+    //
+    // ALL THREE ARE LIVE, and the original of this comment claimed otherwise: it said
+    // `rawAuthorKeyFor` "would already have thrown on a non-string login (earlier, and OUTSIDE
+    // the transaction, where it costs one provider rather than the run)". Both halves were
+    // wrong (#302 review cycle 3, SO-1/SEC-1). It threw, yes — but from `sync.ts`'s post-fetch
+    // loop, which is inside NO `try`: the per-provider catch closed with the fetch and the
+    // write transaction's had not opened, so the throw escaped the whole RUN, advancing no
+    // cursor and emitting no advisory. Not "one provider", and strictly worse than the rollback
+    // this issue is about. `rawAuthorKeyFor`/`retentionKeyFor` are now total over a non-string
+    // (treating it as absent), which is what routes those two fields HERE, to a row-level
+    // refusal that costs one author-day and says so.
     //
     // ITS OWN CODE, not `invalid_key`, even though both are about identity. `invalid_key` is
     // decided partly by `provider` — the namespacing rule — so it is refused for every row of a

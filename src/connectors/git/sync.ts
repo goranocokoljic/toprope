@@ -531,9 +531,16 @@ function formatSkippedAuthorDays(
 export const PR_RECORDS_SKIPPED_PREFIX = 'PR records skipped as unwritable:';
 
 /**
- * Every reason a `pr_records` row is refused, as a runtime allowlist — the same shape, and for
- * the same reason, as {@link RAW_AUTHOR_DAILY_ERROR_CODES}: the value is interpolated into an
- * operator-facing line that reaches a terminal, `sync_logs.errors` and the admin provider row.
+ * Every reason a `pr_records` row is refused — the vocabulary `findPRRecordDefect` returns and
+ * `formatSkippedPRRecords` groups by.
+ *
+ * NOT a runtime allowlist, unlike {@link RAW_AUTHOR_DAILY_ERROR_CODES} (#302 review cycle 3,
+ * SO-4/SEC-5 — this docstring used to claim it was, contradicting `formatSkippedPRRecords`,
+ * which declines the check and gives the right reason). The distinction is provenance, not
+ * shape: a raw-store code arrives across a module boundary from `raw-author-daily.ts` and is
+ * re-checked before interpolation, whereas these values are produced twenty lines away in this
+ * same module and are only ever consumed as `typeof PR_RECORD_REFUSALS[number]`. Adding a
+ * membership check here would be ceremony over a first-party literal.
  */
 const PR_RECORD_REFUSALS = [
     'unstorable_repo',
@@ -1923,16 +1930,29 @@ function isUtcIsoInstant(value: string): boolean {
  * {@link rawAuthorKeyFor} take its email branch, so the stored key matches the identity
  * the resolver actually looks the author up by.
  *
- * Returns null only for a truly anonymous author (no login, no email), whose day is
- * skipped: there is no stable key to retain it under, and bucketing every such commit
- * together would attribute unrelated people to one identity.
+ * Returns null only for a truly anonymous author (no login, no email) — or one whose
+ * login AND email are both unusable — whose day is skipped: there is no stable key to
+ * retain it under, and bucketing every such commit together would attribute unrelated
+ * people to one identity.
+ *
+ * TOTAL OVER A NON-STRING on both parameters (#302 review cycle 3, SO-1/SEC-1), for the
+ * reason spelled out on {@link rawAuthorKeyFor}: `analysisLogin` is a `metricsMap` KEY, i.e.
+ * `AnalysisCommit.authorLogin` verbatim, which `analysis-types.ts` builds with `||` over a
+ * cast response body — so `{}` / `[]` / `42` reach here. `.toLowerCase()` on one of those
+ * throws from a frame with no enclosing `try`, killing the entire run rather than one row.
+ * The equality probe is therefore only asked when both operands are genuinely strings; a
+ * non-string login is otherwise passed straight through to `rawAuthorKeyFor`, which treats
+ * it as absent and lets the write boundary refuse the row as `invalid_identity`.
  */
 function retentionKeyFor(
     providerType: GitProviderType,
-    analysisLogin: string,
-    email: string | null,
+    analysisLogin: unknown,
+    email: unknown,
 ): string | null {
-    const isEmailFallback = email !== null && analysisLogin.toLowerCase() === email.toLowerCase();
+    const isEmailFallback =
+        typeof analysisLogin === 'string' &&
+        typeof email === 'string' &&
+        analysisLogin.toLowerCase() === email.toLowerCase();
     return rawAuthorKeyFor(providerType, isEmailFallback ? null : analysisLogin, email);
 }
 

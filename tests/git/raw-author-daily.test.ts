@@ -860,7 +860,7 @@ describe('findRawAuthorDailyDefect — the non-throwing form of the write bounda
  * is exactly why it needs pinning HERE: nothing else would notice it being dropped.
  */
 describe('ROW_LEVEL_REFUSALS — what the sync may skip (#302)', () => {
-    it('holds exactly the two refusals a single row can be solely responsible for', () => {
+    it('holds exactly the refusals a single row can be solely responsible for', () => {
         expect([...ROW_LEVEL_REFUSALS].sort()).toEqual([
             'invalid_date',
             'invalid_identity',

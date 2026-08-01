@@ -35,6 +35,7 @@ import {
     sanitizeAdvisoryLabel,
     isPermanentLossAdvisory,
     rankAdvisories,
+    stallStateKey,
     syncStateKey,
 } from '../../../src/connectors/git/sync';
 import {
@@ -46,6 +47,8 @@ import {
 } from '../../../src/connectors/git/providers/store';
 import {loadServerKey} from '../../../src/connectors/git/providers/secret';
 import {
+    COMMIT_DATE,
+    SHAS,
     GITHUB_CONFIG,
     GITLAB_CONFIG,
     BITBUCKET_CONFIG,
@@ -136,6 +139,39 @@ function githubPRRoutes(pr: GitHubPRFields): Route[] {
                     requested_reviewers: [],
                 },
             ],
+        },
+        ...githubRoutes(),
+    ];
+}
+
+/**
+ * GitHub COMMIT routes whose `author.login` is not a string, prepended so they shadow
+ * `githubRoutes()`' own commit list/detail entries.
+ *
+ * `toAnalysisCommit` fills `authorLogin` as `username || email`, and `||` filters only FALSY —
+ * so a `{}` login survives and becomes a `metricsMap` KEY. The commit email is left intact, so
+ * the author still has a usable identity to be keyed by; what is unusable is the value that
+ * lands in the row's `author_login` column.
+ */
+function githubNonStringLoginRoutes(login: unknown): Route[] {
+    const commit = {
+        author: {name: 'Alice', email: AUTHOR_EMAIL, date: COMMIT_DATE},
+        message: 'feat: work',
+    };
+    return [
+        {
+            match: /\/repos\/test-org\/repo1\/commits\?/,
+            body: SHAS.map((sha) => ({sha, commit, author: {login}})),
+        },
+        {
+            match: /\/repos\/test-org\/repo1\/commits\/[^?]+$/,
+            bodyFor: (url: string): Record<string, unknown> => ({
+                sha: url.split('/').pop(),
+                commit,
+                author: {login},
+                stats: {additions: 40, deletions: 5, total: 45},
+                files: [{filename: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'}],
+            }),
         },
         ...githubRoutes(),
     ];
@@ -391,6 +427,83 @@ describe('#302 an unwritable author-day costs that row, not the run', () => {
         });
     });
 
+    describe('the identity door', () => {
+        it('costs one author-day when the login is a non-string, and leaves the other provider committed', async () => {
+            // #302 review cycle 3, SO-1/SEC-1 — the end-to-end case for `invalid_identity`, which
+            // until now was only ever driven through the validator directly.
+            //
+            // A `{}` login is dereferenced THREE times before the write boundary ever sees it:
+            // `retentionKeyFor`'s `.toLowerCase()`, `rawAuthorKeyFor`'s `.trim()`, and the store's
+            // `bestKnown`. The first two run in `sync.ts`'s post-fetch loop, which sits inside NO
+            // `try` — so before the fix a TypeError there escaped the entire run: no provider
+            // wrote, no cursor advanced, no advisory was emitted, and the next run replayed the
+            // identical body forever. Revert either `typeof` guard and this test fails with a
+            // TypeError while the rest of the suite goes red for the wrong reason.
+            seedAlice(db);
+            vi.stubGlobal(
+                'fetch',
+                makeCountingFetch([
+                    ...githubNonStringLoginRoutes({}),
+                    ...gitlabRoutes(),
+                ]).fetchMock,
+            );
+
+            const result = await runSync(db, [GITHUB_CONFIG, GITLAB_CONFIG]);
+
+            // The run survived: GitLab's whole window is committed and its cursor advanced…
+            expect(rowsFor(db, 'gitlab')[0].commits).toBe(3);
+            expect(cursorOf(db, GITLAB_CURSOR)).toBeDefined();
+            // …GitHub's day is the only casualty, keyed by the email branch because the login was
+            // unusable, and refused for the identity rather than the date…
+            expect(rowsFor(db, 'github')).toHaveLength(0);
+            const line = skipLineOf(result.errors);
+            expect(line).toContain('[github/test-org]');
+            expect(line).toContain('1 author-day row(s)');
+            expect(line).toContain('refused as invalid_identity');
+            expect(line).toContain(`github:email:${AUTHOR_EMAIL} on ${DAY}`);
+        });
+
+        it('drops the author with no advisory when BOTH login and email are unusable', async () => {
+            // The honest limit of the fix: with no usable identity there is no key to report the
+            // day under, so it takes the same silent path a truly-anonymous commit has always
+            // taken (`if (!rawAuthorKey) continue`). Pinned so the asymmetry with the case above
+            // is a decision on record rather than a surprise — and so the run still SURVIVES,
+            // which is the property that actually matters.
+            seedAlice(db);
+            vi.stubGlobal(
+                'fetch',
+                makeCountingFetch([
+                    {
+                        match: /\/repos\/test-org\/repo1\/commits\?/,
+                        body: SHAS.map((sha) => ({
+                            sha,
+                            commit: {author: {name: 'Alice', email: 42, date: COMMIT_DATE}, message: 'x'},
+                            author: {login: {}},
+                        })),
+                    },
+                    {
+                        match: /\/repos\/test-org\/repo1\/commits\/[^?]+$/,
+                        bodyFor: (url: string): Record<string, unknown> => ({
+                            sha: url.split('/').pop(),
+                            commit: {author: {name: 'Alice', email: 42, date: COMMIT_DATE}, message: 'x'},
+                            author: {login: {}},
+                            stats: {additions: 1, deletions: 0, total: 1},
+                            files: [],
+                        }),
+                    },
+                    ...githubRoutes(),
+                    ...gitlabRoutes(),
+                ]).fetchMock,
+            );
+
+            const result = await runSync(db, [GITHUB_CONFIG, GITLAB_CONFIG]);
+
+            expect(rowsFor(db, 'gitlab')[0].commits).toBe(3);
+            expect(rowsFor(db, 'github')).toHaveLength(0);
+            expect(skipLineOf(result.errors)).toBeUndefined();
+        });
+    });
+
     describe('the NaN avg_time_to_merge_hours door', () => {
         it("keeps the merged day's commits when created_at is unparseable, reporting it unknown", async () => {
             // The one case where the write-boundary skip alone is NOT enough. An unparseable
@@ -446,11 +559,66 @@ describe('#302 an unwritable author-day costs that row, not the run', () => {
     });
 
     describe('the permanence claim', () => {
+        it('does NOT claim the window was recorded when the rollback fires AFTER the staging site', async () => {
+            // THE SHARP VERSION (#302 review cycle 3, TST-1), and the one that actually tests the
+            // mechanism. The `DROP TABLE` case below throws at `projectSnapshots`, which runs
+            // BEFORE the `cursorAdvances` loop — and unlike its three sibling advisories, this
+            // line is not a pre-built string handed to the closure, it is RENDERED INSIDE it. So
+            // on that path the render never executes and `skipLineOf` is trivially undefined:
+            // the assertion passes whether or not the staging exists. Replace the
+            // `skippedRowAdvisories.push(...)` at the staging site with a direct `errors.push`
+            // and every other test in this file, that one included, stays green.
+            //
+            // `stallUpdates` runs AFTER the advances, so a throw there is the one window where
+            // the advisory HAS been rendered and staged and the transaction still rolls back —
+            // exactly the pattern `commit-loss.test.ts` uses for the drop line (#275 cycle 3).
+            seedAlice(db);
+            vi.stubGlobal(
+                'fetch',
+                makeCountingFetch([
+                    // `null` on both, so BOTH advisories are rendered at the staging site — the
+                    // author-day line AND the `pr_records` one. A fixture that only trips one of
+                    // them would leave the other's assertion below trivially true.
+                    ...githubPRRoutes({created_at: null, merged_at: null}),
+                    ...gitlabRoutes(),
+                ]).fetchMock,
+            );
+            // A complete run CLEARS the provider's stall key in `stallUpdates`; seed that exact
+            // key on both providers so the DELETE matches a row, then make the delete abort.
+            const seedStall = (key: string): void => {
+                db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+                    key,
+                    JSON.stringify({runs: 1, since: '2024-01-01T00:00:00.000Z'}),
+                );
+            };
+            seedStall(stallStateKey('github', 'test-org'));
+            seedStall(stallStateKey('gitlab', 'test-group'));
+            db.exec(`
+                CREATE TRIGGER boom BEFORE DELETE ON sync_state
+                WHEN old.key LIKE 'git_stall:%'
+                BEGIN SELECT RAISE(ABORT, 'stall-clear boom'); END;
+            `);
+
+            const result = await runSync(db, [GITHUB_CONFIG, GITLAB_CONFIG]);
+
+            // Positive controls: the run rolled back, and the cursor whose advance the
+            // advisory's claim rests on did not persist…
+            expect(result.errors.some((e) => /transaction rolled back/.test(e))).toBe(true);
+            expect(cursorOf(db, GITHUB_CURSOR)).toBeUndefined();
+            expect(countRows(db, 'raw_author_daily')).toBe(0);
+            // …so NEITHER permanence claim survived, even though the staging site DID execute
+            // and both lines were rendered.
+            expect(skipLineOf(result.errors)).toBeUndefined();
+            expect(prLineOf(result.errors)).toBeUndefined();
+        });
+
         it('does NOT claim the window was recorded when the write transaction rolls back', async () => {
             // The line says "this run has recorded its window as covered — nothing re-asks
             // them", which is only true of a run that committed. Staged on the cursor advance
-            // and pushed after the commit, exactly like the drop advisory. Delete that staging
-            // and every other test in this file stays green.
+            // and pushed after the commit, exactly like the drop advisory. Kept alongside the
+            // sharper case above because it covers a DIFFERENT discard path (a failure before
+            // the advances rather than after them) — but note it cannot fail for the staging
+            // itself; that is what the test above is for.
             seedAlice(db);
             vi.stubGlobal(
                 'fetch',
@@ -744,6 +912,29 @@ describe('#302 an unwritable author-day costs that row, not the run', () => {
             expect(isPermanentLossAdvisory(skipped)).toBe(true);
             const legacy = `${LEGACY_CELLS_SKIPPED_PREFIX} 2 cell(s)`;
             expect(rankAdvisories([legacy, skipped])).toEqual([skipped, legacy]);
+        });
+
+        it('ranks the PR-records line as a permanent loss too, not just the author-day one', async () => {
+            // The sibling assertion above covered only `AUTHOR_DAYS_SKIPPED_PREFIX` (#302 review
+            // cycle 3, TST-2). Both prefixes are in `PERMANENT_LOSS_ADVISORY_PREFIXES`, and that
+            // membership is what keeps the line at the FRONT of the bounded
+            // `last_sync_advisories` column — i.e. the difference between the operator seeing
+            // the loss and it being truncated away. Drop `PR_RECORDS_SKIPPED_PREFIX` from that
+            // array and only this test fails.
+            seedAlice(db);
+            vi.stubGlobal(
+                'fetch',
+                makeCountingFetch(
+                    // `null`, not an expanded year: the PR-record guard refuses a non-string
+                    // bind, so an ill-shaped but well-typed day is storable there.
+                    githubPRRoutes({created_at: null, merged_at: null}),
+                ).fetchMock,
+            );
+
+            const prLine = prLineOf((await runSync(db, [GITHUB_CONFIG])).errors)!;
+            expect(isPermanentLossAdvisory(prLine)).toBe(true);
+            const legacy = `${LEGACY_CELLS_SKIPPED_PREFIX} 2 cell(s)`;
+            expect(rankAdvisories([legacy, prLine])).toEqual([prLine, legacy]);
         });
     });
 });

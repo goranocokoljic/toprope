@@ -13,8 +13,15 @@
  * file is what keeps the mirror honest: every refusal code is driven through BOTH the guard and
  * the real statement on a migrated database, in both directions.
  *
- * Add a `NOT NULL` column bound from a response-derived field without extending
- * `findPRRecordDefect`, and the `null`-defect control below goes red.
+ * WHAT THIS FILE DOES AND DOES NOT PROVE (#302 review cycle 3, SO-3). For every field in
+ * `FAULTS` it proves both directions: the guard refuses exactly what the statement refuses, and
+ * accepts what it accepts. It does NOT prove the mirror is COMPLETE. An earlier version of this
+ * comment claimed that adding a `NOT NULL` column bound from a response-derived field without
+ * extending `findPRRecordDefect` turns the controls below red; that only holds if the new
+ * column is also left unset by the `record()` factory, and the normal way a field is added is
+ * to extend `PRRecordInput` and populate the factory in the same commit — which passes both
+ * directions silently. `FAULTS` is a hand-maintained list over the same columns the guard
+ * hand-maintains, so completeness is a review obligation, not a tested property.
  */
 import {describe, it, expect, beforeEach, afterEach} from 'vitest';
 import Database from 'better-sqlite3';
