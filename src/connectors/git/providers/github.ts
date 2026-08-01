@@ -577,9 +577,12 @@ export class GitHubProvider implements GitProvider {
                 // boundaries downstream ask the identical question about this identical value
                 // and both enforce a lower bound: `diffstat-cache.ts` refuses to persist a row
                 // whose counts are not counts (silently, and deliberately not as a fault), and
-                // `raw-author-daily.ts` THROWS on one, inside the run's single all-providers
-                // write transaction — rolling back every provider's window, deterministically,
-                // on every later run. A value this line waved through but they refuse would be
+                // `raw-author-daily.ts` refuses one at the write boundary — until #302 by
+                // THROWING inside the run's single all-providers write transaction, rolling back
+                // every provider's window deterministically on every later run; since #302 the
+                // sync asks the same validator first and SKIPS that author-day, losing the whole
+                // day's counters and reporting a row it cannot tie back to this commit. A
+                // value this line waved through but they refuse would be
                 // reported to the operator as OBSERVED while being invisible on both of their
                 // channels, which is the failure this classification exists to prevent. One
                 // predicate is what makes the classification protect them.

@@ -3,12 +3,20 @@
  *
  * WHY IT IS PINNED AT THE PROVIDER BOUNDARY. The day key is derived by a bare
  * `isoDate.slice(0, 10)` (`analyzer.ts`, `churn.ts`), and the write boundary then hard-rejects
- * anything that is not a `YYYY-MM-DD` day — by THROWING, inside the run's single all-providers
- * write transaction, which rolls back every provider's window and re-throws identically on every
- * subsequent run. So an ISO 8601 expanded year (`+033658-09-27T…`, which
- * `git commit --date=@999999999999` produces) has to be caught HERE, where it costs one reported
- * commit, rather than one frame down where it bricks the whole git connector. Same hazard class as
- * #233's expanded-year watermark, and the same fix: pin the shape at the boundary.
+ * anything that is not a `YYYY-MM-DD` day. Until #302 that rejection was a THROW inside the run's
+ * single all-providers write transaction, which rolled back every provider's window and re-threw
+ * identically on every subsequent run — so an ISO 8601 expanded year (`+033658-09-27T…`, which
+ * `git commit --date=@999999999999` produces) had to be caught HERE or it bricked the whole git
+ * connector one frame down. Same hazard class as #233's expanded-year watermark, and the same
+ * fix: pin the shape at the boundary.
+ *
+ * #302 REMOVED THAT TAIL BUT NOT THIS GATE'S JOB. The sync now asks the same validator before
+ * writing and skips the row, so an ungated date costs its author-day rather than the run. What
+ * it cannot do is NAME the commit: down there the row is keyed by (author, day) and the shas
+ * were folded into its counters before the store saw it, so the loss is reported as "this author,
+ * this unusable day" and nothing more. Catching it here still costs exactly one commit AND puts
+ * its sha on `onDrop`, which is the difference between an operator who can look the commit up and
+ * one who cannot.
  *
  * WHY IT IS ONE MODULE rather than a copy per provider (#290). #275 pinned only GitHub, and
  * documented the agreement between its gate and the store's `UTC_DAY_RE` in a COMMENT — which
@@ -18,13 +26,24 @@
  * here; that is what lets `GitProvider.getCommits` state the rule without an exception list.
  *
  * WHAT THIS DOES NOT CLOSE, said here so the docstring above is not read as more than it is. This
- * module gates the COMMIT AUTHOR DATE. The same rollback is still reachable through the PR and
- * review-comment day keys (`toDateString(pr.createdAt / pr.mergedAt / comment.createdAt)` in
- * `analyzer.ts`, which key a metrics row that reaches the store verbatim) and through the NaN
- * `avg_time_to_merge_hours` those two timestamps compute. No provider gates any of them. Closing
- * that class needs a per-row skip at the WRITE boundary rather than a fifth gate here — total over
- * every date field and every future provider, and a data-integrity decision of #231/#235's weight,
- * so it is tracked separately in #302. Do not read this module as protecting the run outright.
+ * module gates the COMMIT AUTHOR DATE, and nothing else. The PR and review-comment day keys
+ * (`toDateString(pr.createdAt / pr.mergedAt / comment.createdAt)` in `analyzer.ts`) and the NaN
+ * `avg_time_to_merge_hours` those two timestamps compute still reach the store ungated by any
+ * provider. What changed in #302 is what happens NEXT: those dates no longer roll the run back.
+ * The sync asks `findRawAuthorDailyDefect` — the same body the store's refusal delegates to —
+ * for every raw row and `findPRRecordDefect` for every `pr_records` row (the OTHER write in the
+ * same transaction, whose `created_at` is a `NOT NULL` column bound from an unvalidated field),
+ * skips the ones either write would refuse, and reports them under `AUTHOR_DAYS_SKIPPED_PREFIX`
+ * / `PR_RECORDS_SKIPPED_PREFIX`. That is total over every field those writes validate and over
+ * every future provider, which is why it is a write-boundary skip and not a fourth gate here.
+ * It is scoped to the DATE class at those two writes — it is not a claim that nothing else in
+ * the transaction can ever throw.
+ *
+ * So the division of labour is: the write boundary keeps ONE bad value from costing the run, and
+ * this module keeps a bad AUTHOR DATE from costing more than the one commit it belongs to — and,
+ * unlike the skip, it can still name that commit's sha (`onDrop`), because down there the row is
+ * keyed by (author, day) and the commits have already been summed into it. Do not read either as
+ * making the other redundant.
  */
 
 import {isUtcDay} from '../../../aggregation/dates.js';

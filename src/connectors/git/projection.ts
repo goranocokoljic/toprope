@@ -171,18 +171,28 @@ export function buildDevLookupMap(db: Database.Database): Map<string, string> {
  * signal), commit email second. Returns null when the author has no developer record —
  * which since #253 is a RETAINED state (the raw row is kept and will attribute the
  * moment a matching developer exists), not a dropped one.
+ *
+ * TOTAL OVER A NON-STRING login/email (#302 review cycle 3, SEC-2). `unknown`, not
+ * `string | null`, because the `pr_records` path hands this `record.authorEmail` — built as
+ * `pr.author.email || null`, and GitLab's adapter fills `email: mr.author?.email ?? ''`, so
+ * `??` passes a non-string through and `||` keeps it. `email.toLowerCase()` on one of those
+ * is a `TypeError`, and this function is called TWICE on the same record: once in the
+ * un-`try`'d post-fetch loop (kills the whole run) and once from INSIDE `insertMany` (rolls
+ * back every provider's window). Both are the geometry #302 exists to close, so a value that
+ * cannot be a lookup key resolves to "no developer" — the same retained, re-attributable
+ * state as an author whose developer record simply does not exist yet.
  */
 export function resolveDeveloperId(
     lookup: Map<string, string>,
     providerType: GitProviderType,
-    login: string | null,
-    email: string | null,
+    login: unknown,
+    email: unknown,
 ): string | null {
-    if (login) {
+    if (typeof login === 'string' && login) {
         const byLogin = lookup.get(`${providerType}:${login}`);
         if (byLogin) return byLogin;
     }
-    if (email) {
+    if (typeof email === 'string' && email) {
         const byEmail = lookup.get(`email:${email.toLowerCase()}`);
         if (byEmail) return byEmail;
     }

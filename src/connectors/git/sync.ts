@@ -1,12 +1,16 @@
 import type Database from 'better-sqlite3';
 import {randomUUID} from 'crypto';
-import {aggregateDailyMetrics} from './analyzer.js';
+import {aggregateDailyMetrics, prMergeDurationHours} from './analyzer.js';
 import {toAnalysisCommit, toAnalysisPR, toAnalysisReviewComment} from './analysis-types.js';
 import type {AnalysisCommit, AnalysisPR, AnalysisReviewComment} from './analysis-types.js';
 import {
+    findRawAuthorDailyDefect,
     mergeDailyDisjoint,
     rawAuthorKeyFor,
     upsertRawAuthorDaily,
+    RAW_AUTHOR_DAILY_ERROR_CODES,
+    ROW_LEVEL_REFUSALS,
+    type RawAuthorDailyErrorCode,
     type RawAuthorDailyInput,
 } from './raw-author-daily.js';
 import {
@@ -234,29 +238,106 @@ export const COMMITS_DROPPED_PREFIX = 'Commits dropped as unattributable:';
 export const COMMIT_CHURN_UNKNOWN_PREFIX = 'Commit churn not observed:';
 
 /**
- * How many shas an advisory names before falling back to "+N more". Enough to go look one up
- * in the provider's UI; small enough that a systemic shape problem across thousands of commits
- * still produces one readable line.
+ * Prefix of the advisory pushed when the run built an author-day row the raw store would
+ * REFUSE, and skipped it rather than letting the refusal throw (#302).
+ *
+ * WHY A SKIP AT ALL. `upsertRawAuthorDaily` validates fail-closed and throws, and it runs
+ * inside this run's SINGLE all-providers write transaction — so one unusable row does not cost
+ * one row. It rolls back every provider's window, advances no cursor, and re-throws identically
+ * on every subsequent run: a permanent stall of the whole git connector, from data no retry can
+ * change. #275/#290 closed that door for the commit author date by gating it at each provider;
+ * three more dates reach the store ungated (`pr.createdAt`, `pr.mergedAt`, `comment.createdAt`,
+ * each keyed into a day by `analyzer.ts` and copied verbatim onto the row) and a NaN
+ * `avg_time_to_merge_hours` computed from the first two is a fourth door. Skipping at the WRITE
+ * boundary is total over all of them and over every future provider, which a fifth per-provider
+ * gate would not be.
+ *
+ * WHAT THE TRADE COSTS, stated plainly because it is the whole of the decision. The run keeps
+ * its other rows and its cursor advances, so the skipped author-day is gone: its commits, PRs
+ * and review comments for that day are absent from `raw_author_daily` and therefore from
+ * `git_snapshots`, and nothing re-asks them. That is strictly better than the alternative — the
+ * throw loses the same day AND every other provider's whole window, forever — but it is a real
+ * loss, which is why it is reported here and ranked with the permanent ones.
+ *
+ * WHAT THE LINE CANNOT SAY. The drop advisory names the SHAS it lost, because a provider
+ * reports a drop per commit. This row is keyed by (author, day) — the individual commits and
+ * PRs were already folded into its counters before the store ever saw it — so the finest thing
+ * this line can name is the author-day and the store's refusal code. It does NOT say which
+ * commits were in it; nothing at this boundary knows any more.
+ *
+ * Deliberately NOT a failure, for the same reason as {@link COMMITS_DROPPED_PREFIX}: the
+ * response was well-formed enough to reach here and re-fetching returns the identical unusable
+ * value, so turning the provider red would re-run the entire git connector every run forever
+ * and still never write the row.
+ *
+ * Emitted only for a run whose data was actually KEPT — same seam and same staging as the drop
+ * advisory: a held, rolled-back or deleted-container window is re-fetched intact next run, and
+ * calling its skip permanent would send an operator to repair a span that is fine.
  */
-const ADVISORY_SHA_SAMPLE_SIZE = 5;
+export const AUTHOR_DAYS_SKIPPED_PREFIX = 'Author-days skipped as unwritable:';
 
 /**
- * The bounded sha sample both commit advisories render — {@link COMMITS_DROPPED_PREFIX} per
- * reason group, {@link COMMIT_CHURN_UNKNOWN_PREFIX} per repo (#288).
+ * How many examples an advisory names before falling back to "+N more". Enough to go look one
+ * up in the provider's UI; small enough that a systemic shape problem across thousands of
+ * commits still produces one readable line.
+ */
+const ADVISORY_SAMPLE_SIZE = 5;
+
+/**
+ * The bounded example sample every loss advisory renders — {@link COMMITS_DROPPED_PREFIX} per
+ * reason group, {@link COMMIT_CHURN_UNKNOWN_PREFIX} per repo (#288), and
+ * {@link AUTHOR_DAYS_SKIPPED_PREFIX} per refusal code (#302).
  *
- * ONE renderer, not two, so "the two lines cannot drift to different budgets" is structurally
+ * ONE renderer, not three, so "these lines cannot drift to different budgets" is structurally
  * true rather than a promise a shared constant only half keeps: the cap, the join and the
  * `(+N more)` tail are the whole of what an operator reads as the sample, and a second copy
  * could diverge on any of them while both still sliced at the same number.
  *
- * Takes ALREADY-SANITIZED shas: the allowlist belongs at the boundary that knows the value is
- * a sha, and folding it in here would make it easy for a future caller to pass some other
- * untrusted field and have it silently rendered as `<invalid sha>` instead of rejected.
+ * Takes ALREADY-SANITIZED entries: the allowlist (or escape) belongs at the boundary that knows
+ * what KIND of value it holds, and folding it in here would make it easy for a future caller to
+ * pass some other untrusted field and have it silently rendered under the wrong control — a sha
+ * as `<invalid sha>` when it is really an author key, or vice versa.
  */
-function formatShaSample(shas: readonly string[]): string {
-    const sample = shas.slice(0, ADVISORY_SHA_SAMPLE_SIZE);
-    const more = shas.length - sample.length;
+function formatBoundedSample(entries: readonly string[]): string {
+    const sample = entries.slice(0, ADVISORY_SAMPLE_SIZE);
+    const more = entries.length - sample.length;
     return `${sample.join(', ')}${more > 0 ? ` (+${more} more)` : ''}`;
+}
+
+/** One thing an advisory lost, already sanitized by the boundary that knew what it was. */
+interface AdvisoryLoss {
+    /** The classification the operator's next step follows from. */
+    reason: string;
+    /** What was lost, in whatever identifier that class of loss can name it by. */
+    label: string;
+}
+
+/**
+ * `N <verb> <reason> — e.g. a, b (+3 more); M <verb> <other> — e.g. c` — the grouped body every
+ * loss advisory ends with: {@link COMMITS_DROPPED_PREFIX}, {@link AUTHOR_DAYS_SKIPPED_PREFIX}
+ * and {@link PR_RECORDS_SKIPPED_PREFIX} (#302).
+ *
+ * GROUPED BY REASON rather than listed beside a merged reason set, because the reasons exist
+ * only where the operator's next step differs — a line that says "reasons: A; B — affected: 5"
+ * tells them nothing about which step applies to which item. The sample cap is applied per
+ * group, so a systemic failure of one class cannot crowd the other out of the line entirely.
+ *
+ * ONE body, three callers. Before #302 the grouping was open-coded at the drop advisory and
+ * copied again for the new one, with only {@link formatBoundedSample}'s cap/join/tail actually
+ * shared — so the "one renderer" claim above it was true of the tail and not of the grouping.
+ *
+ * Insertion-ordered, so the rendered output is deterministic.
+ */
+function formatLossGroups(losses: readonly AdvisoryLoss[], verb: string): string {
+    const byReason = new Map<string, string[]>();
+    for (const {reason, label} of losses) {
+        const labels = byReason.get(reason);
+        if (labels === undefined) byReason.set(reason, [label]);
+        else labels.push(label);
+    }
+    return [...byReason]
+        .map(([reason, labels]) => `${labels.length} ${verb} ${reason} — e.g. ${formatBoundedSample(labels)}`)
+        .join('; ');
 }
 
 /**
@@ -306,6 +387,278 @@ function sanitizeDropReason(reason: unknown): string {
 }
 
 /**
+ * A raw-store refusal code, safe to interpolate into {@link AUTHOR_DAYS_SKIPPED_PREFIX} (#302).
+ *
+ * The refusal's `message` is deliberately NOT what the line renders: it embeds the offending
+ * value verbatim (`date must be a UTC YYYY-MM-DD day, got: …`), and that value is raw response
+ * JSON heading for a terminal, `sync_logs.errors` and the admin provider row. The CODE is a
+ * closed vocabulary, so it is allowlisted at runtime against {@link RAW_AUTHOR_DAILY_ERROR_CODES}
+ * exactly as {@link sanitizeDropReason} does — same reason, same shape.
+ */
+function sanitizeRefusalCode(code: unknown): string {
+    return typeof code === 'string' && (RAW_AUTHOR_DAILY_ERROR_CODES as readonly string[]).includes(code)
+        ? code
+        : '<unrecognized refusal code>';
+}
+
+/** How many characters of a response-derived label an advisory prints before truncating. */
+const ADVISORY_LABEL_MAX_CHARS = 60;
+
+/**
+ * Every character that can move a terminal cursor, start an ANSI escape, break one log line into
+ * two, or reorder what an operator reads:
+ *   - C0 controls, DEL and C1 controls — newline, CR, and the ESC every ANSI sequence opens with;
+ *   - U+2028/U+2029, which several renderers (and `eval`ed JS) treat as line terminators, so
+ *     stripping only C0 would leave the "this advisory is exactly one entry" property half-true;
+ *   - the bidi overrides and isolates (U+202A–U+202E, U+2066–U+2069) and the invisible
+ *     format/zero-width characters (U+200B–U+200F), which can visually reorder the line — an
+ *     author login carrying an RLO can make the refusal code render as something else entirely.
+ * Non-ASCII stays otherwise untouched: a CJK or accented display name is legitimate.
+ *
+ * Declared once, at module scope, so the regex is compiled once rather than per label on a run
+ * that skips thousands of rows. `g`-flagged and used only with `String.replace`, never `.test`,
+ * so there is no `lastIndex` state to carry between calls.
+ */
+// eslint-disable-next-line no-control-regex
+const CONTROL_CHARS_RE = /[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u2028\u2029\u202A-\u202E\u2066-\u2069]/g;
+
+/**
+ * An author key or a day, safe to interpolate into {@link AUTHOR_DAYS_SKIPPED_PREFIX}.
+ *
+ * NOT allowlisted, unlike {@link sanitizeSha} — and that is a decision, not an omission. A sha
+ * is hex, so "anything else is not a sha" is a true statement; an author login is free-form
+ * text in every provider and a rejected DAY is by definition off-shape, so an allowlist here
+ * would render the very values the operator needs to see as `<invalid>`. The control that
+ * actually matters for a line printed to a terminal and stored in a log is therefore applied
+ * directly — see {@link CONTROL_CHARS_RE} for exactly which characters and why — and the length
+ * is bounded so one absurd value cannot fill the surface.
+ *
+ * Truncation is marked with `…`, so a shortened value reads as shortened. That is safe here and
+ * would not be for a sha (see {@link sanitizeSha}): nobody looks an author key up by exact
+ * prefix expecting it to resolve, whereas a silently-truncated 64-char sha resolves to nothing.
+ * The cut is by CODE POINT, not by UTF-16 unit, so it cannot split a surrogate pair and leave a
+ * lone surrogate in a string that is later `JSON.stringify`d into a TEXT column.
+ *
+ * TOTAL over `unknown`: `RawAuthorDailyInput.date` is typed `string` but is built by slicing a
+ * response field, and `PRRecordInput.repo`/`prId` are casts over an unvalidated body. `<empty>`
+ * is not defensive either — `toDateString` yields `''` for every non-string date, and that `''`
+ * is exactly what this line has to name.
+ */
+export function sanitizeAdvisoryLabel(value: unknown): string {
+    if (typeof value !== 'string') return '<non-string>';
+    if (value === '') return '<empty>';
+    const printable = [...value.replace(CONTROL_CHARS_RE, '?')];
+    return printable.length > ADVISORY_LABEL_MAX_CHARS
+        ? `${printable.slice(0, ADVISORY_LABEL_MAX_CHARS).join('')}…`
+        : printable.join('');
+}
+
+/** One author-day row this run built and the raw store would not accept (#302). */
+interface SkippedAuthorDay {
+    raw_author_key: string;
+    date: string;
+    code: RawAuthorDailyErrorCode;
+}
+
+
+/**
+ * The {@link AUTHOR_DAYS_SKIPPED_PREFIX} line for one provider instance, or `[]` when it skipped
+ * nothing — so the caller can spread the result unconditionally.
+ *
+ * ONE line per provider instance with a count and a bounded sample, the same layout as the drop
+ * and churn advisories, because an operator reading all of them in one `errors` list should not
+ * have to learn a third.
+ *
+ * Every interpolated value is sanitized here, at the boundary that knows what each one is: the
+ * code against {@link RAW_AUTHOR_DAILY_ERROR_CODES}, the author key and day (both
+ * response-derived) through {@link sanitizeAdvisoryLabel}. The container is operator-configured
+ * rather than response-derived, but it goes through the same call — it is free-form text on the
+ * admin form, and there is no reason for this line to be the one that trusts it.
+ *
+ * WHY IT SAYS "AT LEAST". `toDateString` folds every non-string date — `null`, a number, an
+ * array, a missing key — into ONE `''` day, so a truncated page that cost an author 300 PRs
+ * arrives here as a single unwritable row. Author-days is the only quantity this boundary can
+ * count honestly; printing it bare would let an operator read "1" as "one PR".
+ */
+function formatSkippedAuthorDays(
+    providerType: GitProviderType,
+    container: string,
+    skips: readonly SkippedAuthorDay[],
+): string[] {
+    if (skips.length === 0) return [];
+    const groups = formatLossGroups(
+        skips.map((skip) => ({
+            reason: sanitizeRefusalCode(skip.code),
+            label: `${sanitizeAdvisoryLabel(skip.raw_author_key)} on ${sanitizeAdvisoryLabel(skip.date)}`,
+        })),
+        'refused as',
+    );
+    return [
+        `${AUTHOR_DAYS_SKIPPED_PREFIX} [${providerType}/${sanitizeAdvisoryLabel(container)}] ` +
+            `${skips.length} author-day row(s) could not be written to raw_author_daily, and this ` +
+            `run has recorded its window as covered — nothing re-asks them. Everything that day ` +
+            `carried for the author — commits, PRs and review comments alike — is absent from ` +
+            `raw_author_daily and therefore from git_snapshots. The row is keyed by (author, day), ` +
+            `so this is at LEAST ${skips.length} lost item(s) and may be far more: an unusable ` +
+            `date collapses every PR and comment carrying it onto one row, and nothing at this ` +
+            `boundary still knows how many. Neither a forward sync nor "sync older history" can ` +
+            `re-ask them — the latter only extends STRICTLY older than the earliest synced ` +
+            `instant, so it reaches neither a forward window nor a span a backfill just covered. ` +
+            `${groups}.`,
+    ];
+}
+
+/**
+ * Prefix of the advisory pushed when a PR's `pr_records` row could not be written (#302).
+ *
+ * THE SECOND WRITE IN THE SAME TRANSACTION, and the reason a skip at `raw_author_daily` alone
+ * was not enough. `pr_records.created_at` / `repo` / `pr_id` / `state` are `NOT NULL` columns
+ * bound from fields the providers CAST out of a response body rather than validate, so a
+ * `created_at: null` — the shape a truncated page really produces — reached SQLite as a NULL
+ * bind and threw `NOT NULL constraint failed` from inside `insertMany`. That is the identical
+ * geometry {@link AUTHOR_DAYS_SKIPPED_PREFIX} exists to close: every other provider's window
+ * rolled back, no cursor advanced, and the next run replayed the same body forever.
+ *
+ * Deliberately NOT a failure and staged on the cursor advance, for the same reasons as its
+ * sibling: re-fetching returns the identical unusable value, and the loss is only permanent once
+ * the window is recorded as covered.
+ *
+ * NARROWER THAN ITS SIBLING, and worth stating: a PR whose record is skipped still contributes
+ * its `prs_opened`/`prs_merged` counts to `raw_author_daily` whenever those rows were writable.
+ * What is lost is the per-PR review record — comment counts, review rounds, time-to-merge — so
+ * the PR-review coaching surfaces, not the adoption metrics, are what go short.
+ */
+export const PR_RECORDS_SKIPPED_PREFIX = 'PR records skipped as unwritable:';
+
+/**
+ * Every reason a `pr_records` row is refused — the vocabulary `findPRRecordDefect` returns and
+ * `formatSkippedPRRecords` groups by.
+ *
+ * NOT a runtime allowlist, unlike {@link RAW_AUTHOR_DAILY_ERROR_CODES} (#302 review cycle 3,
+ * SO-4/SEC-5 — this docstring used to claim it was, contradicting `formatSkippedPRRecords`,
+ * which declines the check and gives the right reason). The distinction is provenance, not
+ * shape: a raw-store code arrives across a module boundary from `raw-author-daily.ts` and is
+ * re-checked before interpolation, whereas these values are produced twenty lines away in this
+ * same module and are only ever consumed as `typeof PR_RECORD_REFUSALS[number]`. Adding a
+ * membership check here would be ceremony over a first-party literal.
+ */
+const PR_RECORD_REFUSALS = [
+    'unstorable_repo',
+    'unstorable_pr_id',
+    'unstorable_state',
+    'unstorable_created_at',
+    'unstorable_merged_at',
+    'unstorable_closed_at',
+] as const;
+
+type PRRecordRefusal = (typeof PR_RECORD_REFUSALS)[number];
+
+/**
+ * One PR whose record this run built and `pr_records` would not accept (#302).
+ *
+ * `repo`/`prId` are `unknown`, not `string`: `findPRRecordDefect` may have refused this very
+ * record BECAUSE one of them was not a string, so declaring them `string` here would assert
+ * the thing the refusal just disproved. {@link sanitizeAdvisoryLabel} is total over `unknown`.
+ */
+interface SkippedPRRecord {
+    repo: unknown;
+    prId: unknown;
+    reason: PRRecordRefusal;
+}
+
+/**
+ * The first reason `upsertPRRecord` would fail to bind this record, or `null` if it is writable.
+ *
+ * SCOPED TO THE BIND, not to semantics. It asks exactly one question per column — "is this a
+ * value SQLite can put in that column" — because that is the whole of what can throw out of the
+ * shared transaction. It deliberately does NOT check that `created_at` is a well-formed instant:
+ * the column is unconstrained `TEXT`, an odd-but-present timestamp has always been stored
+ * verbatim, and refusing it here would DISCARD PR history this pipeline has kept for releases
+ * over a shape nothing downstream requires. `time_to_merge_hours` needs no check either — it
+ * comes from {@link timeToMergeHours}, which is already total and yields `null`.
+ *
+ * `provider` and `container` are not checked: both are run-level, not response-derived, and
+ * `container` is already gated by the same `isBlankContainer` the raw store uses — see the
+ * fail-closed split at the raw write for why a run-level defect must NOT be skipped.
+ *
+ * A HAND-MAINTAINED MIRROR of what {@link upsertPRRecord} binds, unlike the raw side — where the
+ * skip and the store's refusal literally share a body, so they cannot disagree. There is no
+ * equivalent seam here: the bind list is a SQL statement, not a validator. Both are therefore
+ * EXPORTED for `tests/connectors/git/pr-record-bind.test.ts`, which drives every refusal code
+ * through this function AND through the real statement on a migrated database, asserting that
+ * each one this refuses really does throw and that a record it passes really does write. That
+ * test is what turns "the guard covers the write" from a code-reading exercise into a property —
+ * add a `NOT NULL` column bound from a response field without extending this function and it
+ * goes red.
+ */
+export function findPRRecordDefect(record: PRRecordInput): PRRecordRefusal | null {
+    if (!isStorable(record.repo)) return 'unstorable_repo';
+    if (!isStorable(record.prId)) return 'unstorable_pr_id';
+    if (!isStorable(record.state)) return 'unstorable_state';
+    if (!isStorable(record.createdAt)) return 'unstorable_created_at';
+    // Nullable columns, so `null` passes — but `undefined` does not, because better-sqlite3
+    // refuses it rather than treating it as NULL, and `toUtcIso` hands it straight through.
+    if (record.mergedAt !== null && !isStorable(record.mergedAt)) return 'unstorable_merged_at';
+    if (record.closedAt !== null && !isStorable(record.closedAt)) return 'unstorable_closed_at';
+    return null;
+}
+
+/**
+ * Can better-sqlite3 bind this value at all?
+ *
+ * EXACTLY the driver's rule, not a stricter one, because every value this refuses is PR history
+ * discarded. The first version asked `typeof === 'string'` and was wrong in both directions the
+ * agreement test checks: `''` and a numeric `7` both bind perfectly well (SQLite applies TEXT
+ * affinity to a number), so refusing them threw away records the write would have taken.
+ * `null`/`undefined` and any object/array/symbol are what actually throw — the first as a NOT
+ * NULL violation, the rest as the driver's `TypeError` — and both come out of `insertMany` the
+ * same way: the whole run's transaction rolled back.
+ *
+ * `bigint` and `Buffer` are listed for completeness of the driver's contract; no field on
+ * `PRRecordInput` can hold one today.
+ */
+function isStorable(value: unknown): boolean {
+    return (
+        typeof value === 'string' ||
+        typeof value === 'number' ||
+        typeof value === 'bigint' ||
+        Buffer.isBuffer(value)
+    );
+}
+
+/** The {@link PR_RECORDS_SKIPPED_PREFIX} line for one provider instance, or `[]` for none. */
+function formatSkippedPRRecords(
+    providerType: GitProviderType,
+    container: string,
+    skips: readonly SkippedPRRecord[],
+): string[] {
+    if (skips.length === 0) return [];
+    // `skip.reason` is produced by `findPRRecordDefect` in this module and typed `PRRecordRefusal`
+    // — it crosses no boundary, so there is no allowlist here. (`sanitizeRefusalCode` on the
+    // sibling line is not the same case: that code arrives from another module.) The repo and PR
+    // id DO come from a cast response body, which is what `sanitizeAdvisoryLabel` is for.
+    const groups = formatLossGroups(
+        skips.map((skip) => ({
+            reason: skip.reason,
+            label: `${sanitizeAdvisoryLabel(skip.repo)}#${sanitizeAdvisoryLabel(skip.prId)}`,
+        })),
+        'refused as',
+    );
+    return [
+        `${PR_RECORDS_SKIPPED_PREFIX} [${providerType}/${sanitizeAdvisoryLabel(container)}] ` +
+            `${skips.length} PR(s) carried a field pr_records cannot store, and this run has ` +
+            `recorded its window as covered — nothing re-asks them. Their per-PR review record ` +
+            `(comment counts, review rounds, time-to-merge) is absent, so the PR-review coaching ` +
+            `surfaces are short by any of these whose author is a registered developer — the ` +
+            `count is every REFUSED PR, not every LOST one, because the check runs before author ` +
+            `resolution and a PR by an unregistered author was never going to be stored. The day ` +
+            `counts in raw_author_daily are unaffected wherever those rows were themselves ` +
+            `writable. Providers re-fetch PRs by updated_at/updated_on, so a PR that is never ` +
+            `touched again is never re-delivered. ${groups}.`,
+    ];
+}
+
+/**
  * The repair for a span whose metrics are permanently understated, shared verbatim by the two
  * advisories that have to prescribe one ({@link DIFFS_NOT_SUPPLIED_PREFIX}'s permanence half
  * and {@link COMMIT_CHURN_UNKNOWN_PREFIX}).
@@ -343,6 +696,8 @@ const ADVISORY_PREFIXES: readonly string[] = [
     DIFFS_NOT_SUPPLIED_PREFIX,
     COMMITS_DROPPED_PREFIX,
     COMMIT_CHURN_UNKNOWN_PREFIX,
+    AUTHOR_DAYS_SKIPPED_PREFIX,
+    PR_RECORDS_SKIPPED_PREFIX,
 ];
 
 /**
@@ -379,6 +734,8 @@ const PERMANENT_LOSS_ADVISORY_PREFIXES: readonly string[] = [
     COMMITS_DROPPED_PREFIX,
     DIFFS_NOT_SUPPLIED_PREFIX,
     COMMIT_CHURN_UNKNOWN_PREFIX,
+    AUTHOR_DAYS_SKIPPED_PREFIX,
+    PR_RECORDS_SKIPPED_PREFIX,
 ];
 
 /** Does this advisory report a loss that can never be re-asked? */
@@ -529,7 +886,7 @@ export interface GitSyncProgress {
      *     #275 that gap is no longer something a reader has to infer from these two
      *     numbers: the drop is reported in `SyncResult.errors` under
      *     {@link COMMITS_DROPPED_PREFIX}, with the full COUNT and a bounded sample of
-     *     shas (not every sha — see {@link ADVISORY_SHA_SAMPLE_SIZE}). That is where
+     *     shas (not every sha — see {@link ADVISORY_SAMPLE_SIZE}). That is where
      *     an operator should look; these counters are a live indicator, not a record,
      *     and are gone the moment the repo finishes. GitLab lists exactly what it returns, and Bitbucket's
      *     total is commits RETAINED after its in-memory `until` filter (which is what
@@ -1573,16 +1930,29 @@ function isUtcIsoInstant(value: string): boolean {
  * {@link rawAuthorKeyFor} take its email branch, so the stored key matches the identity
  * the resolver actually looks the author up by.
  *
- * Returns null only for a truly anonymous author (no login, no email), whose day is
- * skipped: there is no stable key to retain it under, and bucketing every such commit
- * together would attribute unrelated people to one identity.
+ * Returns null only for a truly anonymous author (no login, no email) — or one whose
+ * login AND email are both unusable — whose day is skipped: there is no stable key to
+ * retain it under, and bucketing every such commit together would attribute unrelated
+ * people to one identity.
+ *
+ * TOTAL OVER A NON-STRING on both parameters (#302 review cycle 3, SO-1/SEC-1), for the
+ * reason spelled out on {@link rawAuthorKeyFor}: `analysisLogin` is a `metricsMap` KEY, i.e.
+ * `AnalysisCommit.authorLogin` verbatim, which `analysis-types.ts` builds with `||` over a
+ * cast response body — so `{}` / `[]` / `42` reach here. `.toLowerCase()` on one of those
+ * throws from a frame with no enclosing `try`, killing the entire run rather than one row.
+ * The equality probe is therefore only asked when both operands are genuinely strings; a
+ * non-string login is otherwise passed straight through to `rawAuthorKeyFor`, which treats
+ * it as absent and lets the write boundary refuse the row as `invalid_identity`.
  */
 function retentionKeyFor(
     providerType: GitProviderType,
-    analysisLogin: string,
-    email: string | null,
+    analysisLogin: unknown,
+    email: unknown,
 ): string | null {
-    const isEmailFallback = email !== null && analysisLogin.toLowerCase() === email.toLowerCase();
+    const isEmailFallback =
+        typeof analysisLogin === 'string' &&
+        typeof email === 'string' &&
+        analysisLogin.toLowerCase() === email.toLowerCase();
     return rawAuthorKeyFor(providerType, isEmailFallback ? null : analysisLogin, email);
 }
 
@@ -1648,7 +2018,7 @@ function parseRepoFilters(rawRepos: string[] | undefined): {include: string[]; e
 // Per-PR normalized facts for pr_records (Task 5.2). Built in fetchProviderData
 // where the raw GitPR + its review comments/verdicts are in hand, then resolved
 // to a developer and upserted in sync().
-interface PRRecordInput {
+export interface PRRecordInput {
     provider: GitProviderType;
     /**
      * The provider INSTANCE this PR came from (org/workspace/group) — the other half of the
@@ -2557,28 +2927,22 @@ async function fetchProviderData(
     // included so the operator can go look one up — not the full set, so the line stays
     // readable; the count is the complete figure.
     const droppedAdvisories = droppedByRepo.map(({repo: droppedRepo, drops}) => {
-        // Shas grouped UNDER their reason, not listed beside a merged reason set. The two
-        // reasons exist only because the operator's next step differs, and a line that says
-        // "reasons: A; B — affected: 5 shas" tells them nothing about which step applies to
-        // which sha. Insertion-ordered, so the output is deterministic.
-        const byReason = new Map<string, string[]>();
-        for (const drop of drops) {
-            const reason = sanitizeDropReason(drop.reason);
-            const shas = byReason.get(reason);
-            if (shas === undefined) byReason.set(reason, [sanitizeSha(drop.sha)]);
-            else shas.push(sanitizeSha(drop.sha));
-        }
-        // The SAMPLE cap is per reason group, so a systemic drop of one class cannot crowd the
-        // other class out of the line entirely.
-        const groups = [...byReason].map(
-            ([reason, shas]) => `${shas.length} because ${reason} — e.g. ${formatShaSample(shas)}`,
+        // Shas grouped UNDER their reason by the SHARED renderer (#302) rather than the copy
+        // that used to live here — the two reasons exist only because the operator's next step
+        // differs, and that argument, the per-group sample cap and the join now have one home.
+        const groups = formatLossGroups(
+            drops.map((drop) => ({
+                reason: sanitizeDropReason(drop.reason),
+                label: sanitizeSha(drop.sha),
+            })),
+            'because',
         );
         return (
             `${COMMITS_DROPPED_PREFIX} [${providerType}/${droppedRepo}] ${drops.length} ` +
             `commit(s) the provider listed could not be imported, and this run has recorded ` +
             `its window as covered — nothing re-asks them. There is no targeted re-fetch: ` +
             `"sync older history" only extends STRICTLY older than the earliest synced ` +
-            `instant, so it cannot reach a forward window. ${groups.join('; ')}.`
+            `instant, so it cannot reach a forward window. ${groups}.`
         );
     });
 
@@ -2623,7 +2987,7 @@ async function fetchProviderData(
             'the commit, every re-fetch returns the same body, which is exactly why this run ' +
             'did not fail and retry. Run the repair below only where you have reason to think ' +
             `the omission was transient. ${permanentSpanRepair()}. ` +
-            `Affected: ${formatShaSample(shas.map(sanitizeSha))}.`
+            `Affected: ${formatBoundedSample(shas.map(sanitizeSha))}.`
         );
     });
 
@@ -2723,11 +3087,15 @@ function computeReviewRounds(
     return 1 + changesRequestedCount;
 }
 
+/**
+ * Delegates to {@link prMergeDurationHours} rather than restating the rule (#302). The two used
+ * to be independent copies, and they disagreed: for one `created_at: '+033658-…'` PR this wrote
+ * `pr_records.time_to_merge_hours = NULL` while `analyzer.ts` wrote
+ * `raw_author_daily.avg_time_to_merge_hours = -277304070` from the very same timestamps.
+ */
 function timeToMergeHours(record: PRRecordInput): number | null {
     if (!record.mergedAt) return null;
-    const ms = Date.parse(record.mergedAt) - Date.parse(record.createdAt);
-    if (Number.isNaN(ms) || ms < 0) return null;
-    return ms / 3_600_000;
+    return prMergeDurationHours(record.createdAt, record.mergedAt);
 }
 
 /**
@@ -2750,7 +3118,7 @@ interface PRRecordExistingRow {
     changes_requested_count: number;
 }
 
-function upsertPRRecord(
+export function upsertPRRecord(
     db: Database.Database,
     record: PRRecordInput,
     developerId: string,
@@ -3213,6 +3581,10 @@ export class GitSync implements ConnectorInterface {
         // the line claims the understatement can no longer be re-asked, which is only true once
         // this run's window is recorded as covered. Same closure, same discard semantics.
         const churnUnknownAdvisories: string[] = [];
+        // Unwritable-row advisories (#302), staged for exactly the reason the three above are:
+        // the line claims the skipped row can no longer be re-asked, which is only true once this
+        // run's window is recorded as covered. Same closure, same discard semantics.
+        const skippedRowAdvisories: string[] = [];
         // Deferred stall-counter updates (#235), applied in the SAME transaction as
         // the cursor advances so the counter and the cursor can never disagree about
         // whether this run moved the provider forward. Unlike `cursorAdvances` this
@@ -3260,6 +3632,14 @@ export class GitSync implements ConnectorInterface {
             // to `now`. Written per-provider even on an empty fetch (a complete run
             // that found nothing legitimately covered its window), so a backfill can
             // only ever widen backward and never re-covers a slice.
+            // This provider instance's unwritable rows (#302), filled further down in this same
+            // iteration and read by the cursor-advance closure pushed immediately below. The
+            // closure runs at CALL time — inside the write transaction, opened after this whole
+            // loop — so it always sees the finished lists. Per iteration rather than run-wide
+            // because the advisory is per provider instance, like `result.droppedAdvisories`.
+            const skippedRows: SkippedAuthorDay[] = [];
+            const skippedPRRecords: SkippedPRRecord[] = [];
+
             cursorAdvances.push((): void => {
                 // Advancing a cursor the cascade just purged is exactly what re-arms the #262
                 // double-count, so a container whose owner changed mid-run advances nothing.
@@ -3277,6 +3657,16 @@ export class GitSync implements ConnectorInterface {
                 // Same premise, same gate (#288): a commit whose churn was never observed is
                 // only permanently understated once this advance makes its window covered.
                 churnUnknownAdvisories.push(...result.churnUnknownAdvisories);
+                // Same premise, same gate (#302): a row this run refused to write is only beyond
+                // recovery once this advance records its window as covered. Rendered HERE rather
+                // than staged as a finished string like the three above — those are built in
+                // `fetchProviderData` because that is where their data lives, not to keep work
+                // out of the write lock, and the grouping this does is a regex-replace per
+                // skipped row against a transaction already upserting every row of the run.
+                skippedRowAdvisories.push(
+                    ...formatSkippedAuthorDays(providerType, identifier, skippedRows),
+                    ...formatSkippedPRRecords(providerType, identifier, skippedPRRecords),
+                );
                 if (options?.backfill) {
                     setProviderEarliestSyncTime(db, providerType, identifier, options.backfill.since);
                 } else {
@@ -3302,6 +3692,18 @@ export class GitSync implements ConnectorInterface {
             });
 
             for (const record of prRecords) {
+                // THE SECOND WRITE IN THE SHARED TRANSACTION (#302). `upsertPRRecord` binds
+                // `repo`/`pr_id`/`state`/`created_at` — all `NOT NULL`, all cast rather than
+                // validated out of a response body — so a `created_at: null` threw `NOT NULL
+                // constraint failed` from inside `insertMany` and rolled back every other
+                // provider's window: the identical geometry the raw-row skip closes, one write
+                // over. Checked HERE rather than at the write because the check is pure and this
+                // is where the provider that produced the record is still in hand.
+                const prDefect = findPRRecordDefect(record);
+                if (prDefect) {
+                    skippedPRRecords.push({repo: record.repo, prId: record.prId, reason: prDefect});
+                    continue;
+                }
                 fetchedPRRecords.push({record, providerType});
                 // Progress counter only — the authoritative resolution happens in the
                 // write transaction (see `fetchedPRRecords`).
@@ -3331,7 +3733,6 @@ export class GitSync implements ConnectorInterface {
                 const rawAuthorKey = retentionKeyFor(providerType, login, emailForLogin);
                 // No stable identity (no login, no email) — nothing to retain it under.
                 if (!rawAuthorKey) continue;
-                retainedKeys.add(rawAuthorKey);
 
                 for (const [, metrics] of byDate) {
                     const row: RawAuthorDailyInput = {
@@ -3359,6 +3760,54 @@ export class GitSync implements ConnectorInterface {
                         avg_commit_size: metrics.avg_commit_size,
                         commit_burst_count: metrics.commit_burst_count,
                     };
+                    // THE WRITE BOUNDARY'S REFUSAL, ASKED HERE INSTEAD OF SUFFERED THERE (#302).
+                    //
+                    // `upsertRawAuthorDaily` validates fail-closed and THROWS, and it runs inside
+                    // this run's single all-providers write transaction — so a row it will not
+                    // accept does not cost one row, it rolls back every provider's window, moves
+                    // no cursor, and does it again identically on every subsequent run. Three PR
+                    // and review-comment dates (`pr.createdAt`, `pr.mergedAt`,
+                    // `comment.createdAt`) reach `metrics.date` verbatim with no provider gate
+                    // between them and here, and `avg_time_to_merge_hours` is NaN whenever the
+                    // first two are unparseable. Asking `findRawAuthorDailyDefect` — the SAME
+                    // body the store's refusal delegates to, so the two cannot disagree — turns
+                    // that permanent stall into the loss of exactly this author-day, reported.
+                    //
+                    // BEFORE the dedupe merge below, which is safe because the merge cannot turn
+                    // two acceptable rows into an unacceptable one: it sums non-negative integers
+                    // (still non-negative integers) and commit-weights finite rates (still
+                    // finite), while provider/container/key/date are identical across a merge by
+                    // construction — they ARE the dedupe key.
+                    //
+                    // ONLY A ROW-LEVEL REFUSAL IS SKIPPED. The other four codes are decided by
+                    // operands constant for the whole run or the whole provider, so a defect in
+                    // one of them refuses EVERY row — and skipping then discards the entire
+                    // window fail-open with the cursor advanced and the run reported clean, which
+                    // is strictly worse than the rollback this issue is about. Those fall through
+                    // to `upsertRawAuthorDaily` and throw exactly as they did before, holding the
+                    // cursor over a window that re-covers intact once the operator fixes the
+                    // cause. See ROW_LEVEL_REFUSALS for the full argument.
+                    const defect = findRawAuthorDailyDefect(row, now);
+                    if (defect && ROW_LEVEL_REFUSALS.includes(defect.code)) {
+                        skippedRows.push({
+                            raw_author_key: row.raw_author_key,
+                            date: row.date,
+                            code: defect.code,
+                        });
+                        continue;
+                    }
+                    // Recorded only once a row of this author's SURVIVES the check above, because
+                    // this set means "the raw author keys this run retained" and auto-create acts
+                    // on exactly that. An author every one of whose days was refused retained
+                    // nothing, and offering them to the hands-off onboarding would promote an
+                    // identity on the strength of a window that was not written.
+                    //
+                    // "Retained" up to the WRITE PASS, not all the way to the commit: a surviving
+                    // row is still dropped by the `isWritable` gate inside the transaction if its
+                    // container lost its owner mid-run, and this set is not re-narrowed for that.
+                    // Pre-existing and bounded by that narrow window; noted so the sentence above
+                    // is not read as stronger than it is.
+                    retainedKeys.add(rawAuthorKey);
                     // Accumulate WITHIN the run before the store ever sees it, keyed by the
                     // FULL store key — container included (#264).
                     //
@@ -3515,13 +3964,14 @@ export class GitSync implements ConnectorInterface {
             // Committed — only now is the auto-create summary true.
             errors.push(...autoCreateAdvisories);
             // …and only now has any window actually been recorded as covered, which is what
-            // the drop advisories claim (#275), the permanent-diff-loss advisories claim (#280)
-            // and the unobserved-churn advisories claim (#288). All three are cleared by
-            // construction on the rollback path below — never pushed there — for the same
-            // reason.
+            // the drop advisories claim (#275), the permanent-diff-loss advisories claim (#280),
+            // the unobserved-churn advisories claim (#288) and the skipped-author-day advisories
+            // claim (#302). All four are cleared by construction on the rollback path below —
+            // never pushed there — for the same reason.
             errors.push(...droppedAdvisories);
             errors.push(...diffLossAdvisories);
             errors.push(...churnUnknownAdvisories);
+            errors.push(...skippedRowAdvisories);
         } catch (err) {
             // Hard failure: the tx rolled back, so NO snapshots were written, NO developer
             // was auto-created and NO cursor advanced — the window is intact and will be

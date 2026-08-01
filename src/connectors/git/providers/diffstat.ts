@@ -33,9 +33,11 @@ import type {CommitDiffstat, CommitDiffstatCache, GitFileDiff} from './types.js'
  *     which decides whether the churn is memoized and whether the developer-day is reported
  *     as understated;
  *   - `diffstat-cache.ts` refuses to persist a row whose counts are not counts;
- *   - `raw-author-daily.ts` THROWS on one, inside the run's single all-providers write
- *     transaction, which rolls back every provider's window and does so again on every
- *     later run.
+ *   - `raw-author-daily.ts` REFUSES one at the write boundary. Until #302 that refusal was a
+ *     throw inside the run's single all-providers write transaction, which rolled back every
+ *     provider's window and did so again on every later run; the sync now asks the same
+ *     validator first and skips the author-day instead — so the whole day's counters are lost
+ *     and reported only as an unwritable row, which cannot name this commit.
  * The middle one drops the row silently and deliberately does not count a fault, so a value
  * the first boundary waves through and the second refuses is invisible on both channels
  * while still reaching the third. Keeping one predicate is what makes the front boundary's

@@ -501,29 +501,47 @@ export interface GitProvider {
     // skips it and `retentionKeyFor` returns null for it (`sync.ts`), both with nothing in
     // `errors[]` and the cursor advancing — so a clean `errors[]` does NOT by itself prove the
     // window is fully retained. The specific thing every one of them must gate is the AUTHOR
-    // DATE: `raw_author_daily`'s
-    // validator THROWS on a day it cannot key on, inside the run's single all-providers write
-    // transaction, so an unpinned provider does not merely lose its own commit — it rolls back
-    // every OTHER provider's window too, identically, on every subsequent run. The gate is
+    // DATE: `raw_author_daily`'s validator refuses a day it cannot key on. Until #302 that
+    // refusal was a THROW inside the run's single all-providers write transaction, so an
+    // unpinned provider did not merely lose its own commit — it rolled back every OTHER
+    // provider's window too, identically, on every subsequent run. The sync now asks the same
+    // validator up front and SKIPS the row instead, so that tail is gone; what an ungated date
+    // still costs is the commit, silently as far as this seam is concerned — the skip can name
+    // only the author-day, never the sha. Gating here is what keeps the sha nameable, and it is
+    // why the rule below is unchanged by #302. The gate is
     // `isAttributableDate` in `commit-date.ts`, ONE predicate shared by all three (and resting on
     // the same `isUtcDay` the store validates with), because a per-provider copy is what let the
     // agreement drift in the first place. A new implementation must call it;
     // `tests/connectors/git/providers/commit-date-contract.test.ts` is table-driven over
     // `GIT_PROVIDER_TYPES` and fails for one that does not.
     //
-    // READ THAT AS SCOPED TO THE COMMIT AUTHOR DATE, NOT TO THE HAZARD CLASS. The rollback above
-    // is reachable through three OTHER dates that no provider gates and this listener never sees,
-    // because they arrive on {@link GitPR} / {@link GitReviewComment} rather than on a commit:
-    // `aggregateDailyMetrics` keys a metrics row on `toDateString(pr.createdAt)`,
-    // `toDateString(pr.mergedAt)` and `toDateString(comment.createdAt)` (`analyzer.ts`), and that
-    // day reaches `upsertRawAuthorDaily` verbatim. `avg_time_to_merge_hours` is a fourth door:
-    // it is `new Date(mergedAt) - new Date(createdAt)`, so an unparseable operand yields NaN and
-    // the store's `invalid_metric` throws from the same transaction. Probability is lower — those
-    // timestamps are server-generated, not `git commit --date`-settable — but the cost is
-    // identical, and no gate here protects the run from them. The durable fix is a per-row skip at
-    // the WRITE boundary, which is total over every date field and every future provider; it is a
-    // data-integrity decision of #231/#235's weight (it decides that a malformed PR date silently
-    // costs a developer-day rather than holding the cursor) and is tracked separately in #302.
+    // READ THIS GATE AS THE COMMIT AUTHOR DATE'S SHARE OF A LARGER PROBLEM, not as the whole of
+    // it. The other three dates arrive on {@link GitPR} / {@link GitReviewComment} rather than on
+    // a commit, so no provider gate and this listener never see them: `aggregateDailyMetrics`
+    // keys a metrics row on `toDateString(pr.createdAt)`, `toDateString(pr.mergedAt)` and
+    // `toDateString(comment.createdAt)` (`analyzer.ts`), that day reaches `upsertRawAuthorDaily`
+    // verbatim, and `avg_time_to_merge_hours` is a fourth door. #302 closed that class at the
+    // WRITE boundaries instead of adding a fourth and fifth gate here: the sync asks
+    // `findRawAuthorDailyDefect` — the same body the store's refusal delegates to — for every raw
+    // row, and `findPRRecordDefect` for every `pr_records` row, and skips the ones either write
+    // would refuse. That is total over every field those two writes validate and over every
+    // future provider, which no per-provider gate could be.
+    //
+    // WHAT IT DOES NOT CLAIM. "A rollback is unreachable" is a claim about the whole transaction,
+    // and the transaction holds more writes than those two — anything a future write binds from
+    // an unvalidated response field can still throw inside it. What is closed is the DATE class
+    // specifically, at both writes it reaches. A run-level refusal (a blank container, a
+    // non-ISO `observedAt`) also still rolls back ON PURPOSE: see ROW_LEVEL_REFUSALS in
+    // `raw-author-daily.ts` for why skipping those would be strictly worse than the rollback.
+    //
+    // WHAT THAT MEANS FOR AN IMPLEMENTATION, since it changes what this gate buys. It does NOT
+    // make the gate optional. An ungated bad date keys its own author-day bucket, so the write
+    // boundary refuses THAT row — the commit is still lost, and now the report says only "this
+    // author, this unusable day", never the sha, because the row is keyed by (author, day) and
+    // the commits were folded into its counters before the store saw it. Gating here costs the
+    // same one commit and NAMES it, which is the difference between an operator who can look it
+    // up and one who cannot. What #302 removes is the catastrophic tail: an ungated date can no
+    // longer roll back every other provider's window and stall the connector permanently.
     //
     // NOT a drop, and deliberately not reported as one: Bitbucket's in-memory `until` filter
     // removes commits outside the requested window (#276). Those were never in this call's result
