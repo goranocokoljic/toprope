@@ -304,23 +304,28 @@ export interface GitFetchProgress {
      * left an operator unable to tell a walk still approaching its window from a hang —
      * the exact symptom #270 exists to remove.
      *
-     * WHAT A DIVERGENCE MEANS (#292). On the commit walk, a `scanned - done` a producer EMITS
-     * is rows this call's window filtered out, plus — for a caller that supplied one — rows it
-     * reported through {@link GitCommitDropListener}. It is not the silent third exit
+     * WHAT A DIVERGENCE MEANS (#292, #304). On the commit walk, a `scanned - done` a producer
+     * EMITS is rows this call's window filtered out, plus — for a caller that supplied one — rows
+     * it reported through {@link GitCommitDropListener}. It is not the silent third exit
      * Bitbucket's pre-#290 Invalid-Date fall-through added (see the gate in `bitbucket.ts`
      * getCommits), where a forward run's `1200 commits found (1201 scanned)` read identically
      * to a benign approach while a day was permanently short.
      *
-     * Read that as narrowly as it is written. It is about EMITTED counts, not rows: a producer
-     * may decline a row on a path it publishes no count for, which is why the emission Bitbucket
-     * skips on its cutoff page is load-bearing rather than incidental, and a producer adding a
+     * That statement is now TOTAL over the rows a walk is handed, which is what #304 closed and
+     * why the caveat #292 recorded here is gone. Two exclusions used to sit outside it, both on
+     * Bitbucket: a future-dated row, which `until` excludes on every run and which no later run
+     * admits, went unreported (it now travels as {@link FUTURE_AUTHOR_DATE_DROP_REASON}); and the
+     * rows after the `since` cutoff on the page that trips it were counted by a per-page
+     * increment and then abandoned unexamined (that page's tail is now run through the date gate
+     * before the walk breaks, so an undatable row in it is reported like any other).
+     *
+     * Read the rule as narrowly as it is written even so. It is about EMITTED counts, not rows: a
+     * producer may decline a row on a path it publishes no count for, and a producer adding a
      * further decline path must give it a channel or keep it out of every emitted count. And
-     * "window-filtered" does not promise the row comes back — one excluded on the `until` side
-     * by a date no later run will admit (a future-dated commit) is excluded permanently with
-     * nothing reported. Both exclusions are #304. So an excess reads as "still approaching the
-     * window, or a loss the run states when it completes" — where that report is the BOUNDED
-     * sample {@link GitCommitDropListener} describes, and a run that fails mid-walk discards it
-     * along with the attempt. It is never, on its own, proof that nothing was lost.
+     * "window-filtered" does not promise the row comes back — an excess reads as "still
+     * approaching the window, or a loss the run states when it completes" — where that report is
+     * the BOUNDED sample {@link GitCommitDropListener} describes, and a run that fails mid-walk
+     * discards it along with the attempt. It is never, on its own, proof that nothing was lost.
      *
      * Two limits on what a moving count proves, both deliberate and neither fixed here.
      * It advances only BETWEEN requests: `fetchBitbucket`'s rate-limit and 5xx backoff
@@ -358,12 +363,17 @@ export interface GitFetchProgress {
 export type GitFetchProgressListener = (progress: GitFetchProgress) => void;
 
 /**
- * Every reason a provider may give for dropping a commit it listed (#275).
+ * Every reason a provider may give for dropping a commit it listed (#275, #304).
  *
- * Both members describe the SAME defect class — the commit cannot be attributed to a day —
+ * The first two describe the SAME defect class — the commit cannot be attributed to a day —
  * split only because the operator's next step differs: a commit with no date at all is a
  * truncated/garbled response, while one with an out-of-range or non-ISO date is a real commit
- * with a timestamp this pipeline cannot key on.
+ * with a timestamp this pipeline cannot key on. {@link FUTURE_AUTHOR_DATE_DROP_REASON} (#304) is
+ * a third class and not a response defect at all — the date is fine, it is just ahead of every
+ * window a run can request — which is why it carries its own sentence rather than being folded
+ * into the unattributable one. What all three share, and the only thing this channel requires,
+ * is that re-fetching returns the identical row: none of them is healed by a retry or by holding
+ * the cursor.
  *
  * Declared as SINGLE unbroken literals, deliberately. `'a' + 'b'` is not constant-folded by
  * TypeScript, so a concatenated const widens to `string` and every type derived from it —
@@ -390,6 +400,37 @@ export const NO_AUTHOR_DATE_DROP_REASON = 'no author date on any copy of the com
 export const UNATTRIBUTABLE_DATE_DROP_REASON = 'the author date is present but is not a day the pipeline can key on, so the commit cannot be attributed to a day';
 
 /**
+ * The THIRD reason, and the one that is not a response-shape defect (#304).
+ *
+ * The other two describe a date this pipeline cannot key on at all. This one describes a
+ * perfectly well-formed day that is simply LATER than the end of the window the run could ask
+ * for — and, because a run's `until` can never exceed the moment it started, later than the
+ * current time too. Only an in-memory `until` filter can produce it: GitHub and GitLab push the
+ * window to the server, so a future-dated row is filtered where nothing is counting. Bitbucket's
+ * commit endpoint takes no date bounds, so its walk sees the row, excludes it, and — before
+ * #304 — said nothing, which read to an operator as the benign "still approaching the window"
+ * divergence forever (see {@link GitFetchProgress.scanned}).
+ *
+ * WHY IT IS ON THIS CHANNEL rather than a throw, which is the question {@link GitCommitDrop}
+ * makes every reason answer. Re-fetching returns the identical row with the identical date, so a
+ * retry recovers nothing and holding the cursor would stall the provider forever — exactly the
+ * test the other two pass. What differs is only WHY it cannot come back, and the reason says so
+ * rather than borrowing the other two's "unusable response" wording: it is excluded until
+ * wall-clock time passes the date, and a run that late stops at its own, much newer `since`
+ * cutoff before its walk ever reaches the commit's position in the newest-first list. So the
+ * loss is permanent in practice while being recoverable in principle, and an operator who reads
+ * the reason knows to go look at the commit's timestamp (clock skew, `git commit --date=`,
+ * imported or rewritten history) rather than at a truncated response.
+ *
+ * SMALL SKEW IS DELIBERATELY NOT SILENT EITHER. A commit stamped a minute ahead is reported the
+ * same way and may well be admitted by the next run, so this reason is not a promise that the
+ * commit is gone — it is a statement that THIS run excluded it on a bound no run in flight can
+ * widen. Reporting only "large" skew would need a horizon constant nothing in the pipeline can
+ * derive, and the case it would silence is the one where the operator's clock is broken.
+ */
+export const FUTURE_AUTHOR_DATE_DROP_REASON = 'the author date is later than both the end of the window this run requested and the current time, so no run in flight can include the commit — it stays excluded until wall-clock time passes that date, and a run that late stops at its own newer cutoff before reaching it';
+
+/**
  * The reasons as a runtime-enumerable set, for the allowlist check at the reporting sink.
  *
  * NAMED at the declaration site above and this tuple built from the names — never the reverse.
@@ -400,6 +441,7 @@ export const UNATTRIBUTABLE_DATE_DROP_REASON = 'the author date is present but i
 export const COMMIT_DROP_REASONS = [
     NO_AUTHOR_DATE_DROP_REASON,
     UNATTRIBUTABLE_DATE_DROP_REASON,
+    FUTURE_AUTHOR_DATE_DROP_REASON,
 ] as const;
 
 /** One of the {@link COMMIT_DROP_REASONS}. */
@@ -418,7 +460,14 @@ export type GitCommitDropReason = (typeof COMMIT_DROP_REASONS)[number];
  *
  * The loss is therefore PERMANENT, which is exactly why it has to be said out loud: before
  * #275 such a commit vanished with nothing in `errors[]`, no trace in the sync log, and a
- * cursor already advanced past it. This type is the CANONICAL statement of that decision —
+ * cursor already advanced past it. ONE reason qualifies that word rather than sharing it
+ * outright — {@link FUTURE_AUTHOR_DATE_DROP_REASON} (#304) describes a commit no run IN FLIGHT
+ * can admit, which a run started after the date could in principle admit and in practice does
+ * not (its walk stops at a much newer cutoff first). It travels here because it meets the test
+ * this channel actually imposes: re-fetching returns the identical row, so a retry heals nothing
+ * and a cursor hold would stall the provider forever. Read the per-reason sentence, not this
+ * paragraph, for how recoverable a given drop is. This type is the CANONICAL statement of that
+ * decision —
  * the sites that act on it (`COMMITS_DROPPED_PREFIX` in `sync.ts`, and the drop report in each
  * of `github.ts` / `gitlab.ts` / `bitbucket.ts` since #290) cite it rather than re-deriving it.
  */
@@ -545,11 +594,18 @@ export interface GitProvider {
     //
     // NOT a drop, and deliberately not reported as one: Bitbucket's in-memory `until` filter
     // removes commits outside the requested window (#276). Those were never in this call's result
-    // set, so reporting them would drown the real losses in noise. ONE EXCEPTION, forced by
-    // ordering: Bitbucket cannot window-filter a row whose date it cannot parse, so its gate runs
-    // BEFORE the filter and an out-of-window row with an unusable date IS reported. Gating after
-    // the filter would restore the silent loss this listener exists to prevent, so the report is
-    // the lesser evil — but note exactly what it costs an operator, because it is more than noise.
+    // set, so reporting them would drown the real losses in noise. TWO EXCEPTIONS, and neither is
+    // a softening of that rule — both are rows the filter's premise ("a later run covers this")
+    // does not actually hold for. First, forced by ordering: Bitbucket cannot window-filter a row
+    // whose date it cannot parse, so its gate runs BEFORE the filter and an out-of-window row with
+    // an unusable date IS reported. Second (#304): a row excluded on the `until` side whose date is
+    // ALSO ahead of the current time is not awaiting a later window at all — no run in flight can
+    // have an `until` past it — so it is reported under {@link FUTURE_AUTHOR_DATE_DROP_REASON}
+    // rather than counted as approach. A row excluded by `until` that is merely older than now
+    // stays unreported, because that IS the ordinary approach the filter describes.
+    // Gating after the filter would restore the silent loss this listener exists to prevent, so
+    // the report is the lesser evil — but note exactly what it costs an operator, because it is
+    // more than noise.
     // Bitbucket's endpoint takes no server date bounds, so EVERY run re-pages HEAD→since (not just
     // a backfill chunk — a forward run stops only at the first commit OLDER than `since`). A
     // bad-dated commit in that walked prefix is therefore re-reported on every sync, indefinitely,

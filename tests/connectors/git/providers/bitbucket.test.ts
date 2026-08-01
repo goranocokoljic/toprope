@@ -8,6 +8,7 @@ import {
     isRetryableGitFetchError,
 } from '../../../../src/connectors/git/providers/http-retry';
 import {
+    FUTURE_AUTHOR_DATE_DROP_REASON,
     UNATTRIBUTABLE_DATE_DROP_REASON,
     type BitbucketProviderConfig,
 } from '../../../../src/connectors/git/providers/types';
@@ -623,21 +624,27 @@ describe('BitbucketProvider', () => {
             ]);
         });
 
-        it('does not report the page that hits the since cutoff, and abandons its tail unexamined', async () => {
-            // `break paging` skips the listing report on the cutoff page, deliberately:
-            // the fan-out seed below it runs in the same synchronous block and would
-            // overwrite the tick before any poller could read it, so restructuring the
-            // walk to reach it would be churn for nothing (#270 review OR-1). What must
-            // hold is that the cutoff BEHAVIOR is unchanged and the fan-out still ticks.
+        it('gates the cutoff page tail before breaking, and still does not report that page', async () => {
+            // The cutoff page's listing tick is still skipped, deliberately: the fan-out seed
+            // below it runs in the same synchronous block and would overwrite the tick before
+            // any poller could read it, so restructuring the walk to reach it would be churn
+            // for nothing (#270 review OR-1). What #304 changed is what the page's ROWS do.
             //
-            // `undatable` sits AFTER the cutoff row, which is the BOUND on the claim
-            // `getCommits` and `GitFetchProgress.scanned` make since #292 — an EMITTED
-            // divergence is window-filtered rows plus `onDrop`-reported rows. `scanned` is
-            // incremented for the whole page, so this row is counted, never examined, never
-            // in `collected`, and never routed to `onDrop`. What keeps the claim true is that
-            // the break also skips this page's emission, so no divergence is published for it —
-            // which is what the tick assertion below pins. A change that emits a tick after the
-            // break would publish a `scanned` no channel accounts for, and fails here.
+            // THE THREE ROWS AFTER THE CUTOFF ARE THE POINT, one per outcome the tail can have:
+            //   - `undatable` is now REPORTED. It used to be the one member of its class the
+            //     walk lost in silence — counted into `scanned`, never gated, never in
+            //     `collected`, never on `onDrop` — which is what bounded the #292 claim that an
+            //     emitted divergence is window-filtered rows plus reported drops. The gate runs
+            //     above the cutoff guard for the same reason it `continue`s rather than breaks:
+            //     "it sits after the cutoff row" is a statement about the endpoint's ORDER, and
+            //     a row whose own date is unreadable cannot be placed in that order at all.
+            //   - `straggler` is datable and INSIDE the window, and must still not be collected.
+            //     Draining the tail must not turn the retained set into a function of where the
+            //     page boundary happened to fall; delete the `reachedCutoff` guard in the walk
+            //     and this row appears in the result, which no other test catches.
+            //   - `ahead` is datable and FUTURE-dated, and must not be reported either: past the
+            //     cutoff the endpoint's order is what the stop rests on, so calling it a lost
+            //     commit would report an ordering violation as data loss.
             const fetchMock = makeFetchMock([
                 {
                     body: pagedResponse(
@@ -645,6 +652,8 @@ describe('BitbucketProvider', () => {
                             makeCommitFixture('aaa', {date: '2024-01-20T00:00:00+00:00'}),
                             makeCommitFixture('bbb', {date: '2023-12-01T00:00:00+00:00'}),
                             makeCommitFixture('undatable', {date: 'not-a-date'}),
+                            makeCommitFixture('straggler', {date: '2024-01-05T00:00:00+00:00'}),
+                            makeCommitFixture('ahead', {date: '2099-01-01T00:00:00+00:00'}),
                         ],
                         'https://api.bitbucket.org/2.0/next',
                     ),
@@ -664,11 +673,12 @@ describe('BitbucketProvider', () => {
             );
 
             expect(commits.map((c) => c.sha)).toEqual(['aaa']);
-            // Current behavior, recorded rather than endorsed, and tracked as #304 — a fix that
-            // examines the cutoff page's tail flips this assertion, which is the fix landing,
-            // not a regression. Compare the parameterized test BELOW, where the identical row
-            // placed before any cutoff is reported.
-            expect(onDrop).not.toHaveBeenCalled();
+            // Exactly one report, and it is the row nothing else could account for. Asserted as
+            // the whole call list rather than a `toHaveBeenCalledWith`, so a walk that also
+            // reported `ahead` (or re-reported `bbb`) fails here.
+            expect(onDrop.mock.calls.map((c) => c[0])).toEqual([
+                {sha: 'undatable', reason: UNATTRIBUTABLE_DATE_DROP_REASON},
+            ]);
             expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
                 {done: 0, total: 1},
                 {done: 1, total: 1},
@@ -742,6 +752,155 @@ describe('BitbucketProvider', () => {
                     .map((c) => c[0] as {done: number; total: number | null; scanned?: number})
                     .filter((p) => p.total === null);
                 expect(listingTicks).toEqual([{done: 2, total: null, scanned: 3}]);
+            },
+        );
+
+        // --- future-dated exclusions (#304) ---
+
+        // The clock this walk compares against. Fixed rather than inherited from the suite's
+        // `useFakeTimers()` base (which is the real wall clock) so `until` can be written as a
+        // literal equal to `now` — the forward-run shape the whole class only appears in.
+        const NOW = '2026-07-28T10:00:00.000Z';
+
+        it('reports a future-dated commit the forward window excludes, and keeps walking', async () => {
+            // THE #304 CASE. On a forward run `until` IS `now`, so a commit dated ahead of the
+            // clock fails `commitDate <= untilDate` and never reaches `collected` — and before
+            // #304 nothing said so. It is not the ordinary "still approaching the window"
+            // exclusion the filter exists for: Bitbucket re-pages from HEAD every run and the row
+            // is newer than `since`, so it never trips the cutoff, and no run in flight has an
+            // `until` past `now`. The result was a permanent `+1` divergence between `scanned`
+            // and `done` that an operator reads as benign.
+            //
+            // The future row sits BETWEEN two in-window commits, so a walk that broke on it (or
+            // stopped gating after it) loses `after`.
+            vi.setSystemTime(new Date(NOW));
+            const fetchMock = makeFetchMock([
+                {
+                    body: pagedResponse([
+                        makeCommitFixture('before', {date: '2026-07-20T00:00:00+00:00'}),
+                        makeCommitFixture('skewed', {date: '2099-01-01T00:00:00+00:00'}),
+                        makeCommitFixture('after', {date: '2026-07-10T00:00:00+00:00'}),
+                    ]),
+                },
+                {body: pagedResponse(makeDiffstatFixture())}, // diffstat for before
+                {body: pagedResponse(makeDiffstatFixture())}, // diffstat for after
+            ]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            const onDrop = vi.fn();
+            const onProgress = vi.fn();
+            const commits = await provider.getCommits(
+                'my-repo',
+                '2026-07-01T00:00:00Z',
+                NOW,
+                onProgress,
+                onDrop,
+            );
+
+            expect(commits.map((c) => c.sha)).toEqual(['before', 'after']);
+            // Its OWN reason, not the unattributable one: the date is a perfectly good day and
+            // the operator's next step is the commit's timestamp (clock skew, `--date=`,
+            // imported history), not a truncated response.
+            expect(onDrop.mock.calls.map((c) => c[0])).toEqual([
+                {sha: 'skewed', reason: FUTURE_AUTHOR_DATE_DROP_REASON},
+            ]);
+            expect(FUTURE_AUTHOR_DATE_DROP_REASON).not.toBe(UNATTRIBUTABLE_DATE_DROP_REASON);
+            // The row was HANDED over, so it still counts toward `scanned` — and now the
+            // divergence it creates is accounted for by a channel rather than being silent.
+            const listingTicks = onProgress.mock.calls
+                .map((c) => c[0] as {done: number; total: number | null; scanned?: number})
+                .filter((p) => p.total === null);
+            expect(listingTicks).toEqual([{done: 2, total: null, scanned: 3}]);
+        });
+
+        it('does NOT report a commit excluded by an until in the past — that one a later run covers', async () => {
+            // The negative control the reason above only means something against, and the ONLY
+            // test that distinguishes `commitDate > untilDate && commitDate > now` from a bare
+            // `commitDate > untilDate`. A backfill or catch-up chunk sets `until` in the past and
+            // then filters HUNDREDS of pages of perfectly ordinary commits — reporting those as
+            // drops would bury the real losses under the whole approach walk, and every one of
+            // them IS covered by the forward run.
+            vi.setSystemTime(new Date(NOW));
+            const fetchMock = makeFetchMock([
+                {
+                    body: pagedResponse([
+                        // After `until`, before `now`: excluded here, admitted by the next
+                        // forward run.
+                        makeCommitFixture('newer', {date: '2026-06-01T00:00:00+00:00'}),
+                        makeCommitFixture('inside', {date: '2026-01-15T00:00:00+00:00'}),
+                    ]),
+                },
+                {body: pagedResponse(makeDiffstatFixture())}, // diffstat for inside
+            ]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            const onDrop = vi.fn();
+            const commits = await provider.getCommits(
+                'my-repo',
+                '2026-01-01T00:00:00Z',
+                '2026-02-01T00:00:00Z',
+                undefined,
+                onDrop,
+            );
+
+            expect(commits.map((c) => c.sha)).toEqual(['inside']);
+            expect(onDrop).not.toHaveBeenCalled();
+        });
+
+        it('does NOT report a commit stamped exactly now that until just misses', async () => {
+            // `>` and not `>=`, pinned. A row at exactly the current instant is the boundary the
+            // next run's `until` includes — the sync derives `until` from the run's start, so a
+            // window opened one tick later reaches it. Reporting it would call a one-tick race a
+            // permanent loss.
+            vi.setSystemTime(new Date(NOW));
+            const fetchMock = makeFetchMock([
+                {
+                    body: pagedResponse([
+                        makeCommitFixture('on-the-instant', {date: NOW}),
+                        makeCommitFixture('inside', {date: '2026-07-20T00:00:00+00:00'}),
+                    ]),
+                },
+                {body: pagedResponse(makeDiffstatFixture())}, // diffstat for inside
+            ]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            const onDrop = vi.fn();
+            const commits = await provider.getCommits(
+                'my-repo',
+                '2026-07-01T00:00:00Z',
+                '2026-07-28T09:59:59.999Z',
+                undefined,
+                onDrop,
+            );
+
+            expect(commits.map((c) => c.sha)).toEqual(['inside']);
+            expect(onDrop).not.toHaveBeenCalled();
+        });
+
+        // --- window bounds (#304) ---
+
+        it.each([
+            ['until', ['2024-01-01T00:00:00Z', 'not-a-date']],
+            ['since', ['not-a-date', '2024-12-31T00:00:00Z']],
+        ] as const)(
+            'refuses to walk when %s is not a parseable instant, instead of filtering with NaN',
+            async (label, [since, until]) => {
+                // An Invalid Date compares FALSE against every operator, so an unparseable
+                // `until` would exclude EVERY row while `scanned` climbed and the call returned
+                // an empty list as a success — the silent-exclusion class #304 removes, one level
+                // above the rows it is about. Fail closed: the caller records the failure and
+                // HOLDS the cursor (#231), so the window is re-fetched once the bound is fixed.
+                const fetchMock = makeFetchMock([
+                    {body: pagedResponse([makeCommitFixture('aaa')])},
+                ]);
+                vi.stubGlobal('fetch', fetchMock);
+
+                await expect(provider.getCommits('my-repo', since, until)).rejects.toThrow(
+                    new RegExp(`"${label}"`),
+                );
+                // Refused BEFORE the first request, so a malformed bound costs no network work
+                // and cannot half-walk a repo.
+                expect(fetchMock).not.toHaveBeenCalled();
             },
         );
 

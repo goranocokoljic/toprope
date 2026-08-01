@@ -207,6 +207,16 @@ export const DIFFS_NOT_SUPPLIED_PREFIX = 'Provider supplied no commit diffs:';
  *
  * Emitted only for a run whose data was actually KEPT — see the emit site and the rollback
  * handler. A discarded window is re-fetched, so calling its drops permanent would be a lie.
+ *
+ * "UNATTRIBUTABLE" IN THE SENTINEL IS THE HEADLINE FOR THE CHANNEL, not a claim about every
+ * reason on it, and since #304 that distinction is real: {@link FUTURE_AUTHOR_DATE_DROP_REASON}
+ * describes a commit whose date is perfectly usable and merely ahead of every window a run can
+ * request, so THIS run did not attribute it while a run started after that date could. The
+ * sentinel is deliberately not renamed for it — it is matched by `isAdvisoryError` and
+ * `isPermanentLossAdvisory`, persisted into `sync_logs.errors` and `last_sync_advisories`, and
+ * asserted verbatim across the suite, so widening the word would cost more than it buys. What
+ * carries the distinction is the grouped reason the line ends with, which is why the body below
+ * pushes "can this come back?" onto the reason rather than answering it for the whole line.
  */
 export const COMMITS_DROPPED_PREFIX = 'Commits dropped as unattributable:';
 
@@ -2939,10 +2949,12 @@ async function fetchProviderData(
         );
         return (
             `${COMMITS_DROPPED_PREFIX} [${providerType}/${droppedRepo}] ${drops.length} ` +
-            `commit(s) the provider listed could not be imported, and this run has recorded ` +
-            `its window as covered — nothing re-asks them. There is no targeted re-fetch: ` +
+            `commit(s) the provider listed could not be imported into the window this run has ` +
+            `now recorded as covered. There is no targeted re-fetch: ` +
             `"sync older history" only extends STRICTLY older than the earliest synced ` +
-            `instant, so it cannot reach a forward window. ${groups}.`
+            `instant, so it cannot reach a forward window. Whether an ordinary later run could ` +
+            `reach one of these at all is what its reason says — a date this pipeline cannot ` +
+            `key on is the same on every re-fetch, so nothing re-asks those. ${groups}.`
         );
     });
 
