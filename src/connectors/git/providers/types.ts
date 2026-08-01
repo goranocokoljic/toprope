@@ -311,13 +311,20 @@ export interface GitFetchProgress {
      * getCommits), where a forward run's `1200 commits found (1201 scanned)` read identically
      * to a benign approach while a day was permanently short.
      *
-     * That statement is now TOTAL over the rows a walk is handed, which is what #304 closed and
-     * why the caveat #292 recorded here is gone. Two exclusions used to sit outside it, both on
-     * Bitbucket: a future-dated row, which `until` excludes on every run and which no later run
-     * admits, went unreported (it now travels as {@link FUTURE_AUTHOR_DATE_DROP_REASON}); and the
-     * rows after the `since` cutoff on the page that trips it were counted by a per-page
-     * increment and then abandoned unexamined (that page's tail is now run through the date gate
-     * before the walk breaks, so an undatable row in it is reported like any other).
+     * That statement is now TOTAL over the rows in an EMITTED `scanned`, which is what #304
+     * closed and why the caveat #292 recorded here is gone. Two exclusions used to sit outside
+     * it, both on Bitbucket: a future-dated row, which `until` excludes on every run in flight,
+     * went unreported (it now travels as {@link FUTURE_AUTHOR_DATE_DROP_REASON}); and the rows
+     * after the `since` cutoff on the page that trips it were counted by a per-page increment and
+     * then abandoned unexamined (that page's tail is now run through the date gate before the
+     * walk breaks, so an undatable row in it is reported like any other).
+     *
+     * "In an emitted `scanned`" is the exact bound, not a hedge. The cutoff page is never
+     * emitted, so its rows are outside the claim in BOTH directions: a drop reported from its
+     * tail arrives with no divergence to explain it, and — under an ordering violation, which is
+     * the one premise the cutoff rests on — a datable in-window row in that tail is still
+     * discarded with nothing said. See `getCommits` below, which names that residue rather than
+     * claiming it away.
      *
      * Read the rule as narrowly as it is written even so. It is about EMITTED counts, not rows: a
      * producer may decline a row on a path it publishes no count for, and a producer adding a
@@ -405,30 +412,59 @@ export const UNATTRIBUTABLE_DATE_DROP_REASON = 'the author date is present but i
  * The other two describe a date this pipeline cannot key on at all. This one describes a
  * perfectly well-formed day that is simply LATER than the end of the window the run could ask
  * for — and, because a run's `until` can never exceed the moment it started, later than the
- * current time too. Only an in-memory `until` filter can produce it: GitHub and GitLab push the
- * window to the server, so a future-dated row is filtered where nothing is counting. Bitbucket's
- * commit endpoint takes no date bounds, so its walk sees the row, excludes it, and — before
- * #304 — said nothing, which read to an operator as the benign "still approaching the window"
- * divergence forever (see {@link GitFetchProgress.scanned}).
+ * current time too. Only an in-memory `until` filter can produce it, which today is Bitbucket's
+ * commit walk alone: its endpoint takes no date bounds, so the walk sees the row, excludes it,
+ * and — before #304 — said nothing, which read to an operator as the benign "still approaching
+ * the window" divergence forever (see {@link GitFetchProgress.scanned}).
+ *
+ * THE OTHER TWO PROVIDERS ARE NOT IMMUNE, THEY ARE WORSE, and this reason must not be read as
+ * evidence otherwise. GitHub and GitLab push the window to the server, but that server window
+ * filters on the COMMITTER date (stated again at `getCommits` below), while the day key this
+ * pipeline derives comes from the AUTHOR date — `github.ts` reads `commit.author.date` and
+ * `gitlab.ts` reads `authored_date`, and neither re-filters it in memory. A commit whose author
+ * date is 2099 and whose committer date is today (a `--date=` override, a rebase of imported
+ * history) is therefore RETURNED by their windows, accepted by `isAttributableDate` — `isUtcDay`
+ * has no upper bound — and written to `raw_author_daily` as a `2099-01-01` day, permanently,
+ * under the append-only rule. So the same physical defect is REPORTED here and SILENTLY IMPORTED
+ * there. That gap is real and open; closing it belongs at the write boundary for all three
+ * providers at once (the same argument #302 made for the PR dates), not in this constant.
  *
  * WHY IT IS ON THIS CHANNEL rather than a throw, which is the question {@link GitCommitDrop}
  * makes every reason answer. Re-fetching returns the identical row with the identical date, so a
  * retry recovers nothing and holding the cursor would stall the provider forever — exactly the
- * test the other two pass. What differs is only WHY it cannot come back, and the reason says so
- * rather than borrowing the other two's "unusable response" wording: it is excluded until
- * wall-clock time passes the date, and a run that late stops at its own, much newer `since`
- * cutoff before its walk ever reaches the commit's position in the newest-first list. So the
- * loss is permanent in practice while being recoverable in principle, and an operator who reads
- * the reason knows to go look at the commit's timestamp (clock skew, `git commit --date=`,
- * imported or rewritten history) rather than at a truncated response.
+ * test the other two pass. What differs is HOW recoverable it is, and the sentence says so
+ * plainly rather than borrowing the other two's "unusable response" wording, because the honest
+ * answer depends on the size of the skew:
+ *   - Smaller than the gap to the next run: the next run's `until` reaches past the date and its
+ *     `since` is older than the row, so the commit is simply COLLECTED then. The report was true
+ *     when made ("this run excluded it") and the condition clears itself.
+ *   - Larger: by the time wall-clock passes the date, the forward cursor — and with it the
+ *     `since` cutoff — has moved past the commit's position in the newest-first list, so the
+ *     walk stops before reaching it and the loss is permanent in practice.
+ * The reason therefore states the CONDITION rather than a verdict. Do not tighten it back into
+ * "never": an operator who is told a self-healing skew is a permanent loss stops trusting the
+ * whole channel. What the operator does either way is the same and is what the wording points
+ * at: go look at the commit's timestamp (clock skew, `git commit --date=`, imported or rewritten
+ * history), not at a truncated response.
  *
- * SMALL SKEW IS DELIBERATELY NOT SILENT EITHER. A commit stamped a minute ahead is reported the
- * same way and may well be admitted by the next run, so this reason is not a promise that the
- * commit is gone — it is a statement that THIS run excluded it on a bound no run in flight can
- * widen. Reporting only "large" skew would need a horizon constant nothing in the pipeline can
- * derive, and the case it would silence is the one where the operator's clock is broken.
+ * SMALL SKEW IS DELIBERATELY NOT SILENT EITHER, per the first bullet: it is still reported, and
+ * the wording is what keeps that honest. Reporting only "large" skew would need a horizon
+ * constant nothing in the pipeline can derive, and the case it would silence is the one where
+ * the operator's clock is broken.
+ *
+ * WHAT IT COSTS ON THIS PROVIDER, which is more than the other two reasons cost. `getCommits`
+ * below records that a Bitbucket drop is re-reported on EVERY run (the endpoint has no server
+ * date bounds, so every run re-pages HEAD→since) and that a repeat therefore turns the CLI
+ * permanently red and occupies bounded advisory budget. This reason has that property in its
+ * strongest form: a future-dated row is by definition newer than `since`, so it never trips the
+ * cutoff, and Bitbucket lists newest-first, so it sits at the HEAD of every walk indefinitely.
+ * It also rides {@link GitCommitDrop}'s channel into `sync.ts`'s permanent-loss advisory tier,
+ * which for the self-healing skew above over-ranks it for the one run before it clears. Both are
+ * known and deliberately not fixed here: suppressing the repeat needs the persisted per-loss
+ * ledger `GitCommitDropListener` says the system does not have, and splitting the tier needs a
+ * second advisory sentinel threaded through the staging, ranking and admin surfaces.
  */
-export const FUTURE_AUTHOR_DATE_DROP_REASON = 'the author date is later than both the end of the window this run requested and the current time, so no run in flight can include the commit — it stays excluded until wall-clock time passes that date, and a run that late stops at its own newer cutoff before reaching it';
+export const FUTURE_AUTHOR_DATE_DROP_REASON = 'the author date is later than both the end of the window this run requested and the current time, so no run in flight could include the commit — only a run started after that date can, and only if its cutoff has not moved past the commit by then';
 
 /**
  * The reasons as a runtime-enumerable set, for the allowlist check at the reporting sink.
@@ -544,7 +580,17 @@ export interface GitProvider {
     // hold.
     //
     // ALL THREE IMPLEMENTATIONS HONOR THAT IN FULL since #290 — the rule above has no exception
-    // list any more, so no commit is silently lost BY A PROVIDER'S `getCommits`. That is the
+    // list any more, so no commit is silently lost BY A PROVIDER'S `getCommits` FOR A REASON THIS
+    // GATE CAN SEE. One residue remains and #304 chose to name it rather than close it: on the
+    // page that trips Bitbucket's `since` cutoff, a row the walk CAN date and whose date is
+    // inside the window is discarded with nothing reported. It exists only when the endpoint's
+    // newest-first order and the author date disagree — a merge bringing an older-dated branch in
+    // after newer mainline commits does exactly that — and it is the ordering premise the cutoff
+    // itself rests on, so reporting it would be reporting an order violation as data loss and
+    // COLLECTING it would make the retained set depend on where the page boundary happened to
+    // fall. Pre-#304 the same row was abandoned mid-page; what changed is that the walk now looks
+    // at it, and the decision is written down (`bitbucket.ts`) instead of being an accident of
+    // where the break sat. That is the
     // whole of the claim: it is about this seam, not about the run. One frame downstream the
     // sync still drops a commit whose author has neither a login nor an email — `analyzer.ts`
     // skips it and `retentionKeyFor` returns null for it (`sync.ts`), both with nothing in
@@ -610,8 +656,16 @@ export interface GitProvider {
     // a backfill chunk — a forward run stops only at the first commit OLDER than `since`). A
     // bad-dated commit in that walked prefix is therefore re-reported on every sync, indefinitely,
     // and an ISO expanded year sorts to the head of the newest-first list permanently, so it never
-    // leaves. GitHub and GitLab do not share this: their windows are server-side and filter on
-    // COMMITTER date, so the same commit ages out and is reported once. Two consequences follow,
+    // leaves. THE SAME IS TRUE, IN ITS STRONGEST FORM, of the future-dated class #304 added: that
+    // row is by definition newer than `since`, so it never trips the cutoff, and it sits at the
+    // head of the newest-first list until wall-clock passes its date. Read the cost below as
+    // covering both — with the one difference that a small skew clears itself on the next run,
+    // where a bad date never does (see {@link FUTURE_AUTHOR_DATE_DROP_REASON}).
+    // GitHub and GitLab do not share the REPEAT: their windows are server-side and filter on
+    // COMMITTER date, so a bad-dated commit ages out and is reported once. Note what that same
+    // fact costs them for the future-dated class, which is worse than a repeat — a committer-date
+    // window does not exclude a future AUTHOR date at all, so those two IMPORT the commit onto a
+    // future day instead of reporting it. Two consequences follow,
     // and neither clears on its own: `toprope sync git` exits non-zero whenever `errors[]` is
     // non-empty and advisories share that array, so one such commit makes the CLI permanently red
     // for a run that succeeded; and `last_sync_advisories` is bounded, so the repeat occupies

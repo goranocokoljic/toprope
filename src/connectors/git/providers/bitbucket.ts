@@ -42,25 +42,39 @@ function parseRawAuthor(raw: string): {name: string; email: string} {
  * from the rows it is about, and it is the graduated "make each bound total; reject an
  * unparseable operand explicitly rather than letting NaN compare false" rule (#233).
  *
+ * BOTH HALVES OF THAT RULE, because the NaN half alone would not have caught the value #233 was
+ * actually about. An ISO 8601 expanded year (`+010000-01-01T00:00:00.000Z`, what
+ * `git commit --date=@999999999999` and a mis-copied watermark produce) parses to a perfectly
+ * finite instant, so it sails through a `Number.isNaN` test — and as a `since` it is in the
+ * FUTURE, which makes the walk's very first row trip the cutoff, `collected` come back empty,
+ * the run report success, and the cursor advance over the whole untouched window. That is a
+ * worse outcome than the NaN case, produced by a value the parseability check waves through, so
+ * the shape is pinned as well: an ordinary year is four digits, and `toISOString()` renders
+ * anything else with a leading `+`/`-` sign.
+ *
  * FAIL-CLOSED by throwing rather than by falling back to "no bound": the caller (`sync.ts`)
  * treats a throw out of `getCommits` as an un-covered window — it records the failure and HOLDS
  * the provider's cursor (#231), so the window is re-fetched once the bad value is fixed.
  * Substituting `null` would do the opposite: walk the repo's entire history, record it as the
  * requested window, and advance the cursor over data nobody asked for.
  *
- * The offending value is deliberately NOT interpolated into the message. It reaches an operator
- * terminal and `sync_logs.errors` through the caller's `Failed to fetch commits:` line, and the
- * bounds are read from `git_last_sync`/`git_earliest_sync` — naming which bound is malformed is
- * the whole of what the operator needs, and it costs nothing to keep an unvalidated stored value
- * out of that sink.
+ * The offending VALUE is deliberately not interpolated into the message, but the STATE KEYS that
+ * hold it are. The message reaches an operator terminal and `sync_logs.errors` through the
+ * caller's `Failed to fetch commits:` line, and it is the only signal they get for a fault that
+ * repeats identically forever — so it has to point somewhere. `git_last_sync`/`git_earliest_sync`
+ * are the two `sync_state` rows these bounds are read from; naming them leaks nothing (that is
+ * the whole reason the value itself is withheld) and is the difference between an unexplained
+ * brick and a two-minute repair.
  */
 function parseCommitBound(value: string, label: 'since' | 'until'): Date | null {
     if (!value) return null;
     const parsed = new Date(value);
-    if (Number.isNaN(parsed.getTime())) {
+    if (Number.isNaN(parsed.getTime()) || !/^\d{4}-/.test(parsed.toISOString())) {
         throw new Error(
-            `Bitbucket commit window bound "${label}" is not a parseable instant — refusing to ` +
-                'walk the repository with a bound every comparison would silently fail',
+            `Bitbucket commit window bound "${label}" is not a plain four-digit-year UTC ` +
+                'instant — refusing to walk the repository with a bound whose comparisons ' +
+                'would silently exclude every row. Check the git_last_sync / git_earliest_sync ' +
+                'sync_state rows for this provider.',
         );
     }
     return parsed;
@@ -293,7 +307,9 @@ export class BitbucketProvider implements GitProvider {
         // out of `collected` — reported, not the silent third exit it used to take. So a
         // divergence this walk EMITS is window-filtered rows plus, for a caller that supplied
         // `onDrop`, rows reported there (#292), and since #304 that account is TOTAL over the
-        // rows counted here. See `GitFetchProgress.scanned` for what it does and does not prove.
+        // rows of every page this walk EMITS a count for. The cutoff page is the bound on that,
+        // in both directions, and is deliberately never emitted — see the break below and
+        // `GitFetchProgress.scanned` for what the number does and does not prove.
         let scanned = 0;
         let nextUrl: string | null =
             `${BASE_URL}/repositories/${this.workspace}/${repo}/commits?pagelen=100`;
@@ -342,19 +358,22 @@ export class BitbucketProvider implements GitProvider {
                     onDrop?.({sha: c.hash, reason: commitDropReason(c.date)});
                     continue;
                 }
+                // Past the cutoff, and this row is DATABLE — so the endpoint's newest-first order,
+                // which is the only thing the stop above rests on, covers it and nothing below
+                // runs. Not collected: that would make the retained set depend on where the page
+                // boundary happened to fall, since the identical row one page later is never seen
+                // at all. Not future-date-reported either: a datable row here is out of window by
+                // the same premise the break trusts, so reporting it would describe an ordering
+                // violation as a lost commit and send the operator after the wrong thing. What
+                // that costs when the premise DOES fail — an in-window row discarded silently —
+                // is stated in full on `GitProvider.getCommits`; it is the pre-#304 behavior,
+                // written down rather than inherited from where the break used to sit.
+                if (reachedCutoff) {
+                    continue;
+                }
                 const commitDate = new Date(c.date);
                 if (sinceDate && commitDate < sinceDate) {
                     reachedCutoff = true;
-                    continue;
-                }
-                // Past the cutoff, this row is DATABLE and the endpoint's order is what the stop
-                // rests on — so it is an ordinary out-of-window row and gets no further
-                // examination. Nothing after this point runs for it: it is not collected (which
-                // would make the retained set depend on where the page boundary happened to fall)
-                // and not future-date-reported (a datable row here is out of window by the same
-                // premise the break trusts; reporting one would describe an ordering violation as
-                // a lost commit and send the operator after the wrong thing).
-                if (reachedCutoff) {
                     continue;
                 }
                 if (!untilDate || commitDate <= untilDate) {

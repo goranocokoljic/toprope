@@ -8,6 +8,7 @@ import {
     isRetryableGitFetchError,
 } from '../../../../src/connectors/git/providers/http-retry';
 import {
+    COMMIT_DROP_REASONS,
     FUTURE_AUTHOR_DATE_DROP_REASON,
     UNATTRIBUTABLE_DATE_DROP_REASON,
     type BitbucketProviderConfig,
@@ -762,55 +763,77 @@ describe('BitbucketProvider', () => {
         // literal equal to `now` — the forward-run shape the whole class only appears in.
         const NOW = '2026-07-28T10:00:00.000Z';
 
-        it('reports a future-dated commit the forward window excludes, and keeps walking', async () => {
-            // THE #304 CASE. On a forward run `until` IS `now`, so a commit dated ahead of the
-            // clock fails `commitDate <= untilDate` and never reaches `collected` — and before
-            // #304 nothing said so. It is not the ordinary "still approaching the window"
-            // exclusion the filter exists for: Bitbucket re-pages from HEAD every run and the row
-            // is newer than `since`, so it never trips the cutoff, and no run in flight has an
-            // `until` past `now`. The result was a permanent `+1` divergence between `scanned`
-            // and `done` that an operator reads as benign.
-            //
-            // The future row sits BETWEEN two in-window commits, so a walk that broke on it (or
-            // stopped gating after it) loses `after`.
-            vi.setSystemTime(new Date(NOW));
-            const fetchMock = makeFetchMock([
-                {
-                    body: pagedResponse([
-                        makeCommitFixture('before', {date: '2026-07-20T00:00:00+00:00'}),
-                        makeCommitFixture('skewed', {date: '2099-01-01T00:00:00+00:00'}),
-                        makeCommitFixture('after', {date: '2026-07-10T00:00:00+00:00'}),
-                    ]),
-                },
-                {body: pagedResponse(makeDiffstatFixture())}, // diffstat for before
-                {body: pagedResponse(makeDiffstatFixture())}, // diffstat for after
-            ]);
-            vi.stubGlobal('fetch', fetchMock);
+        // TWO fixtures, and the SMALL one is the load-bearing case. The check is a bare
+        // `commitDate > nowMs` with no tolerance, and `FUTURE_AUTHOR_DATE_DROP_REASON` argues at
+        // length that a horizon constant would be underivable and would silence exactly the
+        // broken-operator-clock case. A 2099 row clears any horizon anyone might later add, so on
+        // its own it would let `> nowMs + FIVE_MINUTES` ship green; the two-minute row is the only
+        // input the threshold-free form and a tolerance form disagree on. It is also the realistic
+        // producer (an NTP-drifting laptop or CI runner), and the only fixture whose day key is
+        // TODAY — i.e. the one that shows this is an instant comparison, not a day comparison.
+        it.each([
+            ['a date decades ahead', '2099-01-01T00:00:00+00:00'],
+            ['a two-minute clock skew', '2026-07-28T10:02:00+00:00'],
+        ])(
+            'reports %s that the forward window excludes, and keeps walking',
+            async (_label, futureDate) => {
+                // THE #304 CASE. On a forward run `until` IS `now`, so a commit dated ahead of the
+                // clock fails `commitDate <= untilDate` and never reaches `collected` — and before
+                // #304 nothing said so. It is not the ordinary "still approaching the window"
+                // exclusion the filter exists for: Bitbucket re-pages from HEAD every run and the
+                // row is newer than `since`, so it never trips the cutoff, and no run in flight
+                // has an `until` past `now`. The result was a permanent `+1` divergence between
+                // `scanned` and `done` that an operator reads as benign.
+                //
+                // The future row sits BETWEEN two in-window commits, so a walk that broke on it
+                // (or stopped gating after it) loses `after`.
+                vi.setSystemTime(new Date(NOW));
+                const fetchMock = makeFetchMock([
+                    {
+                        body: pagedResponse([
+                            makeCommitFixture('before', {date: '2026-07-20T00:00:00+00:00'}),
+                            makeCommitFixture('skewed', {date: futureDate}),
+                            makeCommitFixture('after', {date: '2026-07-10T00:00:00+00:00'}),
+                        ]),
+                    },
+                    {body: pagedResponse(makeDiffstatFixture())}, // diffstat for before
+                    {body: pagedResponse(makeDiffstatFixture())}, // diffstat for after
+                ]);
+                vi.stubGlobal('fetch', fetchMock);
 
-            const onDrop = vi.fn();
-            const onProgress = vi.fn();
-            const commits = await provider.getCommits(
-                'my-repo',
-                '2026-07-01T00:00:00Z',
-                NOW,
-                onProgress,
-                onDrop,
-            );
+                const onDrop = vi.fn();
+                const onProgress = vi.fn();
+                const commits = await provider.getCommits(
+                    'my-repo',
+                    '2026-07-01T00:00:00Z',
+                    NOW,
+                    onProgress,
+                    onDrop,
+                );
 
-            expect(commits.map((c) => c.sha)).toEqual(['before', 'after']);
-            // Its OWN reason, not the unattributable one: the date is a perfectly good day and
-            // the operator's next step is the commit's timestamp (clock skew, `--date=`,
-            // imported history), not a truncated response.
-            expect(onDrop.mock.calls.map((c) => c[0])).toEqual([
-                {sha: 'skewed', reason: FUTURE_AUTHOR_DATE_DROP_REASON},
-            ]);
-            expect(FUTURE_AUTHOR_DATE_DROP_REASON).not.toBe(UNATTRIBUTABLE_DATE_DROP_REASON);
-            // The row was HANDED over, so it still counts toward `scanned` — and now the
-            // divergence it creates is accounted for by a channel rather than being silent.
-            const listingTicks = onProgress.mock.calls
-                .map((c) => c[0] as {done: number; total: number | null; scanned?: number})
-                .filter((p) => p.total === null);
-            expect(listingTicks).toEqual([{done: 2, total: null, scanned: 3}]);
+                expect(commits.map((c) => c.sha)).toEqual(['before', 'after']);
+                // Its OWN reason, not the unattributable one: the date is a perfectly good day and
+                // the operator's next step is the commit's timestamp (clock skew, `--date=`,
+                // imported history), not a truncated response.
+                expect(onDrop.mock.calls.map((c) => c[0])).toEqual([
+                    {sha: 'skewed', reason: FUTURE_AUTHOR_DATE_DROP_REASON},
+                ]);
+                // The row was HANDED over, so it still counts toward `scanned` — and now the
+                // divergence it creates is accounted for by a channel rather than being silent.
+                const listingTicks = onProgress.mock.calls
+                    .map((c) => c[0] as {done: number; total: number | null; scanned?: number})
+                    .filter((p) => p.total === null);
+                expect(listingTicks).toEqual([{done: 2, total: null, scanned: 3}]);
+            },
+        );
+
+        it('keeps the three reasons distinct, so grouping cannot merge two operator next-steps', () => {
+            // `formatLossGroups` (sync.ts) keys its groups on the reason STRING, so two members
+            // that ever became equal — a copy-paste when a fourth is added — would silently fold
+            // two different "what do I do about this" answers into one line while every test
+            // comparing against the constants stayed green. Asserted over the whole tuple rather
+            // than as a pair, so it covers the member that does not exist yet.
+            expect(new Set(COMMIT_DROP_REASONS).size).toBe(COMMIT_DROP_REASONS.length);
         });
 
         it('does NOT report a commit excluded by an until in the past — that one a later run covers', async () => {
@@ -847,6 +870,43 @@ describe('BitbucketProvider', () => {
             expect(onDrop).not.toHaveBeenCalled();
         });
 
+        it('still reports a future-dated commit on a backfill chunk, whose until is in the past', async () => {
+            // The same page as the negative control above, plus one row ahead of the CLOCK. It
+            // separates the two exclusions the previous test only shows one side of: a backfill's
+            // `until` is a past watermark, so BOTH rows are out of window, and only the one no run
+            // can ever reach is reported. Deliberate rather than incidental — a walk has no way to
+            // know whether the sync called it for a backfill chunk or a forward run, and scoping
+            // the report to "forward runs only" would need a flag the interface does not carry.
+            // The cost is that a forward run reports the same sha too; that is the repeat
+            // `GitProvider.getCommits` documents for every Bitbucket drop, not a second loss.
+            vi.setSystemTime(new Date(NOW));
+            const fetchMock = makeFetchMock([
+                {
+                    body: pagedResponse([
+                        makeCommitFixture('ahead-of-clock', {date: '2099-01-01T00:00:00+00:00'}),
+                        makeCommitFixture('newer', {date: '2026-06-01T00:00:00+00:00'}),
+                        makeCommitFixture('inside', {date: '2026-01-15T00:00:00+00:00'}),
+                    ]),
+                },
+                {body: pagedResponse(makeDiffstatFixture())}, // diffstat for inside
+            ]);
+            vi.stubGlobal('fetch', fetchMock);
+
+            const onDrop = vi.fn();
+            const commits = await provider.getCommits(
+                'my-repo',
+                '2026-01-01T00:00:00Z',
+                '2026-02-01T00:00:00Z',
+                undefined,
+                onDrop,
+            );
+
+            expect(commits.map((c) => c.sha)).toEqual(['inside']);
+            expect(onDrop.mock.calls.map((c) => c[0])).toEqual([
+                {sha: 'ahead-of-clock', reason: FUTURE_AUTHOR_DATE_DROP_REASON},
+            ]);
+        });
+
         it('does NOT report a commit stamped exactly now that until just misses', async () => {
             // `>` and not `>=`, pinned. A row at exactly the current instant is the boundary the
             // next run's `until` includes — the sync derives `until` from the run's start, so a
@@ -879,25 +939,42 @@ describe('BitbucketProvider', () => {
 
         // --- window bounds (#304) ---
 
+        // BOTH refusal classes, per bound. The unparseable one is the obvious half; the EXPANDED
+        // YEAR is the half a `Number.isNaN` check alone would miss, and it is the worse failure:
+        // `+010000-…` parses to a finite instant in the future, so as a `since` it makes the very
+        // first row trip the cutoff, `collected` come back empty, the run report success, and the
+        // cursor advance over an entirely unwalked window. It is also the value #233 was actually
+        // about, and what `git commit --date=@999999999999` produces.
         it.each([
-            ['until', ['2024-01-01T00:00:00Z', 'not-a-date']],
-            ['since', ['not-a-date', '2024-12-31T00:00:00Z']],
+            ['until', 'unparseable', ['2024-01-01T00:00:00Z', 'not-a-date']],
+            ['since', 'unparseable', ['not-a-date', '2024-12-31T00:00:00Z']],
+            ['until', 'an expanded year', ['2024-01-01T00:00:00Z', '+010000-01-01T00:00:00.000Z']],
+            ['since', 'an expanded year', ['+010000-01-01T00:00:00.000Z', '2024-12-31T00:00:00Z']],
         ] as const)(
-            'refuses to walk when %s is not a parseable instant, instead of filtering with NaN',
-            async (label, [since, until]) => {
-                // An Invalid Date compares FALSE against every operator, so an unparseable
-                // `until` would exclude EVERY row while `scanned` climbed and the call returned
-                // an empty list as a success — the silent-exclusion class #304 removes, one level
-                // above the rows it is about. Fail closed: the caller records the failure and
-                // HOLDS the cursor (#231), so the window is re-fetched once the bound is fixed.
+            'refuses to walk when %s is %s, instead of filtering with a bound that excludes everything',
+            async (label, _kind, [since, until]) => {
+                // Fail closed: the caller records the failure and HOLDS the cursor (#231), so the
+                // window is re-fetched once the bound is fixed — rather than being recorded as
+                // covered while nothing was walked.
                 const fetchMock = makeFetchMock([
                     {body: pagedResponse([makeCommitFixture('aaa')])},
                 ]);
                 vi.stubGlobal('fetch', fetchMock);
 
-                await expect(provider.getCommits('my-repo', since, until)).rejects.toThrow(
-                    new RegExp(`"${label}"`),
+                const walk = provider.getCommits('my-repo', since, until);
+                await expect(walk).rejects.toThrow(new RegExp(`"${label}"`));
+                // The message names the bound and the state keys that hold it, and NEVER the
+                // value: it reaches an operator terminal and `sync_logs.errors` through the
+                // caller's `Failed to fetch commits:` line, and the bounds are read from stored,
+                // unvalidated `sync_state` rows. `(got: <value>)` is the obvious "make it
+                // debuggable" edit, and this is what stops it landing unnoticed.
+                await expect(walk).rejects.toThrow(/git_last_sync/);
+                const message = await walk.then(
+                    () => '',
+                    (err: unknown) => (err instanceof Error ? err.message : String(err)),
                 );
+                expect(message).not.toContain(since);
+                expect(message).not.toContain(until);
                 // Refused BEFORE the first request, so a malformed bound costs no network work
                 // and cannot half-walk a repo.
                 expect(fetchMock).not.toHaveBeenCalled();
