@@ -243,17 +243,12 @@ export class BitbucketProvider implements GitProvider {
         const collected: RawCommit[] = [];
         // Rows this walk has been HANDED, as opposed to the ones it keeps in `collected`.
         // The INTENDED reason the two differ is the in-memory `until` filter below, and
-        // telling them apart is the whole of #276 — see `GitFetchProgress.scanned`. Since #290
-        // it is not the only reason: a row whose date the pipeline cannot key on is counted
-        // here, routed to `onDrop`, and left out of `collected`. Every divergence this walk
-        // REPORTS is therefore window-filtered rows plus `onDrop`-reported rows, which is why
-        // it no longer hedges that `scanned` is "an upper bound on filtered rows" (#292): that
-        // hedge covered the pre-#290 Invalid-Date fall-through, a third exit that reported
-        // nothing at all. Scoped to what is REPORTED, not to rows — the tail `break paging`
-        // abandons is counted here and leaves by neither exit; see the whole-page increment
-        // below for why no consumer can observe it. Its exclusion rests instead on the
-        // endpoint's ordering agreeing with the field compared below, which this walk cannot
-        // verify, so the claim says nothing about those rows either way.
+        // telling them apart is the whole of #276. Since #290 it is not the only reason: a row
+        // whose date the pipeline cannot key on is counted here, routed to `onDrop`, and left
+        // out of `collected` — reported, not the silent third exit it used to take. So a
+        // divergence this walk EMITS is window-filtered rows plus, for a caller that supplied
+        // `onDrop`, rows reported there (#292). See `GitFetchProgress.scanned` for what that
+        // does and does not prove — two exclusions it does not make recoverable are #304.
         let scanned = 0;
         let nextUrl: string | null =
             `${BASE_URL}/repositories/${this.workspace}/${repo}/commits?pagelen=100`;

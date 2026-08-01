@@ -631,14 +631,13 @@ describe('BitbucketProvider', () => {
             // hold is that the cutoff BEHAVIOR is unchanged and the fan-out still ticks.
             //
             // `undatable` sits AFTER the cutoff row, which is the BOUND on the claim
-            // `getCommits` and `GitFetchProgress.scanned` make since #292 — every REPORTED
+            // `getCommits` and `GitFetchProgress.scanned` make since #292 — an EMITTED
             // divergence is window-filtered rows plus `onDrop`-reported rows. `scanned` is
             // incremented for the whole page, so this row is counted, never examined, never
-            // in `collected`, and never routed to `onDrop`: it leaves by neither exit. What
-            // keeps the claim true is that the break also skips this page's emission, so no
-            // divergence is ever published for it — which is what the tick assertion below
-            // pins. A change that emits a tick after the break would publish a `scanned` no
-            // channel accounts for, and fails here.
+            // in `collected`, and never routed to `onDrop`. What keeps the claim true is that
+            // the break also skips this page's emission, so no divergence is published for it —
+            // which is what the tick assertion below pins. A change that emits a tick after the
+            // break would publish a `scanned` no channel accounts for, and fails here.
             const fetchMock = makeFetchMock([
                 {
                     body: pagedResponse(
@@ -665,9 +664,10 @@ describe('BitbucketProvider', () => {
             );
 
             expect(commits.map((c) => c.sha)).toEqual(['aaa']);
-            // Current behavior, recorded rather than endorsed — and the ONE assertion this
-            // test alone makes. Compare the parameterized test above, where the identical
-            // row placed BEFORE any cutoff is reported.
+            // Current behavior, recorded rather than endorsed, and tracked as #304 — a fix that
+            // examines the cutoff page's tail flips this assertion, which is the fix landing,
+            // not a regression. Compare the parameterized test BELOW, where the identical row
+            // placed before any cutoff is reported.
             expect(onDrop).not.toHaveBeenCalled();
             expect(onProgress.mock.calls.map((c) => c[0])).toEqual([
                 {done: 0, total: 1},
@@ -732,10 +732,12 @@ describe('BitbucketProvider', () => {
                     {sha: 'bad', reason: UNATTRIBUTABLE_DATE_DROP_REASON},
                 ]);
                 // The dropped row was HANDED over, so it still counts toward `scanned` — the
-                // reported divergence from `done` is window-filtered rows plus reported drops,
-                // and this pins that the drop path did not quietly stop counting. Every other row
-                // here is inside the window, so on this walk the drop is the ONLY thing
-                // separating the two counts.
+                // emitted divergence from `done` is window-filtered rows plus reported drops.
+                // Every other row here is inside the window, so on this walk the drop is the ONLY
+                // thing separating the two counts. Note what this can and cannot catch: `scanned`
+                // is incremented per PAGE above the gate, so no change confined to the drop path
+                // moves it. What it pins is that a future move to per-row counting (which
+                // `bitbucket.ts` anticipates) would still have to count the dropped row.
                 const listingTicks = onProgress.mock.calls
                     .map((c) => c[0] as {done: number; total: number | null; scanned?: number})
                     .filter((p) => p.total === null);
