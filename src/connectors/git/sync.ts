@@ -559,10 +559,12 @@ function formatSystemicRowRefusal(
     // Name the arm that actually fired, because the two describe different failures and an
     // operator's next question ("is this one bad import or an ongoing bleed?") is answered by
     // which one it was. A line that reported only the counts would leave the streak arm looking
-    // like an arithmetic error — 3 of 3 rows is not obviously an escalation on its own.
-    const cause = isSystemicRowRefusal(skipped, retained)
-        ? `most of what this run built was refused`
-        : `this provider has now written NOTHING for ${runs} consecutive runs`;
+    // like an arithmetic error — 3 of 3 rows is not obviously an escalation on its own. Asked of
+    // the SHARED classifier, so this line and doctor's cannot tell one record two stories.
+    const cause =
+        escalationArm(refusal) === 'ratio'
+            ? `most of what this run built was refused`
+            : `this provider has now written NOTHING for ${runs} consecutive runs`;
     return (
         `${SYSTEMIC_ROW_REFUSAL_PREFIX} [${providerType}/${sanitizeAdvisoryLabel(container)}] ` +
         `${skipped} of ${skipped + retained} author-day row(s) this run built were refused and ` +
@@ -886,6 +888,47 @@ const ADVISORY_PREFIXES: readonly string[] = [
  */
 export function isAdvisoryError(error: string): boolean {
     return ADVISORY_PREFIXES.some((prefix) => error.startsWith(prefix));
+}
+
+/**
+ * Genuine failures that a re-run cannot repair, and that a re-run actively makes WORSE (#306).
+ *
+ * The third class, and the reason two were not enough. {@link isAdvisoryError} was answering two
+ * questions with one bit — "does this turn the provider red?" and "should the connector be
+ * re-run?" — which happened to have the same answer for every sentinel until this one.
+ * {@link SYSTEMIC_ROW_REFUSAL_PREFIX} needs red WITHOUT a retry, and the retry it would otherwise
+ * trigger is destructive three separate ways:
+ *
+ * 1. IT CANNOT HELP. `ROW_LEVEL_REFUSALS`' entire premise is that re-fetching returns the
+ *    identical unusable value, and the run that emitted this already advanced the cursor past the
+ *    window. There is nothing for a second attempt to recover.
+ * 2. IT LOSES ANOTHER WINDOW. A catch-up run is capped at {@link GIT_CATCHUP_WINDOW_MAX_DAYS}
+ *    (#235), so a provider 170 days behind advances only 30 days per run. The retry's window is
+ *    therefore NOT the covered one — it is the next 30 days, which it fetches, refuses under the
+ *    same unfixed cause, and records as covered. Shipping the retry would double the permanent
+ *    loss this issue exists to stop, on exactly the provider it exists to protect.
+ * 3. IT ERASES THE REPORT. `runConnectorWithRetry` returns the RETRY's result, and that is what
+ *    `toprope sync all` prints and error-flags. For a caught-up provider the second attempt finds
+ *    an empty window, refuses nothing and returns `snapshotsSkipped: 0` — so the escalation would
+ *    make the primary CLI path quieter and greener than it was before this issue.
+ *
+ * A transient fault is the opposite case in all three respects, which is why the split is by
+ * sentinel rather than by severity.
+ */
+const NON_RETRYABLE_ERROR_PREFIXES: readonly string[] = [SYSTEMIC_ROW_REFUSAL_PREFIX];
+
+/**
+ * Should a run reporting this entry be re-attempted? The predicate `runConnectorWithRetry` asks.
+ *
+ * Advisories are excluded because they describe the steady state of a healthy sync (#272), and
+ * {@link NON_RETRYABLE_ERROR_PREFIXES} because re-running is worse than not. Everything else — an
+ * expired token, a 5xx, an unexpected throw — is exactly what a retry is for.
+ */
+export function isRetryableError(error: string): boolean {
+    return (
+        !isAdvisoryError(error) &&
+        !NON_RETRYABLE_ERROR_PREFIXES.some((prefix) => error.startsWith(prefix))
+    );
 }
 
 /**
@@ -1754,29 +1797,34 @@ export interface GitRowRefusal {
 }
 
 /**
- * The UTC ISO instant shape this record's `at` is written in, anchored.
+ * A count decoded out of `sync_state.value`: a non-negative safe integer, bounded on BOTH ends.
  *
- * A round-trip through `Date.parse` is NOT a shape check — the graduated #233 rule exists because
- * ISO 8601 expanded years (`+010000-01-01T00:00:00.000Z`) parse finite and compare wrong, and
- * V8's legacy parser additionally accepts free text and parenthesised comments carrying arbitrary
- * bytes. `doctor` prints this value to a terminal, so "parses" is the wrong question; "is the
- * exact string `toISOString()` produces" is the right one, and nothing legitimate is excluded
- * because {@link recordSystemicRowRefusal} is its only writer.
+ * The upper bound is not decoration. `doctor` renders `${r.skipped} of ${r.skipped + r.retained}`,
+ * so a value past `Number.MAX_SAFE_INTEGER` prints an imprecise sum, and the graduated rule is
+ * explicit that a numeric field at a trust boundary is range-validated on both bounds rather than
+ * only checked for non-negativity. `Number.isSafeInteger` is the same predicate `isCommitCount`
+ * uses one module over, for the same reason.
  */
-const UTC_ISO_MS_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+function isStoredCount(value: unknown, min: number): value is number {
+    return typeof value === 'number' && Number.isSafeInteger(value) && value >= min;
+}
 
 /**
- * Decode a stored refusal row, or null when there is nothing usable to report.
+ * Decode a stored refusal record, or null when there is nothing usable to report.
  *
  * Same shape of totality as {@link parseStall} and for the same reason: `sync_state.value` is an
  * unconstrained TEXT column, so the JSON is parsed and range-validated rather than cast. It is
  * self-healing rather than fail-closed — a corrupt row reported as a refusal of `NaN` rows is a
  * false alarm no remedy clears, and the next run of that provider rewrites or deletes it.
  *
- * `runs` is tolerated as ABSENT (defaulting to 0) rather than refused, unlike the other three.
- * That is the one place forward-compatibility beats strictness here: a record written before the
- * streak existed still describes a real refusal, and refusing it outright would silently clear an
- * escalation across an upgrade. A present-but-invalid `runs` IS refused, like every other field.
+ * `at` goes through {@link isUtcIsoInstant}, the module's canonical instant check, rather than a
+ * local regex. A `Date.parse` liveness test is NOT a shape check — the graduated #233 rule exists
+ * because ISO 8601 expanded years (`+010000-01-01T00:00:00.000Z`) parse finite and compare wrong,
+ * and V8's legacy parser additionally accepts free text and parenthesised comments carrying
+ * arbitrary bytes — and the anchored regex ALONE is not enough either: it admits `2025-02-30`,
+ * which `doctor` would then print as a date that does not exist. The canonical predicate is the
+ * regex AND the `toISOString()` round-trip, so it is both, and reusing it is what stops this
+ * becoming a third weaker copy of the same rule.
  */
 function parseRowRefusal(value: string | null): GitRowRefusal | null {
     if (!value) return null;
@@ -1793,17 +1841,12 @@ function parseRowRefusal(value: string | null): GitRowRefusal | null {
         retained?: unknown;
         runs?: unknown;
     };
-    if (typeof at !== 'string' || !UTC_ISO_MS_RE.test(at)) return null;
-    if (!Number.isInteger(skipped) || (skipped as number) < 1) return null;
-    if (!Number.isInteger(retained) || (retained as number) < 0) return null;
-    const streak = runs === undefined ? 0 : runs;
-    if (!Number.isInteger(streak) || (streak as number) < 0) return null;
-    return {
-        at,
-        skipped: skipped as number,
-        retained: retained as number,
-        runs: streak as number,
-    };
+    if (typeof at !== 'string' || !isUtcIsoInstant(at)) return null;
+    // `skipped >= 1` because a record of zero refusals describes nothing; the other two may be 0.
+    if (!isStoredCount(skipped, 1)) return null;
+    if (!isStoredCount(retained, 0)) return null;
+    if (!isStoredCount(runs, 0)) return null;
+    return {at, skipped, retained, runs};
 }
 
 /**
@@ -1816,10 +1859,25 @@ function parseRowRefusal(value: string | null): GitRowRefusal | null {
  * per-run floor is blind to that, and it is the shape a small org actually sees on a daily sync.
  */
 export function isEscalatedRefusal(refusal: GitRowRefusal): boolean {
-    return (
-        isSystemicRowRefusal(refusal.skipped, refusal.retained) ||
-        refusal.runs >= TOTAL_REFUSAL_ALERT_RUNS
-    );
+    return escalationArm(refusal) !== null;
+}
+
+/**
+ * WHICH arm escalated this record, or null if neither did (#306).
+ *
+ * One function rather than each surface re-deriving it, because they were already drifting: the
+ * sync line asked `isSystemicRowRefusal(...)` and `doctor` asked `runs >= TOTAL_REFUSAL_...`,
+ * which are complementary rather than equal — a record that trips BOTH got a different story from
+ * each. The arm decides only the sentence an operator reads, but "the sentence an operator reads"
+ * is the whole product of this feature, so it gets the same single-source treatment as the
+ * verdict.
+ *
+ * `ratio` wins a tie deliberately: it names a magnitude ("40 of 40 refused"), which is the more
+ * specific statement, and a record that trips it has always also just refused everything.
+ */
+export function escalationArm(refusal: GitRowRefusal): 'ratio' | 'streak' | null {
+    if (isSystemicRowRefusal(refusal.skipped, refusal.retained)) return 'ratio';
+    return refusal.runs >= TOTAL_REFUSAL_ALERT_RUNS ? 'streak' : null;
 }
 
 /** The row-refusal record for one provider (#306), escalated or not, or null if there is none. */
@@ -1836,16 +1894,20 @@ export function getProviderRowRefusal(
  * (#306). Read-modify-write of the streak, so it MUST run inside the sync write transaction —
  * which it does, from the cursor-advance closure.
  *
- * DURABLE, and that is the point rather than a convenience. The error line beside it reaches the
- * admin sync-now surface (which records `last_sync_status`) but nothing on the SCHEDULED path
- * keeps it in view: a non-advisory error makes `runConnectorWithRetry` re-run the whole
- * connector, the retry runs against a window the first attempt's cursor advance already covered
- * — so it refuses nothing and returns clean — and `runPipeline` hands the CLI the RETRY's result.
- * Stated precisely, because the first version of this comment overclaimed: the first attempt's
- * `sync_logs` row (one per attempt since #272) DOES retain its error and `records_skipped`, so
- * the report is not erased everywhere. What the retry washes is the returned result, i.e. what
- * the CLI prints, and what `latestSync`-style readers see as the newest row. `toprope doctor`
- * reads THIS instead, which is state no later run can wash without importing something.
+ * DURABLE, and that is the point rather than a convenience. The error line beside it is a
+ * per-RUN report, and every surface that keeps one is either absent or overwritten on the path
+ * that matters most:
+ * - the SCHEDULED path never calls `recordSyncOutcome`, so `git_providers.last_sync_status` and
+ *   `last_sync_advisories` — the admin UI's red/green — are written only by the sync-now route
+ *   and say nothing at all about a scheduled run;
+ * - a CONFIG-FILE provider has no `git_providers` row to record onto in the first place, on any
+ *   path, so those two columns can never hold its verdict;
+ * - `sync_logs` does retain the line (one row per attempt since #272), but every `latestSync`
+ *   -style reader takes the NEWEST row, and the next scheduled run's row is a clean one.
+ *
+ * So the report survives the run and the verdict does not. `toprope doctor` and `toprope status`
+ * read THIS instead — state that no later run clears without actually importing rows, on both
+ * provenances.
  *
  * The streak is a property of the SEQUENCE, so it is written even for a run below every
  * escalation threshold — the record existing is not the verdict (see {@link isEscalatedRefusal}).
@@ -1853,11 +1915,8 @@ export function getProviderRowRefusal(
  * Written in the SAME transaction as the cursor advance, so the claim and the advance can never
  * disagree about whether the window was recorded as covered.
  *
- * COST NOTE for whoever owns this next: while a cause persists, every scheduled sync now does a
- * second complete network fetch (the retry), for every provider in the run. That is the cost #272
- * cites as the reason advisories were excluded from the retry. It is accepted here — a systemic
- * refusal is exactly the state that should be loud — but it is a doubled rate-limit budget for as
- * long as the cause goes unfixed, which is why the doctor hint leads with "fix the cause".
+ * NOT RETRIED, unlike every other genuine error: see {@link NON_RETRYABLE_ERROR_PREFIXES} for
+ * why a second attempt here loses another window rather than recovering one.
  */
 function recordRowRefusal(
     db: Database.Database,
@@ -1884,7 +1943,10 @@ function recordRowRefusal(
  * Clear a provider's refusal record — a later run of it built rows and refused none of them.
  *
  * The caller's gate is deliberately the STRONGEST evidence available, not the weakest: the run
- * must have retained at least one row AND refused none.
+ * must have retained at least one AUTHOR-DAY row and refused no author-day row. Both halves are
+ * at that grain, so a run that refused every `pr_records` row can still clear this — consistent
+ * with the record being author-day-scoped throughout (see {@link SYSTEMIC_ROW_REFUSAL_PREFIX}'s
+ * scope note), and stated here because "refused none" alone would read as covering both.
  *
  * `retained > 0` alone is not enough. A run that retains one row and refuses four is below every
  * threshold, yet deleting a record of a 40,000-row loss on the strength of it would let one
@@ -2064,13 +2126,19 @@ export function loadGitSyncHealth(
         const refusal = parseRowRefusal(
             refusalByKey.get(rowRefusalStateKey(pc.type, identifier)) ?? null,
         );
-        // REPORTED only once escalated, but DENIES CURRENCY from the first record — the same
-        // asymmetry the stall streak has, and for the same reason. A sub-threshold record still
-        // means this provider refused rows on its last run, so it cannot prove its data is
-        // current; it is just not yet loud enough to fail a health check over.
-        if (refusal && isEscalatedRefusal(refusal)) {
-            systemicRefusals.push({type: pc.type, identifier, ...refusal});
-        }
+        // ESCALATED records only, for the report AND for the currency denial below.
+        //
+        // An earlier draft denied currency from the FIRST refused row, by analogy with the
+        // sub-threshold stall streak. The analogy does not hold: a stall record means the run
+        // imported NOTHING, while a refusal record can mean "99 written, 1 refused" — a run this
+        // feature deliberately classifies as green on every other channel (advisory, no error, no
+        // report). Denying currency on it makes #248's positive all-clear unreachable forever for
+        // any deployment with one chronically malformed PR timestamp, and unreachable with no
+        // line naming why, which is the failure mode that teaches an operator to ignore the
+        // check. Escalation is the threshold at which "this provider's data is not current" is
+        // actually the claim being made, so it is the threshold both decisions key on.
+        const escalated = refusal !== null && isEscalatedRefusal(refusal);
+        if (escalated) systemicRefusals.push({type: pc.type, identifier, ...refusal!});
 
         // Reportable stall wins over every other state — the most specific, most
         // actionable signal, and reported even when the provider also has no cursor.
@@ -2112,10 +2180,9 @@ export function loadGitSyncHealth(
         if (behindMs < 0) continue;
         // A cursor that is current over a window its own run wrote almost nothing into does not
         // prove the DATA is current — it proves the opposite. Denied here rather than subtracted
-        // at the surface, so every reader of `current` gets the same answer (#306). Keyed on the
-        // RECORD, not on `isEscalatedRefusal`: currency is a positive claim, and a provider that
-        // refused rows on its last run cannot earn it just by being below an alert threshold.
-        if (refusal) continue;
+        // at the surface, so every reader of `current` gets the same answer (#306). Keyed on
+        // ESCALATION, for the reason argued where `escalated` is computed.
+        if (escalated) continue;
         current++;
     }
 
@@ -4108,23 +4175,29 @@ export class GitSync implements ConnectorInterface {
                 // trade. Read the advisory lines for the breakdown; read this for "how much did
                 // this run fail to write", which is the question the surfaces actually ask.
                 committedRowsSkipped += skippedRows.length + skippedPRRecords.length;
-                // THE ESCALATION (#306). The skip itself is unchanged — re-asking an immutable
-                // refusal cannot help — but a provider that refused most of what it built must
-                // not settle as `ok`. Two channels, because neither alone survives every path:
-                // the error line turns the admin sync-now surface red and makes the CLI exit
-                // non-zero, and the durable record outlives the connector retry that line
-                // provokes (see `recordRowRefusal`) so `toprope doctor` keeps failing until a
-                // run actually imports rows again.
-                //
-                // FORWARD RUNS ONLY, the same exclusion the stall accounting above applies and
-                // for the same reason: a backfill walks a strictly OLDER span and leaves the
-                // forward cursor untouched, so neither its refusals nor its successes say
-                // anything about the forward window this record is about. Counting a backfill's
-                // refusals would raise an alert against a provider syncing forward perfectly,
-                // and — the direction that actually bites — a healthy backfill would CLEAR a
-                // record of a forward-window loss that is still unrepaired, on the one command
-                // an operator runs precisely because they were told data is missing.
-                if (!options?.backfill) {
+                if (options?.backfill) {
+                    setProviderEarliestSyncTime(db, providerType, identifier, options.backfill.since);
+                } else {
+                    // THE ESCALATION (#306). The skip itself is unchanged — re-asking an
+                    // immutable refusal cannot help — but a provider that refused most of what
+                    // it built must not settle as `ok`. Two channels, because neither alone
+                    // survives every path: the error line turns the admin sync-now surface red
+                    // and makes the CLI exit non-zero, and the durable record is what `doctor`
+                    // and `status` read on the scheduled path, which records no outcome at all
+                    // (see `recordRowRefusal`).
+                    //
+                    // ON THE FORWARD ARM, deliberately — the same exclusion the stall accounting
+                    // above applies and for the same reason. A backfill walks a strictly OLDER
+                    // span and leaves the forward cursor untouched (the sibling branch above is
+                    // exactly that), so neither its refusals nor its successes say anything
+                    // about the forward window this record is about. Counting a backfill's
+                    // refusals would raise an alert against a provider syncing forward
+                    // perfectly, and — the direction that actually bites — a healthy backfill
+                    // would CLEAR a record of a forward-window loss that is still unrepaired, on
+                    // the one command an operator runs precisely because they were told data is
+                    // missing. Living on this arm rather than behind its own `!backfill` test is
+                    // what makes that a property of the structure instead of a second condition
+                    // someone could later change independently of the cursor advance it is about.
                     if (skippedRows.length > 0) {
                         const refusal = recordRowRefusal(
                             db,
@@ -4142,10 +4215,6 @@ export class GitSync implements ConnectorInterface {
                     } else if (retainedRowCount > 0) {
                         clearRowRefusal(db, providerType, identifier);
                     }
-                }
-                if (options?.backfill) {
-                    setProviderEarliestSyncTime(db, providerType, identifier, options.backfill.since);
-                } else {
                     // On the FIRST forward sync, ALSO record the true earliest-synced
                     // floor (#229) so the "sync older history" backfill's default is
                     // exact, not the too-recent lazy guess. Guard on an unset

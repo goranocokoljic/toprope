@@ -10,7 +10,11 @@ import {
     findMissingRepos,
     gitProviderFixHint,
 } from '../../src/cli/doctor';
-import {TOTAL_REFUSAL_ALERT_RUNS, loadGitSyncHealth} from '../../src/connectors/git/sync';
+import {
+    AUTHOR_DAYS_SKIPPED_PREFIX,
+    TOTAL_REFUSAL_ALERT_RUNS,
+    loadGitSyncHealth,
+} from '../../src/connectors/git/sync';
 import {createProvider} from '../../src/connectors/git/providers/store';
 import {createCommitDiffstatCache} from '../../src/connectors/git/diffstat-cache';
 import {loadServerKey} from '../../src/connectors/git/providers/secret';
@@ -705,6 +709,52 @@ describe('runDoctor', () => {
                 expect(allOutput).toContain('github:acme (40 of 40 rows refused');
                 // The all-clear it replaces must not also be printed.
                 expect(allOutput).not.toContain('All 1 provider(s) current');
+                // The streak suffix belongs to the OTHER arm. Without this, dropping the
+                // condition on it (printing it unconditionally) stays green, and a per-run
+                // escalation would report "nothing written for 0 runs".
+                expect(allOutput).not.toContain('nothing written for');
+            });
+
+            it('reports EVERY refusing provider, with a count matching the detail list', async () => {
+                seedRefusal('acme', 40, 0);
+                seedRefusal('beta', 9, 1);
+
+                await runDoctor(
+                    db,
+                    await reachableGitConfig(['acme', 'beta', 'healthy']),
+                    tmpConfigPath,
+                    MIGRATIONS_DIR,
+                );
+
+                const allOutput = [...output, ...errors].join('\n');
+                // >= 2 refusing, so a join that drops entries or a count that disagrees with
+                // the rendered list cannot ship green — the same shape the stall line has.
+                expect(allOutput).toContain('2 provider(s) refused the rows');
+                expect(allOutput).toContain('github:acme (40 of 40');
+                expect(allOutput).toContain('github:beta (9 of 10');
+                expect(allOutput).not.toContain('github:healthy (');
+            });
+
+            it('strips control characters from a provider container before printing it', async () => {
+                // The input class the sanitizer alone handles: without it the raw bytes reach
+                // the operator's terminal. The container of a DB-connected provider is free-form
+                // admin-form text, so this is a real input rather than a synthetic one.
+                //
+                // U+202E (right-to-left override, which reverses the rest of the line in a
+                // terminal) plus a BEL, written as escapes so the fixture stays legible.
+                const hostile = 'acme\u202Egnp\u0007';
+                seedRefusal(hostile, 40, 0);
+
+                await runDoctor(db, await reachableGitConfig([hostile]), tmpConfigPath, MIGRATIONS_DIR);
+
+                // Asserted on the REFUSAL line, not the whole output: other checks (the
+                // reachability probe) echo the configured org verbatim and are outside this
+                // diff, so a whole-output assertion would go red for a reason that has nothing
+                // to do with the sanitizer under test.
+                const line = [...output, ...errors].find((l) => l.includes('rows refused at'))!;
+                expect(line).toContain('github:acme?gnp?');
+                expect(line).not.toContain('\u202E');
+                expect(line).not.toContain('\u0007');
             });
 
             it('denies the refusing provider "current" credit while still crediting a healthy one', async () => {
@@ -748,11 +798,17 @@ describe('runDoctor', () => {
                 // …and it must not open with "run a sync": this alert can be days old, so on a
                 // quiet provider a fresh run prints no advisory at all, and when it does print
                 // one it has just advanced the cursor over another window under the same cause.
-                expect(allOutput).toContain('sync_logs.errors');
+                expect(allOutput).toContain('sync_logs row that carries errors');
                 expect(allOutput).toContain('Do NOT start with a fresh sync');
+                // The line the operator is sent to find, INTERPOLATED from the constant rather
+                // than spelled out — rename the prefix and both the remedy and this assertion
+                // move together, instead of the remedy silently naming a line that is gone.
+                expect(allOutput).toContain(AUTHOR_DAYS_SKIPPED_PREFIX);
                 // The escape hatch for a provider that will never import again, so the alert is
-                // not a wedge with no exit.
-                expect(allOutput).toMatch(/remove it/);
+                // not a wedge with no exit — and it names the ADMIN delete specifically, because
+                // dropping the YAML entry retracts nothing and leaves the record to be inherited.
+                expect(allOutput).toContain('delete it in the admin UI');
+                expect(allOutput).toContain('silences the alert without retracting anything');
             });
 
             it('escalates a provider that keeps writing NOTHING, even below the per-run floor', async () => {
@@ -772,7 +828,7 @@ describe('runDoctor', () => {
                 expect(allOutput).toContain(`nothing written for ${TOTAL_REFUSAL_ALERT_RUNS} runs`);
             });
 
-            it('stays quiet below BOTH arms, but still refuses to call the provider current', async () => {
+            it('stays quiet below BOTH arms, and leaves the all-clear intact', async () => {
                 seedCursor('acme', 1);
                 seedRefusal('acme', 3, 0, TOTAL_REFUSAL_ALERT_RUNS - 1);
 
@@ -783,10 +839,14 @@ describe('runDoctor', () => {
                 expect(result).toBe(true);
                 const allOutput = [...output, ...errors].join('\n');
                 expect(allOutput).not.toContain('refused the rows');
-                // But it refused rows on its last run, so it cannot earn the currency claim
-                // either — the positive check must not be satisfied by a sub-threshold record.
-                expect(allOutput).toContain('0 of 1 provider(s) current');
-                expect(allOutput).toContain('refusing rows below the refusal alert');
+                // …and the all-clear is NOT suppressed. An earlier draft denied currency from
+                // the first refused row, by analogy with the sub-threshold stall streak. The
+                // analogy does not hold: a stall means the run imported nothing, while a
+                // refusal record can mean "99 written, 1 refused" — green on every other
+                // channel. Denying currency on it made #248's positive all-clear permanently
+                // unreachable for any deployment with one chronically malformed PR timestamp,
+                // and unreachable with no line naming why.
+                expect(allOutput).toContain('All 1 provider(s) current');
             });
 
             it('ignores a corrupt marker rather than failing on an alarm no remedy clears', async () => {

@@ -32,12 +32,14 @@ import {
     getProviderRowRefusal,
     isAdvisoryError,
     isEscalatedRefusal,
+    isRetryableError,
     isSystemicRowRefusal,
     loadGitSyncHealth,
     rowRefusalStateKey,
     stallStateKey,
     syncStateKey,
 } from '../../../src/connectors/git/sync';
+import {runPipeline} from '../../../src/scheduler/sync-pipeline';
 import {deleteProviderWithCascade} from '../../../src/connectors/git/providers/delete-cascade';
 import {createProvider} from '../../../src/connectors/git/providers/store';
 import {loadServerKey} from '../../../src/connectors/git/providers/secret';
@@ -249,6 +251,54 @@ describe('#306 a systemic row refusal does not report clean', () => {
             // advisory back at `snapshotsSkipped` and this run invents six pre-upgrade cells
             // that do not exist.
             expect(result.errors.some((e) => e.startsWith(LEGACY_CELLS_SKIPPED_PREFIX))).toBe(false);
+        });
+
+        it('sums the legacy-cell grain into the same field while the advisory keeps its own count', async () => {
+            // The other half of the split, and the direction nothing else can reach: every
+            // other test in the repo runs with `cellsSkippedLegacy === 0`, so `legacyCellsSkipped`
+            // is only ever asserted at zero and deleting its assignment would go unnoticed.
+            //
+            // A cell written before #253 carries `is_projected = 0`, and the projection refuses
+            // to overwrite an accumulated total no raw row can reconstruct — it counts it
+            // skipped instead. Seeding one on the day this run touches is what makes both
+            // grains non-zero in a single run.
+            const devId = seedAlice(db);
+            db.prepare(
+                `INSERT INTO git_snapshots
+                 (id, developer_id, date, commits, lines_added, lines_removed, files_changed,
+                  prs_opened, prs_merged, review_comments_given, avg_time_to_merge_hours,
+                  code_churn_rate, ai_signature_score, avg_commit_size, commit_burst_count,
+                  is_projected)
+                 VALUES ('legacy-1', ?, ?, 99, 0, 0, 0, 0, 0, 0, NULL, 0, 0, 0, 0, 0)`,
+            ).run(devId, DAYS[1]);
+
+            vi.stubGlobal(
+                'fetch',
+                makeCountingFetch(
+                    githubCommitRoutes([
+                        {day: DAYS[0], writable: false},
+                        // Writable, and on the legacy day — so the run retains a raw row whose
+                        // projection then refuses to touch the stored cell.
+                        {day: DAYS[1], writable: true},
+                    ]),
+                ).fetchMock,
+            );
+
+            const result = await runSync(db, [GITHUB_CONFIG]);
+
+            // One refused author-day row + one refused legacy projection cell.
+            expect(result.snapshotsSkipped).toBe(2);
+            const legacy = result.errors.find((e) => e.startsWith(LEGACY_CELLS_SKIPPED_PREFIX))!;
+            // The advisory names ITS OWN count, not the sum. Point it back at `snapshotsSkipped`
+            // and it invents a second pre-upgrade cell that does not exist.
+            expect(legacy).toContain('1 cell(s)');
+            expect(legacy).not.toContain('2 cell(s)');
+            // The legacy cell really was left standing, which is what makes the count honest.
+            expect(
+                (db.prepare('SELECT commits FROM git_snapshots WHERE id = ?').get('legacy-1') as {
+                    commits: number;
+                }).commits,
+            ).toBe(99);
         });
 
         it('counts a refused pr_records row in the same field as a refused author-day row', async () => {
@@ -633,6 +683,54 @@ describe('#306 a systemic row refusal does not report clean', () => {
                     .get(rowRefusalStateKey('github', 'test-org')),
             ).toBeUndefined();
             expect(getProviderRowRefusal(db, 'github', 'test-org')).toBeNull();
+        });
+    });
+
+    describe('the escalation is red WITHOUT being retried', () => {
+        it('is not retryable, so the scheduler keeps the failing attempt as the run outcome', async () => {
+            seedAlice(db);
+            vi.stubGlobal('fetch', makeCountingFetch(githubAllRowsRefusedRoutes(DAYS)).fetchMock);
+
+            const result = await runSync(db, [GITHUB_CONFIG]);
+            const systemic = systemicLineOf(result.errors)!;
+
+            // The two classifiers answer different questions, and this line is the reason there
+            // are two. RED: it is not an advisory, so the sync-now route records `status:
+            // 'error'`. NOT RETRIED: `runConnectorWithRetry` splits on `isRetryableError`, and a
+            // second attempt here cannot recover anything (re-fetching returns the identical
+            // unusable value), loses another window on a catch-up-capped provider (its window is
+            // the NEXT uncovered 30 days, not the one already covered), and returns a clean
+            // result that would replace this one on the CLI.
+            expect(isAdvisoryError(systemic)).toBe(false);
+            expect(isRetryableError(systemic)).toBe(false);
+            // A genuine transient failure is still retried — the split is by sentinel, not by
+            // severity, so this is the control that proves the gate did not simply go dead.
+            expect(isRetryableError('Failed to fetch commits: 503 Service Unavailable')).toBe(true);
+        });
+
+        it('drives the real pipeline: one attempt, one sync_logs row, the skip count intact', async () => {
+            seedAlice(db);
+            vi.stubGlobal('fetch', makeCountingFetch(githubAllRowsRefusedRoutes(DAYS)).fetchMock);
+            // The REAL retry seam, not `isRetryableError` restated — this is what decides
+            // whether `toprope sync all` prints the refusal or the retry's clean result, and
+            // it is also the one hop that carries `snapshotsSkipped` into the column the
+            // acceptance criterion names. The provider comes from the connector CONFIG (the
+            // pipeline's entry point resolves its own set), so the run reaches the fetch rather
+            // than short-circuiting on "No git providers configured" — which IS retryable and
+            // would make the assertion below pass for the wrong reason.
+            const connector = new GitSync({enabled: true, providers: [GITHUB_CONFIG]});
+            const pending = runPipeline(db, [connector], 0);
+            await vi.runAllTimersAsync();
+            const [{result, retried}] = await pending;
+
+            expect(retried).toBe(false);
+            expect(systemicLineOf(result.errors)).toBeDefined();
+            expect(result.snapshotsSkipped).toBe(DAYS.length);
+            const logs = db
+                .prepare('SELECT status, records_skipped FROM sync_logs ORDER BY started_at')
+                .all() as Array<{status: string; records_skipped: number}>;
+            expect(logs).toHaveLength(1);
+            expect(logs[0].records_skipped).toBe(DAYS.length);
         });
     });
 

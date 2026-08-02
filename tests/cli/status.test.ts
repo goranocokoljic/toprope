@@ -406,6 +406,21 @@ describe('printStatus', () => {
                 expect(combined.match(/toprope doctor/g)).toHaveLength(1);
             });
 
+            it('strips control characters from the container before printing it', () => {
+                // The input class only the sanitizer handles: U+202E (right-to-left override)
+                // reverses everything after it in a terminal, and a BEL rings it. A container
+                // is free-form admin-form / YAML text, so this is a real input.
+                const hostile = 'acme\u202Egnp\u0007';
+                seedRefusal(hostile, 40, 0);
+
+                printStatus(db, gitConfig([hostile]));
+
+                const combined = output.join('\n');
+                expect(combined).toContain('github:acme?gnp? refusing rows');
+                expect(combined).not.toContain('\u202E');
+                expect(combined).not.toContain('\u0007');
+            });
+
             it('reports a provider that is BOTH stalled and refusing under both headings', () => {
                 // Unlike stalled-vs-lagging, these are not alternatives: the stall is about the
                 // cursor and the refusal is about the data behind it, so silencing either would

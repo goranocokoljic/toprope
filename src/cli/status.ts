@@ -259,9 +259,13 @@ export function printStatus(db: Database.Database, config: TopropeConfig): void 
     // Printed under the connector block rather than folded into the Git line: both
     // states are per-PROVIDER, and the Git line is per-CONNECTOR (see StatusData.gitStalls).
     const pad = ''.padEnd(14);
+    // `identifier` goes through `sanitizeAdvisoryLabel` on all three lines below (#306). Not new
+    // caution for the new line only — the same value was already printed raw here, and a
+    // sanitizer applied to one of three siblings fed by the same `loadGitSyncHealth` call is
+    // defensive code that does not defend. It is admin-form or YAML text heading for a terminal.
     for (const s of data.gitStalls) {
         console.log(
-            `  ${pad}⚠ ${s.type}:${s.identifier} stalled — cursor held for ${s.runs} consecutive runs since ${formatTimeAgo(s.since)}; importing nothing`,
+            `  ${pad}⚠ ${s.type}:${sanitizeAdvisoryLabel(s.identifier)} stalled — cursor held for ${s.runs} consecutive runs since ${formatTimeAgo(s.since)}; importing nothing`,
         );
     }
     // Advancing but behind: reported separately and NOT as a warning, because a
@@ -269,13 +273,12 @@ export function printStatus(db: Database.Database, config: TopropeConfig): void 
     // mislead — "no stall" would read as "data is current" when it is months old.
     for (const l of data.gitLagging) {
         console.log(
-            `  ${pad}⋯ ${l.type}:${l.identifier} catching up — ${l.daysBehind} days behind; advancing up to ${GIT_CATCHUP_WINDOW_MAX_DAYS} days per run`,
+            `  ${pad}⋯ ${l.type}:${sanitizeAdvisoryLabel(l.identifier)} catching up — ${l.daysBehind} days behind; advancing up to ${GIT_CATCHUP_WINDOW_MAX_DAYS} days per run`,
         );
     }
     // A warning, like a stall and unlike a catch-up: nothing here is working as designed, and
     // the cursor being fresh is the reason this line has to exist at all (see
-    // StatusData.gitRefusing). The container is sanitized for the same reason doctor's is — it
-    // is admin-form text heading for a terminal.
+    // StatusData.gitRefusing).
     for (const r of data.gitRefusing) {
         console.log(
             `  ${pad}⚠ ${r.type}:${sanitizeAdvisoryLabel(r.identifier)} refusing rows — ` +

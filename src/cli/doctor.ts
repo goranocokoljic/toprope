@@ -8,8 +8,9 @@ import {loadServerKey} from '../connectors/git/providers/secret';
 import {createGitProvider} from '../connectors/git/providers/factory';
 import {INTERACTIVE_REQUEST_POLICY} from '../connectors/git/providers/http-retry';
 import {
+    AUTHOR_DAYS_SKIPPED_PREFIX,
     GIT_CATCHUP_WINDOW_MAX_DAYS,
-    TOTAL_REFUSAL_ALERT_RUNS,
+    escalationArm,
     loadGitSyncHealth,
     sanitizeAdvisoryLabel,
 } from '../connectors/git/sync';
@@ -589,8 +590,19 @@ function checkGitStalls(
     const health = loadGitSyncHealth(db, providerConfigs, now);
 
     if (health.stalled.length > 0) {
+        // `identifier` and `since` both go through `sanitizeAdvisoryLabel` (#306). Not new
+        // caution for a new line — the SAME values were already printed raw here, and a
+        // sanitizer applied to one of three sibling lines fed by the same `loadGitSyncHealth`
+        // call is defensive code that does not defend: whatever a control character in a
+        // container could do to a terminal, it did through this line. `identifier` is
+        // admin-form/YAML text, and `since` is raw `sync_state.value` TEXT that survives on a
+        // liveness check alone.
         const detail = health.stalled
-            .map((s) => `${s.type}:${s.identifier} (${s.runs} runs, since ${s.since})`)
+            .map(
+                (s) =>
+                    `${s.type}:${sanitizeAdvisoryLabel(s.identifier)} ` +
+                    `(${s.runs} runs, since ${sanitizeAdvisoryLabel(s.since)})`,
+            )
             .join(', ');
         results.push(
             fail(
@@ -605,21 +617,20 @@ function checkGitStalls(
     //    cursor state, because it is the one condition whose cursor looks perfect. A run whose
     //    author-day refusals were systemic advanced to `now` over a window it wrote almost
     //    nothing into, so stall, lagging and current all read healthy while the data is gone.
-    //    Durable rather than derived from the last run's return value: a non-advisory error
-    //    makes the scheduler retry the connector, the retry runs against a window the first
-    //    attempt already covered, and its clean result is what the CLI prints. This is the
-    //    surface that outlives that.
+    //    Durable rather than derived from the last run's return value, because on the SCHEDULED
+    //    path there is no return value left to derive from: nothing there calls
+    //    `recordSyncOutcome`, so `last_sync_status`/`last_sync_error` describe only the admin
+    //    sync-now route — and a config-file provider has no `git_providers` row to record onto
+    //    at all. This is the one surface that carries the verdict on both provenances.
     if (health.systemicRefusals.length > 0) {
         const detail = health.systemicRefusals
             .map((r) => {
-                // The streak is named only when it is what escalated, so the number an operator
-                // reads is the one that fired rather than both every time.
+                // The streak is named only when it is the arm that escalated, so the number an
+                // operator reads is the one that fired rather than both every time. Asked of the
+                // shared classifier, so this line and the sync's cannot tell one record two
+                // different stories.
                 const streak =
-                    r.runs >= TOTAL_REFUSAL_ALERT_RUNS ? `, nothing written for ${r.runs} runs` : '';
-                // Sanitized, like every other response- or admin-form-derived value this codebase
-                // prints (`sanitizeAdvisoryLabel` on the sync side). The container for a
-                // DB-connected provider comes straight off the admin create form, and a terminal
-                // is exactly the surface where a control character in it matters.
+                    escalationArm(r) === 'streak' ? `, nothing written for ${r.runs} runs` : '';
                 return (
                     `${r.type}:${sanitizeAdvisoryLabel(r.identifier)} ` +
                     `(${r.skipped} of ${r.skipped + r.retained} rows refused at ${r.at}${streak})`
@@ -641,17 +652,41 @@ function checkGitStalls(
                 // wrong twice: this record can be days old, so on a quiet provider a fresh run
                 // finds an empty window and prints no advisory at all — and when it does print
                 // one, it has just advanced the cursor over another window under the unfixed
-                // cause, i.e. the exact loss the next sentence warns about. The run that wrote
-                // this record already persisted the codes in `sync_logs.errors` (one row per
-                // attempt since #272) and on `last_sync_advisories`; both are readable now.
-                'Read that provider\'s most recent sync_logs.errors row (or last_sync_advisories in the admin UI) and find the "Author-days skipped as unwritable" line — its refusal codes name the cause (invalid_date: a provider timestamp that is not a UTC day; invalid_identity: a non-string author field; invalid_metric: a diffstat count that is not a count). Do NOT start with a fresh sync: this alert can be days old, and another run advances the cursor over another window under the same cause. Fix the cause; the alert clears once a run for that provider imports rows again and refuses none. If the provider is genuinely finished (its repos are archived or gone), remove it — delete it in the admin UI, or drop its connectors.git.providers[] entry — which retracts this alert with its data. The windows already covered cannot be re-asked, and purging the provider\'s cursors to re-import them permanently DOUBLES every commit metric on the rows that survived (#262) — do not.',
+                // cause, i.e. the exact loss the next sentence warns about.
+                //
+                // WHERE it sends them is provenance-checked, which the first version was not:
+                // `last_sync_advisories` is written only by `recordSyncOutcome`, keyed by a
+                // `git_providers.id` — so it is empty for a config-file provider AND for every
+                // scheduled run of a DB-connected one. `sync_logs` is the store that covers
+                // both, which is why it is named first and unconditionally, with the admin
+                // column offered only as the DB-provider shortcut it actually is.
+                //
+                // The removal step names only the admin delete. Dropping a YAML entry looks
+                // equivalent and is not: it runs no cascade, so `raw_author_daily`,
+                // `git_snapshots` and `pr_records` survive and the orphaned `git_row_refusal:`
+                // and `git_last_sync:` rows stay in `sync_state` — the alert stops being
+                // REPORTED (health filters to configured providers) while the record waits to
+                // be inherited by anyone who re-adds the same container. Saying "drop the YAML
+                // entry, which retracts this alert with its data" would have been false on both
+                // halves.
+                //
+                // The prefix is INTERPOLATED, not spelled out: a remedy that tells an operator
+                // to look for a line by name must break when the line is renamed.
+                `Read that provider's most recent sync_logs row that carries errors — the run that raised this alert wrote one (for a DB-connected provider, last_sync_advisories in the admin UI holds the same lines) — and find the "${AUTHOR_DAYS_SKIPPED_PREFIX}" line. Its refusal codes name the cause (invalid_date: a provider timestamp that is not a UTC day; invalid_identity: a non-string author field; invalid_metric: a diffstat number that is not a usable count or rate). Do NOT start with a fresh sync: this alert can be days old, and another run advances the cursor over another window under the same cause. Fix the cause; the alert clears once a run for that provider imports rows again and refuses none. If the provider is genuinely finished (its repos are archived or gone), delete it in the admin UI — that cascade retracts its data and this alert together. Removing only its connectors.git.providers[] entry silences the alert without retracting anything, and re-adding the container later inherits this verdict. The windows already covered cannot be re-asked, and purging the provider's cursors to re-import them permanently DOUBLES every commit metric on the rows that survived (#262) — do not.`,
             ),
         );
     }
 
     if (health.lagging.length > 0) {
+        // Sanitized for the same reason as the stall line above (#306) — `cursor` in particular
+        // is raw `sync_state.value` TEXT that reached here on nothing but `Date.parse` not
+        // returning NaN, which is precisely the class the refusal record's shape pin refuses.
         const detail = health.lagging
-            .map((l) => `${l.type}:${l.identifier} (${l.daysBehind} days behind, at ${l.cursor})`)
+            .map(
+                (l) =>
+                    `${l.type}:${sanitizeAdvisoryLabel(l.identifier)} ` +
+                    `(${l.daysBehind} days behind, at ${sanitizeAdvisoryLabel(l.cursor)})`,
+            )
             .join(', ');
         results.push(
             pass(
@@ -675,17 +710,18 @@ function checkGitStalls(
         } else {
             // Some current, some not. With no stalled, lagging or refusing providers
             // here, the "not yet current" remainder is the never-synced ones plus any
-            // that fell through every bucket: held below the stall alert, refusing rows
-            // below the refusal alert (#306), or carrying an unreadable/future-dated
-            // cursor that cannot prove currency.
+            // that fell through every bucket: held below the stall alert, or carrying an
+            // unreadable/future-dated cursor that cannot prove currency. A refusing
+            // provider is NOT in this remainder — currency is denied only once the
+            // refusal escalates (#306), and an escalated one pushed a `fail` above, so
+            // this block did not run.
             const notCurrent = total - health.current;
             const held = notCurrent - health.neverSynced;
             const parts: string[] = [];
             if (health.neverSynced > 0) parts.push(`${health.neverSynced} never synced`);
             if (held > 0) {
                 parts.push(
-                    `${held} held below the stall alert, refusing rows below the refusal alert, ` +
-                        'or with an unreadable or future-dated cursor',
+                    `${held} held below the stall alert, or with an unreadable or future-dated cursor`,
                 );
             }
             results.push(

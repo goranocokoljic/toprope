@@ -20,6 +20,8 @@ import {
     prWithinFetchWindow,
     getProviderStall,
     getProviderRowRefusal,
+    escalationArm,
+    rowRefusalStateKey,
     loadGitSyncHealth,
     GIT_STALL_ALERT_RUNS,
     TOTAL_REFUSAL_ALERT_RUNS,
@@ -4488,15 +4490,13 @@ describe('GitSync — stalled-provider detection (#235)', () => {
          * in — which is exactly the property a single-provider, healthy-cursor test cannot see.
          */
         describe('systemicRefusals', () => {
-            const REFUSAL_KEY = 'git_row_refusal:github:test-org';
+            // Built from the exported key builder, not a hand-spelled prefix, so moving the
+            // namespace breaks the test loudly rather than leaving it asserting about a key
+            // nothing writes.
+            const REFUSAL_KEY = rowRefusalStateKey('github', 'test-org');
+            const OK_AT = '2026-07-01T00:00:00.000Z';
             const refusal = (over: Record<string, unknown> = {}): string =>
-                JSON.stringify({
-                    at: '2026-07-01T00:00:00.000Z',
-                    skipped: 40,
-                    retained: 0,
-                    runs: 1,
-                    ...over,
-                });
+                JSON.stringify({at: OK_AT, skipped: 40, retained: 0, runs: 1, ...over});
 
             it('reports a refusing provider whose cursor is CURRENT, and denies it that credit', () => {
                 writeState(FORWARD_KEY, at(1));
@@ -4570,7 +4570,7 @@ describe('GitSync — stalled-provider detection (#235)', () => {
                 expect(loadGitSyncHealth(db, [CONFIG], NOW).systemicRefusals).toEqual([]);
             });
 
-            it('withholds the report below BOTH arms, but still withholds currency too', () => {
+            it('withholds the report below BOTH arms, and leaves currency intact', () => {
                 writeState(FORWARD_KEY, at(1));
                 // Below the per-run floor AND below the streak: one or two runs importing
                 // nothing is the self-healing case.
@@ -4578,9 +4578,13 @@ describe('GitSync — stalled-provider detection (#235)', () => {
 
                 const health = loadGitSyncHealth(db, [CONFIG], NOW);
                 expect(health.systemicRefusals).toEqual([]);
-                // …but it refused rows on its last run, so it cannot EARN the positive
-                // currency claim either. Reporting and crediting are separate decisions.
-                expect(health.current).toBe(0);
+                // Currency is denied only once the refusal ESCALATES. Keying it on the record's
+                // mere existence — the first draft, by analogy with the sub-threshold stall
+                // streak — does not survive the disanalogy: a stall means the run imported
+                // nothing, while a record can mean "99 written, 1 refused", a run this feature
+                // calls green everywhere else. That made #248's positive all-clear permanently
+                // unreachable for a deployment with one chronically malformed PR timestamp.
+                expect(health.current).toBe(1);
             });
 
             it('escalates on the streak alone, at a count no per-run floor would reach', () => {
@@ -4593,7 +4597,7 @@ describe('GitSync — stalled-provider detection (#235)', () => {
             });
 
             it.each([
-                ['non-integer skipped', JSON.stringify({at: '2026-07-01T00:00:00.000Z', skipped: 2.5, retained: 0})],
+                ['non-integer skipped', JSON.stringify({at: OK_AT, skipped: 2.5, retained: 0})],
                 ['zero skipped', JSON.stringify({at: '2026-07-01T00:00:00.000Z', skipped: 0, retained: 0})],
                 ['negative skipped', JSON.stringify({at: '2026-07-01T00:00:00.000Z', skipped: -3, retained: 0})],
                 ['a stringified skipped', JSON.stringify({at: '2026-07-01T00:00:00.000Z', skipped: '40', retained: 0})],
@@ -4602,8 +4606,15 @@ describe('GitSync — stalled-provider detection (#235)', () => {
                 ['missing retained', JSON.stringify({at: '2026-07-01T00:00:00.000Z', skipped: 40})],
                 ['negative runs', JSON.stringify({at: '2026-07-01T00:00:00.000Z', skipped: 40, retained: 0, runs: -1})],
                 ['non-integer runs', JSON.stringify({at: '2026-07-01T00:00:00.000Z', skipped: 40, retained: 0, runs: 1.5})],
+                ['missing runs', JSON.stringify({at: '2026-07-01T00:00:00.000Z', skipped: 40, retained: 0})],
+                ['an unsafe-integer skipped', JSON.stringify({at: '2026-07-01T00:00:00.000Z', skipped: 2 ** 60, retained: 0})],
                 ['missing at', JSON.stringify({skipped: 40, retained: 0})],
                 ['a non-ISO at', JSON.stringify({at: 'yesterday-ish', skipped: 40, retained: 0})],
+                // Passes the anchored SHAPE regex and is still not a date. Only the
+                // `toISOString()` round-trip half of the canonical `isUtcIsoInstant` rejects it,
+                // which is why the decoder reuses that predicate rather than carrying a third,
+                // weaker copy of the regex — `doctor` would otherwise print 2025-02-30.
+                ['a shape-valid non-existent day', JSON.stringify({at: '2025-02-30T00:00:00.000Z', skipped: 40, retained: 0})],
                 // Parses finite through Date.parse and would pass a round-trip check, which is
                 // exactly why the shape is pinned with an anchored regex instead (#233).
                 ['an expanded-year at', JSON.stringify({at: '+033658-09-27T00:00:00.000Z', skipped: 40, retained: 0})],
@@ -4624,20 +4635,16 @@ describe('GitSync — stalled-provider detection (#235)', () => {
                 expect(loadGitSyncHealth(db, [CONFIG], NOW).systemicRefusals).toEqual([]);
             });
 
-            it('reads a record written before the streak field existed as a streak of 0', () => {
-                // Forward-compatibility, and the only field tolerated as absent: a record
-                // written by the pre-streak build still describes a real refusal, and refusing
-                // it outright would silently clear an escalation across an upgrade.
-                writeState(REFUSAL_KEY, JSON.stringify({at: '2026-07-01T00:00:00.000Z', skipped: 40, retained: 0}));
-
-                expect(getProviderRowRefusal(db, 'github', 'test-org')).toEqual({
-                    at: '2026-07-01T00:00:00.000Z',
-                    skipped: 40,
-                    retained: 0,
-                    runs: 0,
-                });
-                // 40 of 40 still trips the per-run arm, so the escalation survives the upgrade.
-                expect(loadGitSyncHealth(db, [CONFIG], NOW).systemicRefusals).toHaveLength(1);
+            it('names which arm escalated, so the two surfaces cannot tell one record two stories', () => {
+                // `escalationArm` exists because the sync line asked `isSystemicRowRefusal` and
+                // doctor asked `runs >= TOTAL_REFUSAL_ALERT_RUNS` — complementary, not equal, so
+                // a record tripping BOTH got a different explanation from each surface.
+                expect(escalationArm({at: OK_AT, skipped: 40, retained: 0, runs: 1})).toBe('ratio');
+                expect(escalationArm({at: OK_AT, skipped: 3, retained: 0, runs: TOTAL_REFUSAL_ALERT_RUNS})).toBe('streak');
+                // Trips both: `ratio` wins, because it names a magnitude and is the more
+                // specific statement.
+                expect(escalationArm({at: OK_AT, skipped: 40, retained: 0, runs: TOTAL_REFUSAL_ALERT_RUNS})).toBe('ratio');
+                expect(escalationArm({at: OK_AT, skipped: 1, retained: 9, runs: 0})).toBeNull();
             });
         });
     });

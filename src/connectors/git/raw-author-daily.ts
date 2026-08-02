@@ -423,14 +423,23 @@ const RATE_FIELDS: readonly (keyof DailyGitMetrics)[] = [
  * The metric fields whose value flows VERBATIM out of a provider response body, and the reason
  * a bad metric has two codes rather than one (#306).
  *
- * These four are the only ones whose operands this pipeline does not compute. `lines_added` /
- * `lines_removed` are summed from each commit's diffstat, and TWO of the three providers hand
- * that number over uncast: Bitbucket's `getCommitDiff` maps `e.lines_added` straight into
- * `GitFileDiff.additions`, and `resolveCommitDiffstat` then `reduce`s over it — so a
- * `"40"` or a `null` in a diffstat page becomes a non-integer `lines_added` here. (GitHub is
- * the exception: it runs the shared `isCommitCount` predicate over `stats` at its own
- * boundary.) `avg_commit_size` and `code_churn_rate` are arithmetic over the SAME two numbers,
- * so they inherit the same provenance.
+ * These four are the only ones whose operands this pipeline does not compute — every one of them
+ * bottoms out in a per-file `additions`/`deletions` number a provider handed over uncast.
+ * Bitbucket's `getCommitDiff` maps `e.lines_added` / `e.lines_removed` straight into
+ * `GitFileDiff`, so a `"40"` or a `null` in a diffstat page arrives intact. (GitHub is the
+ * exception: it runs the shared `isCommitCount` predicate over `stats` at its own boundary.)
+ *
+ * They reach this row by TWO routes, and the distinction matters for anyone classifying a future
+ * metric — the rule is "does a provider number reach it?", not "is it arithmetic over
+ * lines_added?":
+ * - `lines_added` / `lines_removed` sum each commit's `additions` / `deletions`, which
+ *   `resolveCommitDiffstat` itself `reduce`s out of the per-file entries; `avg_commit_size` is
+ *   `(lines_added + lines_removed) / commits`, so it rides the same two numbers.
+ * - `code_churn_rate` does NOT read those two at all. `calculateDailyChurnRates` (`churn.ts`)
+ *   walks `commit.fileDiffs` and sums `file.additions + file.deletions` per file, so it reaches
+ *   the same provider values one level lower down. An earlier draft of this comment claimed it
+ *   was arithmetic over `lines_added`/`lines_removed`; it is not, and the classification happens
+ *   to be right for a different reason.
  *
  * Provenance is what decides the split, because it decides whether re-asking helps. A defect in
  * one of these is a property of a response body that is immutable under re-fetch — holding the
