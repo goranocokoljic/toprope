@@ -548,6 +548,17 @@ function noGitProvidersDiagnostic(git: TopropeConfig['connectors']['git']): Chec
  *    snapshots are still missing and several more runs away. It is a `pass` because a
  *    bounded catch-up is working as designed and self-resolves; it is reported because
  *    "working" and "current" are not the same claim.
+ * 3. **Systemically refusing** (`fail`, #306): the cursor advanced over a window whose
+ *    author-day rows the write boundary mostly refused. The only condition here whose
+ *    cursor reads perfect — that is the point: the run completed, the cursor is at `now`,
+ *    and the data behind it was never written. It is checked against a durable marker
+ *    rather than the last run's return value, because the non-advisory error the same run
+ *    emits makes the scheduler retry the connector over an already-covered (and therefore
+ *    empty, and therefore clean) window, and it is the RETRY's result the CLI prints.
+ *
+ * These are not mutually exclusive and are not meant to be: 1 and 2 classify the CURSOR,
+ * 3 classifies the DATA the cursor claims to cover, and a provider can be in 3 while
+ * looking healthy on both of the others.
  *
  * The all-clear is now a POSITIVE currency check (#248) rather than the inference it
  * used to be. It no longer reads "no stalled or lagging providers" (true only because
@@ -581,6 +592,36 @@ function checkGitStalls(
                 label,
                 `${health.stalled.length} provider(s) stalled — cursor held, importing nothing: ${detail}`,
                 'Something fails on every run and holds the whole provider back — usually one bad repo (oversized, permission drift, deleted-but-still-listed), or the provider-level repo listing itself (a token/permission problem). Run "toprope sync all" and read the [provider] / [provider/repo] errors to see which. Fix the access, or if it is one repo you do not need, drop it via connectors.git.providers[].exclude_repos.',
+            ),
+        );
+    }
+
+    // 3. Systemic row refusal (#306) — reported BEFORE lagging and independently of every
+    //    cursor state, because it is the one condition whose cursor looks perfect. A run whose
+    //    author-day refusals were systemic advanced to `now` over a window it wrote almost
+    //    nothing into, so stall, lagging and current all read healthy while the data is gone.
+    //    Durable rather than derived from the last run's return value: a non-advisory error
+    //    makes the scheduler retry the connector, the retry runs against a window the first
+    //    attempt already covered, and its clean result is what the CLI prints. This is the
+    //    surface that outlives that.
+    if (health.systemicRefusals.length > 0) {
+        const detail = health.systemicRefusals
+            .map(
+                (r) =>
+                    `${r.type}:${r.identifier} (${r.skipped} of ${r.skipped + r.retained} rows refused at ${r.at})`,
+            )
+            .join(', ');
+        results.push(
+            fail(
+                label,
+                `${health.systemicRefusals.length} provider(s) refused most of the rows their last run built — cursor advanced over data that was never written: ${detail}`,
+                // Deliberately does NOT prescribe a recovery for the lost span. Purging the
+                // cursors to re-import it re-arms the #262 permanent double-count over the rows
+                // that WERE written, and the delete-and-re-add repair is refused outright for a
+                // config-file provider — so naming either would be advice half the deployments
+                // cannot run and the other half should not. Stopping further loss is the part
+                // that is always both safe and reachable.
+                'Run "toprope sync git" and read the "Author-days skipped as unwritable" line for that provider — its refusal codes name the cause (invalid_date: a provider timestamp that is not a UTC day; invalid_identity: a non-string author field; invalid_metric: a diffstat count that is not a count). Fix the cause, because every further run loses another window the same way. This clears once a run for that provider imports rows again. The windows already covered cannot be re-asked, and purging the provider\'s cursors to re-import them permanently DOUBLES every commit metric on the rows that survived (#262) — do not.',
             ),
         );
     }

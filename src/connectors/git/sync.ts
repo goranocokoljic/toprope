@@ -528,6 +528,43 @@ function formatSkippedAuthorDays(
 }
 
 /**
+ * The {@link SYSTEMIC_ROW_REFUSAL_PREFIX} line for one provider instance (#306).
+ *
+ * Deliberately NOT a second copy of the advisory's prose: the sibling line beside it already
+ * names the refusal codes, the sample rows and the fact that nothing re-asks them. This one says
+ * only what the advisory cannot — the SCALE, and that the scale is what changed the verdict —
+ * and points at the line that carries the detail.
+ *
+ * The remedy is deliberately thin, and that is the honest answer rather than an omission. The
+ * graduated rule is that a printed remedy must be safe, reachable and complete; the two repairs
+ * that would recover the lost span are neither safe nor reachable here. Purging the cursors and
+ * re-syncing re-arms the #262 permanent double-count over the rows this run DID retain, and the
+ * delete-and-re-add procedure {@link permanentSpanRepair} prescribes is refused outright for a
+ * config-file provider. So the instruction is the one that is always both: find the cause from
+ * the codes on the sibling line and stop the bleeding, because every further run loses more.
+ */
+function formatSystemicRowRefusal(
+    providerType: GitProviderType,
+    container: string,
+    skipped: number,
+    retained: number,
+): string {
+    return (
+        `${SYSTEMIC_ROW_REFUSAL_PREFIX} [${providerType}/${sanitizeAdvisoryLabel(container)}] ` +
+        `${skipped} of ${skipped + retained} author-day row(s) this run built were refused and ` +
+        `only ${retained} were written, while the cursor advanced over the whole window. That is ` +
+        `not the incidental single-row loss the "${AUTHOR_DAYS_SKIPPED_PREFIX}" advisory reports ` +
+        `— it is a cause refusing this provider's rows wholesale, so this run is reported as a ` +
+        `FAILURE even though it committed. Read the refusal codes on that advisory line (also in ` +
+        `sync_logs.errors and git_providers.last_sync_advisories) to see which. Fix the cause: ` +
+        `every further run loses another window the same way. The windows already covered cannot ` +
+        `be re-asked — neither a forward sync nor "sync older history" reaches them — and do NOT ` +
+        `purge this provider's cursors to re-import them, which permanently doubles every commit ` +
+        `metric on the rows that WERE retained (#262).`
+    );
+}
+
+/**
  * Prefix of the advisory pushed when a PR's `pr_records` row could not be written (#302).
  *
  * THE SECOND WRITE IN THE SAME TRANSACTION, and the reason a skip at `raw_author_daily` alone
@@ -702,6 +739,77 @@ function permanentSpanRepair(): string {
         'cascade is skipped while the YAML entry still owns the container), so it has no ' +
         'supported repair today: leave the span understated'
     );
+}
+
+/**
+ * Prefix of the line raised when a provider instance's author-day refusals stop being
+ * incidental and become SYSTEMIC (#306) — a GENUINE ERROR, deliberately absent from
+ * {@link ADVISORY_PREFIXES}.
+ *
+ * The gap it closes. {@link AUTHOR_DAYS_SKIPPED_PREFIX} is unconditional per row, and its
+ * "skipping is the lesser loss" trade is the right one for the single bad PR date that
+ * motivated it. It is quietly wrong when the SAME refusal hits every row: the provider writes
+ * nothing, its cursor still advances, `recordSyncOutcome` NULLs `last_sync_error` and stores
+ * `status: 'ok'` (because the advisory prefix says so), and the only evidence is one prose line
+ * on a channel with no dashboard surface. `1 author-day row(s)` and `40,000 author-day row(s)`
+ * produced the same green. Under the pre-#302 throw the same event was loud, red, and
+ * RECOVERABLE — the window was intact.
+ *
+ * This is the graduated "a completion signal is not a currency claim" rule: the run that
+ * succeeds while a provider's entire window is permanently gone is exactly the one an operator
+ * reads as an all-clear. The skip stays (re-asking cannot help — see `ROW_LEVEL_REFUSALS`), but
+ * the RUN stops claiming it went fine.
+ *
+ * Staged on the cursor advance like the advisories it escalates, for the identical reason: the
+ * loss is only beyond recovery once the window is recorded as covered.
+ */
+export const SYSTEMIC_ROW_REFUSAL_PREFIX = 'Systemic author-day refusal:';
+
+/**
+ * How many author-day rows one provider instance must refuse before a run can be called
+ * systemic, regardless of ratio.
+ *
+ * A FLOOR, not a preference, and the reason the one-bad-date case #302 was built around stays
+ * an advisory. A provider that builds two rows and refuses one is at a 50% refusal rate on a
+ * sample of two — a ratio test alone would escalate it, and that PR is exactly the incidental
+ * loss the advisory channel exists for.
+ *
+ * 5, from what the advisory can still DO for the operator. Below
+ * {@link ADVISORY_SAMPLE_SIZE} the line names every lost row individually — author key and day,
+ * enough to go look each one up — so the advisory is itself a complete report and escalating
+ * adds nothing but noise. At or above it the line starts rendering `(+N more)`: the enumeration
+ * is gone, the count is all that is left, and the count is precisely what needs a louder channel.
+ */
+export const SYSTEMIC_SKIP_MIN_ROWS = 5;
+
+/**
+ * What share of the author-day rows a provider instance BUILT must be refused before the run is
+ * systemic — "at or near its write count", as a number.
+ *
+ * 0.5, i.e. it refused at least as many rows as it retained. The failure this guards is a cause
+ * that refuses 100% of a provider's rows (ratio 1.0); half is the point at which "this provider
+ * mostly did not import" is no longer arguable, while leaving a genuinely mixed window — a
+ * handful of bad PR dates among a normal day's rows — on the advisory channel.
+ */
+export const SYSTEMIC_SKIP_RATIO = 0.5;
+
+/**
+ * Did this provider instance's run refuse rows systemically rather than incidentally (#306)?
+ *
+ * Both operands are counted PRE-DEDUPE, over the same population: every author-day row the
+ * fetch loop built for this provider instance, before the within-run merge collapses duplicates.
+ * A denominator taken after the merge would move for reasons that have nothing to do with
+ * refusals.
+ *
+ * `retained` counts rows that survived the defect check, not rows that reached SQLite: the
+ * `isWritable` gate inside the transaction can still drop one whose container lost its owner
+ * mid-run. That is the right denominator anyway — this asks whether the REFUSALS were systemic,
+ * and a provider whose container was deleted mid-run is already reported by
+ * {@link PROVIDER_DELETED_MID_RUN_PREFIX}.
+ */
+export function isSystemicRowRefusal(skipped: number, retained: number): boolean {
+    if (skipped < SYSTEMIC_SKIP_MIN_ROWS) return false;
+    return skipped >= (skipped + retained) * SYSTEMIC_SKIP_RATIO;
 }
 
 /** Every sentinel that marks an `errors` entry as advisory rather than a failure. */
@@ -1576,6 +1684,101 @@ function clearProviderStall(
 }
 
 /**
+ * The sync_state key for a provider's last SYSTEMIC row refusal (#306). A FOURTH namespace,
+ * disjoint from the forward cursor, the earliest watermark and the stall counter, so a refusal
+ * row can never be read as any of them.
+ */
+export function rowRefusalStateKey(providerType: GitProviderType, identifier: string): string {
+    return `git_row_refusal:${providerType}:${identifier}`;
+}
+
+/** A provider's last run whose author-day refusals were systemic (#306). */
+export interface GitRowRefusal {
+    /** UTC ISO instant of the run that refused them. */
+    at: string;
+    /** Author-day rows that run refused. Always >= 1. */
+    skipped: number;
+    /** Author-day rows that run retained. May be 0 — that is the worst case, not an absent one. */
+    retained: number;
+}
+
+/**
+ * Decode a stored refusal row, or null when there is nothing usable to report.
+ *
+ * Same shape of totality as {@link parseStall} and for the same reason: `sync_state.value` is an
+ * unconstrained TEXT column, so the JSON is parsed and range-validated rather than cast. It is
+ * self-healing rather than fail-closed — a corrupt row reported as a refusal of `NaN` rows is a
+ * false alarm no remedy clears, and the next run of that provider rewrites or deletes it.
+ */
+function parseRowRefusal(value: string | null): GitRowRefusal | null {
+    if (!value) return null;
+    let raw: unknown;
+    try {
+        raw = JSON.parse(value);
+    } catch {
+        return null;
+    }
+    if (typeof raw !== 'object' || raw === null) return null;
+    const {at, skipped, retained} = raw as {at?: unknown; skipped?: unknown; retained?: unknown};
+    if (typeof at !== 'string' || Number.isNaN(Date.parse(at))) return null;
+    if (!Number.isInteger(skipped) || (skipped as number) < 1) return null;
+    if (!Number.isInteger(retained) || (retained as number) < 0) return null;
+    return {at, skipped: skipped as number, retained: retained as number};
+}
+
+/** The last systemic refusal recorded for one provider (#306), or null if there is none. */
+export function getProviderRowRefusal(
+    db: Database.Database,
+    providerType: GitProviderType,
+    identifier: string,
+): GitRowRefusal | null {
+    return parseRowRefusal(getSyncStateValue(db, rowRefusalStateKey(providerType, identifier)));
+}
+
+/**
+ * Record that this run's refusals for this provider were systemic (#306).
+ *
+ * DURABLE, and that is the point rather than a convenience. The error line beside it reaches the
+ * admin sync-now surface (which records `last_sync_status`) but NOT the scheduled path: a
+ * non-advisory error makes `runConnectorWithRetry` retry the whole connector, and the retry runs
+ * against a window the first attempt's cursor advance already covered — so it finds nothing to
+ * refuse, returns clean, and `runPipeline` hands the CLI the RETRY's result. Without a row that
+ * outlives the run, the loudest signal this issue adds would be erased by the retry it triggers.
+ * `toprope doctor` reads this instead.
+ *
+ * Written in the SAME transaction as the cursor advance, so the claim and the advance can never
+ * disagree about whether the window was recorded as covered.
+ */
+function recordSystemicRowRefusal(
+    db: Database.Database,
+    providerType: GitProviderType,
+    identifier: string,
+    refusal: GitRowRefusal,
+): void {
+    setSyncStateValue(db, rowRefusalStateKey(providerType, identifier), JSON.stringify(refusal));
+}
+
+/**
+ * Clear a provider's systemic-refusal marker — a later run of it built rows and accepted them.
+ *
+ * The caller gates this on that run having actually RETAINED something (see the cursor-advance
+ * closure). A run that built nothing refused nothing, and "no refusals" is then an absence, not
+ * evidence: the graduated rule is that a positive health claim must not be inferred from a
+ * narrower check coming back empty. The retry a systemic run provokes is exactly such a run —
+ * its window is already covered, so it fetches an empty span — and letting it clear the marker
+ * would hand the fail-open back on the very next attempt.
+ */
+function clearSystemicRowRefusal(
+    db: Database.Database,
+    providerType: GitProviderType,
+    identifier: string,
+): void {
+    db.prepare('DELETE FROM sync_state WHERE key = ?').run(
+        rowRefusalStateKey(providerType, identifier),
+    );
+}
+
+/**
  * A provider that is ADVANCING but is still more than one cap-width behind the
  * present (#235) — a bounded catch-up in progress.
  *
@@ -1639,6 +1842,24 @@ export interface GitSyncHealth {
     current: number;
     /** Count of providers with no stored cursor — a pending first sync. */
     neverSynced: number;
+    /**
+     * Providers whose last run refused most of the author-day rows it built (#306) — ORTHOGONAL
+     * to the four states above, not a fifth one.
+     *
+     * The other four classify the CURSOR: whether it is held, catching up, current, or unset.
+     * This classifies the DATA the cursor claims to cover, and the two disagree precisely here —
+     * a systemic refusal advances the cursor to `now` over a window it wrote nothing into, so
+     * the cursor reads perfectly current. A provider in this list is therefore reported IN
+     * ADDITION to whatever cursor state it is in, and is denied `current` credit: currency is a
+     * claim about the data, and this is the one row set that proves the claim false.
+     */
+    systemicRefusals: SystemicRefusalProvider[];
+}
+
+/** A provider whose last run's author-day refusals were systemic (#306). */
+export interface SystemicRefusalProvider extends GitRowRefusal {
+    type: GitProviderType;
+    identifier: string;
 }
 
 /**
@@ -1684,15 +1905,32 @@ export function loadGitSyncHealth(
         ).map((r) => [r.key, r.value]),
     );
 
+    // The third row set, read in the same one-query-per-namespace shape as the two above (#306).
+    const refusalByKey = new Map(
+        (
+            db
+                .prepare("SELECT key, value FROM sync_state WHERE key LIKE 'git_row_refusal:%'")
+                .all() as Array<{key: string; value: string}>
+        ).map((r) => [r.key, r.value]),
+    );
+
     const capMs = GIT_CATCHUP_WINDOW_MAX_DAYS * 86_400_000;
     const stalled: StalledProvider[] = [];
     const lagging: LaggingProvider[] = [];
+    const systemicRefusals: SystemicRefusalProvider[] = [];
     let current = 0;
     let neverSynced = 0;
 
     for (const pc of providerConfigs) {
         const identifier = providerIdentifier(pc);
         const stall = parseStall(stallByKey.get(stallStateKey(pc.type, identifier)) ?? null);
+        // Collected BEFORE the disjoint cursor chain below and without a `continue` of its own:
+        // this is orthogonal to cursor state (see GitSyncHealth.systemicRefusals), so a provider
+        // that is also stalled must appear on BOTH lists rather than have one silence the other.
+        const refusal = parseRowRefusal(
+            refusalByKey.get(rowRefusalStateKey(pc.type, identifier)) ?? null,
+        );
+        if (refusal) systemicRefusals.push({type: pc.type, identifier, ...refusal});
 
         // Reportable stall wins over every other state — the most specific, most
         // actionable signal, and reported even when the provider also has no cursor.
@@ -1732,10 +1970,14 @@ export function loadGitSyncHealth(
         // clamp it out rather than crediting it. Everything remaining is a cursor within
         // one cap-width of now with no open streak: the positive currency check.
         if (behindMs < 0) continue;
+        // A cursor that is current over a window its own run wrote almost nothing into does not
+        // prove the DATA is current — it proves the opposite, loudly. Denied here rather than
+        // subtracted at the surface, so every reader of `current` gets the same answer (#306).
+        if (refusal) continue;
         current++;
     }
 
-    return {stalled, lagging, current, neverSynced};
+    return {stalled, lagging, current, neverSynced, systemicRefusals};
 }
 
 interface SyncStateRow {
@@ -3343,6 +3585,11 @@ export class GitSync implements ConnectorInterface {
         const errors: string[] = [];
         let snapshotsWritten = 0;
         let snapshotsSkipped = 0;
+        // Kept SEPARATE from `snapshotsSkipped` since #306, which folded unwritable rows into
+        // that field. This one still counts only what the LEGACY_CELLS_SKIPPED_PREFIX advisory
+        // is about — projection cells left untouched because they hold pre-upgrade totals — so
+        // that line keeps naming its own number instead of a sum of three unrelated grains.
+        let legacyCellsSkipped = 0;
         const now = new Date().toISOString();
         const allUnmatched = new Set<string>();
 
@@ -3604,6 +3851,18 @@ export class GitSync implements ConnectorInterface {
         // the line claims the skipped row can no longer be re-asked, which is only true once this
         // run's window is recorded as covered. Same closure, same discard semantics.
         const skippedRowAdvisories: string[] = [];
+        // Systemic-refusal ERRORS (#306) — the escalation of the line above, staged on the same
+        // closure and consumed on the same terms. Not advisories: they carry
+        // SYSTEMIC_ROW_REFUSAL_PREFIX, which `isAdvisoryError` deliberately does not match, so a
+        // run that lands one settles as `status: 'error'` rather than as a green run over a
+        // window it wrote nothing into.
+        const systemicRefusalErrors: string[] = [];
+        // Rows this run REFUSED, across every provider instance whose window was recorded as
+        // covered — accumulated by the same closure, for the same reason, and only read after
+        // the transaction commits. This is what moves `sync_logs.records_skipped` off 0 (#306):
+        // before it, `snapshotsSkipped` carried only legacy projection cells, so the one numeric
+        // field meaning "rows we did not write" never moved for an unwritable row.
+        let committedRowsSkipped = 0;
         // Deferred stall-counter updates (#235), applied in the SAME transaction as
         // the cursor advances so the counter and the cursor can never disagree about
         // whether this run moved the provider forward. Unlike `cursorAdvances` this
@@ -3658,6 +3917,10 @@ export class GitSync implements ConnectorInterface {
             // because the advisory is per provider instance, like `result.droppedAdvisories`.
             const skippedRows: SkippedAuthorDay[] = [];
             const skippedPRRecords: SkippedPRRecord[] = [];
+            // The denominator the refusal ratio is judged against (#306): author-day rows this
+            // provider instance BUILT and the write boundary accepted, counted in the same loop
+            // and at the same pre-dedupe grain as `skippedRows`. See `isSystemicRowRefusal`.
+            let retainedRowCount = 0;
 
             cursorAdvances.push((): void => {
                 // Advancing a cursor the cascade just purged is exactly what re-arms the #262
@@ -3686,6 +3949,35 @@ export class GitSync implements ConnectorInterface {
                     ...formatSkippedAuthorDays(providerType, identifier, skippedRows),
                     ...formatSkippedPRRecords(providerType, identifier, skippedPRRecords),
                 );
+                // Both grains, because the field they feed answers "how many rows did this run
+                // not write", and both are rows it did not write. Which is which stays legible
+                // on the two advisory lines just staged; the number is the coarse signal that
+                // reaches `sync_logs.records_skipped` and `toprope sync`'s summary (#306).
+                committedRowsSkipped += skippedRows.length + skippedPRRecords.length;
+                // THE ESCALATION (#306). The skip itself is unchanged — re-asking an
+                // immutable refusal cannot help — but a provider that refused most of what it
+                // built must not settle as `ok`. Two channels, because neither alone survives
+                // every path: the error line turns the admin sync-now surface red and makes the
+                // CLI exit non-zero, and the durable marker outlives the connector retry that
+                // line provokes (see `recordSystemicRowRefusal`) so `toprope doctor` keeps
+                // failing until a run actually imports something again.
+                if (isSystemicRowRefusal(skippedRows.length, retainedRowCount)) {
+                    systemicRefusalErrors.push(
+                        formatSystemicRowRefusal(
+                            providerType,
+                            identifier,
+                            skippedRows.length,
+                            retainedRowCount,
+                        ),
+                    );
+                    recordSystemicRowRefusal(db, providerType, identifier, {
+                        at: now,
+                        skipped: skippedRows.length,
+                        retained: retainedRowCount,
+                    });
+                } else if (retainedRowCount > 0) {
+                    clearSystemicRowRefusal(db, providerType, identifier);
+                }
                 if (options?.backfill) {
                     setProviderEarliestSyncTime(db, providerType, identifier, options.backfill.since);
                 } else {
@@ -3827,6 +4119,12 @@ export class GitSync implements ConnectorInterface {
                     // Pre-existing and bounded by that narrow window; noted so the sentence above
                     // is not read as stronger than it is.
                     retainedKeys.add(rawAuthorKey);
+                    // The refusal ratio's denominator (#306), incremented at the one line that
+                    // means "the write boundary accepted this row" — beside the gate rather than
+                    // derived from `rawWrites.size` afterwards, so it counts the same population
+                    // `skippedRows` does and cannot drift when the dedupe merge collapses two
+                    // rows into one.
+                    retainedRowCount++;
                     // Accumulate WITHIN the run before the store ever sees it, keyed by the
                     // FULL store key — container included (#264).
                     //
@@ -3975,11 +4273,16 @@ export class GitSync implements ConnectorInterface {
                 update();
             }
             snapshotsWritten = written;
-            snapshotsSkipped = skipped;
+            legacyCellsSkipped = skipped;
         });
 
         try {
             insertMany();
+            // `records_skipped` now means every row this run did not write, not just the legacy
+            // projection cells it used to mean (#306) — see `committedRowsSkipped`. Summed only
+            // on the commit path, and left at 0 on the rollback path below, for the same reason
+            // the advisories are: a rolled-back run wrote nothing AND lost nothing.
+            snapshotsSkipped = legacyCellsSkipped + committedRowsSkipped;
             // Committed — only now is the auto-create summary true.
             errors.push(...autoCreateAdvisories);
             // …and only now has any window actually been recorded as covered, which is what
@@ -3991,6 +4294,9 @@ export class GitSync implements ConnectorInterface {
             errors.push(...diffLossAdvisories);
             errors.push(...churnUnknownAdvisories);
             errors.push(...skippedRowAdvisories);
+            // The escalation of the line above (#306), pushed on the same gate. NOT an advisory:
+            // this is what stops a provider that refused its whole window settling as `ok`.
+            errors.push(...systemicRefusalErrors);
         } catch (err) {
             // Hard failure: the tx rolled back, so NO snapshots were written, NO developer
             // was auto-created and NO cursor advanced — the window is intact and will be
@@ -3998,6 +4304,11 @@ export class GitSync implements ConnectorInterface {
             // "successful" result.
             snapshotsWritten = 0;
             snapshotsSkipped = 0;
+            // Reset alongside them, and NOT redundant with `snapshotsSkipped = 0` since #306:
+            // the legacy-cell advisory below now reads this variable, so a run whose transaction
+            // threw after the projection pass would otherwise report cells it never skipped —
+            // they were rolled back with everything else.
+            legacyCellsSkipped = 0;
             autoCreateAdvisories.length = 0;
             // Derived from writes that were discarded, so reporting it would describe a
             // state that does not exist — same reason the auto-create advisories are
@@ -4069,10 +4380,12 @@ export class GitSync implements ConnectorInterface {
 
         // Say WHY cells were skipped, not just how many. `records_skipped` is a bare
         // number on the sync log; without this an operator sees a "complete" run whose
-        // count silently disagrees with the data, and has nothing to search for.
-        if (snapshotsSkipped > 0) {
+        // count silently disagrees with the data, and has nothing to search for. It is now a
+        // SUM of three grains (#306), which makes naming this one's own count here load-bearing
+        // rather than cosmetic: `records_skipped` no longer equals the number in this sentence.
+        if (legacyCellsSkipped > 0) {
             errors.push(
-                `${LEGACY_CELLS_SKIPPED_PREFIX} ${snapshotsSkipped} cell(s) were left untouched because they hold pre-upgrade totals the projection cannot reconstruct. Their raw authorship IS retained; re-run "sync older history" for the affected window if those days matter.`,
+                `${LEGACY_CELLS_SKIPPED_PREFIX} ${legacyCellsSkipped} cell(s) were left untouched because they hold pre-upgrade totals the projection cannot reconstruct. Their raw authorship IS retained; re-run "sync older history" for the affected window if those days matter.`,
             );
         }
 

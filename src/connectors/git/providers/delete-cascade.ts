@@ -66,7 +66,7 @@ import {
 } from '../raw-author-daily.js';
 import {buildDevLookupMap, projectSnapshots, resolveRawAuthor} from '../projection.js';
 import {deleteContainerDiffstats} from '../diffstat-cache.js';
-import {earliestSyncStateKey, stallStateKey, syncStateKey} from '../sync.js';
+import {earliestSyncStateKey, rowRefusalStateKey, stallStateKey, syncStateKey} from '../sync.js';
 import {deleteProvider, getProvider, GitProviderStoreError, type GitProviderRecord} from './store.js';
 import {containerKeyOf} from './config.js';
 
@@ -137,12 +137,17 @@ export interface ProviderDeleteResult {
     cascade_skipped: boolean;
 }
 
-/** The three sync-state keys a container owns — the canonical builders, never a prefix guess. */
+/** The four sync-state keys a container owns — the canonical builders, never a prefix guess. */
 function containerCursorKeys(type: GitProviderType, container: string): string[] {
     return [
         syncStateKey(type, container),
         earliestSyncStateKey(type, container),
         stallStateKey(type, container),
+        // The systemic-refusal marker (#306). It reports on a window whose rows this cascade
+        // has just retracted, so leaving it behind would fail `toprope doctor` forever against
+        // a provider that no longer exists — and re-adding the container would inherit the
+        // deleted provider's verdict.
+        rowRefusalStateKey(type, container),
     ];
 }
 

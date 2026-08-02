@@ -661,6 +661,89 @@ describe('runDoctor', () => {
             expect(result).toBe(true);
             expect([...output, ...errors].join('\n')).not.toContain('Git sync progress');
         });
+
+        /**
+         * #306 — the condition whose CURSOR looks perfect.
+         *
+         * A run whose author-day rows were systemically refused advanced to `now` over a window
+         * it wrote almost nothing into, so every check above reads healthy: reachable, no stall
+         * streak, cursor one day old. This is the surface that is not fooled — and it has to be
+         * durable rather than derived from the last run, because the non-advisory error the same
+         * run emits makes the scheduler retry the connector over an already-covered (empty,
+         * therefore clean) window and print the RETRY's result.
+         */
+        describe('systemic row refusal (#306)', () => {
+            function seedRefusal(org: string, skipped: number, retained: number): void {
+                db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+                    `git_row_refusal:github:${org}`,
+                    JSON.stringify({at: '2026-07-01T00:00:00.000Z', skipped, retained}),
+                );
+            }
+
+            it('FAILS doctor even though the cursor is current and no stall is open', async () => {
+                // A cursor one day old with no streak is the positive currency check passing —
+                // exactly the state that printed an all-clear before this check existed.
+                seedCursor('acme', 1);
+                seedRefusal('acme', 40, 0);
+
+                const result = await runDoctor(db, await reachableGitConfig(), tmpConfigPath, MIGRATIONS_DIR);
+
+                expect(result).toBe(false);
+                const allOutput = [...output, ...errors].join('\n');
+                expect(allOutput).toContain('org "acme" reachable');
+                expect(allOutput).toContain('1 provider(s) refused most of the rows');
+                expect(allOutput).toContain('github:acme (40 of 40 rows refused');
+                // The all-clear it replaces must not also be printed.
+                expect(allOutput).not.toContain('All 1 provider(s) current');
+            });
+
+            it('denies the refusing provider "current" credit while still crediting a healthy one', async () => {
+                seedCursor('acme', 1);
+                seedCursor('beta', 1);
+                seedRefusal('acme', 9, 1);
+
+                await runDoctor(
+                    db,
+                    await reachableGitConfig(['acme', 'beta']),
+                    tmpConfigPath,
+                    MIGRATIONS_DIR,
+                );
+
+                const allOutput = [...output, ...errors].join('\n');
+                // Both cursors are one day old, so a check that classified on the cursor alone
+                // would say "All 2 provider(s) current".
+                expect(allOutput).toContain('github:acme (9 of 10 rows refused');
+                expect(allOutput).not.toContain('github:beta');
+                expect(allOutput).not.toContain('All 2 provider(s) current');
+            });
+
+            it('does not prescribe purging the cursors, which would double the surviving rows', async () => {
+                seedCursor('acme', 1);
+                seedRefusal('acme', 40, 0);
+
+                await runDoctor(db, await reachableGitConfig(), tmpConfigPath, MIGRATIONS_DIR);
+
+                const allOutput = [...output, ...errors].join('\n');
+                // The remedy an operator would reach for first is the one that permanently
+                // doubles every commit metric on the rows that DID survive (#262). The hint
+                // must name it as forbidden, not stay silent and let them find it themselves.
+                expect(allOutput).toContain('Author-days skipped as unwritable');
+                expect(allOutput).toMatch(/DOUBLES every commit metric/);
+            });
+
+            it('ignores a corrupt marker rather than failing on an alarm no remedy clears', async () => {
+                seedCursor('acme', 1);
+                db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+                    'git_row_refusal:github:acme',
+                    'not json at all',
+                );
+
+                const result = await runDoctor(db, await reachableGitConfig(), tmpConfigPath, MIGRATIONS_DIR);
+
+                expect(result).toBe(true);
+                expect([...output, ...errors].join('\n')).not.toContain('refused most of the rows');
+            });
+        });
     });
 });
 

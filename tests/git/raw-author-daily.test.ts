@@ -416,14 +416,47 @@ describe('upsertRawAuthorDaily + readers (#252)', () => {
             }
             throw new Error('expected a throw');
         };
-        expect(codeOf(() => upsertRawAuthorDaily(db, input({commits: -1}), '2026-07-01T10:00:00.000Z'))).toBe('invalid_metric');
-        expect(codeOf(() => upsertRawAuthorDaily(db, input({prs_merged: 1.5}), '2026-07-01T10:00:00.000Z'))).toBe('invalid_metric');
+        // The code is per FIELD, not per rule (#306): a metric whose operands come out of a
+        // provider response body uncast is `invalid_metric` (row-level, skippable), and one this
+        // codebase computes is `invalid_computed_metric` (throwing) — see
+        // RESPONSE_DERIVED_METRIC_FIELDS. The pairs below straddle both rules in both directions,
+        // so a classification that collapsed back to one code per rule would fail here.
+        expect(codeOf(() => upsertRawAuthorDaily(db, input({commits: -1}), '2026-07-01T10:00:00.000Z'))).toBe('invalid_computed_metric');
+        expect(codeOf(() => upsertRawAuthorDaily(db, input({prs_merged: 1.5}), '2026-07-01T10:00:00.000Z'))).toBe('invalid_computed_metric');
+        expect(codeOf(() => upsertRawAuthorDaily(db, input({lines_added: -1}), '2026-07-01T10:00:00.000Z'))).toBe('invalid_metric');
         // NaN binds as NULL into a NOT NULL column — the raw error would name the wrong problem.
-        expect(codeOf(() => upsertRawAuthorDaily(db, input({commits: NaN}), '2026-07-01T10:00:00.000Z'))).toBe('invalid_metric');
+        expect(codeOf(() => upsertRawAuthorDaily(db, input({commits: NaN}), '2026-07-01T10:00:00.000Z'))).toBe('invalid_computed_metric');
+        expect(codeOf(() => upsertRawAuthorDaily(db, input({lines_removed: NaN}), '2026-07-01T10:00:00.000Z'))).toBe('invalid_metric');
         expect(codeOf(() => upsertRawAuthorDaily(db, input({code_churn_rate: NaN}), '2026-07-01T10:00:00.000Z'))).toBe('invalid_metric');
-        expect(codeOf(() => upsertRawAuthorDaily(db, input({ai_signature_score: Infinity}), '2026-07-01T10:00:00.000Z'))).toBe('invalid_metric');
-        expect(codeOf(() => upsertRawAuthorDaily(db, input({avg_time_to_merge_hours: NaN}), '2026-07-01T10:00:00.000Z'))).toBe('invalid_metric');
+        expect(codeOf(() => upsertRawAuthorDaily(db, input({avg_commit_size: Infinity}), '2026-07-01T10:00:00.000Z'))).toBe('invalid_metric');
+        expect(codeOf(() => upsertRawAuthorDaily(db, input({ai_signature_score: Infinity}), '2026-07-01T10:00:00.000Z'))).toBe('invalid_computed_metric');
+        expect(codeOf(() => upsertRawAuthorDaily(db, input({avg_time_to_merge_hours: NaN}), '2026-07-01T10:00:00.000Z'))).toBe('invalid_computed_metric');
         expect(db.prepare('SELECT COUNT(*) AS n FROM raw_author_daily').get()).toEqual({n: 0});
+    });
+
+    it('classifies EVERY metric field, so a new one cannot default into the skippable class', () => {
+        // The gap this closes is directional and asymmetric: an unclassified field falls to
+        // `invalid_computed_metric`, i.e. to the THROWING side, which is the safe default — but
+        // a field wrongly left on the row-level side is skipped, its window recorded as covered,
+        // and nothing re-asks it. So every field is named here individually rather than checked
+        // by set-difference, and both classes are asserted non-empty.
+        const responseDerived = ['lines_added', 'lines_removed', 'code_churn_rate', 'avg_commit_size'] as const;
+        const computed = [
+            'commits', 'files_changed', 'prs_opened', 'prs_merged', 'review_comments_given',
+            'commit_burst_count', 'ai_signature_score', 'avg_time_to_merge_hours',
+        ] as const;
+        // Every field of the metrics shape is in exactly one of the two lists — a new metric
+        // added to DailyGitMetrics and to neither list fails this.
+        expect([...responseDerived, ...computed].sort()).toEqual(Object.keys(ZERO_METRICS).sort());
+
+        const badValue = (field: string): Partial<DailyGitMetrics> =>
+            ({[field]: Number.NaN}) as Partial<DailyGitMetrics>;
+        for (const field of responseDerived) {
+            expect(findRawAuthorDailyDefect(input(badValue(field)), '2026-07-01T10:00:00.000Z')?.code).toBe('invalid_metric');
+        }
+        for (const field of computed) {
+            expect(findRawAuthorDailyDefect(input(badValue(field)), '2026-07-01T10:00:00.000Z')?.code).toBe('invalid_computed_metric');
+        }
     });
 
     it('accepts a null avg_time_to_merge_hours (the "nothing merged" case is not a bad metric)', () => {
@@ -764,24 +797,38 @@ describe('findRawAuthorDailyDefect — the non-throwing form of the write bounda
         {name: 'a non-ISO observedAt', row: input(), observedAt: 'not-a-date', code: 'invalid_instant'},
         // The FOURTH door, and the one no date check catches: `new Date(mergedAt) -
         // new Date(createdAt)` is NaN whenever either operand is unparseable, on a row whose own
-        // day may be perfectly well-formed.
+        // day may be perfectly well-formed. `invalid_computed_metric` since #306: the analyzer's
+        // `prMergeDurationHours` is total and yields `null` rather than NaN, so a NaN reaching
+        // here is a code regression — which a patch repairs, after which re-fetching works.
         {
             name: 'a NaN avg_time_to_merge_hours',
             row: input({avg_time_to_merge_hours: Number.NaN}),
             observedAt: OBSERVED,
-            code: 'invalid_metric',
+            code: 'invalid_computed_metric',
         },
         {
-            name: 'a negative counter',
+            name: 'a negative computed counter',
             row: input({commits: -1}),
+            observedAt: OBSERVED,
+            code: 'invalid_computed_metric',
+        },
+        {
+            name: 'a negative response-derived counter',
+            row: input({lines_added: -1}),
             observedAt: OBSERVED,
             code: 'invalid_metric',
         },
         {
-            name: 'a non-finite rate',
+            name: 'a non-finite response-derived rate',
             row: input({code_churn_rate: Number.POSITIVE_INFINITY}),
             observedAt: OBSERVED,
             code: 'invalid_metric',
+        },
+        {
+            name: 'a non-finite computed score',
+            row: input({ai_signature_score: Number.POSITIVE_INFINITY}),
+            observedAt: OBSERVED,
+            code: 'invalid_computed_metric',
         },
     ];
 
@@ -853,13 +900,34 @@ describe('findRawAuthorDailyDefect — the non-throwing form of the write bounda
  * complement direction IS driven through a real two-provider run
  * (`tests/connectors/git/unwritable-author-days.test.ts`, the corrupted-clock case, which pins
  * that a run-level `invalid_instant` rolls back and holds BOTH cursors) and `invalid_date` is
- * driven end to end several times over. `invalid_metric` has no end-to-end route left: every
- * NaN that could reach a metric is closed upstream — the analyzer's `prMergeDurationHours` for
- * the merge duration, and the shared `isCommitCount` predicate at each provider for the commit
- * counts. Its membership is defence-in-depth for a route that does not currently exist, which
- * is exactly why it needs pinning HERE: nothing else would notice it being dropped.
+ * driven end to end several times over.
+ *
+ * #306 NARROWED `invalid_metric` to the fields whose value comes out of a provider response body
+ * uncast (`lines_added`, `lines_removed`, and the two rates computed from them — Bitbucket's
+ * `getCommitDiff` maps `e.lines_added` straight through, and `resolveCommitDiffstat` reduces over
+ * it). Only for those is "re-fetching returns the identical unusable value" true. Every other
+ * metric field is computed here, so its only realistic trigger is a code regression that a patch
+ * repairs — after which re-fetching DOES yield a writable row, which is exactly what the cursor
+ * hold preserves. Those became `invalid_computed_metric` and moved to the throwing side.
  */
-describe('ROW_LEVEL_REFUSALS — what the sync may skip (#302)', () => {
+describe('ROW_LEVEL_REFUSALS — what the sync may skip (#302/#306)', () => {
+    /**
+     * The complement of ROW_LEVEL_REFUSALS, named individually and shared by the two assertions
+     * below, so ADDING a code to RAW_AUTHOR_DAILY_ERROR_CODES cannot quietly satisfy either.
+     *
+     * Not all four are "run-level" any more (#306): `invalid_computed_metric` IS decided by one
+     * row's own value. What every member shares is the property that actually licenses the throw
+     * — the refusal describes something a fix can change, so holding the cursor preserves a
+     * window that re-covers intact instead of skipping past it forever.
+     */
+    const throwing = [
+        'invalid_instant',
+        'invalid_provider',
+        'invalid_container',
+        'invalid_key',
+        'invalid_computed_metric',
+    ];
+
     it('holds exactly the refusals a single row can be solely responsible for', () => {
         expect([...ROW_LEVEL_REFUSALS].sort()).toEqual([
             'invalid_date',
@@ -868,11 +936,9 @@ describe('ROW_LEVEL_REFUSALS — what the sync may skip (#302)', () => {
         ]);
     });
 
-    it('excludes every refusal decided by a run- or provider-level operand', () => {
-        // Named individually rather than by set-difference, so ADDING a code to
-        // RAW_AUTHOR_DAILY_ERROR_CODES cannot quietly satisfy this assertion.
-        for (const runLevel of ['invalid_instant', 'invalid_provider', 'invalid_container', 'invalid_key'] as const) {
-            expect(ROW_LEVEL_REFUSALS).not.toContain(runLevel);
+    it('excludes every refusal a later fix can make writable', () => {
+        for (const code of throwing) {
+            expect(ROW_LEVEL_REFUSALS).not.toContain(code);
         }
     });
 
@@ -880,9 +946,8 @@ describe('ROW_LEVEL_REFUSALS — what the sync may skip (#302)', () => {
         // The gap this closes: a NEW refusal code lands in neither list, is therefore not
         // row-level, and silently becomes fail-closed — which may be right, but must be a
         // decision rather than an omission. This fails until someone makes it.
-        const runLevel = ['invalid_instant', 'invalid_provider', 'invalid_container', 'invalid_key'];
         for (const code of RAW_AUTHOR_DAILY_ERROR_CODES) {
-            expect(ROW_LEVEL_REFUSALS.includes(code) || runLevel.includes(code)).toBe(true);
+            expect(ROW_LEVEL_REFUSALS.includes(code) || throwing.includes(code)).toBe(true);
         }
     });
 
