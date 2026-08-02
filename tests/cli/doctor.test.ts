@@ -10,6 +10,7 @@ import {
     findMissingRepos,
     gitProviderFixHint,
 } from '../../src/cli/doctor';
+import {TOTAL_REFUSAL_ALERT_RUNS, loadGitSyncHealth} from '../../src/connectors/git/sync';
 import {createProvider} from '../../src/connectors/git/providers/store';
 import {createCommitDiffstatCache} from '../../src/connectors/git/diffstat-cache';
 import {loadServerKey} from '../../src/connectors/git/providers/secret';
@@ -673,10 +674,19 @@ describe('runDoctor', () => {
          * therefore clean) window and print the RETRY's result.
          */
         describe('systemic row refusal (#306)', () => {
-            function seedRefusal(org: string, skipped: number, retained: number): void {
+            /** The same provider set `reachableGitConfig` builds, for a direct health read. */
+            function gitProviderConfigs(orgs: string[]): GitProviderConfig[] {
+                return orgs.map((org) => ({
+                    type: 'github',
+                    org,
+                    auth: {type: 'token', api_token: 't'},
+                }));
+            }
+
+            function seedRefusal(org: string, skipped: number, retained: number, runs = 0): void {
                 db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
                     `git_row_refusal:github:${org}`,
-                    JSON.stringify({at: '2026-07-01T00:00:00.000Z', skipped, retained}),
+                    JSON.stringify({at: '2026-07-01T00:00:00.000Z', skipped, retained, runs}),
                 );
             }
 
@@ -691,7 +701,7 @@ describe('runDoctor', () => {
                 expect(result).toBe(false);
                 const allOutput = [...output, ...errors].join('\n');
                 expect(allOutput).toContain('org "acme" reachable');
-                expect(allOutput).toContain('1 provider(s) refused most of the rows');
+                expect(allOutput).toContain('1 provider(s) refused the rows');
                 expect(allOutput).toContain('github:acme (40 of 40 rows refused');
                 // The all-clear it replaces must not also be printed.
                 expect(allOutput).not.toContain('All 1 provider(s) current');
@@ -710,14 +720,20 @@ describe('runDoctor', () => {
                 );
 
                 const allOutput = [...output, ...errors].join('\n');
-                // Both cursors are one day old, so a check that classified on the cursor alone
-                // would say "All 2 provider(s) current".
                 expect(allOutput).toContain('github:acme (9 of 10 rows refused');
                 expect(allOutput).not.toContain('github:beta');
-                expect(allOutput).not.toContain('All 2 provider(s) current');
+                // The currency DENIAL is asserted at its source, not through the all-clear line:
+                // the fail pushed above already suppresses that line, so `not.toContain("All 2
+                // provider(s) current")` would stay green with the denial removed. `current`
+                // itself is the value that changes — both cursors are one day old, so a
+                // classification that read the cursor alone would count 2.
+                expect(
+                    loadGitSyncHealth(db, gitProviderConfigs(['acme', 'beta']), new Date().toISOString())
+                        .current,
+                ).toBe(1);
             });
 
-            it('does not prescribe purging the cursors, which would double the surviving rows', async () => {
+            it('does not prescribe purging the cursors, or a fresh sync, to diagnose it', async () => {
                 seedCursor('acme', 1);
                 seedRefusal('acme', 40, 0);
 
@@ -729,6 +745,48 @@ describe('runDoctor', () => {
                 // must name it as forbidden, not stay silent and let them find it themselves.
                 expect(allOutput).toContain('Author-days skipped as unwritable');
                 expect(allOutput).toMatch(/DOUBLES every commit metric/);
+                // …and it must not open with "run a sync": this alert can be days old, so on a
+                // quiet provider a fresh run prints no advisory at all, and when it does print
+                // one it has just advanced the cursor over another window under the same cause.
+                expect(allOutput).toContain('sync_logs.errors');
+                expect(allOutput).toContain('Do NOT start with a fresh sync');
+                // The escape hatch for a provider that will never import again, so the alert is
+                // not a wedge with no exit.
+                expect(allOutput).toMatch(/remove it/);
+            });
+
+            it('escalates a provider that keeps writing NOTHING, even below the per-run floor', async () => {
+                // The hole a per-run floor cannot see: a three-developer org's daily window
+                // builds ~3 author-day rows, so a cause refusing every one of them loses 100% of
+                // that provider's data every day while `skipped` never reaches 5.
+                seedCursor('acme', 1);
+                seedRefusal('acme', 3, 0, TOTAL_REFUSAL_ALERT_RUNS);
+
+                const result = await runDoctor(db, await reachableGitConfig(), tmpConfigPath, MIGRATIONS_DIR);
+
+                expect(result).toBe(false);
+                const allOutput = [...output, ...errors].join('\n');
+                expect(allOutput).toContain('github:acme (3 of 3 rows refused');
+                // The streak is named only when it is what fired, so the operator reads the
+                // number that escalated rather than both every time.
+                expect(allOutput).toContain(`nothing written for ${TOTAL_REFUSAL_ALERT_RUNS} runs`);
+            });
+
+            it('stays quiet below BOTH arms, but still refuses to call the provider current', async () => {
+                seedCursor('acme', 1);
+                seedRefusal('acme', 3, 0, TOTAL_REFUSAL_ALERT_RUNS - 1);
+
+                const result = await runDoctor(db, await reachableGitConfig(), tmpConfigPath, MIGRATIONS_DIR);
+
+                // One or two runs importing nothing is the self-healing case (an empty window,
+                // a quiet day) — failing on it would train the reader to ignore the signal.
+                expect(result).toBe(true);
+                const allOutput = [...output, ...errors].join('\n');
+                expect(allOutput).not.toContain('refused the rows');
+                // But it refused rows on its last run, so it cannot earn the currency claim
+                // either — the positive check must not be satisfied by a sub-threshold record.
+                expect(allOutput).toContain('0 of 1 provider(s) current');
+                expect(allOutput).toContain('refusing rows below the refusal alert');
             });
 
             it('ignores a corrupt marker rather than failing on an alarm no remedy clears', async () => {

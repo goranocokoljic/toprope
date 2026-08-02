@@ -19,8 +19,10 @@ import {
     catchUpUntil,
     prWithinFetchWindow,
     getProviderStall,
+    getProviderRowRefusal,
     loadGitSyncHealth,
     GIT_STALL_ALERT_RUNS,
+    TOTAL_REFUSAL_ALERT_RUNS,
     GIT_CATCHUP_WINDOW_MAX_DAYS,
     UNMATCHED_AUTHORS_PREFIX,
     PROVIDER_DELETED_MID_RUN_PREFIX,
@@ -4473,6 +4475,169 @@ describe('GitSync — stalled-provider detection (#235)', () => {
                 const health = loadGitSyncHealth(db, [CONFIG], NOW);
                 expect(health.current).toBe(0);
                 expect(health.lagging).toEqual([]);
+            });
+        });
+
+        /**
+         * #306 — the fifth field, and the reason it is a field rather than a fifth state.
+         *
+         * The four states above classify the CURSOR. This classifies the DATA the cursor claims
+         * to cover, and the two disagree precisely here: a systemic refusal advances the cursor
+         * to `now` over a window it wrote nothing into, so the cursor reads perfectly current.
+         * A provider in this list therefore appears IN ADDITION to whatever cursor state it is
+         * in — which is exactly the property a single-provider, healthy-cursor test cannot see.
+         */
+        describe('systemicRefusals', () => {
+            const REFUSAL_KEY = 'git_row_refusal:github:test-org';
+            const refusal = (over: Record<string, unknown> = {}): string =>
+                JSON.stringify({
+                    at: '2026-07-01T00:00:00.000Z',
+                    skipped: 40,
+                    retained: 0,
+                    runs: 1,
+                    ...over,
+                });
+
+            it('reports a refusing provider whose cursor is CURRENT, and denies it that credit', () => {
+                writeState(FORWARD_KEY, at(1));
+                writeState(REFUSAL_KEY, refusal());
+
+                const health = loadGitSyncHealth(db, [CONFIG], NOW);
+                expect(health.systemicRefusals).toEqual([
+                    {
+                        type: 'github',
+                        identifier: 'test-org',
+                        at: '2026-07-01T00:00:00.000Z',
+                        skipped: 40,
+                        retained: 0,
+                        runs: 1,
+                    },
+                ]);
+                // The whole point: the cursor is one day old and there is no stall streak, so
+                // every cursor-based check reads healthy.
+                expect(health.current).toBe(0);
+                expect(health.stalled).toEqual([]);
+                expect(health.lagging).toEqual([]);
+            });
+
+            it.each([
+                ['stalled', {stall: {runs: 5, since: '2026-01-01T00:00:00.000Z'}, cursor: at(1)}],
+                ['lagging', {cursor: at(170)}],
+                ['never-synced', {}],
+                ['future-cursored', {cursor: at(-5)}],
+            ])(
+                'reports it alongside a provider that is also %s — the lists are not exclusive',
+                (state, seed: {stall?: object; cursor?: string}) => {
+                    if (seed.cursor) writeState(FORWARD_KEY, seed.cursor);
+                    if (seed.stall) writeState(STALL_KEY, JSON.stringify(seed.stall));
+                    writeState(REFUSAL_KEY, refusal());
+
+                    const health = loadGitSyncHealth(db, [CONFIG], NOW);
+                    // Every one of the four cursor arms `continue`s, and three of them do so
+                    // BEFORE the currency check — so collecting the refusal after any of them
+                    // would silence it for exactly the providers that are worst off.
+                    expect(health.systemicRefusals).toHaveLength(1);
+                    expect(health.current).toBe(0);
+                    if (state === 'stalled') expect(health.stalled).toHaveLength(1);
+                    if (state === 'lagging') expect(health.lagging).toHaveLength(1);
+                    if (state === 'never-synced') expect(health.neverSynced).toBe(1);
+                },
+            );
+
+            it('returns every refusing provider, in the provider-config order', () => {
+                writeState('git_row_refusal:github:org-b', refusal());
+                writeState('git_row_refusal:bitbucket:ws-a', refusal({skipped: 9, retained: 1}));
+
+                const configs: GitProviderConfig[] = [
+                    {type: 'bitbucket', workspace: 'ws-a', auth: {type: 'app_password', username: 'u', app_password: 'p'}},
+                    {type: 'github', org: 'org-b', auth: {type: 'token', api_token: 't'}},
+                    {type: 'github', org: 'healthy-org', auth: {type: 'token', api_token: 't'}},
+                ];
+
+                // >= 2, so a single-item happy path can't hide an ordering or accumulation bug.
+                expect(
+                    loadGitSyncHealth(db, configs, NOW).systemicRefusals.map(
+                        (r) => `${r.type}:${r.identifier}`,
+                    ),
+                ).toEqual(['bitbucket:ws-a', 'github:org-b']);
+            });
+
+            it('ignores a record orphaned by a provider that is no longer configured', () => {
+                writeState('git_row_refusal:github:deleted-org', refusal());
+
+                // Filtering to the CONFIGURED set is what stops a row left behind by a deleted
+                // or renamed provider failing `doctor` forever against a dead target.
+                expect(loadGitSyncHealth(db, [CONFIG], NOW).systemicRefusals).toEqual([]);
+            });
+
+            it('withholds the report below BOTH arms, but still withholds currency too', () => {
+                writeState(FORWARD_KEY, at(1));
+                // Below the per-run floor AND below the streak: one or two runs importing
+                // nothing is the self-healing case.
+                writeState(REFUSAL_KEY, refusal({skipped: 3, retained: 0, runs: TOTAL_REFUSAL_ALERT_RUNS - 1}));
+
+                const health = loadGitSyncHealth(db, [CONFIG], NOW);
+                expect(health.systemicRefusals).toEqual([]);
+                // …but it refused rows on its last run, so it cannot EARN the positive
+                // currency claim either. Reporting and crediting are separate decisions.
+                expect(health.current).toBe(0);
+            });
+
+            it('escalates on the streak alone, at a count no per-run floor would reach', () => {
+                writeState(FORWARD_KEY, at(1));
+                // A three-developer org's daily window: 3 rows, all refused, every day. The
+                // per-run floor is 5 and can never be crossed — only the sequence shows it.
+                writeState(REFUSAL_KEY, refusal({skipped: 3, retained: 0, runs: TOTAL_REFUSAL_ALERT_RUNS}));
+
+                expect(loadGitSyncHealth(db, [CONFIG], NOW).systemicRefusals).toHaveLength(1);
+            });
+
+            it.each([
+                ['non-integer skipped', JSON.stringify({at: '2026-07-01T00:00:00.000Z', skipped: 2.5, retained: 0})],
+                ['zero skipped', JSON.stringify({at: '2026-07-01T00:00:00.000Z', skipped: 0, retained: 0})],
+                ['negative skipped', JSON.stringify({at: '2026-07-01T00:00:00.000Z', skipped: -3, retained: 0})],
+                ['a stringified skipped', JSON.stringify({at: '2026-07-01T00:00:00.000Z', skipped: '40', retained: 0})],
+                ['non-integer retained', JSON.stringify({at: '2026-07-01T00:00:00.000Z', skipped: 40, retained: 1.5})],
+                ['negative retained', JSON.stringify({at: '2026-07-01T00:00:00.000Z', skipped: 40, retained: -1})],
+                ['missing retained', JSON.stringify({at: '2026-07-01T00:00:00.000Z', skipped: 40})],
+                ['negative runs', JSON.stringify({at: '2026-07-01T00:00:00.000Z', skipped: 40, retained: 0, runs: -1})],
+                ['non-integer runs', JSON.stringify({at: '2026-07-01T00:00:00.000Z', skipped: 40, retained: 0, runs: 1.5})],
+                ['missing at', JSON.stringify({skipped: 40, retained: 0})],
+                ['a non-ISO at', JSON.stringify({at: 'yesterday-ish', skipped: 40, retained: 0})],
+                // Parses finite through Date.parse and would pass a round-trip check, which is
+                // exactly why the shape is pinned with an anchored regex instead (#233).
+                ['an expanded-year at', JSON.stringify({at: '+033658-09-27T00:00:00.000Z', skipped: 40, retained: 0})],
+                // V8's legacy date parser accepts free text with a parenthesised comment, so a
+                // Date.parse gate would let arbitrary bytes reach a terminal through this field.
+                ['a legacy-parsed at', JSON.stringify({at: 'Jul 1 2026 (]0;pwn)', skipped: 40, retained: 0})],
+                ['a JSON array', JSON.stringify([1, 2])],
+                ['a JSON scalar', JSON.stringify(7)],
+                ['JSON null', 'null'],
+                ['unparseable JSON', 'not json at all'],
+                ['an empty value', ''],
+            ])('range-validates the stored record: %s reads as no refusal', (_label, stored) => {
+                writeState(REFUSAL_KEY, stored);
+                // sync_state.value is unconstrained TEXT, and `doctor` PRINTS these numbers —
+                // a stringified `skipped` would render "40 of 400 rows refused", and a zero
+                // one an alarm no remedy clears.
+                expect(getProviderRowRefusal(db, 'github', 'test-org')).toBeNull();
+                expect(loadGitSyncHealth(db, [CONFIG], NOW).systemicRefusals).toEqual([]);
+            });
+
+            it('reads a record written before the streak field existed as a streak of 0', () => {
+                // Forward-compatibility, and the only field tolerated as absent: a record
+                // written by the pre-streak build still describes a real refusal, and refusing
+                // it outright would silently clear an escalation across an upgrade.
+                writeState(REFUSAL_KEY, JSON.stringify({at: '2026-07-01T00:00:00.000Z', skipped: 40, retained: 0}));
+
+                expect(getProviderRowRefusal(db, 'github', 'test-org')).toEqual({
+                    at: '2026-07-01T00:00:00.000Z',
+                    skipped: 40,
+                    retained: 0,
+                    runs: 0,
+                });
+                // 40 of 40 still trips the per-run arm, so the escalation survives the upgrade.
+                expect(loadGitSyncHealth(db, [CONFIG], NOW).systemicRefusals).toHaveLength(1);
             });
         });
     });

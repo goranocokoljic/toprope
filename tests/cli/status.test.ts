@@ -354,6 +354,71 @@ describe('printStatus', () => {
             const combined = output.join('\n');
             expect(combined).not.toContain('stalled');
             expect(combined).not.toContain('catching up');
+            expect(combined).not.toContain('refusing rows');
+        });
+
+        /**
+         * #306 — the third per-provider line, and the one whose cursor reads perfectly healthy.
+         *
+         * `status` and `doctor` share `loadGitSyncHealth`, so they cannot disagree about WHICH
+         * providers are unhealthy — but status has to actually render the field. Left unrendered,
+         * `toprope status` prints a clean git section for the provider whose window was never
+         * written: the false all-clear #306 exists to close, reproduced on the surface an
+         * operator reaches for first.
+         */
+        describe('systemically refusing git providers (#306)', () => {
+            function seedRefusal(org: string, skipped: number, retained: number): void {
+                db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+                    `git_row_refusal:github:${org}`,
+                    JSON.stringify({at: new Date().toISOString(), skipped, retained, runs: 1}),
+                );
+            }
+
+            it('warns, naming the provider and both counts, when its cursor looks perfect', () => {
+                // A one-day-old cursor with no stall streak: every other check on this surface
+                // reads healthy, which is the entire reason this line exists.
+                seedCursor('git_last_sync:github:acme', 1);
+                seedRefusal('acme', 40, 0);
+
+                printStatus(db, gitConfig());
+
+                const combined = output.join('\n');
+                expect(combined).toContain('github:acme refusing rows');
+                expect(combined).toContain('40 of 40 author-day row(s) unwritable');
+                expect(combined).toContain('cursor advanced anyway');
+                // The hint fires for this state too, not only for a stall.
+                expect(combined).toContain('toprope doctor');
+                expect(combined).not.toContain('stalled');
+                expect(combined).not.toContain('catching up');
+            });
+
+            it('reports EVERY refusing provider, and the doctor hint exactly once', () => {
+                seedRefusal('acme', 40, 0);
+                seedRefusal('beta', 9, 1);
+
+                printStatus(db, gitConfig(['acme', 'beta', 'healthy']));
+
+                const combined = output.join('\n');
+                // >= 2, so printing only gitRefusing[0] cannot pass.
+                expect(combined).toContain('github:acme refusing rows');
+                expect(combined).toContain('github:beta refusing rows');
+                expect(combined).not.toContain('github:healthy refusing rows');
+                expect(combined.match(/toprope doctor/g)).toHaveLength(1);
+            });
+
+            it('reports a provider that is BOTH stalled and refusing under both headings', () => {
+                // Unlike stalled-vs-lagging, these are not alternatives: the stall is about the
+                // cursor and the refusal is about the data behind it, so silencing either would
+                // hide a distinct fault.
+                seedStall('git_stall:github:acme', 5, new Date().toISOString());
+                seedRefusal('acme', 40, 0);
+
+                printStatus(db, gitConfig());
+
+                const combined = output.join('\n');
+                expect(combined).toContain('github:acme stalled');
+                expect(combined).toContain('github:acme refusing rows');
+            });
         });
     });
 

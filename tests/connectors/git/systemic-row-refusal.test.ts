@@ -24,13 +24,18 @@ import {addDeveloper} from '../../../src/registry/developers';
 import {
     AUTHOR_DAYS_SKIPPED_PREFIX,
     GitSync,
+    LEGACY_CELLS_SKIPPED_PREFIX,
+    PR_RECORDS_SKIPPED_PREFIX,
     SYSTEMIC_ROW_REFUSAL_PREFIX,
     SYSTEMIC_SKIP_MIN_ROWS,
+    TOTAL_REFUSAL_ALERT_RUNS,
     getProviderRowRefusal,
     isAdvisoryError,
+    isEscalatedRefusal,
     isSystemicRowRefusal,
     loadGitSyncHealth,
     rowRefusalStateKey,
+    stallStateKey,
     syncStateKey,
 } from '../../../src/connectors/git/sync';
 import {deleteProviderWithCascade} from '../../../src/connectors/git/providers/delete-cascade';
@@ -54,6 +59,9 @@ const NOW = '2024-01-20T00:00:00.000Z';
 /** Six distinct UTC days inside the first-sync window, so six distinct author-day ROWS. */
 const DAYS = ['2024-01-09', '2024-01-10', '2024-01-11', '2024-01-12', '2024-01-13', '2024-01-14'];
 
+/** Strictly older than every entry in {@link DAYS} — the span a "sync older history" run walks. */
+const OLDER_DAYS = ['2023-11-20', '2023-11-21'];
+
 function makeDb(): Database.Database {
     const db = new Database(':memory:');
     db.pragma('foreign_keys = ON');
@@ -69,38 +77,56 @@ function seedAlice(db: Database.Database): string {
 }
 
 /**
- * GitHub commits across `days.length` distinct days, every one carrying a non-string
- * `author.login`.
+ * One day's commit, and whether the author-day row it builds is writable.
  *
- * The systemic shape, built from the door #302 review cycle 2 opened: `toAnalysisCommit` fills
+ * `writable: false` uses the door #302 review cycle 2 opened: `toAnalysisCommit` fills
  * `authorLogin` as `username || email`, and `||` filters only FALSY — so a `{}` login survives
  * into the row's `author_login` column and the write boundary refuses it as `invalid_identity`.
- * The commit EMAIL is left intact, so the author still has a usable key and the rows are really
+ * The commit EMAIL is left intact, so the author still has a usable key and the row is really
  * built and then refused, rather than dropped earlier for having no identity at all.
- *
- * One commit per day (not one per repo or per author) because the refused unit is the
- * (author, day) ROW: N days is exactly N refusals, with nothing else on the provider to retain.
  */
-function githubAllRowsRefusedRoutes(days: readonly string[], login: unknown = {}): Route[] {
-    const commitFor = (day: string): Record<string, unknown> => ({
-        author: {name: 'Alice', email: AUTHOR_EMAIL, date: `${day}T10:00:00.000Z`},
+interface DayCommit {
+    day: string;
+    writable: boolean;
+}
+
+/**
+ * GitHub commits, one per entry, each on its own UTC day.
+ *
+ * ONE builder over a MIX rather than a refused-routes builder and a healthy one, because the
+ * routes are keyed by URL and `makeCountingFetch` takes the first match — so two builders
+ * spread into one route list silently shadow each other and the second one's days never arrive.
+ * The mixed run (some rows refused, some retained) is exactly what the streak-reset and
+ * below-the-floor cases need, so the mix has to live inside a single commit list.
+ *
+ * One commit per day because the refused unit is the (author, day) ROW: N unwritable days is
+ * exactly N refusals.
+ */
+function githubCommitRoutes(entries: readonly DayCommit[]): Route[] {
+    const loginFor = (e: DayCommit): unknown => (e.writable ? 'alice-gh' : {});
+    const commitFor = (e: DayCommit): Record<string, unknown> => ({
+        author: {name: 'Alice', email: AUTHOR_EMAIL, date: `${e.day}T10:00:00.000Z`},
         message: 'feat: work',
     });
-    const shaFor = (day: string): string => `sha-${day.replace(/-/g, '')}`;
-    const byS = new Map(days.map((d) => [shaFor(d), d]));
+    const shaFor = (e: DayCommit): string => `sha-${e.day.replace(/-/g, '')}`;
+    const byS = new Map(entries.map((e) => [shaFor(e), e]));
     return [
         {
             match: /\/repos\/test-org\/repo1\/commits\?/,
-            body: days.map((day) => ({sha: shaFor(day), commit: commitFor(day), author: {login}})),
+            body: entries.map((e) => ({
+                sha: shaFor(e),
+                commit: commitFor(e),
+                author: {login: loginFor(e)},
+            })),
         },
         {
             match: /\/repos\/test-org\/repo1\/commits\/[^?]+$/,
             bodyFor: (url: string): Record<string, unknown> => {
-                const sha = url.split('/').pop()!;
+                const entry = byS.get(url.split('/').pop()!) ?? entries[0];
                 return {
-                    sha,
-                    commit: commitFor(byS.get(sha) ?? days[0]),
-                    author: {login},
+                    sha: shaFor(entry),
+                    commit: commitFor(entry),
+                    author: {login: loginFor(entry)},
                     stats: {additions: 40, deletions: 5, total: 45},
                     files: [{filename: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'}],
                 };
@@ -108,6 +134,16 @@ function githubAllRowsRefusedRoutes(days: readonly string[], login: unknown = {}
         },
         ...githubRoutes(),
     ];
+}
+
+/** Every day unwritable — the "provider writes nothing" shape. */
+function githubAllRowsRefusedRoutes(days: readonly string[]): Route[] {
+    return githubCommitRoutes(days.map((day) => ({day, writable: false})));
+}
+
+/** Every day writable — one retained author-day row per day. */
+function githubHealthyCommitRoutes(days: readonly string[]): Route[] {
+    return githubCommitRoutes(days.map((day) => ({day, writable: true})));
 }
 
 /** GitHub routes that list NO commits at all — the empty window a connector retry re-fetches. */
@@ -208,6 +244,49 @@ describe('#306 a systemic row refusal does not report clean', () => {
             // cells, so it read 0 for a run that refused every row it built.
             expect(result.snapshotsSkipped).toBe(DAYS.length);
             expect(result.snapshotsWritten).toBeGreaterThan(0);
+            // The legacy-cell advisory must NOT fire on that number. It reads its own counter
+            // now, and the two diverged the moment refused rows joined the sum — point the
+            // advisory back at `snapshotsSkipped` and this run invents six pre-upgrade cells
+            // that do not exist.
+            expect(result.errors.some((e) => e.startsWith(LEGACY_CELLS_SKIPPED_PREFIX))).toBe(false);
+        });
+
+        it('counts a refused pr_records row in the same field as a refused author-day row', async () => {
+            seedAlice(db);
+            // `created_at: null` is the shape a truncated page really produces: the day key it
+            // yields is unusable (one refused author-day row) AND `pr_records.created_at` is
+            // NOT NULL, so the PR record is refused too — one run, one of each grain. Drop
+            // `+ skippedPRRecords.length` from the sum and only this assertion goes red.
+            vi.stubGlobal(
+                'fetch',
+                makeCountingFetch([
+                    {match: /\/repos\/test-org\/repo1\/pulls\/\d+\/comments/, body: []},
+                    {match: /\/repos\/test-org\/repo1\/pulls\/\d+\/reviews/, body: []},
+                    {
+                        match: /\/repos\/test-org\/repo1\/pulls\?/,
+                        body: [
+                            {
+                                number: 1,
+                                title: 'feat: work',
+                                user: {login: 'alice-gh'},
+                                state: 'closed',
+                                created_at: null,
+                                merged_at: null,
+                                closed_at: null,
+                                updated_at: '2024-01-15T18:00:00.000Z',
+                                requested_reviewers: [],
+                            },
+                        ],
+                    },
+                    ...githubRoutes(),
+                ]).fetchMock,
+            );
+
+            const result = await runSync(db, [GITHUB_CONFIG]);
+
+            expect(skipLineOf(result.errors)).toContain('1 author-day row(s)');
+            expect(result.errors.some((e) => e.startsWith(PR_RECORDS_SKIPPED_PREFIX))).toBe(true);
+            expect(result.snapshotsSkipped).toBe(2);
         });
 
         it('records a marker that outlives the run, and denies the provider "current"', async () => {
@@ -223,6 +302,7 @@ describe('#306 a systemic row refusal does not report clean', () => {
                 at: NOW,
                 skipped: DAYS.length,
                 retained: 0,
+                runs: 1,
             });
 
             const health = loadGitSyncHealth(db, [GITHUB_CONFIG, GITLAB_CONFIG], NOW);
@@ -320,10 +400,7 @@ describe('#306 a systemic row refusal does not report clean', () => {
             vi.unstubAllGlobals();
             vi.stubGlobal(
                 'fetch',
-                makeCountingFetch([
-                    ...githubAllRowsRefusedRoutes(DAYS, 'alice-gh'),
-                    ...gitlabRoutes(),
-                ]).fetchMock,
+                makeCountingFetch([...githubHealthyCommitRoutes(DAYS), ...gitlabRoutes()]).fetchMock,
             );
             const healed = await runSync(db, [GITHUB_CONFIG, GITLAB_CONFIG]);
 
@@ -337,13 +414,16 @@ describe('#306 a systemic row refusal does not report clean', () => {
     describe('the incidental loss #302 was built for STAYS an advisory', () => {
         it('does not escalate a run whose single bad row is below the floor', async () => {
             seedAlice(db);
-            // One refused day among a normal window: the row count is at the write count (1 and 1),
-            // so only the absolute floor keeps this on the advisory channel. A ratio-only
-            // threshold would escalate exactly the case #302 exists to keep quiet.
+            // One refused day among a normal window: the refused count is at the write count
+            // (1 and 1), so only the absolute floor keeps this on the advisory channel. A
+            // ratio-only threshold would escalate exactly the case #302 exists to keep quiet.
             vi.stubGlobal(
                 'fetch',
                 makeCountingFetch([
-                    ...githubAllRowsRefusedRoutes([DAYS[0]]),
+                    ...githubCommitRoutes([
+                        {day: DAYS[0], writable: false},
+                        {day: DAYS[1], writable: true},
+                    ]),
                     ...gitlabRoutes(),
                 ]).fetchMock,
             );
@@ -354,7 +434,12 @@ describe('#306 a systemic row refusal does not report clean', () => {
             expect(systemicLineOf(result.errors)).toBeUndefined();
             // …and the run still settles green, which is the whole point of the advisory channel.
             expect(result.errors.filter((e) => !isAdvisoryError(e))).toEqual([]);
-            expect(getProviderRowRefusal(db, 'github', 'test-org')).toBeNull();
+            // A record IS written — refusals are tracked from the first one, because the streak
+            // arm needs the history — but it is not escalated, so no surface reports it.
+            const refusal = getProviderRowRefusal(db, 'github', 'test-org')!;
+            expect(refusal).toMatchObject({skipped: 1, retained: 1, runs: 0});
+            expect(isEscalatedRefusal(refusal)).toBe(false);
+            expect(loadGitSyncHealth(db, [GITHUB_CONFIG, GITLAB_CONFIG], NOW).systemicRefusals).toEqual([]);
             // The count still reaches the numeric field — reporting and escalating are separate.
             expect(result.snapshotsSkipped).toBe(1);
         });
@@ -369,6 +454,161 @@ describe('#306 a systemic row refusal does not report clean', () => {
 
             expect(rawRowCount(db, 'github')).toBe(0);
             expect(systemicLineOf(result.errors)).toBeUndefined();
+        });
+    });
+
+    describe('a small window refused ENTIRELY, run after run', () => {
+        /**
+         * The hole the per-run floor cannot see, and the reason this arm exists.
+         *
+         * The scheduled sync is daily, so a steady-state window is one day; for a small org that
+         * is a handful of author-day rows. A cause refusing every one of them loses 100% of that
+         * provider's data every day forever while `skipped` never reaches SYSTEMIC_SKIP_MIN_ROWS
+         * — verbatim the condition #306 says must not settle as ok, just at a smaller scale than
+         * the tests above seed.
+         */
+        const ONE_DAY = [DAYS[0]];
+
+        async function refuseEverything(): Promise<Awaited<ReturnType<GitSync['syncProviders']>>> {
+            vi.unstubAllGlobals();
+            vi.stubGlobal('fetch', makeCountingFetch(githubAllRowsRefusedRoutes(ONE_DAY)).fetchMock);
+            return runSync(db, [GITHUB_CONFIG]);
+        }
+
+        it('stays quiet for the first runs, then escalates on the streak', async () => {
+            seedAlice(db);
+
+            for (let run = 1; run < TOTAL_REFUSAL_ALERT_RUNS; run++) {
+                const early = await refuseEverything();
+                // Below BOTH arms: one row is under the floor, and the streak has not run out.
+                expect(systemicLineOf(early.errors)).toBeUndefined();
+                expect(early.errors.filter((e) => !isAdvisoryError(e))).toEqual([]);
+                expect(getProviderRowRefusal(db, 'github', 'test-org')).toMatchObject({runs: run});
+            }
+
+            const escalated = await refuseEverything();
+
+            const systemic = systemicLineOf(escalated.errors);
+            expect(systemic).toBeDefined();
+            expect(isAdvisoryError(systemic!)).toBe(false);
+            // The line names the arm that fired — 1 of 1 rows is not self-evidently an alert.
+            expect(systemic).toContain(
+                `written NOTHING for ${TOTAL_REFUSAL_ALERT_RUNS} consecutive runs`,
+            );
+            expect(rawRowCount(db, 'github')).toBe(0);
+            expect(
+                loadGitSyncHealth(db, [GITHUB_CONFIG], NOW).systemicRefusals.map((r) => r.runs),
+            ).toEqual([TOTAL_REFUSAL_ALERT_RUNS]);
+        });
+
+        it('restarts the streak the moment a run retains anything', async () => {
+            seedAlice(db);
+            await refuseEverything();
+            await refuseEverything();
+            expect(getProviderRowRefusal(db, 'github', 'test-org')).toMatchObject({runs: 2});
+
+            // A run that retains a row proves the cause is not total — even though it still
+            // refuses one, so the record itself must stand.
+            vi.unstubAllGlobals();
+            vi.stubGlobal(
+                'fetch',
+                makeCountingFetch(
+                    githubCommitRoutes([
+                        {day: ONE_DAY[0], writable: false},
+                        {day: DAYS[1], writable: true},
+                    ]),
+                ).fetchMock,
+            );
+            const mixed = await runSync(db, [GITHUB_CONFIG]);
+
+            expect(rawRowCount(db, 'github')).toBe(1);
+            expect(getProviderRowRefusal(db, 'github', 'test-org')).toMatchObject({runs: 0});
+            expect(systemicLineOf(mixed.errors)).toBeUndefined();
+        });
+    });
+
+    describe('a backfill neither raises nor clears the forward verdict', () => {
+        it('does not clear the record when "sync older history" imports a healthy older span', async () => {
+            seedAlice(db);
+            vi.stubGlobal('fetch', makeCountingFetch(githubAllRowsRefusedRoutes(DAYS)).fetchMock);
+            await runSync(db, [GITHUB_CONFIG]);
+            expect(getProviderRowRefusal(db, 'github', 'test-org')).not.toBeNull();
+
+            // "Sync older history" is the first thing an operator reaches for when told data is
+            // missing, so a backfill clearing the record would be the COMMON path to a false
+            // all-clear — and a healthy older span is no evidence at all about the forward
+            // window this record is about, because a backfill never touches the forward cursor.
+            vi.unstubAllGlobals();
+            vi.stubGlobal('fetch', makeCountingFetch(githubHealthyCommitRoutes(OLDER_DAYS)).fetchMock);
+            const backfill = new GitSync({enabled: false}).syncProviders(db, [GITHUB_CONFIG], undefined, {
+                backfill: {since: `${OLDER_DAYS[0]}T00:00:00.000Z`, until: `${DAYS[0]}T00:00:00.000Z`},
+            });
+            await vi.runAllTimersAsync();
+            await backfill;
+
+            expect(rawRowCount(db, 'github')).toBe(OLDER_DAYS.length);
+            expect(getProviderRowRefusal(db, 'github', 'test-org')).toMatchObject({
+                skipped: DAYS.length,
+                retained: 0,
+            });
+            expect(loadGitSyncHealth(db, [GITHUB_CONFIG], NOW).systemicRefusals).toHaveLength(1);
+        });
+
+        it('does not raise one either, when the backfill itself refuses everything', async () => {
+            seedAlice(db);
+            // A backfill walks a strictly older span and leaves the forward cursor untouched, so
+            // its refusals say nothing about whether the forward sync is healthy. Counting them
+            // would turn a provider syncing forward perfectly red.
+            vi.stubGlobal('fetch', makeCountingFetch(githubAllRowsRefusedRoutes(OLDER_DAYS)).fetchMock);
+            const backfill = new GitSync({enabled: false}).syncProviders(db, [GITHUB_CONFIG], undefined, {
+                backfill: {since: `${OLDER_DAYS[0]}T00:00:00.000Z`, until: `${DAYS[0]}T00:00:00.000Z`},
+            });
+            await vi.runAllTimersAsync();
+            const result = await backfill;
+
+            expect(skipLineOf(result.errors)).toContain(`${OLDER_DAYS.length} author-day row(s)`);
+            expect(systemicLineOf(result.errors)).toBeUndefined();
+            expect(getProviderRowRefusal(db, 'github', 'test-org')).toBeNull();
+        });
+    });
+
+    describe('a rolled-back run claims nothing and records nothing', () => {
+        it('leaves no record, no error line and no skip count when the transaction aborts', async () => {
+            seedAlice(db);
+            vi.stubGlobal('fetch', makeCountingFetch(githubAllRowsRefusedRoutes(DAYS)).fetchMock);
+            // Abort AFTER `cursorAdvances` has already written the refusal record and staged the
+            // error line — `stallUpdates` runs last, so a throw there is the one window where
+            // both have happened and the transaction still rolls back. Anything that aborts
+            // earlier would make the assertions below trivially true. Same fixture, same reason,
+            // as the #302 suite's permanence test. A COMPLETE run CLEARS the stall key, so the
+            // row has to exist for the DELETE to match and the trigger to fire.
+            db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+                stallStateKey('github', 'test-org'),
+                JSON.stringify({runs: 1, since: '2024-01-01T00:00:00.000Z'}),
+            );
+            db.exec(`
+                CREATE TRIGGER boom BEFORE DELETE ON sync_state
+                WHEN old.key LIKE 'git_stall:%'
+                BEGIN SELECT RAISE(ABORT, 'stall-clear boom'); END;
+            `);
+
+            const result = await runSync(db, [GITHUB_CONFIG]);
+
+            // Positive control: the rollback really fired, so the assertions below are about a
+            // discarded transaction rather than about a run that never got that far.
+            expect(result.errors.some((e) => /transaction rolled back/.test(e))).toBe(true);
+            // Nothing was recorded as covered, so nothing was lost — a durable record here would
+            // fail doctor forever over a window the rollback left intact and re-fetchable.
+            expect(systemicLineOf(result.errors)).toBeUndefined();
+            expect(getProviderRowRefusal(db, 'github', 'test-org')).toBeNull();
+            expect(
+                db
+                    .prepare('SELECT value FROM sync_state WHERE key = ?')
+                    .get(rowRefusalStateKey('github', 'test-org')),
+            ).toBeUndefined();
+            expect(result.snapshotsSkipped).toBe(0);
+            expect(skipLineOf(result.errors)).toBeUndefined();
+            expect(result.errors.some((e) => e.startsWith(LEGACY_CELLS_SKIPPED_PREFIX))).toBe(false);
         });
     });
 

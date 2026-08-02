@@ -6,8 +6,10 @@ import {
     GIT_CATCHUP_WINDOW_MAX_DAYS,
     latestProviderCursor,
     loadGitSyncHealth,
+    sanitizeAdvisoryLabel,
     type LaggingProvider,
     type StalledProvider,
+    type SystemicRefusalProvider,
 } from '../connectors/git/sync';
 
 interface ConnectorStatus {
@@ -39,6 +41,19 @@ interface StatusData {
      */
     gitStalls: StalledProvider[];
     gitLagging: LaggingProvider[];
+    /**
+     * Git providers whose last run refused the author-day rows it built (#306) — a THIRD
+     * per-provider line, and the one whose cursor reads perfectly healthy.
+     *
+     * Not a variant of the two above: those classify the CURSOR (held, or advancing but behind),
+     * and this classifies the DATA the cursor claims to cover. A systemic refusal advances the
+     * cursor to `now` over a window it wrote nothing into, so it appears in neither of the other
+     * lists and the connector line's "last sync" instant is fresh. Rendering only stalls and
+     * catch-ups would therefore print a clean git section for exactly the provider whose window
+     * is gone — the false all-clear #306 exists to close, reproduced on the surface an operator
+     * reaches for first.
+     */
+    gitRefusing: SystemicRefusalProvider[];
     activeSubscriptions: number;
     totalMonthlyCost: number;
     wasteAlertCount: number;
@@ -47,20 +62,32 @@ interface StatusData {
 }
 
 /**
- * The stalled + lagging provider sets for the status report (#235), or empty when
- * git is off. Resolves providers ONCE, the same way `doctor` does — DB-connected ∪
- * config-file — so both commands report on the identical set. The stall/lagging
- * classification comes from the shared {@link loadGitSyncHealth} (#248), so status and
- * doctor cannot drift; status renders only the two per-provider lists (the `current` /
- * `neverSynced` counts are doctor's currency line, not shown here).
+ * The per-provider health sets for the status report, or empty when git is off. Resolves
+ * providers ONCE, the same way `doctor` does — DB-connected ∪ config-file — so both commands
+ * report on the identical set.
+ *
+ * Every classification comes from the shared {@link loadGitSyncHealth} (#248/#306), so status
+ * and doctor cannot drift on WHICH providers are unhealthy. They deliberately differ on the
+ * verdict: doctor FAILS on a stall or a systemic refusal, status only reports them, because
+ * status is a summary and not a gate.
+ *
+ * Status renders all three per-provider lists and none of the aggregate counts — `current` /
+ * `neverSynced` are doctor's currency line. That is the only omission, and it is why the third
+ * list had to be added here rather than left to doctor: a count can be summarised away, a
+ * provider whose window was never written cannot.
  */
 function collectGitHealth(
     db: Database.Database,
     config: TopropeConfig,
     now: string,
-): {stalls: StalledProvider[]; lagging: LaggingProvider[]; lastSync: string | null} {
+): {
+    stalls: StalledProvider[];
+    lagging: LaggingProvider[];
+    refusing: SystemicRefusalProvider[];
+    lastSync: string | null;
+} {
     const {git} = config.connectors;
-    if (!git.enabled) return {stalls: [], lagging: [], lastSync: null};
+    if (!git.enabled) return {stalls: [], lagging: [], refusing: [], lastSync: null};
     // Resolve providers ONCE for both git-health reads — the newest cursor and the
     // health classification both derive from the same resolved set.
     const providerConfigs = resolveAllGitProviders(db, loadServerKey(), git);
@@ -68,6 +95,7 @@ function collectGitHealth(
     return {
         stalls: health.stalled,
         lagging: health.lagging,
+        refusing: health.systemicRefusals,
         lastSync: latestProviderCursor(db, providerConfigs),
     };
 }
@@ -188,6 +216,7 @@ function collectStatus(db: Database.Database, config: TopropeConfig): StatusData
         connectors,
         gitStalls: gitHealth.stalls,
         gitLagging: gitHealth.lagging,
+        gitRefusing: gitHealth.refusing,
         activeSubscriptions: subRow.cnt,
         totalMonthlyCost: subRow.total,
         wasteAlertCount: wasteRow.cnt,
@@ -243,7 +272,18 @@ export function printStatus(db: Database.Database, config: TopropeConfig): void 
             `  ${pad}⋯ ${l.type}:${l.identifier} catching up — ${l.daysBehind} days behind; advancing up to ${GIT_CATCHUP_WINDOW_MAX_DAYS} days per run`,
         );
     }
-    if (data.gitStalls.length > 0) {
+    // A warning, like a stall and unlike a catch-up: nothing here is working as designed, and
+    // the cursor being fresh is the reason this line has to exist at all (see
+    // StatusData.gitRefusing). The container is sanitized for the same reason doctor's is — it
+    // is admin-form text heading for a terminal.
+    for (const r of data.gitRefusing) {
+        console.log(
+            `  ${pad}⚠ ${r.type}:${sanitizeAdvisoryLabel(r.identifier)} refusing rows — ` +
+                `${r.skipped} of ${r.skipped + r.retained} author-day row(s) unwritable on its ` +
+                `last run, cursor advanced anyway`,
+        );
+    }
+    if (data.gitStalls.length > 0 || data.gitRefusing.length > 0) {
         console.log(`  ${pad}  Run "toprope doctor" for the fix.`);
     }
 
