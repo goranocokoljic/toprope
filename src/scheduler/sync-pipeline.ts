@@ -1,7 +1,7 @@
 import type Database from 'better-sqlite3';
 import type {ConnectorInterface, SyncResult} from '../connectors/types';
 import {startSyncLog, finishSyncLog} from './sync-log';
-import {isAdvisoryError} from '../connectors/git/sync';
+import {isRetryableError} from '../connectors/git/sync';
 
 export interface PipelineResult {
     connector: string;
@@ -60,11 +60,18 @@ async function runConnectorWithRetry(
     let result = await runLogged();
     let retried = false;
 
-    // Retry on genuine FAILURES only. `errors` also carries advisories — unmatched CI bots
-    // and external contributors are the steady state of a healthy repo, so a run reporting
-    // them synced fine. Retrying on those meant every scheduled sync of a repo with one bot
-    // author did a second complete network fetch and was logged as an error, forever.
-    if (result.errors.some((e) => !isAdvisoryError(e))) {
+    // Retry on RETRYABLE failures only. `errors` carries three classes, not two: advisories
+    // (the steady state of a healthy repo — unmatched CI bots and external contributors —
+    // whose retry meant every scheduled sync of a repo with one bot author did a second
+    // complete network fetch, forever), genuine-but-unrepeatable failures, and genuine
+    // retryable ones. The middle class exists because a systemic row refusal (#306) must turn
+    // the provider red WITHOUT a second attempt: re-fetching returns the identical unusable
+    // value, the retry's window on a catch-up-capped provider is the NEXT uncovered 30 days
+    // (so it loses another window under the same cause), and this function returns the
+    // retry's result — which for a caught-up provider is a clean one that would erase the
+    // report from everything downstream. `isRetryableError` is the single classifier; see it
+    // for the full argument.
+    if (result.errors.some(isRetryableError)) {
         await sleep(retryDelayMs);
         retried = true;
         result = await runLogged();

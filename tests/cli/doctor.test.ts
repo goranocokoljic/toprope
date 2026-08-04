@@ -10,6 +10,13 @@ import {
     findMissingRepos,
     gitProviderFixHint,
 } from '../../src/cli/doctor';
+import {
+    AUTHOR_DAYS_SKIPPED_PREFIX,
+    TOTAL_REFUSAL_ALERT_RUNS,
+    configFileProviderNotDeletable,
+    loadGitSyncHealth,
+    rowRefusalStateKey,
+} from '../../src/connectors/git/sync';
 import {createProvider} from '../../src/connectors/git/providers/store';
 import {createCommitDiffstatCache} from '../../src/connectors/git/diffstat-cache';
 import {loadServerKey} from '../../src/connectors/git/providers/secret';
@@ -660,6 +667,256 @@ describe('runDoctor', () => {
 
             expect(result).toBe(true);
             expect([...output, ...errors].join('\n')).not.toContain('Git sync progress');
+        });
+
+        /**
+         * #306 — the condition whose CURSOR looks perfect.
+         *
+         * A run whose author-day rows were systemically refused advanced to `now` over a window
+         * it wrote almost nothing into, so every check above reads healthy: reachable, no stall
+         * streak, cursor one day old. This is the surface that is not fooled — and it has to be
+         * durable rather than derived from the last run, because the non-advisory error the same
+         * run emits makes the scheduler retry the connector over an already-covered (empty,
+         * therefore clean) window and print the RETRY's result.
+         */
+        describe('systemic row refusal (#306)', () => {
+            /** The same provider set `reachableGitConfig` builds, for a direct health read. */
+            function gitProviderConfigs(orgs: string[]): GitProviderConfig[] {
+                return orgs.map((org) => ({
+                    type: 'github',
+                    org,
+                    auth: {type: 'token', api_token: 't'},
+                }));
+            }
+
+            // The key comes from the exported builder, not a hand-spelled literal: the two
+            // ABSENCE assertions below (the corrupt marker, and below-both-arms) would silently
+            // stop covering anything if a namespace rename left this string behind.
+            function seedRefusal(
+                org: string,
+                skipped: number,
+                retained: number,
+                runs = 0,
+                escalated = false,
+            ): void {
+                db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+                    rowRefusalStateKey('github', org),
+                    JSON.stringify({
+                        at: '2026-07-01T00:00:00.000Z',
+                        skipped,
+                        retained,
+                        runs,
+                        escalated,
+                    }),
+                );
+            }
+
+            it('FAILS doctor even though the cursor is current and no stall is open', async () => {
+                // A cursor one day old with no streak is the positive currency check passing —
+                // exactly the state that printed an all-clear before this check existed.
+                seedCursor('acme', 1);
+                seedRefusal('acme', 40, 0);
+
+                const result = await runDoctor(db, await reachableGitConfig(), tmpConfigPath, MIGRATIONS_DIR);
+
+                expect(result).toBe(false);
+                const allOutput = [...output, ...errors].join('\n');
+                expect(allOutput).toContain('org "acme" reachable');
+                expect(allOutput).toContain('1 provider(s) refused the rows');
+                expect(allOutput).toContain('github:acme (40 of 40 rows refused');
+                // The all-clear it replaces must not also be printed.
+                expect(allOutput).not.toContain('All 1 provider(s) current');
+                // The streak suffix belongs to the OTHER arm. Without this, dropping the
+                // condition on it (printing it unconditionally) stays green, and a per-run
+                // escalation would report "…on 0 consecutive refusing runs".
+                expect(allOutput).not.toContain('consecutive refusing runs');
+                // …as does the carried suffix, whose whole purpose is to explain counts that are
+                // BELOW the threshold. 40 of 40 is above it, so naming it here would be wrong.
+                expect(allOutput).not.toContain('escalated by an EARLIER run');
+            });
+
+            it('reports EVERY refusing provider, with a count matching the detail list', async () => {
+                seedRefusal('acme', 40, 0);
+                seedRefusal('beta', 9, 1);
+
+                await runDoctor(
+                    db,
+                    await reachableGitConfig(['acme', 'beta', 'healthy']),
+                    tmpConfigPath,
+                    MIGRATIONS_DIR,
+                );
+
+                const allOutput = [...output, ...errors].join('\n');
+                // >= 2 refusing, so a join that drops entries or a count that disagrees with
+                // the rendered list cannot ship green — the same shape the stall line has.
+                expect(allOutput).toContain('2 provider(s) refused the rows');
+                expect(allOutput).toContain('github:acme (40 of 40');
+                expect(allOutput).toContain('github:beta (9 of 10');
+                expect(allOutput).not.toContain('github:healthy (');
+            });
+
+            it('strips control characters from a provider container before printing it', async () => {
+                // The input class the sanitizer alone handles: without it the raw bytes reach
+                // the operator's terminal. The container of a DB-connected provider is free-form
+                // admin-form text, so this is a real input rather than a synthetic one.
+                //
+                // U+202E (right-to-left override, which reverses the rest of the line in a
+                // terminal) plus a BEL, written as escapes so the fixture stays legible.
+                const hostile = 'acme\u202Egnp\u0007';
+                seedRefusal(hostile, 40, 0);
+
+                await runDoctor(db, await reachableGitConfig([hostile]), tmpConfigPath, MIGRATIONS_DIR);
+
+                // Asserted on the REFUSAL line, not the whole output: other checks (the
+                // reachability probe) echo the configured org verbatim and are outside this
+                // diff, so a whole-output assertion would go red for a reason that has nothing
+                // to do with the sanitizer under test.
+                const line = [...output, ...errors].find((l) => l.includes('rows refused at'))!;
+                expect(line).toContain('github:acme?gnp?');
+                expect(line).not.toContain('\u202E');
+                expect(line).not.toContain('\u0007');
+            });
+
+            it('denies the refusing provider "current" credit while still crediting a healthy one', async () => {
+                seedCursor('acme', 1);
+                seedCursor('beta', 1);
+                seedRefusal('acme', 9, 1);
+
+                await runDoctor(
+                    db,
+                    await reachableGitConfig(['acme', 'beta']),
+                    tmpConfigPath,
+                    MIGRATIONS_DIR,
+                );
+
+                const allOutput = [...output, ...errors].join('\n');
+                expect(allOutput).toContain('github:acme (9 of 10 rows refused');
+                expect(allOutput).not.toContain('github:beta');
+                // The currency DENIAL is asserted at its source, not through the all-clear line:
+                // the fail pushed above already suppresses that line, so `not.toContain("All 2
+                // provider(s) current")` would stay green with the denial removed. `current`
+                // itself is the value that changes — both cursors are one day old, so a
+                // classification that read the cursor alone would count 2.
+                expect(
+                    loadGitSyncHealth(db, gitProviderConfigs(['acme', 'beta']), new Date().toISOString())
+                        .current,
+                ).toBe(1);
+            });
+
+            it('does not prescribe purging the cursors, or a fresh sync, to diagnose it', async () => {
+                seedCursor('acme', 1);
+                seedRefusal('acme', 40, 0);
+
+                await runDoctor(db, await reachableGitConfig(), tmpConfigPath, MIGRATIONS_DIR);
+
+                const allOutput = [...output, ...errors].join('\n');
+                // The remedy an operator would reach for first is the one that permanently
+                // doubles every commit metric on the rows that DID survive (#262). The hint
+                // must name it as forbidden, not stay silent and let them find it themselves.
+                expect(allOutput).toContain('Author-days skipped as unwritable');
+                expect(allOutput).toMatch(/DOUBLES every commit metric/);
+                // …and it must not open with "run a sync": this alert can be days old, so on a
+                // quiet provider a fresh run prints no advisory at all, and when it does print
+                // one it has just advanced the cursor over another window under the same cause.
+                // WHERE the line is durably stored is provenance-dependent, and the hint has to
+                // say so: `sync_logs` rows are written only by the scheduler and "toprope sync
+                // all", `last_sync_advisories` only by the admin Sync-now route, and neither by
+                // "toprope sync git". A hint that named one unconditionally sends half the
+                // deployments to an empty table.
+                expect(allOutput).toContain('sync_logs.errors for a scheduled run');
+                expect(allOutput).toContain('NEITHER for "toprope sync git"');
+                expect(allOutput).toContain('Do NOT start with a fresh sync');
+                // The line the operator is sent to find, INTERPOLATED from the constant rather
+                // than spelled out — rename the prefix and both the remedy and this assertion
+                // move together, instead of the remedy silently naming a line that is gone.
+                expect(allOutput).toContain(AUTHOR_DAYS_SKIPPED_PREFIX);
+                // The escape hatch for a provider that will never import again, so the alert is
+                // not a wedge with no exit — and it names the ADMIN delete specifically, because
+                // dropping the YAML entry retracts nothing and leaves the record to be inherited.
+                expect(allOutput).toContain('registered in the admin UI, delete it there');
+                expect(allOutput).toContain('silences the alert without retracting anything');
+                // …and the caveat that makes that remedy REACHABLE or not. The admin delete route
+                // refuses a config-file provider outright, so naming the delete without this
+                // clause prescribes an operation every YAML-configured deployment cannot run.
+                // Interpolated from the single shared sentence, so a change to the cascade cannot
+                // update one copy and leave this one prescribing the old procedure.
+                expect(allOutput).toContain(configFileProviderNotDeletable());
+            });
+
+            it('escalates a provider that keeps refusing MOST of what it builds, below the per-run floor', async () => {
+                // The hole a per-run floor cannot see: a three-developer org's daily window
+                // builds ~3 author-day rows, so a cause refusing every one of them loses 100% of
+                // that provider's data every day while `skipped` never reaches 5.
+                seedCursor('acme', 1);
+                seedRefusal('acme', 3, 0, TOTAL_REFUSAL_ALERT_RUNS);
+
+                const result = await runDoctor(db, await reachableGitConfig(), tmpConfigPath, MIGRATIONS_DIR);
+
+                expect(result).toBe(false);
+                const allOutput = [...output, ...errors].join('\n');
+                expect(allOutput).toContain('github:acme (3 of 3 rows refused');
+                // The streak is named only when it is what fired, so the operator reads the
+                // number that escalated rather than both every time.
+                expect(allOutput).toContain(
+                    `most of what it built refused on ${TOTAL_REFUSAL_ALERT_RUNS} consecutive refusing runs`,
+                );
+            });
+
+            it('fails on a CARRIED verdict whose own counts are below every threshold', async () => {
+                // The state the sticky flag exists for: an earlier run escalated, and the run
+                // that overwrote the record refused one row of four. Every threshold on THIS
+                // record says quiet — so with the flag ignored, doctor goes green over a span
+                // that is permanently gone. This is the ordinary next day on a daily schedule.
+                seedCursor('acme', 1);
+                seedRefusal('acme', 1, 3, 0, true);
+
+                const result = await runDoctor(db, await reachableGitConfig(), tmpConfigPath, MIGRATIONS_DIR);
+
+                expect(result).toBe(false);
+                const allOutput = [...output, ...errors].join('\n');
+                expect(allOutput).toContain('github:acme (1 of 4 rows refused');
+                // The suffix has to be there, because without it the line reads as an arithmetic
+                // error — 1 of 4 is not self-evidently an escalation.
+                expect(allOutput).toContain('escalated by an EARLIER run');
+                expect(allOutput).not.toContain('All 1 provider(s) current');
+            });
+
+            it('stays quiet below BOTH arms, and leaves the all-clear intact', async () => {
+                seedCursor('acme', 1);
+                seedRefusal('acme', 3, 0, TOTAL_REFUSAL_ALERT_RUNS - 1);
+
+                const result = await runDoctor(db, await reachableGitConfig(), tmpConfigPath, MIGRATIONS_DIR);
+
+                // One or two runs importing nothing is the self-healing case (an empty window,
+                // a quiet day) — failing on it would train the reader to ignore the signal.
+                expect(result).toBe(true);
+                const allOutput = [...output, ...errors].join('\n');
+                expect(allOutput).not.toContain('refused the rows');
+                // …and the all-clear is NOT suppressed. An earlier draft denied currency from
+                // the first refused row, by analogy with the sub-threshold stall streak. The
+                // analogy does not hold: a stall means the run imported nothing, while a
+                // refusal record can mean "99 written, 1 refused" — green on every other
+                // channel. Denying currency on it made #248's positive all-clear permanently
+                // unreachable for any deployment with one chronically malformed PR timestamp,
+                // and unreachable with no line naming why.
+                expect(allOutput).toContain('All 1 provider(s) current');
+            });
+
+            it('ignores a corrupt marker rather than failing on an alarm no remedy clears', async () => {
+                seedCursor('acme', 1);
+                db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+                    rowRefusalStateKey('github', 'acme'),
+                    'not json at all',
+                );
+
+                const result = await runDoctor(db, await reachableGitConfig(), tmpConfigPath, MIGRATIONS_DIR);
+
+                expect(result).toBe(true);
+                // The phrasing the refusal line ACTUALLY emits. An earlier form of this assertion
+                // named a string that appears nowhere in `src/`, so it passed unconditionally and
+                // would have kept passing if `parseRowRefusal` started accepting the corrupt row.
+                expect([...output, ...errors].join('\n')).not.toContain('refused the rows');
+            });
         });
     });
 });

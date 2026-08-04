@@ -84,6 +84,7 @@ export const RAW_AUTHOR_DAILY_ERROR_CODES = [
     'invalid_date',
     'invalid_instant',
     'invalid_metric',
+    'invalid_computed_metric',
 ] as const;
 
 /** Why a raw-author write refused. Typed so callers map it instead of leaking a raw DB error. */
@@ -419,14 +420,86 @@ const RATE_FIELDS: readonly (keyof DailyGitMetrics)[] = [
 ];
 
 /**
+ * The metric fields whose value flows VERBATIM out of a provider response body, and the reason
+ * a bad metric has two codes rather than one (#306).
+ *
+ * These four are the only ones whose operands this pipeline does not compute — every one of them
+ * bottoms out in a per-file `additions`/`deletions` number a provider handed over uncast.
+ * Bitbucket's `getCommitDiff` maps `e.lines_added` / `e.lines_removed` straight into
+ * `GitFileDiff`, so a `"40"` or a `null` in a diffstat page arrives intact. (GitHub is the
+ * exception: it runs the shared `isCommitCount` predicate over `stats` at its own boundary.)
+ *
+ * They reach this row by TWO routes, and the distinction matters for anyone classifying a future
+ * metric — the rule is "does a provider number reach it?", not "is it arithmetic over
+ * lines_added?":
+ * - `lines_added` / `lines_removed` sum each commit's `additions` / `deletions`, which
+ *   `resolveCommitDiffstat` itself `reduce`s out of the per-file entries; `avg_commit_size` is
+ *   `(lines_added + lines_removed) / commits`, so it rides the same two numbers.
+ * - `code_churn_rate` does NOT read those two at all. `calculateDailyChurnRates` (`churn.ts`)
+ *   walks `commit.fileDiffs` and sums `file.additions + file.deletions` per file, so it reaches
+ *   the same provider values one level lower down. An earlier draft of this comment claimed it
+ *   was arithmetic over `lines_added`/`lines_removed`; it is not, and the classification happens
+ *   to be right for a different reason.
+ *
+ * Provenance is what decides the split, because it decides whether re-asking helps. A defect in
+ * one of these is a property of a response body that is immutable under re-fetch — holding the
+ * cursor would replay it forever and never write the row — so it is a row-level refusal the
+ * sync may skip ({@link ROW_LEVEL_REFUSALS}). Every OTHER metric field is produced by this
+ * codebase from counts and guarded values (`commits`/`files_changed`/`prs_*`/
+ * `review_comments_given`/`commit_burst_count` are lengths and increments; `ai_signature_score`
+ * is our scorer's mean; `avg_time_to_merge_hours` comes from `prMergeDurationHours`, which is
+ * total and returns `null` rather than NaN). Nothing a provider can send makes one of those
+ * invalid — only a code regression can — and a code regression is repaired by shipping a patch,
+ * after which re-fetching DOES yield a writable row. Those therefore carry
+ * `invalid_computed_metric` and stay on the throwing side, so the cursor is held over a window
+ * that re-covers intact instead of being skipped past and reported clean.
+ */
+const RESPONSE_DERIVED_METRIC_FIELDS: readonly (keyof DailyGitMetrics)[] = [
+    'lines_added', 'lines_removed', 'code_churn_rate', 'avg_commit_size',
+];
+
+/**
+ * Which refusal code an out-of-range metric field carries — see
+ * {@link RESPONSE_DERIVED_METRIC_FIELDS} for why the answer is per FIELD and not per rule.
+ *
+ * One function, asked by all three metric loops, so the classification cannot drift between
+ * the counter rule and the rate rule for two fields that share a provenance.
+ */
+function metricDefectCode(field: keyof DailyGitMetrics): RawAuthorDailyErrorCode {
+    return RESPONSE_DERIVED_METRIC_FIELDS.includes(field)
+        ? 'invalid_metric'
+        : 'invalid_computed_metric';
+}
+
+/**
  * The refusals that are a property of the ROW, as opposed to of the run or the provider (#302).
  *
  * The distinction decides whether a caller may SKIP the row or must let the refusal throw.
- * These three are the ones evaluated against a value the row ALONE carries — a day key derived
- * from that PR's timestamp, an identity column off that author's own commit, a metric computed
- * from that author's activity. Re-fetching returns the identical unusable value, so holding the
- * cursor for them would brick the provider without saving anything, and skipping is the lesser
- * loss.
+ * These three are the ones evaluated against a value the row ALONE carries AND that this
+ * pipeline cannot change by re-asking: a day key sliced from that PR's own timestamp, an
+ * identity column off that author's own commit, and — since #306 — a metric field whose
+ * operands come out of a provider response body uncast. Re-fetching returns the identical
+ * unusable value, so holding the cursor for them would brick the provider without saving
+ * anything, and skipping is the lesser loss.
+ *
+ * WHICH FIELDS `invalid_metric`'s premise ACTUALLY HOLDS FOR — the second half of #306, because
+ * it did not hold for the whole code. `invalid_metric` used to cover every metric field, and for
+ * most of them the premise was false: `commits`, `files_changed`, `prs_opened`, `prs_merged`,
+ * `review_comments_given`, `commit_burst_count`, `ai_signature_score` and
+ * `avg_time_to_merge_hours` are all computed HERE, from lengths, increments and
+ * `prMergeDurationHours` (which is total and yields `null`, never NaN). No response body can
+ * make one of them invalid, so their only realistic trigger is a code regression — and a code
+ * regression IS repaired, after which re-fetching yields a writable row. Skipping them advanced
+ * the cursor past every affected window first, so the branch that exists to avoid a fail-open
+ * inversion caused one. They now carry `invalid_computed_metric` and throw.
+ * `invalid_metric` is left holding exactly {@link RESPONSE_DERIVED_METRIC_FIELDS} —
+ * `lines_added`, `lines_removed`, `code_churn_rate`, `avg_commit_size` — the four whose value
+ * flows from a diffstat body two of the three providers do not validate.
+ *
+ * SKIPPING IS NOT SILENT ANY MORE (#306). A row-level refusal is still an advisory when it is
+ * incidental, but a provider instance whose refusals reach `isSystemicRowRefusal`'s threshold
+ * (`sync.ts`) now raises a genuine error and a durable `toprope doctor` failure —
+ * so "the cause refuses 100% of a provider's rows" can no longer settle as a green run.
  *
  * The others are evaluated against operands that are CONSTANT for a whole run (`observedAt`) or
  * a whole provider (`provider`, `container`, and the namespacing half of `raw_author_key`). A
@@ -581,17 +654,17 @@ export function findRawAuthorDailyDefect(
     for (const field of COUNTER_FIELDS) {
         const value = row[field];
         if (!Number.isInteger(value) || (value as number) < 0) {
-            return defect('invalid_metric', `${field} must be a non-negative integer, got: ${String(value)}`);
+            return defect(metricDefectCode(field), `${field} must be a non-negative integer, got: ${String(value)}`);
         }
     }
     for (const field of RATE_FIELDS) {
         if (!Number.isFinite(row[field])) {
-            return defect('invalid_metric', `${field} must be a finite number, got: ${String(row[field])}`);
+            return defect(metricDefectCode(field), `${field} must be a finite number, got: ${String(row[field])}`);
         }
     }
     if (row.avg_time_to_merge_hours !== null && !Number.isFinite(row.avg_time_to_merge_hours)) {
         return defect(
-            'invalid_metric',
+            metricDefectCode('avg_time_to_merge_hours'),
             `avg_time_to_merge_hours must be a finite number or null, got: ${String(row.avg_time_to_merge_hours)}`,
         );
     }
