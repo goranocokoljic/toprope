@@ -29,6 +29,7 @@ import {
     SYSTEMIC_ROW_REFUSAL_PREFIX,
     SYSTEMIC_SKIP_MIN_ROWS,
     TOTAL_REFUSAL_ALERT_RUNS,
+    escalationArm,
     getProviderRowRefusal,
     isAdvisoryError,
     isEscalatedRefusal,
@@ -353,6 +354,7 @@ describe('#306 a systemic row refusal does not report clean', () => {
                 skipped: DAYS.length,
                 retained: 0,
                 runs: 1,
+                escalated: true,
             });
 
             const health = loadGitSyncHealth(db, [GITHUB_CONFIG, GITLAB_CONFIG], NOW);
@@ -486,8 +488,14 @@ describe('#306 a systemic row refusal does not report clean', () => {
             expect(result.errors.filter((e) => !isAdvisoryError(e))).toEqual([]);
             // A record IS written — refusals are tracked from the first one, because the streak
             // arm needs the history — but it is not escalated, so no surface reports it.
+            //
+            // `runs: 1` on a 1-refused/1-retained run, and that is the streak arm's majority
+            // predicate (`skipped >= retained`) doing its job, not an escalation: one run of
+            // one-in-two is a sample too small for the floor to judge, which is exactly why the
+            // sequence is the thing being counted. Three consecutive runs of it would escalate;
+            // one does not, which is what the two assertions below pin.
             const refusal = getProviderRowRefusal(db, 'github', 'test-org')!;
-            expect(refusal).toMatchObject({skipped: 1, retained: 1, runs: 0});
+            expect(refusal).toMatchObject({skipped: 1, retained: 1, runs: 1, escalated: false});
             expect(isEscalatedRefusal(refusal)).toBe(false);
             expect(loadGitSyncHealth(db, [GITHUB_CONFIG, GITLAB_CONFIG], NOW).systemicRefusals).toEqual([]);
             // The count still reaches the numeric field — reporting and escalating are separate.
@@ -543,7 +551,7 @@ describe('#306 a systemic row refusal does not report clean', () => {
             expect(isAdvisoryError(systemic!)).toBe(false);
             // The line names the arm that fired — 1 of 1 rows is not self-evidently an alert.
             expect(systemic).toContain(
-                `written NOTHING for ${TOTAL_REFUSAL_ALERT_RUNS} consecutive runs`,
+                `refused most of what it built on ${TOTAL_REFUSAL_ALERT_RUNS} consecutive refusing runs`,
             );
             expect(rawRowCount(db, 'github')).toBe(0);
             expect(
@@ -551,14 +559,15 @@ describe('#306 a systemic row refusal does not report clean', () => {
             ).toEqual([TOTAL_REFUSAL_ALERT_RUNS]);
         });
 
-        it('restarts the streak the moment a run retains anything', async () => {
+        it('restarts the streak the moment a run writes MORE than it refuses', async () => {
             seedAlice(db);
             await refuseEverything();
             await refuseEverything();
             expect(getProviderRowRefusal(db, 'github', 'test-org')).toMatchObject({runs: 2});
 
-            // A run that retains a row proves the cause is not total — even though it still
-            // refuses one, so the record itself must stand.
+            // A run that writes more than it refuses proves the cause is not systemic — even
+            // though it still refuses one, so the record itself must stand. Note the fixture is
+            // 1 refused of 3, not 1 of 2: a tie is a MAJORITY refusal and extends the streak.
             vi.unstubAllGlobals();
             vi.stubGlobal(
                 'fetch',
@@ -566,14 +575,141 @@ describe('#306 a systemic row refusal does not report clean', () => {
                     githubCommitRoutes([
                         {day: ONE_DAY[0], writable: false},
                         {day: DAYS[1], writable: true},
+                        {day: DAYS[2], writable: true},
                     ]),
                 ).fetchMock,
             );
             const mixed = await runSync(db, [GITHUB_CONFIG]);
 
-            expect(rawRowCount(db, 'github')).toBe(1);
+            expect(rawRowCount(db, 'github')).toBe(2);
             expect(getProviderRowRefusal(db, 'github', 'test-org')).toMatchObject({runs: 0});
             expect(systemicLineOf(mixed.errors)).toBeUndefined();
+        });
+
+        /**
+         * The shape that cleared NEITHER arm before #306 cycle 3, and lost most of a small org's
+         * data every day forever with a green `doctor` (SO-2/SEC-1).
+         *
+         * 2 refused of 3 clears no per-run floor (2 < SYSTEMIC_SKIP_MIN_ROWS) and is never a TOTAL
+         * refusal, so a streak keyed on `retained === 0` reset on every single run. Two thirds of
+         * the window gone, permanently, cursor advancing — and no surface said anything. The
+         * majority predicate is what closes it.
+         */
+        it('escalates a persistent MAJORITY refusal that is never total and never clears the floor', async () => {
+            seedAlice(db);
+            const mostlyRefused = async (): Promise<
+                Awaited<ReturnType<GitSync['syncProviders']>>
+            > => {
+                vi.unstubAllGlobals();
+                vi.stubGlobal(
+                    'fetch',
+                    makeCountingFetch(
+                        githubCommitRoutes([
+                            {day: DAYS[0], writable: false},
+                            {day: DAYS[1], writable: false},
+                            {day: DAYS[2], writable: true},
+                        ]),
+                    ).fetchMock,
+                );
+                return runSync(db, [GITHUB_CONFIG]);
+            };
+
+            for (let run = 1; run < TOTAL_REFUSAL_ALERT_RUNS; run++) {
+                const early = await mostlyRefused();
+                expect(systemicLineOf(early.errors)).toBeUndefined();
+                expect(getProviderRowRefusal(db, 'github', 'test-org')).toMatchObject({
+                    skipped: 2,
+                    retained: 1,
+                    runs: run,
+                });
+            }
+
+            const escalated = await mostlyRefused();
+            const systemic = systemicLineOf(escalated.errors);
+            expect(systemic).toBeDefined();
+            // Never total (a row was written every run) and never at the floor (2 < 5) — so this
+            // could only have escalated on the majority streak.
+            expect(isAdvisoryError(systemic!)).toBe(false);
+            expect(systemic).toContain(
+                `refused most of what it built on ${TOTAL_REFUSAL_ALERT_RUNS} consecutive refusing runs`,
+            );
+            expect(
+                loadGitSyncHealth(db, [GITHUB_CONFIG], NOW).systemicRefusals.map((r) => r.identifier),
+            ).toEqual(['test-org']);
+        });
+    });
+
+    describe('an escalated verdict is not downgraded by a later, healthier window', () => {
+        /**
+         * The UPDATE-path twin of the erasure `clearRowRefusal` is hardened against (SO-1/SEC-2).
+         *
+         * The record is rewritten wholesale by every refusing run, so before the sticky flag the
+         * verdict lived only in the LAST run's counts. An ordinary next-day window — one
+         * chronically malformed PR timestamp among several good rows — is below every threshold,
+         * so it silently put `doctor` back to green over a span that is permanently gone. That is
+         * the ordinary next run on a daily schedule, not an exotic one.
+         */
+        it('keeps the verdict when the next run refuses only a minority, and names it as carried', async () => {
+            seedAlice(db);
+            vi.stubGlobal('fetch', makeCountingFetch(githubAllRowsRefusedRoutes(DAYS)).fetchMock);
+            await runSync(db, [GITHUB_CONFIG]);
+            expect(getProviderRowRefusal(db, 'github', 'test-org')).toMatchObject({
+                escalated: true,
+            });
+
+            // The ordinary next window: one bad row, several good ones. Below the floor, below the
+            // streak, and it writes more than it refuses — every threshold says "quiet".
+            vi.unstubAllGlobals();
+            vi.stubGlobal(
+                'fetch',
+                makeCountingFetch(
+                    githubCommitRoutes([
+                        {day: OLDER_DAYS[0], writable: false},
+                        {day: '2024-02-01', writable: true},
+                        {day: '2024-02-02', writable: true},
+                        {day: '2024-02-03', writable: true},
+                    ]),
+                ).fetchMock,
+            );
+            const next = await runSync(db, [GITHUB_CONFIG]);
+
+            const refusal = getProviderRowRefusal(db, 'github', 'test-org')!;
+            // This run's own counts trip NOTHING — the verdict survives only because it is sticky.
+            expect(refusal).toMatchObject({skipped: 1, runs: 0, escalated: true});
+            expect(isSystemicRowRefusal(refusal.skipped, refusal.retained)).toBe(false);
+            expect(refusal.runs).toBeLessThan(TOTAL_REFUSAL_ALERT_RUNS);
+            expect(escalationArm(refusal)).toBe('carried');
+            expect(isEscalatedRefusal(refusal)).toBe(true);
+
+            // …and every surface still reports it, rather than reading as repaired.
+            const systemic = systemicLineOf(next.errors);
+            expect(systemic).toBeDefined();
+            expect(isAdvisoryError(systemic!)).toBe(false);
+            expect(systemic).toContain('an EARLIER run of this provider already refused a window');
+            expect(
+                loadGitSyncHealth(db, [GITHUB_CONFIG], NOW).systemicRefusals.map((r) => r.identifier),
+            ).toEqual(['test-org']);
+            expect(loadGitSyncHealth(db, [GITHUB_CONFIG], NOW).current).toBe(0);
+        });
+
+        it('still clears on the one thing that IS evidence — a run that refuses nothing', async () => {
+            seedAlice(db);
+            vi.stubGlobal('fetch', makeCountingFetch(githubAllRowsRefusedRoutes(DAYS)).fetchMock);
+            await runSync(db, [GITHUB_CONFIG]);
+            expect(getProviderRowRefusal(db, 'github', 'test-org')).toMatchObject({
+                escalated: true,
+            });
+
+            vi.unstubAllGlobals();
+            vi.stubGlobal(
+                'fetch',
+                makeCountingFetch(githubHealthyCommitRoutes(['2024-02-01', '2024-02-02'])).fetchMock,
+            );
+            const healed = await runSync(db, [GITHUB_CONFIG]);
+
+            expect(getProviderRowRefusal(db, 'github', 'test-org')).toBeNull();
+            expect(systemicLineOf(healed.errors)).toBeUndefined();
+            expect(loadGitSyncHealth(db, [GITHUB_CONFIG], NOW).systemicRefusals).toEqual([]);
         });
     });
 
@@ -731,6 +867,10 @@ describe('#306 a systemic row refusal does not report clean', () => {
                 .all() as Array<{status: string; records_skipped: number}>;
             expect(logs).toHaveLength(1);
             expect(logs[0].records_skipped).toBe(DAYS.length);
+            // The persisted verdict, on the ONE path with no `recordSyncOutcome` behind it.
+            // `finishSyncLog` derives this from `isAdvisoryError`, so it is the literal
+            // manifestation of "does not settle as ok" for a scheduled run.
+            expect(logs[0].status).toBe('error');
         });
     });
 

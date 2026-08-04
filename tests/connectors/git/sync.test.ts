@@ -21,7 +21,9 @@ import {
     getProviderStall,
     getProviderRowRefusal,
     escalationArm,
+    isEscalatedRefusal,
     rowRefusalStateKey,
+    type GitRowRefusal,
     loadGitSyncHealth,
     GIT_STALL_ALERT_RUNS,
     TOTAL_REFUSAL_ALERT_RUNS,
@@ -4511,6 +4513,7 @@ describe('GitSync — stalled-provider detection (#235)', () => {
                         skipped: 40,
                         retained: 0,
                         runs: 1,
+                        escalated: false,
                     },
                 ]);
                 // The whole point: the cursor is one day old and there is no stall streak, so
@@ -4608,6 +4611,11 @@ describe('GitSync — stalled-provider detection (#235)', () => {
                 ['non-integer runs', JSON.stringify({at: '2026-07-01T00:00:00.000Z', skipped: 40, retained: 0, runs: 1.5})],
                 ['missing runs', JSON.stringify({at: '2026-07-01T00:00:00.000Z', skipped: 40, retained: 0})],
                 ['an unsafe-integer skipped', JSON.stringify({at: '2026-07-01T00:00:00.000Z', skipped: 2 ** 60, retained: 0})],
+                // Both bounds matter on BOTH counters: `doctor` renders `${skipped} of ${skipped
+                // + retained}`, so an unsafe `retained` prints the imprecise sum the upper bound
+                // exists to prevent — and the streak count is interpolated into the same line.
+                ['an unsafe-integer retained', JSON.stringify({at: '2026-07-01T00:00:00.000Z', skipped: 40, retained: 2 ** 60})],
+                ['an unsafe-integer runs', JSON.stringify({at: '2026-07-01T00:00:00.000Z', skipped: 40, retained: 0, runs: 2 ** 60})],
                 ['missing at', JSON.stringify({skipped: 40, retained: 0})],
                 ['a non-ISO at', JSON.stringify({at: 'yesterday-ish', skipped: 40, retained: 0})],
                 // Passes the anchored SHAPE regex and is still not a date. Only the
@@ -4639,12 +4647,45 @@ describe('GitSync — stalled-provider detection (#235)', () => {
                 // `escalationArm` exists because the sync line asked `isSystemicRowRefusal` and
                 // doctor asked `runs >= TOTAL_REFUSAL_ALERT_RUNS` — complementary, not equal, so
                 // a record tripping BOTH got a different explanation from each surface.
-                expect(escalationArm({at: OK_AT, skipped: 40, retained: 0, runs: 1})).toBe('ratio');
-                expect(escalationArm({at: OK_AT, skipped: 3, retained: 0, runs: TOTAL_REFUSAL_ALERT_RUNS})).toBe('streak');
+                const rec = (over: Partial<GitRowRefusal>): GitRowRefusal => ({
+                    at: OK_AT,
+                    skipped: 40,
+                    retained: 0,
+                    runs: 1,
+                    escalated: false,
+                    ...over,
+                });
+                expect(escalationArm(rec({}))).toBe('ratio');
+                expect(escalationArm(rec({skipped: 3, runs: TOTAL_REFUSAL_ALERT_RUNS}))).toBe('streak');
                 // Trips both: `ratio` wins, because it names a magnitude and is the more
                 // specific statement.
-                expect(escalationArm({at: OK_AT, skipped: 40, retained: 0, runs: TOTAL_REFUSAL_ALERT_RUNS})).toBe('ratio');
-                expect(escalationArm({at: OK_AT, skipped: 1, retained: 9, runs: 0})).toBeNull();
+                expect(escalationArm(rec({runs: TOTAL_REFUSAL_ALERT_RUNS}))).toBe('ratio');
+                expect(escalationArm(rec({skipped: 1, retained: 9, runs: 0}))).toBeNull();
+                // The sticky arm, and the input class ONLY it handles: identical counts, below
+                // every threshold, and the flag is the single bit that separates "quiet" from
+                // "an earlier run lost a window and nothing has imported cleanly since".
+                expect(escalationArm(rec({skipped: 1, retained: 9, runs: 0, escalated: true}))).toBe('carried');
+                // …and it is checked LAST, so an arm describing THIS run always wins the sentence.
+                expect(escalationArm(rec({escalated: true}))).toBe('ratio');
+                expect(escalationArm(rec({skipped: 3, runs: TOTAL_REFUSAL_ALERT_RUNS, escalated: true}))).toBe('streak');
+            });
+
+            it('decodes the sticky flag strictly, and a record written before it existed still escalates', () => {
+                // `escalated` is an ADDITION to the verdict, never the whole of it — so a missing
+                // or non-boolean value must decode to `false` rather than rejecting the record,
+                // and a pre-flag record's own counts must still trip an arm on their own.
+                writeState(REFUSAL_KEY, JSON.stringify({at: OK_AT, skipped: 40, retained: 0, runs: 1}));
+                const legacy = getProviderRowRefusal(db, 'github', 'test-org')!;
+                expect(legacy.escalated).toBe(false);
+                expect(isEscalatedRefusal(legacy)).toBe(true);
+
+                writeState(REFUSAL_KEY, JSON.stringify({at: OK_AT, skipped: 1, retained: 9, runs: 0, escalated: 'yes'}));
+                const coerced = getProviderRowRefusal(db, 'github', 'test-org')!;
+                expect(coerced.escalated).toBe(false);
+                expect(isEscalatedRefusal(coerced)).toBe(false);
+
+                writeState(REFUSAL_KEY, JSON.stringify({at: OK_AT, skipped: 1, retained: 9, runs: 0, escalated: true}));
+                expect(isEscalatedRefusal(getProviderRowRefusal(db, 'github', 'test-org')!)).toBe(true);
             });
         });
     });

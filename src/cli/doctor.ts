@@ -10,6 +10,7 @@ import {INTERACTIVE_REQUEST_POLICY} from '../connectors/git/providers/http-retry
 import {
     AUTHOR_DAYS_SKIPPED_PREFIX,
     GIT_CATCHUP_WINDOW_MAX_DAYS,
+    configFileProviderNotDeletable,
     escalationArm,
     loadGitSyncHealth,
     sanitizeAdvisoryLabel,
@@ -625,15 +626,29 @@ function checkGitStalls(
     if (health.systemicRefusals.length > 0) {
         const detail = health.systemicRefusals
             .map((r) => {
-                // The streak is named only when it is the arm that escalated, so the number an
-                // operator reads is the one that fired rather than both every time. Asked of the
-                // shared classifier, so this line and the sync's cannot tell one record two
-                // different stories.
-                const streak =
-                    escalationArm(r) === 'streak' ? `, nothing written for ${r.runs} runs` : '';
+                // The arm is named only when it adds something the counts do not already say, so
+                // an operator reads the one fact that fired rather than all three every time.
+                // Asked of the shared classifier, so this line and the sync's cannot tell one
+                // record two different stories.
+                //
+                // `refusing runs`, not `runs`: `r.runs` is incremented only by a run that refused
+                // rows, so a run over an empty window neither increments nor resets it and the
+                // streak can span more calendar time than a raw run count implies.
+                //
+                // `carried` is the arm where the counts on this line are BELOW every threshold, so
+                // without the suffix the line reads as an arithmetic error. It is the sticky
+                // verdict: an earlier run lost a window systemically and nothing has imported
+                // cleanly since.
+                const arm = escalationArm(r);
+                const why =
+                    arm === 'streak'
+                        ? `, most of what it built refused on ${r.runs} consecutive refusing runs`
+                        : arm === 'carried'
+                          ? `, escalated by an EARLIER run and not cleared since — this run's counts are below the threshold, the span that earlier run lost is still gone`
+                          : '';
                 return (
                     `${r.type}:${sanitizeAdvisoryLabel(r.identifier)} ` +
-                    `(${r.skipped} of ${r.skipped + r.retained} rows refused at ${r.at}${streak})`
+                    `(${r.skipped} of ${r.skipped + r.retained} rows refused at ${r.at}${why})`
                 );
             })
             .join(', ');
@@ -672,7 +687,7 @@ function checkGitStalls(
                 //
                 // The prefix is INTERPOLATED, not spelled out: a remedy that tells an operator
                 // to look for a line by name must break when the line is renamed.
-                `Read that provider's most recent sync_logs row that carries errors — the run that raised this alert wrote one (for a DB-connected provider, last_sync_advisories in the admin UI holds the same lines) — and find the "${AUTHOR_DAYS_SKIPPED_PREFIX}" line. Its refusal codes name the cause (invalid_date: a provider timestamp that is not a UTC day; invalid_identity: a non-string author field; invalid_metric: a diffstat number that is not a usable count or rate). Do NOT start with a fresh sync: this alert can be days old, and another run advances the cursor over another window under the same cause. Fix the cause; the alert clears once a run for that provider imports rows again and refuses none. If the provider is genuinely finished (its repos are archived or gone), delete it in the admin UI — that cascade retracts its data and this alert together. Removing only its connectors.git.providers[] entry silences the alert without retracting anything, and re-adding the container later inherits this verdict. The windows already covered cannot be re-asked, and purging the provider's cursors to re-import them permanently DOUBLES every commit metric on the rows that survived (#262) — do not.`,
+                `Find the "${AUTHOR_DAYS_SKIPPED_PREFIX}" line the refusing run emitted: its refusal codes name the cause (invalid_date: a provider timestamp that is not a UTC day; invalid_identity: a non-string author field; invalid_metric: a diffstat number that is not a usable count or rate). Where it is durably stored depends on how the run was started — sync_logs.errors for a scheduled run or "toprope sync all", git_providers.last_sync_advisories for an admin Sync-now of a DB-connected provider, and NEITHER for "toprope sync git", which persists no log row. sync_logs has no CLI or API reader, so that one is a direct SQL read against the database file. Do NOT start with a fresh sync: this alert can be days old, and another run advances the cursor over another window under the same cause. Fix the cause; the alert clears once a run for that provider imports rows again and refuses none — and only then, since a later run that merely refuses FEWER rows no longer clears it. If the provider is genuinely finished (its repos are archived or gone) and it is registered in the admin UI, delete it there — that cascade retracts its data and this alert together. ${configFileProviderNotDeletable()}; removing only its connectors.git.providers[] entry silences the alert without retracting anything, and re-adding the container later inherits this verdict. The windows already covered cannot be re-asked, and purging the provider's cursors to re-import them permanently DOUBLES every commit metric on the rows that survived (#262) — do not.`,
             ),
         );
     }

@@ -546,9 +546,17 @@ function formatSkippedAuthorDays(
  * It says explicitly that the codes are readable WITHOUT re-running a sync. That is not padding:
  * a sync is the one action this same line calls lossy (it advances the cursor over another window
  * under the unfixed cause), so an instruction that implied one as step 1 would prescribe the
- * damage it warns about. Both named stores are written by the run that emitted this — `sync_logs`
- * per attempt since #272, `last_sync_advisories` by the sync-now route — so the pointer is
- * reachable on both provenances.
+ * damage it warns about.
+ *
+ * WHERE it sends them is provenance-checked, and the honest answer is narrower than the first
+ * version claimed. The one store written on EVERY provenance is the run's own error list — the
+ * text the caller is already looking at. The two durable stores each cover one provenance and
+ * only one: `sync_logs` rows are written by `runConnectorWithRetry` alone (`sync-pipeline.ts`),
+ * i.e. the scheduler and `toprope sync all` — `toprope sync git` and the admin Sync-now button
+ * write NO row; `last_sync_advisories` is written by the sync-now route alone. Naming either
+ * unconditionally would send half the deployments to an empty table. `sync_logs` additionally has
+ * no reader in `src/` at all (`getRecentSyncLogs` is uncalled), so reaching it means a direct SQL
+ * read, and saying so is the difference between an instruction and a dead end.
  */
 function formatSystemicRowRefusal(
     providerType: GitProviderType,
@@ -556,24 +564,36 @@ function formatSystemicRowRefusal(
     refusal: GitRowRefusal,
 ): string {
     const {skipped, retained, runs} = refusal;
-    // Name the arm that actually fired, because the two describe different failures and an
-    // operator's next question ("is this one bad import or an ongoing bleed?") is answered by
-    // which one it was. A line that reported only the counts would leave the streak arm looking
-    // like an arithmetic error — 3 of 3 rows is not obviously an escalation on its own. Asked of
-    // the SHARED classifier, so this line and doctor's cannot tell one record two stories.
+    // Name the arm that actually fired, because the three describe different failures and an
+    // operator's next question ("is this one bad import, an ongoing bleed, or an old wound?") is
+    // answered by which one it was. A line that reported only the counts would leave the streak
+    // arm looking like an arithmetic error — 3 of 3 rows is not obviously an escalation on its
+    // own — and would leave `carried` unexplained entirely, since on that arm THIS run's counts
+    // are below every threshold. Asked of the SHARED classifier, so this line and doctor's cannot
+    // tell one record two stories.
+    //
+    // The streak sentence says "refusing runs" rather than "consecutive runs": `runs` is
+    // incremented only by a run that refused rows, so a run over an empty window neither
+    // increments nor resets it and the streak can span more calendar time than a raw run count
+    // implies.
+    const arm = escalationArm(refusal);
     const cause =
-        escalationArm(refusal) === 'ratio'
+        arm === 'ratio'
             ? `most of what this run built was refused`
-            : `this provider has now written NOTHING for ${runs} consecutive runs`;
+            : arm === 'streak'
+              ? `this provider has now refused most of what it built on ${runs} consecutive refusing runs`
+              : `an EARLIER run of this provider already refused a window systemically, and nothing has imported cleanly since — this run being smaller does not recover that span`;
     return (
         `${SYSTEMIC_ROW_REFUSAL_PREFIX} [${providerType}/${sanitizeAdvisoryLabel(container)}] ` +
         `${skipped} of ${skipped + retained} author-day row(s) this run built were refused and ` +
         `only ${retained} were written, while the forward cursor advanced over the whole window ` +
         `— and ${cause}. That is not the incidental single-row loss the ` +
         `"${AUTHOR_DAYS_SKIPPED_PREFIX}" advisory reports, so this run is reported as a FAILURE ` +
-        `even though it committed. Read the refusal codes on that advisory line — it is in this ` +
-        `same run's sync_logs.errors row and on git_providers.last_sync_advisories, so you do ` +
-        `NOT need to re-run a sync to see it — and fix the cause: every further run loses another ` +
+        `even though it committed. Read the refusal codes on that advisory line — it is beside ` +
+        `this one in THIS run's own error output, so you do NOT need to re-run a sync to see it ` +
+        `(durably, it is in sync_logs.errors only for a scheduled run or "toprope sync all", and ` +
+        `on git_providers.last_sync_advisories only for an admin Sync-now of a DB-connected ` +
+        `provider) — and fix the cause: every further run loses another ` +
         `window the same way. The windows already covered cannot be re-asked (neither a forward ` +
         `sync nor "sync older history" reaches them), and do NOT purge this provider's cursors ` +
         `to re-import them: that permanently doubles every commit metric on the rows that WERE ` +
@@ -752,9 +772,24 @@ function permanentSpanRepair(): string {
         're-projects the affected days BEFORE purging its cursors, so the re-import lands on ' +
         'an empty span — then run "sync older history" to recover anything beyond the ' +
         `${FIRST_SYNC_WINDOW_DEFAULT_MONTHS}-month first-sync window a re-added provider ` +
-        'starts from. A CONFIG-FILE provider cannot be deleted (the route refuses it, and the ' +
-        'cascade is skipped while the YAML entry still owns the container), so it has no ' +
+        `starts from. ${configFileProviderNotDeletable()}, so it has no ` +
         'supported repair today: leave the span understated'
+    );
+}
+
+/**
+ * Why the admin delete is not a remedy for a CONFIG-FILE provider — the one sentence every
+ * surface that prescribes "delete it" has to carry.
+ *
+ * ONE copy, for the reason {@link permanentSpanRepair} states about itself: this is the clause
+ * that makes a named remedy reachable or not, and it is exactly the clause a second hand-written
+ * rendering drops. It was dropped once already — the #306 `doctor` hint told the operator to
+ * "delete it in the admin UI" flat, which the route refuses for every YAML-configured provider.
+ */
+export function configFileProviderNotDeletable(): string {
+    return (
+        'A CONFIG-FILE provider cannot be deleted (the route refuses it, and the cascade is ' +
+        'skipped while the YAML entry still owns the container)'
     );
 }
 
@@ -784,8 +819,10 @@ function permanentSpanRepair(): string {
  * decision, not an oversight: the two need separate denominators (pr_records written, not
  * author-day rows), the losses differ in weight (adoption metrics vs the PR-coaching surfaces),
  * and folding them into one ratio would let a healthy author-day window mask a total PR refusal
- * and vice versa. The refused count DOES reach `records_skipped` either way. Tracked as its own
- * follow-up rather than smuggled in here.
+ * and vice versa. The refused count DOES reach `records_skipped` either way — which is also the
+ * cost of the decision, since the two grains now share one number whose magnitude no longer says
+ * which of them moved. Tracked as #313 rather than smuggled in here; the issue number is named
+ * so the claim can be checked rather than taken on trust.
  *
  * Staged on the cursor advance like the advisories it escalates, for the identical reason: the
  * loss is only beyond recovery once the window is recorded as covered.
@@ -811,7 +848,7 @@ export const SYSTEMIC_ROW_REFUSAL_PREFIX = 'Systemic author-day refusal:';
 export const SYSTEMIC_SKIP_MIN_ROWS = 5;
 
 /**
- * Consecutive runs in which a provider refused rows and retained NONE before the streak alone
+ * Consecutive runs in which a provider refused MOST of what it built before the streak alone
  * escalates, whatever the per-run counts (#306).
  *
  * The arm {@link SYSTEMIC_SKIP_MIN_ROWS} cannot cover. The scheduled sync is daily, so a
@@ -821,11 +858,15 @@ export const SYSTEMIC_SKIP_MIN_ROWS = 5;
  * per-run floor is right about ONE run and blind to the sequence.
  *
  * 3, and deliberately the same number and the same argument as {@link GIT_STALL_ALERT_RUNS}
- * beside it: one run importing nothing is the common, self-healing case (an empty window, a
+ * beside it: one run importing almost nothing is the common, self-healing case (an empty window, a
  * provider with no activity that day), and alerting on it would train the reader to ignore the
- * signal. Three consecutive runs that built rows and wrote none of them cannot be explained away.
+ * signal. Three consecutive runs that built rows and refused most of them cannot be explained away.
  *
- * A run that retains ANY row breaks the streak — it proves the cause is not total.
+ * "MOST", not "all": `retained === 0` was the first predicate and it left the two arms with an
+ * uncovered intersection — a window too small for the floor and never quite totally refused. See
+ * {@link GitRowRefusal.runs} and the counter's own comment in `recordRowRefusal`. A run that
+ * writes MORE than it refuses breaks the streak; that is the incidental-loss shape, and it proves
+ * the cause is not systemic.
  */
 export const TOTAL_REFUSAL_ALERT_RUNS = 3;
 
@@ -1790,10 +1831,23 @@ export interface GitRowRefusal {
     /** Author-day rows that run retained. May be 0 — that is the worst case, not an absent one. */
     retained: number;
     /**
-     * Consecutive runs (this one last) that refused rows and retained NONE; 0 when the last such
-     * run retained something. See {@link TOTAL_REFUSAL_ALERT_RUNS}.
+     * Consecutive runs (this one last) whose refusals were the MAJORITY of what they built
+     * (`skipped >= retained`); 0 when the last such run wrote more than it refused.
+     * See {@link TOTAL_REFUSAL_ALERT_RUNS}.
      */
     runs: number;
+    /**
+     * STICKY: some run of this provider has already escalated, whether or not THIS one does.
+     *
+     * The record is rewritten wholesale by every refusing run, so without this the verdict lives
+     * only in the last run's two counts — and the ordinary next-day window (one chronically bad PR
+     * timestamp among five good rows) is below every threshold, so it silently downgraded an
+     * escalation raised over a window that is permanently gone. That is the same erasure
+     * {@link clearRowRefusal} is deliberately hardened against, reached through the UPDATE path
+     * instead of the DELETE path. Once true it survives every rewrite; only `clearRowRefusal`'s
+     * strict gate (refused nothing AND retained something) drops it, by deleting the record.
+     */
+    escalated: boolean;
 }
 
 /**
@@ -1835,28 +1889,37 @@ function parseRowRefusal(value: string | null): GitRowRefusal | null {
         return null;
     }
     if (typeof raw !== 'object' || raw === null) return null;
-    const {at, skipped, retained, runs} = raw as {
+    const {at, skipped, retained, runs, escalated} = raw as {
         at?: unknown;
         skipped?: unknown;
         retained?: unknown;
         runs?: unknown;
+        escalated?: unknown;
     };
     if (typeof at !== 'string' || !isUtcIsoInstant(at)) return null;
     // `skipped >= 1` because a record of zero refusals describes nothing; the other two may be 0.
     if (!isStoredCount(skipped, 1)) return null;
     if (!isStoredCount(retained, 0)) return null;
     if (!isStoredCount(runs, 0)) return null;
-    return {at, skipped, retained, runs};
+    // Strict `=== true`, and absent decodes as false rather than rejecting the record: the sticky
+    // flag is an ADDITION to the verdict, never the whole of it. A record written before the flag
+    // existed still escalates if its own counts trip an arm, because {@link escalationArm}
+    // recomputes those from `skipped`/`retained`/`runs` — so the only thing a missing flag can
+    // lose is stickiness the old writer never claimed.
+    return {at, skipped, retained, runs, escalated: escalated === true};
 }
 
 /**
  * Does this record warrant turning a provider red (#306)? The ONE predicate every surface asks,
  * so the sync's error line, `loadGitSyncHealth` and `doctor` cannot disagree about the verdict.
  *
- * TWO ARMS, because one run and a sequence of runs fail differently. The first catches a large
- * window mostly refused — a first sync that builds 40,000 rows and writes none escalates
- * immediately, on run 1. The second catches a small window ENTIRELY refused, repeatedly: the
- * per-run floor is blind to that, and it is the shape a small org actually sees on a daily sync.
+ * THREE ARMS, because one run, a sequence of runs, and the history of the provider fail
+ * differently. `ratio` catches a large window mostly refused — a first sync that builds 40,000
+ * rows and writes none escalates immediately, on run 1. `streak` catches a small window mostly
+ * refused, repeatedly: the per-run floor is blind to that, and it is the shape a small org
+ * actually sees on a daily sync. `carried` is the sticky flag — a verdict already raised is not
+ * un-raised by a later, healthier window, because that window is a DIFFERENT span and says
+ * nothing about the one that was lost.
  */
 export function isEscalatedRefusal(refusal: GitRowRefusal): boolean {
     return escalationArm(refusal) !== null;
@@ -1874,10 +1937,15 @@ export function isEscalatedRefusal(refusal: GitRowRefusal): boolean {
  *
  * `ratio` wins a tie deliberately: it names a magnitude ("40 of 40 refused"), which is the more
  * specific statement, and a record that trips it has always also just refused everything.
+ *
+ * `carried` is checked LAST, so it is only ever the answer when THIS run's counts trip nothing.
+ * That ordering is what makes the operator sentence honest: an arm naming what just happened is
+ * preferred, and `carried` is reserved for "this run looked better, the earlier loss stands".
  */
-export function escalationArm(refusal: GitRowRefusal): 'ratio' | 'streak' | null {
+export function escalationArm(refusal: GitRowRefusal): 'ratio' | 'streak' | 'carried' | null {
     if (isSystemicRowRefusal(refusal.skipped, refusal.retained)) return 'ratio';
-    return refusal.runs >= TOTAL_REFUSAL_ALERT_RUNS ? 'streak' : null;
+    if (refusal.runs >= TOTAL_REFUSAL_ALERT_RUNS) return 'streak';
+    return refusal.escalated ? 'carried' : null;
 }
 
 /** The row-refusal record for one provider (#306), escalated or not, or null if there is none. */
@@ -1927,13 +1995,28 @@ function recordRowRefusal(
     now: string,
 ): GitRowRefusal {
     const open = getProviderRowRefusal(db, providerType, identifier);
-    const next: GitRowRefusal = {
+    const provisional: GitRowRefusal = {
         at: now,
         skipped,
         retained,
-        // Extended only by a run that wrote NOTHING. A run that retained anything proves the
-        // cause is not total, so the streak restarts — even though the record stands.
-        runs: retained === 0 ? (open?.runs ?? 0) + 1 : 0,
+        // Extended by a run whose refusals were the MAJORITY of what it built, not only by one
+        // that wrote nothing at all. `retained === 0` was too strict to be the sequence arm: the
+        // per-run floor already declines to judge a small sample, so the shape neither arm saw was
+        // a small window mostly — not entirely — refused, run after run. A 4-developer org losing
+        // 3 of 4 rows every day cleared no floor (3 < SYSTEMIC_SKIP_MIN_ROWS) and reset the streak
+        // every run (retained 1 ≠ 0), so 75% of that provider's data went permanently missing with
+        // a green `doctor`, forever. `skipped >= retained` is the same majority predicate the ratio
+        // arm uses, minus the floor the sequence makes unnecessary — one run of 1-in-2 is noise,
+        // three consecutive is not. A run that writes more than it refuses still restarts it: that
+        // is the incidental-loss shape #302 is built around, and it must stay quiet.
+        runs: skipped >= retained ? (open?.runs ?? 0) + 1 : 0,
+        // Seeded from the open record, then re-decided below. Sticky by construction: see
+        // GitRowRefusal.escalated for why a later, healthier window may not clear a verdict.
+        escalated: open?.escalated ?? false,
+    };
+    const next: GitRowRefusal = {
+        ...provisional,
+        escalated: escalationArm(provisional) !== null,
     };
     setSyncStateValue(db, rowRefusalStateKey(providerType, identifier), JSON.stringify(next));
     return next;
@@ -1952,6 +2035,12 @@ function recordRowRefusal(
  * threshold, yet deleting a record of a 40,000-row loss on the strength of it would let one
  * mostly-broken daily window erase the verdict on a mostly-broken first sync — and with a daily
  * schedule that is the ordinary next run, not an exotic one.
+ *
+ * THIS IS THE ONLY EXIT from an escalated verdict, and that is why the gate is this strict.
+ * `recordRowRefusal` carries {@link GitRowRefusal.escalated} forward across every rewrite, so a
+ * later run cannot downgrade the verdict by being smaller — it can only be dropped here, by a run
+ * that built rows and refused none of them. Note what is still NOT claimed by that: the earlier
+ * span stays lost. The clear says the CAUSE is gone, which is the most any later run can prove.
  *
  * `skipped === 0` alone is not enough either. A run that built nothing refused nothing, and "no
  * refusals" is then an absence rather than evidence: the graduated rule is that a positive health
@@ -2182,6 +2271,14 @@ export function loadGitSyncHealth(
         // prove the DATA is current — it proves the opposite. Denied here rather than subtracted
         // at the surface, so every reader of `current` gets the same answer (#306). Keyed on
         // ESCALATION, for the reason argued where `escalated` is computed.
+        //
+        // NO CALLER OBSERVES THIS TODAY, and that is stated rather than implied: `doctor` is the
+        // only production reader of `current`, and its currency block is gated on having pushed no
+        // check at all — which an escalated refusal always has. It stays because `current` is a
+        // FIELD of an exported struct, documented as the count of providers whose data is current;
+        // counting a provider whose window was refused would make that field's own contract false
+        // for anyone who reads it next, and the guard costs one line. It is not a seam for a
+        // hypothetical caller — it is the definition of the number already being returned.
         if (escalated) continue;
         current++;
     }

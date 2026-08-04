@@ -13,7 +13,9 @@ import {
 import {
     AUTHOR_DAYS_SKIPPED_PREFIX,
     TOTAL_REFUSAL_ALERT_RUNS,
+    configFileProviderNotDeletable,
     loadGitSyncHealth,
+    rowRefusalStateKey,
 } from '../../src/connectors/git/sync';
 import {createProvider} from '../../src/connectors/git/providers/store';
 import {createCommitDiffstatCache} from '../../src/connectors/git/diffstat-cache';
@@ -687,10 +689,25 @@ describe('runDoctor', () => {
                 }));
             }
 
-            function seedRefusal(org: string, skipped: number, retained: number, runs = 0): void {
+            // The key comes from the exported builder, not a hand-spelled literal: the two
+            // ABSENCE assertions below (the corrupt marker, and below-both-arms) would silently
+            // stop covering anything if a namespace rename left this string behind.
+            function seedRefusal(
+                org: string,
+                skipped: number,
+                retained: number,
+                runs = 0,
+                escalated = false,
+            ): void {
                 db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
-                    `git_row_refusal:github:${org}`,
-                    JSON.stringify({at: '2026-07-01T00:00:00.000Z', skipped, retained, runs}),
+                    rowRefusalStateKey('github', org),
+                    JSON.stringify({
+                        at: '2026-07-01T00:00:00.000Z',
+                        skipped,
+                        retained,
+                        runs,
+                        escalated,
+                    }),
                 );
             }
 
@@ -711,8 +728,11 @@ describe('runDoctor', () => {
                 expect(allOutput).not.toContain('All 1 provider(s) current');
                 // The streak suffix belongs to the OTHER arm. Without this, dropping the
                 // condition on it (printing it unconditionally) stays green, and a per-run
-                // escalation would report "nothing written for 0 runs".
-                expect(allOutput).not.toContain('nothing written for');
+                // escalation would report "…on 0 consecutive refusing runs".
+                expect(allOutput).not.toContain('consecutive refusing runs');
+                // …as does the carried suffix, whose whole purpose is to explain counts that are
+                // BELOW the threshold. 40 of 40 is above it, so naming it here would be wrong.
+                expect(allOutput).not.toContain('escalated by an EARLIER run');
             });
 
             it('reports EVERY refusing provider, with a count matching the detail list', async () => {
@@ -798,7 +818,13 @@ describe('runDoctor', () => {
                 // …and it must not open with "run a sync": this alert can be days old, so on a
                 // quiet provider a fresh run prints no advisory at all, and when it does print
                 // one it has just advanced the cursor over another window under the same cause.
-                expect(allOutput).toContain('sync_logs row that carries errors');
+                // WHERE the line is durably stored is provenance-dependent, and the hint has to
+                // say so: `sync_logs` rows are written only by the scheduler and "toprope sync
+                // all", `last_sync_advisories` only by the admin Sync-now route, and neither by
+                // "toprope sync git". A hint that named one unconditionally sends half the
+                // deployments to an empty table.
+                expect(allOutput).toContain('sync_logs.errors for a scheduled run');
+                expect(allOutput).toContain('NEITHER for "toprope sync git"');
                 expect(allOutput).toContain('Do NOT start with a fresh sync');
                 // The line the operator is sent to find, INTERPOLATED from the constant rather
                 // than spelled out — rename the prefix and both the remedy and this assertion
@@ -807,11 +833,17 @@ describe('runDoctor', () => {
                 // The escape hatch for a provider that will never import again, so the alert is
                 // not a wedge with no exit — and it names the ADMIN delete specifically, because
                 // dropping the YAML entry retracts nothing and leaves the record to be inherited.
-                expect(allOutput).toContain('delete it in the admin UI');
+                expect(allOutput).toContain('registered in the admin UI, delete it there');
                 expect(allOutput).toContain('silences the alert without retracting anything');
+                // …and the caveat that makes that remedy REACHABLE or not. The admin delete route
+                // refuses a config-file provider outright, so naming the delete without this
+                // clause prescribes an operation every YAML-configured deployment cannot run.
+                // Interpolated from the single shared sentence, so a change to the cascade cannot
+                // update one copy and leave this one prescribing the old procedure.
+                expect(allOutput).toContain(configFileProviderNotDeletable());
             });
 
-            it('escalates a provider that keeps writing NOTHING, even below the per-run floor', async () => {
+            it('escalates a provider that keeps refusing MOST of what it builds, below the per-run floor', async () => {
                 // The hole a per-run floor cannot see: a three-developer org's daily window
                 // builds ~3 author-day rows, so a cause refusing every one of them loses 100% of
                 // that provider's data every day while `skipped` never reaches 5.
@@ -825,7 +857,28 @@ describe('runDoctor', () => {
                 expect(allOutput).toContain('github:acme (3 of 3 rows refused');
                 // The streak is named only when it is what fired, so the operator reads the
                 // number that escalated rather than both every time.
-                expect(allOutput).toContain(`nothing written for ${TOTAL_REFUSAL_ALERT_RUNS} runs`);
+                expect(allOutput).toContain(
+                    `most of what it built refused on ${TOTAL_REFUSAL_ALERT_RUNS} consecutive refusing runs`,
+                );
+            });
+
+            it('fails on a CARRIED verdict whose own counts are below every threshold', async () => {
+                // The state the sticky flag exists for: an earlier run escalated, and the run
+                // that overwrote the record refused one row of four. Every threshold on THIS
+                // record says quiet — so with the flag ignored, doctor goes green over a span
+                // that is permanently gone. This is the ordinary next day on a daily schedule.
+                seedCursor('acme', 1);
+                seedRefusal('acme', 1, 3, 0, true);
+
+                const result = await runDoctor(db, await reachableGitConfig(), tmpConfigPath, MIGRATIONS_DIR);
+
+                expect(result).toBe(false);
+                const allOutput = [...output, ...errors].join('\n');
+                expect(allOutput).toContain('github:acme (1 of 4 rows refused');
+                // The suffix has to be there, because without it the line reads as an arithmetic
+                // error — 1 of 4 is not self-evidently an escalation.
+                expect(allOutput).toContain('escalated by an EARLIER run');
+                expect(allOutput).not.toContain('All 1 provider(s) current');
             });
 
             it('stays quiet below BOTH arms, and leaves the all-clear intact', async () => {
@@ -852,14 +905,17 @@ describe('runDoctor', () => {
             it('ignores a corrupt marker rather than failing on an alarm no remedy clears', async () => {
                 seedCursor('acme', 1);
                 db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
-                    'git_row_refusal:github:acme',
+                    rowRefusalStateKey('github', 'acme'),
                     'not json at all',
                 );
 
                 const result = await runDoctor(db, await reachableGitConfig(), tmpConfigPath, MIGRATIONS_DIR);
 
                 expect(result).toBe(true);
-                expect([...output, ...errors].join('\n')).not.toContain('refused most of the rows');
+                // The phrasing the refusal line ACTUALLY emits. An earlier form of this assertion
+                // named a string that appears nowhere in `src/`, so it passed unconditionally and
+                // would have kept passing if `parseRowRefusal` started accepting the corrupt row.
+                expect([...output, ...errors].join('\n')).not.toContain('refused the rows');
             });
         });
     });
