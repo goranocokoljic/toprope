@@ -15,7 +15,6 @@ import {
     containerRawDailyDates,
     deleteContainerRawDaily,
     RawAuthorDailyError,
-    findRawAuthorDailyDefect,
     RAW_AUTHOR_DAILY_ERROR_CODES,
     ROW_LEVEL_REFUSALS,
     type DailyGitMetrics,
@@ -23,6 +22,25 @@ import {
 } from '../../src/connectors/git/raw-author-daily';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../src/storage/migrations');
+
+/**
+ * The refusal code {@link upsertRawAuthorDaily} throws for `row`, or `null` if it accepts it —
+ * the throwing form is the ONLY validator since #307 (the non-throwing `findRawAuthorDailyDefect`
+ * twin was deleted). Runs against a fresh migrated DB so the write path is the real one.
+ */
+function refusalCodeOf(row: RawAuthorDailyInput, observedAt: string): string | null {
+    const db = new Database(':memory:');
+    try {
+        runMigrations(db, MIGRATIONS_DIR);
+        upsertRawAuthorDaily(db, row, observedAt);
+        return null;
+    } catch (e) {
+        if (e instanceof RawAuthorDailyError) return e.code;
+        throw e;
+    } finally {
+        db.close();
+    }
+}
 
 const ZERO_METRICS: DailyGitMetrics = {
     commits: 0,
@@ -452,10 +470,10 @@ describe('upsertRawAuthorDaily + readers (#252)', () => {
         const badValue = (field: string): Partial<DailyGitMetrics> =>
             ({[field]: Number.NaN}) as Partial<DailyGitMetrics>;
         for (const field of responseDerived) {
-            expect(findRawAuthorDailyDefect(input(badValue(field)), '2026-07-01T10:00:00.000Z')?.code).toBe('invalid_metric');
+            expect(refusalCodeOf(input(badValue(field)), '2026-07-01T10:00:00.000Z')).toBe('invalid_metric');
         }
         for (const field of computed) {
-            expect(findRawAuthorDailyDefect(input(badValue(field)), '2026-07-01T10:00:00.000Z')?.code).toBe('invalid_computed_metric');
+            expect(refusalCodeOf(input(badValue(field)), '2026-07-01T10:00:00.000Z')).toBe('invalid_computed_metric');
         }
     });
 
@@ -758,19 +776,19 @@ describe('upsertRawAuthorDaily + readers (#252)', () => {
 });
 
 /**
- * #302 — the same refusal, asked instead of suffered.
+ * #302/#307 — the write boundary's refusal, now the ONE validator (the non-throwing
+ * `findRawAuthorDailyDefect` twin was deleted in #307).
  *
- * `upsertRawAuthorDaily` throws INSIDE the git sync's single all-providers write transaction,
- * so a row it refuses does not cost a row: it rolls back every provider's window and recurs
- * identically on every run. The sync therefore asks this function first and skips the row. The
- * property that makes that safe is AGREEMENT — a row this returns `null` for must be one the
- * throwing form accepts, and vice versa — which is why the two share a body rather than a rule
- * list, and why the table below drives both forms over the same inputs.
+ * `upsertRawAuthorDaily` throws INSIDE the git sync's single all-providers write transaction, so a
+ * row it refuses does not cost a row: it rolls back every provider's window and recurs identically
+ * on every run. The sync therefore CATCHES this throw and skips a row-level refusal. This table
+ * pins the code the store raises for each refusal class, and that the offending value reaches the
+ * message (which is why the advisory renders the typed CODE, never the message).
  */
-describe('findRawAuthorDailyDefect — the non-throwing form of the write boundary (#302)', () => {
+describe('upsertRawAuthorDaily — the write-boundary refusal (#302/#307)', () => {
     const OBSERVED = '2026-07-01T10:00:00.000Z';
 
-    /** Every refusal class the validator can reach, with the code it must report. */
+    /** Every refusal class the validator can reach, with the code it must raise. */
     const REFUSALS: Array<{name: string; row: RawAuthorDailyInput; observedAt: string; code: string}> = [
         {
             name: 'an unknown provider',
@@ -832,25 +850,15 @@ describe('findRawAuthorDailyDefect — the non-throwing form of the write bounda
         },
     ];
 
-    it('returns null for a row the throwing form accepts', () => {
-        const db = new Database(':memory:');
-        try {
-            runMigrations(db, MIGRATIONS_DIR);
-            expect(findRawAuthorDailyDefect(input(), OBSERVED)).toBeNull();
-            expect(() => upsertRawAuthorDaily(db, input(), OBSERVED)).not.toThrow();
-        } finally {
-            db.close();
-        }
+    it('accepts a well-formed row', () => {
+        expect(refusalCodeOf(input(), OBSERVED)).toBeNull();
     });
 
     for (const refusal of REFUSALS) {
-        it(`reports ${refusal.name} with the SAME code the throwing form raises`, () => {
+        it(`raises ${refusal.name} as ${refusal.code}, and really does throw`, () => {
             const db = new Database(':memory:');
             try {
                 runMigrations(db, MIGRATIONS_DIR);
-                const defect = findRawAuthorDailyDefect(refusal.row, refusal.observedAt);
-                expect(defect?.code).toBe(refusal.code);
-
                 let thrownCode: string | undefined;
                 try {
                     upsertRawAuthorDaily(db, refusal.row, refusal.observedAt);
@@ -858,43 +866,54 @@ describe('findRawAuthorDailyDefect — the non-throwing form of the write bounda
                     expect(e).toBeInstanceOf(RawAuthorDailyError);
                     thrownCode = (e as RawAuthorDailyError).code;
                 }
-                // Agreement in BOTH directions: the same code, and the throw really happened —
-                // a form that silently accepted this row would leave `thrownCode` undefined.
-                expect(thrownCode).toBe(defect?.code);
+                // The throw really happened — a form that silently accepted this row would leave
+                // `thrownCode` undefined — and it carried the expected code.
+                expect(thrownCode).toBe(refusal.code);
             } finally {
                 db.close();
             }
         });
     }
 
-    it('reports only codes on the runtime allowlist, which is what the advisory renders', () => {
-        // `sync.ts` interpolates the code into an operator-facing line and allowlists it against
-        // this array first. A code the validator can produce but the array omits would render as
-        // `<unrecognized refusal code>` and tell the operator nothing.
+    it('raises only codes on the runtime allowlist, which is what the advisory renders', () => {
+        // `sync.ts` interpolates the code into an operator-facing line, and it is safe to do so
+        // only because the code is a closed vocabulary. A code the validator can produce but the
+        // array omits would break that guarantee.
         for (const refusal of REFUSALS) {
-            const defect = findRawAuthorDailyDefect(refusal.row, refusal.observedAt);
-            expect(RAW_AUTHOR_DAILY_ERROR_CODES).toContain(defect!.code);
+            expect(RAW_AUTHOR_DAILY_ERROR_CODES).toContain(refusalCodeOf(refusal.row, refusal.observedAt));
         }
     });
 
     it('embeds the offending VALUE in the message, which is why the advisory renders the code', () => {
-        // Pinned so the caller warning on `findRawAuthorDailyDefect` stays true: if the message
-        // ever stopped carrying the raw value, `sanitizeRefusalCode` would be protecting nothing
-        // and the line could safely say more. It does carry it, so it must not be pasted through.
-        const defect = findRawAuthorDailyDefect(input({date: '+033658-0'}), OBSERVED);
-        expect(defect!.message).toContain('+033658-0');
+        // Pinned so the advisory keeps rendering the typed CODE, never `.message`: the message
+        // carries the raw response-derived value verbatim, so pasting it into a line bound for a
+        // terminal / `sync_logs` / the admin UI would be a control-character hazard.
+        let message: string | undefined;
+        try {
+            const db = new Database(':memory:');
+            try {
+                runMigrations(db, MIGRATIONS_DIR);
+                upsertRawAuthorDaily(db, input({date: '+033658-0'}), OBSERVED);
+            } finally {
+                db.close();
+            }
+        } catch (e) {
+            message = (e as RawAuthorDailyError).message;
+        }
+        expect(message).toContain('+033658-0');
     });
 });
 
 /**
  * #302 — which refusals the git sync may SKIP, and which must still roll the run back.
  *
- * The sync asks `findRawAuthorDailyDefect` before every write and skips a row-level refusal
- * rather than letting it throw inside the run's single all-providers write transaction. That is
+ * The sync CATCHES the store's own throw at the write (#307) and skips a row-level refusal
+ * rather than letting it roll the run's single all-providers write transaction back. That is
  * only safe for a refusal decided by a value THIS ROW carries: a defect in a run- or
  * provider-level operand refuses every row, so skipping it would discard the entire window
  * fail-open with the cursor advanced and the run reported clean — the exact inversion of the
- * fail-closed behaviour `providers/config.ts` relies on.
+ * fail-closed behaviour `providers/config.ts` relies on. So the catch filters on
+ * `ROW_LEVEL_REFUSALS` and rethrows everything else.
  *
  * Asserted here rather than end to end because that is where the distinction is decidable. The
  * complement direction IS driven through a real two-provider run
@@ -952,13 +971,14 @@ describe('ROW_LEVEL_REFUSALS — what the sync may skip (#302/#306)', () => {
     });
 
     it('checks the run-level operand FIRST, so the split cannot depend on the row mix', () => {
-        // `findRawAuthorDailyDefect` returns the FIRST defect. With `observedAt` checked after
-        // the date, a run whose clock is corrupt AND whose every row also carries a bad date
-        // reported `invalid_date` for all of them — so every row was skipped, nothing reached
-        // the throw, and the run-level fault advanced the cursor and reported `ok`.
-        const bothWrong = findRawAuthorDailyDefect(input({date: 'not-a-day'}), 'not-an-instant');
-        expect(bothWrong?.code).toBe('invalid_instant');
-        expect(ROW_LEVEL_REFUSALS).not.toContain(bothWrong!.code);
+        // The validator raises the FIRST defect. With `observedAt` checked after the date, a run
+        // whose clock is corrupt AND whose every row also carries a bad date would raise
+        // `invalid_date` for all of them — so every row would be skipped, nothing would reach the
+        // run-level throw, and the fault the split exists to make loud would advance the cursor
+        // and report `ok`.
+        const bothWrong = refusalCodeOf(input({date: 'not-a-day'}), 'not-an-instant');
+        expect(bothWrong).toBe('invalid_instant');
+        expect(ROW_LEVEL_REFUSALS).not.toContain(bothWrong!);
     });
 });
 
@@ -971,35 +991,19 @@ describe('ROW_LEVEL_REFUSALS — what the sync may skip (#302/#306)', () => {
  * different field of the same body. `analysis-types.ts` builds `authorName` with `||`, which
  * only filters falsy, so `{}` / `[]` / `42` survive from a cast response body.
  */
-describe('findRawAuthorDailyDefect covers the identity columns (#302)', () => {
+describe('the write boundary covers the identity columns (#302)', () => {
     const OBSERVED = '2026-07-01T10:00:00.000Z';
     const FIELDS = ['author_login', 'author_email', 'author_display_name'] as const;
 
     for (const field of FIELDS) {
-        it(`refuses a non-string ${field}, which the upsert would have .trim()ed`, () => {
-            const db = new Database(':memory:');
-            try {
-                runMigrations(db, MIGRATIONS_DIR);
-                const row = input({[field]: {} as never});
-                expect(findRawAuthorDailyDefect(row, OBSERVED)?.code).toBe('invalid_identity');
-                // The input class only this guard handles: without it the throw below is a
-                // TypeError from inside the transaction, not a typed refusal.
-                expect(() => upsertRawAuthorDaily(db, row, OBSERVED)).toThrow();
-            } finally {
-                db.close();
-            }
+        it(`refuses a non-string ${field} as invalid_identity, which the upsert would have .trim()ed`, () => {
+            // The input class only this guard handles: without it the throw is a raw TypeError
+            // from inside the transaction rather than a typed row-level refusal.
+            expect(refusalCodeOf(input({[field]: {} as never}), OBSERVED)).toBe('invalid_identity');
         });
 
         it(`still accepts a null ${field}, which is the normal shape for a PR-only author`, () => {
-            const db = new Database(':memory:');
-            try {
-                runMigrations(db, MIGRATIONS_DIR);
-                const row = input({[field]: null});
-                expect(findRawAuthorDailyDefect(row, OBSERVED)).toBeNull();
-                expect(() => upsertRawAuthorDaily(db, row, OBSERVED)).not.toThrow();
-            } finally {
-                db.close();
-            }
+            expect(refusalCodeOf(input({[field]: null}), OBSERVED)).toBeNull();
         });
     }
 
@@ -1008,8 +1012,7 @@ describe('findRawAuthorDailyDefect covers the identity columns (#302)', () => {
         // decided partly by `provider` (the namespacing rule), so it refuses every row of a
         // provider at once and is fail-closed. Folding the identity check into it would have made
         // a single odd display name roll back every provider's window.
-        const found = findRawAuthorDailyDefect(input({author_display_name: 42 as never}), OBSERVED);
-        expect(found?.code).toBe('invalid_identity');
+        expect(refusalCodeOf(input({author_display_name: 42 as never}), OBSERVED)).toBe('invalid_identity');
         expect(ROW_LEVEL_REFUSALS).toContain('invalid_identity');
         expect(ROW_LEVEL_REFUSALS).not.toContain('invalid_key');
     });

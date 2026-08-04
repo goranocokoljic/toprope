@@ -193,7 +193,7 @@ export interface DistinctRawAuthor {
  *
  * A non-string is treated as ABSENT, exactly like `null`, so the key falls through to the
  * other field. That keeps the row alive and carrying its offending value, which
- * {@link findRawAuthorDailyDefect} then refuses as `invalid_identity` at the write boundary
+ * {@link assertValidInput} then refuses as `invalid_identity` at the write boundary
  * — so the loss costs one author-day and reaches the advisory surface, instead of the run.
  * (Both non-string → `null` → the caller skips the author, the same as a truly-anonymous
  * one; there is no identity left to report the day under.)
@@ -518,172 +518,117 @@ export const ROW_LEVEL_REFUSALS: readonly RawAuthorDailyErrorCode[] = [
     'invalid_metric',
 ];
 
-/** What is wrong with a row this store will not accept. See {@link findRawAuthorDailyDefect}. */
-export interface RawAuthorDailyDefect {
-    code: RawAuthorDailyErrorCode;
-    /** Operator-readable, and it INTERPOLATES THE OFFENDING VALUE — see the caller warning. */
-    message: string;
-}
-
-/** Brevity only — one `return defect(...)` per rule reads as the rule, not as object literals. */
-function defect(code: RawAuthorDailyErrorCode, message: string): RawAuthorDailyDefect {
-    return {code, message};
-}
-
 /**
- * The first defect that would make {@link upsertRawAuthorDaily} refuse this row, or `null` if
- * the row is writable — the same decision {@link assertValidInput} makes, without the throw.
+ * Refuse this row unless the store can accept it, by throwing {@link RawAuthorDailyError} with a
+ * typed {@link RawAuthorDailyErrorCode} — the ONE validator the write boundary has, and the shape
+ * every caller of {@link upsertRawAuthorDaily} is written against.
  *
- * WHY IT EXISTS (#302). This validator runs inside the git sync's SINGLE all-providers write
- * transaction, so a throw does not cost one row: it rolls back every provider's window, no
+ * WHY THE CALLER CATCHES IT (#302/#307). This runs inside the git sync's SINGLE all-providers
+ * write transaction, so a throw does not cost one row: it rolls back every provider's window, no
  * cursor advances, and the identical input recurs on the next run — a permanent stall of the
- * whole git connector. #275/#290 closed that door for the commit author date by gating it at
- * each provider, but three more dates reach here ungated (`pr.createdAt`, `pr.mergedAt`,
- * `comment.createdAt`, keyed into a day by `analyzer.ts`) plus the NaN
- * `avg_time_to_merge_hours` those timestamps compute. A fourth and fifth provider gate would
- * not close the class; asking THIS function, at the write boundary, is total over every field
- * it validates and over every future provider.
+ * whole git connector. #275/#290 closed that door for the commit author date by gating it at each
+ * provider, but three more dates reach here ungated (`pr.createdAt`, `pr.mergedAt`,
+ * `comment.createdAt`, keyed into a day by `analyzer.ts`) plus the NaN `avg_time_to_merge_hours`
+ * those timestamps compute. A fourth and fifth provider gate would not close the class; refusing
+ * HERE is total over every field this validates and over every future provider. The sync
+ * therefore CATCHES this throw and — for a {@link ROW_LEVEL_REFUSALS} code only — skips the one
+ * row rather than letting it roll the run back. #307 collapsed the old separate pre-check
+ * (`findRawAuthorDailyDefect`, a non-throwing twin that had to be kept byte-for-byte in step with
+ * this one) into exactly that catch: one validator, run once at the write, with no second body to
+ * drift.
  *
- * ONE BODY, TWO CALLERS. The throwing form now delegates here rather than restating the rules,
- * so the sync's per-row skip and the store's refusal can never disagree about what is writable
- * — a second copy is exactly how the #290 gate/store agreement drifted before it was made
- * structural.
+ * FAIL-CLOSED, and ordered so the caller's split is a property of the RULES, not of the row mix.
+ * The run- and provider-level rules run FIRST: this throws the FIRST defect it finds, and the
+ * caller skips a row-level refusal but lets a run/provider-level one throw — so if a run whose
+ * clock is corrupt (`observedAt`) ALSO carries a bad date on every row, checking `observedAt`
+ * first is what stops every row being skipped as `invalid_date` while the run-level fault the
+ * split exists to make loud advances the cursor and reports `ok`.
  *
- * FIRST defect, not all of them: the caller acts identically on any defect (skip the row and
- * report it), so enumerating the rest would cost a full pass to say nothing more.
- *
- * CALLER WARNING — {@link RawAuthorDailyDefect.message} embeds the offending value, which is
- * response-derived and unvalidated. It is fine in a thrown `Error`, and it is NOT fine pasted
- * into a line that reaches a terminal, `sync_logs.errors` or the admin UI. Render
- * {@link RawAuthorDailyDefect.code} there instead — that is what
- * {@link RAW_AUTHOR_DAILY_ERROR_CODES} is an allowlist for.
+ * THE MESSAGE EMBEDS THE OFFENDING VALUE, which is response-derived and unvalidated. It is fine
+ * in a thrown `Error`; it is NOT fine pasted into a line that reaches a terminal,
+ * `sync_logs.errors` or the admin UI. A caller rendering an advisory interpolates the typed
+ * `.code` (a closed vocabulary — {@link RAW_AUTHOR_DAILY_ERROR_CODES}) there, never `.message`.
  */
-export function findRawAuthorDailyDefect(
-    row: RawAuthorDailyInput,
-    observedAt: string,
-): RawAuthorDailyDefect | null {
-    // RUN- AND PROVIDER-LEVEL RULES FIRST, before any row-level one (#302 review cycle 2, SEC-3).
-    //
-    // This returns the FIRST defect, and the sync skips a row-level refusal but lets a
-    // run/provider-level one throw. Order therefore decides which of the two a row that violates
-    // BOTH is reported as — and with `observedAt` checked after `date`, a run whose clock is
-    // corrupt AND whose every row also carries a bad date returned `invalid_date` for all of
-    // them, so every row was skipped, nothing ever reached the throw, and the run-level defect
-    // the split exists to make loud advanced the cursor and reported `ok`. Evaluating the
-    // run-level rules first makes the split a property of the RULES rather than of which rows
-    // happened to be in the batch.
+function assertValidInput(row: RawAuthorDailyInput, observedAt: string): void {
     if (!UTC_ISO_INSTANT_RE.test(observedAt)) {
-        return defect('invalid_instant', `observedAt must be a UTC ISO instant, got: ${observedAt}`);
+        throw new RawAuthorDailyError('invalid_instant', `observedAt must be a UTC ISO instant, got: ${observedAt}`);
     }
     if (!RAW_AUTHOR_PROVIDERS.includes(row.provider)) {
-        return defect('invalid_provider', `Unknown git provider: ${String(row.provider)}`);
+        throw new RawAuthorDailyError('invalid_provider', `Unknown git provider: ${String(row.provider)}`);
     }
-    // The container is half the attribution key (#264). A blank one would merge two
-    // provider instances back into one bucket — the exact defect the column removes — and
-    // would leave rows that no per-container delete can retract. Refused at the write
-    // boundary, not just by the schema CHECK, so the caller gets a message naming the
-    // problem instead of a raw SQLITE_CONSTRAINT. Blankness goes through the SHARED
-    // `isBlankContainer` (#266) rather than a local `.trim()`, so this boundary and the
-    // duplicate guard cannot disagree about what an empty container is — and it is total over a
-    // non-string too (`normalizeContainer` yields `''`), so no separate `typeof` disjunct is needed.
+    // The container is half the attribution key (#264). A blank one would merge two provider
+    // instances back into one bucket — the exact defect the column removes — and would leave rows
+    // no per-container delete can retract. Refused here, not just by the schema CHECK, so the
+    // caller gets a message naming the problem instead of a raw SQLITE_CONSTRAINT. Blankness goes
+    // through the SHARED `isBlankContainer` (#266) rather than a local `.trim()`, so this boundary
+    // and the duplicate guard cannot disagree about what an empty container is — and it is total
+    // over a non-string too (`normalizeContainer` yields `''`), so no separate `typeof` disjunct
+    // is needed.
     if (isBlankContainer(row.container)) {
-        return defect(
+        throw new RawAuthorDailyError(
             'invalid_container',
             `container must be a non-blank string (the provider's org/workspace/group), got: ${String(row.container)}`,
         );
     }
     if (!row.raw_author_key || !row.raw_author_key.trim()) {
-        return defect('invalid_key', 'raw_author_key must be a non-blank string');
+        throw new RawAuthorDailyError('invalid_key', 'raw_author_key must be a non-blank string');
     }
-    // The key must carry the SAME provider as the column. readRawDailyForKeys relies on
-    // a key embedding its own provider to justify querying without a provider predicate;
-    // that invariant has to be ENFORCED at the write boundary, not merely assumed, or a
-    // mismatched pair writes a second row (the UNIQUE triple includes provider) that the
-    // key-read would then return as cross-provider contamination.
+    // The key must carry the SAME provider as the column. readRawDailyForKeys relies on a key
+    // embedding its own provider to justify querying without a provider predicate; that invariant
+    // has to be ENFORCED here, not merely assumed, or a mismatched pair writes a second row (the
+    // UNIQUE triple includes provider) that the key-read would then return as cross-provider
+    // contamination.
     if (!row.raw_author_key.startsWith(`${row.provider}:`)) {
-        return defect(
+        throw new RawAuthorDailyError(
             'invalid_key',
             `raw_author_key must be namespaced by its provider (${row.provider}:…), got: ${row.raw_author_key}`,
         );
     }
     if (!isUtcDay(row.date)) {
-        return defect('invalid_date', `date must be a UTC YYYY-MM-DD day, got: ${String(row.date)}`);
+        throw new RawAuthorDailyError('invalid_date', `date must be a UTC YYYY-MM-DD day, got: ${String(row.date)}`);
     }
-    // THE IDENTITY COLUMNS, which this validator did not cover until #302 review cycle 2 (SEC-1).
+    // THE IDENTITY COLUMNS. `upsertRawAuthorDaily` DEREFERENCES all three inside the shared write
+    // transaction — `bestKnown` and `normalizeEmail` both do `(x ?? '').trim()` — so a non-string,
+    // non-null value is a `TypeError` from inside the write: the exact permanent-stall geometry a
+    // bad date has, reached by a different field. Reachable, not theoretical: `analysis-types.ts`
+    // builds `authorName`/`authorLogin`/`authorEmail` with `||`, which only filters falsy, so
+    // `{}` / `[]` / `42` survive from a cast response body.
     //
-    // They are the third unvalidated bind in the SAME row the date rules above were made total
-    // for, and they are worse than a bind: `upsertRawAuthorDaily` DEREFERENCES all three inside
-    // the shared write transaction — `bestKnown` and `normalizeEmail` both do `(x ?? '').trim()`
-    // — so a non-string, non-null value is a `TypeError` thrown from inside `insertMany`, which
-    // is the exact permanent-stall geometry this issue exists to close, reached by a different
-    // field of the same body.
-    //
-    // Reachable, not theoretical: `analysis-types.ts` builds `authorName`, `authorLogin` and
-    // `authorEmail` with `||`, which only filters falsy, so `{}` / `[]` / `42` survive from a
-    // cast response body.
-    //
-    // ALL THREE ARE LIVE, and the original of this comment claimed otherwise: it said
-    // `rawAuthorKeyFor` "would already have thrown on a non-string login (earlier, and OUTSIDE
-    // the transaction, where it costs one provider rather than the run)". Both halves were
-    // wrong (#302 review cycle 3, SO-1/SEC-1). It threw, yes — but from `sync.ts`'s post-fetch
-    // loop, which is inside NO `try`: the per-provider catch closed with the fetch and the
-    // write transaction's had not opened, so the throw escaped the whole RUN, advancing no
-    // cursor and emitting no advisory. Not "one provider", and strictly worse than the rollback
-    // this issue is about. `rawAuthorKeyFor`/`retentionKeyFor` are now total over a non-string
-    // (treating it as absent), which is what routes those two fields HERE, to a row-level
-    // refusal that costs one author-day and says so.
-    //
-    // ITS OWN CODE, not `invalid_key`, even though both are about identity. `invalid_key` is
-    // decided partly by `provider` — the namespacing rule — so it is refused for every row of a
-    // provider at once and is therefore NOT row-level. This one is: the value comes from one
-    // author's own commit, and re-fetching returns the identical body. Folding it into
-    // `invalid_key` would have made a single odd display name roll back every provider's window,
-    // which is the failure this whole issue exists to close.
+    // ITS OWN CODE, not `invalid_key`, even though both are about identity: `invalid_key` is
+    // decided partly by `provider` (the namespacing rule), so it refuses every row of a provider
+    // at once and is NOT row-level. This one is — the value comes from one author's own commit and
+    // re-fetching returns the identical body — so folding it into `invalid_key` would make a
+    // single odd display name roll back every provider's window, the failure this whole issue
+    // exists to close.
     for (const field of IDENTITY_FIELDS) {
         const value = row[field];
         if (value !== null && typeof value !== 'string') {
-            return defect(
+            throw new RawAuthorDailyError(
                 'invalid_identity',
                 `${field} must be a string or null, got: ${typeof value}`,
             );
         }
     }
     // Range-validate the metrics here rather than letting the schema CHECKs surface a raw
-    // SQLITE_CONSTRAINT — and because NaN binds as NULL into a NOT NULL column, which
-    // would fail with an error that names the wrong problem.
+    // SQLITE_CONSTRAINT — and because NaN binds as NULL into a NOT NULL column, an error that
+    // names the wrong problem. The code is per FIELD (#306): see {@link metricDefectCode}.
     for (const field of COUNTER_FIELDS) {
         const value = row[field];
         if (!Number.isInteger(value) || (value as number) < 0) {
-            return defect(metricDefectCode(field), `${field} must be a non-negative integer, got: ${String(value)}`);
+            throw new RawAuthorDailyError(metricDefectCode(field), `${field} must be a non-negative integer, got: ${String(value)}`);
         }
     }
     for (const field of RATE_FIELDS) {
         if (!Number.isFinite(row[field])) {
-            return defect(metricDefectCode(field), `${field} must be a finite number, got: ${String(row[field])}`);
+            throw new RawAuthorDailyError(metricDefectCode(field), `${field} must be a finite number, got: ${String(row[field])}`);
         }
     }
     if (row.avg_time_to_merge_hours !== null && !Number.isFinite(row.avg_time_to_merge_hours)) {
-        return defect(
+        throw new RawAuthorDailyError(
             metricDefectCode('avg_time_to_merge_hours'),
             `avg_time_to_merge_hours must be a finite number or null, got: ${String(row.avg_time_to_merge_hours)}`,
         );
     }
-    return null;
-}
-
-/**
- * Refuse this row, by throwing {@link RawAuthorDailyError} — the shape every existing caller of
- * {@link upsertRawAuthorDaily} is written against.
- *
- * A three-line delegation to {@link findRawAuthorDailyDefect} rather than a second copy of the
- * rules: the sync's per-row skip (#302) and this refusal decide the SAME question, and the one
- * thing that must never happen is for them to disagree — a row the skip lets through and this
- * throws on rolls back every provider's window, which is the whole failure the skip exists to
- * prevent. Sharing the body makes that structural instead of a promise.
- */
-function assertValidInput(row: RawAuthorDailyInput, observedAt: string): void {
-    const found = findRawAuthorDailyDefect(row, observedAt);
-    if (found) throw new RawAuthorDailyError(found.code, found.message);
 }
 
 const SELECT_COLUMNS = `id, provider, container, raw_author_key, author_login, author_email, author_display_name,

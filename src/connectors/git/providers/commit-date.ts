@@ -30,10 +30,11 @@
  * (`toDateString(pr.createdAt / pr.mergedAt / comment.createdAt)` in `analyzer.ts`) and the NaN
  * `avg_time_to_merge_hours` those two timestamps compute still reach the store ungated by any
  * provider. What changed in #302 is what happens NEXT: those dates no longer roll the run back.
- * The sync asks `findRawAuthorDailyDefect` — the same body the store's refusal delegates to —
- * for every raw row and `findPRRecordDefect` for every `pr_records` row (the OTHER write in the
- * same transaction, whose `created_at` is a `NOT NULL` column bound from an unvalidated field),
- * skips the ones either write would refuse, and reports them under `AUTHOR_DAYS_SKIPPED_PREFIX`
+ * The sync CATCHES the raw store's own typed refusal for every raw row (#307 collapsed the old
+ * `findRawAuthorDailyDefect` pre-check into that catch) and catches the `pr_records` bind refusal
+ * for every PR record (the OTHER write in the same transaction, whose `created_at` is a `NOT NULL`
+ * column bound from an unvalidated field), skips the ones either write refuses, and reports them
+ * under `AUTHOR_DAYS_SKIPPED_PREFIX`
  * / `PR_RECORDS_SKIPPED_PREFIX`. That is total over every field those writes validate and over
  * every future provider, which is why it is a write-boundary skip and not a fourth gate here.
  * It is scoped to the DATE class at those two writes — it is not a claim that nothing else in

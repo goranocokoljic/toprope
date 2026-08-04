@@ -395,7 +395,9 @@ describe('#302 an unwritable author-day costs that row, not the run', () => {
             const prLine = prLineOf(result.errors);
             expect(prLine).toContain('[github/test-org]');
             expect(prLine).toContain('1 PR(s)');
-            expect(prLine).toContain('refused as unstorable_created_at');
+            // #307 no longer classifies WHICH column was unstorable — the skip is caught at the
+            // write, so the reason is one generic literal rather than a per-column code.
+            expect(prLine).toContain('refused as an unstorable field');
             expect(prLine).toContain('repo1#1');
             expect(countRows(db, 'pr_records')).toBe(0);
         });
@@ -762,25 +764,20 @@ describe('#302 an unwritable author-day costs that row, not the run', () => {
 
     describe('the OTHER write in the transaction (pr_records)', () => {
         /**
-         * Every non-`missing_created_at` arm of `findPRRecordDefect`, driven end to end.
+         * The two bind faults `pr_records` refuses at the write (#302/#307), driven end to end —
+         * the two error SHAPES `isUnstorablePRFieldError` matches beyond the `null` NOT-NULL case
+         * covered above: an object bound positionally (better-sqlite3 RangeError) and a `NOT NULL`
+         * column bound `undefined` (`SQLITE_CONSTRAINT_NOTNULL`).
          *
          * Each is a `NOT NULL` column (or a nullable one whose non-string value `toUtcIso` passes
          * through untouched to the bind) filled from a field GitHub CASTS rather than validates.
-         * Before cycle 1's fix each threw out of `insertMany` and rolled back every provider's
-         * window; the existing date fixtures could not reach them, because they only ever use a
-         * string or `null` — precisely the input class the old and new forms agree on.
+         * Before #302 each threw out of `insertMany` and rolled back every provider's window; the
+         * existing date fixtures could not reach them, because they only ever use a string or
+         * `null`. #307 no longer names the offending column, so all report one generic reason.
          */
-        const PR_BIND_FAULTS: Array<{name: string; pr: GitHubPRFields; code: string}> = [
-            {
-                name: 'an object merged_at',
-                pr: {created_at: PR_CREATED, merged_at: {}},
-                code: 'unstorable_merged_at',
-            },
-            {
-                name: 'an omitted state',
-                pr: {created_at: PR_CREATED, merged_at: null, state: undefined},
-                code: 'unstorable_state',
-            },
+        const PR_BIND_FAULTS: Array<{name: string; pr: GitHubPRFields}> = [
+            {name: 'an object merged_at', pr: {created_at: PR_CREATED, merged_at: {}}},
+            {name: 'an omitted state', pr: {created_at: PR_CREATED, merged_at: null, state: undefined}},
         ];
 
         for (const fault of PR_BIND_FAULTS) {
@@ -797,7 +794,7 @@ describe('#302 an unwritable author-day costs that row, not the run', () => {
                 expect(rowsFor(db, 'gitlab')[0].commits).toBe(3);
                 expect(cursorOf(db, GITLAB_CURSOR)).toBeDefined();
                 expect(countRows(db, 'pr_records')).toBe(0);
-                expect(prLineOf(result.errors)).toContain(`refused as ${fault.code}`);
+                expect(prLineOf(result.errors)).toContain('refused as an unstorable field');
                 expect(prLineOf(result.errors)).toContain('repo1#1');
             });
         }
@@ -878,6 +875,63 @@ describe('#302 an unwritable author-day costs that row, not the run', () => {
             // …and it was NOT reported as a per-row skip, which would have claimed a permanent
             // loss over a window that is in fact intact.
             expect(skipLineOf(result.errors)).toBeUndefined();
+        });
+    });
+
+    describe('a non-refusal error is never swallowed as a skip (#307)', () => {
+        // The write-boundary skip is now a CATCH at each write, and the whole point of #307's
+        // discrimination is that the catch is narrow: it absorbs ONLY the store's own row-level
+        // refusal (raw side) or an unstorable-field bind error (pr side). A bare `catch {}` in
+        // either place would swallow a raised trigger, SQLITE_BUSY or a genuine bug as a "skipped
+        // row" advisory WITH the cursor advanced — fail-open on an unknown error class, a worse
+        // version of the failure #302 closed. These two drive an unrelated SQLite error through
+        // each write and assert the run rolls back loudly instead. Replace either catch's filter
+        // with a bare catch and exactly the matching test here goes red.
+        it('rethrows a raised trigger from the raw_author_daily write and rolls the run back', async () => {
+            seedAlice(db);
+            // Not a RawAuthorDailyError and not row-level: RAISE(ABORT) surfaces as a SqliteError
+            // (SQLITE_CONSTRAINT_TRIGGER), which the raw catch must let propagate.
+            db.exec(`
+                CREATE TRIGGER raw_boom BEFORE INSERT ON raw_author_daily
+                BEGIN SELECT RAISE(ABORT, 'raw boom'); END;
+            `);
+            vi.stubGlobal(
+                'fetch',
+                makeCountingFetch(githubPRRoutes({created_at: PR_CREATED, merged_at: PR_MERGED})).fetchMock,
+            );
+
+            const result = await runSync(db, [GITHUB_CONFIG]);
+
+            expect(result.errors.some((e) => /transaction rolled back/.test(e))).toBe(true);
+            expect(result.errors.some((e) => /raw boom/.test(e))).toBe(true);
+            expect(countRows(db, 'raw_author_daily')).toBe(0);
+            expect(cursorOf(db, GITHUB_CURSOR)).toBeUndefined();
+            // NOT reported as a per-row skip — that would claim a permanent loss over an intact
+            // window and advance the cursor past it.
+            expect(skipLineOf(result.errors)).toBeUndefined();
+        });
+
+        it('rethrows a raised trigger from the pr_records write and rolls the run back', async () => {
+            seedAlice(db);
+            // A trigger abort is SQLITE_CONSTRAINT_TRIGGER, not the SQLITE_CONSTRAINT_NOTNULL /
+            // bind shapes `isUnstorablePRFieldError` matches — so the pr catch must rethrow it.
+            db.exec(`
+                CREATE TRIGGER pr_boom BEFORE INSERT ON pr_records
+                BEGIN SELECT RAISE(ABORT, 'pr boom'); END;
+            `);
+            vi.stubGlobal(
+                'fetch',
+                makeCountingFetch(githubPRRoutes({created_at: PR_CREATED, merged_at: PR_MERGED})).fetchMock,
+            );
+
+            const result = await runSync(db, [GITHUB_CONFIG]);
+
+            expect(result.errors.some((e) => /transaction rolled back/.test(e))).toBe(true);
+            expect(result.errors.some((e) => /pr boom/.test(e))).toBe(true);
+            // The raw writes ran first but rolled back with the failing PR write.
+            expect(countRows(db, 'raw_author_daily')).toBe(0);
+            expect(cursorOf(db, GITHUB_CURSOR)).toBeUndefined();
+            expect(prLineOf(result.errors)).toBeUndefined();
         });
     });
 

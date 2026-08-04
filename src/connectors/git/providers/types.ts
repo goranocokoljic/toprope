@@ -611,11 +611,11 @@ export interface GitProvider {
     // keys a metrics row on `toDateString(pr.createdAt)`, `toDateString(pr.mergedAt)` and
     // `toDateString(comment.createdAt)` (`analyzer.ts`), that day reaches `upsertRawAuthorDaily`
     // verbatim, and `avg_time_to_merge_hours` is a fourth door. #302 closed that class at the
-    // WRITE boundaries instead of adding a fourth and fifth gate here: the sync asks
-    // `findRawAuthorDailyDefect` — the same body the store's refusal delegates to — for every raw
-    // row, and `findPRRecordDefect` for every `pr_records` row, and skips the ones either write
-    // would refuse. That is total over every field those two writes validate and over every
-    // future provider, which no per-provider gate could be.
+    // WRITE boundaries instead of adding a fourth and fifth gate here: the sync CATCHES the raw
+    // store's own typed refusal for every raw row (#307 collapsed the old `findRawAuthorDailyDefect`
+    // pre-check into that catch), and catches the `pr_records` bind refusal for every PR record,
+    // and skips the ones either write refuses. That is total over every field those two writes
+    // validate and over every future provider, which no per-provider gate could be.
     //
     // WHAT IT DOES NOT CLAIM. "A rollback is unreachable" is a claim about the whole transaction,
     // and the transaction holds more writes than those two — anything a future write binds from
