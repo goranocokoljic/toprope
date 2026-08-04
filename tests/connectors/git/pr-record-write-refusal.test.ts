@@ -93,7 +93,15 @@ describe('isUnstorablePRFieldError — the PR-write skip discrimination (#307)',
         it('a driver LIFECYCLE RangeError/TypeError of the same class as a bind error is NOT swallowed', () => {
             // These are the exact messages a bare `instanceof RangeError || TypeError` match would
             // wrongly absorb as a skip. Matching the MESSAGE positively is the whole point.
-            expect(isUnstorablePRFieldError(new RangeError('Too many parameter values were provided'))).toBe(false);
+            // "Too many" is driven through the REAL driver (an over-supplied positional bind) — it
+            // is the message most confusable with the "too few" alternative we DO match, so it is
+            // pinned to the driver's actual text, not a hand-copied string, exactly like the
+            // positives. The connection-lifecycle throws have no cheap real trigger, so they stay
+            // synthetic; they are far less confusable.
+            const tooMany = realBindError(['x', 'ok', 'y', 'z']); // 4 args, 3 placeholders
+            expect(tooMany).toBeInstanceOf(RangeError);
+            expect((tooMany as RangeError).message).toMatch(/too many parameter values/i);
+            expect(isUnstorablePRFieldError(tooMany)).toBe(false);
             expect(isUnstorablePRFieldError(new TypeError('The database connection is not open'))).toBe(false);
             expect(isUnstorablePRFieldError(new TypeError('This database connection is busy executing a query'))).toBe(false);
         });
