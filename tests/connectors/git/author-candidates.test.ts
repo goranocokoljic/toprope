@@ -296,7 +296,7 @@ describe('listAuthorCandidates — unmapped retained authors (#254)', () => {
         );
         upsertRawAuthorDaily(
             db,
-            rawRow({raw_author_key: 'github:login:erin', author_login: 'erin', date: '2026-07-03', commits: 4}),
+            rawRow({raw_author_key: 'github:login:erin', author_login: 'erin', date: '2026-06-30', commits: 4}),
             '2026-07-01T09:00:00.000Z',
         );
 

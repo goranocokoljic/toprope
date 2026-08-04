@@ -25,6 +25,8 @@ import {
     isoWeekRange,
     priorIsoWeek,
     isUtcDay,
+    isPlainYearInstant,
+    isUtcIsoInstant,
 } from '../../src/aggregation/dates';
 
 /**
@@ -54,6 +56,85 @@ describe('isUtcDay', () => {
         ['a non-date word', 'yesterday'],
     ])('rejects %s', (_label, value) => {
         expect(isUtcDay(value)).toBe(false);
+    });
+});
+
+/**
+ * `isPlainYearInstant` is #309's consolidation of the expanded-year rejection — the rule that used
+ * to be spelled three ways (a `\d{4}`-anchored regex in `sync.ts`, a byte-identical one in
+ * `raw-author-daily.ts`, and `parseCommitBound`'s `/^\d{4}-/` on a round-tripped value in
+ * `bitbucket.ts`). It has direct tests here, in the module that owns it, because every consumer
+ * now composes it: the git window bounds ask it straight, and {@link isUtcIsoInstant} layers the
+ * round-trip on top.
+ */
+describe('isPlainYearInstant', () => {
+    it.each([
+        ['the canonical toISOString form', '2026-07-01T10:00:00.000Z'],
+        ['a millis-less instant', '2024-01-01T00:00:00Z'],
+        // Deliberately accepted: this is a BOUND check, not an input-format contract. A value the
+        // git window walk can compare correctly is usable even if it is not how we would spell it.
+        ['an offset-bearing instant', '2024-01-15T10:00:00.000+02:00'],
+        ['a bare day', '2024-01-15'],
+        ['a four-digit year at the low end', '0001-01-01T00:00:00.000Z'],
+    ])('accepts %s', (_label, value) => {
+        expect(isPlainYearInstant(value)).toBe(true);
+    });
+
+    it.each([
+        // THE case the rule exists for. It parses to a finite instant and round-trips through
+        // `Date` cleanly, so a `Number.isNaN` check waves it through — yet '+' (0x2B) byte-sorts
+        // BELOW every digit, so every string comparison reads it as the distant past while it is
+        // in fact the far future. #233 bricked a backfill on exactly this; #304's commit walk
+        // returned an empty page as a success on it.
+        ['an ISO expanded year', '+033658-09-27T00:00:00.000Z'],
+        ['a padded expanded year', '+010000-01-01T00:00:00.000Z'],
+        ['a negative year', '-000001-01-01T00:00:00.000Z'],
+        ['an unparseable value', 'not-a-date'],
+        ['the empty string', ''],
+        ['an out-of-range instant', '+275760-09-14T00:00:00.000Z'],
+    ])('rejects %s', (_label, value) => {
+        expect(isPlainYearInstant(value)).toBe(false);
+    });
+
+    // TOTAL over a non-string, and `typeof` first — the values reaching it are stored `sync_state`
+    // rows and cast response fields, and `RegExp.test` COERCES, so an array would otherwise
+    // stringify into a passing value. This is the input class ONLY the `typeof` guard handles: a
+    // one-element array of a valid instant is exactly what `String()` turns back into that instant.
+    it.each([
+        ['undefined', undefined],
+        ['null', null],
+        ['a number', 1_700_000_000_000],
+        ['a one-element array of a valid instant', ['2026-07-01T10:00:00.000Z']],
+    ])('rejects the non-string %s rather than coercing it', (_label, value) => {
+        expect(isPlainYearInstant(value)).toBe(false);
+    });
+});
+
+/**
+ * `isUtcIsoInstant` is the canonical stored-timestamp shape: byte-for-byte what `toISOString()`
+ * emits. It was module-private in `sync.ts` with a byte-identical regex twin in
+ * `raw-author-daily.ts`; #309 moved it here and both now import it.
+ */
+describe('isUtcIsoInstant', () => {
+    it.each(['2026-07-01T10:00:00.000Z', '2024-01-15T00:00:00.000Z'])('accepts %s', (value) => {
+        expect(isUtcIsoInstant(value)).toBe(true);
+    });
+
+    it.each([
+        // Inherited from isPlainYearInstant.
+        ['an ISO expanded year', '+010000-01-01T00:00:00.000Z'],
+        ['an unparseable value', 'not-a-date'],
+        // Only the ROUND-TRIP rejects these three — each parses AND has a plain four-digit year.
+        ['a calendar-impossible day that normalizes', '2025-02-30T00:00:00.000Z'],
+        ['a millis-less instant', '2024-01-01T00:00:00Z'],
+        ['an offset-bearing instant', '2024-01-15T10:00:00.000+02:00'],
+    ])('rejects %s', (_label, value) => {
+        expect(isUtcIsoInstant(value)).toBe(false);
+    });
+
+    it('rejects a non-string without throwing', () => {
+        expect(isUtcIsoInstant(undefined)).toBe(false);
+        expect(isUtcIsoInstant(42)).toBe(false);
     });
 });
 

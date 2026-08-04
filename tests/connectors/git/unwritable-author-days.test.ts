@@ -253,6 +253,14 @@ function cursorOf(db: Database.Database, key: string): string | undefined {
         | undefined)?.value;
 }
 
+/**
+ * A forward cursor just before the fixtures' commit day, for the cases that need the run to
+ * RESUME rather than treat the window as a first sync. `catchUpUntil` then derives `until` from
+ * this instant plus the catch-up cap rather than from the clock, which is what lets a case with a
+ * corrupt clock still reach the write transaction (#309).
+ */
+const CURSOR_BEFORE_FIXTURES = '2024-01-10T00:00:00.000Z';
+
 const GITHUB_CURSOR = syncStateKey('github', 'test-org');
 const GITLAB_CURSOR = syncStateKey('gitlab', 'test-group');
 const BITBUCKET_CURSOR = syncStateKey('bitbucket', 'test-ws');
@@ -852,7 +860,22 @@ describe('#302 an unwritable author-day costs that row, not the run', () => {
             // reads an ISO 8601 expanded year (the same #233 hazard class as the commit dates
             // above). A blank container cannot get this far: the factory refuses it by name
             // before a provider is ever built.
+            //
+            // BOTH PROVIDERS ARE GIVEN A STORED CURSOR FIRST, and that is what keeps this test
+            // pointed at the store's rollback rather than at #309's window check. With no cursor
+            // the run's `until` IS the corrupt clock reading, which `fetchProviderData` now
+            // refuses outright before a single request — a strictly better outcome, pinned by its
+            // own test below, but it never reaches the write transaction this case is about. With
+            // a cursor, `catchUpUntil` caps `until` to `since + GIT_CATCHUP_WINDOW_MAX_DAYS`, an
+            // ordinary four-digit-year instant the window check accepts, so the corrupt clock
+            // survives to `observedAt` exactly as it did before.
             seedAlice(db);
+            db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?), (?, ?)').run(
+                GITHUB_CURSOR,
+                CURSOR_BEFORE_FIXTURES,
+                GITLAB_CURSOR,
+                CURSOR_BEFORE_FIXTURES,
+            );
             vi.setSystemTime(new Date(EXPANDED_YEAR));
             vi.stubGlobal(
                 'fetch',
@@ -869,8 +892,8 @@ describe('#302 an unwritable author-day costs that row, not the run', () => {
             expect(result.errors.some((e) => /observedAt must be a UTC ISO instant/.test(e))).toBe(true);
             // …NO cursor advanced, for either provider, so both windows re-cover once the
             // operator fixes the clock…
-            expect(cursorOf(db, GITLAB_CURSOR)).toBeUndefined();
-            expect(cursorOf(db, GITHUB_CURSOR)).toBeUndefined();
+            expect(cursorOf(db, GITLAB_CURSOR)).toBe(CURSOR_BEFORE_FIXTURES);
+            expect(cursorOf(db, GITHUB_CURSOR)).toBe(CURSOR_BEFORE_FIXTURES);
             expect(rawRows(db)).toHaveLength(0);
             // …and it was NOT reported as a per-row skip, which would have claimed a permanent
             // loss over a window that is in fact intact.

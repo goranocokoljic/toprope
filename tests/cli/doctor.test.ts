@@ -17,6 +17,7 @@ import {
     loadGitSyncHealth,
     rowRefusalStateKey,
 } from '../../src/connectors/git/sync';
+import {ROW_LEVEL_REFUSALS} from '../../src/connectors/git/raw-author-daily';
 import {createProvider} from '../../src/connectors/git/providers/store';
 import {createCommitDiffstatCache} from '../../src/connectors/git/diffstat-cache';
 import {loadServerKey} from '../../src/connectors/git/providers/secret';
@@ -841,6 +842,20 @@ describe('runDoctor', () => {
                 // Interpolated from the single shared sentence, so a change to the cascade cannot
                 // update one copy and leave this one prescribing the old procedure.
                 expect(allOutput).toContain(configFileProviderNotDeletable());
+                // EVERY code the sync can actually skip on is explained, asserted against
+                // ROW_LEVEL_REFUSALS rather than against a hand-copied list — the hint tells the
+                // operator "its refusal codes name the cause", so a code the sync skips on but the
+                // hint never mentions makes that sentence a dead end. This is what caught the
+                // omission when #309 added `future_date`. The complement (run-level codes) is
+                // deliberately NOT required here: those roll the run back rather than reaching
+                // this advisory at all.
+                for (const code of ROW_LEVEL_REFUSALS) {
+                    expect(allOutput).toContain(`${code}:`);
+                }
+                // …and the one whose likeliest cause is the HOST rather than the commits, which no
+                // per-code gloss can say (#309): a clock skewed backward makes ordinary commits
+                // read as future-dated, so an all-`future_date` refusal is a local repair.
+                expect(allOutput).toMatch(/EVERY code is future_date/);
             });
 
             it('escalates a provider that keeps refusing MOST of what it builds, below the per-run floor', async () => {

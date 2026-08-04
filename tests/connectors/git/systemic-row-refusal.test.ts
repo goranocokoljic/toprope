@@ -659,15 +659,20 @@ describe('#306 a systemic row refusal does not report clean', () => {
 
             // The ordinary next window: one bad row, several good ones. Below the floor, below the
             // streak, and it writes more than it refuses — every threshold says "quiet".
+            //
+            // The "good" days sit between the first window and NOW, never after it. Since #309 a
+            // day later than the run's own UTC day is itself a refusal (`future_date`), so days
+            // dated past NOW would have been counted as skips too and the arithmetic this test is
+            // about would be measuring the fixture rather than the verdict.
             vi.unstubAllGlobals();
             vi.stubGlobal(
                 'fetch',
                 makeCountingFetch(
                     githubCommitRoutes([
                         {day: OLDER_DAYS[0], writable: false},
-                        {day: '2024-02-01', writable: true},
-                        {day: '2024-02-02', writable: true},
-                        {day: '2024-02-03', writable: true},
+                        {day: '2024-01-16', writable: true},
+                        {day: '2024-01-17', writable: true},
+                        {day: '2024-01-18', writable: true},
                     ]),
                 ).fetchMock,
             );
@@ -703,7 +708,7 @@ describe('#306 a systemic row refusal does not report clean', () => {
             vi.unstubAllGlobals();
             vi.stubGlobal(
                 'fetch',
-                makeCountingFetch(githubHealthyCommitRoutes(['2024-02-01', '2024-02-02'])).fetchMock,
+                makeCountingFetch(githubHealthyCommitRoutes(['2024-01-16', '2024-01-17'])).fetchMock,
             );
             const healed = await runSync(db, [GITHUB_CONFIG]);
 

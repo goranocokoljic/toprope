@@ -20,7 +20,7 @@
 
 import type Database from 'better-sqlite3';
 import {randomUUID} from 'crypto';
-import {isUtcDay} from '../../aggregation/dates.js';
+import {addDays, isUtcDay, isUtcIsoInstant} from '../../aggregation/dates.js';
 import {isBlankContainer} from './providers/container.js';
 import type {GitProviderType} from './providers/types.js';
 
@@ -46,15 +46,31 @@ const RAW_AUTHOR_PROVIDERS: readonly GitProviderType[] = ['github', 'bitbucket',
 // params, self-report, the cursor transformer); they validate different inputs against their own
 // extra rules and are deliberately not folded in here.
 
+// The UTC-ISO-instant pin this store enforces on `observedAt` is {@link isUtcIsoInstant},
+// imported rather than restated (#309) — the same move #290 made for the day shape one line up.
+// It was a local `UTC_ISO_INSTANT_RE` here and a byte-identical anchored regex inside `sync.ts`'s
+// own `isUtcIsoInstant`, which is a second copy of the ONE rule that actually matters: expanded /
+// negative ISO years ('+010000-01-01T00:00:00.000Z') round-trip cleanly through `toISOString()`
+// yet sort BEFORE ordinary years, which would invert every string comparison of
+// `first_seen`/`last_seen` (including the MIN/MAX in {@link distinctRawAuthorIdentities}). That
+// rule now has one home (`isPlainYearInstant`, in `aggregation/dates.ts`) and this boundary
+// composes it. Slightly STRICTER than the old regex, deliberately: the shared predicate also
+// round-trips, so a shape-valid impossible instant ('2025-02-30T00:00:00.000Z') is refused here
+// too rather than silently normalizing to a different day inside `laterInstant`.
+
 /**
- * Anchored UTC-ISO-instant shape. Deliberately stricter than `Date.parse`: expanded
- * / negative ISO years ('+010000-01-01T00:00:00.000Z') round-trip cleanly through
- * `toISOString()` yet sort BEFORE ordinary years, which would invert every string
- * comparison of `first_seen`/`last_seen` (including the MIN/MAX in
- * {@link distinctRawAuthorIdentities}). Pinning the shape at the write boundary is what makes
- * those comparisons sound.
+ * How far past the run's own UTC day a commit's day key may legitimately sit — see
+ * {@link assertValidInput}'s future-day refusal for why the answer is one day and not zero (#309).
+ *
+ * The pipeline derives a day key by slicing the RAW author timestamp (`isoDate.slice(0, 10)` in
+ * `analyzer.ts` / `churn.ts`), and `isAttributableDate` deliberately admits an offset form because
+ * the store does — GitLab's `authored_date` really is offset-bearing (`…T10:00:00.000+02:00`). So
+ * a commit made at this very instant in the easternmost zone (UTC+14) keys to TOMORROW's UTC day,
+ * legitimately. One day is exactly that maximum offset rounded up, which is why the horizon is a
+ * derived quantity rather than a fudge factor: it is the largest gap the offset slice can open,
+ * and nothing beyond it can be explained by a timezone.
  */
-const UTC_ISO_INSTANT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+const FUTURE_DAY_HORIZON_DAYS = 1;
 
 /**
  * How many bind parameters one batched read packs into a single statement. Well
@@ -82,6 +98,7 @@ export const RAW_AUTHOR_DAILY_ERROR_CODES = [
     'invalid_key',
     'invalid_identity',
     'invalid_date',
+    'future_date',
     'invalid_instant',
     'invalid_metric',
     'invalid_computed_metric',
@@ -475,12 +492,19 @@ function metricDefectCode(field: keyof DailyGitMetrics): RawAuthorDailyErrorCode
  * The refusals that are a property of the ROW, as opposed to of the run or the provider (#302).
  *
  * The distinction decides whether a caller may SKIP the row or must let the refusal throw.
- * These three are the ones evaluated against a value the row ALONE carries AND that this
+ * These are the ones evaluated against a value the row ALONE carries AND that this
  * pipeline cannot change by re-asking: a day key sliced from that PR's own timestamp, an
  * identity column off that author's own commit, and — since #306 — a metric field whose
  * operands come out of a provider response body uncast. Re-fetching returns the identical
  * unusable value, so holding the cursor for them would brick the provider without saving
  * anything, and skipping is the lesser loss.
+ *
+ * `future_date` (#309) joins them on the same test and is worth calling out because it is the one
+ * whose comparison reads a run-constant operand (`observedAt`). The DEFECT is still the row's —
+ * an author date years ahead of the clock comes back byte-identical on every re-fetch — and
+ * `observedAt` is itself refused as `invalid_instant` (run-level, above) before this check runs.
+ * The case where the run-constant side is the broken one, a host clock skewed BACKWARD, refuses
+ * every row rather than one, which is exactly the shape `isSystemicRowRefusal` escalates.
  *
  * WHICH FIELDS `invalid_metric`'s premise ACTUALLY HOLDS FOR — the second half of #306, because
  * it did not hold for the whole code. `invalid_metric` used to cover every metric field, and for
@@ -514,6 +538,7 @@ function metricDefectCode(field: keyof DailyGitMetrics): RawAuthorDailyErrorCode
  */
 export const ROW_LEVEL_REFUSALS: readonly RawAuthorDailyErrorCode[] = [
     'invalid_date',
+    'future_date',
     'invalid_identity',
     'invalid_metric',
 ];
@@ -550,7 +575,7 @@ export const ROW_LEVEL_REFUSALS: readonly RawAuthorDailyErrorCode[] = [
  * `.code` (a closed vocabulary — {@link RAW_AUTHOR_DAILY_ERROR_CODES}) there, never `.message`.
  */
 function assertValidInput(row: RawAuthorDailyInput, observedAt: string): void {
-    if (!UTC_ISO_INSTANT_RE.test(observedAt)) {
+    if (!isUtcIsoInstant(observedAt)) {
         throw new RawAuthorDailyError('invalid_instant', `observedAt must be a UTC ISO instant, got: ${observedAt}`);
     }
     if (!RAW_AUTHOR_PROVIDERS.includes(row.provider)) {
@@ -586,6 +611,53 @@ function assertValidInput(row: RawAuthorDailyInput, observedAt: string): void {
     }
     if (!isUtcDay(row.date)) {
         throw new RawAuthorDailyError('invalid_date', `date must be a UTC YYYY-MM-DD day, got: ${String(row.date)}`);
+    }
+    // A FUTURE DEVELOPER-DAY, refused here for every provider at once (#309).
+    //
+    // WHAT ARRIVES. `git commit --date="2099-01-01"` — and any rebase or import of rewritten
+    // history — sets the AUTHOR date far ahead while leaving the COMMITTER date at now. GitHub and
+    // GitLab push the run's window to the server, and that server window filters on the COMMITTER
+    // date, so the row is RETURNED; the day key this pipeline derives comes from the author date;
+    // and `isAttributableDate` is a bare shape-plus-parseability test with no upper bound. So
+    // before this check the row was written as a `2099-01-01` developer-day and projected into
+    // `git_snapshots`, where the append-only rule means it could never be corrected. Bitbucket
+    // REPORTS the same physical commit (its in-memory `until` filter can see it —
+    // `FUTURE_AUTHOR_DATE_DROP_REASON`, #304) and the other two IMPORTED it, which is the
+    // asymmetry this closes.
+    //
+    // WHY THE WRITE BOUNDARY AND NOT A FOURTH PROVIDER GATE — the same argument #302 made for the
+    // PR/review dates. The bound is a property of the RUN (`observedAt`), which no provider knows,
+    // and the three PR/comment dates that reach `row.date` never pass a provider gate at all. One
+    // check here is total over every provider, present and future, and over every route into
+    // `metrics.date`.
+    //
+    // IT IS THE GRADUATED "bound and clamp ranges driven by external timestamps" RULE, and #106 is
+    // what it costs when it is missing: one future-dated snapshot made `buildTrajectory` walk
+    // week-by-week to it and emit thousands of zero-weeks.
+    //
+    // SKIP, NOT CLAMP. Clamping would silently attribute someone else's commits to today, and the
+    // day key is part of the row's identity — a clamped row MERGES into a real day and is then
+    // indistinguishable from it forever. Refusing costs the one author-day and says so:
+    // `future_date` is a {@link ROW_LEVEL_REFUSALS} code, so the sync skips the row and reports it
+    // under `AUTHOR_DAYS_SKIPPED_PREFIX` rather than rolling the run back.
+    //
+    // ROW-LEVEL DESPITE READING A RUN-CONSTANT OPERAND, which is the one thing to check against
+    // that list's own rule. The DEFECT is in the row — re-fetching returns the identical author
+    // date — and `observedAt` has already been validated as a real instant two checks up. The
+    // residual case where the run-constant side is the broken one (a host clock skewed BACKWARD,
+    // making every row look future) refuses everything, and that is precisely what
+    // `isSystemicRowRefusal` (`sync.ts`, #306) escalates from an advisory into a genuine run
+    // failure and a durable `toprope doctor` alert. It is not left to settle as a green run.
+    //
+    // Compared as `YYYY-MM-DD` STRINGS, which is sound because both operands are shape-pinned by
+    // the two checks above it: zero-padded day keys byte-sort chronologically.
+    const futureDayHorizon = addDays(observedAt.slice(0, 10), FUTURE_DAY_HORIZON_DAYS);
+    if (row.date > futureDayHorizon) {
+        throw new RawAuthorDailyError(
+            'future_date',
+            `date is a future developer-day (later than ${futureDayHorizon}, the run's own UTC ` +
+                `day plus the maximum timezone offset), got: ${row.date}`,
+        );
     }
     // THE IDENTITY COLUMNS. `upsertRawAuthorDaily` DEREFERENCES all three inside the shared write
     // transaction — `bestKnown` and `normalizeEmail` both do `(x ?? '').trim()` — so a non-string,
