@@ -644,14 +644,28 @@ interface SkippedPRRecord {
  *     matched — any OTHER `SQLITE_*` code (a FK violation on `developer_id`, a `RAISE(ABORT)`
  *     trigger, `SQLITE_BUSY`, disk-full) is a genuine failure and rethrows.
  *   - an object/array/symbol positional bind (a cast body field that is not a scalar): the driver
- *     rejects the JS value at its BINDING layer, before SQLite ever runs, as a `RangeError` or
- *     `TypeError` with NO `code`. Those two classes are exactly the driver's "this value is not
- *     bindable" signal — a real SQLite failure is always a coded `SqliteError`, never one of them —
- *     so matching the CLASS is exact and needs no message pinning (which would be version-fragile).
- *     The one theoretical overlap is a `RangeError`/`TypeError` thrown by our OWN code inside
- *     `upsertPRRecord`; there is none — its helpers (`toUtcIso`, `computeReviewRounds`,
- *     `timeToMergeHours`) coerce rather than throw on odd input.
+ *     rejects the JS VALUE at its binding layer, before SQLite runs, as a bare `RangeError` /
+ *     `TypeError` with no `code`, carrying one of a few fixed messages ({@link DRIVER_VALUE_BIND_RE}).
+ *     We match those messages POSITIVELY rather than the whole `RangeError`/`TypeError` class,
+ *     because the driver throws the SAME two classes (also uncoded) for LIFECYCLE faults that are
+ *     NOT bad values — "The database connection is not open", "This database connection is busy
+ *     executing a query", "Too many parameter values were provided" — and a bare class match would
+ *     swallow those (and any future own-code `TypeError`) as a per-PR skip WITH the cursor
+ *     advanced, the exact fail-open #302 closed. Version drift fails SAFE: an unrecognized message
+ *     falls through to a rethrow and rolls the run back loudly rather than losing a PR silently.
  */
+/**
+ * better-sqlite3's VALUE-rejection messages, the ones that mean "this bound JS value is not
+ * storable" as opposed to a connection/statement lifecycle fault (#307). An object/array
+ * positional arg is misread as a named-parameter bag ("Too few parameter values"); two such
+ * objects collide ("named parameters in two different objects"); an unbindable scalar like a
+ * symbol is refused outright ("can only bind"). Deliberately EXCLUDES "Too MANY parameter values"
+ * (an arg-count bug at a fixed-arity call site, not a bad value) and the "not open"/"busy"
+ * lifecycle messages — those must roll the run back, not skip one PR.
+ */
+const DRIVER_VALUE_BIND_RE =
+    /too few parameter values|named parameters in two different objects|can only bind/i;
+
 function isUnstorablePRFieldError(err: unknown): boolean {
     if (err instanceof Error) {
         const code = (err as {code?: unknown}).code;
@@ -659,7 +673,7 @@ function isUnstorablePRFieldError(err: unknown): boolean {
             return code === 'SQLITE_CONSTRAINT_NOTNULL';
         }
     }
-    return err instanceof RangeError || err instanceof TypeError;
+    return (err instanceof RangeError || err instanceof TypeError) && DRIVER_VALUE_BIND_RE.test(err.message);
 }
 
 /** The {@link PR_RECORDS_SKIPPED_PREFIX} line for one provider instance, or `[]` for none. */
@@ -820,15 +834,19 @@ export const TOTAL_REFUSAL_ALERT_RUNS = 3;
  * arguable, while leaving a genuinely mixed window — a handful of bad PR dates among a normal
  * day's rows — on the advisory channel.
  *
- * Both operands are counted PRE-DEDUPE, over the same population: every author-day row the fetch
- * loop built for this provider instance, before the within-run merge collapses duplicates. A
- * denominator taken after the merge would move for reasons that have nothing to do with refusals.
+ * Both operands are counted AT THE WRITE (#307): `skipped` is the rows the write refused,
+ * `retained` the rows it accepted, both tallied in `insertMany`'s raw loop over `rawWrites`. That
+ * is the DEDUPED map, but the count equals the pre-dedupe one in practice: `aggregateDailyMetrics`
+ * already collapses a provider instance's repos to one row per `(login, date)` BEFORE the row is
+ * built, and the within-run `mergeDailyDisjoint` only ever fires for the same container appearing
+ * twice — the duplicate-container case the resolver forecloses. So no real single-provider run has
+ * two `rawWrites` entries that a merge collapses, and the ratio moves only with genuine refusals.
  *
- * `retained` counts rows that survived the defect check, not rows that reached SQLite: the
- * `isWritable` gate inside the transaction can still drop one whose container lost its owner
- * mid-run. That is the right denominator anyway — this asks whether the REFUSALS were systemic,
- * and a provider whose container was deleted mid-run is already reported by
- * {@link PROVIDER_DELETED_MID_RUN_PREFIX}.
+ * `retained` counts rows the store ACCEPTED, which is also rows that reached SQLite past the
+ * `isWritable` gate — but that gate is per `(provider, container)`, so a container whose closure
+ * runs at all had every one of its rows counted, and a container deleted mid-run returns early
+ * from its cursor-advance closure and never reads these counts (it is reported by
+ * {@link PROVIDER_DELETED_MID_RUN_PREFIX} instead).
  *
  * This is ONE of the two arms. A run below the floor can still escalate on the streak — ask
  * {@link isEscalatedRefusal}, which is what every surface reads.
