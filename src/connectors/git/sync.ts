@@ -626,6 +626,28 @@ interface SkippedPRRecord {
 }
 
 /**
+ * better-sqlite3's VALUE-rejection messages, the ones that mean "this bound JS value is not
+ * storable" as opposed to a connection/statement lifecycle fault (#307). An object/array
+ * positional arg is misread as a named-parameter bag ("Too few parameter values"); two such
+ * objects collide ("named parameters in two different objects"); an unbindable scalar like a
+ * symbol is refused outright ("can only bind"). Deliberately EXCLUDES "Too MANY parameter values"
+ * and the "not open"/"busy" lifecycle messages — those must roll the run back, not skip one PR.
+ *
+ * KNOWN OVERLOAD, and why it stays (#307 review cycle 2, SO-M1/SEC-1). "Too few parameter values"
+ * is thrown BOTH by an object-valued response field (the bad value we mean to skip) AND by a call
+ * site passing fewer positional args than the statement has `?` placeholders (an arg-count bug in
+ * `upsertPRRecord`'s `.run(...)`), and the message cannot tell them apart. This is tolerated rather
+ * than disambiguated with a scalar pre-check — re-adding a pre-check is exactly what this issue
+ * removes — because an arg-count regression is STATIC (it fails every PR of every provider
+ * identically, not just an odd body) and is caught loudly at develop time by the happy-path
+ * `pr_records`-write assertions in `provider-container-migration`/`provider-delete-cascade`, which
+ * expect a row and would see zero. It never reaches production as silent per-body loss; a bad
+ * object body, which is response-driven and per-PR, is what this correctly skips.
+ */
+const DRIVER_VALUE_BIND_RE =
+    /too few parameter values|named parameters in two different objects|can only bind/i;
+
+/**
  * Is this error `pr_records` refusing an unstorable field VALUE (#307), rather than a genuine
  * failure the run must surface (SQLITE_BUSY, disk-full, a FK violation, a bug in our own code)?
  *
@@ -636,8 +658,8 @@ interface SkippedPRRecord {
  * makes a newly-added `NOT NULL` column covered the day it lands, with no second body to keep in
  * step. The price is that the discrimination is on the ERROR, and it must be EXACT: a bare catch
  * that also swallowed SQLITE_BUSY would advance the cursor over a transient failure and report the
- * run clean — a worse fail-open than the rollback #302 closed. So this matches only the three
- * shapes an unstorable value actually produces, and lets everything else propagate and roll back:
+ * run clean — a worse fail-open than the rollback #302 closed. So this matches only the shapes an
+ * unstorable value actually produces, and lets everything else propagate and roll back:
  *
  *   - `null`/`undefined` into a NOT NULL column: SQLite RUNS the statement and rejects it with a
  *     `SqliteError` carrying `code: 'SQLITE_CONSTRAINT_NOTNULL'`. That is the ONE SQLite-side code
@@ -645,28 +667,21 @@ interface SkippedPRRecord {
  *     trigger, `SQLITE_BUSY`, disk-full) is a genuine failure and rethrows.
  *   - an object/array/symbol positional bind (a cast body field that is not a scalar): the driver
  *     rejects the JS VALUE at its binding layer, before SQLite runs, as a bare `RangeError` /
- *     `TypeError` with no `code`, carrying one of a few fixed messages ({@link DRIVER_VALUE_BIND_RE}).
+ *     `TypeError` with no `code`, carrying one of the fixed messages in {@link DRIVER_VALUE_BIND_RE}.
  *     We match those messages POSITIVELY rather than the whole `RangeError`/`TypeError` class,
  *     because the driver throws the SAME two classes (also uncoded) for LIFECYCLE faults that are
- *     NOT bad values — "The database connection is not open", "This database connection is busy
- *     executing a query", "Too many parameter values were provided" — and a bare class match would
- *     swallow those (and any future own-code `TypeError`) as a per-PR skip WITH the cursor
- *     advanced, the exact fail-open #302 closed. Version drift fails SAFE: an unrecognized message
- *     falls through to a rethrow and rolls the run back loudly rather than losing a PR silently.
+ *     NOT bad values ("connection is not open", "busy executing a query", "Too many parameter
+ *     values"), and a bare class match would swallow those (and any future own-code `TypeError`) as
+ *     a per-PR skip WITH the cursor advanced — the exact fail-open #302 closed. Version drift fails
+ *     SAFE: an unrecognized message falls through to a rethrow and rolls the run back loudly.
+ *
+ * Exported ONLY for `tests/connectors/git/pr-record-write-refusal.test.ts`, which drives real
+ * driver errors for the positives and synthetic lifecycle messages for the negatives — the
+ * single-object and message-vs-class decisions are not reachable end to end (the one object-valued
+ * PR fixture binds two objects, and no pipeline path produces a lifecycle throw), so reverting the
+ * regex or the message test would otherwise pass silently.
  */
-/**
- * better-sqlite3's VALUE-rejection messages, the ones that mean "this bound JS value is not
- * storable" as opposed to a connection/statement lifecycle fault (#307). An object/array
- * positional arg is misread as a named-parameter bag ("Too few parameter values"); two such
- * objects collide ("named parameters in two different objects"); an unbindable scalar like a
- * symbol is refused outright ("can only bind"). Deliberately EXCLUDES "Too MANY parameter values"
- * (an arg-count bug at a fixed-arity call site, not a bad value) and the "not open"/"busy"
- * lifecycle messages — those must roll the run back, not skip one PR.
- */
-const DRIVER_VALUE_BIND_RE =
-    /too few parameter values|named parameters in two different objects|can only bind/i;
-
-function isUnstorablePRFieldError(err: unknown): boolean {
+export function isUnstorablePRFieldError(err: unknown): boolean {
     if (err instanceof Error) {
         const code = (err as {code?: unknown}).code;
         if (typeof code === 'string' && code.startsWith('SQLITE_')) {
@@ -836,11 +851,13 @@ export const TOTAL_REFUSAL_ALERT_RUNS = 3;
  *
  * Both operands are counted AT THE WRITE (#307): `skipped` is the rows the write refused,
  * `retained` the rows it accepted, both tallied in `insertMany`'s raw loop over `rawWrites`. That
- * is the DEDUPED map, but the count equals the pre-dedupe one in practice: `aggregateDailyMetrics`
+ * is the DEDUPED map, but the count tracks the pre-dedupe one closely: `aggregateDailyMetrics`
  * already collapses a provider instance's repos to one row per `(login, date)` BEFORE the row is
- * built, and the within-run `mergeDailyDisjoint` only ever fires for the same container appearing
- * twice — the duplicate-container case the resolver forecloses. So no real single-provider run has
- * two `rawWrites` entries that a merge collapses, and the ratio moves only with genuine refusals.
+ * built, so the within-run `mergeDailyDisjoint` collapses two `rawWrites` entries only in the
+ * corners where distinct build rows share a `(container, raw_author_key, date)` key — the
+ * duplicate-container case the resolver forecloses, or two logins normalizing to one key on one
+ * day. Those are rare and shrink retained and skipped ALIKE, so the ratio still moves only with
+ * genuine refusals; the floor arm's grain is author-day rows, not build rows, by the same token.
  *
  * `retained` counts rows the store ACCEPTED, which is also rows that reached SQLite past the
  * `isWritable` gate — but that gate is per `(provider, container)`, so a container whose closure
@@ -4379,8 +4396,9 @@ export class GitSync implements ConnectorInterface {
                     // moves no cursor, and does it again identically on every subsequent run. Three
                     // PR and review-comment dates (`pr.createdAt`, `pr.mergedAt`,
                     // `comment.createdAt`) reach `metrics.date` verbatim with no provider gate
-                    // between them and here, and `avg_time_to_merge_hours` is NaN whenever the
-                    // first two are unparseable. #307 replaced the pre-check that used to live here
+                    // between them and here (the analyzer keeps `avg_time_to_merge_hours` null on an
+                    // unparseable pair, so only a code regression makes it NaN, which throws as
+                    // `invalid_computed_metric`). #307 replaced the pre-check that used to live here
                     // (`findRawAuthorDailyDefect`) with a CATCH of the store's own throw in the
                     // `insertMany` raw loop: one validator, run once, with no twin to keep in step
                     // — and `retainedKeys`/`retainedRowCount` are recorded THERE, on a successful
