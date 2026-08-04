@@ -4,11 +4,10 @@ import {aggregateDailyMetrics, prMergeDurationHours} from './analyzer.js';
 import {toAnalysisCommit, toAnalysisPR, toAnalysisReviewComment} from './analysis-types.js';
 import type {AnalysisCommit, AnalysisPR, AnalysisReviewComment} from './analysis-types.js';
 import {
-    findRawAuthorDailyDefect,
     mergeDailyDisjoint,
     rawAuthorKeyFor,
     upsertRawAuthorDaily,
-    RAW_AUTHOR_DAILY_ERROR_CODES,
+    RawAuthorDailyError,
     ROW_LEVEL_REFUSALS,
     type RawAuthorDailyErrorCode,
     type RawAuthorDailyInput,
@@ -405,21 +404,6 @@ function sanitizeDropReason(reason: unknown): string {
         : '<unrecognized drop reason>';
 }
 
-/**
- * A raw-store refusal code, safe to interpolate into {@link AUTHOR_DAYS_SKIPPED_PREFIX} (#302).
- *
- * The refusal's `message` is deliberately NOT what the line renders: it embeds the offending
- * value verbatim (`date must be a UTC YYYY-MM-DD day, got: …`), and that value is raw response
- * JSON heading for a terminal, `sync_logs.errors` and the admin provider row. The CODE is a
- * closed vocabulary, so it is allowlisted at runtime against {@link RAW_AUTHOR_DAILY_ERROR_CODES}
- * exactly as {@link sanitizeDropReason} does — same reason, same shape.
- */
-function sanitizeRefusalCode(code: unknown): string {
-    return typeof code === 'string' && (RAW_AUTHOR_DAILY_ERROR_CODES as readonly string[]).includes(code)
-        ? code
-        : '<unrecognized refusal code>';
-}
-
 /** How many characters of a response-derived label an advisory prints before truncating. */
 const ADVISORY_LABEL_MAX_CHARS = 60;
 
@@ -488,9 +472,11 @@ interface SkippedAuthorDay {
  * and churn advisories, because an operator reading all of them in one `errors` list should not
  * have to learn a third.
  *
- * Every interpolated value is sanitized here, at the boundary that knows what each one is: the
- * code against {@link RAW_AUTHOR_DAILY_ERROR_CODES}, the author key and day (both
- * response-derived) through {@link sanitizeAdvisoryLabel}. The container is operator-configured
+ * Every interpolated value is handled at the boundary that knows what each one is: `skip.code` is
+ * a first-party {@link RawAuthorDailyErrorCode} caught from the store's own typed refusal (#307)
+ * — a closed enum produced in-process, not a value crossing a trust boundary, so it interpolates
+ * verbatim exactly as `formatSkippedPRRecords`'s reason does. The author key and day (both
+ * response-derived) go through {@link sanitizeAdvisoryLabel}. The container is operator-configured
  * rather than response-derived, but it goes through the same call — it is free-form text on the
  * admin form, and there is no reason for this line to be the one that trusts it.
  *
@@ -507,7 +493,7 @@ function formatSkippedAuthorDays(
     if (skips.length === 0) return [];
     const groups = formatLossGroups(
         skips.map((skip) => ({
-            reason: sanitizeRefusalCode(skip.code),
+            reason: skip.code,
             label: `${sanitizeAdvisoryLabel(skip.raw_author_key)} on ${sanitizeAdvisoryLabel(skip.date)}`,
         })),
         'refused as',
@@ -623,100 +609,86 @@ function formatSystemicRowRefusal(
  */
 export const PR_RECORDS_SKIPPED_PREFIX = 'PR records skipped as unwritable:';
 
-/**
- * Every reason a `pr_records` row is refused — the vocabulary `findPRRecordDefect` returns and
- * `formatSkippedPRRecords` groups by.
- *
- * NOT a runtime allowlist, unlike {@link RAW_AUTHOR_DAILY_ERROR_CODES} (#302 review cycle 3,
- * SO-4/SEC-5 — this docstring used to claim it was, contradicting `formatSkippedPRRecords`,
- * which declines the check and gives the right reason). The distinction is provenance, not
- * shape: a raw-store code arrives across a module boundary from `raw-author-daily.ts` and is
- * re-checked before interpolation, whereas these values are produced twenty lines away in this
- * same module and are only ever consumed as `typeof PR_RECORD_REFUSALS[number]`. Adding a
- * membership check here would be ceremony over a first-party literal.
- */
-const PR_RECORD_REFUSALS = [
-    'unstorable_repo',
-    'unstorable_pr_id',
-    'unstorable_state',
-    'unstorable_created_at',
-    'unstorable_merged_at',
-    'unstorable_closed_at',
-] as const;
-
-type PRRecordRefusal = (typeof PR_RECORD_REFUSALS)[number];
+/** The single reason the PR-skip advisory groups by (#307) — see {@link isUnstorablePRFieldError}. */
+const PR_RECORD_UNSTORABLE_REASON = 'an unstorable field';
 
 /**
- * One PR whose record this run built and `pr_records` would not accept (#302).
+ * One PR whose record this run built and `pr_records` refused at the write (#302/#307).
  *
- * `repo`/`prId` are `unknown`, not `string`: `findPRRecordDefect` may have refused this very
- * record BECAUSE one of them was not a string, so declaring them `string` here would assert
- * the thing the refusal just disproved. {@link sanitizeAdvisoryLabel} is total over `unknown`.
+ * `repo`/`prId` are `unknown`, not `string`: the record was refused precisely because a field of
+ * it could not be bound, and one of these two may be the offender, so declaring them `string`
+ * would assert the thing the refusal just disproved. {@link sanitizeAdvisoryLabel} is total over
+ * `unknown`.
  */
 interface SkippedPRRecord {
     repo: unknown;
     prId: unknown;
-    reason: PRRecordRefusal;
 }
 
 /**
- * The first reason `upsertPRRecord` would fail to bind this record, or `null` if it is writable.
+ * better-sqlite3's VALUE-rejection messages, the ones that mean "this bound JS value is not
+ * storable" as opposed to a connection/statement lifecycle fault (#307). An object/array
+ * positional arg is misread as a named-parameter bag ("Too few parameter values"); two such
+ * objects collide ("named parameters in two different objects"); an unbindable scalar like a
+ * symbol is refused outright ("can only bind"). Deliberately EXCLUDES "Too MANY parameter values"
+ * and the "not open"/"busy" lifecycle messages — those must roll the run back, not skip one PR.
  *
- * SCOPED TO THE BIND, not to semantics. It asks exactly one question per column — "is this a
- * value SQLite can put in that column" — because that is the whole of what can throw out of the
- * shared transaction. It deliberately does NOT check that `created_at` is a well-formed instant:
- * the column is unconstrained `TEXT`, an odd-but-present timestamp has always been stored
- * verbatim, and refusing it here would DISCARD PR history this pipeline has kept for releases
- * over a shape nothing downstream requires. `time_to_merge_hours` needs no check either — it
- * comes from {@link timeToMergeHours}, which is already total and yields `null`.
- *
- * `provider` and `container` are not checked: both are run-level, not response-derived, and
- * `container` is already gated by the same `isBlankContainer` the raw store uses — see the
- * fail-closed split at the raw write for why a run-level defect must NOT be skipped.
- *
- * A HAND-MAINTAINED MIRROR of what {@link upsertPRRecord} binds, unlike the raw side — where the
- * skip and the store's refusal literally share a body, so they cannot disagree. There is no
- * equivalent seam here: the bind list is a SQL statement, not a validator. Both are therefore
- * EXPORTED for `tests/connectors/git/pr-record-bind.test.ts`, which drives every refusal code
- * through this function AND through the real statement on a migrated database, asserting that
- * each one this refuses really does throw and that a record it passes really does write. That
- * test is what turns "the guard covers the write" from a code-reading exercise into a property —
- * add a `NOT NULL` column bound from a response field without extending this function and it
- * goes red.
+ * KNOWN OVERLOAD, and why it stays (#307 review cycle 2, SO-M1/SEC-1). "Too few parameter values"
+ * is thrown BOTH by an object-valued response field (the bad value we mean to skip) AND by a call
+ * site passing fewer positional args than the statement has `?` placeholders (an arg-count bug in
+ * `upsertPRRecord`'s `.run(...)`), and the message cannot tell them apart. This is tolerated rather
+ * than disambiguated with a scalar pre-check — re-adding a pre-check is exactly what this issue
+ * removes — because an arg-count regression is STATIC (it fails every PR of every provider
+ * identically, not just an odd body) and is caught loudly at develop time by the happy-path
+ * `pr_records`-write assertions in `provider-container-migration`/`provider-delete-cascade`, which
+ * expect a row and would see zero. It never reaches production as silent per-body loss; a bad
+ * object body, which is response-driven and per-PR, is what this correctly skips.
  */
-export function findPRRecordDefect(record: PRRecordInput): PRRecordRefusal | null {
-    if (!isStorable(record.repo)) return 'unstorable_repo';
-    if (!isStorable(record.prId)) return 'unstorable_pr_id';
-    if (!isStorable(record.state)) return 'unstorable_state';
-    if (!isStorable(record.createdAt)) return 'unstorable_created_at';
-    // Nullable columns, so `null` passes — but `undefined` does not, because better-sqlite3
-    // refuses it rather than treating it as NULL, and `toUtcIso` hands it straight through.
-    if (record.mergedAt !== null && !isStorable(record.mergedAt)) return 'unstorable_merged_at';
-    if (record.closedAt !== null && !isStorable(record.closedAt)) return 'unstorable_closed_at';
-    return null;
-}
+const DRIVER_VALUE_BIND_RE =
+    /too few parameter values|named parameters in two different objects|can only bind/i;
 
 /**
- * Can better-sqlite3 bind this value at all?
+ * Is this error `pr_records` refusing an unstorable field VALUE (#307), rather than a genuine
+ * failure the run must surface (SQLITE_BUSY, disk-full, a FK violation, a bug in our own code)?
  *
- * EXACTLY the driver's rule, not a stricter one, because every value this refuses is PR history
- * discarded. The first version asked `typeof === 'string'` and was wrong in both directions the
- * agreement test checks: `''` and a numeric `7` both bind perfectly well (SQLite applies TEXT
- * affinity to a number), so refusing them threw away records the write would have taken.
- * `null`/`undefined` and any object/array/symbol are what actually throw — the first as a NOT
- * NULL violation, the rest as the driver's `TypeError` — and both come out of `insertMany` the
- * same way: the whole run's transaction rolled back.
+ * The PR write is the OTHER unvalidated bind in the git sync's single all-providers transaction:
+ * `repo`/`pr_id`/`state`/`created_at` are `NOT NULL`, and every column is bound from a field the
+ * providers CAST out of a response body. #307 refuses at the write itself rather than mirroring
+ * the bind list in a hand-maintained pre-check (`findPRRecordDefect`, now deleted) — which is what
+ * makes a newly-added `NOT NULL` column covered the day it lands, with no second body to keep in
+ * step. The price is that the discrimination is on the ERROR, and it must be EXACT: a bare catch
+ * that also swallowed SQLITE_BUSY would advance the cursor over a transient failure and report the
+ * run clean — a worse fail-open than the rollback #302 closed. So this matches only the shapes an
+ * unstorable value actually produces, and lets everything else propagate and roll back:
  *
- * `bigint` and `Buffer` are listed for completeness of the driver's contract; no field on
- * `PRRecordInput` can hold one today.
+ *   - `null`/`undefined` into a NOT NULL column: SQLite RUNS the statement and rejects it with a
+ *     `SqliteError` carrying `code: 'SQLITE_CONSTRAINT_NOTNULL'`. That is the ONE SQLite-side code
+ *     matched — any OTHER `SQLITE_*` code (a FK violation on `developer_id`, a `RAISE(ABORT)`
+ *     trigger, `SQLITE_BUSY`, disk-full) is a genuine failure and rethrows.
+ *   - an object/array/symbol positional bind (a cast body field that is not a scalar): the driver
+ *     rejects the JS VALUE at its binding layer, before SQLite runs, as a bare `RangeError` /
+ *     `TypeError` with no `code`, carrying one of the fixed messages in {@link DRIVER_VALUE_BIND_RE}.
+ *     We match those messages POSITIVELY rather than the whole `RangeError`/`TypeError` class,
+ *     because the driver throws the SAME two classes (also uncoded) for LIFECYCLE faults that are
+ *     NOT bad values ("connection is not open", "busy executing a query", "Too many parameter
+ *     values"), and a bare class match would swallow those (and any future own-code `TypeError`) as
+ *     a per-PR skip WITH the cursor advanced — the exact fail-open #302 closed. Version drift fails
+ *     SAFE: an unrecognized message falls through to a rethrow and rolls the run back loudly.
+ *
+ * Exported ONLY for `tests/connectors/git/pr-record-write-refusal.test.ts`, which drives real
+ * driver errors for the positives and synthetic lifecycle messages for the negatives — the
+ * single-object and message-vs-class decisions are not reachable end to end (the one object-valued
+ * PR fixture binds two objects, and no pipeline path produces a lifecycle throw), so reverting the
+ * regex or the message test would otherwise pass silently.
  */
-function isStorable(value: unknown): boolean {
-    return (
-        typeof value === 'string' ||
-        typeof value === 'number' ||
-        typeof value === 'bigint' ||
-        Buffer.isBuffer(value)
-    );
+export function isUnstorablePRFieldError(err: unknown): boolean {
+    if (err instanceof Error) {
+        const code = (err as {code?: unknown}).code;
+        if (typeof code === 'string' && code.startsWith('SQLITE_')) {
+            return code === 'SQLITE_CONSTRAINT_NOTNULL';
+        }
+    }
+    return (err instanceof RangeError || err instanceof TypeError) && DRIVER_VALUE_BIND_RE.test(err.message);
 }
 
 /** The {@link PR_RECORDS_SKIPPED_PREFIX} line for one provider instance, or `[]` for none. */
@@ -726,13 +698,12 @@ function formatSkippedPRRecords(
     skips: readonly SkippedPRRecord[],
 ): string[] {
     if (skips.length === 0) return [];
-    // `skip.reason` is produced by `findPRRecordDefect` in this module and typed `PRRecordRefusal`
-    // — it crosses no boundary, so there is no allowlist here. (`sanitizeRefusalCode` on the
-    // sibling line is not the same case: that code arrives from another module.) The repo and PR
-    // id DO come from a cast response body, which is what `sanitizeAdvisoryLabel` is for.
+    // The reason is a fixed first-party literal (#307), not a per-column code — the write no
+    // longer classifies WHICH field was unstorable, only that a bind refused. The repo and PR id
+    // DO come from a cast response body, which is what `sanitizeAdvisoryLabel` is for.
     const groups = formatLossGroups(
         skips.map((skip) => ({
-            reason: skip.reason,
+            reason: PR_RECORD_UNSTORABLE_REASON,
             label: `${sanitizeAdvisoryLabel(skip.repo)}#${sanitizeAdvisoryLabel(skip.prId)}`,
         })),
         'refused as',
@@ -742,12 +713,11 @@ function formatSkippedPRRecords(
             `${skips.length} PR(s) carried a field pr_records cannot store, and this run has ` +
             `recorded its window as covered — nothing re-asks them. Their per-PR review record ` +
             `(comment counts, review rounds, time-to-merge) is absent, so the PR-review coaching ` +
-            `surfaces are short by any of these whose author is a registered developer — the ` +
-            `count is every REFUSED PR, not every LOST one, because the check runs before author ` +
-            `resolution and a PR by an unregistered author was never going to be stored. The day ` +
-            `counts in raw_author_daily are unaffected wherever those rows were themselves ` +
-            `writable. Providers re-fetch PRs by updated_at/updated_on, so a PR that is never ` +
-            `touched again is never re-delivered. ${groups}.`,
+            `surfaces are short by exactly these: each was authored by a registered developer, ` +
+            `resolved, and then refused at the write, so the count is every LOST PR — not merely ` +
+            `every refused one (#307). The day counts in raw_author_daily are unaffected wherever ` +
+            `those rows were themselves writable. Providers re-fetch PRs by updated_at/updated_on, ` +
+            `so a PR that is never touched again is never re-delivered. ${groups}.`,
     ];
 }
 
@@ -879,15 +849,21 @@ export const TOTAL_REFUSAL_ALERT_RUNS = 3;
  * arguable, while leaving a genuinely mixed window — a handful of bad PR dates among a normal
  * day's rows — on the advisory channel.
  *
- * Both operands are counted PRE-DEDUPE, over the same population: every author-day row the fetch
- * loop built for this provider instance, before the within-run merge collapses duplicates. A
- * denominator taken after the merge would move for reasons that have nothing to do with refusals.
+ * Both operands are counted AT THE WRITE (#307): `skipped` is the rows the write refused,
+ * `retained` the rows it accepted, both tallied in `insertMany`'s raw loop over `rawWrites`. That
+ * is the DEDUPED map, but the count tracks the pre-dedupe one closely: `aggregateDailyMetrics`
+ * already collapses a provider instance's repos to one row per `(login, date)` BEFORE the row is
+ * built, so the within-run `mergeDailyDisjoint` collapses two `rawWrites` entries only in the
+ * corners where distinct build rows share a `(container, raw_author_key, date)` key — the
+ * duplicate-container case the resolver forecloses, or two logins normalizing to one key on one
+ * day. Those are rare and shrink retained and skipped ALIKE, so the ratio still moves only with
+ * genuine refusals; the floor arm's grain is author-day rows, not build rows, by the same token.
  *
- * `retained` counts rows that survived the defect check, not rows that reached SQLite: the
- * `isWritable` gate inside the transaction can still drop one whose container lost its owner
- * mid-run. That is the right denominator anyway — this asks whether the REFUSALS were systemic,
- * and a provider whose container was deleted mid-run is already reported by
- * {@link PROVIDER_DELETED_MID_RUN_PREFIX}.
+ * `retained` counts rows the store ACCEPTED, which is also rows that reached SQLite past the
+ * `isWritable` gate — but that gate is per `(provider, container)`, so a container whose closure
+ * runs at all had every one of its rows counted, and a container deleted mid-run returns early
+ * from its cursor-advance closure and never reads these counts (it is reported by
+ * {@link PROVIDER_DELETED_MID_RUN_PREFIX} instead).
  *
  * This is ONE of the two arms. A run below the floor can still escalate on the streak — ask
  * {@link isEscalatedRefusal}, which is what every surface reads.
@@ -4169,6 +4145,21 @@ export class GitSync implements ConnectorInterface {
         // before it, `snapshotsSkipped` carried only legacy projection cells, so the one numeric
         // field meaning "rows we did not write" never moved for an unwritable row.
         let committedRowsSkipped = 0;
+        // Per-container skip/retain accounting (#307). Both writes now decide their skip AT the
+        // write, inside `insertMany` — which iterates every provider's rows together — so the
+        // counts can no longer be per-fetch-iteration locals; they are keyed by the provider
+        // instance's `containerKeyOf(type, container)` and read back by each cursor-advance closure
+        // (which runs after both write passes complete). A row/PR is counted here only when the
+        // store's own typed refusal is caught; `retainedRowCountByContainer` is the accepted-row
+        // denominator `isSystemicRowRefusal` weighs the refusals against.
+        const skippedRowsByContainer = new Map<string, SkippedAuthorDay[]>();
+        const skippedPRRecordsByContainer = new Map<string, SkippedPRRecord[]>();
+        const retainedRowCountByContainer = new Map<string, number>();
+        const pushByContainer = <T>(map: Map<string, T[]>, key: string, value: T): void => {
+            const list = map.get(key);
+            if (list) list.push(value);
+            else map.set(key, [value]);
+        };
         // Deferred stall-counter updates (#235), applied in the SAME transaction as
         // the cursor advances so the counter and the cursor can never disagree about
         // whether this run moved the provider forward. Unlike `cursorAdvances` this
@@ -4216,22 +4207,21 @@ export class GitSync implements ConnectorInterface {
             // to `now`. Written per-provider even on an empty fetch (a complete run
             // that found nothing legitimately covered its window), so a backfill can
             // only ever widen backward and never re-covers a slice.
-            // This provider instance's unwritable rows (#302), filled further down in this same
-            // iteration and read by the cursor-advance closure pushed immediately below. The
-            // closure runs at CALL time — inside the write transaction, opened after this whole
-            // loop — so it always sees the finished lists. Per iteration rather than run-wide
-            // because the advisory is per provider instance, like `result.droppedAdvisories`.
-            const skippedRows: SkippedAuthorDay[] = [];
-            const skippedPRRecords: SkippedPRRecord[] = [];
-            // The denominator the refusal ratio is judged against (#306): author-day rows this
-            // provider instance BUILT and the write boundary accepted, counted in the same loop
-            // and at the same pre-dedupe grain as `skippedRows`. See `isSystemicRowRefusal`.
-            let retainedRowCount = 0;
+            // This provider instance's unwritable rows and accepted-row count are decided at the
+            // WRITE now (#302/#307), inside `insertMany`, not here — so they live in the run-wide
+            // per-container maps declared above, keyed by this instance's container key.
+            const instanceKey = containerKeyOf(providerType, identifier);
 
             cursorAdvances.push((): void => {
                 // Advancing a cursor the cascade just purged is exactly what re-arms the #262
                 // double-count, so a container whose owner changed mid-run advances nothing.
                 if (!isWritable(providerType, identifier)) return;
+                // THIS instance's write-time accounting, finished by the time this closure runs
+                // (inside the write transaction, after both write passes). `retainedRowCount` is
+                // the accepted-row denominator `isSystemicRowRefusal` weighs the refusals against.
+                const skippedRows = skippedRowsByContainer.get(instanceKey) ?? [];
+                const skippedPRRecords = skippedPRRecordsByContainer.get(instanceKey) ?? [];
+                const retainedRowCount = retainedRowCountByContainer.get(instanceKey) ?? 0;
                 // This provider's window IS being recorded as covered, which is the exact
                 // premise of its drop advisories (#275). Staged, not pushed: this closure runs
                 // INSIDE the write transaction, so on a rollback nothing was recorded and the
@@ -4334,18 +4324,15 @@ export class GitSync implements ConnectorInterface {
             });
 
             for (const record of prRecords) {
-                // THE SECOND WRITE IN THE SHARED TRANSACTION (#302). `upsertPRRecord` binds
+                // THE SECOND WRITE IN THE SHARED TRANSACTION (#302/#307). `upsertPRRecord` binds
                 // `repo`/`pr_id`/`state`/`created_at` — all `NOT NULL`, all cast rather than
                 // validated out of a response body — so a `created_at: null` threw `NOT NULL
                 // constraint failed` from inside `insertMany` and rolled back every other
                 // provider's window: the identical geometry the raw-row skip closes, one write
-                // over. Checked HERE rather than at the write because the check is pure and this
-                // is where the provider that produced the record is still in hand.
-                const prDefect = findPRRecordDefect(record);
-                if (prDefect) {
-                    skippedPRRecords.push({repo: record.repo, prId: record.prId, reason: prDefect});
-                    continue;
-                }
+                // over. #307 collapsed the old `findPRRecordDefect` pre-check into a catch AT the
+                // write (see the `insertMany` PR loop) — which covers a new NOT NULL column the
+                // day it is added and counts exactly the PRs actually lost, since the skip now
+                // lives after author resolution. So every record is queued here unconditionally.
                 fetchedPRRecords.push({record, providerType});
                 // Progress counter only — the authoritative resolution happens in the
                 // write transaction (see `fetchedPRRecords`).
@@ -4402,60 +4389,22 @@ export class GitSync implements ConnectorInterface {
                         avg_commit_size: metrics.avg_commit_size,
                         commit_burst_count: metrics.commit_burst_count,
                     };
-                    // THE WRITE BOUNDARY'S REFUSAL, ASKED HERE INSTEAD OF SUFFERED THERE (#302).
-                    //
-                    // `upsertRawAuthorDaily` validates fail-closed and THROWS, and it runs inside
-                    // this run's single all-providers write transaction — so a row it will not
-                    // accept does not cost one row, it rolls back every provider's window, moves
-                    // no cursor, and does it again identically on every subsequent run. Three PR
-                    // and review-comment dates (`pr.createdAt`, `pr.mergedAt`,
+                    // QUEUED FOR THE WRITE PASS, which is where its refusal is now decided
+                    // (#302/#307). `upsertRawAuthorDaily` validates fail-closed and THROWS, and it
+                    // runs inside this run's single all-providers write transaction — so a row it
+                    // will not accept does not cost one row, it rolls back every provider's window,
+                    // moves no cursor, and does it again identically on every subsequent run. Three
+                    // PR and review-comment dates (`pr.createdAt`, `pr.mergedAt`,
                     // `comment.createdAt`) reach `metrics.date` verbatim with no provider gate
-                    // between them and here, and `avg_time_to_merge_hours` is NaN whenever the
-                    // first two are unparseable. Asking `findRawAuthorDailyDefect` — the SAME
-                    // body the store's refusal delegates to, so the two cannot disagree — turns
-                    // that permanent stall into the loss of exactly this author-day, reported.
+                    // between them and here (the analyzer keeps `avg_time_to_merge_hours` null on an
+                    // unparseable pair, so only a code regression makes it NaN, which throws as
+                    // `invalid_computed_metric`). #307 replaced the pre-check that used to live here
+                    // (`findRawAuthorDailyDefect`) with a CATCH of the store's own throw in the
+                    // `insertMany` raw loop: one validator, run once, with no twin to keep in step
+                    // — and `retainedKeys`/`retainedRowCount` are recorded THERE, on a successful
+                    // upsert, so the set means exactly "keys this run wrote". Only a ROW_LEVEL
+                    // refusal is skipped there; a run/provider-level one rethrows and rolls back.
                     //
-                    // BEFORE the dedupe merge below, which is safe because the merge cannot turn
-                    // two acceptable rows into an unacceptable one: it sums non-negative integers
-                    // (still non-negative integers) and commit-weights finite rates (still
-                    // finite), while provider/container/key/date are identical across a merge by
-                    // construction — they ARE the dedupe key.
-                    //
-                    // ONLY A ROW-LEVEL REFUSAL IS SKIPPED. The other four codes are decided by
-                    // operands constant for the whole run or the whole provider, so a defect in
-                    // one of them refuses EVERY row — and skipping then discards the entire
-                    // window fail-open with the cursor advanced and the run reported clean, which
-                    // is strictly worse than the rollback this issue is about. Those fall through
-                    // to `upsertRawAuthorDaily` and throw exactly as they did before, holding the
-                    // cursor over a window that re-covers intact once the operator fixes the
-                    // cause. See ROW_LEVEL_REFUSALS for the full argument.
-                    const defect = findRawAuthorDailyDefect(row, now);
-                    if (defect && ROW_LEVEL_REFUSALS.includes(defect.code)) {
-                        skippedRows.push({
-                            raw_author_key: row.raw_author_key,
-                            date: row.date,
-                            code: defect.code,
-                        });
-                        continue;
-                    }
-                    // Recorded only once a row of this author's SURVIVES the check above, because
-                    // this set means "the raw author keys this run retained" and auto-create acts
-                    // on exactly that. An author every one of whose days was refused retained
-                    // nothing, and offering them to the hands-off onboarding would promote an
-                    // identity on the strength of a window that was not written.
-                    //
-                    // "Retained" up to the WRITE PASS, not all the way to the commit: a surviving
-                    // row is still dropped by the `isWritable` gate inside the transaction if its
-                    // container lost its owner mid-run, and this set is not re-narrowed for that.
-                    // Pre-existing and bounded by that narrow window; noted so the sentence above
-                    // is not read as stronger than it is.
-                    retainedKeys.add(rawAuthorKey);
-                    // The refusal ratio's denominator (#306), incremented at the one line that
-                    // means "the write boundary accepted this row" — beside the gate rather than
-                    // derived from `rawWrites.size` afterwards, so it counts the same population
-                    // `skippedRows` does and cannot drift when the dedupe merge collapses two
-                    // rows into one.
-                    retainedRowCount++;
                     // Accumulate WITHIN the run before the store ever sees it, keyed by the
                     // FULL store key — container included (#264).
                     //
@@ -4531,7 +4480,35 @@ export class GitSync implements ConnectorInterface {
             // former single loop is exactly what buys "no second pass, no re-fetch".
             for (const row of rawWrites.values()) {
                 if (!isWritable(row.provider, row.container)) continue;
-                upsertRawAuthorDaily(db, row, now);
+                const ck = containerKeyOf(row.provider, row.container);
+                try {
+                    upsertRawAuthorDaily(db, row, now);
+                } catch (e) {
+                    // THE SKIP, DECIDED AT THE WRITE (#307). Catch ONLY the store's own typed
+                    // refusal, and ONLY a ROW_LEVEL one: those describe a value THIS row alone
+                    // carries and that re-fetching returns unchanged, so skipping costs one
+                    // author-day and the cursor may still advance. Everything else — a
+                    // run/provider-level RawAuthorDailyError (a corrupt clock, a bad provider),
+                    // or any other throw (SQLITE_BUSY, a trigger, a bug) — RETHROWS, rolling the
+                    // whole transaction back and holding every cursor, which is the fail-closed
+                    // behaviour a bare `catch {}` would silently invert.
+                    if (e instanceof RawAuthorDailyError && ROW_LEVEL_REFUSALS.includes(e.code)) {
+                        pushByContainer(skippedRowsByContainer, ck, {
+                            raw_author_key: row.raw_author_key,
+                            date: row.date,
+                            code: e.code,
+                        });
+                        continue;
+                    }
+                    throw e;
+                }
+                // Recorded only once the store ACCEPTED the row, so `retainedKeys` means exactly
+                // "the raw author keys this run wrote" — the allowlist auto-create acts on — and
+                // `retainedRowCount` is the accepted-row denominator the refusal ratio weighs the
+                // skips against (#306/#307). An author every one of whose days was refused
+                // retains nothing and is not offered to the hands-off onboarding.
+                retainedKeys.add(row.raw_author_key);
+                retainedRowCountByContainer.set(ck, (retainedRowCountByContainer.get(ck) ?? 0) + 1);
             }
 
             // Opt-in hands-off onboarding (#256), between retention and projection.
@@ -4587,7 +4564,25 @@ export class GitSync implements ConnectorInterface {
                     record.authorLogin,
                     record.authorEmail,
                 );
-                if (developerId) upsertPRRecord(db, record, developerId, now);
+                if (!developerId) continue;
+                // THE SKIP, DECIDED AT THE WRITE (#307), after author resolution — so the count is
+                // exactly the PRs actually LOST, not every refused one. `upsertPRRecord` binds
+                // `repo`/`pr_id`/`state`/`created_at` (all NOT NULL) from cast response fields, so
+                // an unstorable value throws from inside the shared transaction. Catch ONLY that
+                // shape (see `isUnstorablePRFieldError`) and skip the one PR; anything else —
+                // SQLITE_BUSY, a FK violation, a trigger, a bug — rethrows and rolls back.
+                try {
+                    upsertPRRecord(db, record, developerId, now);
+                } catch (e) {
+                    if (isUnstorablePRFieldError(e)) {
+                        pushByContainer(skippedPRRecordsByContainer, containerKeyOf(providerType, record.container), {
+                            repo: record.repo,
+                            prId: record.prId,
+                        });
+                        continue;
+                    }
+                    throw e;
+                }
             }
             // Advance cursors LAST, still inside the tx: they persist iff every write
             // above committed. Collected only for complete providers, and each closure
