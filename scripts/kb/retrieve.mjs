@@ -36,13 +36,17 @@ function main() {
   const active = readStore().filter((l) => l.status === 'active');
   const eligible = category ? active.filter((l) => l.category === category) : active;
 
+  // With --paths, return ONLY area-matched lessons. The old behavior filled
+  // remaining slots with cross-cutting actives, which was fine at 8 active
+  // lessons but floods unrelated issues now that area-specific case law
+  // (demoted git-sync rules, 2026-08) lives at active: a frontend issue must
+  // not be primed with cursor/additive-merge pitfalls. Without --paths the
+  // top actives overall are still returned.
   const matched = paths.length ? eligible.filter((l) => lessonMatchesPaths(l, paths)) : [];
-  const rest = eligible
-    .filter((l) => !matched.includes(l))
-    .sort(bySeverityThenOccurrence);
   matched.sort(bySeverityThenOccurrence);
+  const pool = paths.length ? matched : [...eligible].sort(bySeverityThenOccurrence);
 
-  const picked = [...matched, ...rest].slice(0, top);
+  const picked = pool.slice(0, top);
 
   if (picked.length === 0) {
     console.log('<!-- review-KB: no relevant active lessons -->');

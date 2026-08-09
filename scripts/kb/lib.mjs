@@ -128,11 +128,25 @@ export function lessonMatchesPaths(lesson, paths) {
   const lessonGlobs = lesson.file_globs ?? [];
   if (lessonGlobs.length === 0) return false;
   // Bidirectional: a lesson matches if either side's glob matches the other's
-  // first two path segments (the module dir), which is robust to glob-vs-glob.
-  const dirKey = (g) => g.split('/').slice(0, 2).join('/');
+  // leading concrete path segments (the module dir), which is robust to
+  // glob-vs-glob. Concrete-segments-only: two segments made src/dashboard/api/**
+  // collide with src/dashboard/frontend/** (both keyed "src/dashboard"), which
+  // surfaced git-sync case law on pure frontend issues. A glob segment ("**",
+  // "*.ts") ends the key, so the shortcut only fires on genuinely-shared dirs;
+  // everything else falls through to the regex test below.
+  const dirKey = (g) => {
+    const segs = g.split('/');
+    const concrete = [];
+    for (const s of segs) {
+      if (s.includes('*') || s.includes('?')) break;
+      concrete.push(s);
+    }
+    return concrete.slice(0, 3).join('/');
+  };
   const pathKeys = new Set(paths.map(dirKey));
   return lessonGlobs.some((lg) => {
-    if (pathKeys.has(dirKey(lg))) return true;
+    const k = dirKey(lg);
+    if (k && pathKeys.has(k)) return true;
     const lre = globToRegExp(lg);
     return paths.some((p) => lre.test(p) || globToRegExp(p).test(lg));
   });

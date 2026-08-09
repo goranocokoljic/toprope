@@ -137,6 +137,14 @@ param(
     # completes successfully.
     [switch]$NoGraduate,
 
+    # Disable the convergence guard (scripts/dev-cycle/loop-check.mjs) that runs
+    # after each completed item. The guard detects fix-of-fix loop signatures —
+    # a streak of review-spawned issues, non-converging blocker counts, rising
+    # cost/task, a single churning hotspot file — and STOPS the queue when they
+    # trip, so a runaway loop can't burn the remaining budget unattended. Pass
+    # this to run the queue anyway after reviewing the signals.
+    [switch]$NoLoopGuard,
+
     # Run ONLY the KB graduation review — no dev-cycle runs, no panel. Reviews the
     # KB's active lessons with an agent recommendation and graduates the ones you pick.
     [switch]$GraduateOnly
@@ -1691,6 +1699,26 @@ Do not print either sentinel until the run is genuinely complete.
         $script:CurrentIssue = $null
         $script:CurItem      = $null
         Draw-Panel
+
+        # Convergence guard: after each completed item, scan the trailing analytics
+        # for fix-of-fix loop signatures. warn (exit 1) logs and continues; stop
+        # (exit 2) halts the queue — remaining items stay pending and re-running
+        # the same list resumes for free once the signals are triaged.
+        if (-not $NoLoopGuard -and (Get-Command node -ErrorAction SilentlyContinue)) {
+            $lcOut  = & node (Join-Path $PSScriptRoot 'scripts/dev-cycle/loop-check.mjs') 2>&1
+            $lcExit = $LASTEXITCODE
+            if ($lcExit -ge 1) {
+                $lcColor = if ($lcExit -ge 2) { 'Red' } else { 'Yellow' }
+                foreach ($lcLine in ($lcOut -split "`r?`n")) {
+                    if ($lcLine.Trim()) { Write-Log "    $lcLine" $lcColor }
+                }
+            }
+            if ($lcExit -ge 2) {
+                $script:RunState = 'stopped'
+                Write-Log '=== LOOP GUARD: convergence signals tripped - stopping the queue. Triage the signals above; re-run the same list to resume, or pass -NoLoopGuard to override. ===' 'Red'
+                break
+            }
+        }
     }
 
     $failedIssues  = @($script:IssueState.Keys | Where-Object { $script:IssueState["$_"] -eq 'failed' })

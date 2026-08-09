@@ -141,3 +141,13 @@ Feature branches are cut from `develop` and squash-merged back into `develop` (a
 
 ## Dev Cycle
 When working on a GitHub issue, always follow the `/dev-cycle` skill. Never open a PR on a failing build or failing tests. Never merge without completing the review cycle or exhausting all 3 iterations.
+
+## Review convergence policy
+The review pipeline has damping rules so it cannot loop (see the Convergence guard
+in `.claude/skills/dev-cycle-phases/SKILL.md`): reviewers rank only in-diff defects
+(out-of-diff observations are unranked and parked in `dev-docs/parking-lot.md`);
+a review finding becomes a new GitHub issue only within the spawn policy (max one
+per completed issue, chain depth ≤ 2 without human approval); small follow-up fixes
+get a focused `--lenses SEC,TST` review, not all five lenses. The harness runs
+`scripts/dev-cycle/loop-check.mjs` after every completed item and stops the queue
+when fix-of-fix loop signatures trip.

@@ -8,7 +8,14 @@
 // Usage:
 //   node scripts/kb/graduate.mjs --list                 # show active lessons ranked for review
 //   node scripts/kb/graduate.mjs --id fail-open-gate --id no-unbounded-list
+//   node scripts/kb/graduate.mjs --demote some-lesson-id   # graduated -> active (area-scoped)
 //   node scripts/kb/graduate.mjs --retire stale-lesson-id
+//
+// --demote is the reverse of --id: the lesson leaves the always-loaded
+// review-rules.md and surfaces only via retrieve.mjs when an issue touches its
+// file_globs. Use it when a graduated rule turns out to be area-specific case
+// law rather than a codebase-wide principle (2026-08 triage: 10 git-sync
+// invariant rules were demoted this way to stop priming every session).
 //
 // After any change it rewrites the store and regenerates dev-docs/review-rules.md.
 
@@ -58,8 +65,9 @@ function main() {
 
   const ids = collectRepeated('id');
   const retire = collectRepeated('retire');
-  if (ids.length === 0 && retire.length === 0) {
-    console.log('Nothing to do. Use --list, --id <id>, or --retire <id>.');
+  const demote = collectRepeated('demote');
+  if (ids.length === 0 && retire.length === 0 && demote.length === 0) {
+    console.log('Nothing to do. Use --list, --id <id>, --demote <id>, or --retire <id>.');
     return;
   }
 
@@ -74,6 +82,20 @@ function main() {
     l.status = 'graduated';
     l.last_seen = now;
     console.log(`graduated: ${id}`);
+  }
+  for (const id of demote) {
+    const l = byId.get(id);
+    if (!l) {
+      console.error(`! no lesson with id "${id}"`);
+      continue;
+    }
+    if (l.status !== 'graduated') {
+      console.error(`! ${id} is "${l.status}", not graduated — skipped`);
+      continue;
+    }
+    l.status = 'active';
+    l.last_seen = now;
+    console.log(`demoted to active: ${id}`);
   }
   for (const id of retire) {
     const l = byId.get(id);

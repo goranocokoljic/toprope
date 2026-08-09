@@ -9,7 +9,7 @@ description: >-
   file in /reviews. With --post, it also publishes a summary + inline
   findings to the branch's GitHub PR. Diff scope is merge-base against a
   configurable base branch.
-argument-hint: "[anchor: what this change does and why — the bug/issue/feature being addressed] [--base <branch> (default: develop)] [--post (publish to the GitHub PR)]"
+argument-hint: "[anchor: what this change does and why — the bug/issue/feature being addressed] [--base <branch> (default: develop)] [--post (publish to the GitHub PR)] [--lenses <csv of SO,SEC,OR,TST,DUP> (default: all five)]"
 ---
 
 # Multi-Lens PR Review
@@ -97,6 +97,19 @@ would do. A lens should read what a *finding genuinely depends on*. If
 you find yourself reading without a finding in mind, stop and reason
 from the diff first.
 
+**In-diff vs out-of-diff (severity boundary — applies to every lens).**
+A Critical/High/Medium/Low ranking may only be assigned to a defect that
+this diff **introduces, or materially worsens, on lines it adds or
+changes**. A pre-existing defect you discover while investigating —
+however real — is not this PR's blocker: report it under the lens's
+`### Out-of-diff observations` bucket, unranked, at most three per lens,
+one line each with `file:line`. This boundary exists because reviews
+here feed an auto-fix loop and an issue tracker: ranked out-of-diff
+findings turn every review into a fresh audit of the whole subsystem and
+have driven a measured fix-of-fix spiral (18+ consecutive review-spawned
+issues). The observation is not lost — the dev-cycle parks it in
+`dev-docs/parking-lot.md` for deliberate, human-prioritized scheduling.
+
 Use `offset`/`limit` for targeted reads. `grep -n` then a narrow `Read`
 is usually cheaper than a full-file read.
 
@@ -109,6 +122,11 @@ Batch the independent commands into a single message.
   value and strip the token. Otherwise `$BASE_BRANCH=develop`.
 - If `$ARGUMENTS` contains `--post`, set `$POST=1` and strip the token.
   Otherwise `$POST=0`.
+- If `$ARGUMENTS` contains `--lenses <csv>`, set `$LENSES` to that
+  comma-separated subset of `SO,SEC,OR,TST,DUP` and strip the token.
+  Otherwise `$LENSES` is all five. Unknown lens names are an error —
+  abort and say so. The caller (dev-cycle) uses this to right-size
+  small follow-up reviews to `SEC,TST`.
 - The remaining text is the anchor.
 
 **Extract the issue number** (for the filename and PR linkage only, not
@@ -164,12 +182,14 @@ subagents read the diff and return sections; Phase 3 writes once.
 
 ## Phase 2 — Five lens subagents (parallel, isolated)
 
-Dispatch five independent subagents — one per lens — in a **single
+Dispatch one independent subagent per lens **in `$LENSES`** — all five
+by default, fewer when `--lenses` narrowed the set — in a **single
 message** (one `Agent` call each, `subagent_type: general-purpose` so
 each has Read + Bash + Grep for the investigation policy). They run in
 parallel with fully isolated contexts; no subagent can see another's
 findings, so isolation is structural — there is no "approach the diff
-fresh" instruction to give.
+fresh" instruction to give. (Phase 3 concatenates only the dispatched
+lenses' sections, in the canonical SO, SEC, OR, TST, DUP order.)
 
 **The DUP lens gets one extra capability.** Reuse/duplication cannot be
 judged from the diff alone — it needs the whole existing component library.
@@ -230,6 +250,11 @@ Anchor: <one-line restatement of $ARGUMENTS or "no anchor provided">
 
 ### Low / Style
 …
+
+### Out-of-diff observations
+<unranked; max 3; one line each with file:line — pre-existing defects this
+diff neither introduced nor worsened. `_None._` if none. These never count
+toward blocker totals and never gate the merge; the dev-cycle parks them.>
 
 ### Net assessment
 <2–3 sentences>

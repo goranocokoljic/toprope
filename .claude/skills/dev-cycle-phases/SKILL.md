@@ -496,10 +496,66 @@ Note the PR number returned — needed for Phase 7.
 
 ---
 
+## Convergence guard — spawn policy & review right-sizing (READ BEFORE PHASE 6)
+
+This section exists because this project measurably entered a fix-of-fix loop
+(#262→#313: 20 consecutive review-spawned issues, blocker medians plateaued at
+4/task, cost/task up 4–5×, `sync.ts` 1,045→4,821 lines in 3.5 weeks). Reviews
+feed an auto-fix loop AND an issue tracker; without damping, the pipeline has
+no stopping condition. These rules are the damping. The harness additionally
+runs `scripts/dev-cycle/loop-check.mjs` after every completed item and stops
+the queue when loop signatures trip.
+
+### Right-size the review
+
+- **Full review** (five lenses, `MAX_CYCLES` as configured): feature issues and
+  epic finalizes.
+- **Focused review** (`--lenses SEC,TST`, `MAX_CYCLES` 2): fix/chore/follow-up
+  issues whose final diff is under ~150 changed lines — in particular any issue
+  that was itself spawned from a review finding. A small hardening fix does not
+  need five priming contexts hunting the same subsystem.
+
+### Out-of-diff findings never block
+
+Reviewer lenses rank only defects the diff introduces or materially worsens
+(see the command's in-diff/out-of-diff rule). Anything reported under
+`Out-of-diff observations` is **never** a blocker, never counts in
+`DEVCYCLE_METRIC` finding buckets, and is handled only by the parking rule
+below. Do not "promote" an out-of-diff observation to a blocker because it
+looks severe — severity is not the boundary; provenance is.
+
+### Issue-spawning policy (hard rules)
+
+A review finding may become a NEW GitHub issue only if **all** of these hold:
+
+1. **In-diff, or corruption-with-repro.** It concerns code this diff changed,
+   OR it is a data-corruption/security/privacy defect with a concrete,
+   named reproduction path (not "an operator could conceivably…").
+2. **Not recoverable by reset.** While the project is pre-production with
+   disposable data, a defect whose full remedy is "drop and resync" does not
+   get an issue — park it.
+3. **Budget: at most ONE spawned issue per completed issue.** If the review
+   surfaces more than one candidate, consolidate them or park the rest.
+4. **Chain depth caps at 2 without a human.** If the CURRENT issue was itself
+   spawned from a review (its body cites a review or a `Split out of #N` /
+   `Deferred from #N` line), spawning another issue from ITS review requires
+   explicitly asking the user first — a chain of fix-of-fix-of-fix is exactly
+   the loop signature.
+
+Everything that does not clear this bar goes to **`dev-docs/parking-lot.md`**:
+append one line per item under the current date heading —
+`- [#issue it came from] file:line — one-sentence description (severity as the
+reviewer saw it)`. Parked items are triaged by the user deliberately, in
+batches; they are not lost, they are just not allowed to self-schedule.
+
+---
+
 ## Phase 6 — Review Cycle
 
 Let `MAX_CYCLES` be the review-cycle cap: **3 by default**, but if the invoking
 prompt specified a maximum number of review cycles, use that value instead.
+The **Convergence guard** section above governs lens count and everything
+about turning findings into issues.
 
 At the start of **each iteration**, emit `DEVCYCLE_PHASE: review | cycle {REVIEW_CYCLE}/{MAX_CYCLES}`.
 
@@ -518,7 +574,10 @@ Initialize `REVIEW_CYCLE=1`. Repeat up to `MAX_CYCLES` times:
 1. Invoke the multi-lens review, passing the issue's intent as the anchor
    so the lenses check "does this meet the issue," not just style. Do
    **not** pass `--post` — the loop produces a file to fix from, and
-   posting to the PR every cycle would spam reviewers.
+   posting to the PR every cycle would spam reviewers. Per the
+   **Convergence guard**, add `--lenses SEC,TST` (and use `MAX_CYCLES` 2)
+   when this is a fix/chore/follow-up issue with a diff under ~150 changed
+   lines.
    ```
    /multi-lens-code-review {1-2 line summary of what this issue builds + its key acceptance criteria}
    ```
@@ -536,6 +595,10 @@ Initialize `REVIEW_CYCLE=1`. Repeat up to `MAX_CYCLES` times:
    The five lenses don't dedup, so one underlying issue may appear under
    more than one prefix (e.g. `SO-2`, `SEC-1`, `TST-1`, and `DUP-1`). Treat it as a
    single finding and fix the root cause once.
+
+   Entries under a lens's `Out-of-diff observations` are NOT findings for
+   this loop: exclude them from every bucket and metric line, and append
+   them to `dev-docs/parking-lot.md` per the Convergence guard.
 
    Then emit the analytics line with the **deduped** counts (0 is fine for any bucket):
    ```
@@ -592,8 +655,11 @@ EOF
 )"
 ```
 
-If a Medium finding is substantial enough to warrant tracked work, open a GitHub
-issue for it instead of (or in addition to) the comment.
+If a Medium finding is substantial enough to warrant tracked work, it may
+become a GitHub issue **only within the Convergence guard's issue-spawning
+policy** (in-diff or corruption-with-repro; not reset-recoverable; max one
+per completed issue; chain depth ≤ 2 without asking the user). Otherwise
+park it in `dev-docs/parking-lot.md`.
 
 ### After loop — unresolved findings
 
