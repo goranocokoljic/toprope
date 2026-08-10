@@ -365,9 +365,75 @@ describe('raw_commits — the per-commit write boundary (#318)', () => {
             insertRawCommit(db, commitRow(at('2026-07-01', '23:55:00')), OBSERVED_AT);
             insertRawCommit(db, commitRow(at('2026-07-02', '00:05:00')), OBSERVED_AT);
 
-            const bursts = readAuthorBurstsByDay(db, 'github', 'test-org', 'github:login:alice');
+            // The day set is the run's touched days; the read pads one day on each side, which is
+            // what lets the 23:50 burst see the 00:05 commit.
+            const bursts = readAuthorBurstsByDay(db, 'github', 'test-org', 'github:login:alice', [
+                '2026-07-01',
+                '2026-07-02',
+            ]);
             expect(bursts.get('2026-07-01')).toBe(1);
             expect(bursts.get('2026-07-02')).toBeUndefined();
+        });
+
+        it('bounds the read to the day set it was given, plus one day of padding each side', () => {
+            // The padding is not decoration: a burst that started at 23:50 on the day BEFORE the
+            // only day the run touched must still be found, or the burst would be re-counted on
+            // the later day. Conversely a commit two days outside the set is not read at all.
+            const at = (day: string, time: string): Partial<RawCommitInput> => ({
+                sha: `${day}-${time}`,
+                author_day: day,
+                committed_at: `${day}T${time}.000Z`,
+            });
+            // A burst of its own, two days outside the set.
+            insertRawCommit(db, commitRow(at('2026-06-28', '10:00:00')), OBSERVED_AT);
+            insertRawCommit(db, commitRow(at('2026-06-28', '10:05:00')), OBSERVED_AT);
+            insertRawCommit(db, commitRow(at('2026-06-28', '10:10:00')), OBSERVED_AT);
+            // A burst that starts on the padded day before and finishes inside the set.
+            insertRawCommit(db, commitRow(at('2026-06-30', '23:45:00')), OBSERVED_AT);
+            insertRawCommit(db, commitRow(at('2026-06-30', '23:50:00')), OBSERVED_AT);
+            insertRawCommit(db, commitRow(at('2026-07-01', '00:05:00')), OBSERVED_AT);
+
+            const bursts = readAuthorBurstsByDay(db, 'github', 'test-org', 'github:login:alice', [
+                '2026-07-01',
+            ]);
+            // 06-30 is inside the padding, so its burst is seen and attributed to 06-30 — 07-01's
+            // commit is part of that burst, not a burst of its own.
+            expect(bursts.get('2026-06-30')).toBe(1);
+            expect(bursts.get('2026-07-01')).toBeUndefined();
+            // 06-28's burst is outside the padded range entirely and is never read.
+            expect(bursts.get('2026-06-28')).toBeUndefined();
+        });
+
+        it('reads nothing for an empty day set', () => {
+            insertRawCommit(db, commitRow({sha: 'lonely', author_day: '2026-07-01'}), OBSERVED_AT);
+            expect(readAuthorBurstsByDay(db, 'github', 'test-org', 'github:login:alice', []).size).toBe(0);
+        });
+
+        it('filters a malformed day out of the bound instead of throwing out of the transaction', () => {
+            // `''` is what `toDateString` yields for a null/expanded-year PR date (#302) — a
+            // ROW-level refusal the store raises as `invalid_date` when the cell is projected.
+            // Handing it to `addDays` would throw a RangeError from inside the run's single write
+            // transaction, rolling back every provider's window over one bad row. The good day in
+            // the same set must still get its burst.
+            const at = (day: string, time: string): Partial<RawCommitInput> => ({
+                sha: `${day}-${time}`,
+                author_day: day,
+                committed_at: `${day}T${time}.000Z`,
+            });
+            insertRawCommit(db, commitRow(at('2026-07-01', '09:00:00')), OBSERVED_AT);
+            insertRawCommit(db, commitRow(at('2026-07-01', '09:10:00')), OBSERVED_AT);
+            insertRawCommit(db, commitRow(at('2026-07-01', '09:20:00')), OBSERVED_AT);
+
+            const bursts = readAuthorBurstsByDay(db, 'github', 'test-org', 'github:login:alice', [
+                '',
+                '2026-07-01',
+            ]);
+            expect(bursts.get('2026-07-01')).toBe(1);
+
+            // …and a set of NOTHING BUT malformed days reads nothing rather than throwing.
+            expect(
+                readAuthorBurstsByDay(db, 'github', 'test-org', 'github:login:alice', ['', 'not-a-day']).size,
+            ).toBe(0);
         });
 
         it('REPLACES the projected cell rather than adding to it, and preserves first_seen', () => {

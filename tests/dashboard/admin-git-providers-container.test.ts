@@ -257,8 +257,11 @@ describe('admin git-provider container normalization (#266)', () => {
      * provider added with different casing resolves to the EXISTING data set rather than a
      * fresh empty one. That is what makes the #262/#264 delete-then-re-add reasoning hold: if
      * a re-add under a different spelling resolved to a new bucket, its cursors would be
-     * empty, the pipeline would re-import the same span, and `mergeDailyAcrossRuns` would add
-     * it on top of rows that were never retracted.
+     * empty and the pipeline would re-import the same span on top of rows that were never
+     * retracted — which the deleted cross-run merge would have ADDED. IG1.2 (#318) removed
+     * that particular consequence (the re-import is now a sha-keyed no-op), but the
+     * normalization this asserts is what makes the two spellings ONE data set at all, so it
+     * still decides whether the re-added provider sees its own history or an empty bucket.
      */
     describe('cursor keys and imported rows resolve through the normalized container (AC3)', () => {
         // Seed one container's worth of imported history plus its forward cursor and

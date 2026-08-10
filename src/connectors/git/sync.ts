@@ -4657,6 +4657,27 @@ export class GitSync implements ConnectorInterface {
             // Burst counts are read ONCE PER AUTHOR, not once per cell: a burst may span midnight
             // so the detector needs that author's whole stream, and a per-cell read would be an
             // O(days) fan-out over the same rows (the no-per-row-fan-out rule).
+            //
+            // The day set is collected FIRST, in a pass of its own, because that read is BOUNDED
+            // to `[min(days) - 1, max(days) + 1]` (see `readAuthorBurstsByDay`) and the bound is
+            // only knowable once every cell this run touched for the author is in hand. Reading
+            // lazily on first sight of an author would bound the range to whichever day happened
+            // to come first out of the map, and report 0 bursts for every other day that author
+            // committed on in this run.
+            const daysByAuthor = new Map<string, Map<string, string[]>>();
+            for (const cell of cellObservations.values()) {
+                if (!isWritable(cell.provider, cell.container)) continue;
+                const ck = containerKeyOf(cell.provider, cell.container);
+                let byAuthor = daysByAuthor.get(ck);
+                if (byAuthor === undefined) {
+                    byAuthor = new Map<string, string[]>();
+                    daysByAuthor.set(ck, byAuthor);
+                }
+                const days = byAuthor.get(cell.raw_author_key);
+                if (days === undefined) byAuthor.set(cell.raw_author_key, [cell.date]);
+                else days.push(cell.date);
+            }
+
             const burstsByAuthor = new Map<string, Map<string, number>>();
             for (const cell of cellObservations.values()) {
                 if (!isWritable(cell.provider, cell.container)) continue;
@@ -4664,7 +4685,13 @@ export class GitSync implements ConnectorInterface {
                 const authorKey = `${ck}\u0000${cell.raw_author_key}`;
                 let bursts = burstsByAuthor.get(authorKey);
                 if (bursts === undefined) {
-                    bursts = readAuthorBurstsByDay(db, cell.provider, cell.container, cell.raw_author_key);
+                    bursts = readAuthorBurstsByDay(
+                        db,
+                        cell.provider,
+                        cell.container,
+                        cell.raw_author_key,
+                        daysByAuthor.get(ck)?.get(cell.raw_author_key) ?? [cell.date],
+                    );
                     burstsByAuthor.set(authorKey, bursts);
                 }
                 try {

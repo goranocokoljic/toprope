@@ -43,7 +43,7 @@
  */
 
 import type Database from 'better-sqlite3';
-import {addDays, isUtcIsoInstant} from '../../aggregation/dates.js';
+import {addDays, isUtcDay, isUtcIsoInstant} from '../../aggregation/dates.js';
 import {detectBursts} from './analyzer.js';
 import {
     RawAuthorDailyError,
@@ -367,6 +367,15 @@ function readCellCommitTotals(db: Database.Database, key: RawCommitCellKey): Raw
  *
  * Ordered `(committed_at, sha)` so the sort the detector applies is total and the result is
  * deterministic across runs regardless of insertion order.
+ *
+ * MALFORMED DAYS ARE FILTERED, NOT TRUSTED. `days` comes from cell observations that have not yet
+ * reached the write boundary, and a malformed author-day is a real, reachable input — a provider
+ * body with a null or expanded-year PR date yields `toDateString(...) === ''` (#302). That value
+ * is a ROW-level refusal, which `assertValidAuthorDay` raises as `invalid_date` when the cell is
+ * projected. Feeding it to `addDays` first would turn it into a `RangeError` thrown from inside
+ * the run's write transaction — rolling back every provider's window over one bad row, which is
+ * the exact failure #302 exists to prevent. Filtering here leaves the refusal where it belongs and
+ * costs the bad cell only its own burst count, which the store is about to refuse anyway.
  */
 export function readAuthorBurstsByDay(
     db: Database.Database,
@@ -375,8 +384,8 @@ export function readAuthorBurstsByDay(
     rawAuthorKey: string,
     days: readonly string[],
 ): Map<string, number> {
-    if (days.length === 0) return new Map();
-    const sorted = [...days].sort();
+    const sorted = days.filter(isUtcDay).sort();
+    if (sorted.length === 0) return new Map();
     const rows = db
         .prepare(
             `SELECT committed_at, author_day FROM raw_commits
