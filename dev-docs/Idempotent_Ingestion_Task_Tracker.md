@@ -251,13 +251,12 @@ layer). No parallelism inside this epic — the value of stacking is one full re
 
 ## How to run
 
-1. Import to GitHub: epic issue `IG1` (full "Why" + strategy + cross-cutting criteria + verification matrix +
-   `## Subtasks` checklist), four child issues each with `Epic: #NN`, its own section from this tracker verbatim,
-   and — required — linked as **native sub-issues**:
-   `gh api repos/{owner}/{repo}/issues/{epic}/sub_issues -f sub_issue_id=<child-node-id>`.
-2. Run via the harness in epic-batching mode (children stack on `epic/issue-{NN}-idempotent-ingestion`, fast SEC
+1. Imported to GitHub 2026-08-10: epic **#316** (`epic`, `epic-ig1`), children **#317** (IG1.1, `tier:critical`),
+   **#318** (IG1.2, `tier:critical`), **#319** (IG1.3, `tier:critical`), **#320** (IG1.4, `tier:simple`) — all
+   linked as native sub-issues of #316; child bodies quote the design excerpts with the doc marked canonical.
+2. Run via the harness in epic-batching mode (children stack on `epic/issue-316-idempotent-ingestion`, fast SEC
    lens per child, one full five-lens review at finalize):
-   `./tr-harness.ps1 <IG1.1#> <IG1.2#> <IG1.3#> <IG1.4#> <IG1#> …` per the harness's epic flags.
+   `./tr-harness.ps1 317 318 319 320 316 …` per the harness's epic flags.
 3. The convergence guard applies throughout: out-of-diff findings park, spawn budget max 1 per completed issue,
    chain depth ≤ 2 without human approval. The epic's own **locked out-of-scope list** (top of this file) binds
    reviewers too: an adapter-rewrite or client.ts finding is a parking-lot entry, not a blocker.
