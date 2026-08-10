@@ -77,10 +77,14 @@ if (last.length === W) {
   const mLast = median(last.map((g) => g.blockers));
   const mPrev = prev.length === W ? median(prev.map((g) => g.blockers)) : null;
   info.push(`blockers/task median: ${mLast}${mPrev !== null ? ` (prev ${mPrev})` : ''}`);
+  const newest = last[last.length - 1].blockers;
   if (mLast >= 8) strongs.push(`median ${mLast} critical+high findings per task over the last ${W} tasks`);
-  else if (mLast >= 3 && (mPrev === null || mLast >= Math.max(mPrev * 0.75, 2))) {
-    // A plateau counts: only a clear decline is convergence.
-    warns.push(`critical+high findings not converging (median ${mLast}/task, prev ${mPrev ?? 'n/a'})`);
+  else if (mLast >= 3 && newest >= 3 && (mPrev === null || mLast >= Math.max(mPrev * 0.75, 2))) {
+    // A plateau counts: only a clear decline is convergence. But the NEWEST task must
+    // sustain it — a high median whose latest member is already clean is history
+    // decaying out of the window, not a live loop (seen 2026-08-10: median 4 driven
+    // entirely by pre-policy tasks while the newest task had 0 blockers).
+    warns.push(`critical+high findings not converging (median ${mLast}/task, newest ${newest}, prev ${mPrev ?? 'n/a'})`);
   }
 }
 
@@ -102,12 +106,15 @@ if (ghRaw) {
   if (streak >= 6) strongs.push(`${streak} consecutive issues spawned from review findings`);
   else if (streak >= 4) warns.push(`${streak} consecutive issues spawned from review findings`);
 
-  // S4: net issue flow over the last 14 days — is the queue actually shrinking?
-  const cutoff = new Date(Date.now() - 14 * 864e5).toISOString();
-  const opened = issues.filter((i) => (i.createdAt ?? '') >= cutoff).length;
-  const closed = issues.filter((i) => (i.closedAt ?? '') >= cutoff).length;
-  info.push(`issue flow (14d): ${opened} opened / ${closed} closed`);
-  if (opened >= 6 && opened > closed) warns.push(`more issues opened (${opened}) than closed (${closed}) in 14 days`);
+  // S4: OPEN review-spawned issues — the inflow the guard exists to catch. Raw
+  // opened-vs-closed was a false positive: importing a planned epic (5 roadmap
+  // issues in one day, 2026-08-10) read as queue growth, and spawned issues that
+  // were already triaged into the parking lot kept counting. Open + spawn-marked
+  // measures the live backlog the review pipeline itself created.
+  const spawnedOpen = issues.filter((i) => i.state === 'OPEN' && SPAWN_RE.test(i.body ?? '')).length;
+  info.push(`open review-spawned issues: ${spawnedOpen}`);
+  if (spawnedOpen >= 6) strongs.push(`${spawnedOpen} open review-spawned issues`);
+  else if (spawnedOpen >= 4) warns.push(`${spawnedOpen} open review-spawned issues`);
 }
 
 // ---- S5: single-file churn hotspot -----------------------------------------
