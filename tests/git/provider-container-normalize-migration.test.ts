@@ -586,7 +586,13 @@ describe('migration 043 — container normalization (#266)', () => {
         // The stale rollup that makes the notice necessary is still there…
         expect(count(db, 'weekly_aggregates')).toBe(1);
         // …and the notice fired, so `toprope doctor` will not report a green currency claim.
-        expect(gitResetNotice(db)).toBe('043');
+        // This case runs the WHOLE chain, so migration 046 (#317) — another unconditional git
+        // reset raising the same migration-agnostic key — runs after 043 in the same pass and
+        // RE-STAMPS the value. The assertion is on the id of the newest unmet rebuild, which is
+        // what an operator owes; the property under test (a notice fired at all, from evidence
+        // 042 had already erased) is unchanged, and `apply043` covers 043's value in isolation
+        // in every other case in this file.
+        expect(gitResetNotice(db)).toBe('046');
         expect(
             db.prepare('SELECT container, last_sync_at FROM git_providers WHERE id = ?').get('p1'),
         ).toEqual({container: 'wireless_media', last_sync_at: null});
