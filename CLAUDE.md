@@ -48,6 +48,13 @@ No proxy, no traffic interception. Pure API-pull + git analysis.
   cursors behind. The raw rows it clears cannot be honestly re-attributed to one spelling, so
   the days they fed are re-projected by a resync — and 043 leaves a `git_data_reset_pending`
   marker that `toprope doctor` fails on until the rebuild is acknowledged.
+  **Migration 046 (#317, epic #316)** is the second one-time path licensed like 042: it clears
+  `git_snapshots` outright — legacy cells included — plus `raw_author_daily`, `commit_diffstats`
+  and the `git_last_sync:*` / `git_earliest_sync:*` cursors, as the pre-production reset that
+  precedes the idempotent-ingestion rewrite. Same license, same bound: pre-production only, no
+  runtime path may do this. `pr_records` is deliberately NOT cleared (state-keyed and
+  replace-idempotent — a resync re-upserts it), and it re-stamps the same
+  `git_data_reset_pending` marker with `046`.
   **`commit_diffstats` (#273) is NOT a snapshot table and the rule does not reach it.** It is a
   MEMO of an idempotent remote read — `(provider, container, repo, sha) → file stats` — of a
   fact that is immutable by construction (a commit is named by the hash of its own content), so

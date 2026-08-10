@@ -18,6 +18,7 @@ import {
     rowRefusalStateKey,
 } from '../../src/connectors/git/sync';
 import {ROW_LEVEL_REFUSALS} from '../../src/connectors/git/raw-author-daily';
+import {clearGitResetNotice} from '../../src/connectors/git/reset-notice';
 import {createProvider} from '../../src/connectors/git/providers/store';
 import {createCommitDiffstatCache} from '../../src/connectors/git/diffstat-cache';
 import {loadServerKey} from '../../src/connectors/git/providers/secret';
@@ -164,6 +165,35 @@ describe('runDoctor', () => {
         expect(allOutput).toContain('aggregate backfill');
         expect(allOutput).toContain('pr_review_metrics');
         expect(allOutput).toContain('clear-reset-notice');
+    });
+
+    /**
+     * #317: migration 046 raises the SAME marker under a new id, so the doctor gate has to hold
+     * for it too — and it has to keep holding until the operator acknowledges THAT id. The
+     * value-scoped acknowledgement is the point: `clearGitResetNotice` deletes only the exact
+     * value it was handed, so acknowledging the older 043 rebuild can never silently clear the
+     * 046 one (the #235 false all-clear, reached through the command written to close it).
+     */
+    it('FAILS on the 046 reset notice, and passes once THAT id is acknowledged', async () => {
+        db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+            'git_data_reset_pending',
+            '046',
+        );
+
+        expect(await runDoctor(db, disabledConfig(), tmpConfigPath, MIGRATIONS_DIR)).toBe(false);
+        expect([...output, ...errors].join('\n')).toContain('migration 046 reset the imported git data');
+
+        // Acknowledging the WRONG id leaves the doctor failing.
+        expect(clearGitResetNotice(db, '043')).toBe(false);
+        output.length = 0;
+        errors.length = 0;
+        expect(await runDoctor(db, disabledConfig(), tmpConfigPath, MIGRATIONS_DIR)).toBe(false);
+
+        expect(clearGitResetNotice(db, '046')).toBe(true);
+        output.length = 0;
+        errors.length = 0;
+        expect(await runDoctor(db, disabledConfig(), tmpConfigPath, MIGRATIONS_DIR)).toBe(true);
+        expect(output.join('\n')).toContain('none pending');
     });
 
     it('fails config check when config file missing', async () => {
