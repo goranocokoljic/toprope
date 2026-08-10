@@ -746,6 +746,13 @@ describe('GitSync', () => {
             // Owned when the run starts; the row disappears while it is fetching.
             const result = await runWithOneCommit(db, [DB_PROVIDER], deleteRow(db, 'p1'));
 
+            // The sha-keyed source of record too (IG1.2/#318), which needs its OWN `isWritable`
+            // guard in pass 1: without it this run leaves orphan `raw_commits` rows for a purged
+            // container — no cursor, no `raw_author_daily` row pointing at them, and nothing the
+            // delete cascade will ever see, because the cascade already ran.
+            expect(
+                (db.prepare('SELECT COUNT(*) AS n FROM raw_commits').get() as {n: number}).n,
+            ).toBe(0);
             expect(
                 (db.prepare('SELECT COUNT(*) AS n FROM raw_author_daily').get() as {n: number}).n,
             ).toBe(0);
@@ -819,7 +826,7 @@ describe('GitSync', () => {
             expect(diffLines[0]).toContain('1 of those requests FAILED');
             // …and the staged half is suppressed, exactly as for the drop line above.
             expect(diffLines.some((e) => e.includes('PERMANENT'))).toBe(false);
-            expect(diffLines.some((e) => e.includes('delete cascade'))).toBe(false);
+            expect(diffLines.some((e) => e.includes('git_last_sync sync_state row'))).toBe(false);
         });
 
         // Positive control for the assertion above: the identical mock reports a drop on a run
@@ -3493,9 +3500,9 @@ describe('GitSync.syncProviders — backfill atomicity (#233)', () => {
             .prepare('SELECT COUNT(*) AS n FROM git_snapshots WHERE developer_id = ?')
             .get(devId) as {n: number}).n;
 
-    it('does NOT lower the watermark — or write ANY snapshot — when a repo commit fetch fails', async () => {
-        // Positive control: repo1 succeeds and DOES produce commits, so a passing
-        // assertion below can only mean the run discarded real, fetched data.
+    it('does NOT lower the watermark when a repo commit fetch fails — but KEEPS repo1’s commits (IG1.2)', async () => {
+        // Positive control: repo1 succeeds and DOES produce commits, so the data assertion
+        // below is about real, fetched data rather than an empty run.
         const devId = seedDev(db, 'alice');
         const createGitProvider = await getCreateGitProvider();
         createGitProvider.mockReturnValue(
@@ -3515,11 +3522,13 @@ describe('GitSync.syncProviders — backfill atomicity (#233)', () => {
         // The watermark must NOT move: repo2's [since, until] slice was never covered,
         // and the overlap guard would reject the retry that should re-cover it.
         expect(readState(EARLIEST_KEY)).toBeUndefined();
-        // repo1's fetched commits are discarded rather than half-written: they are
-        // ADDITIVE, so persisting them now and re-fetching the same slice on retry
-        // would double-count. Whole-window re-cover is the only gap-free option.
-        expect(countSnapshots(devId)).toBe(0);
-        expect(result.snapshotsWritten).toBe(0);
+        // repo1's fetched commits ARE persisted, which is the half IG1.2 (#318) inverted.
+        // They used to be discarded because they were ADDITIVE — persisting them and
+        // re-fetching the same slice on retry would double-count. `raw_commits` is sha-keyed,
+        // so the retry re-observes them and inserts nothing; the cell is recomputed, not
+        // accumulated. The WATERMARK is still held, which is the invariant this test guards.
+        expect(countSnapshots(devId)).toBe(1);
+        expect(result.snapshotsWritten).toBe(1);
         // …and the failure is loud, not a silent skip.
         expect(result.errors.some((e) => e.includes('repo2') && e.includes('boom'))).toBe(true);
     });
@@ -3750,7 +3759,7 @@ describe('GitSync.syncProviders — first-sync earliest-watermark recording (#22
             expect(readState(FORWARD_KEY)).toBeUndefined();
         });
 
-        it('does NOT advance the cursor and persists NO snapshots when a single repo commit fetch throws', async () => {
+        it('does NOT advance the cursor when a single repo commit fetch throws — but keeps what it fetched (IG1.2)', async () => {
             seedDev(db, 'alice');
             const createGitProvider = await getCreateGitProvider();
             createGitProvider.mockReturnValue(
@@ -3767,12 +3776,13 @@ describe('GitSync.syncProviders — first-sync earliest-watermark recording (#22
 
             // The per-repo failure is surfaced loudly…
             expect(result.errors.some((e) => /bad-repo.*Failed to fetch commits/.test(e))).toBe(true);
-            // …the provider is held all-or-nothing: even the GOOD repo's commit is NOT
-            // written (writing it now + re-fetching the whole window next run would
-            // double-count the additive commit)…
-            expect(countSnapshots(db)).toBe(0);
-            expect(result.snapshotsWritten).toBe(0);
-            // …and the cursor stays put so the whole window is re-covered next run.
+            // …the GOOD repo's commit IS written. It used to be discarded with the run: the
+            // commit counter was additive, so persisting it and re-fetching the whole window
+            // next run would double-count. Since IG1.2 (#318) the sha makes the re-observation
+            // a no-op, so keeping it costs nothing and saves the re-fetch (V6)…
+            expect(countSnapshots(db)).toBe(1);
+            expect(result.snapshotsWritten).toBe(1);
+            // …and the cursor still stays put, so the whole window is re-covered next run.
             expect(readState(FORWARD_KEY)).toBeUndefined();
         });
 
@@ -3813,16 +3823,16 @@ describe('GitSync.syncProviders — first-sync earliest-watermark recording (#22
         });
 
         it('re-covers the window on the NEXT run after a held cursor — no gap AND no double-count (#231 acceptance)', async () => {
-            // The headline acceptance criterion: a run whose fetch was incomplete
-            // persists nothing and holds the cursor, so the NEXT (successful) run
-            // re-fetches the whole [since, now] window and lands the data exactly once.
-            // This is the end-to-end proof — the hold is worthless if recovery doesn't
-            // actually fill the gap, and dangerous if it double-counts the additive commit.
+            // The headline acceptance criterion, and V6 of the IG1 verification matrix: a run
+            // whose fetch was incomplete KEEPS what it fetched and holds the cursor, so the NEXT
+            // (successful) run re-fetches the whole [since, now] window and the data lands
+            // exactly once. Before IG1.2 (#318) the first half read "persists nothing" — the
+            // partial had to be discarded because re-covering it would have double-counted.
             seedDev(db, 'alice');
             const createGitProvider = await getCreateGitProvider();
 
             // Run 1: bad-repo throws, good-repo returns alice's commit c-good. Provider
-            // incomplete → NOTHING written, cursor held.
+            // incomplete → c-good IS written, cursor held.
             createGitProvider.mockReturnValueOnce(
                 makeMockProvider({
                     listRepos: vi.fn().mockResolvedValue([makeRepo('bad-repo'), makeRepo('good-repo')]),
@@ -3833,7 +3843,7 @@ describe('GitSync.syncProviders — first-sync earliest-watermark recording (#22
                 }),
             );
             await new GitSync({enabled: false}).syncProviders(db, [CONFIG]);
-            expect(countSnapshots(db)).toBe(0);
+            expect(countSnapshots(db)).toBe(1);
             expect(readState(FORWARD_KEY)).toBeUndefined();
 
             // Run 2: both repos succeed. Because the cursor was held, this run re-fetches
@@ -3852,9 +3862,9 @@ describe('GitSync.syncProviders — first-sync earliest-watermark recording (#22
             );
             await new GitSync({enabled: false}).syncProviders(db, [CONFIG]);
 
-            // Exactly the two distinct commits, once each: 3 would mean run 1's partial
-            // c-good was persisted and additively re-counted (the double-count the hold
-            // exists to prevent); <2 would mean a gap. Neither.
+            // Exactly the two distinct commits, once each. 3 would mean run 1's c-good was
+            // counted a second time when run 2 re-delivered it — the double-count the sha key
+            // makes impossible; <2 would mean a gap. Neither.
             const row = db
                 .prepare(`SELECT commits FROM git_snapshots WHERE date = '2024-01-15'`)
                 .get() as {commits: number} | undefined;
@@ -5730,18 +5740,22 @@ describe('GitCommit.diffs reuse vs the getCommitDiff fallback (#280)', () => {
         // The claim about persisted state, on its own line, keyed to the FAILURE count.
         expect(loss).toContain('the 1 commit(s) whose fallback diff request failed');
         expect(loss).toContain('PERMANENT');
-        // It must name the SAFE remedy. A bare cursor reset re-imports over surviving
-        // raw_author_daily rows, which additively double every commit metric in the span (#262)
-        // — a far larger corruption than the understatement being repaired.
-        expect(loss).toContain('delete cascade');
-        expect(loss).toContain('do NOT simply purge this provider\'s cursors');
-        // The remedy is only reachable for a DB-registered provider: the admin delete route
-        // refuses a config-file provider, and the cascade is skipped while the YAML entry still
-        // owns the container — so a line that named it unconditionally would send half the
-        // deployments to a no-op that looks like a repair.
-        expect(loss).toContain('CONFIG-FILE provider cannot be deleted');
-        // …and re-adding restores only the first-sync window, so the backfill step is part of
-        // the remedy, not an optional extra.
+        // It must name the SAFE remedy — and since IG1 (#316) a cursor reset IS the safe remedy:
+        // re-importing re-observes commits already stored by sha, so no counter moves. Before it,
+        // that same action additively doubled every commit metric in the span (#262), which is
+        // why the line used to prescribe a delete-and-re-add instead.
+        expect(loss).toContain('git_last_sync sync_state row BACK');
+        expect(loss).not.toContain('delete cascade');
+        // REACHABILITY: the delete-and-re-add this replaced was a no-op for a config-file
+        // provider, since the admin delete route refuses those. A sync_state edit is not.
+        expect(loss).toContain('config-file provider exactly as to a DB-connected one');
+        // The caveat the old remedy needed is GONE rather than silently dropped: it existed
+        // because the admin delete route refuses a config-file provider, so a delete-and-re-add
+        // sent half the deployments to a no-op that looked like a repair. Editing a sync_state
+        // row has no such hole.
+        expect(loss).not.toContain('CONFIG-FILE provider cannot be deleted');
+        // COMPLETENESS: deleting the cursor rather than lowering it resets the next run to the
+        // bounded first-sync window, so the backfill step is part of the remedy, not an extra.
         expect(loss).toContain('sync older history');
 
         // Still advisories: turning them red buys no recovery (the window is already recorded as
@@ -5796,10 +5810,10 @@ describe('GitCommit.diffs reuse vs the getCommitDiff fallback (#280)', () => {
         expect(advisories).toHaveLength(1);
         expect(advisories[0]).toContain('1 commit(s)');
         expect(advisories[0]).toContain('1 of those requests FAILED');
-        // …but nothing claims the loss is permanent, and nothing sends the operator to a
-        // destructive rebuild of a span that will be re-fetched next run.
+        // …but nothing claims the loss is permanent, and nothing sends the operator to repair a
+        // span that will be re-fetched next run anyway.
         expect(advisories.some((a) => a.includes('PERMANENT'))).toBe(false);
-        expect(advisories.some((a) => a.includes('delete cascade'))).toBe(false);
+        expect(advisories.some((a) => a.includes('git_last_sync sync_state row'))).toBe(false);
     });
 
     /**
@@ -5823,8 +5837,11 @@ describe('GitCommit.diffs reuse vs the getCommitDiff fallback (#280)', () => {
             }),
         );
 
-        // Positive control: the provider really was held, so its window is intact.
-        expect(countSnapshots(db)).toBe(0);
+        // Positive control: the provider really was held. Since IG1.2 (#318) the commits it DID
+        // fetch are kept, so the evidence of the hold is the cursor, not an empty table.
+        expect(
+            db.prepare("SELECT value FROM sync_state WHERE key = 'git_last_sync:github:test-org'").get(),
+        ).toBeUndefined();
 
         const advisories = diffAdvisories(result);
         expect(advisories).toHaveLength(1);

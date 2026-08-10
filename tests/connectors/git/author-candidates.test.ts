@@ -306,10 +306,18 @@ describe('listAuthorCandidates — unmapped retained authors (#254)', () => {
         expect(erin.last_seen).toBe('2026-07-03T00:00:00.000Z');
     });
 
-    it('accumulates commits across RUNS on the same day (the raw store’s additive merge)', () => {
-        const row = rawRow({raw_author_key: 'github:login:frank', author_login: 'frank', commits: 3});
-        upsertRawAuthorDaily(db, row, '2026-07-01T00:00:00.000Z');
-        upsertRawAuthorDaily(db, row, '2026-07-02T00:00:00.000Z');
+    it('sums an author’s commits across their retained DAYS, and re-observing one day does not inflate it', () => {
+        // The rollup adds across days; it must NOT add across runs. Since IG1.2 (#318) a
+        // `raw_author_daily` cell is a recompute of `raw_commits`, so writing the same day twice
+        // stores the same number twice — the old additive merge would have reported 9 here.
+        const day1 = rawRow({raw_author_key: 'github:login:frank', author_login: 'frank', commits: 3});
+        upsertRawAuthorDaily(db, day1, '2026-07-01T00:00:00.000Z');
+        upsertRawAuthorDaily(db, day1, '2026-07-02T00:00:00.000Z');
+        upsertRawAuthorDaily(
+            db,
+            {...day1, date: '2026-07-02', commits: 3},
+            '2026-07-02T00:00:00.000Z',
+        );
 
         expect(listAuthorCandidates(db)[0].commit_count).toBe(6);
     });

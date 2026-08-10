@@ -301,7 +301,7 @@ describe('in-run repo retry (#272)', () => {
         expect(seen.slice(afterStale + 1)).toContainEqual({done: 0, scanned: null, total: null});
     });
 
-    it('a persistently failing repo behaves exactly as before: cursor held, partials dropped, error recorded', async () => {
+    it('a persistently failing repo holds the cursor and records the error — but KEEPS the good repo’s commits (IG1.2)', async () => {
         seedAlice(db);
         const createGitProvider = await getCreateGitProvider();
         const getCommits = vi.fn().mockImplementation(async (repo: string): Promise<GitCommit[]> => {
@@ -323,11 +323,21 @@ describe('in-run repo retry (#272)', () => {
         expect(getCommits.mock.calls.filter((c) => c[0] === 'bad-repo')).toHaveLength(
             1 + GIT_REPO_RETRY_DELAYS_MS.length,
         );
-        // Then: identical to pre-#272 behavior.
         expect(result.errors.some((e) => /bad-repo.*Failed to fetch commits/.test(e))).toBe(true);
-        expect(result.snapshotsWritten).toBe(0);
-        expect(dayRow(db, '2024-01-15')).toBeUndefined();
+        // THE CURSOR HALF is unchanged: an incomplete window is not recorded as covered, so the
+        // next run re-asks for it.
         expect(readState(db, FORWARD_KEY)).toBeUndefined();
+        // THE DATA HALF is what IG1.2 (#318) inverted. Before it, the good repo's commits were
+        // DISCARDED with the run, because commit counters were ADDED across runs and persisting a
+        // half-covered window would double-count when the held cursor made the next run re-cover
+        // it. `raw_commits` is sha-keyed, so re-observing `c-good` next run inserts nothing and
+        // the cell is recomputed rather than accumulated — the partial result is progress to keep,
+        // not a hazard to drop. (V6.)
+        expect(result.snapshotsWritten).toBe(1);
+        expect(dayRow(db, '2024-01-15')?.commits).toBe(1);
+        expect(
+            (db.prepare('SELECT COUNT(*) AS n FROM raw_commits').get() as {n: number}).n,
+        ).toBe(1);
         // …including the stall counter that drives doctor's "not advancing" alert (#235).
         expect(getProviderStall(db, 'github', 'test-org')?.runs).toBe(1);
     });

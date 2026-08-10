@@ -834,18 +834,24 @@ describe('runDoctor', () => {
                 ).toBe(1);
             });
 
-            it('does not prescribe purging the cursors, or a fresh sync, to diagnose it', async () => {
+            it('prescribes the SAFE cursor rewind, and not a fresh sync, to diagnose it', async () => {
                 seedCursor('acme', 1);
                 seedRefusal('acme', 40, 0);
 
                 await runDoctor(db, await reachableGitConfig(), tmpConfigPath, MIGRATIONS_DIR);
 
                 const allOutput = [...output, ...errors].join('\n');
-                // The remedy an operator would reach for first is the one that permanently
-                // doubles every commit metric on the rows that DID survive (#262). The hint
-                // must name it as forbidden, not stay silent and let them find it themselves.
+                // The remedy an operator reaches for first — rewind the cursor and re-import —
+                // used to be the one that permanently doubled every commit metric on the rows
+                // that DID survive (#262), so the hint named it as forbidden. Since IG1 (#316)
+                // it is the CORRECT remedy: commits are sha-keyed and each author-day is
+                // recomputed, so a re-observation moves no counter. The hint must now name it as
+                // the repair — and name the first-sync-window bound a delete rather than a
+                // rewind runs into, which is the completeness half of the remedy rule.
                 expect(allOutput).toContain('Author-days skipped as unwritable');
-                expect(allOutput).toMatch(/DOUBLES every commit metric/);
+                expect(allOutput).toMatch(/git_last_sync sync_state row back/);
+                expect(allOutput).toContain('sync older history');
+                expect(allOutput).not.toMatch(/DOUBLES every commit metric on the rows that survived \(#262\) — do not/);
                 // …and it must not open with "run a sync": this alert can be days old, so on a
                 // quiet provider a fresh run prints no advisory at all, and when it does print
                 // one it has just advanced the cursor over another window under the same cause.

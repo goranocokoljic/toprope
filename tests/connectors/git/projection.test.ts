@@ -180,6 +180,39 @@ describe('projectSnapshots — git_snapshots as a projection of raw_author_daily
         expect(readSnapshots(db)).toHaveLength(1);
     });
 
+    it('COMMIT-WEIGHTS the rate fields when two identities fold into one cell', () => {
+        // The weighting survived IG1.2 (#318): criterion C deleted the symbol it used to share a
+        // body with, and this fold still needs the rule — but its only tests went with that
+        // symbol, so the arithmetic could be collapsed to a plain two-way mean with the whole
+        // suite green. 100 commits at 0.9 folded with 1 commit at 0.0 must land near 0.891, NOT
+        // at the 0.45 midpoint, or a one-commit identity halves a busy day's reported churn.
+        const dev = addDeveloper(db, 'Alice', 'eng', 'alice@example.com', 'alice', {bitbucket: 'alice-bb'});
+        upsertRawAuthorDaily(db, rawRow({
+            raw_author_key: 'github:login:alice',
+            author_login: 'alice',
+            commits: 100,
+            code_churn_rate: 0.9,
+            ai_signature_score: 90,
+        }));
+        upsertRawAuthorDaily(db, rawRow({
+            provider: 'bitbucket',
+            raw_author_key: 'bitbucket:login:alice-bb',
+            author_login: 'alice-bb',
+            commits: 1,
+            code_churn_rate: 0,
+            ai_signature_score: 0,
+        }));
+
+        projectSnapshots(db, {dates: ['2024-01-15']});
+
+        const cell = readCell(db, dev.id, '2024-01-15')!;
+        expect(cell.commits).toBe(101);
+        expect(cell.code_churn_rate).toBeCloseTo((0.9 * 100) / 101, 6);
+        expect(cell.ai_signature_score).toBeCloseTo((90 * 100) / 101, 6);
+        // The plain two-way mean a collapsed implementation would produce, explicitly excluded.
+        expect(cell.code_churn_rate).not.toBeCloseTo(0.45, 2);
+    });
+
     it('resolves a raw row by commit email when the login maps to nobody', () => {
         // No github external id at all — only the email can attribute this row.
         const dev = addDeveloper(db, 'Carol', 'eng', 'carol@example.com');

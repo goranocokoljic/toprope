@@ -566,9 +566,12 @@ describe('BitbucketProvider', () => {
             // (the break is `commitDate < sinceDate`, so a row at `since` survives it), and
             // a capped run advances the cursor to exactly its `until` — so adjacent windows
             // share that instant and a commit stamped there is returned by BOTH of them.
-            // Since mergeDailyAcrossRuns ADDS commit metrics on a stated premise of
-            // disjoint windows, the real exposure at this boundary is a one-instant
-            // double-count, not a gap; an exclusive `until` would close it. Left alone here
+            // That used to be a one-instant DOUBLE-COUNT rather than a gap, because the
+            // cross-run merge ADDED commit metrics on a stated premise of disjoint windows.
+            // IG1.2 (#318) removed that premise: the commit is inserted by sha with ON
+            // CONFLICT DO NOTHING and the cell is recomputed from all of its stored commits,
+            // so a shared instant now costs one redundant insert attempt and nothing else.
+            // The overlap is pinned here as behaviour, not as an exposure. Left alone here
             // because the bounds are pre-existing and shared in spirit with the other two
             // providers' server-side filters — the point of pinning it is that whoever
             // changes them has to change this assertion deliberately rather than drift

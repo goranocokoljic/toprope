@@ -44,6 +44,21 @@ match the notice predicate) were fixed in the commit itself.
 - [#317 review] `src/storage/migrations/046_raw_commits.sql` — 046 clears the cursors AND `commit_diffstats`, so the next scheduled run walks full history with a cold diffstat ratchet, the most expensive shape of resync under #231's all-or-nothing rule. 042's header advised using the admin per-provider "Sync now" with an explicit window before the scheduler fires; 046 does not repeat that advice (Low).
 - [#317 review] `tests/connectors/git/golden-raw-author-daily.test.ts` — deleting the golden fixture and re-running silently re-records whatever the pipeline currently produces (first run throws, second passes). Deliberate and documented in the file header; a checksum or an explicit `--update-golden` gate would close it (Low).
 
+## 2026-08-11 — #318 (IG1.2) SEC fast-lens
+
+Out-of-diff observations plus the Medium/Low findings the fast lens deferred. The one
+High (a shape-valid but unparseable author-day throwing a `RangeError` out of the run's
+write transaction) was fixed in the commit itself. The Medium/Low below carry to the
+epic #316 review as well — parked here so they survive if that review does not reach them.
+
+- [#318 review] `src/connectors/git/sync.ts:4551` — `cellObservations.set` is last-write-wins where the deleted fold combined; `rawAuthorKeyFor`'s login branch trims, so `' alice'` and `'alice'` are two `metricsMap` entries collapsing to one cell key and the last one wins for the four PR counters and the two carried rates (commit counters are unaffected — they come from the store). The reviewer's stated lowercase-email mechanism is NOT reachable; this trim-only variant is what survives (Medium).
+- [#318 review] `src/cli/doctor.ts:690`, `src/connectors/git/sync.ts:771`/`:575`, `src/connectors/git/providers/window-bounds.ts` — four surfaces now advertise "rewind the cursor and re-import, it only costs API calls" on a sha-keyed-commit argument, but `raw_commits`' PK is `(provider, container, repo, sha)` and the cell recompute SUMs across repos, so a repo renamed between the original import and the rewind double-counts. Needs the qualifier (Low).
+- [#318 review] `src/connectors/git/raw-commits.ts:171` — `insertRawCommit` validates `repo`/`sha` with `.trim()` but binds the untrimmed value (the graduated check-and-store-the-same-value rule). Fixing it means moving `commit_diffstats`' sha handling in step (Low).
+- [#318 review] `src/connectors/git/sync.ts:4354`/`:4405` — advisory reporting was moved onto both completeness arms but `recordRowRefusal` / `isEscalatedRefusal` stayed on the complete-provider arm, so a provider that refuses rows every run while staying incomplete never writes `git_row_refusal:*` and never trips doctor's alert (Low).
+- [#318 review] `src/connectors/git/sync.ts` (`formatSkippedAuthorDays` / `formatLossGroups`) — `raw_author_key` and `date` reach `sync_logs.errors` and the admin UI unsanitized; only `container` goes through `sanitizeAdvisoryLabel` (out-of-diff).
+- [#318 review] `src/aggregation/dates.ts:82` (`isUtcDay`) — shape-only, so `raw_author_daily.date` still accepts calendar-impossible days like `2026-02-31`. #318 added `isComputableUtcDay` beside it, so the write boundary now has a total predicate to adopt; adopting it there is a behavior change this child did not make (out-of-diff).
+- [#318 review] `src/connectors/git/sync.ts` (`fetchProviderData`) — a commit reachable from two repos of one container is counted once per repo, before and after this change (out-of-diff).
+
 ## Backlog (pre-policy deferrals)
 
 - Deferred Medium/Low findings from before this policy live in PR comments
