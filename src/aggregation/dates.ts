@@ -15,6 +15,62 @@
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 /**
+ * The year field of a `toISOString()` rendering, as a plain four digits.
+ *
+ * ISO 8601 expanded and negative years (`+033658-09-27T00:00:00.000Z`, which
+ * `git commit --date=@999999999999` produces; `-000001-01-01T00:00:00.000Z`) round-trip through
+ * `Date` cleanly and `Date.parse` finite — so nothing but an anchored test on the RENDERED form
+ * tells them apart from an ordinary year.
+ */
+const PLAIN_YEAR_RE = /^\d{4}-/;
+
+/**
+ * Does `value` name an instant whose year is a plain four digits — the ONE expanded/negative-year
+ * rejection this codebase has (#309)?
+ *
+ * WHY IT IS A RULE AT ALL. Every stored timestamp in the git pipeline is compared as a STRING
+ * somewhere (`ORDER BY`, a `>=` watermark guard, a `slice(0, 10)` day key), and `'+'` (0x2B) and
+ * `'-'` (0x2D) both byte-sort BELOW every digit — so an expanded year reads as "in the distant
+ * past" to every one of those comparisons while parsing as the far future. That is #233's bricked
+ * backfill and #304's silently-empty commit walk, and it is why this predicate exists separately
+ * from "does it parse".
+ *
+ * ONE HOME, three callers (#309's third acceptance criterion). It was three: a `\d{4}`-anchored
+ * regex in `sync.ts`, a byte-identical one in `raw-author-daily.ts`, and `parseCommitBound`'s
+ * `/^\d{4}-/` on a `toISOString()` in `bitbucket.ts`. All three now bottom out here —
+ * {@link isUtcIsoInstant} composes it for the two that also pin `toISOString()`'s exact shape, and
+ * the git window bounds ask it directly (`providers/window-bounds.ts`).
+ *
+ * TOTAL over `unknown`, and `typeof` first: the values reaching it are stored `sync_state` rows
+ * and cast response fields, and `RegExp.test` COERCES — so a bare pattern test would stringify an
+ * array into a passing value.
+ */
+export function isPlainYearInstant(value: unknown): boolean {
+    if (typeof value !== 'string') return false;
+    const ms = Date.parse(value);
+    if (!Number.isFinite(ms)) return false;
+    return PLAIN_YEAR_RE.test(new Date(ms).toISOString());
+}
+
+/**
+ * Is `value` the canonical UTC ISO instant — byte-for-byte what `toISOString()` emits?
+ *
+ * Two conjuncts, and each catches what the other cannot:
+ *  - {@link isPlainYearInstant} rejects an unparseable value and an expanded/negative year;
+ *  - the ROUND-TRIP rejects everything that parses but is not the instant it spells —
+ *    `'2025-02-30T00:00:00.000Z'` (normalizes to 2025-03-02), an offset form
+ *    (`'2024-01-01T01:00:00+01:00'`), and a millis-less `'2024-01-01T00:00:00Z'`.
+ *
+ * The round-trip is what pins the SHAPE, so there is no second `\d{4}-\d{2}-\d{2}T…` regex here:
+ * `toISOString()` only ever emits `YYYY-MM-DDTHH:mm:ss.sssZ` for a plain year, so "equals its own
+ * `toISOString()`" is exactly the old anchored-regex-plus-round-trip pair with the year rule
+ * single-homed above instead of restated in the pattern.
+ */
+export function isUtcIsoInstant(value: unknown): boolean {
+    return isPlainYearInstant(value) && new Date(value as string).toISOString() === value;
+}
+
+/**
  * Is `value` the canonical UTC day SHAPE (YYYY-MM-DD)?
  *
  * The shape check alone, without {@link assertValidDate}'s calendar validation — for callers

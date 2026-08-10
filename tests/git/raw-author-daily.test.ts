@@ -813,6 +813,16 @@ describe('upsertRawAuthorDaily — the write-boundary refusal (#302/#307)', () =
         // day is empty rather than a value an odd JSON body manufactured.
         {name: 'an empty day', row: input({date: ''}), observedAt: OBSERVED, code: 'invalid_date'},
         {name: 'a non-ISO observedAt', row: input(), observedAt: 'not-a-date', code: 'invalid_instant'},
+        // The input class ONLY the #309 round-trip check refuses: shape-valid but impossible, so
+        // the pre-#309 anchored regex accepted it and `laterInstant` would have silently
+        // normalized it to March 2. Reverting `isUtcIsoInstant` here to a shape-only regex
+        // fails exactly this row and nothing else.
+        {
+            name: 'a shape-valid impossible observedAt instant',
+            row: input(),
+            observedAt: '2025-02-30T00:00:00.000Z',
+            code: 'invalid_instant',
+        },
         // The FOURTH door, and the one no date check catches: `new Date(mergedAt) -
         // new Date(createdAt)` is NaN whenever either operand is unparseable, on a row whose own
         // day may be perfectly well-formed. `invalid_computed_metric` since #306: the analyzer's
@@ -949,6 +959,7 @@ describe('ROW_LEVEL_REFUSALS — what the sync may skip (#302/#306)', () => {
 
     it('holds exactly the refusals a single row can be solely responsible for', () => {
         expect([...ROW_LEVEL_REFUSALS].sort()).toEqual([
+            'future_date',
             'invalid_date',
             'invalid_identity',
             'invalid_metric',
@@ -979,6 +990,77 @@ describe('ROW_LEVEL_REFUSALS — what the sync may skip (#302/#306)', () => {
         const bothWrong = refusalCodeOf(input({date: 'not-a-day'}), 'not-an-instant');
         expect(bothWrong).toBe('invalid_instant');
         expect(ROW_LEVEL_REFUSALS).not.toContain(bothWrong!);
+    });
+});
+
+/**
+ * #309 — a FUTURE developer-day is refused here, for every provider at once.
+ *
+ * `git commit --date="2099-01-01"` leaves the AUTHOR date years ahead while the committer date
+ * stays at now, and GitHub/GitLab window on the COMMITTER date server-side — so the row comes back
+ * from the very window the run asked for, and the day key this pipeline derives is the author's.
+ * `isUtcDay` is a bare shape test with no upper bound, so before this check the row was written as
+ * a `2099-01-01` developer-day and projected into `git_snapshots`, where append-only means it
+ * could never be corrected (the #106 hazard: one future-dated cell made `buildTrajectory` emit
+ * thousands of zero-weeks).
+ *
+ * The end-to-end half — that a real GitHub and a real GitLab run refuse it and report the skip —
+ * is in `tests/connectors/git/future-author-dates.test.ts`.
+ */
+describe('the write boundary bounds the day against the run clock (#309)', () => {
+    const OBSERVED = '2026-07-01T12:00:00.000Z';
+
+    it('refuses a day years ahead of the run as future_date', () => {
+        expect(refusalCodeOf(input({date: '2099-01-01'}), OBSERVED)).toBe('future_date');
+    });
+
+    it('accepts the run’s own UTC day', () => {
+        expect(refusalCodeOf(input({date: '2026-07-01'}), OBSERVED)).toBeNull();
+    });
+
+    it('accepts the day AFTER the run’s, which UTC+14 legitimately produces', () => {
+        // The input class only the horizon handles, and the reason it is one day rather than zero.
+        // `isAttributableDate` admits an offset-bearing timestamp because the store does, and
+        // GitLab's `authored_date` really is offset-bearing — so a commit made at this instant in
+        // the easternmost zone slices to TOMORROW's UTC day. A zero-day bound would refuse honest
+        // commits from half the planet every evening.
+        expect(refusalCodeOf(input({date: '2026-07-02'}), OBSERVED)).toBeNull();
+    });
+
+    it('refuses TWO days ahead, which no timezone offset can explain', () => {
+        // The other side of the same boundary: the horizon is derived from the maximum UTC offset
+        // (+14:00, rounded up to a day), not a loose grace period. Without this case the horizon
+        // could be widened to a week and the test above would stay green.
+        expect(refusalCodeOf(input({date: '2026-07-03'}), OBSERVED)).toBe('future_date');
+    });
+
+    it('checks the day SHAPE first, so an off-shape value is still invalid_date', () => {
+        // Ordering matters, and this is the input class only that ordering handles: `>` on two
+        // strings is sound ONLY once both are shape-pinned, because a non-conforming value
+        // byte-sorts arbitrarily. `'not-a-day'` sorts BELOW every real day, so with the two checks
+        // swapped it would slip past the horizon comparison and be reported as a clock problem —
+        // or, worse, be accepted by it and left to the schema CHECK.
+        expect(refusalCodeOf(input({date: 'not-a-day'}), OBSERVED)).toBe('invalid_date');
+    });
+
+    it('reports a calendar-impossible day past the horizon as future_date, not invalid_date', () => {
+        // Deliberate, and worth pinning so it is not read as a bug. `isUtcDay` is a SHAPE check by
+        // design — the store accepts `2024-02-30` because rejecting it would drop commits the
+        // provider gates deliberately let through (see `commit-date.ts`) — so `'9999-99-99'` is a
+        // well-shaped day as far as this boundary is concerned, and it is genuinely after the
+        // horizon under the same byte comparison every consumer of the column uses. Both codes are
+        // row-level refusals, so the row is skipped identically either way; only the operator's
+        // first guess changes. An in-window impossible day is unaffected and still writes.
+        expect(refusalCodeOf(input({date: '9999-99-99'}), OBSERVED)).toBe('future_date');
+        expect(refusalCodeOf(input({date: '2026-02-30'}), OBSERVED)).toBeNull();
+    });
+
+    it('checks the run-level observedAt BEFORE the row’s day', () => {
+        // Same argument as the `invalid_date` ordering case above: a corrupt clock makes EVERY row
+        // look future-dated, and if that were reported per row the sync would skip the whole
+        // window (row-level) and advance the cursor, instead of rolling back on the run-level
+        // `invalid_instant` the fault actually is.
+        expect(refusalCodeOf(input({date: '2099-01-01'}), 'not-an-instant')).toBe('invalid_instant');
     });
 });
 

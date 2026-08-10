@@ -78,6 +78,16 @@ import {
  * component (every one of them is `slice(0, 10)` or a parsed instant), so rejecting it would lose a
  * commit the store would have keyed correctly. Both remaining gaps are pre-existing and shared by
  * all three providers; fixing them belongs at the write boundary, for every provider at once.
+ *
+ * NO UPPER BOUND EITHER, and that one WAS closed — at the write boundary, exactly as the sentence
+ * above prescribes (#309). `isUtcDay` is a shape test, so a `2099-01-01` author date passed here
+ * and was written as a future developer-day by whichever provider's window did not exclude it
+ * (GitHub's and GitLab's are server-side and filter the COMMITTER date, so both returned the row).
+ * `raw_author_daily`'s validator now refuses a day past the run's own UTC day plus one — the
+ * maximum timezone offset, which the accepted offset form above is precisely why it cannot be
+ * zero. Deliberately NOT added here: the bound is a property of the RUN (`observedAt`), which no
+ * provider knows, and three PR/comment dates reach the same column without passing this gate at
+ * all.
  */
 export function isAttributableDate(date: unknown): boolean {
     return (

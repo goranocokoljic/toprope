@@ -48,6 +48,8 @@ import type {
     GitPR,
 } from './providers/types.js';
 import {COMMIT_DROP_REASONS} from './providers/types.js';
+import {resolveCommitWindow} from './providers/window-bounds.js';
+import {isUtcIsoInstant} from '../../aggregation/dates.js';
 import {promoteAllCandidates} from './onboarding.js';
 import {ensureTeam} from '../../registry/teams.js';
 import {resolveAutoCreateSettings, type AutoCreateSettings} from '../../config/git-auto-create.js';
@@ -2447,22 +2449,6 @@ export function declareEarliestSyncedFloor(
 }
 
 /**
- * True iff `value` is a canonical UTC ISO instant (what every stored timestamp is).
- * Both checks earn their place, and each catches what the other cannot:
- *  - the REGEX pins the shape to exactly 4 digits + millis + 'Z', excluding ISO 8601
- *    expanded/negative years ('+010000-01-01T00:00:00.000Z'), which parse and round-trip
- *    cleanly yet break the ISO-string ordering every watermark comparison relies on;
- *  - the ROUND-TRIP rejects values that match the shape but are not the instant they
- *    spell — '2025-02-30T00:00:00.000Z' parses and normalizes to 2025-03-02;
- *  - the NaN check guards `toISOString()`, which throws RangeError on an Invalid Date.
- */
-function isUtcIsoInstant(value: string): boolean {
-    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) return false;
-    const parsed = new Date(value);
-    return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
-}
-
-/**
  * Derive the immutable raw-author key a day's metrics are RETAINED under (#253).
  *
  * `aggregateDailyMetrics` groups by `AnalysisCommit.authorLogin`, which
@@ -2758,6 +2744,28 @@ async function fetchProviderData(
         : storedCursor !== null
           ? catchUpUntil(storedCursor, now)
           : now;
+    // VALIDATE THE PAIR ONCE, HERE, WHERE IT IS DERIVED (#309).
+    //
+    // These two strings are the whole window: they are handed to every provider's `getCommits`
+    // AND to `getPullRequests`, so a bound that mis-compares corrupts every walk of the run at
+    // once. Before this, only `BitbucketProvider.getCommits` checked them (#304) — which left the
+    // two providers that push the bounds to the SERVER unguarded (an expanded year parsed as year
+    // 10000 can return an empty result set as a success, and the run then records an unwalked
+    // window as covered), and left all three PR walks hand-rolling `since ? new Date(since) :
+    // null`, where an Invalid Date makes the `reachedSince` break unreachable and the walk pages
+    // the entire PR history back as "the requested window".
+    //
+    // ONCE PER RUN, not once per repo, which is also why it belongs here: the bounds are constant
+    // across a provider's repos, so re-deriving the verdict per repo could only ever produce the
+    // same answer at N times the cost — and, more importantly, would refuse repo 7 of 12 after
+    // six repos of network work rather than before the first request.
+    //
+    // FAIL-CLOSED. The throw escapes to `runSync`'s per-provider catch, which records the
+    // provider as unusable and advances NO cursor (#231), so the window is re-fetched intact once
+    // the bad value is repaired. The parsed pair is deliberately discarded: `since`/`until` travel
+    // onward as the strings they already were, and Bitbucket — the one walk that compares them in
+    // memory — asks the same function for its own `Date`s.
+    resolveCommitWindow(since, until);
 
     const rawRepos = 'repos' in providerConfig ? providerConfig.repos : undefined;
     const excludeRepos =
@@ -4053,6 +4061,14 @@ export class GitSync implements ConnectorInterface {
                 // constructor, are both TOTAL by design, so nothing else can land here.) A
                 // genuine error, not an advisory: the operator configured a provider that
                 // cannot be synced at all.
+                //
+                // Since #309 it also catches the run's WINDOW refusal — an unparseable or
+                // expanded-year `since`/`until`, or an inverted pair — which is raised from the
+                // same pre-request stretch and wants exactly this handling: the provider is
+                // skipped, its cursor does not move, and the window is re-fetched intact once the
+                // offending `sync_state` row is repaired. That fault is not a config error, so
+                // read the line's wording as "this provider could not be used THIS RUN"; the
+                // message `resolveCommitWindow` throws names which bound and which state key.
                 errors.push(
                     `[${pc.type}] Skipped — this provider could not be used: ` +
                         `${err instanceof Error ? err.message : String(err)}`,

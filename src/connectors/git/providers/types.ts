@@ -413,11 +413,21 @@ export const UNATTRIBUTABLE_DATE_DROP_REASON = 'the author date is present but i
  * and — before #304 — said nothing, which read to an operator as the benign "still approaching
  * the window" divergence forever (see {@link GitFetchProgress.scanned}).
  *
- * THE OTHER TWO PROVIDERS ARE NOT IMMUNE, THEY ARE WORSE, and this reason must not be read as
- * evidence otherwise: on them a future-dated commit is IMPORTED as a future developer-day rather
- * than reported. Tracked as #309, which carries the evidence (their server windows filter on the
- * COMMITTER date while the day key comes from the AUTHOR date) and the argument that the fix
- * belongs at the write boundary for all three at once, as #302's did for the PR dates.
+ * THE OTHER TWO PROVIDERS WERE NOT IMMUNE, THEY WERE WORSE, and this reason must not be read as
+ * evidence otherwise: on them a future-dated commit was IMPORTED as a future developer-day rather
+ * than reported (their server windows filter on the COMMITTER date while the day key comes from
+ * the AUTHOR date). #309 CLOSED THAT at the write boundary for all three at once, exactly as #302
+ * did for the PR dates: `raw_author_daily`'s validator refuses a day later than the run's own UTC
+ * day plus one (the maximum timezone offset), as the row-level `future_date` code, and the run
+ * reports it under `AUTHOR_DAYS_SKIPPED_PREFIX`.
+ *
+ * SO THIS REASON IS NOT REDUNDANT, and the difference is what it can NAME. The write-boundary
+ * refusal happens after the commits have been folded into an (author, day) row, so it can report
+ * only that author and that day; this report happens at the walk and carries the SHA, which is the
+ * difference between an operator who can look the commit up and one who cannot. Same division of
+ * labour as `isAttributableDate`'s gate versus the store's `invalid_date` — see
+ * `commit-date.ts`. On Bitbucket the two are also mutually exclusive in practice: the row never
+ * becomes an author-day at all, so the store never sees it.
  *
  * WHICH TIMESTAMP BITBUCKET'S OWN `date` FIELD IS, said plainly because the contrast above leans
  * on it: unknown. Its commit payload exposes ONE `date` (`RawCommit` in `bitbucket.ts`), with no
@@ -656,7 +666,11 @@ export interface GitProvider {
     // that whole comparison lives on {@link FUTURE_AUTHOR_DATE_DROP_REASON} and is not repeated
     // here. GitHub and GitLab do not share the REPEAT: their windows are server-side and filter on
     // COMMITTER date, so a bad-dated commit ages out and is reported once. For the future-dated
-    // class that same fact costs them something worse than a repeat — see the same docstring.
+    // class that same fact used to cost them something worse than a repeat — they IMPORTED the row
+    // as a future developer-day. #309 closed that at the write boundary for all three (a
+    // `future_date` row-level refusal in `raw-author-daily.ts`), so what is left is only the
+    // difference in what each surface can NAME: this listener carries the sha, the write-boundary
+    // skip carries the (author, day).
     // Two consequences follow,
     // and neither clears on its own: `toprope sync git` exits non-zero whenever `errors[]` is
     // non-empty and advisories share that array, so one such commit makes the CLI permanently red
