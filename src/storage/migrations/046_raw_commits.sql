@@ -52,9 +52,24 @@
 --     fixture- or import-seeded row that appeared since. Same one-time, pre-production license as
 --     042, and no RUNTIME path may do this.
 --   * `raw_author_daily` — every row. The additive output described above.
---   * The `git_last_sync:*` and `git_earliest_sync:*` rows in `sync_state` — the forward cursor
---     and the earliest-synced watermark of every provider instance (key shapes:
---     `syncStateKey` / `earliestSyncStateKey`, `src/connectors/git/sync.ts`).
+--   * All FOUR per-provider `sync_state` namespaces — the forward cursor (`git_last_sync:*`),
+--     the earliest-synced watermark (`git_earliest_sync:*`), the consecutive-stall streak
+--     (`git_stall:*`, #235) and the row-refusal record (`git_row_refusal:*`, #306). Key shapes:
+--     `syncStateKey` / `earliestSyncStateKey` / `stallStateKey` / `rowRefusalStateKey` in
+--     `src/connectors/git/sync.ts`; the same four `containerCursorKeys` the per-container delete
+--     cascade purges (`providers/delete-cascade.ts`), and the same set 042 and 043 cleared.
+--
+--     THE TWO HEALTH NAMESPACES GO WITH THE DATA, not because they are cursors but because both
+--     count RUNS, and this file deletes the data every one of those runs produced. A streak of 2
+--     (invisible — `GIT_STALL_ALERT_RUNS` is 3) survives the reset, so the FIRST post-reset run
+--     that fails for any transient reason reports the provider stalled "since" a pre-reset date,
+--     with `doctor`'s "cursor held, importing nothing" naming a cursor this file deleted. The
+--     refusal record is worse: its escalated flag is sticky, and the remedy `doctor` prints for
+--     it warns against purging cursors because that "permanently DOUBLES every commit metric on
+--     the rows that survived" — after this reset no rows survived and the cursors are already
+--     gone, so the warning is inverted. Neither is self-healing in the direction that matters:
+--     `clearProviderStall` fires only on a COMPLETE run, and until one lands the streak is
+--     extended, preserving its original `since`.
 --   * `commit_diffstats` — every row, per the reset contract 044's own header states: *"any
 --     future migration or command that resets git data must add DELETE FROM commit_diffstats"*.
 --     A resync that reads the memo does NOT re-ask the provider; it replays whatever is cached,
@@ -68,14 +83,9 @@
 --     is state-keyed (`provider, container, repo, pr_id`) and replace-idempotent, so a resync
 --     re-upserts every row it re-lists. Clearing it would be scope creep, not fidelity — and it
 --     is the one git table whose re-fetch this reset cannot make cheaper.
---   * `git_stall:*` and `git_row_refusal:*` in `sync_state` — per-run HEALTH verdicts (#235,
---     #306), not data and not cursors, so the #262 "cursors go with the data" rule does not reach
---     them. Both are self-healing: a completed window clears the stall streak
---     (`clearProviderStall`) and a run whose rows are retained clears the refusal record. The
---     resync this file's notice already mandates is exactly that run, so clearing them here would
---     only pre-empt a signal that the rebuild resolves on its own. (The per-container delete
---     cascade DOES purge all four namespaces — but it removes the provider itself, so there is no
---     later run to heal them.)
+--   * The DERIVED rollups — `weekly_aggregates` and its siblings, `pr_review_metrics`,
+--     `coaching_signals`. They are a SECOND projection that no migration rebuilds, which is
+--     exactly why the notice below exists and why its remedy names `toprope aggregate backfill`.
 --
 -- ─── AFTERWARDS ──────────────────────────────────────────────────────────────────────
 -- The notice below raises the same `git_data_reset_pending` marker 043 used, stamped `046`, via
@@ -101,6 +111,13 @@
 --     so the privacy model is unchanged.
 --   * `author_day` is GLOB-pinned to `YYYY-MM-DD` because the projection groups by it and the
 --     day key is compared as a STRING; `committed_at` and `first_seen` are UTC ISO instants.
+--     READ THE TWO INLINE COMMENTS AS A CONTRACT ON THE WRITER, NOT AS A SCHEMA GUARANTEE:
+--     "lowercased at the write boundary" (`author_email`) and "pinned UTC ISO instant"
+--     (`committed_at`) carry no CHECK, exactly as their `raw_author_daily` counterparts do not.
+--     #318 must enforce both in code — `normalizeEmail` and the existing `isUtcIsoInstant` gate —
+--     and the day key is the one this schema does pin, because it is the one compared as a
+--     string. Adding CHECKs here would edit design §1, which this child may not do unilaterally
+--     (the epic's drift protocol: a design change is raised and signed off, never improvised).
 --   * ONE secondary index, on the projection's grain. Both hot patterns are left-prefix seeks —
 --     the per-commit upsert on the PK, the per-cell recompute and the delete cascade on the index
 --     — so a second index would tax every write and buy nothing (the `commit_diffstats`
@@ -136,9 +153,16 @@ CREATE INDEX IF NOT EXISTS idx_raw_commits_author_day ON raw_commits(provider, c
 -- signal is not a currency claim).
 --
 -- The arms answer ONE question — "did this database ever hold git data" — which needs no
--- knowledge of the new model at all. They are 043's arms minus its `changes()` arm (that one read
--- the row count of a `git_providers` DELETE this file does not perform), and they deliberately
--- reach beyond the tables emptied below:
+-- knowledge of the new model at all. Relative to 043's arms (`043:198-209`) there are exactly
+-- four differences, all deliberate: its `changes() > 0` arm is dropped (it read the row count of
+-- a `git_providers` DELETE this file does not perform); a `commit_diffstats` arm is added,
+-- because this file empties that table too; the `git_snapshots` arm is widened from
+-- `is_projected = 1` to unscoped, matching the unscoped DELETE below; and the cursor arm keeps
+-- only the two data-bearing namespaces, since a database whose ONLY git evidence is a
+-- `git_stall:` / `git_row_refusal:` row has no data for this file to delete and owes no rebuild
+-- (those rows are still cleared below — they describe runs whose data is gone).
+--
+-- The arms deliberately reach beyond the tables emptied below:
 --   * `pr_records` — not cleared here, but its presence is direct evidence of imported git data
 --     whose per-day counters this file DOES empty;
 --   * `git_providers.last_sync_at` — written only by a git sync, and nulled further down, so it
@@ -178,14 +202,26 @@ DELETE FROM raw_author_daily;
 -- The diffstat memo (044's reset contract). Deleting it costs only re-fetching.
 DELETE FROM commit_diffstats;
 
--- The forward cursor and the earliest-synced watermark of every provider instance. See the header
--- for why `git_stall:*` / `git_row_refusal:*` are deliberately left in place.
+-- All four per-provider namespaces: the forward cursor, the earliest-synced watermark, and the
+-- two run-health records whose runs this file has just deleted the output of (see the header).
 DELETE FROM sync_state
  WHERE key LIKE 'git_last_sync:%'
-    OR key LIKE 'git_earliest_sync:%';
+    OR key LIKE 'git_earliest_sync:%'
+    OR key LIKE 'git_stall:%'
+    OR key LIKE 'git_row_refusal:%';
 
--- The provider rows' own sync display columns describe a run whose data no longer exists. Leaving
+-- The provider rows' own sync-outcome columns describe a run whose data no longer exists. Leaving
 -- them would make the admin list read "synced 2 hours ago · ok" for a provider with zero rows and
 -- `first_sync_pending: true` — a completion signal read as a currency claim (#235).
+--
+-- ALL FOUR of them, which is one more than 043 cleared: #289 added `last_sync_advisories` one
+-- migration ago, and `recordSyncOutcome` writes all four in a single UPDATE as ONE record of the
+-- last scoped run. Leaving the advisories behind would keep rendering a loss report (e.g. a
+-- `COMMITS_DROPPED` advisory about commits behind an already-advanced cursor) for a run whose
+-- cursor and rows are gone — and it would not clear on the remedy this notice prescribes, since
+-- only the admin per-provider routes ever write that column, never the scheduler or the CLI.
 UPDATE git_providers
-   SET last_sync_at = NULL, last_sync_status = NULL, last_sync_error = NULL;
+   SET last_sync_at = NULL,
+       last_sync_status = NULL,
+       last_sync_error = NULL,
+       last_sync_advisories = NULL;

@@ -9,8 +9,10 @@
  * The locked decisions under test (deviating from any of them is design drift, not a refactor):
  *   - `pr_records` is NOT cleared: it is state-keyed and replace-idempotent, so a resync
  *     re-upserts it. Clearing it would be scope creep.
- *   - `git_stall:*` / `git_row_refusal:*` are NOT cleared: per-run health verdicts, self-healing
- *     on the resync the notice already mandates.
+ *   - `git_stall:*` / `git_row_refusal:*` ARE cleared, alongside the two cursor namespaces: both
+ *     count RUNS whose output this migration deletes, so a surviving sub-threshold streak makes
+ *     the first post-reset blip report a provider stalled "since" a pre-reset date, with a
+ *     cursor-held remedy naming a cursor that is gone.
  *   - `git_snapshots` IS cleared unscoped — legacy (`is_projected = 0`) cells included — because
  *     the projection can never retract one, so any survivor would make later delete cascades
  *     silently partial (the 042 argument).
@@ -113,10 +115,12 @@ function seedGitProvider(db: Database.Database): void {
     db.prepare(
         `INSERT INTO git_providers
          (id, type, container, auth_method, token_ciphertext, token_meta, enabled,
-          created_at, updated_at, last_sync_at, last_sync_status, last_sync_error)
+          created_at, updated_at, last_sync_at, last_sync_status, last_sync_error,
+          last_sync_advisories)
          VALUES ('gp1', 'github', 'acme', 'token', X'00', '{}', 1,
                  '2026-06-01T00:00:00.000Z', '2026-06-01T00:00:00.000Z',
-                 '2026-07-02T00:00:00.000Z', 'ok', NULL)`,
+                 '2026-07-02T00:00:00.000Z', 'ok', NULL,
+                 '["Commits dropped: 3 in acme/repo1"]')`,
     ).run();
 }
 
@@ -182,23 +186,29 @@ describe('migration 046 reset (#317)', () => {
         expect(count(db, 'git_snapshots')).toBe(0);
         expect(count(db, 'commit_diffstats')).toBe(0);
 
-        // Gone: both cursor namespaces. Kept: the health verdicts and every non-git key.
-        expect(syncStateKeys(db)).toEqual([
-            'copilot_last_sync',
-            'git_data_reset_pending',
-            'git_row_refusal:github:acme',
-            'git_stall:github:acme',
-        ]);
+        // Gone: all four per-provider namespaces — the two cursors AND the two run-health records,
+        // which count runs whose output this migration has just deleted. Kept: every non-git key.
+        expect(syncStateKeys(db)).toEqual(['copilot_last_sync', 'git_data_reset_pending']);
 
         // KEPT — the locked decision. `pr_records` is state-keyed and replace-idempotent.
         expect(count(db, 'pr_records')).toBe(1);
 
         // Kept, but no longer claiming currency (#235): the provider row survives with its token,
-        // its sync display columns cleared.
+        // and ALL FOUR sync-outcome columns are cleared — `last_sync_advisories` (#289) included,
+        // since `recordSyncOutcome` writes the four as one record of the last scoped run, and only
+        // an admin per-provider sync would ever clear that column again.
         const provider = db
-            .prepare('SELECT last_sync_at, last_sync_status, last_sync_error FROM git_providers WHERE id = ?')
+            .prepare(
+                `SELECT last_sync_at, last_sync_status, last_sync_error, last_sync_advisories
+                   FROM git_providers WHERE id = ?`,
+            )
             .get('gp1') as Record<string, unknown>;
-        expect(provider).toEqual({last_sync_at: null, last_sync_status: null, last_sync_error: null});
+        expect(provider).toEqual({
+            last_sync_at: null,
+            last_sync_status: null,
+            last_sync_error: null,
+            last_sync_advisories: null,
+        });
 
         // Untouched — and that is exactly why the notice below has to exist: the rollups still
         // hold pre-reset totals over zero snapshots until `aggregate backfill` runs.
