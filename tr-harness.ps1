@@ -1006,6 +1006,21 @@ function Expand-Queue {
         }
         $work += [ordered]@{ Issue = $n; Mode = 'finalize'; EpicIssue = $n; EpicBranch = $branch; Children = $epic.Children }
     }
+
+    # Dedup: an issue passed explicitly on the command line AND resolved as some
+    # epic's child would run TWICE — once standalone (default mode, whose verifier
+    # expects the issue CLOSED and therefore always quarantines an epic child that
+    # correctly stays open) and once as the epic's subtask. Keep only the epic's
+    # copy. (2026-08-10: `tr-harness 317 318 319 320 316` quarantined #317's
+    # standalone duplicate and ran #318 standalone with epic-sized context.)
+    $epicChildSet = @{}
+    foreach ($w in $work) { if ($w.Mode -eq 'subtask') { $epicChildSet["$($w.Issue)"] = $true } }
+    $dupes = @($work | Where-Object { $_.Mode -eq 'default' -and $epicChildSet.ContainsKey("$($_.Issue)") })
+    if ($dupes.Count -gt 0) {
+        $work = @($work | Where-Object { -not ($_.Mode -eq 'default' -and $epicChildSet.ContainsKey("$($_.Issue)")) })
+        $names = ($dupes | ForEach-Object { "#$($_.Issue)" }) -join ', '
+        Write-Log "    note: $names passed explicitly but also resolved as epic children - running each ONCE, as its epic's subtask (pass just the epic number next time)." 'Yellow'
+    }
     return ,$work
 }
 
