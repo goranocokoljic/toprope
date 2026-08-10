@@ -492,11 +492,26 @@ interface SkippedAuthorDay {
  * array, a missing key — into ONE `''` day, so a truncated page that cost an author 300 PRs
  * arrives here as a single unwritable row. Author-days is the only quantity this boundary can
  * count honestly; printing it bare would let an operator read "1" as "one PR".
+ *
+ * IT NO LONGER SAYS THE DAY IS ABSENT, because since IG1.2 (#318) that is only half true. A
+ * refusal is now decided at TWO grains: a refused COMMIT drops one commit and the day is still
+ * written, understated; a refused CELL drops the whole author-day as before. Both arrive here as
+ * one `(author, day)` entry — deliberately, since that is the grain an operator can act on — so
+ * the line states the weaker, true claim rather than the stronger, sometimes-false one. Telling
+ * an operator a day is missing when it is present-but-low is worse than saying nothing: the
+ * repair they would reach for is scoped to a day that is already there.
+ *
+ * `windowCovered` is the run's completeness. It gates the PERMANENCE claim only, and it exists
+ * because IG1.2 made an incomplete provider write (and therefore refuse) rows: with the cursor
+ * held, the next run genuinely does re-ask the window, so claiming "nothing re-asks them" would
+ * be the graduated "a remedy printed to an operator is executable advice" rule broken in the
+ * direction that causes a needless repair.
  */
 function formatSkippedAuthorDays(
     providerType: GitProviderType,
     container: string,
     skips: readonly SkippedAuthorDay[],
+    windowCovered: boolean,
 ): string[] {
     if (skips.length === 0) return [];
     const groups = formatLossGroups(
@@ -506,18 +521,23 @@ function formatSkippedAuthorDays(
         })),
         'refused as',
     );
+    const permanence = windowCovered
+        ? `and this run has recorded its window as covered — nothing re-asks them. Neither a ` +
+          `forward sync nor "sync older history" reaches them: the latter only extends STRICTLY ` +
+          `older than the earliest synced instant. `
+        : `This run did NOT record its window as covered (its fetch was incomplete), so the ` +
+          `cursor is held and the next run re-asks this window — expect the same refusals until ` +
+          `the cause is fixed, and no loss yet if it is. `;
     return [
         `${AUTHOR_DAYS_SKIPPED_PREFIX} [${providerType}/${sanitizeAdvisoryLabel(container)}] ` +
-            `${skips.length} author-day row(s) could not be written to raw_author_daily, and this ` +
-            `run has recorded its window as covered — nothing re-asks them. Everything that day ` +
-            `carried for the author — commits, PRs and review comments alike — is absent from ` +
-            `raw_author_daily and therefore from git_snapshots. The row is keyed by (author, day), ` +
-            `so this is at LEAST ${skips.length} lost item(s) and may be far more: an unusable ` +
-            `date collapses every PR and comment carrying it onto one row, and nothing at this ` +
-            `boundary still knows how many. Neither a forward sync nor "sync older history" can ` +
-            `re-ask them — the latter only extends STRICTLY older than the earliest synced ` +
-            `instant, so it reaches neither a forward window nor a span a backfill just covered. ` +
-            `${groups}.`,
+            `${skips.length} author-day row(s) were refused by the raw store, ${permanence}` +
+            `Each entry is one (author, day): either that day carried a commit this pipeline ` +
+            `could not store — the day is WRITTEN but understated by that commit — or the whole ` +
+            `day-row was refused, in which case everything it carried (commits, PRs and review ` +
+            `comments alike) is absent from raw_author_daily and therefore from git_snapshots. ` +
+            `Either way this is at LEAST ${skips.length} lost item(s) and may be far more: an ` +
+            `unusable date collapses every PR and comment carrying it onto one row, and nothing ` +
+            `at this boundary still knows how many. ${groups}.`,
     ];
 }
 
@@ -4145,6 +4165,11 @@ export class GitSync implements ConnectorInterface {
         // Each closure self-guards with `isWritable` (hoisted above the fetch loop), so a
         // container that lost its owner mid-run advances nothing.
         const cursorAdvances: Array<() => void> = [];
+        // Deferred refusal REPORTING, applied in the same transaction as the cursor advances but
+        // for EVERY provider rather than only the complete ones (IG1.2 / #318) — see where they
+        // are pushed for why the two had to be separated once an incomplete provider started
+        // writing rows.
+        const refusalReports: Array<() => void> = [];
         // Auto-create's summary/failure lines (#256). Staged rather than pushed straight
         // into `errors` because they are produced INSIDE the write transaction: on a
         // rollback no developer was created, so reporting that any were would be a lie.
@@ -4211,6 +4236,16 @@ export class GitSync implements ConnectorInterface {
         // carried by the commits and by the cell built from them — which is the second way one
         // defect would otherwise be counted twice.
         const recordedSkips = new Set<string>();
+        // The (container, author, day) cells that lost at least one COMMIT to a refusal. Pass 2
+        // still writes those cells — the surviving commits are real data and dropping the whole
+        // day would be a strictly larger loss — but they must NOT be counted as retained rows.
+        //
+        // `isSystemicRowRefusal` weighs refusals against accepted rows, and before this set the
+        // SAME author-day incremented both sides: one refused commit made the day appear in the
+        // numerator, and the cell written from its surviving commits added it to the denominator.
+        // That dilutes the ratio in the fail-open direction with exactly the input class the guard
+        // exists to catch — a provider refusing most of what it builds.
+        const cellsWithRefusedCommits = new Set<string>();
         const recordSkippedAuthorDay = (
             provider: GitProviderType,
             container: string,
@@ -4283,6 +4318,39 @@ export class GitSync implements ConnectorInterface {
             // per-container maps declared above, keyed by this instance's container key.
             const instanceKey = containerKeyOf(providerType, identifier);
 
+            // REFUSAL REPORTING RUNS FOR EVERY PROVIDER, complete or not (IG1.2 / #318). Before
+            // this child an incomplete provider `continue`d before contributing anything, so it
+            // could not produce a refusal and the reporting could live inside the cursor-advance
+            // closure below. It now WRITES its rows, so it can refuse — and if the reporting had
+            // stayed behind the completeness gate, a provider with one permanently-failing repo
+            // would refuse a row on every run forever with no advisory, `records_skipped` stuck at
+            // 0, and `doctor` telling the operator to go find a line that is never printed.
+            //
+            // WHAT DIFFERS BETWEEN THE ARMS IS THE PERMANENCE CLAIM, not the reporting. A refused
+            // row is only beyond recovery once the window is recorded as covered; while the cursor
+            // is held the next run re-asks it. `windowCovered` is that distinction, and it is the
+            // one clause of the advisory that changes.
+            //
+            // `clearRowRefusal` stays on the COMPLETE arm only (see below): clearing a durable
+            // alert on the strength of a run that did not cover its window would retract a report
+            // of a loss that is still unrepaired.
+            refusalReports.push((): void => {
+                const skippedRows = skippedRowsByContainer.get(instanceKey) ?? [];
+                const skippedPRRecords = skippedPRRecordsByContainer.get(instanceKey) ?? [];
+                // Nothing to report — return BEFORE the ownership gate. `isWritable` is not a pure
+                // predicate: it records an orphaned container as a side effect, so asking it for a
+                // provider with no refusals would report a mid-run provider change on runs that
+                // previously reported none (`diffstat-ratchet-cache.test.ts`'s failed-backfill
+                // case is exactly that shape).
+                if (skippedRows.length === 0 && skippedPRRecords.length === 0) return;
+                if (!isWritable(providerType, identifier)) return;
+                skippedRowAdvisories.push(
+                    ...formatSkippedAuthorDays(providerType, identifier, skippedRows, result.complete),
+                    ...formatSkippedPRRecords(providerType, identifier, skippedPRRecords),
+                );
+                committedRowsSkipped += skippedRows.length + skippedPRRecords.length;
+            });
+
             if (result.complete) cursorAdvances.push((): void => {
                 // Advancing a cursor the cascade just purged is exactly what re-arms the #262
                 // double-count, so a container whose owner changed mid-run advances nothing.
@@ -4306,33 +4374,10 @@ export class GitSync implements ConnectorInterface {
                 // Same premise, same gate (#288): a commit whose churn was never observed is
                 // only permanently understated once this advance makes its window covered.
                 churnUnknownAdvisories.push(...result.churnUnknownAdvisories);
-                // Same premise, same gate (#302): a row this run refused to write is only beyond
-                // recovery once this advance records its window as covered. Rendered HERE rather
-                // than staged as a finished string like the three above — those are built in
-                // `fetchProviderData` because that is where their data lives, not to keep work
-                // out of the write lock, and the grouping this does is a regex-replace per
-                // skipped row against a transaction already upserting every row of the run.
-                skippedRowAdvisories.push(
-                    ...formatSkippedAuthorDays(providerType, identifier, skippedRows),
-                    ...formatSkippedPRRecords(providerType, identifier, skippedPRRecords),
-                );
-                // Both grains, because the field they feed answers "how many rows did this run
-                // not write", and both are rows it did not write. Which is which stays legible
-                // on the two advisory lines just staged; the number is the coarse signal that
-                // reaches `sync_logs.records_skipped` and `toprope sync`'s summary (#306).
-                //
-                // IT NO LONGER PARTITIONS WITH `snapshotsWritten`, and that is worth stating
-                // rather than leaving for a reader to discover from "100 written, 40 skipped".
-                // `snapshotsWritten` counts git_snapshots CELLS; this counts legacy cells plus
-                // refused raw_author_daily rows plus refused pr_records rows. The two are not
-                // slices of one attempted population and their sum is not an attempt count: a
-                // cell folds several raw authors, and a raw row for an unmatched author produces
-                // no cell at all. The alternative — a fourth SyncResult field — would be a wire
-                // change across all five connectors to carry a number only the git one can ever
-                // be non-zero for, so the coarse field plus per-grain advisory lines is the
-                // trade. Read the advisory lines for the breakdown; read this for "how much did
-                // this run fail to write", which is the question the surfaces actually ask.
-                committedRowsSkipped += skippedRows.length + skippedPRRecords.length;
+                // The refused rows themselves are reported by `refusalReports` above, which runs
+                // on BOTH completeness arms — see there. `records_skipped` is accumulated there
+                // too: the field answers "how many rows did this run not write", and an
+                // incomplete provider's refusals are equally rows it did not write.
                 if (options?.backfill) {
                     setProviderEarliestSyncTime(db, providerType, identifier, options.backfill.since);
                 } else {
@@ -4568,13 +4613,16 @@ export class GitSync implements ConnectorInterface {
             // be in the store before either happens, or a freshly-created developer's
             // current-window activity would be invisible to their own replay. Splitting the
             // former single loop is exactly what buys "no second pass, no re-fetch".
-            // PASS 1 — THE SOURCE OF RECORD. Every observed commit, `INSERT … ON CONFLICT DO
-            // NOTHING`: a re-observed sha is the same immutable fact, so an overlapping window
-            // costs nothing and changes nothing. This must complete before pass 2, which reads
-            // back what it wrote.
+            // PASS 1 — THE SOURCE OF RECORD. Every observed commit, `INSERT … ON CONFLICT`: a
+            // re-observed sha is the same immutable fact, so an overlapping window costs nothing
+            // and changes nothing — with the ONE exception `insertRawCommit` documents, a strictly
+            // more informative observation of a commit first seen with a degraded diffstat (#288),
+            // which is an upgrade rather than a second count. This must complete before pass 2,
+            // which reads back what it wrote.
             //
             // A refused commit is skipped and REPORTED at the (author, day) grain the advisory
-            // speaks in — see `dedupeSkip` for why several refusals on one day still count once.
+            // speaks in — see `recordSkippedAuthorDay` for why several refusals on one day still
+            // count once.
             for (const commit of commitInserts) {
                 if (!isWritable(commit.provider, commit.container)) continue;
                 try {
@@ -4593,6 +4641,9 @@ export class GitSync implements ConnectorInterface {
                             date: commit.author_day,
                             code: e.code,
                         });
+                        cellsWithRefusedCommits.add(
+                            `${containerKeyOf(commit.provider, commit.container)}\u0000${commit.raw_author_key}\u0000${commit.author_day}`,
+                        );
                         continue;
                     }
                     throw e;
@@ -4636,7 +4687,13 @@ export class GitSync implements ConnectorInterface {
                 // skips against (#306/#307). An author every one of whose days was refused
                 // retains nothing and is not offered to the hands-off onboarding.
                 retainedKeys.add(cell.raw_author_key);
-                retainedRowCountByContainer.set(ck, (retainedRowCountByContainer.get(ck) ?? 0) + 1);
+                // Counted only when the cell is WHOLE. A cell that lost a commit in pass 1 is
+                // already in the refusal numerator, and counting it here too would let one
+                // author-day cancel itself out of the systemic ratio — see
+                // `cellsWithRefusedCommits`.
+                if (!cellsWithRefusedCommits.has(`${ck}\u0000${cell.raw_author_key}\u0000${cell.date}`)) {
+                    retainedRowCountByContainer.set(ck, (retainedRowCountByContainer.get(ck) ?? 0) + 1);
+                }
             }
 
             // Opt-in hands-off onboarding (#256), between retention and projection.
@@ -4711,6 +4768,12 @@ export class GitSync implements ConnectorInterface {
                     }
                     throw e;
                 }
+            }
+            // Report refusals BEFORE the cursor advances, so the escalation below reads a
+            // finished count. Runs for every provider, complete or not (see where they are
+            // pushed); each closure self-guards on `isWritable`.
+            for (const report of refusalReports) {
+                report();
             }
             // Advance cursors LAST, still inside the tx: they persist iff every write
             // above committed. Collected only for complete providers, and each closure

@@ -746,6 +746,13 @@ describe('GitSync', () => {
             // Owned when the run starts; the row disappears while it is fetching.
             const result = await runWithOneCommit(db, [DB_PROVIDER], deleteRow(db, 'p1'));
 
+            // The sha-keyed source of record too (IG1.2/#318), which needs its OWN `isWritable`
+            // guard in pass 1: without it this run leaves orphan `raw_commits` rows for a purged
+            // container — no cursor, no `raw_author_daily` row pointing at them, and nothing the
+            // delete cascade will ever see, because the cascade already ran.
+            expect(
+                (db.prepare('SELECT COUNT(*) AS n FROM raw_commits').get() as {n: number}).n,
+            ).toBe(0);
             expect(
                 (db.prepare('SELECT COUNT(*) AS n FROM raw_author_daily').get() as {n: number}).n,
             ).toBe(0);

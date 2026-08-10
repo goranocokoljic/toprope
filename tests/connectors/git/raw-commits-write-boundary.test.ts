@@ -26,7 +26,6 @@ import {
     insertRawCommit,
     projectRawAuthorDailyCell,
     readAuthorBurstsByDay,
-    readCellCommitTotals,
     toUtcInstant,
     type RawCommitInput,
 } from '../../../src/connectors/git/raw-commits';
@@ -36,8 +35,11 @@ import {
     type RawAuthorDailyErrorCode,
 } from '../../../src/connectors/git/raw-author-daily';
 import {
+    AUTHOR_EMAIL,
     BITBUCKET_CONFIG,
+    COMMIT_DATE,
     GITHUB_CONFIG,
+    SHAS,
     bitbucketRoutes,
     githubRoutes,
     makeCountingFetch,
@@ -152,6 +154,41 @@ describe('raw_commits — the per-commit write boundary (#318)', () => {
         expect(row.author_email).toBe('alice@example.com');
     });
 
+    it('keeps author_day on the RAW author date while normalizing committed_at to UTC', () => {
+        // THE INPUT CLASS THE DERIVATION EXISTS FOR, and the one no fixture carried: an
+        // offset-bearing author timestamp whose UTC instant falls on the NEXT calendar day.
+        // GitLab really sends this shape. `author_day` is sliced from the raw string — exactly as
+        // `analyzer.ts` and `churn.ts` slice it — so re-deriving the day from the normalized
+        // instant would silently move the commit a day, which is a semantics change wearing a
+        // normalization's clothes. Reverting either half fails on exactly one of these columns.
+        const raw = '2024-01-15T22:00:00-05:00';
+        expect(toUtcInstant(raw)).toBe('2024-01-16T03:00:00.000Z');
+        insertRawCommit(
+            db,
+            commitRow({author_day: raw.slice(0, 10), committed_at: toUtcInstant(raw)}),
+            OBSERVED_AT,
+        );
+        expect(db.prepare('SELECT author_day, committed_at FROM raw_commits').get()).toEqual({
+            author_day: '2024-01-15',
+            committed_at: '2024-01-16T03:00:00.000Z',
+        });
+    });
+
+    it('stores is_merge and ai_signature as the 0/1 the schema CHECK requires, both ways', () => {
+        // Both are bound through `? 1 : 0`; inverting that coercion, or dropping the
+        // `scoreAiSignature` call at the sync boundary for a literal, would otherwise break
+        // nothing. Nothing READS these columns yet, which is exactly why they need an assertion
+        // now rather than after a consumer trusts them.
+        insertRawCommit(db, commitRow({sha: 'plain'}), OBSERVED_AT);
+        insertRawCommit(db, commitRow({sha: 'flagged', is_merge: true, ai_signature: true}), OBSERVED_AT);
+        expect(
+            db.prepare('SELECT sha, is_merge, ai_signature FROM raw_commits ORDER BY sha').all(),
+        ).toEqual([
+            {sha: 'flagged', is_merge: 1, ai_signature: 1},
+            {sha: 'plain', is_merge: 0, ai_signature: 0},
+        ]);
+    });
+
     it('UPGRADES a degraded observation, and only ever upward', () => {
         // The #288 shape: a commit whose diffstat endpoint answered without stats is imported
         // with zeros, and a later run re-asks and gets the real numbers. A bare DO NOTHING would
@@ -233,6 +270,12 @@ describe('raw_commits — the per-commit write boundary (#318)', () => {
                 [commitRow({provider: 'perforce' as never}), 'invalid_provider'],
                 [commitRow({container: '   '}), 'invalid_container'],
                 [commitRow({raw_author_key: 'gitlab:login:alice'}), 'invalid_key'],
+                // `files_changed` is a LENGTH this codebase computes, not a provider number, so a
+                // bad one is a code regression — repairable, after which re-fetching yields a
+                // writable row. It must hold the cursor rather than skip the commit and advance
+                // past it, which is the whole point of `metricDefectCode` being asked per FIELD
+                // rather than hardcoded to `invalid_metric` here.
+                [commitRow({files_changed: -1}), 'invalid_computed_metric'],
             ] as const) {
                 const code0 = refusalFor(row);
                 expect(code0).toBe(code);
@@ -249,6 +292,25 @@ describe('raw_commits — the per-commit write boundary (#318)', () => {
     });
 
     describe('the cell recompute', () => {
+        /** A minimal cell observation for the default identity; override per case. */
+        function cellFor(date: string): Parameters<typeof projectRawAuthorDailyCell>[1] {
+            return {
+                provider: 'github',
+                container: 'test-org',
+                raw_author_key: 'github:login:alice',
+                date,
+                author_login: 'alice',
+                author_email: 'alice@example.com',
+                author_display_name: 'Alice',
+                prs_opened: 0,
+                prs_merged: 0,
+                review_comments_given: 0,
+                avg_time_to_merge_hours: null,
+                code_churn_rate: 0,
+                ai_signature_score: 0,
+            };
+        }
+
         it('sums a cell from ALL its commits and derives avg_commit_size from the same operands', () => {
             insertRawCommit(db, commitRow({sha: 'a', lines_added: 10, lines_removed: 2, files_changed: 1}), OBSERVED_AT);
             insertRawCommit(db, commitRow({sha: 'b', lines_added: 30, lines_removed: 8, files_changed: 3}), OBSERVED_AT);
@@ -256,14 +318,14 @@ describe('raw_commits — the per-commit write boundary (#318)', () => {
             insertRawCommit(db, commitRow({sha: 'c', author_day: '2026-07-02', lines_added: 99}), OBSERVED_AT);
             insertRawCommit(db, commitRow({sha: 'd', container: 'other-org', lines_added: 77}), OBSERVED_AT);
 
-            expect(
-                readCellCommitTotals(db, {
-                    provider: 'github',
-                    container: 'test-org',
-                    raw_author_key: 'github:login:alice',
-                    date: '2026-07-01',
-                }),
-            ).toEqual({
+            const written = projectRawAuthorDailyCell(db, cellFor('2026-07-01'), new Map(), OBSERVED_AT);
+            expect({
+                commits: written.commits,
+                lines_added: written.lines_added,
+                lines_removed: written.lines_removed,
+                files_changed: written.files_changed,
+                avg_commit_size: written.avg_commit_size,
+            }).toEqual({
                 commits: 2,
                 lines_added: 40,
                 lines_removed: 10,
@@ -273,14 +335,22 @@ describe('raw_commits — the per-commit write boundary (#318)', () => {
         });
 
         it('reports an empty cell as zeros, not as NULLs (a PR-only author-day is a real state)', () => {
-            expect(
-                readCellCommitTotals(db, {
-                    provider: 'github',
-                    container: 'test-org',
-                    raw_author_key: 'github:login:nobody',
-                    date: '2026-07-01',
-                }),
-            ).toEqual({commits: 0, lines_added: 0, lines_removed: 0, files_changed: 0, avg_commit_size: 0});
+            // No commits at all for this key — SUM() is NULL over an empty set, and a NULL bound
+            // into a NOT NULL column is a constraint error rather than the honest zero.
+            const written = projectRawAuthorDailyCell(
+                db,
+                {...cellFor('2026-07-01'), raw_author_key: 'github:login:nobody', prs_opened: 1},
+                new Map(),
+                OBSERVED_AT,
+            );
+            expect({
+                commits: written.commits,
+                lines_added: written.lines_added,
+                lines_removed: written.lines_removed,
+                files_changed: written.files_changed,
+                avg_commit_size: written.avg_commit_size,
+            }).toEqual({commits: 0, lines_added: 0, lines_removed: 0, files_changed: 0, avg_commit_size: 0});
+            expect(written.prs_opened).toBe(1);
         });
 
         it('recomputes bursts from the stored stream, including one that spans midnight', () => {
@@ -406,6 +476,10 @@ describe('IG1 verification matrix — the rows IG1.2 owns (#318)', () => {
 
         await sync([GITHUB_CONFIG], routes);
         const first = dumpTables(db);
+        // Non-vacuous, for the reason V1 states: `toEqual(first)` over two empty dumps passes.
+        expect(first.raw_commits.length).toBeGreaterThan(0);
+        expect(first.raw_author_daily.length).toBeGreaterThan(0);
+        expect(first.git_snapshots.length).toBeGreaterThan(0);
 
         // Lose the cursor entirely: under the old model this was the #262 hazard — the only
         // evidence that the next window was disjoint from what was stored.
@@ -459,35 +533,76 @@ describe('IG1 verification matrix — the rows IG1.2 owns (#318)', () => {
     it('V6 — a failed run’s commits survive, and the completing run does not double-count', async () => {
         seedDev(db, 'alice-gh');
 
-        // Run 1: the repo LIST succeeds but one repo's commit fetch 500s, so the provider is
-        // incomplete. Its commits are still written; only the cursor is held.
-        const failing: Route[] = [
-            {match: /\/repos\/test-org\/repo1\/commits\?/, status: 500, body: {message: 'boom'}},
-            ...githubRoutes(),
+        // TWO repos, so run 1 has something to KEEP. With the shared single-repo fixture the
+        // failing run fetches nothing at all and "the partial survived" is unfalsifiable — the
+        // assertion has to compare a non-zero baseline or it proves only that the cursor held.
+        const twoRepos: Route[] = [
+            {
+                match: /\/orgs\/test-org\/repos\?/,
+                body: [
+                    {id: 1, name: 'repo1', full_name: 'test-org/repo1', default_branch: 'main', archived: false},
+                    {id: 2, name: 'repo2', full_name: 'test-org/repo2', default_branch: 'main', archived: false},
+                ],
+            },
         ];
-        await sync([GITHUB_CONFIG], failing);
+        // repo2 mirrors repo1's list/detail shape under its own path and its own shas.
+        const repo2Shas = SHAS.map((s) => `${s}-r2`);
+        const repo2Commit = {
+            author: {name: 'Alice', email: AUTHOR_EMAIL, date: COMMIT_DATE},
+            message: 'feat: work',
+        };
+        const repo2Routes: Route[] = [
+            {
+                match: /\/repos\/test-org\/repo2\/commits\?/,
+                body: repo2Shas.map((sha) => ({sha, commit: repo2Commit, author: {login: 'alice-gh'}})),
+            },
+            {
+                match: /\/repos\/test-org\/repo2\/commits\/[^?]+$/,
+                bodyFor: (url: string): Record<string, unknown> => ({
+                    sha: url.split('/').pop(),
+                    commit: repo2Commit,
+                    author: {login: 'alice-gh'},
+                    stats: {additions: 40, deletions: 5, total: 45},
+                    files: [{filename: 'src/foo.ts', additions: 40, deletions: 5, status: 'modified'}],
+                }),
+            },
+            {match: /\/repos\/test-org\/repo2\/pulls\?/, body: []},
+        ];
 
-        const partial = db.prepare('SELECT COUNT(*) AS n FROM raw_commits').get() as {n: number};
-        // Nothing to keep from repo1 itself — the point is the cursor, asserted next.
+        // Run 1: repo1's commit fetch 500s, so the provider is INCOMPLETE — but repo2's commits
+        // were fetched and must be kept. Only the cursor is held.
+        await sync([GITHUB_CONFIG], [
+            {match: /\/repos\/test-org\/repo1\/commits\?/, status: 500, body: {message: 'boom'}},
+            ...twoRepos,
+            ...repo2Routes,
+            ...githubRoutes(),
+        ]);
+
+        const partial = db.prepare('SELECT sha FROM raw_commits ORDER BY sha').all() as Array<{sha: string}>;
+        // THE CLAIM, non-vacuously: the failed run's rows are on disk.
+        expect(partial.length).toBe(repo2Shas.length);
+        expect(partial.map((r) => r.sha).sort()).toEqual([...repo2Shas].sort());
+        // …and the window is NOT recorded as covered, so the next run re-asks all of it.
         expect(db.prepare('SELECT value FROM sync_state WHERE key = ?').get(syncStateKey('github', 'test-org'))).toBeUndefined();
 
-        // Run 2 completes. Because the cursor was held it re-covers the WHOLE window, so every
-        // sha run 1 did store is re-observed — and inserts nothing.
-        await sync([GITHUB_CONFIG], githubRoutes());
+        // Run 2 completes over the WHOLE window, re-delivering every sha run 1 already stored.
+        await sync([GITHUB_CONFIG], [...twoRepos, ...repo2Routes, ...githubRoutes()]);
 
         const rows = db.prepare('SELECT sha FROM raw_commits').all() as Array<{sha: string}>;
         expect(new Set(rows.map((r) => r.sha)).size).toBe(rows.length);
-        expect(rows.length).toBeGreaterThanOrEqual(partial.n);
+        // Both repos now, and every one of run 1's shas is still exactly one row.
+        expect(rows.length).toBe(SHAS.length + repo2Shas.length);
+        for (const sha of partial.map((r) => r.sha)) {
+            expect(rows.filter((r) => r.sha === sha)).toHaveLength(1);
+        }
 
-        const cell = db
-            .prepare('SELECT commits FROM raw_author_daily')
-            .get() as {commits: number};
+        const cell = db.prepare('SELECT commits FROM raw_author_daily').get() as {commits: number};
         // The counter equals the number of DISTINCT commits, not the number of times they were
-        // observed. Under the additive merge this was run1 + run2.
+        // observed. Under the additive merge this was run1 + run2 — repo2's three counted twice.
         expect(cell.commits).toBe(rows.length);
 
         // A third, fully-successful run must not move it either.
-        await sync([GITHUB_CONFIG], githubRoutes());
+        await sync([GITHUB_CONFIG], [...twoRepos, ...repo2Routes, ...githubRoutes()]);
         expect((db.prepare('SELECT commits FROM raw_author_daily').get() as {commits: number}).commits).toBe(
             rows.length,
         );

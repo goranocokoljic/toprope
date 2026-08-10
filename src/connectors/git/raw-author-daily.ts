@@ -309,7 +309,7 @@ function firstKnown(stored: string | null, incoming: string | null): string | nu
  * same author up to whichever casing byte-sorts higher rather than to one canonical
  * value.
  */
-function normalizeEmail(email: string | null): string | null {
+export function normalizeEmail(email: string | null): string | null {
     const trimmed = (email ?? '').trim().toLowerCase();
     return trimmed || null;
 }
@@ -660,35 +660,7 @@ const SELECT_COLUMNS = `id, provider, container, raw_author_key, author_login, a
      review_comments_given, avg_time_to_merge_hours, code_churn_rate, ai_signature_score,
      avg_commit_size, commit_burst_count, first_seen, last_seen`;
 
-/**
- * REPLACE the (provider, container, raw_author_key, date) cell with the values handed in, except
- * the four PR counters ({@link mergePRCounters}) — the
- * write half of the projection (IG1.2 / #318). It used to MERGE against the stored row, adding the
- * commit counters on a premise of disjoint windows; every
- * metric field is now simply the value the caller computed, because the caller computed it from
- * ALL of the cell's stored commits (`projectRawAuthorDailyCell` in `raw-commits.ts`) rather than
- * from one run's delta. Re-running the same ingest therefore writes the same number twice.
- *
- * DO NOT reintroduce a merge here to "protect" a scoped run. The graduated rule about scoped
- * writes into multi-source rows is about `git_snapshots`, whose cell folds every provider; THIS
- * row is keyed by `(provider, container)`, so exactly one provider instance ever writes it and a
- * replace can never drop another source's contribution.
- *
- * The key includes the CONTAINER (#264): two provider instances of one family (two GitHub
- * orgs, two Bitbucket workspaces) contributing to the same author-day are two independent
- * rows. That is what makes a per-provider delete able to retract exactly its own contribution.
- *
- * STILL a read-modify-write, so it still runs inside a `db.transaction`: the metrics are
- * replaced, but `first_seen` and the three identity columns are carried forward from the stored
- * row (identity only ever GAINS information — a blank observation never erases a known value, and
- * `author_email` is stable-on-first-known so a row that resolved to a developer cannot silently
- * stop resolving). Nesting is safe: better-sqlite3 promotes an inner transaction to a savepoint,
- * so a caller that already holds the sync transaction still gets one atomic unit.
- *
- * `first_seen` is PRESERVED from the stored row (a later run's clock can never move
- * it backward); `last_seen` advances via a total comparator.
- */
-/** The four PR-derived counters — the only fields this write still combines with the stored row. */
+/** The four PR-derived counters — one of the two field groups this write combines rather than replaces. */
 type PRCounters = Pick<
     DailyGitMetrics,
     'prs_opened' | 'prs_merged' | 'review_comments_given' | 'avg_time_to_merge_hours'
@@ -732,6 +704,107 @@ function mergePRCounters(stored: PRCounters, incoming: PRCounters): PRCounters {
     };
 }
 
+/** The two rate/score fields the store cannot recompute — see {@link mergeObservedRates}. */
+type ObservedRates = Pick<DailyGitMetrics, 'code_churn_rate' | 'ai_signature_score'>;
+
+/**
+ * Commit-count-weighted mean of a rate/score field, so combining two observations of one cell does
+ * not depend on their order. `total === 0` yields 0 — the neutral value for a per-commit metric.
+ *
+ * THIS IS NOT THE DELETED CROSS-RUN WEIGHTING COMING BACK, and the distinction is the whole of
+ * criterion C. That symbol weighted the ADDITIVE cross-run merge of COUNTERS — it existed to make
+ * `stored + delta` produce a plausible rate, on a premise of disjoint windows that had to be
+ * proved by a cursor. Counters are now a pure recompute over `raw_commits` and no longer merge at
+ * all. What remains is a genuine weighted mean of two DIFFERENT observations of the same rate,
+ * needed in exactly two places, which is why it lives here once and is exported rather than
+ * copied: {@link mergeObservedRates} below, and the cross-IDENTITY fold in `projection.ts`.
+ */
+export function commitWeightedMean(aVal: number, aCommits: number, bVal: number, bCommits: number): number {
+    const total = aCommits + bCommits;
+    return total > 0 ? (aVal * aCommits + bVal * bCommits) / total : 0;
+}
+
+/**
+ * Carry `code_churn_rate` and `ai_signature_score` across writes instead of replacing them.
+ *
+ * WHY THESE TWO NEED A RULE AT ALL. They are the two fields `raw_commits` cannot recompute (no
+ * commit message, no per-file paths — see `raw-commits.ts`'s header and the drift notice on epic
+ * #316), so they are supplied by the caller from ITS OWN observation of the cell. That observation
+ * is scoped to the run's fetch WINDOW, not to the day — and a run legitimately observes a day it
+ * fetched no commits for. `aggregateDailyMetrics` manufactures exactly such a cell from
+ * `emptyMetrics` whenever a provider re-lists a PR by `updated_at` whose `createdAt` falls on an
+ * older day, which happens on essentially every scheduled sync of an active PR. Replacing would
+ * write that cell's `code_churn_rate` and `ai_signature_score` as 0 over a day whose commits are
+ * intact — silent erasure of the metric this product exists to report, in the direction that looks
+ * healthy, because the commit counters beside it stay correct.
+ *
+ * THE WEIGHT IS DERIVED, NOT THREADED. `row.commits` is the cell's RECOMPUTED TOTAL and
+ * `stored.commits` is what that total was before this write, so `row.commits - stored.commits` is
+ * how many commits this write actually added — the exact weight the incoming observation deserves:
+ *   - 0 new commits (the PR-only re-delivery above, and a re-sync of an identical window) ⇒ the
+ *     run measured nothing about this day's commits, so the stored value stands unchanged. This is
+ *     also what keeps V1 byte-identical: the second run of the same window adds no commits, so it
+ *     cannot perturb the rates even by a rounding step.
+ *   - The whole cell is new (`stored.commits === 0`) ⇒ pure replace, which is what makes the
+ *     single-run golden (criterion B) exact.
+ *   - Otherwise ⇒ a commit-weighted mean of the two observations.
+ *
+ * It is an APPROXIMATION and says so: a run that re-observes some already-stored commits alongside
+ * new ones is weighted only by the new ones. The alternative — threading the run's own observed
+ * count down through the projection — buys a second-order correction on a value that is itself an
+ * estimate, and the deleted merge was no better. The exact answer is the design §1 amendment the
+ * drift notice queues, which makes both fields true projections and deletes this rule outright.
+ */
+function mergeObservedRates(stored: RawAuthorDailyRecord, incoming: RawAuthorDailyInput): ObservedRates {
+    const newCommits = incoming.commits - stored.commits;
+    if (newCommits <= 0) {
+        return {
+            code_churn_rate: stored.code_churn_rate,
+            ai_signature_score: stored.ai_signature_score,
+        };
+    }
+    return {
+        code_churn_rate: commitWeightedMean(
+            stored.code_churn_rate, stored.commits, incoming.code_churn_rate, newCommits,
+        ),
+        ai_signature_score: commitWeightedMean(
+            stored.ai_signature_score, stored.commits, incoming.ai_signature_score, newCommits,
+        ),
+    };
+}
+
+/**
+ * REPLACE the (provider, container, raw_author_key, date) cell with the values handed in, except
+ * the four PR counters ({@link mergePRCounters}) and the two unprojectable rates
+ * ({@link mergeObservedRates}) — the write half of the projection (IG1.2 / #318).
+ *
+ * It used to MERGE against the stored row, adding the commit counters on a premise of disjoint
+ * windows; every counter is now simply the value the caller computed, because the caller computed
+ * it from ALL of the cell's stored commits (`projectRawAuthorDailyCell` in `raw-commits.ts`)
+ * rather than from one run's delta. Re-running the same ingest therefore writes the same number
+ * twice.
+ *
+ * DO NOT reintroduce a merge for the COUNTERS to "protect" a scoped run. The graduated rule about
+ * scoped writes into multi-source rows is about `git_snapshots`, whose cell folds every provider;
+ * THIS row is keyed by `(provider, container)`, so exactly one provider instance ever writes it
+ * and a replace can never drop another source's contribution. The two exceptions above exist for
+ * the opposite reason: those fields are NOT recomputed from the store, so the incoming value is a
+ * partial observation rather than a total.
+ *
+ * The key includes the CONTAINER (#264): two provider instances of one family (two GitHub
+ * orgs, two Bitbucket workspaces) contributing to the same author-day are two independent
+ * rows. That is what makes a per-provider delete able to retract exactly its own contribution.
+ *
+ * STILL a read-modify-write, so it still runs inside a `db.transaction`: `first_seen` and the
+ * three identity columns are carried forward from the stored row (identity only ever GAINS
+ * information — a blank observation never erases a known value, and `author_email` is
+ * stable-on-first-known so a row that resolved to a developer cannot silently stop resolving).
+ * Nesting is safe: better-sqlite3 promotes an inner transaction to a savepoint, so a caller that
+ * already holds the sync transaction still gets one atomic unit.
+ *
+ * `first_seen` is PRESERVED from the stored row (a later run's clock can never move it backward);
+ * `last_seen` advances via a total comparator.
+ */
 export function upsertRawAuthorDaily(
     db: Database.Database,
     row: RawAuthorDailyInput,
@@ -752,6 +825,7 @@ export function upsertRawAuthorDaily(
                   ...stored,
                   ...row,
                   ...mergePRCounters(stored, row),
+                  ...mergeObservedRates(stored, row),
                   author_login: bestKnown(stored.author_login, row.author_login),
                   author_email: firstKnown(stored.author_email, normalizeEmail(row.author_email)),
                   author_display_name: bestKnown(stored.author_display_name, row.author_display_name),

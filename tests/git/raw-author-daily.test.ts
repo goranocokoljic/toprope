@@ -153,24 +153,79 @@ describe('upsertRawAuthorDaily + readers (#252)', () => {
         expect(row.lines_added).toBe(40);
     });
 
-    it('REPLACES the derived rate fields too — a re-observation is not weighted against the stored one', () => {
+    it('REPLACES the PROJECTED fields — they arrive as the cell\u2019s whole recomputed total', () => {
+        // `avg_commit_size` and `commit_burst_count` are recomputed from `raw_commits` by the
+        // caller, so whatever arrives IS the answer and must be stored verbatim. Weighting them
+        // against the stored value would be double-counting the history they already contain.
         upsertRawAuthorDaily(
             db,
-            input({commits: 100, code_churn_rate: 0.9, ai_signature_score: 80, avg_commit_size: 50, commit_burst_count: 4}),
+            input({commits: 100, avg_commit_size: 50, commit_burst_count: 4}),
             '2026-07-01T10:00:00.000Z',
         );
         upsertRawAuthorDaily(
             db,
-            input({commits: 1, code_churn_rate: 0.1, ai_signature_score: 10, avg_commit_size: 5, commit_burst_count: 1}),
+            input({commits: 1, avg_commit_size: 5, commit_burst_count: 1}),
             '2026-07-02T10:00:00.000Z',
         );
         const row = stored();
-        // Under the deleted `commitWeightedAvg` rule these would have stayed near the 100-commit
-        // side (~0.89 / ~79.3). There is no delta to weight any more.
-        expect(row.code_churn_rate).toBe(0.1);
-        expect(row.ai_signature_score).toBe(10);
+        expect(row.commits).toBe(1);
         expect(row.avg_commit_size).toBe(5);
         expect(row.commit_burst_count).toBe(1);
+    });
+
+    it('CARRIES FORWARD the two unprojectable rates when a run observed no new commits', () => {
+        // THE #318 review's SO-1/SEC-1 case, at the store level. `code_churn_rate` and
+        // `ai_signature_score` cannot be recomputed from `raw_commits` (no per-file paths, no
+        // commit message), so they arrive as the RUN's observation — and a run legitimately
+        // observes a day it fetched no commits for, because a provider re-lists an old PR by
+        // `updated_at` and `aggregateDailyMetrics` manufactures that day from `emptyMetrics` with
+        // both rates at 0. Replacing would erase a real score with a measurement that was never
+        // taken.
+        upsertRawAuthorDaily(
+            db,
+            input({commits: 4, code_churn_rate: 0.42, ai_signature_score: 68}),
+            '2026-07-01T10:00:00.000Z',
+        );
+        // Same recomputed commit total (no new commits arrived), zeroed rates.
+        upsertRawAuthorDaily(
+            db,
+            input({commits: 4, code_churn_rate: 0, ai_signature_score: 0}),
+            '2026-07-02T10:00:00.000Z',
+        );
+        const row = stored();
+        expect(row.code_churn_rate).toBe(0.42);
+        expect(row.ai_signature_score).toBe(68);
+        // …and the projected counter is still the value handed in, unweighted.
+        expect(row.commits).toBe(4);
+    });
+
+    it('COMMIT-WEIGHTS the two rates when a run genuinely added commits to the cell', () => {
+        upsertRawAuthorDaily(
+            db,
+            input({commits: 100, code_churn_rate: 0.9, ai_signature_score: 80}),
+            '2026-07-01T10:00:00.000Z',
+        );
+        // The recomputed total rose by 1, so the incoming observation covers exactly one commit
+        // and must not drag a 100-commit row to a plain two-way mean.
+        upsertRawAuthorDaily(
+            db,
+            input({commits: 101, code_churn_rate: 0.1, ai_signature_score: 10}),
+            '2026-07-02T10:00:00.000Z',
+        );
+        const row = stored();
+        expect(row.code_churn_rate).toBeCloseTo((0.9 * 100 + 0.1 * 1) / 101, 6);
+        expect(row.ai_signature_score).toBeCloseTo((80 * 100 + 10 * 1) / 101, 6);
+        expect(row.commits).toBe(101);
+    });
+
+    it('REPLACES the two rates outright on the first write of a cell (the single-run golden case)', () => {
+        upsertRawAuthorDaily(
+            db,
+            input({commits: 3, code_churn_rate: 0.66, ai_signature_score: 20}),
+            '2026-07-01T10:00:00.000Z',
+        );
+        expect(stored().code_churn_rate).toBe(0.66);
+        expect(stored().ai_signature_score).toBe(20);
     });
 
     it('does NOT inflate prs/review across runs that re-deliver the same PRs', () => {
@@ -198,6 +253,37 @@ describe('upsertRawAuthorDaily + readers (#252)', () => {
         upsertRawAuthorDaily(db, input({prs_opened: 5, prs_merged: 3}), '2026-07-03T10:00:00.000Z');
         expect(stored().prs_opened).toBe(5);
         expect(stored().prs_merged).toBe(3);
+    });
+
+    it('takes avg_time_to_merge from the side owning the LARGER prs_merged', () => {
+        // The rule survived IG1.2 (#318) inside `mergePRCounters`; its tests went with the
+        // deleted `mergeDailyAcrossRuns` describe block. `prs_merged` is combined with max(), so
+        // pairing it with a mean from the OTHER side would report a count and an average that
+        // never described one observation.
+        upsertRawAuthorDaily(db, input({prs_merged: 1, avg_time_to_merge_hours: 4}), '2026-07-01T10:00:00.000Z');
+        upsertRawAuthorDaily(db, input({prs_merged: 3, avg_time_to_merge_hours: 20}), '2026-07-02T10:00:00.000Z');
+        expect(stored().prs_merged).toBe(3);
+        expect(stored().avg_time_to_merge_hours).toBe(20);
+
+        // …and a LOWER incoming count does not drag the mean with it.
+        upsertRawAuthorDaily(db, input({prs_merged: 1, avg_time_to_merge_hours: 99}), '2026-07-03T10:00:00.000Z');
+        expect(stored().prs_merged).toBe(3);
+        expect(stored().avg_time_to_merge_hours).toBe(20);
+    });
+
+    it('keeps the first-observed avg_time_to_merge on a prs_merged tie (same-PR re-delivery)', () => {
+        upsertRawAuthorDaily(db, input({prs_merged: 2, avg_time_to_merge_hours: 7}), '2026-07-01T10:00:00.000Z');
+        upsertRawAuthorDaily(db, input({prs_merged: 2, avg_time_to_merge_hours: 31}), '2026-07-02T10:00:00.000Z');
+        expect(stored().avg_time_to_merge_hours).toBe(7);
+    });
+
+    it('falls back across a null avg_time_to_merge on either side', () => {
+        upsertRawAuthorDaily(db, input({prs_merged: 1, avg_time_to_merge_hours: null}), '2026-07-01T10:00:00.000Z');
+        upsertRawAuthorDaily(db, input({prs_merged: 2, avg_time_to_merge_hours: 5}), '2026-07-02T10:00:00.000Z');
+        expect(stored().avg_time_to_merge_hours).toBe(5);
+        // A null incoming never erases a known duration.
+        upsertRawAuthorDaily(db, input({prs_merged: 3, avg_time_to_merge_hours: null}), '2026-07-03T10:00:00.000Z');
+        expect(stored().avg_time_to_merge_hours).toBe(5);
     });
 
     it('PRESERVES first_seen and ADVANCES last_seen across runs', () => {

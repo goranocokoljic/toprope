@@ -33,6 +33,7 @@ import type Database from 'better-sqlite3';
 import {randomUUID} from 'crypto';
 import {
     chunk,
+    commitWeightedMean,
     distinctRawAuthorIdentities,
     readRawDailyForDates,
     readRawDailyForKeys,
@@ -250,11 +251,13 @@ export function resolveRawAuthor(
  * connect the parent group or the subgroups, not both.
  *
  * The metric arithmetic is {@link foldDisjointMetrics} below, which this module now OWNS. It used
- * to live in `raw-author-daily.ts`, shared with a same-run cross-provider-instance accumulation
- * in `sync.ts` that IG1.2 (#318) deleted — `raw_commits` makes that accumulation unnecessary, so
- * the raw store's last remaining caller went away and the epic's criterion C removed the symbol
- * with it. The rule itself is unchanged and still needed: this is the only place in the pipeline
- * where two genuinely different AUTHORS fold into one cell.
+ * to live in `raw-author-daily.ts` under a name criterion C removed, shared with a same-run
+ * cross-provider-instance accumulation in `sync.ts` that IG1.2 (#318) deleted. The rule itself is
+ * unchanged and still needed: this is the only place in the pipeline where two genuinely different
+ * AUTHORS fold into one cell. Its per-field weighting is `commitWeightedMean`, imported from the
+ * raw store rather than copied — that helper now has two callers (this fold and the store's own
+ * carry-forward of the unprojectable rates), and two copies of one mean is how the deleted symbol
+ * came to have a twin in the first place.
  */
 export function mergeSnapshots(a: GitSnapshotRow, b: GitSnapshotRow): GitSnapshotRow {
     return {
@@ -263,20 +266,6 @@ export function mergeSnapshots(a: GitSnapshotRow, b: GitSnapshotRow): GitSnapsho
         ...foldDisjointMetrics(a, b),
         data_source: a.data_source === b.data_source ? a.data_source : 'multi',
     };
-}
-
-/**
- * Commit-count-weighted mean of a rate/score field, so the fold's result does not depend on the
- * ORDER identities are combined in — which matters because three or more identities can share a
- * cell. `total === 0` yields 0, the neutral value for these per-commit metrics.
- *
- * Private to this module on purpose (IG1.2 / #318): it exists only to serve the cross-IDENTITY
- * fold below. The cross-RUN weighting it used to share a body with is gone, and re-exporting this
- * would invite it back.
- */
-function commitWeightedMean(aVal: number, aCommits: number, bVal: number, bCommits: number): number {
-    const total = aCommits + bCommits;
-    return total > 0 ? (aVal * aCommits + bVal * bCommits) / total : 0;
 }
 
 /**

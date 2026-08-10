@@ -9,7 +9,8 @@
  * individually prevented from invalidating. The pipeline aggregated commits BEFORE persisting
  * them, discarding the sha that would have made the write idempotent. This module keeps the sha:
  * a commit is named by the hash of its own content, so a re-observed sha is the SAME fact and
- * `INSERT … ON CONFLICT DO NOTHING` makes overlap a no-op. The same argument `commit_diffstats`
+ * `INSERT … ON CONFLICT` makes overlap a no-op (with the one narrow upgrade
+ * {@link insertRawCommit} documents). The same argument `commit_diffstats`
  * (#273) and `pr_records` (#264) already run on.
  *
  * WHAT A CELL IS. `raw_author_daily` is now a PROJECTION at the
@@ -42,7 +43,7 @@
  */
 
 import type Database from 'better-sqlite3';
-import {isUtcIsoInstant} from '../../aggregation/dates.js';
+import {addDays, isUtcIsoInstant} from '../../aggregation/dates.js';
 import {detectBursts} from './analyzer.js';
 import {
     RawAuthorDailyError,
@@ -50,6 +51,7 @@ import {
     assertValidIdentityColumns,
     assertValidRunScope,
     metricDefectCode,
+    normalizeEmail,
     upsertRawAuthorDaily,
     type RawAuthorDailyRecord,
     type RawAuthorIdentity,
@@ -86,7 +88,7 @@ export interface RawCommitCellKey {
 }
 
 /** What one cell's commits sum to — the projected half of a `raw_author_daily` row. */
-export interface RawCommitCellTotals {
+interface RawCommitCellTotals {
     commits: number;
     lines_added: number;
     lines_removed: number;
@@ -157,11 +159,26 @@ export function toUtcInstant(value: unknown): string {
  */
 function assertValidRawCommit(row: RawCommitInput, observedAt: string): void {
     assertValidRunScope(row, observedAt);
-    if (!row.repo || !row.repo.trim()) {
-        throw new RawAuthorDailyError('invalid_identity', 'repo must be a non-blank string');
+    // `typeof` FIRST on both, not `!row.repo || !row.repo.trim()`. Neither value is validated
+    // anywhere upstream: `repo` is `listRepos()`'s `r.name` and `sha` is the commit body's `sha`,
+    // both read off a response cast rather than parsed. A non-string, non-falsy value (`42`, `{}`,
+    // `[]`) passes the truthiness disjunct and makes `.trim()` throw a bare `TypeError` — which is
+    // NOT a `RawAuthorDailyError`, so the sync's catch rethrows it, rolls back every provider's
+    // window and does it again identically on the next run. That is the permanent-stall geometry
+    // this whole refusal vocabulary exists to close, reached by the one field that skipped the
+    // check; `assertValidIdentityColumns` puts `typeof` first for exactly this reason, as do
+    // `toDateString` and {@link toUtcInstant}.
+    if (typeof row.repo !== 'string' || !row.repo.trim()) {
+        throw new RawAuthorDailyError(
+            'invalid_identity',
+            `repo must be a non-blank string, got: ${typeof row.repo}`,
+        );
     }
-    if (!row.sha || !row.sha.trim()) {
-        throw new RawAuthorDailyError('invalid_identity', 'sha must be a non-blank string');
+    if (typeof row.sha !== 'string' || !row.sha.trim()) {
+        throw new RawAuthorDailyError(
+            'invalid_identity',
+            `sha must be a non-blank string, got: ${typeof row.sha}`,
+        );
     }
     assertValidAuthorDay(row.author_day, observedAt);
     assertValidIdentityColumns(row);
@@ -187,6 +204,43 @@ function assertValidRawCommit(row: RawCommitInput, observedAt: string): void {
             );
         }
     }
+}
+
+/**
+ * The per-commit INSERT, prepared ONCE per database and reused for the whole run.
+ *
+ * This fires per COMMIT — tens of thousands of times on a full-history sync — and better-sqlite3
+ * does not cache, so preparing it inside {@link insertRawCommit} compiled the same SQL once per
+ * commit. `diffstat-cache.ts`, the other per-commit store at the same grain in the same run,
+ * hoists its statement for exactly this reason and says so; this is the same move.
+ *
+ * LAZY and keyed by the DATABASE HANDLE, not a module-level constant: a statement is bound to the
+ * connection that prepared it, and a `Database` is per-process in production but per-TEST in the
+ * suite (each case opens its own `:memory:` db). The `WeakMap` also lets a closed database's
+ * statement be collected rather than pinned for the life of the module.
+ */
+const INSERT_STATEMENTS = new WeakMap<Database.Database, Database.Statement>();
+
+function insertStatement(db: Database.Database): Database.Statement {
+    const cached = INSERT_STATEMENTS.get(db);
+    if (cached) return cached;
+    const prepared = db.prepare(
+        `INSERT INTO raw_commits
+         (provider, container, repo, sha, raw_author_key, author_login, author_email,
+          author_display_name, author_day, committed_at, lines_added, lines_removed,
+          files_changed, is_merge, ai_signature, first_seen)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(provider, container, repo, sha) DO UPDATE SET
+           lines_added   = excluded.lines_added,
+           lines_removed = excluded.lines_removed,
+           files_changed = excluded.files_changed,
+           ai_signature  = excluded.ai_signature,
+           is_merge      = excluded.is_merge
+         WHERE excluded.files_changed + excluded.lines_added + excluded.lines_removed
+             > raw_commits.files_changed + raw_commits.lines_added + raw_commits.lines_removed`,
+    );
+    INSERT_STATEMENTS.set(db, prepared);
+    return prepared;
 }
 
 /**
@@ -226,22 +280,7 @@ export function insertRawCommit(
 ): boolean {
     assertValidRawCommit(row, observedAt);
     return (
-        db
-            .prepare(
-                `INSERT INTO raw_commits
-                 (provider, container, repo, sha, raw_author_key, author_login, author_email,
-                  author_display_name, author_day, committed_at, lines_added, lines_removed,
-                  files_changed, is_merge, ai_signature, first_seen)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(provider, container, repo, sha) DO UPDATE SET
-                   lines_added   = excluded.lines_added,
-                   lines_removed = excluded.lines_removed,
-                   files_changed = excluded.files_changed,
-                   ai_signature  = excluded.ai_signature,
-                   is_merge      = excluded.is_merge
-                 WHERE excluded.files_changed + excluded.lines_added + excluded.lines_removed
-                     > raw_commits.files_changed + raw_commits.lines_added + raw_commits.lines_removed`,
-            )
+        insertStatement(db)
             .run(
                 row.provider,
                 row.container,
@@ -251,8 +290,12 @@ export function insertRawCommit(
                 row.author_login,
                 // Lowercased at the write boundary — the contract §1 states as a comment and
                 // leaves to the writer, because the column carries no CHECK (its
-                // `raw_author_daily` counterpart does not either).
-                normalizeStoredEmail(row.author_email),
+                // `raw_author_daily` counterpart does not either). THE SAME function that
+                // canonicalizes the `raw_author_daily` column, imported rather than restated: a
+                // second copy would let a later change to one canonicalization silently apply to
+                // one of the two columns, which is precisely what the comment above claims cannot
+                // happen.
+                normalizeEmail(row.author_email),
                 row.author_display_name,
                 row.author_day,
                 row.committed_at,
@@ -264,12 +307,6 @@ export function insertRawCommit(
                 observedAt,
             ).changes > 0
     );
-}
-
-/** The same canonicalization `raw_author_daily` applies, so the two columns cannot disagree. */
-function normalizeStoredEmail(email: string | null): string | null {
-    const trimmed = (email ?? '').trim().toLowerCase();
-    return trimmed || null;
 }
 
 interface CellTotalsRow {
@@ -286,7 +323,7 @@ interface CellTotalsRow {
  * `SUM` is NULL over an empty set, so each is coalesced to 0: a cell with no commits is a real
  * state (a PR-only author-day), not an unknown.
  */
-export function readCellCommitTotals(db: Database.Database, key: RawCommitCellKey): RawCommitCellTotals {
+function readCellCommitTotals(db: Database.Database, key: RawCommitCellKey): RawCommitCellTotals {
     const row = db
         .prepare(
             `SELECT COUNT(*) AS commits,
@@ -321,6 +358,13 @@ export function readCellCommitTotals(db: Database.Database, key: RawCommitCellKe
  * read is one index seek per author per run, and the row set is that author's commits in that
  * container, not the table.
  *
+ * BOUNDED to `[min(days) - 1, max(days) + 1]`, not the author's whole history. `raw_commits` is a
+ * source of record with no prune path — unlike `commit_diffstats`, which has one — so an
+ * unbounded read here would grow monotonically with the install's age, for every author, on every
+ * run, forever. One day of padding on each side is exactly what the midnight case needs:
+ * `COMMIT_BURST_WINDOW_MINUTES` is half an hour, so no burst can reach past the adjacent day, and
+ * the clamp is a left-prefix range on `idx_raw_commits_author_day` rather than a scan.
+ *
  * Ordered `(committed_at, sha)` so the sort the detector applies is total and the result is
  * deterministic across runs regardless of insertion order.
  */
@@ -329,14 +373,24 @@ export function readAuthorBurstsByDay(
     provider: GitProviderType,
     container: string,
     rawAuthorKey: string,
+    days: readonly string[],
 ): Map<string, number> {
+    if (days.length === 0) return new Map();
+    const sorted = [...days].sort();
     const rows = db
         .prepare(
             `SELECT committed_at, author_day FROM raw_commits
               WHERE provider = ? AND container = ? AND raw_author_key = ?
+                AND author_day >= ? AND author_day <= ?
               ORDER BY committed_at ASC, sha ASC`,
         )
-        .all(provider, container, rawAuthorKey) as Array<{committed_at: string; author_day: string}>;
+        .all(
+            provider,
+            container,
+            rawAuthorKey,
+            addDays(sorted[0], -1),
+            addDays(sorted[sorted.length - 1], 1),
+        ) as Array<{committed_at: string; author_day: string}>;
 
     return detectBursts(
         rows.map((r) => ({instantMs: Date.parse(r.committed_at), day: r.author_day})),
