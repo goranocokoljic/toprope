@@ -864,8 +864,9 @@ describe('#302 an unwritable author-day costs that row, not the run', () => {
             // BOTH PROVIDERS ARE GIVEN A STORED CURSOR FIRST, and that is what keeps this test
             // pointed at the store's rollback rather than at #309's window check. With no cursor
             // the run's `until` IS the corrupt clock reading, which `fetchProviderData` now
-            // refuses outright before a single request — a strictly better outcome, pinned by its
-            // own test below, but it never reaches the write transaction this case is about. With
+            // refuses outright before a single request — a strictly better outcome, pinned by the
+            // no-cursor corrupt-clock case in `future-author-dates.test.ts` ("the window bounds
+            // are validated once"), but it never reaches the write transaction this case is about. With
             // a cursor, `catchUpUntil` caps `until` to `since + GIT_CATCHUP_WINDOW_MAX_DAYS`, an
             // ordinary four-digit-year instant the window check accepts, so the corrupt clock
             // survives to `observedAt` exactly as it did before.

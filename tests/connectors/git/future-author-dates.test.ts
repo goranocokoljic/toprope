@@ -356,6 +356,31 @@ describe('#309 the window bounds are validated once, where they are derived', ()
         });
     });
 
+    it('with no cursor, a corrupt clock IS the "until" bound — refused before a single request', async () => {
+        // The other half of the rollback case in `unwritable-author-days.test.ts` ("a refusal
+        // that is NOT a property of the row"), whose comment points here: that test seeds
+        // cursors PRECISELY so the corrupt clock survives past the window check to
+        // `observedAt`. On a first sync there is no cursor, so `until` is derived straight
+        // from the clock and the same expanded-year reading is refused at the derivation
+        // site instead — before any network work, with nothing written and no cursor
+        // invented over an unwalked span.
+        const corruptClock = '+033658-09-27T00:00:00.000Z';
+        seedAlice(db);
+        vi.setSystemTime(new Date(corruptClock));
+        const counting = makeCountingFetch(githubRoutes());
+        vi.stubGlobal('fetch', counting.fetchMock);
+
+        const result = await runSync(db, [GITHUB_CONFIG]);
+
+        expect(counting.fetchMock).not.toHaveBeenCalled();
+        const line = result.errors.find((e) => /four-digit-year/.test(e));
+        expect(line).toBeDefined();
+        expect(line).toContain('"until"');
+        expect(isAdvisoryError(line!)).toBe(false);
+        expect(cursorOf(db, syncStateKey('github', 'test-org'))).toBeUndefined();
+        expect(rawDays(db)).toEqual([]);
+    });
+
     it('leaves an ordinary run untouched — the check refuses, it does not narrow', () => {
         // The other half of a fail-closed gate: it must not cost a healthy run anything. A normal
         // first sync (`since: ''`, `until: now`) walks and writes exactly as before.

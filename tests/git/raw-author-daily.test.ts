@@ -813,6 +813,16 @@ describe('upsertRawAuthorDaily — the write-boundary refusal (#302/#307)', () =
         // day is empty rather than a value an odd JSON body manufactured.
         {name: 'an empty day', row: input({date: ''}), observedAt: OBSERVED, code: 'invalid_date'},
         {name: 'a non-ISO observedAt', row: input(), observedAt: 'not-a-date', code: 'invalid_instant'},
+        // The input class ONLY the #309 round-trip check refuses: shape-valid but impossible, so
+        // the pre-#309 anchored regex accepted it and `laterInstant` would have silently
+        // normalized it to March 2. Reverting `isUtcIsoInstant` here to a shape-only regex
+        // fails exactly this row and nothing else.
+        {
+            name: 'a shape-valid impossible observedAt instant',
+            row: input(),
+            observedAt: '2025-02-30T00:00:00.000Z',
+            code: 'invalid_instant',
+        },
         // The FOURTH door, and the one no date check catches: `new Date(mergedAt) -
         // new Date(createdAt)` is NaN whenever either operand is unparseable, on a row whose own
         // day may be perfectly well-formed. `invalid_computed_metric` since #306: the analyzer's
