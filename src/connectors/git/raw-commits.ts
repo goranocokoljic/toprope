@@ -43,7 +43,7 @@
  */
 
 import type Database from 'better-sqlite3';
-import {addDays, isUtcDay, isUtcIsoInstant} from '../../aggregation/dates.js';
+import {addDays, isComputableUtcDay, isUtcIsoInstant} from '../../aggregation/dates.js';
 import {detectBursts} from './analyzer.js';
 import {
     RawAuthorDailyError,
@@ -369,13 +369,18 @@ function readCellCommitTotals(db: Database.Database, key: RawCommitCellKey): Raw
  * deterministic across runs regardless of insertion order.
  *
  * MALFORMED DAYS ARE FILTERED, NOT TRUSTED. `days` comes from cell observations that have not yet
- * reached the write boundary, and a malformed author-day is a real, reachable input — a provider
- * body with a null or expanded-year PR date yields `toDateString(...) === ''` (#302). That value
- * is a ROW-level refusal, which `assertValidAuthorDay` raises as `invalid_date` when the cell is
- * projected. Feeding it to `addDays` first would turn it into a `RangeError` thrown from inside
- * the run's write transaction — rolling back every provider's window over one bad row, which is
- * the exact failure #302 exists to prevent. Filtering here leaves the refusal where it belongs and
- * costs the bad cell only its own burst count, which the store is about to refuse anyway.
+ * reached the write boundary, and a malformed author-day is a real, reachable input: the three
+ * PR/comment dates that feed `metrics.date` pass NO provider gate at all — `toDateString` is a
+ * bare `slice(0, 10)` over an unvalidated response field (#302) — so a null date yields `''` and
+ * a MySQL-style zero date yields `'0000-00-00'`. Both are refused a moment later by
+ * `assertValidAuthorDay` as row-level `invalid_date`; feeding either to `addDays` FIRST would
+ * instead throw a `RangeError` from inside the run's single write transaction, rolling back every
+ * provider's window over one bad row — the exact failure #302 exists to prevent, and one no
+ * operator can clear because the next run re-fetches the identical body.
+ *
+ * The filter is therefore {@link isComputableUtcDay}, not `isUtcDay`: the shape test alone lets
+ * `'0000-00-00'` and `'2026-13-45'` through, and those are precisely the values that throw. The
+ * bad cell loses only its own burst count, which the store is about to refuse the whole row for.
  */
 export function readAuthorBurstsByDay(
     db: Database.Database,
@@ -384,7 +389,7 @@ export function readAuthorBurstsByDay(
     rawAuthorKey: string,
     days: readonly string[],
 ): Map<string, number> {
-    const sorted = days.filter(isUtcDay).sort();
+    const sorted = days.filter(isComputableUtcDay).sort();
     if (sorted.length === 0) return new Map();
     const rows = db
         .prepare(

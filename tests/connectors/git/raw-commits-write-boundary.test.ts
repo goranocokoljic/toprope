@@ -424,15 +424,26 @@ describe('raw_commits — the per-commit write boundary (#318)', () => {
             insertRawCommit(db, commitRow(at('2026-07-01', '09:10:00')), OBSERVED_AT);
             insertRawCommit(db, commitRow(at('2026-07-01', '09:20:00')), OBSERVED_AT);
 
-            const bursts = readAuthorBurstsByDay(db, 'github', 'test-org', 'github:login:alice', [
-                '',
-                '2026-07-01',
-            ]);
-            expect(bursts.get('2026-07-01')).toBe(1);
+            // `'0000-00-00'` and `'2026-13-45'` are the class a SHAPE test does not catch: both
+            // satisfy `YYYY-MM-DD`, both make `Date.parse` return NaN, and both are what a
+            // provider body with a MySQL-style zero date or an off-range month produces through
+            // `toDateString`'s bare slice. They are why the filter is `isComputableUtcDay` and
+            // not `isUtcDay` — under the shape test these three assertions throw rather than fail.
+            for (const bad of ['', 'not-a-day', '0000-00-00', '2026-13-45']) {
+                const bursts = readAuthorBurstsByDay(db, 'github', 'test-org', 'github:login:alice', [
+                    bad,
+                    '2026-07-01',
+                ]);
+                expect(bursts.get('2026-07-01')).toBe(1);
+            }
 
             // …and a set of NOTHING BUT malformed days reads nothing rather than throwing.
             expect(
-                readAuthorBurstsByDay(db, 'github', 'test-org', 'github:login:alice', ['', 'not-a-day']).size,
+                readAuthorBurstsByDay(db, 'github', 'test-org', 'github:login:alice', [
+                    '',
+                    'not-a-day',
+                    '0000-00-00',
+                ]).size,
             ).toBe(0);
         });
 
