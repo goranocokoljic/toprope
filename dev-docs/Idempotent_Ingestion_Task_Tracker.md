@@ -145,6 +145,13 @@ reset behavior test (rows gone, cursors gone, diffstats gone, notice present); g
 - Collect the touched set of `(provider, container, raw_author_key, author_day)` cells; recompute each touched cell
   from `raw_commits` by aggregate and write with `INSERT OR REPLACE` — **never `+=`, never a merge of stored+new**.
   The recompute always sees ALL of the cell's commits, so no commit-count weighting exists anywhere anymore.
+  - **As landed (#318), with a drift notice on the epic and an amendment note in design §2:** `commits`,
+    `lines_added`, `lines_removed`, `files_changed`, `avg_commit_size` and `commit_burst_count` are projected from
+    `raw_commits`; `code_churn_rate` and `ai_signature_score` are **not derivable from the §1 schema** (no commit
+    message, no per-file paths — and §5 forbids adding paths) and are supplied from the run's own observation of
+    the cell, which is what keeps criterion B exact. `is_merge` is always `0` (no provider supplies it). The
+    conflict clause is `DO UPDATE … WHERE` a strictly more informative observation arrives, so a degraded
+    first sighting (#288) is not frozen. Awaiting sign-off; reversing it means amending design §1.
 - PR counters (`prs_opened`, `prs_merged`, `review_comments_given`, `avg_time_to_merge_hours`) keep their existing
   `pr_records`-derived path (`sync.ts` ~3712) — merged into the recomputed cell write, not moved into
   `raw_commits`. `raw_commits` is commits only.

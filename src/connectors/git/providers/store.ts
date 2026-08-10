@@ -593,9 +593,10 @@ export const MAX_STORED_ADVISORIES = 20;
  * SIZED FROM A MEASUREMENT, not from an estimate of the prose. The longest single-purpose
  * advisory is `COMMIT_CHURN_UNKNOWN_PREFIX`, which embeds the permanent-span repair
  * instruction AND a five-sha sample: at its worst realistic inputs (full 40-hex shas, a long
- * repo path, a `(+N more)` tail) the emitted LINE measures ~2.15 KB — the repair prose alone
- * is only ~0.8 KB, so sizing against the paragraph rather than the line is what put an
- * earlier 2 KB cap underneath it. That is also the line `rankAdvisories` moves to the FRONT
+ * repo path, a `(+N more)` tail) the emitted LINE measures ~1.9 KB — the repair prose alone
+ * is only ~0.5 KB, so sizing against the paragraph rather than the line is what put an
+ * earlier 2 KB cap underneath it. (It measured ~2.15 KB until IG1.2/#318 collapsed the repair
+ * from a delete-and-re-add procedure to a cursor purge; the cap is unchanged, the headroom grew.) That is also the line `rankAdvisories` moves to the FRONT
  * as permanent loss, so a cap below it would mangle precisely the report the ranking exists
  * to protect, cutting the `Affected: <shas>` tail an operator verifies the loss with. 4 KB
  * leaves ~1.8 KB of headroom for a longer container path or future prose.

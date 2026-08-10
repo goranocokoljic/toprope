@@ -9,6 +9,16 @@ export interface AnalysisFileDiff {
 
 export interface AnalysisCommit {
     sha: string;
+    /**
+     * The repository this commit was listed from — half of `raw_commits`' primary key
+     * `(provider, container, repo, sha)` (IG1.2 / #318).
+     *
+     * Threaded from the repo loop because that is the only frame that knows it; the provider
+     * adapters are untouched (the epic forbids changing them). It is the SAME repo name
+     * `commit_diffstats` is keyed by, so both per-commit stores attribute a commit identically
+     * and one delete cascade can retract both.
+     */
+    repo: string;
     authorLogin: string | null;
     authorEmail: string | null;
     /**
@@ -37,9 +47,10 @@ export interface AnalysisReviewComment {
     createdAt: string;
 }
 
-export function toAnalysisCommit(commit: GitCommit, diffs: GitFileDiff[]): AnalysisCommit {
+export function toAnalysisCommit(commit: GitCommit, diffs: GitFileDiff[], repo: string): AnalysisCommit {
     return {
         sha: commit.sha,
+        repo,
         // Use email as fallback when username is absent — enables email-based dev mapping
         authorLogin: commit.author.username || commit.author.email || null,
         authorEmail: commit.author.email || null,

@@ -54,7 +54,8 @@
 --
 -- Cursors go WITH the data, never on their own (the graduated #262 rule). A forward cursor
 -- is the only evidence that the next run's window is disjoint from what is already stored,
--- which is what licenses `mergeDailyAcrossRuns` to ADD commit counts. Purging cursors while
+-- which is what licensed the cross-run merge to ADD commit counts (that merge was deleted by
+-- IG1/#316; this records what was true when 043 ran). Purging cursors while
 -- leaving imported rows behind would re-arm that double-count permanently; here the rows
 -- and the cursors are removed in the same transaction, so the next run starts from nothing
 -- with nothing behind it.

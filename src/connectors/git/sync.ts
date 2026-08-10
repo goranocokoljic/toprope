@@ -1,16 +1,22 @@
 import type Database from 'better-sqlite3';
 import {randomUUID} from 'crypto';
 import {aggregateDailyMetrics, prMergeDurationHours} from './analyzer.js';
+import {scoreAiSignature} from './ai-signature.js';
+import {
+    insertRawCommit,
+    projectRawAuthorDailyCell,
+    readAuthorBurstsByDay,
+    toUtcInstant,
+    type RawAuthorDailyCellObservation,
+    type RawCommitInput,
+} from './raw-commits.js';
 import {toAnalysisCommit, toAnalysisPR, toAnalysisReviewComment} from './analysis-types.js';
 import type {AnalysisCommit, AnalysisPR, AnalysisReviewComment} from './analysis-types.js';
 import {
-    mergeDailyDisjoint,
     rawAuthorKeyFor,
-    upsertRawAuthorDaily,
     RawAuthorDailyError,
     ROW_LEVEL_REFUSALS,
     type RawAuthorDailyErrorCode,
-    type RawAuthorDailyInput,
 } from './raw-author-daily.js';
 import {
     buildDevLookupMap,
@@ -176,14 +182,14 @@ export const DIFFSTAT_CACHE_DEGRADED_PREFIX = 'Diffstat cache degraded:';
  * Making that claim unconditionally would be worse than saying nothing, because the remedy it
  * names is destructive: it sends the operator to rebuild a span that is in fact intact.
  *
- * WHICH REMEDY IT NAMES MATTERS. Purging `git_last_sync`/`git_earliest_sync` on its own and
- * re-syncing is the one action that is NEVER safe here: `mergeDailyAcrossRuns` ADDS commits,
- * lines and files on the premise that run windows are disjoint, and `upsertRawAuthorDaily` has no
- * dedup guard, so re-importing an already-imported span permanently DOUBLES every commit metric
- * in it (#262) — a far larger corruption than the understatement being repaired. The line
- * therefore names the provider delete cascade (`providers/delete-cascade.ts`), which retracts the
- * container's `raw_author_daily`/`pr_records`/`commit_diffstats` and re-projects the affected days
- * BEFORE purging its cursors, so the re-import lands on an empty span.
+ * WHICH REMEDY IT NAMES MATTERS, and IG1 (#316) changed the answer. Purging the cursors and
+ * re-syncing used to be the one action that was NEVER safe: the cross-run merge ADDED commits,
+ * lines and files on the premise that run windows are disjoint, so re-importing an
+ * already-imported span permanently DOUBLED every commit metric in it (#262) — a far larger
+ * corruption than the understatement being repaired, which is why the line named the provider
+ * delete cascade instead. Commits are now keyed by sha in `raw_commits` and each author-day is
+ * RECOMPUTED from that store, so a re-import is a no-op on the counters and the cheap remedy is
+ * the correct one. See {@link permanentSpanRepair}, the single copy of that advice.
  */
 export const DIFFS_NOT_SUPPLIED_PREFIX = 'Provider supplied no commit diffs:';
 
@@ -582,10 +588,11 @@ function formatSystemicRowRefusal(
         `(durably, it is in sync_logs.errors only for a scheduled run or "toprope sync all", and ` +
         `on git_providers.last_sync_advisories only for an admin Sync-now of a DB-connected ` +
         `provider) — and fix the cause: every further run loses another ` +
-        `window the same way. The windows already covered cannot be re-asked (neither a forward ` +
-        `sync nor "sync older history" reaches them), and do NOT purge this provider's cursors ` +
-        `to re-import them: that permanently doubles every commit metric on the rows that WERE ` +
-        `retained (#262).`
+        `window the same way. Once the cause is fixed, purge this provider's git_last_sync ` +
+        `sync_state row and re-sync to re-ask the covered windows — safe now that commits are ` +
+        `sha-keyed and each author-day is recomputed rather than accumulated (IG1, #316), so it ` +
+        `costs API calls, not correctness. It used to double every commit metric on the rows ` +
+        `that WERE retained (#262), which is why older advice forbade it.`
     );
 }
 
@@ -728,24 +735,33 @@ function formatSkippedPRRecords(
  * advisories that have to prescribe one ({@link DIFFS_NOT_SUPPLIED_PREFIX}'s permanence half
  * and {@link COMMIT_CHURN_UNKNOWN_PREFIX}).
  *
- * ONE copy, deliberately. This is executable advice whose first sentence exists to stop an
- * operator from doing something strictly worse than the damage being repaired (#262), and two
- * copies of it is two chances for a later change to the cascade to update one and leave the
- * other prescribing the old procedure — the exact drift the "a remedy printed to an operator
- * is executable advice" rule is about.
+ * ONE copy, deliberately: this is executable advice, and two copies is two chances for a later
+ * change to update one and leave the other prescribing a stale procedure — the exact drift the
+ * "a remedy printed to an operator is executable advice" rule is about. IG1.2 (#318) is the
+ * change that would have caused it, so the single copy earned itself.
+ *
+ * IT IS CHECKED AGAINST ALL THREE ARMS OF THAT RULE. SAFE: re-importing a covered span was the
+ * one operation the codebase documented as corrupting (#262) and is now a no-op on the counters,
+ * because `raw_commits` is sha-keyed and the author-day is recomputed from it. REACHABLE: it
+ * touches only a `sync_state` row, so unlike the delete-and-re-add it replaces it works for a
+ * config-file provider too — the admin delete route 409s those. COMPLETE: deleting the cursor
+ * rather than lowering it resets the next run to the bounded first-sync window, so the recovery
+ * step for anything older ("sync older history") is named rather than left implicit.
  */
 function permanentSpanRepair(): string {
     return (
-        'raw_author_daily has no recompute path. Whatever you do, do NOT simply purge this ' +
-        "provider's cursors and re-sync: that re-imports over the surviving rows and " +
-        'permanently DOUBLES every commit metric in the span (#262), which is strictly worse ' +
-        'than the understatement. For a provider registered in the admin UI the repair is to ' +
-        'DELETE it and re-add it — the delete cascade retracts this container\'s raw rows and ' +
-        're-projects the affected days BEFORE purging its cursors, so the re-import lands on ' +
-        'an empty span — then run "sync older history" to recover anything beyond the ' +
-        `${FIRST_SYNC_WINDOW_DEFAULT_MONTHS}-month first-sync window a re-added provider ` +
-        `starts from. ${configFileProviderNotDeletable()}, so it has no ` +
-        'supported repair today: leave the span understated'
+        'The repair is to move this provider\'s git_last_sync sync_state row BACK to just before ' +
+        'the affected span and re-sync, which re-asks it and lands the missing detail. ' +
+        'Re-importing over rows that are already stored is SAFE: commits are keyed by their sha ' +
+        'in raw_commits and each author-day is RECOMPUTED from that store rather than added to, ' +
+        'so a re-observed commit changes nothing and only API calls are spent (IG1, #316). ' +
+        'DELETING that row rather than lowering it also works, but it makes the next run a FIRST ' +
+        `sync, which reaches back only ${FIRST_SYNC_WINDOW_DEFAULT_MONTHS} months — for anything ` +
+        'older than that, run "sync older history" afterwards. This applies to a config-file ' +
+        'provider exactly as to a DB-connected one, because it touches no git_providers row. It ' +
+        'used to be the one action that was never safe (it permanently doubled every commit ' +
+        'metric in the span, #262), and the repair was a delete-and-re-add the admin route ' +
+        'refuses for config-file providers; neither is true now'
     );
 }
 
@@ -851,15 +867,14 @@ export const TOTAL_REFUSAL_ALERT_RUNS = 3;
  * arguable, while leaving a genuinely mixed window — a handful of bad PR dates among a normal
  * day's rows — on the advisory channel.
  *
- * Both operands are counted AT THE WRITE (#307): `skipped` is the rows the write refused,
- * `retained` the rows it accepted, both tallied in `insertMany`'s raw loop over `rawWrites`. That
- * is the DEDUPED map, but the count tracks the pre-dedupe one closely: `aggregateDailyMetrics`
- * already collapses a provider instance's repos to one row per `(login, date)` BEFORE the row is
- * built, so the within-run `mergeDailyDisjoint` collapses two `rawWrites` entries only in the
- * corners where distinct build rows share a `(container, raw_author_key, date)` key — the
- * duplicate-container case the resolver forecloses, or two logins normalizing to one key on one
- * day. Those are rare and shrink retained and skipped ALIKE, so the ratio still moves only with
- * genuine refusals; the floor arm's grain is author-day rows, not build rows, by the same token.
+ * Both operands are counted AT THE WRITE (#307): `skipped` is the author-days the write refused,
+ * `retained` the cells it accepted, both tallied inside `insertMany`. Since IG1.2 (#318) a
+ * refusal can be decided per COMMIT as well as per cell, and one unusable author date belongs to
+ * EVERY commit carrying it — so the skip list is DEDUPED by `(author key, day, code)` before it
+ * reaches this ratio (`recordSkippedAuthorDay`). Without that, a day with forty such commits
+ * would weigh forty refusals against one accepted cell and escalate an incidental loss into a run
+ * failure. Both operands are therefore at the author-day grain the advisory itself speaks in, as
+ * is the floor arm.
  *
  * `retained` counts rows the store ACCEPTED, which is also rows that reached SQLite past the
  * `isWritable` gate — but that gate is per `(provider, container)`, so a container whose closure
@@ -3286,7 +3301,7 @@ async function fetchProviderData(
             }
             // Namespace file paths by repo to prevent false churn collisions
             const namespacedDiffs = diffs.map((d) => ({...d, path: `${repoName}/${d.path}`}));
-            allCommits.push(toAnalysisCommit(rawCommit, namespacedDiffs));
+            allCommits.push(toAnalysisCommit(rawCommit, namespacedDiffs, repoName));
             // No iteration is skipped, so the loop index IS the processed count.
             reportStep('diffs', i + 1, rawCommits.length);
         }
@@ -4090,16 +4105,19 @@ export class GitSync implements ConnectorInterface {
             Object.assign(p, NO_REPO_STEP);
         });
 
-        // Every author's daily facts this run observed, matched AND unmatched, ready to
-        // be RETAINED under their immutable raw identity (#253). This — not
-        // git_snapshots — is now the run's primary write: git_snapshots is derived from
-        // it by projection below, so an author with no developer record is no longer
-        // dropped but simply not yet projected.
-        // Keyed by the FULL store key — `(container, raw_author_key, date)` — so two provider
-        // INSTANCES of the same family contributing to one author-day stay SEPARATE rows rather
-        // than being folded together (see the accumulation below). Insertion-ordered, so the
-        // write pass stays deterministic.
-        const rawWrites = new Map<string, RawAuthorDailyInput>();
+        // Every COMMIT this run observed, ready to be inserted into `raw_commits` — the
+        // sha-keyed SOURCE OF RECORD (IG1.2 / #318). This is now the run's primary write: a
+        // re-observed sha is the same fact and inserts nothing, which is what makes an
+        // overlapping window a no-op instead of a double-count.
+        const commitInserts: RawCommitInput[] = [];
+        // Every (provider, container, raw_author_key, date) CELL this run observed, carrying the
+        // fields `raw_commits` cannot answer — the PR counters and the two unprojectable rates
+        // (see `raw-commits.ts`'s header). The commit counters are NOT here: they are recomputed
+        // from the store, so this map decides WHICH cells to rebuild, not what their totals are.
+        // Keyed by the FULL store key so two provider INSTANCES of the same family contributing
+        // to one author-day stay SEPARATE rows. Insertion-ordered, so the write pass stays
+        // deterministic.
+        const cellObservations = new Map<string, RawAuthorDailyCellObservation>();
         // The raw author keys THIS run retained — the scope auto-create (#256) acts on.
         // Deliberately not "every current candidate": a hands-off run onboards the
         // authorship it just observed, and must not silently sweep up candidates an
@@ -4176,6 +4194,35 @@ export class GitSync implements ConnectorInterface {
             if (list) list.push(value);
             else map.set(key, [value]);
         };
+        // The (author, day, code) triples already recorded, so one refusal is counted ONCE
+        // however many writes hit it (IG1.2 / #318).
+        //
+        // WHY IT IS NEEDED NOW AND WAS NOT BEFORE. The refusal used to be decided once per
+        // author-day row, because that row was the only write. It is now decided per COMMIT as
+        // well, and one unusable author date belongs to every commit that carries it — so a day
+        // with 40 such commits would report 40 skipped author-days where the old path reported
+        // one, and `isSystemicRowRefusal` weighs that count against the accepted-row count to
+        // decide whether a provider has failed systemically (#306). Inflating the numerator would
+        // escalate an incidental loss into a run failure. The advisory's own grain is the
+        // author-day ("this is at LEAST N lost item(s)"), so deduping at that grain is what keeps
+        // the number meaning what the line says it means.
+        //
+        // The same triple can also be reached from BOTH passes — a non-string display name is
+        // carried by the commits and by the cell built from them — which is the second way one
+        // defect would otherwise be counted twice.
+        const recordedSkips = new Set<string>();
+        const recordSkippedAuthorDay = (
+            provider: GitProviderType,
+            container: string,
+            skip: SkippedAuthorDay,
+        ): void => {
+            const ck = containerKeyOf(provider, container);
+            // NUL-separated for the reason the cell key is: every component is free-form text.
+            const dedupe = `${ck}\u0000${skip.raw_author_key}\u0000${skip.date}\u0000${skip.code}`;
+            if (recordedSkips.has(dedupe)) return;
+            recordedSkips.add(dedupe);
+            pushByContainer(skippedRowsByContainer, ck, skip);
+        };
         // Deferred stall-counter updates (#235), applied in the SAME transaction as
         // the cursor advances so the counter and the cursor can never disagree about
         // whether this run moved the provider forward. Unlike `cursorAdvances` this
@@ -4202,19 +4249,27 @@ export class GitSync implements ConnectorInterface {
                 });
             }
 
-            // A provider whose commit fetch was incomplete (listRepos or any repo's
-            // getCommits threw) must not advance its cursor OR write its additive
-            // snapshots (#231). Commit counts are ADDED across runs, so writing this
-            // run's partial data and re-fetching the same window next run would
-            // double-count; discarding the partial data and re-covering the whole
-            // window next run is the only gap-free option. Skip the provider entirely
-            // — its errors are already surfaced, so the failure is loud, not silent.
-            // (Trade-off: a permanently-failing repo stalls the provider until it is
-            // fixed or excluded via config — a visible stall, preferred over a silent,
-            // permanent snapshot gap.)
-            if (!result.complete) {
-                continue;
-            }
+            // A provider whose commit fetch was incomplete (listRepos or any repo's getCommits
+            // threw) KEEPS ITS DATA and only holds its cursor (IG1.2 / #318). This is the
+            // correctness coupling the epic deletes, and V6 is its proof.
+            //
+            // It used to `continue` here, discarding every partial result. That was forced by the
+            // additive merge: commit counts were ADDED across runs, so persisting a half-covered
+            // window and re-fetching it next run would double-count, and #231 concluded that
+            // discarding was the only gap-free option — at the cost of a permanently-failing repo
+            // stalling the provider, and of #273 having to build a whole diffstat ratchet to keep
+            // the expensive half of the discarded work.
+            //
+            // With `raw_commits` the partial rows are simply already there next time: the next
+            // run re-lists the same window, every sha it re-observes inserts nothing, and each
+            // touched cell is RECOMPUTED from the union rather than accumulated. So the partial
+            // write is not a hazard to be discarded, it is progress to be kept.
+            //
+            // What still holds back is the CURSOR, and only as a fetch hint: the window was not
+            // fully covered, so the next run should ask for it again. The advance below is
+            // therefore queued only for a complete provider, exactly as before — an operator's
+            // "where did the sync get to" reading does not change. The provider's errors are
+            // surfaced either way, so the failure stays loud.
 
             // Defer this provider's sync-state advance into the write transaction.
             // Backfill (#229) LOWERS the earliest watermark to the (older) slice it
@@ -4228,7 +4283,7 @@ export class GitSync implements ConnectorInterface {
             // per-container maps declared above, keyed by this instance's container key.
             const instanceKey = containerKeyOf(providerType, identifier);
 
-            cursorAdvances.push((): void => {
+            if (result.complete) cursorAdvances.push((): void => {
                 // Advancing a cursor the cascade just purged is exactly what re-arms the #262
                 // double-count, so a container whose owner changed mid-run advances nothing.
                 if (!isWritable(providerType, identifier)) return;
@@ -4379,8 +4434,77 @@ export class GitSync implements ConnectorInterface {
                 // No stable identity (no login, no email) — nothing to retain it under.
                 if (!rawAuthorKey) continue;
 
+                // EVERY COMMIT OF THIS AUTHOR, as a `raw_commits` row (IG1.2 / #318). The key
+                // is `retentionKeyFor`'s, i.e. the SAME key the cell below is written under —
+                // derived once per login from that login's sample email — so the per-commit rows
+                // and the cell they are recomputed into can never end up in different buckets.
+                //
+                // Refusal is decided at the WRITE, in `insertMany`, exactly as it is for the cell
+                // (#302/#307): one validator, run once, with no non-throwing twin to keep in step.
+                for (const commit of commits) {
+                    if (commit.authorLogin !== login) continue;
+                    commitInserts.push({
+                        provider: providerType,
+                        container: identifier,
+                        repo: commit.repo,
+                        sha: commit.sha,
+                        raw_author_key: rawAuthorKey,
+                        author_login: login,
+                        author_email: emailForLogin,
+                        author_display_name: sampleCommit?.authorName ?? null,
+                        // Sliced from the RAW author timestamp, byte-for-byte the derivation
+                        // `analyzer.ts` and `churn.ts` use — so a commit keys to the day it has
+                        // always keyed to. `toUtcInstant` normalizes the INSTANT separately (an
+                        // offset-bearing GitLab date is a real input); re-deriving the day from
+                        // that normalized value would move some commits a day, which is a
+                        // semantics change wearing a normalization's clothes.
+                        author_day: typeof commit.date === 'string' ? commit.date.slice(0, 10) : '',
+                        committed_at: toUtcInstant(commit.date),
+                        lines_added: commit.additions,
+                        lines_removed: commit.deletions,
+                        files_changed: commit.fileDiffs.length,
+                        // ALWAYS 0, and that is a statement about the provider layer, not a
+                        // heuristic: no in-tree provider reports a merge flag on `GitCommit`, and
+                        // this child may not change the adapters. Design §1 defines the column, so
+                        // it is written honestly-empty rather than guessed at from a commit
+                        // message — a guess would be indistinguishable from an observation forever
+                        // after. Recorded on the epic's drift notice.
+                        is_merge: false,
+                        // The BOOLEAN §1 defines. It is deliberately NOT what
+                        // `ai_signature_score` is recomputed from — that is a 0–100 score and this
+                        // column cannot carry it (see `raw-commits.ts`'s header and the epic drift
+                        // notice); this is the "did this commit trip the scorer at all" fact the
+                        // schema does define.
+                        ai_signature: scoreAiSignature(commit).estimated_score > 0,
+                    });
+                }
+
                 for (const [, metrics] of byDate) {
-                    const row: RawAuthorDailyInput = {
+                    // WHAT THIS CELL CARRIES, and what it deliberately does not (IG1.2 / #318).
+                    // The commit counters are absent: `projectRawAuthorDailyCell` recomputes them
+                    // from every `raw_commits` row of the cell, which is what makes a re-observed
+                    // window a no-op instead of a double-count. What the store cannot answer is
+                    // supplied here — the four PR counters (design §2 keeps them on their existing
+                    // `pr_records`-derived path) plus `code_churn_rate` and `ai_signature_score`,
+                    // which need per-file paths and the commit message respectively and so are not
+                    // derivable from the §1 schema. See `raw-commits.ts`'s header and the drift
+                    // notice on epic #316.
+                    //
+                    // NUL-separated on BOTH joins: a container is free-form text and may
+                    // contain spaces, so a space separator would let ('a b', 'key') and
+                    // ('a', 'b key') produce the same composite key.
+                    //
+                    // LAST WRITE WINS on a repeated key, where the old code folded the two sides
+                    // together. That fold existed for two provider INSTANCES of one family sharing
+                    // an author-day, which cannot reach one entry here: the key includes the
+                    // container. What is left is a caller reaching `syncProviders(db, configs)`
+                    // with the SAME container twice — closed by `UNIQUE(type, container)` for DB
+                    // rows and by `resolveAllGitProviders`' config-against-DB and
+                    // config-against-config de-dupe (#264). Under the new model even that case can
+                    // no longer corrupt the counters: they come from the store, and a re-listed
+                    // sha inserts nothing.
+                    const cellKey = `${identifier}\u0000${rawAuthorKey}\u0000${metrics.date}`;
+                    cellObservations.set(cellKey, {
                         provider: providerType,
                         // The provider INSTANCE this row is attributed to (#264). `identifier`
                         // is `providerContainer(pc)` — the exact same value this provider's
@@ -4392,63 +4516,13 @@ export class GitSync implements ConnectorInterface {
                         author_email: emailForLogin,
                         author_display_name: sampleCommit?.authorName ?? null,
                         date: metrics.date,
-                        commits: metrics.commits,
-                        lines_added: metrics.lines_added,
-                        lines_removed: metrics.lines_removed,
-                        files_changed: metrics.files_changed,
                         prs_opened: metrics.prs_opened,
                         prs_merged: metrics.prs_merged,
                         review_comments_given: metrics.review_comments_given,
                         avg_time_to_merge_hours: metrics.avg_time_to_merge_hours,
                         code_churn_rate: metrics.code_churn_rate,
                         ai_signature_score: metrics.ai_signature_score,
-                        avg_commit_size: metrics.avg_commit_size,
-                        commit_burst_count: metrics.commit_burst_count,
-                    };
-                    // QUEUED FOR THE WRITE PASS, which is where its refusal is now decided
-                    // (#302/#307). `upsertRawAuthorDaily` validates fail-closed and THROWS, and it
-                    // runs inside this run's single all-providers write transaction — so a row it
-                    // will not accept does not cost one row, it rolls back every provider's window,
-                    // moves no cursor, and does it again identically on every subsequent run. Three
-                    // PR and review-comment dates (`pr.createdAt`, `pr.mergedAt`,
-                    // `comment.createdAt`) reach `metrics.date` verbatim with no provider gate
-                    // between them and here (the analyzer keeps `avg_time_to_merge_hours` null on an
-                    // unparseable pair, so only a code regression makes it NaN, which throws as
-                    // `invalid_computed_metric`). #307 replaced the pre-check that used to live here
-                    // (`findRawAuthorDailyDefect`) with a CATCH of the store's own throw in the
-                    // `insertMany` raw loop: one validator, run once, with no twin to keep in step
-                    // — and `retainedKeys`/`retainedRowCount` are recorded THERE, on a successful
-                    // upsert, so the set means exactly "keys this run wrote". Only a ROW_LEVEL
-                    // refusal is skipped there; a run/provider-level one rethrows and rolls back.
-                    //
-                    // Accumulate WITHIN the run before the store ever sees it, keyed by the
-                    // FULL store key — container included (#264).
-                    //
-                    // Two provider instances of one family (two GitHub orgs, two Bitbucket
-                    // workspaces) sharing an author no longer collide here at all: they are
-                    // separate rows in the store, so their genuinely-different PRs are never
-                    // handed to the across-runs `max()` rule that would have kept only the
-                    // larger org's count, permanently, once the cursor advanced past the window.
-                    //
-                    // The branch is RETAINED as defence-in-depth for a caller that reaches
-                    // `syncProviders(db, configs)` with the SAME container twice. Both routes that
-                    // build the list are now closed to it — `UNIQUE(type, container)` for DB rows,
-                    // and `resolveAllGitProviders` de-dupes config-against-DB *and*
-                    // config-against-config (#264) — so this is unreachable through either, and
-                    // only a direct programmatic caller bypassing the resolver can produce it.
-                    // Summing is the right rule for the shape it was written for (two genuinely
-                    // different orgs on one author-day); for a literally-duplicated container it
-                    // would double-count, which is exactly why the de-dupe belongs upstream.
-                    //
-                    // NUL-separated on BOTH joins: a container is free-form text and may
-                    // contain spaces, so a space separator would let ('a b', 'key') and
-                    // ('a', 'b key') produce the same composite key.
-                    const dedupeKey = `${identifier}\u0000${rawAuthorKey}\u0000${metrics.date}`;
-                    const prior = rawWrites.get(dedupeKey);
-                    rawWrites.set(
-                        dedupeKey,
-                        prior ? {...prior, ...mergeDailyDisjoint(prior, row)} : row,
-                    );
+                    });
                 }
 
                 // Progress counter only — a live estimate for the UI, resolved against the
@@ -4494,24 +4568,62 @@ export class GitSync implements ConnectorInterface {
             // be in the store before either happens, or a freshly-created developer's
             // current-window activity would be invisible to their own replay. Splitting the
             // former single loop is exactly what buys "no second pass, no re-fetch".
-            for (const row of rawWrites.values()) {
-                if (!isWritable(row.provider, row.container)) continue;
-                const ck = containerKeyOf(row.provider, row.container);
+            // PASS 1 — THE SOURCE OF RECORD. Every observed commit, `INSERT … ON CONFLICT DO
+            // NOTHING`: a re-observed sha is the same immutable fact, so an overlapping window
+            // costs nothing and changes nothing. This must complete before pass 2, which reads
+            // back what it wrote.
+            //
+            // A refused commit is skipped and REPORTED at the (author, day) grain the advisory
+            // speaks in — see `dedupeSkip` for why several refusals on one day still count once.
+            for (const commit of commitInserts) {
+                if (!isWritable(commit.provider, commit.container)) continue;
                 try {
-                    upsertRawAuthorDaily(db, row, now);
+                    insertRawCommit(db, commit, now);
                 } catch (e) {
-                    // THE SKIP, DECIDED AT THE WRITE (#307). Catch ONLY the store's own typed
-                    // refusal, and ONLY a ROW_LEVEL one: those describe a value THIS row alone
-                    // carries and that re-fetching returns unchanged, so skipping costs one
-                    // author-day and the cursor may still advance. Everything else — a
-                    // run/provider-level RawAuthorDailyError (a corrupt clock, a bad provider),
-                    // or any other throw (SQLITE_BUSY, a trigger, a bug) — RETHROWS, rolling the
-                    // whole transaction back and holding every cursor, which is the fail-closed
-                    // behaviour a bare `catch {}` would silently invert.
+                    // THE SKIP, DECIDED AT THE WRITE (#307), unchanged in kind by IG1.2: catch
+                    // ONLY the store's own typed refusal and ONLY a ROW_LEVEL one — a value THIS
+                    // commit alone carries and that re-fetching returns unchanged. Everything else
+                    // — a run/provider-level RawAuthorDailyError (a corrupt clock, a bad provider)
+                    // or any other throw (SQLITE_BUSY, a trigger, a bug) — RETHROWS and rolls the
+                    // whole transaction back, which is the fail-closed behaviour a bare `catch {}`
+                    // would silently invert.
                     if (e instanceof RawAuthorDailyError && ROW_LEVEL_REFUSALS.includes(e.code)) {
-                        pushByContainer(skippedRowsByContainer, ck, {
-                            raw_author_key: row.raw_author_key,
-                            date: row.date,
+                        recordSkippedAuthorDay(commit.provider, commit.container, {
+                            raw_author_key: commit.raw_author_key,
+                            date: commit.author_day,
+                            code: e.code,
+                        });
+                        continue;
+                    }
+                    throw e;
+                }
+            }
+
+            // PASS 2 — THE PROJECTION. Recompute each touched cell from ALL of its stored
+            // commits and REPLACE it. Nothing here adds to a stored value, which is the whole
+            // point: run the same ingest twice and the same number is written twice.
+            //
+            // Burst counts are read ONCE PER AUTHOR, not once per cell: a burst may span midnight
+            // so the detector needs that author's whole stream, and a per-cell read would be an
+            // O(days) fan-out over the same rows (the no-per-row-fan-out rule).
+            const burstsByAuthor = new Map<string, Map<string, number>>();
+            for (const cell of cellObservations.values()) {
+                if (!isWritable(cell.provider, cell.container)) continue;
+                const ck = containerKeyOf(cell.provider, cell.container);
+                const authorKey = `${ck}\u0000${cell.raw_author_key}`;
+                let bursts = burstsByAuthor.get(authorKey);
+                if (bursts === undefined) {
+                    bursts = readAuthorBurstsByDay(db, cell.provider, cell.container, cell.raw_author_key);
+                    burstsByAuthor.set(authorKey, bursts);
+                }
+                try {
+                    projectRawAuthorDailyCell(db, cell, bursts, now);
+                } catch (e) {
+                    // Same discrimination as pass 1, and for the same reason.
+                    if (e instanceof RawAuthorDailyError && ROW_LEVEL_REFUSALS.includes(e.code)) {
+                        recordSkippedAuthorDay(cell.provider, cell.container, {
+                            raw_author_key: cell.raw_author_key,
+                            date: cell.date,
                             code: e.code,
                         });
                         continue;
@@ -4523,7 +4635,7 @@ export class GitSync implements ConnectorInterface {
                 // `retainedRowCount` is the accepted-row denominator the refusal ratio weighs the
                 // skips against (#306/#307). An author every one of whose days was refused
                 // retains nothing and is not offered to the hands-off onboarding.
-                retainedKeys.add(row.raw_author_key);
+                retainedKeys.add(cell.raw_author_key);
                 retainedRowCountByContainer.set(ck, (retainedRowCountByContainer.get(ck) ?? 0) + 1);
             }
 
@@ -4538,22 +4650,22 @@ export class GitSync implements ConnectorInterface {
             // produced them. (The same reason it is re-read at all: `devLookup` was built
             // before minutes of network fetch, during which a developer may have been added.)
             const writeLookup = buildDevLookupMap(db);
-            for (const row of rawWrites.values()) {
-                if (!isWritable(row.provider, row.container)) continue;
+            for (const cell of cellObservations.values()) {
+                if (!isWritable(cell.provider, cell.container)) continue;
                 const developerId = resolveRawAuthor(
                     writeLookup,
-                    row.provider,
-                    row.raw_author_key,
-                    row.author_login,
-                    row.author_email,
+                    cell.provider,
+                    cell.raw_author_key,
+                    cell.author_login,
+                    cell.author_email,
                 );
                 if (developerId) {
-                    touchedCells.set(`${developerId}:${row.date}`, {developer_id: developerId, date: row.date});
+                    touchedCells.set(`${developerId}:${cell.date}`, {developer_id: developerId, date: cell.date});
                 } else {
                     // The advisory is sourced from the RETAINED rows: exactly the authors
                     // whose day was kept but could not be attributed — precisely the set the
                     // onboarding review queue (DO1.4/DO1.5) will offer to promote.
-                    allUnmatched.add(`${row.provider}:${row.author_login ?? row.author_email ?? 'unknown'}`);
+                    allUnmatched.add(`${cell.provider}:${cell.author_login ?? cell.author_email ?? 'unknown'}`);
                 }
             }
             // Rebuild EXACTLY the cells this run touched. Each is recomputed from every

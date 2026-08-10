@@ -89,6 +89,26 @@ transaction, replacing the stored value (`INSERT OR REPLACE`, not `+=`).
 weighting needed, because the recompute always sees *all* the commits, not a
 delta. PR counters keep their existing `pr_records`-derived path.
 
+> **Amendment pending sign-off (raised by IG1.2 / #318, drift notice on epic #316).**
+> Two of those four are **not derivable from the §1 schema**, so as landed they are
+> supplied by the caller from its own observation of the cell rather than projected:
+> `ai_signature_score` is a 0–100 score read from the commit *message*
+> (`scoreAiSignature`) and §1 stores a 0/1 `ai_signature` flag and no message;
+> `code_churn_rate` needs per-*file* paths and a 48 h cross-day window
+> (`calculateDailyChurnRates`) and §1 stores no paths — which §5 deliberately forbids.
+> `avg_commit_size` and `commit_burst_count` **are** projected, as written.
+> Nothing is additive either way, so the epic's guarantee (a re-observed commit cannot
+> inflate a counter) holds whole, and criterion B (golden equivalence) is met exactly.
+> Making the other two true projections needs a §1 amendment — an `ai_signature_score
+> REAL` column, plus either per-file paths (a §5 privacy-model change) or an accepted
+> semantics change for churn. That is a user decision, not a child's.
+>
+> Two smaller deviations from the same notice: `is_merge` is always `0`, because no
+> in-tree provider exposes a merge flag on `GitCommit` and this epic may not change the
+> adapters; and the `raw_commits` conflict clause is `DO UPDATE … WHERE` a strictly more
+> informative observation arrives, not a bare `DO NOTHING`, so a commit first seen with a
+> degraded diffstat (#288) is not frozen at zero while the later run's advisory clears.
+
 `git_snapshots` stays exactly what it is: a projection of
 `(raw_author_daily, identity map)`.
 

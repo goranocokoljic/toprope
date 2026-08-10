@@ -70,13 +70,14 @@ export function buildConnectorSchedule(config: TopropeConfig): ScheduledConnecto
  *
  * `node-cron` fires on the wall clock and does not care whether the previous firing has
  * returned, so before this a run that outlasted its period simply overlapped the next one.
- * For git that is not a latency problem but a DATA-INTEGRITY one: two overlapping runs read
- * the same forward cursor, fetch non-disjoint `[since, until]` windows, and
- * `mergeDailyAcrossRuns` ADDS commits/lines/files on the stated premise that the windows are
- * disjoint — `upsertRawAuthorDaily` has no dedup guard, so the overlap is a permanent
- * double-count in `raw_author_daily` and in the `git_snapshots` projection over it (see
- * `sync-log.ts`). A git run can legitimately take hours, so this is not a remote case; it is
- * the shape of a slow first import.
+ * For git that used to be a DATA-INTEGRITY problem rather than a latency one: two overlapping
+ * runs read the same forward cursor, fetch non-disjoint `[since, until]` windows, and the
+ * cross-run merge ADDED commits/lines/files on the stated premise that the windows were disjoint,
+ * so the overlap was a permanent double-count. IG1 (#316) removed that: commits are keyed by sha
+ * in `raw_commits` and each author-day is recomputed from that store, so an overlap now costs
+ * duplicated API budget and wall clock — which is why the guard stays — rather than corrupt
+ * counters. A git run can legitimately take hours, so this is not a remote case; it is the shape
+ * of a slow first import.
  *
  * SKIP, never queue. The runs are idempotent-by-window, not by count: the skipped tick's work
  * is exactly what the in-flight run is already doing, and the next tick picks up whatever it

@@ -95,7 +95,8 @@ CREATE TABLE raw_author_daily (
     files_changed INTEGER NOT NULL CHECK (files_changed >= 0),
     -- PR/review counters. RE-DELIVERED by providers on every run (they fetch PRs by
     -- updated_at), so these combine with max() — never additively. See
-    -- mergeDailyAcrossRuns in raw-author-daily.ts for the full reasoning.
+    -- the cross-run merge rule in raw-author-daily.ts for the full reasoning. (That rule was
+    -- deleted by IG1/#316; this comment records what was true when 042 ran.)
     prs_opened INTEGER NOT NULL CHECK (prs_opened >= 0),
     prs_merged INTEGER NOT NULL CHECK (prs_merged >= 0),
     review_comments_given INTEGER NOT NULL CHECK (review_comments_given >= 0),

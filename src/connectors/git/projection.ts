@@ -23,17 +23,16 @@
  *
  * WHAT THIS MODULE DOES NOT OWN: the cross-RUN merge rule (commit deltas ADD,
  * re-delivered PR fields max(), rate fields commit-weighted). That accumulation now
- * happens entirely inside `raw_author_daily` (see `mergeDailyAcrossRuns`), one level
- * below. By the time a row reaches the projection it is already the accumulated total
- * for that (raw author, day), so the projection REPLACES a cell rather than adding to
- * it — a deterministic rebuild, not a second accumulator.
+ * happens nowhere any more: since IG1.2 (#318) `raw_author_daily` is itself recomputed from the
+ * sha-keyed `raw_commits` store, one level below. By the time a row reaches the projection it is
+ * already that (raw author, day)'s whole total, so the projection REPLACES a cell rather than
+ * adding to it — a deterministic rebuild, not a second accumulator.
  */
 
 import type Database from 'better-sqlite3';
 import {randomUUID} from 'crypto';
 import {
     chunk,
-    mergeDailyDisjoint,
     distinctRawAuthorIdentities,
     readRawDailyForDates,
     readRawDailyForKeys,
@@ -241,8 +240,8 @@ export function resolveRawAuthor(
  * `raw_author_daily` is keyed by (provider, container, raw_author_key, date) since #264, so
  * no commit and no PR can appear under two rows — a commit belongs to exactly one container,
  * and each container fetches its own PRs. This is NOT the rule for combining across RUNS
- * under one key — that is `mergeDailyAcrossRuns`, which lives one level down in the raw store
- * and has already been applied by the time a row gets here.
+ * under one key — the raw store no longer accumulates at all (IG1.2/#318): its row is recomputed
+ * from `raw_commits` and is already whole by the time it gets here.
  *
  * The one configuration that can violate the disjointness premise is two OVERLAPPING
  * containers of the same family — a GitLab group and one of its own subgroups, both connected
@@ -250,16 +249,71 @@ export function resolveRawAuthor(
  * views of ONE commit and are summed here. That overlap is unsupported rather than handled;
  * connect the parent group or the subgroups, not both.
  *
- * The metric arithmetic itself is `mergeDailyDisjoint`, shared with the sync path's
- * same-run cross-provider-instance accumulation; this function only carries the
- * `git_snapshots`-specific identity columns over it.
+ * The metric arithmetic is {@link foldDisjointMetrics} below, which this module now OWNS. It used
+ * to live in `raw-author-daily.ts`, shared with a same-run cross-provider-instance accumulation
+ * in `sync.ts` that IG1.2 (#318) deleted — `raw_commits` makes that accumulation unnecessary, so
+ * the raw store's last remaining caller went away and the epic's criterion C removed the symbol
+ * with it. The rule itself is unchanged and still needed: this is the only place in the pipeline
+ * where two genuinely different AUTHORS fold into one cell.
  */
 export function mergeSnapshots(a: GitSnapshotRow, b: GitSnapshotRow): GitSnapshotRow {
     return {
         developer_id: a.developer_id,
         date: a.date,
-        ...mergeDailyDisjoint(a, b),
+        ...foldDisjointMetrics(a, b),
         data_source: a.data_source === b.data_source ? a.data_source : 'multi',
+    };
+}
+
+/**
+ * Commit-count-weighted mean of a rate/score field, so the fold's result does not depend on the
+ * ORDER identities are combined in — which matters because three or more identities can share a
+ * cell. `total === 0` yields 0, the neutral value for these per-commit metrics.
+ *
+ * Private to this module on purpose (IG1.2 / #318): it exists only to serve the cross-IDENTITY
+ * fold below. The cross-RUN weighting it used to share a body with is gone, and re-exporting this
+ * would invite it back.
+ */
+function commitWeightedMean(aVal: number, aCommits: number, bVal: number, bCommits: number): number {
+    const total = aCommits + bCommits;
+    return total > 0 ? (aVal * aCommits + bVal * bCommits) / total : 0;
+}
+
+/**
+ * Combine two genuinely DISJOINT contributions to one (developer, day) cell — see
+ * {@link mergeSnapshots} for why the two sides share no commit and no PR, and for the one
+ * unsupported configuration that can violate that premise.
+ *
+ * Every counter adds. `avg_time_to_merge_hours` is weighted by each side's merged-PR count so the
+ * pair (count, mean) always describes a real population; when only one side knows a duration, that
+ * one is the answer. The three rate/score fields are commit-count-weighted for the fold-order
+ * reason above — cross-identity churn cannot be recomputed exactly without the full commit set,
+ * so this stays an approximation, but a weighted and order-independent one.
+ */
+function foldDisjointMetrics(a: DailyGitMetrics, b: DailyGitMetrics): DailyGitMetrics {
+    const totalCommits = a.commits + b.commits;
+    const totalPrs = a.prs_merged + b.prs_merged;
+
+    let avgTTM: number | null;
+    if (a.avg_time_to_merge_hours !== null && b.avg_time_to_merge_hours !== null && totalPrs > 0) {
+        avgTTM = (a.avg_time_to_merge_hours * a.prs_merged + b.avg_time_to_merge_hours * b.prs_merged) / totalPrs;
+    } else {
+        avgTTM = a.avg_time_to_merge_hours ?? b.avg_time_to_merge_hours;
+    }
+
+    return {
+        commits: totalCommits,
+        lines_added: a.lines_added + b.lines_added,
+        lines_removed: a.lines_removed + b.lines_removed,
+        files_changed: a.files_changed + b.files_changed,
+        prs_opened: a.prs_opened + b.prs_opened,
+        prs_merged: totalPrs,
+        review_comments_given: a.review_comments_given + b.review_comments_given,
+        avg_time_to_merge_hours: avgTTM,
+        code_churn_rate: commitWeightedMean(a.code_churn_rate, a.commits, b.code_churn_rate, b.commits),
+        ai_signature_score: commitWeightedMean(a.ai_signature_score, a.commits, b.ai_signature_score, b.commits),
+        avg_commit_size: commitWeightedMean(a.avg_commit_size, a.commits, b.avg_commit_size, b.commits),
+        commit_burst_count: a.commit_burst_count + b.commit_burst_count,
     };
 }
 
@@ -349,8 +403,8 @@ const WRITE_SQL = `INSERT INTO git_snapshots
  * The projected value REPLACES the cell's commit/PR-derived columns — it is not added
  * to them. That is what makes the operation idempotent: running it twice over the same
  * raw store and identity map writes the same bytes, so a replay can never double-count.
- * The accumulation that used to live here now happens under the raw key, one level
- * down (`mergeDailyAcrossRuns`).
+ * The accumulation that used to live here is gone entirely (IG1.2/#318) — the raw key's row is
+ * itself a recompute over `raw_commits`.
  *
  * Runs in a single `db.transaction`, so a whole-day rebuild's writes and retractions
  * commit or roll back together and no reader ever sees a half-rebuilt day. Nesting is

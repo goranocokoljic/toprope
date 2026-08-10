@@ -82,22 +82,38 @@ function toInstantMs(iso: unknown): number {
     return typeof iso === 'string' ? Date.parse(iso) : Number.NaN;
 }
 
-// Detect bursts across a developer's full commit stream (so bursts spanning
-// midnight are not split), attributing each burst to the day of its first
-// commit. Returns burst counts keyed by date.
-function detectBurstsByDate(commits: AnalysisCommit[]): Map<string, number> {
-    const burstsByDate = new Map<string, number>();
-    if (commits.length < COMMIT_BURST_MIN_COUNT) return burstsByDate;
+/**
+ * One commit reduced to what burst detection needs: WHEN it happened and WHICH day key it is
+ * attributed to. The two are separate on purpose — an offset-bearing author timestamp
+ * (`…T10:00:00.000+02:00`, which GitLab really sends) keys to the day of its RAW string while
+ * ordering by its instant, and folding them together would silently move commits a day.
+ */
+export interface BurstEvent {
+    instantMs: number;
+    day: string;
+}
 
-    const sorted = [...commits].sort(
-        (a, b) => new Date(a.date).getTime() - new Date(b.date).getTime(),
-    );
-    const times = sorted.map((c) => new Date(c.date).getTime());
+/**
+ * Detect bursts across a developer's full commit stream (so bursts spanning midnight are not
+ * split), attributing each burst to the day of its first commit. Returns burst counts keyed by
+ * day.
+ *
+ * Exported (IG1.2 / #318) so the `raw_commits` cell recompute derives `commit_burst_count` with
+ * THIS detector over the stored `committed_at` stream rather than re-implementing the
+ * skip-past-the-window scan — a second copy would have to stay in step with a rule whose whole
+ * point is not double-counting overlapping windows.
+ */
+export function detectBursts(events: BurstEvent[]): Map<string, number> {
+    const burstsByDate = new Map<string, number>();
+    if (events.length < COMMIT_BURST_MIN_COUNT) return burstsByDate;
+
+    const sorted = [...events].sort((a, b) => a.instantMs - b.instantMs);
+    const times = sorted.map((e) => e.instantMs);
     const windowMs = COMMIT_BURST_WINDOW_MINUTES * 60 * 1_000;
 
     for (let i = 0; i <= times.length - COMMIT_BURST_MIN_COUNT; i++) {
         if (times[i + COMMIT_BURST_MIN_COUNT - 1] - times[i] <= windowMs) {
-            const day = toDateString(sorted[i].date);
+            const day = sorted[i].day;
             burstsByDate.set(day, (burstsByDate.get(day) ?? 0) + 1);
             // Skip past all commits in this burst to avoid double-counting overlapping windows
             const burstEnd = times[i] + windowMs;
@@ -107,6 +123,12 @@ function detectBurstsByDate(commits: AnalysisCommit[]): Map<string, number> {
     }
 
     return burstsByDate;
+}
+
+function detectBurstsByDate(commits: AnalysisCommit[]): Map<string, number> {
+    return detectBursts(
+        commits.map((c) => ({instantMs: new Date(c.date).getTime(), day: toDateString(c.date)})),
+    );
 }
 
 function emptyMetrics(login: string, date: string): DailyGitMetrics {

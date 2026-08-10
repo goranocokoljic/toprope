@@ -92,20 +92,23 @@ export function resolveCommitWindow(since: string, until: string): CommitWindow 
     if (sinceDate && untilDate && sinceDate.getTime() > untilDate.getTime()) {
         // WHAT THE MESSAGE MAY AND MAY NOT SAY. The likeliest cause is a host clock that ran ahead
         // when the cursor was stamped and has since been corrected, so the first thing it names is
-        // the clock — an operator told only "check git_last_sync" concludes the cursor is too new
-        // and lowers it, and re-importing an already-covered span is the permanent double-count
-        // #262 documents (`mergeDailyAcrossRuns` ADDS commit metrics on a premise of disjoint
-        // windows and `upsertRawAuthorDaily` has no dedup guard). So the line says explicitly what
-        // must NOT be done. It also states the blast radius, because this refusal stalls the whole
-        // provider until the value is corrected — better than the silent alternative it replaces,
-        // but not something to discover.
+        // the clock. The line used to go on to FORBID lowering that cursor: re-importing an
+        // already-covered span was the permanent double-count #262 documents, because the
+        // cross-run merge ADDED commit metrics on a premise of disjoint windows. IG1 (#316)
+        // removed the premise — commits are sha-keyed in `raw_commits` and each author-day is
+        // recomputed from it — so lowering the cursor now costs only re-fetching, and the message
+        // says that instead of prescribing a caution that is no longer true. It still states the
+        // blast radius, because this refusal stalls the whole provider until the value is
+        // corrected — better than the silent alternative it replaces, but not something to
+        // discover.
         throw new Error(
             'Git commit window is inverted ("since" is after "until") — refusing to fetch with a ' +
                 'window no commit can satisfy, which would record an untouched span as covered. ' +
                 'Every repo of this provider is stalled until it is corrected. Usual cause: the ' +
-                'host clock ran ahead when the git_last_sync sync_state row was stamped. Do NOT ' +
-                'move that cursor BACKWARD by hand — re-importing an already-covered span ' +
-                'permanently doubles its commit metrics; correct the clock and let the cursor stand.',
+                'host clock ran ahead when the git_last_sync sync_state row was stamped. Correct ' +
+                'the clock first; if that cursor is itself too far ahead, lowering it is safe — ' +
+                're-importing an already-covered span re-observes commits that are already stored ' +
+                'by sha and changes no counter, so it costs API calls only (IG1, #316).',
         );
     }
     return {since: sinceDate, until: untilDate};

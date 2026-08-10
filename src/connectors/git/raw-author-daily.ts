@@ -9,13 +9,13 @@
  * retained rows (DO1.3 / #253) rather than a re-fetch, which is what makes it
  * additive-safe and idempotent.
  *
- * This file also owns the ONE copy of the cross-run daily-metric merge rule
- * ({@link mergeDailyAcrossRuns}) and its commit-count weighting
- * ({@link commitWeightedAvg}). Both were relocated here from `sync.ts`, which now
- * imports them: the rule is keyed by the raw identity here and by `developer_id`
- * there, but the arithmetic must never diverge between the two.
+ * Since IG1.2 (#318, epic #316) this table is itself a PROJECTION, at the
+ * `(provider, container, raw_author_key, date)` grain, of the sha-keyed `raw_commits` source of
+ * record — so this file owns the write boundary (validation, identity carry-forward, the REPLACE)
+ * while `raw-commits.ts` owns what the metric values are recomputed FROM. The cross-run merge
+ * rule this file used to own is deleted; see the note where it stood.
  *
- * No sync wiring and no projection live here — those are #253.
+ * No sync wiring and no `git_snapshots` projection live here — those are #253.
  */
 
 import type Database from 'better-sqlite3';
@@ -246,112 +246,22 @@ export function isLoginKey(provider: GitProviderType, rawAuthorKey: string): boo
 }
 
 /**
- * Commit-count-weighted mean of a rate/score field. When two rows' commit counts
- * add, a straight average would ignore that one side may represent far more commits
- * than the other. total===0 (no commits on either side) yields 0 — the neutral value
- * for these per-commit metrics.
+ * THE CROSS-RUN MERGE IS GONE (IG1.2 / #318, epic #316), and this note is here so nobody
+ * reintroduces it. The three cross-run merge helpers — the additive across-runs rule, its
+ * genuinely-disjoint twin, and the commit-count weighting both used — stood at this point in the
+ * file. They existed to ADD each run's commit counters onto the stored
+ * row, which is correct only while every run's window is provably disjoint from everything
+ * already stored — the invariant the sync cursors carried, and the one every feature since #229
+ * had to be individually prevented from invalidating.
  *
- * Relocated here from `sync.ts` (#252); `mergeSnapshots` imports it so the weighting
- * exists in exactly one place.
+ * `raw_commits` (`raw-commits.ts`) makes the question moot: commits are stored per sha, and a
+ * cell is RECOMPUTED from all of them (`projectRawAuthorDailyCell`) rather than accumulated. A
+ * re-observed window re-inserts nothing and recomputes the same number, so there is no delta to
+ * weight and no disjointness to prove. {@link upsertRawAuthorDaily} below is now a REPLACE.
+ *
+ * The one merge that survives is a genuinely different rule at a different grain: folding several
+ * raw AUTHORS into one `git_snapshots` cell. It lives in `projection.ts`, which owns it outright.
  */
-export function commitWeightedAvg(aVal: number, aCommits: number, bVal: number, bCommits: number): number {
-    const total = aCommits + bCommits;
-    return total > 0 ? (aVal * aCommits + bVal * bCommits) / total : 0;
-}
-
-/**
- * Merge two DISJOINT contributions to the same day — sides that share no commit and no
- * PR, so every field is genuinely additive. The counterpart to
- * {@link mergeDailyAcrossRuns}: same day, but the two inputs are known not to overlap,
- * which is what makes summing (rather than max()-ing) the re-delivered PR fields correct.
- *
- * Two situations produce genuinely-disjoint sides, and both must use THIS rule:
- *   - one run's contributions from two DIFFERENT provider instances of the same family
- *     (two GitHub orgs, two Bitbucket workspaces). They resolve to the same
- *     `raw_author_key` and day, but their PRs are different PRs — see `sync.ts`, which
- *     accumulates with this before a single store write, precisely so the across-runs
- *     `max()` never sees them and silently keeps only the larger org's PR count;
- *   - two different raw authors folding into one `git_snapshots` cell (see
- *     `mergeSnapshots`, which delegates the arithmetic here).
- *
- * Rate/score fields are commit-count-weighted so the result does not depend on fold
- * ORDER — which matters because three or more identities can share a cell.
- */
-export function mergeDailyDisjoint(a: DailyGitMetrics, b: DailyGitMetrics): DailyGitMetrics {
-    const totalCommits = a.commits + b.commits;
-    const totalPrs = a.prs_merged + b.prs_merged;
-
-    let avgTTM: number | null;
-    if (a.avg_time_to_merge_hours !== null && b.avg_time_to_merge_hours !== null && totalPrs > 0) {
-        avgTTM = (a.avg_time_to_merge_hours * a.prs_merged + b.avg_time_to_merge_hours * b.prs_merged) / totalPrs;
-    } else {
-        avgTTM = a.avg_time_to_merge_hours ?? b.avg_time_to_merge_hours;
-    }
-
-    return {
-        commits: totalCommits,
-        lines_added: a.lines_added + b.lines_added,
-        lines_removed: a.lines_removed + b.lines_removed,
-        files_changed: a.files_changed + b.files_changed,
-        prs_opened: a.prs_opened + b.prs_opened,
-        prs_merged: totalPrs,
-        review_comments_given: a.review_comments_given + b.review_comments_given,
-        avg_time_to_merge_hours: avgTTM,
-        // Commit-weighted like every other rate field. Cross-identity churn cannot be
-        // recomputed exactly without the full commit set, so this stays an approximation
-        // — but a commit-weighted one, which is both closer and (unlike a plain two-way
-        // mean) independent of the order identities are folded in.
-        code_churn_rate: commitWeightedAvg(a.code_churn_rate, a.commits, b.code_churn_rate, b.commits),
-        ai_signature_score: commitWeightedAvg(a.ai_signature_score, a.commits, b.ai_signature_score, b.commits),
-        avg_commit_size: commitWeightedAvg(a.avg_commit_size, a.commits, b.avg_commit_size, b.commits),
-        commit_burst_count: a.commit_burst_count + b.commit_burst_count,
-    };
-}
-
-/**
- * Merge an incoming per-run set of daily metrics against the STORED row for the same
- * (identity, day). This is the ACROSS-RUNS rule — the two sides are NOT disjoint:
- *
- *   - Commit windows ARE disjoint (each run fetches commits on a committer-date
- *     window that advances), so commit-derived counts are ADDED. That accumulation is
- *     the point.
- *   - PR / review activity is RE-DELIVERED: providers fetch PRs by updated_at/
- *     updated_on, so a PR merely touched since the last cursor is re-fetched and
- *     re-aggregated on the next run, and its review comments are re-fetched
- *     unconditionally. Additively summing prs_opened/prs_merged/review_comments_given
- *     would inflate them on essentially every scheduled sync of an active PR. They are
- *     combined with max(): idempotent under re-delivery, and never below the stored
- *     value, so a scoped single-provider run cannot drop already-recorded PRs.
- *   - Rate/score fields are commit-count-weighted so a small delta cannot drag a large
- *     accumulated row halfway (the exponential-recency skew a plain mean would cause).
- *
- * Relocated from `sync.ts`'s `remergeStoredSnapshot` (#252), which is now a thin
- * identity-preserving wrapper around this function — one copy of the arithmetic.
- */
-export function mergeDailyAcrossRuns(stored: DailyGitMetrics, incoming: DailyGitMetrics): DailyGitMetrics {
-    return {
-        commits: stored.commits + incoming.commits,
-        lines_added: stored.lines_added + incoming.lines_added,
-        lines_removed: stored.lines_removed + incoming.lines_removed,
-        files_changed: stored.files_changed + incoming.files_changed,
-        prs_opened: Math.max(stored.prs_opened, incoming.prs_opened),
-        prs_merged: Math.max(stored.prs_merged, incoming.prs_merged),
-        review_comments_given: Math.max(stored.review_comments_given, incoming.review_comments_given),
-        // avg_time_to_merge pairs with prs_merged (which we take via max). Source it
-        // from the SAME side that owns the larger merge count so the (count, TTM) pair
-        // always matches a real observation — never a maxed count paired with a stale
-        // first-observed average from a different run. On a tie (the common same-PR
-        // re-delivery case) keep the first-observed value.
-        avg_time_to_merge_hours:
-            incoming.prs_merged > stored.prs_merged
-                ? incoming.avg_time_to_merge_hours ?? stored.avg_time_to_merge_hours
-                : stored.avg_time_to_merge_hours ?? incoming.avg_time_to_merge_hours,
-        code_churn_rate: commitWeightedAvg(stored.code_churn_rate, stored.commits, incoming.code_churn_rate, incoming.commits),
-        ai_signature_score: commitWeightedAvg(stored.ai_signature_score, stored.commits, incoming.ai_signature_score, incoming.commits),
-        avg_commit_size: commitWeightedAvg(stored.avg_commit_size, stored.commits, incoming.avg_commit_size, incoming.commits),
-        commit_burst_count: stored.commit_burst_count + incoming.commit_burst_count,
-    };
-}
 
 /**
  * Keep the most-informative of two optional identity fields: a non-blank incoming
@@ -482,7 +392,7 @@ const RESPONSE_DERIVED_METRIC_FIELDS: readonly (keyof DailyGitMetrics)[] = [
  * One function, asked by all three metric loops, so the classification cannot drift between
  * the counter rule and the rate rule for two fields that share a provenance.
  */
-function metricDefectCode(field: keyof DailyGitMetrics): RawAuthorDailyErrorCode {
+export function metricDefectCode(field: keyof DailyGitMetrics): RawAuthorDailyErrorCode {
     return RESPONSE_DERIVED_METRIC_FIELDS.includes(field)
         ? 'invalid_metric'
         : 'invalid_computed_metric';
@@ -575,6 +485,48 @@ export const ROW_LEVEL_REFUSALS: readonly RawAuthorDailyErrorCode[] = [
  * `.code` (a closed vocabulary — {@link RAW_AUTHOR_DAILY_ERROR_CODES}) there, never `.message`.
  */
 function assertValidInput(row: RawAuthorDailyInput, observedAt: string): void {
+    assertValidRunScope(row, observedAt);
+    assertValidAuthorDay(row.date, observedAt);
+    assertValidIdentityColumns(row);
+    // Range-validate the metrics here rather than letting the schema CHECKs surface a raw
+    // SQLITE_CONSTRAINT — and because NaN binds as NULL into a NOT NULL column, an error that
+    // names the wrong problem. The code is per FIELD (#306): see {@link metricDefectCode}.
+    for (const field of COUNTER_FIELDS) {
+        const value = row[field];
+        if (!Number.isInteger(value) || (value as number) < 0) {
+            throw new RawAuthorDailyError(metricDefectCode(field), `${field} must be a non-negative integer, got: ${String(value)}`);
+        }
+    }
+    for (const field of RATE_FIELDS) {
+        if (!Number.isFinite(row[field])) {
+            throw new RawAuthorDailyError(metricDefectCode(field), `${field} must be a finite number, got: ${String(row[field])}`);
+        }
+    }
+    if (row.avg_time_to_merge_hours !== null && !Number.isFinite(row.avg_time_to_merge_hours)) {
+        throw new RawAuthorDailyError(
+            metricDefectCode('avg_time_to_merge_hours'),
+            `avg_time_to_merge_hours must be a finite number or null, got: ${String(row.avg_time_to_merge_hours)}`,
+        );
+    }
+}
+
+/**
+ * The RUN- and PROVIDER-level half of the write boundary: `observedAt`, `provider`, `container`
+ * and the `raw_author_key` namespacing rule.
+ *
+ * Split out (IG1.2 / #318) so the `raw_commits` boundary can compose the SAME rules instead of
+ * restating them — the canonical-helper rule applied to a validator, and the specific drift this
+ * codebase has already paid for twice (#290's three copies of the day shape, #307's non-throwing
+ * twin of this very function). Every operand here is constant for a whole run or a whole
+ * provider, which is exactly why none of these codes is in {@link ROW_LEVEL_REFUSALS}: a defect
+ * in one refuses EVERY row, so skipping would discard the window fail-open with the cursor
+ * advanced. They must throw.
+ *
+ * Called FIRST by both boundaries, deliberately: this throws the first defect it finds, and the
+ * caller skips a row-level refusal but lets a run/provider-level one through — so a run whose
+ * clock is corrupt is reported as the run-level fault it is rather than as a heap of skipped rows.
+ */
+export function assertValidRunScope(row: RawAuthorIdentity, observedAt: string): void {
     if (!isUtcIsoInstant(observedAt)) {
         throw new RawAuthorDailyError('invalid_instant', `observedAt must be a UTC ISO instant, got: ${observedAt}`);
     }
@@ -609,8 +561,21 @@ function assertValidInput(row: RawAuthorDailyInput, observedAt: string): void {
             `raw_author_key must be namespaced by its provider (${row.provider}:…), got: ${row.raw_author_key}`,
         );
     }
-    if (!isUtcDay(row.date)) {
-        throw new RawAuthorDailyError('invalid_date', `date must be a UTC YYYY-MM-DD day, got: ${String(row.date)}`);
+}
+
+/**
+ * The DAY-KEY half of the write boundary: shape, then the future-day horizon. Both are
+ * {@link ROW_LEVEL_REFUSALS} codes — the defect is in the row and re-fetching returns it
+ * unchanged — so the caller skips the one row and reports it.
+ *
+ * Composed by BOTH write boundaries (IG1.2 / #318): `raw_author_daily`'s `date` and
+ * `raw_commits`' `author_day` are the same key derived the same way, and #290 is what a second
+ * copy of this rule costs — three copies of the day shape, with the provider gate agreeing with
+ * one of them only by comment.
+ */
+export function assertValidAuthorDay(date: string, observedAt: string): void {
+    if (!isUtcDay(date)) {
+        throw new RawAuthorDailyError('invalid_date', `date must be a UTC YYYY-MM-DD day, got: ${String(date)}`);
     }
     // A FUTURE DEVELOPER-DAY, refused here for every provider at once (#309).
     //
@@ -652,26 +617,33 @@ function assertValidInput(row: RawAuthorDailyInput, observedAt: string): void {
     // Compared as `YYYY-MM-DD` STRINGS, which is sound because both operands are shape-pinned by
     // the two checks above it: zero-padded day keys byte-sort chronologically.
     const futureDayHorizon = addDays(observedAt.slice(0, 10), FUTURE_DAY_HORIZON_DAYS);
-    if (row.date > futureDayHorizon) {
+    if (date > futureDayHorizon) {
         throw new RawAuthorDailyError(
             'future_date',
             `date is a future developer-day (later than ${futureDayHorizon}, the run's own UTC ` +
-                `day plus the maximum timezone offset), got: ${row.date}`,
+                `day plus the maximum timezone offset), got: ${date}`,
         );
     }
-    // THE IDENTITY COLUMNS. `upsertRawAuthorDaily` DEREFERENCES all three inside the shared write
-    // transaction — `bestKnown` and `normalizeEmail` both do `(x ?? '').trim()` — so a non-string,
-    // non-null value is a `TypeError` from inside the write: the exact permanent-stall geometry a
-    // bad date has, reached by a different field. Reachable, not theoretical: `analysis-types.ts`
-    // builds `authorName`/`authorLogin`/`authorEmail` with `||`, which only filters falsy, so
-    // `{}` / `[]` / `42` survive from a cast response body.
-    //
-    // ITS OWN CODE, not `invalid_key`, even though both are about identity: `invalid_key` is
-    // decided partly by `provider` (the namespacing rule), so it refuses every row of a provider
-    // at once and is NOT row-level. This one is — the value comes from one author's own commit and
-    // re-fetching returns the identical body — so folding it into `invalid_key` would make a
-    // single odd display name roll back every provider's window, the failure this whole issue
-    // exists to close.
+}
+
+/**
+ * The IDENTITY-COLUMN half of the write boundary, composed by both boundaries (IG1.2 / #318) —
+ * `raw_commits` carries the same three nullable columns and dereferences them the same way.
+ *
+ * Both writes DEREFERENCE all three inside the shared write transaction — `bestKnown` and
+ * `normalizeEmail` both do `(x ?? '').trim()` — so a non-string, non-null value is a `TypeError`
+ * from inside the write: the exact permanent-stall geometry a bad date has, reached by a
+ * different field. Reachable, not theoretical: `analysis-types.ts` builds
+ * `authorName`/`authorLogin`/`authorEmail` with `||`, which only filters falsy, so `{}` / `[]` /
+ * `42` survive from a cast response body.
+ *
+ * ITS OWN CODE, not `invalid_key`, even though both are about identity: `invalid_key` is decided
+ * partly by `provider` (the namespacing rule), so it refuses every row of a provider at once and
+ * is NOT row-level. This one is — the value comes from one author's own commit and re-fetching
+ * returns the identical body — so folding it into `invalid_key` would make a single odd display
+ * name roll back every provider's window, the failure this whole issue exists to close.
+ */
+export function assertValidIdentityColumns(row: RawAuthorIdentity): void {
     for (const field of IDENTITY_FIELDS) {
         const value = row[field];
         if (value !== null && typeof value !== 'string') {
@@ -681,26 +653,6 @@ function assertValidInput(row: RawAuthorDailyInput, observedAt: string): void {
             );
         }
     }
-    // Range-validate the metrics here rather than letting the schema CHECKs surface a raw
-    // SQLITE_CONSTRAINT — and because NaN binds as NULL into a NOT NULL column, an error that
-    // names the wrong problem. The code is per FIELD (#306): see {@link metricDefectCode}.
-    for (const field of COUNTER_FIELDS) {
-        const value = row[field];
-        if (!Number.isInteger(value) || (value as number) < 0) {
-            throw new RawAuthorDailyError(metricDefectCode(field), `${field} must be a non-negative integer, got: ${String(value)}`);
-        }
-    }
-    for (const field of RATE_FIELDS) {
-        if (!Number.isFinite(row[field])) {
-            throw new RawAuthorDailyError(metricDefectCode(field), `${field} must be a finite number, got: ${String(row[field])}`);
-        }
-    }
-    if (row.avg_time_to_merge_hours !== null && !Number.isFinite(row.avg_time_to_merge_hours)) {
-        throw new RawAuthorDailyError(
-            metricDefectCode('avg_time_to_merge_hours'),
-            `avg_time_to_merge_hours must be a finite number or null, got: ${String(row.avg_time_to_merge_hours)}`,
-        );
-    }
 }
 
 const SELECT_COLUMNS = `id, provider, container, raw_author_key, author_login, author_email, author_display_name,
@@ -709,25 +661,77 @@ const SELECT_COLUMNS = `id, provider, container, raw_author_key, author_login, a
      avg_commit_size, commit_burst_count, first_seen, last_seen`;
 
 /**
- * Record one run's contribution for a (provider, container, raw_author_key, date), merging
- * it against whatever is already stored under {@link mergeDailyAcrossRuns}'s rules.
+ * REPLACE the (provider, container, raw_author_key, date) cell with the values handed in, except
+ * the four PR counters ({@link mergePRCounters}) — the
+ * write half of the projection (IG1.2 / #318). It used to MERGE against the stored row, adding the
+ * commit counters on a premise of disjoint windows; every
+ * metric field is now simply the value the caller computed, because the caller computed it from
+ * ALL of the cell's stored commits (`projectRawAuthorDailyCell` in `raw-commits.ts`) rather than
+ * from one run's delta. Re-running the same ingest therefore writes the same number twice.
+ *
+ * DO NOT reintroduce a merge here to "protect" a scoped run. The graduated rule about scoped
+ * writes into multi-source rows is about `git_snapshots`, whose cell folds every provider; THIS
+ * row is keyed by `(provider, container)`, so exactly one provider instance ever writes it and a
+ * replace can never drop another source's contribution.
  *
  * The key includes the CONTAINER (#264): two provider instances of one family (two GitHub
  * orgs, two Bitbucket workspaces) contributing to the same author-day are two independent
- * rows, not one row to be merged. That is what makes a per-provider delete able to retract
- * exactly its own contribution — and it also removes the old hazard of handing two
- * workspaces' genuinely-different PRs to the across-runs `max()` rule.
+ * rows. That is what makes a per-provider delete able to retract exactly its own contribution.
  *
- * Read-modify-write, so it runs inside a `db.transaction` — the graduated rule is
- * that a check-then-act mutation must be serialized by a transaction, not merely
- * backstopped by the UNIQUE constraint (which fails fast on a race, it does not
- * order it). Nesting is safe: better-sqlite3 promotes an inner transaction to a
- * savepoint, so a caller that already holds the sync transaction still gets one
- * atomic unit.
+ * STILL a read-modify-write, so it still runs inside a `db.transaction`: the metrics are
+ * replaced, but `first_seen` and the three identity columns are carried forward from the stored
+ * row (identity only ever GAINS information — a blank observation never erases a known value, and
+ * `author_email` is stable-on-first-known so a row that resolved to a developer cannot silently
+ * stop resolving). Nesting is safe: better-sqlite3 promotes an inner transaction to a savepoint,
+ * so a caller that already holds the sync transaction still gets one atomic unit.
  *
  * `first_seen` is PRESERVED from the stored row (a later run's clock can never move
  * it backward); `last_seen` advances via a total comparator.
  */
+/** The four PR-derived counters — the only fields this write still combines with the stored row. */
+type PRCounters = Pick<
+    DailyGitMetrics,
+    'prs_opened' | 'prs_merged' | 'review_comments_given' | 'avg_time_to_merge_hours'
+>;
+
+/**
+ * THE ONE RULE THAT SURVIVED IG1.2, and the design says so: "PR counters keep their existing
+ * `pr_records`-derived path". Everything else on this row is now REPLACED with a value recomputed
+ * from `raw_commits`; these four are not, because `raw_commits` is commits only and the PR
+ * counters have no sha to be keyed by.
+ *
+ * WHY THEY CANNOT SIMPLY BE REPLACED — this is a regression that was caught by an existing test
+ * (#247 SO-1), not a hypothetical. Providers list PRs by `updated_at`/`updated_on`, so what a run
+ * observes for a day is "the PRs of that day that were touched inside this run's window", NOT the
+ * day's whole population: a catch-up-capped or narrowed later run legitimately sees FEWER PRs for
+ * a day it already recorded. Replacing would silently lower the count every time that happens.
+ * `max()` is idempotent under re-delivery (the common case: the same PR re-listed run after run)
+ * and never falls below what is already recorded.
+ *
+ * WHY NOT DERIVE THEM FROM `pr_records` INSTEAD, which is the genuinely idempotent PR store: two
+ * of the four are not in it. `pr_records` is keyed by `developer_id`, so an UNMATCHED author's PRs
+ * are never written there at all — and this table's entire purpose is retaining unmatched authors
+ * — while `review_comments_given` is a REVIEWER's activity on the day they commented, which
+ * `pr_records.review_comment_count` (comments ON a PR) does not express. Recorded on the epic's
+ * drift notice.
+ *
+ * `avg_time_to_merge_hours` is sourced from the SAME side that owns the larger `prs_merged`, so
+ * the (count, mean) pair always matches a real observation rather than pairing a maxed count with
+ * a mean from a different run. On a tie — the common same-PR re-delivery case — the
+ * first-observed value stays.
+ */
+function mergePRCounters(stored: PRCounters, incoming: PRCounters): PRCounters {
+    return {
+        prs_opened: Math.max(stored.prs_opened, incoming.prs_opened),
+        prs_merged: Math.max(stored.prs_merged, incoming.prs_merged),
+        review_comments_given: Math.max(stored.review_comments_given, incoming.review_comments_given),
+        avg_time_to_merge_hours:
+            incoming.prs_merged > stored.prs_merged
+                ? incoming.avg_time_to_merge_hours ?? stored.avg_time_to_merge_hours
+                : stored.avg_time_to_merge_hours ?? incoming.avg_time_to_merge_hours,
+    };
+}
+
 export function upsertRawAuthorDaily(
     db: Database.Database,
     row: RawAuthorDailyInput,
@@ -746,7 +750,8 @@ export function upsertRawAuthorDaily(
         const merged: RawAuthorDailyRecord = stored
             ? {
                   ...stored,
-                  ...mergeDailyAcrossRuns(stored, row),
+                  ...row,
+                  ...mergePRCounters(stored, row),
                   author_login: bestKnown(stored.author_login, row.author_login),
                   author_email: firstKnown(stored.author_email, normalizeEmail(row.author_email)),
                   author_display_name: bestKnown(stored.author_display_name, row.author_display_name),

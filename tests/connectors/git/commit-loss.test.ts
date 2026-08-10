@@ -703,13 +703,25 @@ describe('unreturned commits are never silent (#275)', () => {
             expect(churnLine).toContain('avg_commit_size and ai_signature_score');
             expect(churnLine).toContain('files_changed and code_churn_rate are understated too');
             expect(churnLine).not.toMatch(/files_changed[^.]*(are|is) unaffected/);
-            // The REMEDY half, which is the part that stops an operator doing something
-            // strictly worse than the damage. Deleting `permanentSpanRepair()` from this line
-            // left the whole suite green (#288 review cycle 2, TST-2).
-            expect(churnLine).toContain('do NOT simply purge');
-            expect(churnLine).toContain('delete cascade');
+            // The REMEDY half, which is the part an operator actually acts on. Deleting
+            // `permanentSpanRepair()` from this line left the whole suite green (#288 review
+            // cycle 2, TST-2), so it is asserted here. Since IG1 (#316) the remedy is the CHEAP
+            // one — re-import is safe because commits are sha-keyed — where it used to forbid a
+            // cursor purge and prescribe a full delete-and-re-add.
+            expect(churnLine).toContain('git_last_sync sync_state row BACK');
+            expect(churnLine).toContain('re-observed commit changes');
+            expect(churnLine).not.toContain('delete cascade');
+            // COMPLETENESS, per the graduated "a remedy is executable advice" rule: deleting the
+            // cursor instead of lowering it resets the next run to the bounded first-sync window,
+            // so the recovery step for anything older has to be part of the remedy.
             expect(churnLine).toContain('sync older history');
-            expect(churnLine).toContain('CONFIG-FILE provider cannot be deleted');
+            // REACHABILITY. The old remedy was a delete-and-re-add, which the admin route refuses
+            // for a config-file provider — so the line had to carry that caveat or send half the
+            // deployments to a no-op. The new one edits a sync_state row and touches no
+            // git_providers row, so it is reachable everywhere and the caveat is GONE rather than
+            // silently dropped.
+            expect(churnLine).toContain('config-file provider exactly as to a DB-connected one');
+            expect(churnLine).not.toContain('CONFIG-FILE provider cannot be deleted');
             // A healthy commit is not named — an operator cannot act on a line listing the repo.
             expect(churnLine).not.toContain('bbb222');
             // 4. The cursor advances: re-fetching returns the identical body.
@@ -899,10 +911,13 @@ describe('unreturned commits are never silent (#275)', () => {
             // The fresh answer arrived and the advisory is gone…
             expect(churnLineOf(second.errors)).toBeUndefined();
             expect(dayLines(db)?.added).toBe(40);
-            // …and the price of getting it this way, stated rather than hidden: the overlapping
-            // re-import ADDED a second commit for one real commit (#262). That is why the
-            // supported repair retracts the span first.
-            expect(dayCommits(db)).toBe(2);
+            // …and the price the old model charged for getting it this way is GONE. The
+            // overlapping re-import used to ADD a second commit for one real commit (#262),
+            // which is why the supported repair had to retract the span first. Since IG1.2
+            // (#318) the commit is keyed by its sha in `raw_commits` and the day's counter is
+            // recomputed from that store, so re-importing an overlapping span is a no-op on the
+            // count while still delivering the better diffstat.
+            expect(dayCommits(db)).toBe(1);
         });
 
         it('counts each unobserved commit ONCE even when an in-run retry re-pages the window', async () => {
@@ -1029,7 +1044,11 @@ describe('unreturned commits are never silent (#275)', () => {
             // line" from "the line collapsed and the cap is now sized against nothing" — and
             // the constant's docstring cites this measurement as its justification, so the
             // measurement itself is what has to stay pinned.
-            expect(churnLine!.length).toBeGreaterThan(2_000);
+            // Lowered from 2_000 by IG1.2 (#318): the repair paragraph got SHORTER because the
+            // remedy collapsed from "delete and re-add the provider, then backfill" to "purge the
+            // cursor and re-sync". The bound still detects a collapsed line — the sha sample and
+            // the repair prose together are ~1.9 KB — which is the only thing it is for.
+            expect(churnLine!.length).toBeGreaterThan(1_800);
             // The tail is the part a tight cap eats first, and it is the part an operator uses
             // to verify the loss — assert it survived rather than only asserting the total.
             expect(churnLine!.endsWith('.')).toBe(true);

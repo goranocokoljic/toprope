@@ -68,11 +68,13 @@ export const ABANDONED_RUN_ERROR =
  * finished, so `toprope doctor` and `/api/coverage` report a false red until the run's own
  * `finishSyncLog` overwrites it.
  *
- * Do not read this bound as making overlap SAFE — it only stops the log from lying about it.
- * Two concurrent git runs read the same forward cursor, fetch non-disjoint windows, and
- * `mergeDailyAcrossRuns`/`upsertRawAuthorDaily` add commit metrics with no dedup guard, so the
- * overlap itself is a permanent double-count in `git_snapshots` (the hazard #262 documents).
- * Nothing serializes the two entry points today; that gap is not this function's to close.
+ * Do not read this bound as making overlap desirable — it only stops the log from lying about it.
+ * Two concurrent git runs read the same forward cursor and fetch non-disjoint windows. Since IG1
+ * (#316) that is no longer a CORRECTNESS fault: commits are sha-keyed in `raw_commits` and each
+ * author-day is recomputed from that store, so the overlapping half is re-observed and changes
+ * nothing (while the merge was additive it was a permanent double-count — the hazard #262
+ * documents). What an overlap still costs is duplicated API budget and wall clock. Nothing
+ * serializes the two entry points today; that gap is not this function's to close.
  *
  * 24 h is chosen against what a run can legitimately take: a git sync walking a full
  * repository history is the longest thing in this system, measured in hours. A row older than
