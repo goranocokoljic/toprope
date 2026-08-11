@@ -1364,8 +1364,10 @@ export const GIT_RUN_BEST_EFFORT_RETRY_SLEEP_BUDGET_MS = 20 * 60_000;
  * to the cap, so ~10 minutes PER REQUEST), and the per-commit fan-out is an O(commits)
  * population of such requests. Run length was therefore a function of the provider's behaviour
  * with no ceiling at all, and length is not cosmetic here: `sync-pipeline` re-runs a failed
- * connector once, and two overlapping git runs read the same forward cursor into an ADDITIVE
- * commit merge — a permanent double-count (see `sync-log.ts`).
+ * connector once, so two git runs can overlap. That used to be a permanent double-count (both
+ * read the same forward cursor into an additive commit merge); since IG1 (#316) it costs the
+ * duplicated fetch and nothing else, and `scheduler.ts` refuses an overlapping tick anyway
+ * (#283). The bound is now about run length itself, not about what an overlap corrupts.
  *
  * FOUR HOURS, chosen against what actually runs on top of it rather than as a round number:
  * `runConnectorWithRetry` grants a failed connector one full second attempt, so the ceiling an
@@ -1378,11 +1380,12 @@ export const GIT_RUN_BEST_EFFORT_RETRY_SLEEP_BUDGET_MS = 20 * 60_000;
  * 50 minutes and still not have waited the wall out. Read this as "at most four hours", not "a
  * guaranteed four hours of fetching".
  *
- * A run that hits it fails like any other incompletely-covered window: #231 holds the cursor
- * and drops the run's partial snapshots. That is only sound because of #273 — every per-commit
- * diffstat the run fetched is memoized OUTSIDE the write transaction, so the next run re-pages
- * the commit lists and serves the whole fan-out from the memo, redoing strictly less of the
- * dominant cost each time.
+ * A run that hits it fails like any other incompletely-covered window: it holds the cursor so the
+ * window is asked again. Since IG1 (#316) it KEEPS its rows rather than dropping them (#231's
+ * drop-partials rule is gone — see `ProviderFetchResult.complete`), so the next run re-pages the
+ * commit lists and re-inserts shas that are already there for free. #273's memo still saves the
+ * per-commit diffstat fan-out on top of that, so each attempt redoes strictly less of the
+ * dominant cost.
  *
  * That ratchet covers the per-commit fan-out and NOTHING ELSE: the commit-list paging and the
  * per-PR review fan-out are re-paid in full every run, so convergence holds iff the un-memoized
@@ -1554,9 +1557,12 @@ export interface SyncRunOptions {
      * `now - firstSyncWindowMonths` instead of walking all history from ''. This is
      * the lever that stops run #1 draining a provider's whole rate-limit budget.
      *
-     * IGNORED once a provider has a stored cursor: `since` is cursor-derived and the
-     * snapshot upsert is additive, so re-widening the window on a later run would
-     * double-count the already-recorded span. Omitting it (undefined) preserves the
+     * IGNORED once a provider has a stored cursor: `since` is cursor-derived, and a
+     * later run has no reason to re-ask a span it already holds. It used to be a
+     * correctness rule — re-widening the window double-counted the recorded span
+     * against the additive snapshot merge — and since IG1 (#316) it is a cost rule:
+     * re-observed shas insert nothing, so re-widening would only spend API calls.
+     * Omitting it (undefined) preserves the
      * legacy "walk all history on first sync" behavior — the scheduled path passes
      * nothing and is deliberately unchanged. Residual exposure (out of scope for
      * #228, which scoped the cap to the "Sync now" button): a fresh org first synced
@@ -1568,11 +1574,12 @@ export interface SyncRunOptions {
     /**
      * "Sync older history" backfill (#229): extend a provider's synced window
      * BACKWARD by fetching the fixed, strictly-older commit slice [since, until]
-     * and additively merging it. `until` is the provider's current earliest
-     * watermark and `since` the new (older) target; the caller (the backfill route)
-     * computes both and enforces `since < until` (the overlap guard) BEFORE
-     * dispatching, so the slice is always disjoint from already-stored activity and
-     * the additive snapshot merge stays correct — no double-count.
+     * and inserting it. `until` is the provider's current earliest watermark and
+     * `since` the new (older) target; the caller (the backfill route) computes both
+     * and enforces `since < until` BEFORE dispatching. That guard is UX since IG1
+     * (#316), not a correctness proof: a slice overlapping already-stored activity
+     * re-observes shas that are already in `raw_commits` and moves no counter, so
+     * asking for one is an inverted request, not a double-count.
      *
      * In this mode the run does NOT advance the forward cursor (normal "Sync now"
      * must keep resuming from now); instead it LOWERS the earliest watermark to
@@ -2694,8 +2701,10 @@ async function fetchProviderData(
     // The persistent per-commit diffstat cache (#273), scoped to this provider instance. It is
     // what turns a failed run from "lost every fetch" into "lost only the uncached tail": the
     // provider writes each commit's diffstat through as it goes, OUTSIDE this run's write
-    // transaction, so the rows survive the #231 drop-partials rule that discards everything
-    // else. Supplied only here — probe paths (`doctor`, test-connection) never walk commits.
+    // transaction. That used to be the ONLY thing a failed run kept, because #231 discarded
+    // everything else; since IG1 (#316) the run's `raw_commits` rows survive too, and this
+    // stays as the saving on the per-commit fan-out the next attempt would otherwise re-fetch.
+    // Supplied only here — probe paths (`doctor`, test-connection) never walk commits.
     //
     // Built BEFORE the config is validated, which is safe because the cache is total: an
     // invalid config (blank org/workspace/group, bogus type) yields a cache whose every write
@@ -2714,13 +2723,13 @@ async function fetchProviderData(
     const stateKey = syncStateKey(providerType, identifier);
     // Window selection:
     //   - Backfill (#229): a fixed, strictly-older slice [since, until] the caller
-    //     already validated as disjoint from stored activity. It ignores the forward
-    //     cursor entirely (it walks BELOW the earliest watermark, not above `now`).
+    //     bounded below the earliest watermark. It ignores the forward cursor
+    //     entirely (it walks BELOW the watermark, not above `now`).
     //   - Otherwise: first sync (no stored cursor) optionally clamps the window to
     //     the last N months so run #1 doesn't walk the whole history; once a cursor
     //     exists it is the source of truth and firstSyncWindowMonths is IGNORED —
-    //     re-widening `since` against additive snapshots would double-count (see
-    //     SyncRunOptions).
+    //     re-widening `since` would re-fetch a span already held, which since IG1
+    //     (#316) costs API calls rather than double-counting (see SyncRunOptions).
     const storedCursor = getSyncStateValue(db, stateKey);
     const since = backfill ? backfill.since : (storedCursor ?? firstSyncSince(now, firstSyncWindowMonths));
     // This run is a FIRST forward sync when it is not a backfill and no cursor exists
@@ -2785,9 +2794,9 @@ async function fetchProviderData(
     // which made the documented 40-minute ceiling really `40 min × providers` — and
     // `runConnectorWithRetry` doubles whatever that is again. Run length is not a cosmetic
     // concern here: two overlapping git runs read the same forward cursor and fetch
-    // non-disjoint windows into an additive commit merge, which is a permanent double-count
-    // (see `sync-log.ts`); since #283 `scheduler.ts` also refuses to start a tick while the
-    // previous one is still in flight.
+    // non-disjoint windows, which used to land in an additive commit merge as a permanent
+    // double-count and since IG1 (#316) costs only the duplicated fetch; since #283
+    // `scheduler.ts` also refuses to start a tick while the previous one is still in flight.
     //
     // `runBudget.deadline` is the run's WALL CLOCK (#283) — the bound the sleep counter could
     // not express, because the sleep counter only sees repo-level pauses. It is consulted in
@@ -3303,9 +3312,11 @@ async function fetchProviderData(
         // Retried in-run on the same terms and out of the same run budget as the commit fetch
         // above (#272) — see fetchRepoWithRetry for why retrying only commits would have made
         // the PR path WORSE than before. Still best-effort on exhaustion: a failed PR list does
-        // NOT clear `commitsComplete`, because holding the cursor for it would force an
-        // additive commit re-fetch, which #231 weighed and rejected (see the note on
-        // `ProviderFetchResult.complete`). The retry narrows the window in which that
+        // NOT clear `commitsComplete`, because that flag now decides only whether the cursor
+        // advances, and holding it for a PR-list failure would re-walk every commit in the
+        // window for a fetch that is idempotent under re-delivery anyway (see the note on
+        // `ProviderFetchResult.complete`; #231 weighed the same trade when the re-walk was a
+        // double-count rather than a cost). The retry narrows the window in which that
         // best-effort answer is reached; it does not change what happens when it is.
         const prFetch = await fetchRepoWithRetry(
             () => provider.getPullRequests(repoName, 'all', since, onPRProgress),

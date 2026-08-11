@@ -660,13 +660,15 @@ export class GitHubProvider implements GitProvider {
                 //
                 // Recovering it instead was the trap: `additions`/`deletions`/`diffs` above are
                 // read off this same body, so the recovered commit would carry 0/0/[] — and
-                // those zeros land in `raw_author_daily`, which is ADDITIVE and append-only,
-                // with the cursor advanced past the day. That is a permanent, silent
-                // understatement of the developer-day's churn in the one table that has no
-                // recompute path, and the empty `diffs` array even suppresses the sync loop's
-                // `getCommitDiff` fallback (`[]` is an answer there, deliberately). Skipping the
-                // diffstat memo does not help: the memo is trivially re-fetchable, the snapshot
-                // is not, so guarding only the memo protected the cheap side.
+                // those zeros land in `raw_commits` under this sha, with the cursor advanced
+                // past the day. Since IG1 (#316) that is no longer PERMANENT (the insert is
+                // conflict-upgraded when a strictly more informative observation arrives, and
+                // the developer-day is recomputed from the store), but nothing re-asks a sha
+                // the cursor has moved past, so in practice it is still a silent understatement
+                // of the day's churn that survives until someone rewinds the cursor. The empty
+                // `diffs` array even suppresses the sync loop's `getCommitDiff` fallback (`[]`
+                // is an answer there, deliberately). Skipping the diffstat memo does not help:
+                // the memo is trivially re-fetchable, the raw commit row is what gets read.
                 //
                 // Throwing routes it to `fetchRepoWithRetry` — the in-run repo retry, where a
                 // transient bad body heals — and then, if it never heals, #231's cursor hold.

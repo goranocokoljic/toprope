@@ -26,43 +26,51 @@ No proxy, no traffic interception. Pure API-pull + git analysis.
 
 ## Key Constraints
 - Daily snapshots are the atomic unit — one row per developer per day per tool
-- Append-only: never modify historical snapshots.
-  **Documented exception — `git_snapshots` (#253 / #264).** Since #253 `git_snapshots` is not
-  a source of record but a deterministic PROJECTION of `(raw_author_daily, identity map)`
-  at the `(developer_id, date)` grain. Rebuilding or removing a projected cell is therefore
-  *recomputation*, not history rewriting: the facts live in `raw_author_daily`, keyed by the
-  immutable raw git identity and by `(provider, container)`. Two paths rely on it — replaying
-  a developer whose identities changed (#253), and the provider delete cascade, which
-  retracts one container's contribution and re-projects the affected days (#264). The
-  exception is bounded by `is_projected`: rows the projection did not produce are never
-  written or deleted by it.
-  **A third, one-time path is migration 042 (#264)**, which clears `git_snapshots` outright —
-  including `is_projected = 0` legacy cells, i.e. deliberately outside that bound. It is
-  licensed only as a pre-production reset, and it is what makes the cascade *complete*: a
-  legacy cell can never be retracted by the projection, so leaving any behind would make every
-  later provider delete silently partial. No runtime path may do this.
-  **Migration 043 (#266)** also drops projected cells — unconditionally, like 042, but strictly
-  WITHIN the `is_projected` bound (legacy cells are left untouched, unlike 042). It is
-  unconditional deliberately: "needs normalizing" is not decidable in SQL the way the code
-  decides it, so a conditional probe would miss exactly the rows that matter and leave their
-  cursors behind. The raw rows it clears cannot be honestly re-attributed to one spelling, so
-  the days they fed are re-projected by a resync — and 043 leaves a `git_data_reset_pending`
-  marker that `toprope doctor` fails on until the rebuild is acknowledged.
-  **Migration 046 (#317, epic #316)** is the second one-time path licensed like 042: it clears
-  `git_snapshots` outright — legacy cells included — plus `raw_author_daily`, `commit_diffstats`
-  and the `git_last_sync:*` / `git_earliest_sync:*` cursors, as the pre-production reset that
-  precedes the idempotent-ingestion rewrite. Same license, same bound: pre-production only, no
-  runtime path may do this. `pr_records` is deliberately NOT cleared (state-keyed and
-  replace-idempotent — a resync re-upserts it), and it re-stamps the same
-  `git_data_reset_pending` marker with `046`.
-  **`commit_diffstats` (#273) is NOT a snapshot table and the rule does not reach it.** It is a
-  MEMO of an idempotent remote read — `(provider, container, repo, sha) → file stats` — of a
-  fact that is immutable by construction (a commit is named by the hash of its own content), so
-  it has no history to rewrite and no staleness to invalidate. It is written per commit DURING
-  the fetch, outside the run's write transaction, which is the entire feature: those rows must
-  survive the #231 rule that discards a failed run's partial data. Deleting the whole table
-  costs nothing but re-fetching. Every other table's append-only reasoning is unaffected.
-  `tool_snapshots` and every other snapshot table remain strictly append-only.
+- Append-only: never modify historical snapshots. `tool_snapshots` and every other non-git
+  snapshot table are strictly append-only, with no exceptions.
+  **The git pipeline is not append-only — it is a source of record plus projections
+  (IG1, epic #316; design: `dev-docs/Idempotent_Git_Ingestion_Design.md`).** Four tables,
+  four different rules:
+  - **`raw_commits` — the immutable SOURCE OF RECORD.** One row per commit, keyed
+    `(provider, container, repo, sha)`. A commit is named by the hash of its own content, so a
+    re-observed sha is the same fact: the write is insert-or-improve (`ON CONFLICT DO UPDATE`
+    only when a strictly more informative observation arrives, e.g. a diffstat that was degraded
+    on first sight), never `+=`. Overlapping windows, a replayed run and a re-fetched backfill
+    are all no-ops. Rows leave only via the provider delete cascade, which retracts exactly one
+    `(provider, container)`. **No other runtime path may delete them.**
+  - **`raw_author_daily` — a recomputed PROJECTION** at the
+    `(provider, container, raw_author_key, date)` grain. Every cell an ingest touches is
+    recomputed by aggregate over `raw_commits` inside the run's transaction (`INSERT OR REPLACE`,
+    never `+=`), so re-running an ingest writes the same numbers twice. Two groups of columns are
+    NOT projected and must be combined idempotently rather than replaced. (1) The PR columns,
+    which come from the run's own PR/review fetch — NOT from `pr_records`, which is keyed by
+    `developer_id` and so holds nothing for the unmatched authors this table exists to retain:
+    `prs_opened` / `prs_merged` / `review_comments_given` combine with `max()`, and
+    `avg_time_to_merge_hours` follows whichever side owns the larger `prs_merged`. (2)
+    `code_churn_rate` / `ai_signature_score`, which `raw_commits` cannot recompute (no commit
+    message, no file paths) and which are carried across writes by a commit-weighted mean —
+    weighted by the commits THIS write added, so a write that added none leaves them untouched
+    (which also means a cursor rewind cannot repair them). Adding a new column means deciding
+    which group it is in.
+  - **`git_snapshots` — a PROJECTION of `(raw_author_daily, identity map)`** at the
+    `(developer_id, date)` grain (#253/#264). It folds every provider and identity for the day,
+    so a scoped single-provider run cannot drop another provider's same-day contribution.
+    Bounded by `is_projected`: rows the projection did not produce are never written or
+    deleted by it.
+  - **`commit_diffstats` — a MEMO** of an idempotent remote read (#273), same immutability
+    argument as `raw_commits`, written per commit DURING the fetch and outside the run's write
+    transaction so a failed run keeps its expensive fetches. Deleting it costs only re-fetching.
+  **Sync cursors are FETCH HINTS, not correctness proofs — in ONE direction.** A cursor that
+  is stale, lost, overlapping or rewound costs API calls and never accuracy; the disjoint-window
+  invariant it used to carry died with the additive merge. Advancing it is still gated: a cursor
+  is the only record of what has been ASKED, so advancing past a window the run did not fully
+  fetch is still a silent, unrecoverable gap (#231 — `ProviderFetchResult.complete` holds the
+  cursor for exactly this, and it is the one coupling IG1 did not delete).
+  **Migrations 042 (#264), 043 (#266) and 046 (#317) are one-time PRE-PRODUCTION resets** that
+  cleared the projections and cursors outright, 042 and 046 including `is_projected = 0` legacy
+  cells. (046 does not clear `raw_commits` — it creates it; 042 and 043 predate the table.) 046
+  is the reset that precedes IG1 and leaves the `git_data_reset_pending` marker `toprope doctor`
+  fails on until the rebuild is acknowledged. **No runtime path may do any of this.**
 - Waste detection: subscription with zero activity for 14+ days = unused
 - Data quality tracked per data point: high (API), medium (git), low (expense only)
 - Privacy: individual data visible only to developer. Managers see team aggregates.
