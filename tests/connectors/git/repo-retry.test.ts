@@ -443,8 +443,11 @@ describe('in-run repo retry (#272)', () => {
         expect(prLine).not.toContain('is never re-delivered');
 
         // …and the numeric field the operator surfaces read moves with it, rather than the
-        // refusal being visible only in prose. Both grains are counted.
-        expect(result.snapshotsSkipped).toBeGreaterThanOrEqual(2);
+        // refusal being visible only in prose. EXACT, not a lower bound: this fixture refuses one
+        // commit and one PR record on one author-day, and a `>=` bound had a whole unit of slack —
+        // enough that dropping `skippedPRRecords.length` from `committedRowsSkipped` still
+        // satisfied it, so the comment claimed more than the assertion enforced (cycle 3, TST3-2).
+        expect(result.snapshotsSkipped).toBe(3);
     });
 
     it('reports the LAST fault of an exhausted sequence, not the first', async () => {

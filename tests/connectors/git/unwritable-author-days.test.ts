@@ -407,6 +407,15 @@ describe('#302 an unwritable author-day costs that row, not the run', () => {
             // write, so the reason is one generic literal rather than a per-column code.
             expect(prLine).toContain('refused as an unstorable field');
             expect(prLine).toContain('repo1#1');
+            // THE COVERED ARM of `formatSkippedPRRecords` (#316 review cycle 3, TST3-1). This
+            // provider completed — its cursor advanced above — so these PRs really are gone: no
+            // run re-asks the window, and providers page PRs by updated_at, so an untouched PR is
+            // never re-delivered. Every other assertion on this line is arm-independent, so
+            // hardcoding the parameter to `false` passed all 5,019 tests: the advisory would have
+            // told an operator "no loss yet" over a permanent loss. Its sibling arm is pinned in
+            // `repo-retry.test.ts`; this is the direction that was still free.
+            expect(prLine).toContain('recorded its window as covered — nothing re-asks them');
+            expect(prLine).not.toContain('did NOT record its window as covered');
             expect(countRows(db, 'pr_records')).toBe(0);
         });
 

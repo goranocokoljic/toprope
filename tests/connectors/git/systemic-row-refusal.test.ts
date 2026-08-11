@@ -231,6 +231,16 @@ describe('#306 a systemic row refusal does not report clean', () => {
             // The advisory that carries the DETAIL is still emitted beside it — the escalation
             // replaces neither the codes nor the sample an operator acts on.
             expect(skipLineOf(result.errors)).toContain('refused as invalid_identity');
+
+            // THE REMEDY this line prescribes (#316 review cycle 3, SEC3-1). IG1 reversed it from
+            // "never purge the cursors" to "re-asking is safe", and no test asserted either
+            // wording — so the line went on saying PURGE after cycle 2 established that deleting
+            // the row strands everything between the retained history floor and the new bounded
+            // first-sync window. Lowering has no such gap, so the remedy must name that and not
+            // the destructive variant.
+            expect(systemic).toContain('move this provider\'s git_last_sync');
+            expect(systemic).toContain('LOWER that row; do not DELETE it');
+            expect(systemic).not.toContain('purge this provider');
         });
 
         it('moves the numeric field an operator surface already reads', async () => {

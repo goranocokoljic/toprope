@@ -522,7 +522,7 @@ function formatSkippedAuthorDays(
         'refused as',
     );
     const permanence = windowCovered
-        ? `and this run has recorded its window as covered — nothing re-asks them. Neither a ` +
+        ? `This run HAS recorded its window as covered — nothing re-asks them. Neither a ` +
           `forward sync nor "sync older history" reaches them: the latter only extends STRICTLY ` +
           `older than the earliest synced instant. `
         : `This run did NOT record its window as covered (its fetch was incomplete), so the ` +
@@ -530,7 +530,7 @@ function formatSkippedAuthorDays(
           `the cause is fixed, and no loss yet if it is. `;
     return [
         `${AUTHOR_DAYS_SKIPPED_PREFIX} [${providerType}/${sanitizeAdvisoryLabel(container)}] ` +
-            `${skips.length} author-day row(s) were refused by the raw store, ${permanence}` +
+            `${skips.length} author-day row(s) were refused by the raw store. ${permanence}` +
             `Each entry is one (author, day): either that day carried a commit this pipeline ` +
             `could not store — the day is WRITTEN but understated by that commit — or the whole ` +
             `day-row was refused, in which case everything it carried (commits, PRs and review ` +
@@ -608,11 +608,14 @@ function formatSystemicRowRefusal(
         `(durably, it is in sync_logs.errors only for a scheduled run or "toprope sync all", and ` +
         `on git_providers.last_sync_advisories only for an admin Sync-now of a DB-connected ` +
         `provider) — and fix the cause: every further run loses another ` +
-        `window the same way. Once the cause is fixed, purge this provider's git_last_sync ` +
-        `sync_state row and re-sync to re-ask the covered windows — safe now that commits are ` +
-        `sha-keyed and each author-day is recomputed rather than accumulated (IG1, #316), so it ` +
-        `costs API calls, not correctness. It used to double every commit metric on the rows ` +
-        `that WERE retained (#262), which is why older advice forbade it.`
+        `window the same way. Once the cause is fixed, move this provider's git_last_sync ` +
+        `sync_state row BACK to before the covered windows and re-sync to re-ask them — safe now ` +
+        `that commits are sha-keyed and each author-day is recomputed rather than accumulated ` +
+        `(IG1, #316), so it costs API calls, not correctness. It used to double every commit ` +
+        `metric on the rows that WERE retained (#262), which is why older advice forbade it. ` +
+        `LOWER that row; do not DELETE it — deleting makes the next run a bounded first sync, and ` +
+        `a backfill only extends STRICTLY below the retained history floor that deleting does not ` +
+        `reset, so the span in between is reachable by neither.`
     );
 }
 
@@ -751,7 +754,7 @@ function formatSkippedPRRecords(
         'refused as',
     );
     const permanence = windowCovered
-        ? `and this run has recorded its window as covered — nothing re-asks them. Providers ` +
+        ? `This run HAS recorded its window as covered — nothing re-asks them. Providers ` +
           `re-fetch PRs by updated_at/updated_on, so a PR that is never touched again is never ` +
           `re-delivered. `
         : `This run did NOT record its window as covered (its fetch was incomplete), so the cursor ` +
@@ -759,7 +762,7 @@ function formatSkippedPRRecords(
           `the same refusals until the cause is fixed, and no loss yet if it is. `;
     return [
         `${PR_RECORDS_SKIPPED_PREFIX} [${providerType}/${sanitizeAdvisoryLabel(container)}] ` +
-            `${skips.length} PR(s) carried a field pr_records cannot store, ${permanence}` +
+            `${skips.length} PR(s) carried a field pr_records cannot store. ${permanence}` +
             `Their per-PR review record ` +
             `(comment counts, review rounds, time-to-merge) is absent, so the PR-review coaching ` +
             `surfaces are short by exactly these: each was authored by a registered developer, ` +

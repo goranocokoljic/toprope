@@ -212,6 +212,27 @@ Cycle 2's two High findings (the untested COVERED arm of `formatSkippedAuthorDay
   `COMMIT_CHURN_UNKNOWN` line carries the full caveat assertions. Pinned today only by
   `permanentSpanRepair()` being a single copy; three `toContain` lines close it (Low).
 
+## 2026-08-11 — #316 (IG1 epic finalize) review cycle 3 (final)
+
+Both cycle-3 High findings were FIXED (SEC3-1: `doctor.ts` and `formatSystemicRowRefusal` still
+printed the remedy cycle 2 proved false; TST3-1: the COVERED arm of `formatSkippedPRRecords` was
+unpinned). So were the two Low items TST3-2 and SEC3-3. Remaining:
+
+- [#316 review c3 SEC3-2] `src/connectors/git/sync.ts` `permanentSpanRepair()` — the floor-gap
+  clause is stated unconditionally ("deleting the cursor does not reset the retained history
+  floor"), but for a provider with NO floor row the next first sync does record one and a backfill
+  then reaches below it normally. The JSDoc scopes this correctly; the printed string does not. It
+  errs toward over-warning, so it costs the operator nothing (Low).
+
+**Pattern worth acting on before the next epic.** Three consecutive review cycles produced the same
+defect shape: an operator-advice string with two arms, or two copies, where the fix updated one and
+the test pinned one. The structural remedy the TST lens named is worth doing on its own: extract
+each permanence clause as a named exported constant instead of an inline ternary branch, so both
+arms are assertable by identity rather than by `toContain` on a long English sentence, and a second
+copy of the prose becomes a compile-time reference rather than a literal that can drift. `sync.ts`
+already has `autoCreateFailureLine` and `configFileProviderNotDeletable()` as precedent for exactly
+this. That would have made all three cycles' blockers structurally hard to write.
+
 ## Backlog (pre-policy deferrals)
 
 - Deferred Medium/Low findings from before this policy live in PR comments

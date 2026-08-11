@@ -850,7 +850,17 @@ describe('runDoctor', () => {
                 // rewind runs into, which is the completeness half of the remedy rule.
                 expect(allOutput).toContain('Author-days skipped as unwritable');
                 expect(allOutput).toMatch(/git_last_sync sync_state row back/);
-                expect(allOutput).toContain('sync older history');
+                // The COMPLETENESS half, corrected in cycle 3 (SEC3-1). This sentence used to end
+                // "run 'sync older history' for anything beyond that" — the exact instruction the
+                // #316 review proved is a no-op for any provider that already has a history
+                // floor: deleting the cursor does not reset the floor, and a backfill extends
+                // strictly BELOW it, so the span in between is reachable by neither run. The
+                // remedy must therefore steer to LOWERING the row and name the gap, not prescribe
+                // a repair that cannot reach it. `sync.ts` says the same thing in its own two
+                // copies; this is the surface an operator is most likely to read.
+                expect(allOutput).toContain('LOWER that row; do not delete it');
+                expect(allOutput).toContain('cannot rescue what that leaves out');
+                expect(allOutput).not.toMatch(/run "sync older history" for anything beyond that/);
                 expect(allOutput).not.toMatch(/DOUBLES every commit metric on the rows that survived \(#262\) — do not/);
                 // …and it must not open with "run a sync": this alert can be days old, so on a
                 // quiet provider a fresh run prints no advisory at all, and when it does print
