@@ -24,6 +24,7 @@ import {addDeveloper} from '../../../src/registry/developers';
 import {
     AUTHOR_DAYS_SKIPPED_PREFIX,
     GitSync,
+    PR_RECORDS_SKIPPED_PREFIX,
     GIT_REPO_RETRY_DELAYS_MS,
     GIT_RUN_BEST_EFFORT_RETRY_SLEEP_BUDGET_MS,
     GIT_RUN_RETRY_SLEEP_BUDGET_MS,
@@ -36,6 +37,7 @@ import {
 import {GitProviderFetchError} from '../../../src/connectors/git/providers/http-retry';
 import type {
     GitCommit,
+    GitPR,
     GitFetchProgressListener,
     GitProvider,
     GitProviderConfig,
@@ -380,6 +382,29 @@ describe('in-run repo retry (#272)', () => {
                         {...makeCommit('c-bad'), sha: {} as unknown as string},
                     ];
                 }),
+                // BOTH refusal grains on the same incomplete run. `refusalReports` drains two
+                // formatters, and only one of them was given the completeness arm — so a fixture
+                // that exercised the author-day half alone left the PR-records half asserting
+                // permanence for a held cursor (#316 review cycle 2, TST2-2). `createdAt: null`
+                // cannot bind, which is what `isUnstorablePRFieldError` catches.
+                getPullRequests: vi.fn().mockImplementation(async (repo: string): Promise<GitPR[]> => {
+                    if (repo !== 'good-repo') return [];
+                    return [
+                        {
+                            id: '1',
+                            title: 'feat: work',
+                            author: {name: 'alice', email: 'alice@example.com', username: 'alice'},
+                            state: 'closed',
+                            createdAt: null as unknown as string,
+                            mergedAt: '2024-01-15T12:00:00Z',
+                            closedAt: '2024-01-15T12:00:00Z',
+                            updatedAt: '2024-01-15T12:00:00Z',
+                            reviewers: [],
+                            additions: 10,
+                            deletions: 2,
+                        },
+                    ];
+                }),
             }),
         );
 
@@ -404,9 +429,22 @@ describe('in-run repo retry (#272)', () => {
         expect(skipLine).toContain('the next run re-asks this window');
         expect(skipLine).not.toContain('nothing re-asks them');
 
+        // THE SECOND FORMATTER on the same arm. `refusalReports` drains both, and only
+        // `formatSkippedAuthorDays` originally took the completeness argument — so this line
+        // claimed "recorded its window as covered — nothing re-asks them" for a HELD cursor, and
+        // closed by saying the PR is never re-delivered. Both are false here: providers page PRs
+        // by `updated_at`, and the next run re-asks this very window.
+        const prLine = result.errors.find((e) => e.startsWith(PR_RECORDS_SKIPPED_PREFIX));
+        expect(prLine).toBeDefined();
+        expect(prLine).toContain('refused as an unstorable field');
+        expect(prLine).toContain('did NOT record its window as covered');
+        expect(prLine).toContain('the same PRs are re-delivered');
+        expect(prLine).not.toContain('recorded its window as covered — nothing re-asks them');
+        expect(prLine).not.toContain('is never re-delivered');
+
         // …and the numeric field the operator surfaces read moves with it, rather than the
-        // refusal being visible only in prose.
-        expect(result.snapshotsSkipped).toBeGreaterThan(0);
+        // refusal being visible only in prose. Both grains are counted.
+        expect(result.snapshotsSkipped).toBeGreaterThanOrEqual(2);
     });
 
     it('reports the LAST fault of an exhausted sequence, not the first', async () => {

@@ -184,6 +184,34 @@ not listed here. Everything below is Medium/Low, deferred deliberately.
   config-file path (partially corrected in this cycle); `refusalReports` closures are byte-identical;
   two new functions return values no production caller reads (Low).
 
+## 2026-08-11 — #316 (IG1 epic finalize) review cycle 2 (SEC + TST, right-sized)
+
+Cycle 2's two High findings (the untested COVERED arm of `formatSkippedAuthorDays`, and
+`formatSkippedPRRecords` claiming permanence unconditionally) were FIXED, along with SEC2-2 (the
+`sync older history` clause that cannot reach the span it was prescribed for). Remaining:
+
+- [#316 review c2 TST2-3] `src/connectors/git/sync.ts:4507` — `author_day` is sliced from the RAW
+  commit date while `committed_at` is normalized by `toUtcInstant`, and the comment argues the two
+  must NOT be unified. No fixture carries an offset-bearing date whose local day differs from its
+  UTC day, so mutating `author_day` to re-derive from the normalized instant passes 1,477 tests
+  including the golden. If it ever drifts the failure is silent: commits stored, cell recomputes to
+  `commits = 0`, real day gets no row. Add one `…T23:30:00.000+02:00` GitLab-shaped commit
+  (Medium — the highest-value remaining test gap).
+- [#316 review c2 SEC2-3] `src/connectors/git/raw-commits.ts:25-26` — `commit_burst_count` is
+  documented as PROJECTED but is a PARTIAL projection: a burst whose first-commit day falls outside
+  the run's touched set is attributed to a day the run does not rewrite, so that day's stored count
+  stays stale. Criterion A is unaffected (the day set is a function of the fetch) and the value
+  matches the pre-IG1 result, so this is a doc-accuracy item, not a regression (Low).
+- [#316 review c2 TST2-4] `src/connectors/git/sync.ts:611` (`formatSystemicRowRefusal`) and
+  `src/connectors/git/providers/window-bounds.ts:109` — two operator remedies IG1 REVERSED
+  ("do NOT purge the cursors" → "purge, safe now"; "do NOT move the cursor backward" → "lowering is
+  safe") have no test asserting either the new or the old sentence. `permanentSpanRepair` is now
+  pinned; these two are the asymmetry (Low).
+- [#316 review c2 TST2-5] `tests/connectors/git/sync.test.ts:5776-5794` — the `DIFFS_NOT_SUPPLIED`
+  permanence line is asserted with only the pre-fix subset, while its sibling
+  `COMMIT_CHURN_UNKNOWN` line carries the full caveat assertions. Pinned today only by
+  `permanentSpanRepair()` being a single copy; three `toContain` lines close it (Low).
+
 ## Backlog (pre-policy deferrals)
 
 - Deferred Medium/Low findings from before this policy live in PR comments

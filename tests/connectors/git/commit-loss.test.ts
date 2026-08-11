@@ -713,8 +713,16 @@ describe('unreturned commits are never silent (#275)', () => {
             expect(churnLine).not.toContain('delete cascade');
             // COMPLETENESS, per the graduated "a remedy is executable advice" rule: deleting the
             // cursor instead of lowering it resets the next run to the bounded first-sync window,
-            // so the recovery step for anything older has to be part of the remedy.
-            expect(churnLine).toContain('sync older history');
+            // so what happens to anything older has to be part of the remedy. The FIRST answer
+            // here named "sync older history" as that recovery, which is a no-op for any provider
+            // that already has a history floor — deleting the cursor does not reset the floor, and
+            // a backfill extends strictly BELOW it, so the span in between is reachable by
+            // neither. The remedy must therefore say the gap exists rather than prescribe a
+            // repair that cannot reach it (#316 review cycle 2, SEC2-2).
+            expect(churnLine).toContain('LOWER that row rather than deleting it');
+            expect(churnLine).toMatch(/"sync older history" CANNOT rescue/);
+            expect(churnLine).toContain('does not reset the retained history floor');
+            expect(churnLine).toContain('LARGER first-sync window');
             // …and the OTHER completeness hole, which is the one #316's review caught: this very
             // line names ai_signature_score and code_churn_rate as damaged, and the rewind it
             // prescribes is precisely the operation that does NOT repair them. A rewind re-observes

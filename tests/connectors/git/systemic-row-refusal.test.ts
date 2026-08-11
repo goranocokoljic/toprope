@@ -496,7 +496,18 @@ describe('#306 a systemic row refusal does not report clean', () => {
             // is the shape every other fixture in this file already produces.
             expect(rawRowCount(db, 'github')).toBe(1);
             // One commit was refused, at the author-day grain the advisory speaks in.
-            expect(skipLineOf(result.errors)).toContain('refused as invalid_identity');
+            const skipLine = skipLineOf(result.errors);
+            expect(skipLine).toContain('refused as invalid_identity');
+
+            // THE COVERED ARM of `formatSkippedAuthorDays` (#316 review cycle 2, TST2-1/SEC2-1).
+            // This provider completed, so its cursor advanced and the refused rows genuinely are
+            // beyond reach — which is what justifies the destructive repair the sibling advisory
+            // prescribes. The incomplete arm was pinned in cycle 1; hardcoding the parameter to
+            // `false` still passed all 5,019 tests, because nothing asserted this direction. That
+            // is the dangerous one: printing "no loss yet" over a permanent loss tells an operator
+            // the data returns by itself.
+            expect(skipLine).toContain('recorded its window as covered — nothing re-asks them');
+            expect(skipLine).not.toContain('did NOT record its window as covered');
 
             // THE GUARD. The day is in the numerator, so it must not also be in the denominator:
             // `retained` is 0, not 1. Deleting the `cellsWithRefusedCommits` check makes this read

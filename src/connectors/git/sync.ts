@@ -720,11 +720,24 @@ export function isUnstorablePRFieldError(err: unknown): boolean {
     return (err instanceof RangeError || err instanceof TypeError) && DRIVER_VALUE_BIND_RE.test(err.message);
 }
 
-/** The {@link PR_RECORDS_SKIPPED_PREFIX} line for one provider instance, or `[]` for none. */
+/**
+ * The {@link PR_RECORDS_SKIPPED_PREFIX} line for one provider instance, or `[]` for none.
+ *
+ * `windowCovered` gates the permanence claim for the SAME reason it does on
+ * {@link formatSkippedAuthorDays}, and it is here because that sibling got the parameter and this
+ * one did not: IG1.2 (#318) moved BOTH formatters onto both completeness arms, so this line was
+ * still asserting "recorded its window as covered — nothing re-asks them" for a provider whose
+ * cursor is HELD. On that arm both of its claims are false — the next run re-asks the window, and
+ * the PR is re-delivered by the same `updated_at` sweep the covered arm correctly says will never
+ * touch it again. Telling an operator a PR is permanently lost when the next run picks it up is
+ * the graduated "a remedy printed to an operator is executable advice" rule broken in the
+ * direction that causes a needless repair.
+ */
 function formatSkippedPRRecords(
     providerType: GitProviderType,
     container: string,
     skips: readonly SkippedPRRecord[],
+    windowCovered: boolean,
 ): string[] {
     if (skips.length === 0) return [];
     // The reason is a fixed first-party literal (#307), not a per-column code — the write no
@@ -737,16 +750,22 @@ function formatSkippedPRRecords(
         })),
         'refused as',
     );
+    const permanence = windowCovered
+        ? `and this run has recorded its window as covered — nothing re-asks them. Providers ` +
+          `re-fetch PRs by updated_at/updated_on, so a PR that is never touched again is never ` +
+          `re-delivered. `
+        : `This run did NOT record its window as covered (its fetch was incomplete), so the cursor ` +
+          `is held and the next run re-asks this window — the same PRs are re-delivered, so expect ` +
+          `the same refusals until the cause is fixed, and no loss yet if it is. `;
     return [
         `${PR_RECORDS_SKIPPED_PREFIX} [${providerType}/${sanitizeAdvisoryLabel(container)}] ` +
-            `${skips.length} PR(s) carried a field pr_records cannot store, and this run has ` +
-            `recorded its window as covered — nothing re-asks them. Their per-PR review record ` +
+            `${skips.length} PR(s) carried a field pr_records cannot store, ${permanence}` +
+            `Their per-PR review record ` +
             `(comment counts, review rounds, time-to-merge) is absent, so the PR-review coaching ` +
             `surfaces are short by exactly these: each was authored by a registered developer, ` +
             `resolved, and then refused at the write, so the count is every LOST PR — not merely ` +
             `every refused one (#307). The day counts in raw_author_daily are unaffected wherever ` +
-            `those rows were themselves writable. Providers re-fetch PRs by updated_at/updated_on, ` +
-            `so a PR that is never touched again is never re-delivered. ${groups}.`,
+            `those rows were themselves writable. ${groups}.`,
     ];
 }
 
@@ -774,6 +793,14 @@ function formatSkippedPRRecords(
  * from empty) and its own reachability limit are therefore part of the remedy, not an extra.
  * `cli/git-cache.ts` states the same split for the diffstat purge; this is the single copy for
  * the sync advisories, so the two must say the same thing.
+ *
+ * The COMPLETE arm also has to be right about the DELETE variant, and its first draft was not: it
+ * named "sync older history" as the recovery for anything below the first-sync window, which is a
+ * no-op for every provider that already has a floor. Deleting the cursor leaves the floor intact
+ * (the first-sync write is guarded on `getProviderEarliestSyncTime(...) === null`) and a backfill
+ * extends STRICTLY below it, so the span between the floor and the new window is reachable by
+ * neither. The rewind strictly dominates the delete, so the string now leads with it and states
+ * that gap rather than prescribing a repair that cannot reach it.
  */
 function permanentSpanRepair(): string {
     return (
@@ -791,10 +818,14 @@ function permanentSpanRepair(): string {
         'rebuilt from empty: for a provider registered in the admin UI, delete and re-add it, ' +
         'accepting that this drops every day older than the window a re-added provider starts ' +
         'from. A config-file provider has no path to that second half. ' +
-        'DELETING the git_last_sync row rather than lowering it also works for the volume half, ' +
-        'but it makes the next run a FIRST sync, which — where the run supplies a first-sync ' +
-        `window, as the admin Sync-now path does — reaches back only ${FIRST_SYNC_WINDOW_DEFAULT_MONTHS} ` +
-        'months; for anything older than that, run "sync older history" afterwards. The rewind ' +
+        'LOWER that row rather than deleting it. Deleting it makes the next run a FIRST sync, ' +
+        'which — where the run supplies a first-sync window, as the admin Sync-now path does — ' +
+        `reaches back only ${FIRST_SYNC_WINDOW_DEFAULT_MONTHS} months by default, and "sync older ` +
+        'history" CANNOT rescue what that leaves out: deleting the cursor does not reset the ' +
+        'retained history floor, and a backfill only ever extends STRICTLY below that floor, so ' +
+        'the span between the floor and the new first-sync window is reachable by neither. If you ' +
+        'delete the row anyway, choose a LARGER first-sync window on the re-sync to cover the ' +
+        'affected span. The rewind ' +
         'itself applies to a config-file provider exactly as to a DB-connected one, because it ' +
         'touches no git_providers row. It used to be the one action that was never safe (it ' +
         'permanently doubled every commit metric in the span, #262), and the repair was a ' +
@@ -4345,7 +4376,7 @@ export class GitSync implements ConnectorInterface {
                 if (!isWritable(providerType, identifier)) return;
                 skippedRowAdvisories.push(
                     ...formatSkippedAuthorDays(providerType, identifier, skippedRows, result.complete),
-                    ...formatSkippedPRRecords(providerType, identifier, skippedPRRecords),
+                    ...formatSkippedPRRecords(providerType, identifier, skippedPRRecords, result.complete),
                 );
                 committedRowsSkipped += skippedRows.length + skippedPRRecords.length;
             });
