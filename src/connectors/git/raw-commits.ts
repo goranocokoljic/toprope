@@ -309,6 +309,38 @@ export function insertRawCommit(
     );
 }
 
+/**
+ * Retract every stored commit belonging to one `(provider, container)` — the source-of-record
+ * half of the provider delete cascade (IG1.3 / #319).
+ *
+ * Scoped by the FULL attribution key, never by `provider` alone: a sibling workspace of the same
+ * family shares the provider column and must survive byte-identical. Same statement shape, same
+ * reasoning and the same verbatim `container` as {@link deleteContainerRawDaily} — these rows are
+ * written by the sync under the identical spelling the cell is written under (both take
+ * `identifier` from the one frame), so matching them means NOT normalizing, unlike
+ * `deleteContainerDiffstats` whose writer normalizes.
+ *
+ * WHY THE CASCADE CANNOT SKIP THIS. Before #319 the cascade retracted `raw_author_daily` and left
+ * `raw_commits` standing, which was wrong in two independent ways now that the store is the source
+ * of record and the cell is its projection. It kept every commit's identity columns — login, email,
+ * display name — for a container an admin explicitly deleted, so the cascade's claim ("this
+ * container's contribution is gone") was false where it matters most. And the orphaned rows are
+ * live input: the projection reads them by `(provider, container, raw_author_key, author_day)`, so
+ * a container re-added later resurrects the retracted counts for any day its new window happens to
+ * touch, days the operator was told were removed.
+ *
+ * Returns the number of rows removed.
+ */
+export function deleteContainerRawCommits(
+    db: Database.Database,
+    provider: GitProviderType,
+    container: string,
+): number {
+    return db
+        .prepare('DELETE FROM raw_commits WHERE provider = ? AND container = ?')
+        .run(provider, container).changes;
+}
+
 interface CellTotalsRow {
     commits: number;
     lines_added: number | null;

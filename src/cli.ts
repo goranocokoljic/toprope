@@ -824,11 +824,11 @@ const gitCommand = program.command('git').description('Git provider history main
 gitCommand
     .command('set-history-floor')
     .description(
-        'Declare how far back a LEGACY git provider has already synced (#233). Only ' +
-            'needed for providers first synced before history-window tracking existed: ' +
-            'their true floor was never recorded, so "sync older history" refuses to run ' +
-            'rather than risk double-counting. Pass the instant that provider first ' +
-            'reached — normally (first sync time − the window that run used).',
+        'Declare how far back a git provider has already synced (#233). Only needed for ' +
+            'providers first synced before history-window tracking existed: their true ' +
+            'floor was never recorded, so "sync older history" assumes the default window ' +
+            'and stops asking there. Pass the instant that provider first reached — ' +
+            'normally (first sync time − the window that run used).',
     )
     .requiredOption('--provider <type>', 'Provider type (github, bitbucket, gitlab)')
     .requiredOption('--container <name>', 'Provider container: org (github) / workspace (bitbucket) / group (gitlab)')
@@ -836,8 +836,8 @@ gitCommand
     .option(
         '--force',
         'Overwrite a floor that is already recorded. Needed to correct a mis-typed --at ' +
-            'before backfilling; declaring a floor NEWER than the truth makes the next ' +
-            'backfill double-count the overlap.',
+            'before backfilling; declaring a floor OLDER than the truth makes the next ' +
+            'backfill skip every day in between.',
     )
     .option('-c, --config <path>', 'Path to config file', 'toprope.config.yaml')
     .action((options: {provider: string; container: string; at: string; force?: boolean; config: string}) => {

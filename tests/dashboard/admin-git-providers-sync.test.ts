@@ -1313,8 +1313,6 @@ describe('admin git-provider sync-now API (#199)', () => {
             const id = await createGithub();
             // A synced provider: a forward cursor AND the floor its first sync recorded.
             // Backfill must read neither cursor nor move it — it walks below the floor.
-            // (Both keys, because since #233 a cursor with NO floor is the LEGACY state
-            // and is refused outright rather than backfilled — see the 409 test below.)
             db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
                 FORWARD_KEY,
                 '2026-06-01T00:00:00.000Z',
@@ -1337,7 +1335,7 @@ describe('admin git-provider sync-now API (#199)', () => {
             const expSince = new Date(before);
             expSince.setUTCMonth(expSince.getUTCMonth() - 12);
             expect(Math.abs(Date.parse(since) - expSince.getTime())).toBeLessThan(60_000);
-            // until = the recorded floor, exactly — the slice is disjoint by construction.
+            // until = the recorded floor, exactly — the hint decides where "older" starts.
             expect(until).toBe(recordedFloor);
 
             // Watermark lowered to exactly `since`; forward cursor untouched.
@@ -1363,7 +1361,7 @@ describe('admin git-provider sync-now API (#199)', () => {
             expect((await triggerOlder(id, {months: 12})).statusCode).toBe(202);
             await waitForSyncStatus(id, 'ok');
             // Watermark is now ≈ now − 12mo; the same absolute request can't reach
-            // further back, so it is a no-op reject — never a re-fetch/double-count.
+            // further back, so it is a no-op reject rather than a fetch that imports nothing.
             const again = await triggerOlder(id, {months: 12});
             expect(again.statusCode).toBe(409);
         });
@@ -1388,10 +1386,14 @@ describe('admin git-provider sync-now API (#199)', () => {
             expect(res.json().message).toMatch(/disabled/);
         });
 
-        // #233: a LEGACY provider (first synced before #229 recorded the floor) has no
-        // watermark and no recoverable one. The route must refuse rather than fall back
-        // to the old `now − 6mo` guess, which is too RECENT and silently double-counts.
-        it('fails closed with 409 for a legacy provider whose floor is unknown, and starts no run', async () => {
+        // THE DELETED GUARD (IG1.3 / #319). #233 made this exact request a 409: a LEGACY
+        // provider (first synced before #229 recorded the floor) has no recoverable watermark,
+        // and under the additive merge falling back to the `now - 6mo` guess was too RECENT, so
+        // the slice overlapped imported activity and doubled it permanently. The 409 existed
+        // ONLY to protect that merge. Commits are sha-keyed in `raw_commits` now and each
+        // author-day is recomputed from it, so the overlap costs API calls and nothing else —
+        // the guard is deleted rather than bypassed, and the request runs.
+        it('runs the backfill for a legacy provider with no recorded floor (#319, was 409)', async () => {
             const id = await createGithub();
             const getCommits = await armGetCommits();
             // Legacy = what a pre-#229 first sync left: a forward cursor, no floor.
@@ -1400,28 +1402,35 @@ describe('admin git-provider sync-now API (#199)', () => {
                 '2026-06-01T00:00:00.000Z',
             );
 
-            // months=60 targets 5y back — far older than the old lazy guess, so this
-            // request WOULD have been accepted (and double-counted) before #233.
+            // months=60 targets 5y back — older than the fallback guess, so there IS older
+            // history to ask for and the route accepts.
+            const before = Date.now();
             const res = await triggerOlder(id, {months: 60});
+            expect(res.statusCode).toBe(202);
+            await waitForSyncStatus(id, 'ok');
 
-            expect(res.statusCode).toBe(409);
-            expect(res.json().message).toMatch(/set-history-floor/);
-            // No fetch, no watermark write — a refusal, not a partial run.
-            expect(getCommits).not.toHaveBeenCalled();
-            expect(readState(EARLIEST_KEY)).toBeUndefined();
-            expect((await readProvider(id))?.last_sync_status).toBeNull();
+            // The fallback guess (now - 6mo) became the slice's upper bound…
+            const until = getCommits.mock.calls[0][2] as string;
+            const expUntil = new Date(before);
+            expUntil.setUTCMonth(expUntil.getUTCMonth() - 6);
+            expect(Math.abs(Date.parse(until) - expUntil.getTime())).toBeLessThan(60_000);
+            // …from the requested 60-month target, and the floor now records it.
+            const since = getCommits.mock.calls[0][1] as string;
+            expect(readState(EARLIEST_KEY)).toBe(since);
+            // The forward cursor that made the provider legacy is untouched throughout.
+            expect(readState(FORWARD_KEY)).toBe('2026-06-01T00:00:00.000Z');
         });
 
-        it('accepts the backfill once an admin declares the legacy floor', async () => {
+        it('a declared floor still bounds the slice (the hint is honored, not ignored)', async () => {
             const id = await createGithub();
             const getCommits = await armGetCommits();
             db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
                 FORWARD_KEY,
                 '2026-06-01T00:00:00.000Z',
             );
-            expect((await triggerOlder(id, {months: 60})).statusCode).toBe(409);
 
-            // The recovery path: the admin asserts the real floor.
+            // Declaring a floor is no longer unblocking a refusal — it is telling the fetch
+            // where "older" actually starts, so the run asks for a narrower, accurate slice.
             const declaredFloor = '2025-01-01T00:00:00.000Z';
             const before = Date.now();
             expect(
@@ -1445,8 +1454,7 @@ describe('admin git-provider sync-now API (#199)', () => {
             expSince.setUTCMonth(expSince.getUTCMonth() - 60);
             const since = getCommits.mock.calls[0][1] as string;
             expect(Math.abs(Date.parse(since) - expSince.getTime())).toBeLessThan(60_000);
-            // …and the run lowered the floor to it, closing the recovery loop: the
-            // forward cursor that made the provider legacy is untouched throughout.
+            // …and the run lowered the floor to it: the forward cursor is untouched throughout.
             expect(readState(EARLIEST_KEY)).toBe(since);
             expect(readState(FORWARD_KEY)).toBe('2026-06-01T00:00:00.000Z');
         });

@@ -15,14 +15,15 @@
  * composes what is there, in the one order that is correct:
  *
  *   1. collect the affected dates            — BEFORE the delete; afterwards they are unknowable
- *   2. delete the container's raw_author_daily rows
+ *   2. delete the container's raw_commits rows (the source of record, IG1.3 / #319)
+ *  2b. delete the container's raw_author_daily rows — the projection of what step 2 just emptied
  *   3. delete the container's pr_records rows
  *  3b. delete the container's commit_diffstats cache rows (#273)
  *   4. projectSnapshots(db, {dates})         — rewrites survivors, retracts orphans
  *   5. purge the container's git_* cursors
  *   6. delete the git_providers row
  *
- * Two details are easy to get wrong and are load-bearing:
+ * Three details are easy to get wrong and are load-bearing:
  *
  *   - **Dates come from step 1, not step 4.** Once the rows are gone nothing records which
  *     days they covered, so a later scope would silently miss days and leave stale cells.
@@ -31,6 +32,16 @@
  *     row. Whole-day rebuild also recomputes untouched developers' cells on those days —
  *     wider than strictly necessary, but idempotent and correct, and the only mode that can
  *     retract.
+ *   - **Step 2b IS the per-cell recompute, evaluated in closed form** (IG1.3 / #319). Since
+ *     the epic, `raw_author_daily` is a projection of `raw_commits` at the
+ *     `(provider, container, raw_author_key, date)` grain, so retracting a container means
+ *     recomputing every cell it owns and deleting the ones whose commit set is now empty.
+ *     Every one of them is: a cell is keyed by `(provider, container)`, `projectRawAuthorDailyCell`
+ *     reads `raw_commits` under that same key, and step 2 has just emptied it — as step 3 has
+ *     emptied the container's PR side. So the recompute's answer is "delete", uniformly, and one
+ *     scoped `DELETE` is that answer rather than a second implementation of it (the
+ *     canonical-helper rule: looping the projection here would write a zero-commit row per cell
+ *     and then have to delete it anyway).
  *
  * Everything runs in ONE `db.transaction`, so a failure anywhere leaves every table
  * unchanged: no half-retracted container, and never a purged cursor whose data survived
@@ -64,6 +75,7 @@ import {
     deleteContainerRawDaily,
     summarizeContainerRawDaily,
 } from '../raw-author-daily.js';
+import {deleteContainerRawCommits} from '../raw-commits.js';
 import {buildDevLookupMap, projectSnapshots, resolveRawAuthor} from '../projection.js';
 import {deleteContainerDiffstats} from '../diffstat-cache.js';
 import {earliestSyncStateKey, rowRefusalStateKey, stallStateKey, syncStateKey} from '../sync.js';
@@ -292,8 +304,25 @@ export function deleteProviderWithCascade(
         // Resolved before the rows go too: after step 2 there is nothing left to resolve.
         const developersAffected = developersAffectedByContainer(db, type, container);
 
-        // 2 + 3. Retract the container's own rows. Scoped by the FULL (provider, container)
-        // key, so a sibling workspace of the same family is untouched.
+        // 2 + 2b + 3. Retract the container's own rows. Scoped by the FULL (provider,
+        // container) key, so a sibling workspace of the same family is untouched.
+        //
+        // THE SOURCE OF RECORD GOES FIRST (IG1.3 / #319). `raw_commits` is where the commit
+        // facts live since the epic; `raw_author_daily` is a projection of it. Retracting only
+        // the projection would leave the facts on disk — every commit's login, email and
+        // display name for a container the admin just deleted — and leave them LIVE: the
+        // projection reads them by (provider, container, raw_author_key, author_day), so a
+        // re-added container's next sync would resurrect the retracted counts on any day its
+        // window touched. Ordered before the projection delete so the two can never be read as
+        // independent steps; both are inside this one transaction either way.
+        //
+        // Deliberately NOT reported on {@link ProviderDeleteResult}. The DTO enumerates the
+        // history being destroyed in the operator's own terms — author-days and commits — and
+        // the preview's `commits` figure IS this row count restated at the grain the
+        // confirmation dialog speaks in (`raw_author_daily.commits` is `COUNT(*)` over exactly
+        // these rows). A second, finer count of the same facts would read as a second thing
+        // being deleted.
+        deleteContainerRawCommits(db, type, container);
         const rawRows = deleteContainerRawDaily(db, type, container);
         const prRows = db
             .prepare('DELETE FROM pr_records WHERE provider = ? AND container = ?')

@@ -1498,9 +1498,11 @@ function ProviderRow({
     const test = useTestAdminGitProvider();
     const [scopeOpen, setScopeOpen] = useState(false);
     // First-sync history window (months). Only meaningful — and only surfaced —
-    // before this provider has ever synced: once a cursor exists the server ignores
-    // it (re-widening would double-count), so the input disappears and "Sync now"
-    // sends no window. Gate on the server's cursor-derived `first_sync_pending`, NOT
+    // before this provider has ever synced: once a cursor exists the server ignores it
+    // (the cursor is where the run resumes from; widening the window here would just
+    // re-ask a span already held), so the input disappears and "Sync now" sends no
+    // window — "Sync older history" is the control that extends backward. Gate on the
+    // server's cursor-derived `first_sync_pending`, NOT
     // `last_sync_at`: the latter only tracks sync-now runs, so it would keep showing
     // the (server-ignored) input after a scheduled/CLI first sync.
     const [windowMonths, setWindowMonths] = useState(FIRST_SYNC_WINDOW_DEFAULT_MONTHS);
