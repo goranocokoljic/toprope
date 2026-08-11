@@ -382,21 +382,35 @@ describe('toprope git cache clear (#286)', () => {
             expect(message).toContain('DOES NOT RE-ASK COMMITS ALREADY COVERED');
             expect(message).toContain('forward cursor');
             // …and names the repair that DOES correct it. IG1 (#316) changed which repair
-            // that is, and this assertion is what keeps this surface from drifting back:
-            // under the additive merge the ONLY safe re-cover was delete-and-re-add, which a
-            // config-file provider cannot run, so the message had to end by telling half of
-            // all deployments there was no repair. Commits are sha-keyed now, so rewinding
-            // the cursor is safe, cheap and available to every provenance — the same remedy
-            // `doctor` and `sync.ts` print for this class.
+            // that is: under the additive merge the ONLY safe re-cover was delete-and-re-add,
+            // which a config-file provider cannot run, so the message had to end by telling
+            // half of all deployments there was no repair at all. Commits are sha-keyed now,
+            // so rewinding the cursor is safe and available to every provenance — the same
+            // remedy `doctor` and `sync.ts` print for this class.
             expect(message).toContain('git_last_sync');
             expect(message).toContain('re-sync');
             expect(message).toContain('#316');
             expect(message).toContain('works for a config-file provider');
-            // The retired advice must be GONE, not merely deprioritized: leaving it would
-            // send an operator to a route that discards every day below the first-sync
-            // window, to repair an understatement of a few.
-            expect(message).not.toContain('delete it and re-add it');
-            expect(message).not.toContain('config-file provider cannot be deleted');
+        });
+
+        it('says the rewind repairs the VOLUME and not the two rates', () => {
+            // The failure this pins is the completeness arm of the graduated "a printed remedy
+            // is executable advice" rule, and it is the arm that is easy to lose when a remedy
+            // gets cheaper. A rewind re-observes shas that are already stored, so the cell's
+            // COUNT(*) over raw_commits does not move, so `mergeObservedRates` takes its
+            // `newCommits <= 0` branch and CARRIES FORWARD the stored code_churn_rate and
+            // ai_signature_score instead of the run's fresh observation. Promising all three
+            // fields would hand an operator a day with corrected line/file volume beside the
+            // degraded rate that sent them here — repaired-looking and still wrong.
+            const {message} = clearDiffstatCache(db, {provider: 'github'});
+            expect(message).toContain('PARTIAL REPAIR');
+            expect(message).toContain('NOT code_churn_rate or ai_signature_score');
+            // …and it must still name the one path that DOES re-derive them, with its cost,
+            // and say which provenance cannot reach it. Naming the cheap remedy alone is what
+            // made this finding; naming the expensive one alone is what the diff replaced.
+            expect(message).toContain('delete it and re-add it');
+            expect(message).toContain('first-sync window');
+            expect(message).toContain('config-file provider has no path');
         });
 
         it('explains an empty match by the two columns’ different case rules', () => {

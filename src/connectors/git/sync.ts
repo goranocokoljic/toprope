@@ -1380,11 +1380,12 @@ export const GIT_RUN_BEST_EFFORT_RETRY_SLEEP_BUDGET_MS = 20 * 60_000;
  * 50 minutes and still not have waited the wall out. Read this as "at most four hours", not "a
  * guaranteed four hours of fetching".
  *
- * A run that hits it fails like any other incompletely-covered window: #231 holds the cursor
- * and drops the run's partial snapshots. That is only sound because of #273 — every per-commit
- * diffstat the run fetched is memoized OUTSIDE the write transaction, so the next run re-pages
- * the commit lists and serves the whole fan-out from the memo, redoing strictly less of the
- * dominant cost each time.
+ * A run that hits it fails like any other incompletely-covered window: it holds the cursor so the
+ * window is asked again. Since IG1 (#316) it KEEPS its rows rather than dropping them (#231's
+ * drop-partials rule is gone — see `ProviderFetchResult.complete`), so the next run re-pages the
+ * commit lists and re-inserts shas that are already there for free. #273's memo still saves the
+ * per-commit diffstat fan-out on top of that, so each attempt redoes strictly less of the
+ * dominant cost.
  *
  * That ratchet covers the per-commit fan-out and NOTHING ELSE: the commit-list paging and the
  * per-PR review fan-out are re-paid in full every run, so convergence holds iff the un-memoized
@@ -2700,8 +2701,10 @@ async function fetchProviderData(
     // The persistent per-commit diffstat cache (#273), scoped to this provider instance. It is
     // what turns a failed run from "lost every fetch" into "lost only the uncached tail": the
     // provider writes each commit's diffstat through as it goes, OUTSIDE this run's write
-    // transaction, so the rows survive the #231 drop-partials rule that discards everything
-    // else. Supplied only here — probe paths (`doctor`, test-connection) never walk commits.
+    // transaction. That used to be the ONLY thing a failed run kept, because #231 discarded
+    // everything else; since IG1 (#316) the run's `raw_commits` rows survive too, and this
+    // stays as the saving on the per-commit fan-out the next attempt would otherwise re-fetch.
+    // Supplied only here — probe paths (`doctor`, test-connection) never walk commits.
     //
     // Built BEFORE the config is validated, which is safe because the cache is total: an
     // invalid config (blank org/workspace/group, bogus type) yields a cache whose every write

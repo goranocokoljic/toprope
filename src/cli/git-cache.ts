@@ -206,17 +206,33 @@ export function clearDiffstatCache(
     // graduated #235 rule (a completion signal is not a currency claim) and the graduated
     // "a remedy printed to an operator is executable advice" rule.
     //
-    // THE NAMED REPAIR CHANGED WITH IG1 (#316), and this surface is the one that had to be
-    // corrected rather than merely reworded. It used to prescribe delete-and-re-add — the only
-    // safe way to re-cover a span under the additive merge, and one a config-file provider
-    // cannot run, so half of all deployments were told there was no repair at all. Now the
-    // cheap repair is the honest one: move the provider's `git_last_sync` row back before the
-    // affected window and re-sync. Commits are keyed by sha, a re-observed one is upgraded in
-    // place when the new observation is strictly more informative (which is exactly the case
-    // here — a real diffstat replacing a recovered zero), and each author-day is recomputed
-    // from that store. It costs API calls, works for a config-file provider, and is the SAME
-    // remedy `doctor` and `sync.ts` now print for this class. Delete-and-re-add still works
-    // for a DB-registered provider but throws away history below the first-sync window.
+    // THE NAMED REPAIR CHANGED WITH IG1 (#316), and it is PARTIAL — saying so is the whole
+    // point, because the graduated rule is that a printed remedy must be safe, reachable AND
+    // COMPLETE, and this one is only the first two.
+    //
+    // It used to prescribe delete-and-re-add: under the additive merge that was the only safe
+    // way to re-cover a span, and a config-file provider cannot run it, so the message had to
+    // end by telling half of all deployments there was no repair at all. A cursor rewind is
+    // safe now — commits are sha-keyed and a re-observed one is upgraded in place when the new
+    // observation is strictly more informative, which is exactly this case (a real diffstat
+    // replacing a recovered zero) — and it is reachable for every provenance.
+    //
+    // WHAT IT DOES NOT FIX, and this is not a detail: the rewind re-observes shas that are
+    // ALREADY stored, so the cell's `COUNT(*)` over `raw_commits` is unchanged, so
+    // `mergeObservedRates` sees `newCommits <= 0` and deliberately CARRIES FORWARD the stored
+    // `code_churn_rate` and `ai_signature_score` rather than taking the run's fresh observation
+    // (`raw-author-daily.ts`; the carry-forward is what stops a PR-only re-delivery zeroing an
+    // intact day, and it cannot distinguish this case from that one). The recomputed columns —
+    // `lines_added`, `lines_removed`, `files_changed`, `avg_commit_size` — DO correct, because
+    // they are summed straight off the upgraded rows. So the rewind repairs the volume and
+    // leaves the two rates degraded until a genuinely new commit lands on that day.
+    //
+    // Delete-and-re-add is still the only path that re-derives the rates (the cascade removes
+    // the container's `raw_author_daily` rows, so the re-import writes a fresh cell with no
+    // stored value to carry), and it is still unavailable to a config-file provider and still
+    // discards history below the first-sync window. Both halves are named rather than one,
+    // because "repaired" over a day whose churn rate is still the degraded number is the
+    // false all-clear this message exists to prevent.
     return {
         ok: true,
         removed,
@@ -235,7 +251,17 @@ export function clearDiffstatCache(
             'a re-observed one is upgraded in place only when the new observation is more ' +
             'informative, and each author-day is recomputed from that store, so re-asking ' +
             'spends API calls and moves no counter twice. It works for a config-file provider ' +
-            'too, which delete-and-re-add does not.',
+            'too, which delete-and-re-add does not. THE REWIND IS A PARTIAL REPAIR: it ' +
+            'restores lines_added / lines_removed / files_changed / avg_commit_size, which are ' +
+            'summed from the corrected rows, but NOT code_churn_rate or ai_signature_score — ' +
+            'a rewind adds no new commits to the day, and those two are then deliberately ' +
+            'carried forward from the stored value rather than re-observed (which is what ' +
+            'stops an ordinary PR-only re-sync zeroing an intact day). They stay degraded ' +
+            'until a genuinely new commit lands on that day. Re-deriving them needs the cell ' +
+            'rebuilt from empty: for a provider registered in the admin UI, delete it and ' +
+            're-add it, accepting that this drops every day older than the first-sync window ' +
+            'a re-added provider starts from. A config-file provider has no path to that ' +
+            'second half.',
     };
 }
 

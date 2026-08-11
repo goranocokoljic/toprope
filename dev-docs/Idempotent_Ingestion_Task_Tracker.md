@@ -256,9 +256,16 @@ model-independent.
   `upsertRawAuthorDaily` is a REPLACE fed by a full recompute over `raw_commits`, and
   `mergeDailyAcrossRuns` / `mergeDailyDisjoint` / `commitWeightedAvg` no longer exist (a test asserts
   their absence). **Its surviving half was re-filed**, not dropped — see below.
-- `before-deleting-state-ask-which-invariant-reads-it-as-proof` — a cursor licenses nothing now, and
-  `deleteContainerRawCommits` retracts at the same `(provider, container)` grain the delete acts on,
-  so the "coarser-keyed data cannot be retracted" half has no instance left either.
+- `before-deleting-state-ask-which-invariant-reads-it-as-proof` — retired on its FIRST half only:
+  a cursor licenses nothing now, and `deleteContainerRawCommits` retracts `raw_commits` at the same
+  `(provider, container)` grain the delete acts on. Its second half — "data keyed by a coarser
+  identity than the thing being deleted cannot be retracted alongside it" — is **still live**, and
+  the first pass of this issue wrongly claimed otherwise. `providers/delete-cascade.ts`'s own header
+  says the period-keyed rollups (`weekly_aggregates` and siblings, `pr_review_metrics`) survive the
+  cascade and depend on the single admin route calling `aggregation/retract.ts` afterwards, and
+  `reset-notice.ts` records that `pr_review_metrics` / `coaching_signals` have no covering command
+  at all. So that half is **re-filed**, not dropped, as
+  `a-retraction-stops-at-the-grain-it-is-keyed-by` (active; sources #264 + #320).
 - `a-scoped-single-source-write-into-a-multi-source-aggregated-` — `projectSnapshots` reads *every*
   provider's raw rows for the touched days and folds them, and `raw_author_daily` is keyed by
   `(provider, container)` so exactly one source ever writes a cell. A scoped run cannot drop another

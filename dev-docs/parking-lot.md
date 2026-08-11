@@ -71,6 +71,28 @@ that overstated the delete preview's `commits` equality. What is left is out-of-
   deliberately re-ask a span already held (out-of-diff; the diff's edit to this file is a
   different comment).
 
+## 2026-08-11 — #320 (IG1.4) SEC fast-lens
+
+The High (the `toprope git cache clear` remedy promising a repair the write path refuses for
+two of the three fields it named) and every Medium/Low were fixed in the commit itself. What
+is left is out-of-diff — both are the SAME defect as that High, in code #318 landed and #320
+did not touch.
+
+- [#320 review] `src/connectors/git/sync.ts:771-786` (`permanentSpanRepair`) — the shared
+  remedy string says a cursor rewind "re-asks it and lands the missing detail", which is false
+  for `code_churn_rate` and `ai_signature_score` in exactly the `DIFFS_NOT_SUPPLIED_PREFIX` /
+  `COMMIT_CHURN_UNKNOWN_PREFIX` cases it is printed for: those commits are already in
+  `raw_commits`, so the rewind adds no commits and `mergeObservedRates` deliberately carries
+  the stored (degraded) rates forward. Its own doc-comment claims the graduated remedy rule's
+  COMPLETE arm was checked. `git-cache.ts` was corrected under #320; this is the same sentence
+  on the surface `doctor` and `sync.ts` share, and it should say the same thing (High).
+- [#320 review] `src/connectors/git/providers/delete-cascade.ts:51-57` — the period-keyed
+  rollups the cascade cannot retract depend on ONE caller (`admin/git-providers.ts`) invoking
+  `aggregation/retract.ts` afterwards; any other path to the same delete leaves them holding
+  the deleted container's totals, and `pr_review_metrics` / `coaching_signals` have no
+  covering command at all. Now carried as an active KB lesson
+  (`a-retraction-stops-at-the-grain-it-is-keyed-by`) rather than a code change.
+
 ## Backlog (pre-policy deferrals)
 
 - Deferred Medium/Low findings from before this policy live in PR comments

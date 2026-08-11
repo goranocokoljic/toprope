@@ -42,11 +42,16 @@ No proxy, no traffic interception. Pure API-pull + git analysis.
     `(provider, container, raw_author_key, date)` grain. Every cell an ingest touches is
     recomputed by aggregate over `raw_commits` inside the run's transaction (`INSERT OR REPLACE`,
     never `+=`), so re-running an ingest writes the same numbers twice. Two groups of columns are
-    NOT projected and must be combined idempotently rather than replaced: the four PR counters
-    (derived from `pr_records`, combined with `max()`) and `code_churn_rate` /
-    `ai_signature_score`, which `raw_commits` cannot recompute (no commit message, no file paths)
-    and which are therefore carried across writes by a commit-weighted mean. Adding a new column
-    means deciding which group it is in.
+    NOT projected and must be combined idempotently rather than replaced. (1) The PR columns,
+    which come from the run's own PR/review fetch — NOT from `pr_records`, which is keyed by
+    `developer_id` and so holds nothing for the unmatched authors this table exists to retain:
+    `prs_opened` / `prs_merged` / `review_comments_given` combine with `max()`, and
+    `avg_time_to_merge_hours` follows whichever side owns the larger `prs_merged`. (2)
+    `code_churn_rate` / `ai_signature_score`, which `raw_commits` cannot recompute (no commit
+    message, no file paths) and which are carried across writes by a commit-weighted mean —
+    weighted by the commits THIS write added, so a write that added none leaves them untouched
+    (which also means a cursor rewind cannot repair them). Adding a new column means deciding
+    which group it is in.
   - **`git_snapshots` — a PROJECTION of `(raw_author_daily, identity map)`** at the
     `(developer_id, date)` grain (#253/#264). It folds every provider and identity for the day,
     so a scoped single-provider run cannot drop another provider's same-day contribution.
@@ -55,12 +60,16 @@ No proxy, no traffic interception. Pure API-pull + git analysis.
   - **`commit_diffstats` — a MEMO** of an idempotent remote read (#273), same immutability
     argument as `raw_commits`, written per commit DURING the fetch and outside the run's write
     transaction so a failed run keeps its expensive fetches. Deleting it costs only re-fetching.
-  **Sync cursors are FETCH HINTS, not correctness proofs.** A stale, lost or overlapping
-  cursor costs API calls, never accuracy — the old disjoint-window invariant it used to carry
-  is gone with the additive merge.
+  **Sync cursors are FETCH HINTS, not correctness proofs — in ONE direction.** A cursor that
+  is stale, lost, overlapping or rewound costs API calls and never accuracy; the disjoint-window
+  invariant it used to carry died with the additive merge. Advancing it is still gated: a cursor
+  is the only record of what has been ASKED, so advancing past a window the run did not fully
+  fetch is still a silent, unrecoverable gap (#231 — `ProviderFetchResult.complete` holds the
+  cursor for exactly this, and it is the one coupling IG1 did not delete).
   **Migrations 042 (#264), 043 (#266) and 046 (#317) are one-time PRE-PRODUCTION resets** that
-  cleared this data outright, 042 and 046 including `is_projected = 0` legacy cells. 046 is
-  the reset that precedes IG1 and leaves the `git_data_reset_pending` marker `toprope doctor`
+  cleared the projections and cursors outright, 042 and 046 including `is_projected = 0` legacy
+  cells. (046 does not clear `raw_commits` — it creates it; 042 and 043 predate the table.) 046
+  is the reset that precedes IG1 and leaves the `git_data_reset_pending` marker `toprope doctor`
   fails on until the rebuild is acknowledged. **No runtime path may do any of this.**
 - Waste detection: subscription with zero activity for 14+ days = unused
 - Data quality tracked per data point: high (API), medium (git), low (expense only)
