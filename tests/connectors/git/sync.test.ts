@@ -3050,7 +3050,7 @@ describe('subtractUtcMonths — shared month arithmetic (#229)', () => {
     });
 });
 
-describe('getEarliestSyncedWatermark — never-synced default (#229) / legacy unknown (#233)', () => {
+describe('getEarliestSyncedWatermark — the backfill fetch hint (#229/#233, IG1.3 #319)', () => {
     let db: Database.Database;
 
     beforeEach(() => {
@@ -3062,13 +3062,11 @@ describe('getEarliestSyncedWatermark — never-synced default (#229) / legacy un
     });
 
     it('defaults to now − default window for a NEVER-synced provider (no cursor, no marker)', () => {
-        // Not a guess: nothing is imported, so the window its first sync will use is
-        // the honest floor and any backfill below it stays disjoint.
+        // Nothing is imported, so the window its first sync will use is the honest floor.
         const now = '2026-03-15T12:00:00.000Z';
-        expect(getEarliestSyncedWatermark(db, 'github', 'test-org', now)).toEqual({
-            kind: 'exact',
-            watermark: firstSyncSince(now, FIRST_SYNC_WINDOW_DEFAULT_MONTHS),
-        });
+        expect(getEarliestSyncedWatermark(db, 'github', 'test-org', now)).toBe(
+            firstSyncSince(now, FIRST_SYNC_WINDOW_DEFAULT_MONTHS),
+        );
     });
 
     it('returns the stored watermark verbatim once set', () => {
@@ -3076,35 +3074,65 @@ describe('getEarliestSyncedWatermark — never-synced default (#229) / legacy un
             earliestSyncStateKey('github', 'test-org'),
             '2024-01-01T00:00:00.000Z',
         );
-        expect(
-            getEarliestSyncedWatermark(db, 'github', 'test-org', '2026-03-15T12:00:00.000Z'),
-        ).toEqual({kind: 'exact', watermark: '2024-01-01T00:00:00.000Z'});
+        expect(getEarliestSyncedWatermark(db, 'github', 'test-org', '2026-03-15T12:00:00.000Z')).toBe(
+            '2024-01-01T00:00:00.000Z',
+        );
     });
 
     it('falls back to now (a zero-width window the guard rejects) when now is unparseable and unset', () => {
-        expect(getEarliestSyncedWatermark(db, 'github', 'test-org', 'not-a-date')).toEqual({
-            kind: 'exact',
-            watermark: 'not-a-date',
-        });
+        expect(getEarliestSyncedWatermark(db, 'github', 'test-org', 'not-a-date')).toBe('not-a-date');
     });
 
-    it('returns `unknown` for a LEGACY provider — cursor present, floor absent (#233)', () => {
-        // The regression this closes: before #233 this returned `now − 6mo`, which is
-        // NEWER than the true floor, so the first backfill re-covered the overlap and
-        // additively double-counted it. The legacy state is DERIVED: a pre-#229 first
-        // sync left a cursor behind but never recorded the floor it reached.
+    // THE INPUT CLASS THE DELETED `unknown` VERDICT OWNED (IG1.3 / #319). A LEGACY provider —
+    // forward cursor present, floor absent, i.e. one first synced before #229 recorded floors —
+    // used to return `{kind: 'unknown'}` and make the backfill route 409, because under the
+    // additive merge any overlap the guess implied was permanently double-counted. Commits are
+    // sha-keyed now, so overlap costs API calls and the backfill runs — but the guess it runs
+    // with must be `now`, NOT the default window.
+    //
+    // WHY THIS IS THE CASE THAT MATTERS. The backfill walks only BELOW this value and records the
+    // slice it asked for as the new floor, so a bound ABOVE the real floor strands everything in
+    // between, permanently and with nothing to report it. The default-window guess is not
+    // "always too recent": true floor = first_sync − window, so it is too OLD whenever
+    // window + age < 6 months — a provider synced days ago with a 3-month window has a true floor
+    // of now − 3mo, and a bound of now − 6mo would fence off three months of real history. `now`
+    // is the only bound that cannot do that. Reverting this branch makes THIS test fail and
+    // leaves the never-synced case below green, which is the pair the two branches disagree on.
+    it('a LEGACY provider (cursor, no floor) is bounded at NOW, not at the default window (#319)', () => {
+        const now = '2026-03-15T12:00:00.000Z';
         db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
             syncStateKey('github', 'test-org'),
             '2026-03-01T00:00:00.000Z',
         );
-        expect(
-            getEarliestSyncedWatermark(db, 'github', 'test-org', '2026-03-15T12:00:00.000Z'),
-        ).toEqual({kind: 'unknown'});
+        expect(getEarliestSyncedWatermark(db, 'github', 'test-org', now)).toBe(now);
+        // Concretely: the too-old default would have fenced a 3-month-deep provider off above
+        // its own floor. Stated as the comparison the bug turns on, not just as a value.
+        const defaultGuess = firstSyncSince(now, FIRST_SYNC_WINDOW_DEFAULT_MONTHS);
+        const realFloorOfAYoungProvider = firstSyncSince(now, 3);
+        expect(defaultGuess < realFloorOfAYoungProvider).toBe(true);
+        expect(getEarliestSyncedWatermark(db, 'github', 'test-org', now) > realFloorOfAYoungProvider).toBe(true);
     });
 
-    it('a cursor AND a floor (a #229-era provider) is exact, never unknown', () => {
-        // The other side of the derived predicate: the pair is written atomically by a
-        // post-#229 first sync, so both-present is the normal, trustworthy state.
+    it('distinguishes the legacy provider from the never-synced one', () => {
+        // The two no-floor states are NOT the same state and must not answer the same: nothing
+        // has been imported for the never-synced one, so the window its first sync will use is
+        // the honest floor and bounding it at `now` would make the backfill re-ask a span the
+        // first sync is about to cover anyway.
+        const now = '2026-03-15T12:00:00.000Z';
+        const legacy = makeDb();
+        try {
+            legacy
+                .prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)')
+                .run(syncStateKey('github', 'test-org'), '2026-03-01T00:00:00.000Z');
+            expect(getEarliestSyncedWatermark(legacy, 'github', 'test-org', now)).not.toBe(
+                getEarliestSyncedWatermark(db, 'github', 'test-org', now),
+            );
+        } finally {
+            legacy.close();
+        }
+    });
+
+    it('a cursor AND a floor (a #229-era provider) returns the recorded floor', () => {
         db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
             syncStateKey('github', 'test-org'),
             '2026-03-01T00:00:00.000Z',
@@ -3113,21 +3141,33 @@ describe('getEarliestSyncedWatermark — never-synced default (#229) / legacy un
             earliestSyncStateKey('github', 'test-org'),
             '2024-01-01T00:00:00.000Z',
         );
-        expect(
-            getEarliestSyncedWatermark(db, 'github', 'test-org', '2026-03-15T12:00:00.000Z'),
-        ).toEqual({kind: 'exact', watermark: '2024-01-01T00:00:00.000Z'});
+        expect(getEarliestSyncedWatermark(db, 'github', 'test-org', '2026-03-15T12:00:00.000Z')).toBe(
+            '2024-01-01T00:00:00.000Z',
+        );
     });
 
-    it('a floor with NO cursor (backfill-before-first-sync) is exact, not unknown', () => {
-        // The backfill route does not require a cursor, so this ordering is reachable:
-        // the floor is real and recorded, so there is nothing to refuse.
+    it('a floor with NO cursor (backfill-before-first-sync) returns that floor', () => {
+        // The backfill route does not require a cursor, so this ordering is reachable.
         db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
             earliestSyncStateKey('github', 'test-org'),
             '2020-01-01T00:00:00.000Z',
         );
-        expect(
-            getEarliestSyncedWatermark(db, 'github', 'test-org', '2026-03-15T12:00:00.000Z'),
-        ).toEqual({kind: 'exact', watermark: '2020-01-01T00:00:00.000Z'});
+        expect(getEarliestSyncedWatermark(db, 'github', 'test-org', '2026-03-15T12:00:00.000Z')).toBe(
+            '2020-01-01T00:00:00.000Z',
+        );
+    });
+
+    it('treats a BLANK floor row as no floor at all', () => {
+        // Falsy-not-null: a blank value is not a floor, and reading it verbatim would hand the
+        // route an empty upper bound — which downstream reads as "walk all history".
+        const now = '2026-03-15T12:00:00.000Z';
+        db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+            earliestSyncStateKey('github', 'test-org'),
+            '',
+        );
+        expect(getEarliestSyncedWatermark(db, 'github', 'test-org', now)).toBe(
+            firstSyncSince(now, FIRST_SYNC_WINDOW_DEFAULT_MONTHS),
+        );
     });
 });
 
@@ -3161,12 +3201,9 @@ describe('declareEarliestSyncedFloor — the admin recovery path (#233)', () => 
         const floor = '2025-01-01T00:00:00.000Z';
         expect(declareEarliestSyncedFloor(db, 'github', 'test-org', floor, NOW)).toEqual({ok: true});
         expect(readState(earliestSyncStateKey('github', 'test-org'))).toBe(floor);
-        // Recording the floor is itself what makes the provider non-legacy — the route
-        // stops refusing, with no second key to keep in sync.
-        expect(getEarliestSyncedWatermark(db, 'github', 'test-org', NOW)).toEqual({
-            kind: 'exact',
-            watermark: floor,
-        });
+        // Recording the floor is what the backfill then walks below — no second key to
+        // keep in sync.
+        expect(getEarliestSyncedWatermark(db, 'github', 'test-org', NOW)).toBe(floor);
     });
 
     it('refuses a non-legacy provider rather than overwrite a recorded floor', () => {
@@ -3202,10 +3239,9 @@ describe('declareEarliestSyncedFloor — the admin recovery path (#233)', () => 
         ).toEqual({ok: false, reason: 'never_synced'});
         // No floor conjured for a provider that has synced nothing.
         expect(readState(earliestSyncStateKey('github', 'ghost-org'))).toBeNull();
-        expect(getEarliestSyncedWatermark(db, 'github', 'ghost-org', NOW)).toEqual({
-            kind: 'exact',
-            watermark: firstSyncSince(NOW, FIRST_SYNC_WINDOW_DEFAULT_MONTHS),
-        });
+        expect(getEarliestSyncedWatermark(db, 'github', 'ghost-org', NOW)).toBe(
+            firstSyncSince(NOW, FIRST_SYNC_WINDOW_DEFAULT_MONTHS),
+        );
     });
 
     it('force applies to a floor-without-cursor provider (backfilled before its first sync)', () => {
@@ -3241,10 +3277,7 @@ describe('declareEarliestSyncedFloor — the admin recovery path (#233)', () => 
         expect(
             declareEarliestSyncedFloor(db, 'github', 'test-org', truth, NOW, {force: true}),
         ).toEqual({ok: true});
-        expect(getEarliestSyncedWatermark(db, 'github', 'test-org', NOW)).toEqual({
-            kind: 'exact',
-            watermark: truth,
-        });
+        expect(getEarliestSyncedWatermark(db, 'github', 'test-org', NOW)).toBe(truth);
     });
 
     it('force still enforces the value guards (it overrides WHO, not WHAT)', () => {
@@ -3281,8 +3314,10 @@ describe('declareEarliestSyncedFloor — the admin recovery path (#233)', () => 
             ok: false,
             reason: 'invalid_floor',
         });
-        // Still legacy after a rejected declare — the cursor stands, no floor written.
-        expect(getEarliestSyncedWatermark(db, 'github', 'test-org', NOW)).toEqual({kind: 'unknown'});
+        // Still floor-less after a rejected declare — the cursor stands and no floor was
+        // written, so the reader stays on the legacy fallback (`now`) rather than adopting
+        // the rejected value.
+        expect(getEarliestSyncedWatermark(db, 'github', 'test-org', NOW)).toBe(NOW);
         expect(readState(earliestSyncStateKey('github', 'test-org'))).toBeNull();
     });
 
@@ -3673,8 +3708,8 @@ describe('GitSync.syncProviders — first-sync earliest-watermark recording (#22
         // And the guard sees "everything already synced" for any real target.
         const target = '2020-01-01T00:00:00.000Z';
         const earliest = getEarliestSyncedWatermark(db, 'github', 'test-org', '2026-03-15T12:00:00.000Z');
-        expect(earliest.kind).toBe('exact');
-        expect(earliest.kind === 'exact' && target >= earliest.watermark).toBe(true);
+        expect(earliest).toBe(EARLIEST_SYNC_EPOCH);
+        expect(target >= earliest).toBe(true);
     });
 
     it('does NOT re-write the watermark on an incremental (non-first) sync', async () => {

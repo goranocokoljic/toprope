@@ -45,22 +45,23 @@ describe('toprope git set-history-floor (#233)', () => {
         expect(result.ok).toBe(true);
         expect(result.message).toContain(FLOOR);
         expect(readState(earliestSyncStateKey('github', 'acme'))).toBe(FLOOR);
-        // The observable point of the command: backfill is unblocked.
-        expect(getEarliestSyncedWatermark(db, 'github', 'acme', NOW)).toEqual({
-            kind: 'exact',
-            watermark: FLOOR,
-        });
+        // The observable point of the command: the backfill's lower edge now sits here.
+        expect(getEarliestSyncedWatermark(db, 'github', 'acme', NOW)).toBe(FLOOR);
     });
 
     it('states the consequence of the declared floor, not just that it was written', () => {
-        // The admin typed this instant from memory and it silently decides whether the
-        // next backfill double-counts — the echo is their only chance to catch a typo.
+        // The admin typed this instant from memory and it silently decides where the next
+        // backfill STOPS asking — the echo is their only chance to catch a typo. Since IG1.3
+        // (#319) the consequence being echoed is the stranded span, not a double-count: the
+        // latter is structurally impossible now, and a message still threatening it would send
+        // the admin looking for inflated counters that can never appear.
         markLegacy();
         const result = setHistoryFloor(db, {provider: 'github', container: 'acme', at: FLOOR}, NOW);
 
         expect(result.ok).toBe(true);
         expect(result.message).toMatch(/older/i);
-        expect(result.message).toMatch(/double-count/i);
+        expect(result.message).toMatch(/never be fetched/i);
+        expect(result.message).not.toMatch(/double-count/i);
         expect(result.message).toContain('--force');
     });
 
@@ -114,8 +115,10 @@ describe('toprope git set-history-floor (#233)', () => {
         const result = setHistoryFloor(db, {provider: 'github', container: 'acme', at: '2025-01-01'}, NOW);
         expect(result.ok).toBe(false);
         expect(result.message).toContain('invalid --at value');
-        // Still legacy after the rejection — nothing was written.
-        expect(getEarliestSyncedWatermark(db, 'github', 'acme', NOW)).toEqual({kind: 'unknown'});
+        // Nothing was written, so the reader still falls back to the default window rather
+        // than to the rejected value.
+        expect(getEarliestSyncedWatermark(db, 'github', 'acme', NOW)).not.toBe('2025-01-01');
+        expect(readState(earliestSyncStateKey('github', 'acme'))).toBeNull();
     });
 
     it('trims --container so a padded value is not misreported as a state fact', () => {
@@ -139,10 +142,7 @@ describe('toprope git set-history-floor (#233)', () => {
         expect(result.ok).toBe(true);
         expect(result.message).toContain('github:acme');
         expect(readState(earliestSyncStateKey('github', 'acme'))).toBe(FLOOR);
-        expect(getEarliestSyncedWatermark(db, 'github', 'acme', NOW)).toEqual({
-            kind: 'exact',
-            watermark: FLOOR,
-        });
+        expect(getEarliestSyncedWatermark(db, 'github', 'acme', NOW)).toBe(FLOOR);
     });
 
     it('--force corrects a floor that was already declared', () => {

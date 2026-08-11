@@ -1652,39 +1652,6 @@ export function earliestSyncStateKey(providerType: GitProviderType, identifier: 
 }
 
 /**
- * Whether a provider's earliest-synced floor is UNKNOWN and unrecoverable (#233) —
- * i.e. it is LEGACY, first synced before #229 began recording the floor.
- *
- * DERIVED, not stored. `cursor present ∧ watermark absent` ⟺ legacy, because a
- * post-#229 first sync writes BOTH inside the same deferred closure, applied in the
- * same snapshot transaction (see the `cursorAdvances` push in {@link GitSync.syncProviders});
- * and that closure is the ONLY writer of a `git_last_sync:` cursor. So for any provider
- * synced by this build the two keys can never be out of step — only a provider whose
- * first sync predates that build can hold a cursor with no floor.
- *
- * Deriving beats seeding a marker row at upgrade time: a marker freezes the legacy set
- * at one instant and then needs reconciling whenever a real floor is recorded, which is
- * a second source of truth that can drift. The predicate is true at EVERY instant, so it
- * also fails closed on a cursor-without-floor that appears later (a partial restore, a
- * hand-edited row, a future code path) — states a migration-seeded marker would miss and
- * silently fall back to the too-recent guess for.
- */
-function isEarliestFloorUnknown(
-    db: Database.Database,
-    providerType: GitProviderType,
-    identifier: string,
-): boolean {
-    // Falsy, not just null: a blank-valued floor row is no floor at all, and treating it
-    // as present here (while getEarliestSyncedWatermark's `if (stored)` treats it as
-    // absent) would disagree with that reader and fail OPEN — back to the too-recent
-    // guess for a provider that has a cursor, the exact defect this exists to close.
-    return (
-        !getSyncStateValue(db, earliestSyncStateKey(providerType, identifier)) &&
-        getSyncStateValue(db, syncStateKey(providerType, identifier)) !== null
-    );
-}
-
-/**
  * Every git sync-state cursor key currently stored, resolved in ONE query. The
  * admin list uses this to tell whether a provider's FIRST sync is still pending
  * (no cursor yet) — the real gate the "Sync now" window input keys off. Read once
@@ -2343,95 +2310,91 @@ function setProviderEarliestSyncTime(
 }
 
 /**
- * Whether a provider's earliest-synced floor is known (#233). `unknown` is the LEGACY
- * case — a provider whose first sync predates #229's floor recording. Callers must
- * branch on `kind` rather than treat a missing watermark as "guess a default": the
- * guess is systematically too recent, which is the additive double-count direction.
- */
-export type EarliestSyncedWatermark =
-    | {kind: 'exact'; watermark: string}
-    | {kind: 'unknown'};
-
-/**
- * The current earliest-synced watermark for a provider — the oldest instant whose
- * activity has already been imported — as UTC ISO. The "sync older history"
- * backfill (#229) extends BELOW this edge: it fetches the strictly-older slice
- * [new_target, watermark], disjoint from everything already stored, so the
- * additive snapshot merge stays correct. The backfill route calls this to both
- * enforce the overlap guard (`new_target < watermark`) and set the fetch's upper
- * bound.
+ * The current earliest-synced watermark for a provider — the oldest instant whose activity has
+ * already been imported — as UTC ISO. The "sync older history" backfill (#229) extends BELOW this
+ * edge: it fetches the older slice [new_target, watermark]. The backfill route calls this to set
+ * the fetch's upper bound and to answer "is there anything older to ask for".
  *
- * The watermark is recorded at FIRST-SYNC time (runSync writes the real floor the
- * first forward sync reached — the clamped window start, or {@link
- * EARLIEST_SYNC_EPOCH} for a walk-all sync) and lowered by every backfill, so for
- * any provider synced by this build it is EXACT — the overlap guard never overlaps
- * an already-imported span. That is the `exact` result.
+ * A FETCH HINT, NOT A PROOF (IG1.3 / #319, epic #316). The watermark used to carry the
+ * disjointness proof the additive merge needed, and it had a third result — `unknown` (#233) — for
+ * a LEGACY provider (a forward cursor with no recorded floor, i.e. one first synced before #229
+ * began recording it). Its true floor is unrecoverable from stored state, and under the additive
+ * merge the only safe answer was to refuse the backfill outright, because the lazy default
+ * (`now` − the #228 window) is systematically TOO RECENT — precisely the direction that made the
+ * slice overlap already-imported activity and double-count it, permanently and silently.
  *
- * LEGACY PROVIDERS return `unknown` (#233) — see {@link isEarliestFloorUnknown} for how
- * they are identified. Such a provider's true floor (`first_sync_time − window`) is
- * unrecoverable: sync_state stores neither the first-sync instant nor the window it
- * used, and git_snapshots merges every provider into UNIQUE(developer_id, date) rows,
- * so the earliest activity date can't be attributed back to one provider.
+ * That hazard is gone by construction. Commits are keyed by sha in `raw_commits` and each
+ * author-day is RECOMPUTED from that store, so a slice that overlaps an imported span re-observes
+ * shas that are already there: no counter moves, and the cost is API calls. So the third result is
+ * deleted along with the proof, and the too-recent guess becomes the ordinary answer for a legacy
+ * provider — it can only make a backfill ask for MORE than it strictly needed.
  *
- * THIS IS THE RATIONALE THE REST OF THE FEATURE POINTS AT. The previous lazy default
- * (`now` − the #228 window) was a guess, and it is systematically TOO RECENT — the true
- * floor is older by however long ago the provider first synced. Too-recent is precisely
- * the direction that makes the backfill slice OVERLAP already-imported activity, which
- * the additive merge then double-counts, permanently and silently. Guessing too-old is
- * no better (it makes the span between the guess and the true floor un-importable
- * forever), so there is no safe guess: we fail closed and let an admin who knows the
- * real floor declare it ({@link declareEarliestSyncedFloor}, `toprope git
- * set-history-floor`).
+ * What the floor still decides is COMPLETENESS, and the two error directions are no longer
+ * symmetric — which is what picks the fallback below. The backfill walks only BELOW this value
+ * and records the slice it asked for as the new floor, so:
+ *  - too RECENT ⇒ the slice re-covers a held span. Costs API calls. Self-correcting.
+ *  - too OLD ⇒ the span between this value and what was really imported is never fetched, by
+ *    this run or any later one, and nothing reports the hole.
+ * So where the value must be guessed, it is guessed at the safe extreme.
  *
- * A provider with NO cursor and no floor is ASSUMED never-synced, and returns the window
- * its first sync would use. Two caveats on that assumption, neither introduced here:
- *  - It is the DEFAULT window. The first sync's window is caller-supplied (1–60 months),
- *    so a backfill run BEFORE that first sync (API-only — the UI hides the control until
- *    a provider has synced) can leave a gap or an overlap against whatever window the
- *    later first sync actually uses. Pre-existing from #229.
- *  - Renaming a provider's container (a supported PATCH) ORPHANS its cursor and floor
- *    rows rather than re-keying them, so the renamed provider reads as never-synced here
- *    while its old activity is still stored. Pre-existing #228-era: the next forward sync
- *    already re-imports its window as a "first" sync.
+ * THE TWO NO-FLOOR STATES ARE NOT THE SAME STATE, and conflating them is how the first cut of
+ * this function lost data (found by the #319 SEC pass):
+ *  - **No floor AND no cursor** — nothing has been imported, so the window a first sync WOULD use
+ *    is the honest floor. Unchanged from #229.
+ *  - **No floor BUT a cursor** — the LEGACY provider the deleted `unknown` verdict was about. Its
+ *    first sync already happened, with a window this function does not know and cannot recover
+ *    (`sync_state` stores neither the instant nor the window). The default-window guess is NOT
+ *    "systematically too recent": the true floor is `first_sync − window`, so the guess is too OLD
+ *    whenever `window + age < 6 months` — a provider synced last week with a 3-month window has a
+ *    true floor of `now − 3.5mo`, and a backfill bounded at `now − 6mo` would strand ten weeks of
+ *    history permanently. `now` is the only bound that cannot: it makes the slice cover everything,
+ *    which under the sha-keyed store is a re-observation, and leaves the recorded floor honest.
+ *
+ * Remaining caveat, not introduced here: renaming a provider's container (a supported PATCH)
+ * ORPHANS its cursor and floor rows rather than re-keying them, so the renamed provider reads as
+ * never-synced here while its old activity is still stored. Pre-existing #228-era — the next
+ * forward sync already re-imports its window as a "first" sync.
  */
 export function getEarliestSyncedWatermark(
     db: Database.Database,
     providerType: GitProviderType,
     identifier: string,
     now: string,
-): EarliestSyncedWatermark {
+): string {
+    // Falsy, not just non-null: a blank-valued floor row is no floor at all.
     const stored = getProviderEarliestSyncTime(db, providerType, identifier);
-    if (stored) return {kind: 'exact', watermark: stored};
-    // Legacy: cursor exists but the floor it reached was never recorded (#233).
-    if (isEarliestFloorUnknown(db, providerType, identifier)) return {kind: 'unknown'};
-    // Never-synced provider: nothing imported yet, so the window its first sync will
-    // use is the honest floor. firstSyncSince returns '' only when `now` is
-    // unparseable; fall back to `now` (a zero-width window the caller's overlap guard
-    // rejects) rather than '', which downstream would read as "walk all history".
-    return {
-        kind: 'exact',
-        watermark: firstSyncSince(now, FIRST_SYNC_WINDOW_DEFAULT_MONTHS) || now,
-    };
+    if (stored) return stored;
+    // A cursor with no floor is the LEGACY state: something WAS imported and how far back is
+    // unrecoverable, so bound the backfill at `now` and let it re-ask rather than risk fencing
+    // it off above the real floor. See the doc above for why this is not symmetric.
+    if (getSyncStateValue(db, syncStateKey(providerType, identifier)) !== null) return now;
+    // Never synced: the window its first sync will use is the honest floor. firstSyncSince
+    // returns '' only when `now` is unparseable; fall back to `now` (a zero-width window the
+    // caller's guard rejects) rather than '', which downstream reads as "walk all history".
+    return firstSyncSince(now, FIRST_SYNC_WINDOW_DEFAULT_MONTHS) || now;
 }
 
 /**
- * Declare a LEGACY provider's true earliest-synced floor (#233) — the admin-supplied
- * recovery path for a floor {@link getEarliestSyncedWatermark} refuses to guess. Writes
- * the exact watermark, restoring the provider's ability to back-extend its window.
+ * Declare a provider's true earliest-synced floor (#233) — the admin-supplied correction for a
+ * floor {@link getEarliestSyncedWatermark} can only guess at, typically a LEGACY provider whose
+ * first sync predates #229's floor recording.
  *
- * Only ever call this with a floor the admin actually knows (when the provider first
- * synced, minus the window that run used). Declaring a floor NEWER than the truth makes
- * the next backfill re-cover already-imported activity and double-count it; declaring
- * one OLDER silently strands the span in between. Hence: no default and no inference —
- * an explicit human assertion.
+ * WHAT DECLARING A FLOOR IS FOR, SINCE IG1.3 (#319). It is no longer a gate: the backfill runs
+ * whatever the floor says, because a slice that overlaps imported history re-observes shas that
+ * are already stored and changes no counter. Two things still depend on the value, in opposite
+ * directions. A floor NEWER than the truth costs API calls — the next backfill re-asks a span it
+ * already holds — and nothing else. A floor OLDER than the truth is the one that still bites: the
+ * backfill walks only BELOW the floor, so the span between the declared value and what was really
+ * imported is never fetched, and no later run notices. Hence: no default and no inference — an
+ * explicit human assertion, in the direction where being wrong is merely expensive.
  *
- * By default this refuses a provider whose floor is already recorded, because clobbering
- * a floor EARNED by a real sync is exactly the corruption the feature guards. But a
- * hand-typed floor is fallible, and refusing every overwrite would make the admin's own
- * typo permanent — the mistake would only surface as inflated counts after the backfill
- * ran. `force` is the escape hatch: it says "I know a floor is recorded and I am
- * replacing it", which is correctable-by-design for a declared floor and a loaded gun for
- * an earned one. That is why it is opt-in per call and never the default.
+ * By default this refuses a provider whose floor is already recorded, because a floor EARNED by a
+ * real sync describes what that sync actually reached and a hand-typed replacement can only be
+ * worse-informed. But a hand-typed floor is fallible, and refusing every overwrite would make the
+ * admin's own typo permanent — a too-old one strands history with nothing to report it. `force` is
+ * the escape hatch: it says "I know a floor is recorded and I am replacing it", which is
+ * correctable-by-design for a declared floor and a loaded gun for an earned one. That is why it is
+ * opt-in per call and never the default.
  *
  * `force` overrides ONLY that refusal. It never waives the existence requirement: a
  * provider with neither a cursor nor a floor has synced nothing, so there is no floor to
@@ -2459,17 +2422,17 @@ export function declareEarliestSyncedFloor(
     // overlap guard, so a loosely-parsed date would corrupt every later comparison.
     if (!isUtcIsoInstant(floor)) return {ok: false, reason: 'invalid_floor'};
     // Bound the upper edge: a floor at/after `now` claims the provider imported nothing
-    // (or imported the future). Both make every later backfill target look "older than
-    // the floor" and pass the overlap guard onto already-synced spans. Compared as
-    // INSTANTS so the guard is total for anything isUtcIsoInstant admits; `now` is
-    // rejected outright if unparseable rather than letting NaN compare false and pass.
+    // (or imported the future), which makes every later backfill target look "older than
+    // the floor" and re-ask spans that are already held. Compared as INSTANTS so the guard
+    // is total for anything isUtcIsoInstant admits; `now` is rejected outright if
+    // unparseable rather than letting NaN compare false and pass.
     if (Number.isNaN(Date.parse(now))) return {ok: false, reason: 'future_floor'};
     if (Date.parse(floor) >= Date.parse(now)) return {ok: false, reason: 'future_floor'};
     // Check-then-act: read the state and write the floor in ONE transaction so a
     // concurrent declare/first-sync can't land between them and clobber a real floor.
     return db.transaction(
         (): {ok: true} | {ok: false; reason: 'not_legacy' | 'never_synced'} => {
-            // Falsy, matching isEarliestFloorUnknown: a blank row is not a floor.
+            // Falsy, matching `getEarliestSyncedWatermark`: a blank row is not a floor.
             const hasFloor = Boolean(getProviderEarliestSyncTime(db, providerType, identifier));
             const hasCursor =
                 getSyncStateValue(db, syncStateKey(providerType, identifier)) !== null;
@@ -2690,19 +2653,24 @@ interface ProviderFetchResult {
      */
     churnUnknownAdvisories: string[];
     /**
-     * True iff every fetch feeding the ADDITIVE commit-derived snapshot succeeded
-     * for this provider — `listRepos` AND every repo's `getCommits`. When false the
-     * run must NOT advance this provider's cursor/watermark AND must NOT write its
-     * snapshots (#231): commit counts are ADDED across runs (see
-     * {@link remergeStoredSnapshot}), so persisting the partially-fetched window now
-     * and re-fetching it next run would double-count. The only gap-free option is to
-     * discard this provider's partial data and re-cover the whole window next run —
-     * loud (errors surface every run) rather than a silent, permanent snapshot gap.
+     * True iff every fetch feeding this provider's commit-derived snapshot succeeded —
+     * `listRepos` AND every repo's `getCommits`. When false the run holds this provider's
+     * cursor/watermark: the window was not fully covered, so the next run should ask for it
+     * again (#231).
      *
-     * Best-effort fetches that are idempotent under re-delivery (PRs/review comments
-     * are max()-merged; commit diffs fall back to empty) do NOT clear this flag:
-     * holding the cursor for them would force an additive commit re-fetch, which is
-     * strictly worse than the bounded, self-healing undercount they already accept.
+     * IT NO LONGER GATES THE WRITE (IG1.2 / #318). Under the additive merge, commit counts were
+     * ADDED across runs, so persisting a half-covered window and re-fetching it next run would
+     * double-count and the partial data had to be discarded — at the cost of one permanently
+     * failing repo stalling the provider, and of #273 building a diffstat ratchet to salvage the
+     * expensive half. With `raw_commits` the partial rows are simply already there next time:
+     * every re-observed sha inserts nothing and each touched cell is recomputed from the union.
+     * So an incomplete provider KEEPS its rows and holds only the cursor — see the
+     * `cursorAdvances` push in {@link GitSync.syncProviders}, where that split lives, and V6.
+     *
+     * Best-effort fetches that are idempotent under re-delivery (PRs/review comments are
+     * max()-merged by {@link mergePRCounters}; commit diffs fall back to empty) do NOT clear this
+     * flag: holding the cursor for them buys nothing over the bounded, self-healing undercount
+     * they already accept.
      */
     complete: boolean;
 }
@@ -3364,7 +3332,7 @@ async function fetchProviderData(
         for (const [prIndex, pr] of rawPRs.entries()) {
             // EVERY listed PR feeds allPRs / prRecords unconditionally — the list row is
             // already in hand and cheap, and the per-day open/merge aggregate is combined
-            // across runs with max() (remergeStoredSnapshot), which is only idempotent if
+            // across runs with max() ({@link mergePRCounters}), which is only idempotent if
             // each run delivers the FULL per-day set. Dropping list rows here would
             // partition a single day's PRs across catch-up chunks and make max(partial,
             // partial) silently undercount prs_opened/prs_merged (#247 review SO-1; the
@@ -4311,8 +4279,10 @@ export class GitSync implements ConnectorInterface {
             // just imported and leaves the forward cursor untouched, so normal "Sync
             // now" keeps resuming from now; every other run advances the forward cursor
             // to `now`. Written per-provider even on an empty fetch (a complete run
-            // that found nothing legitimately covered its window), so a backfill can
-            // only ever widen backward and never re-covers a slice.
+            // that found nothing legitimately covered its window), so the hint only ever
+            // moves backward and the next backfill asks for strictly older history than
+            // this one did. Re-asking a slice would cost API calls, not correctness
+            // (IG1.3 / #319) — but there is no reason to pay it.
             // This provider instance's unwritable rows and accepted-row count are decided at the
             // WRITE now (#302/#307), inside `insertMany`, not here — so they live in the run-wide
             // per-container maps declared above, keyed by this instance's container key.

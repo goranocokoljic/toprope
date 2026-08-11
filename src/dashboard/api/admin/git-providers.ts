@@ -1109,14 +1109,21 @@ export function registerAdminGitProviderRoutes(
     );
 
     // POST /:id/sync-older-history — extend a provider's synced window BACKWARD
-    // (#229). Additive-only: it fetches the strictly-older commit slice
-    // [now − months, current_earliest_watermark] and merges it, never re-covering
-    // an already-synced span (the additive merge would double-count). `months` is
-    // ABSOLUTE ("keep this many months of history"), so re-pressing with the same
-    // value is idempotent by construction — the overlap guard turns it into a no-op.
+    // (#229). It fetches the older commit slice [now − months, current_earliest_watermark]
+    // and inserts it; `months` is ABSOLUTE ("keep this many months of history"), so
+    // re-pressing with the same value is a no-op the overlap guard answers without a fetch.
     // Fire-and-forget like "Sync now"; the terminal outcome lands on the row.
     // Crucially, this LOWERS the earliest watermark and does NOT advance the forward
     // cursor, so normal "Sync now" keeps resuming from now.
+    //
+    // THE WATERMARK IS A FETCH HINT, NOT A PROOF (IG1.3 / #319). It used to carry the
+    // disjointness proof the additive merge needed, which is why this route refused a
+    // provider whose floor was unrecoverable (#233) rather than re-cover a span and
+    // double-count it. Commits are now keyed by sha in `raw_commits` and each author-day is
+    // recomputed from that store, so an overlapping slice re-observes rows that are already
+    // there: no counter moves. That 409 is therefore deleted; the one below it — "the target
+    // is not older than what you already have" — is pure UX and stays, since asking for a
+    // slice that is entirely inside the current window is an inverted request, not a hazard.
     app.post<{Params: {id: string}; Body: unknown}>(
         '/api/admin/git/providers/:id/sync-older-history',
         async (request, reply) => {
@@ -1160,32 +1167,23 @@ export function registerAdminGitProviderRoutes(
                 return conflict(reply, 'A sync is already in progress for this provider');
             }
 
-            // Compute the disjoint older slice from the CURRENT earliest watermark.
+            // Compute the older slice from the CURRENT earliest watermark. A legacy provider
+            // with no recorded floor reads as `now` here — the bound that cannot fence the
+            // backfill off above its real floor — so its slice re-asks the whole held span.
+            // Under the new model that costs API calls and changes no counter.
             const now = new Date().toISOString();
-            const earliest = getEarliestSyncedWatermark(db, record.type, record.container, now);
-            // Fail closed on a LEGACY provider whose floor is unknown (#233). The
-            // additive merge is only correct over a slice proven disjoint from what is
-            // already imported, and the watermark is that proof — without it we cannot
-            // establish disjointness, and the old lazy guess (`now − 6mo`) was
-            // systematically too recent, silently double-counting the overlap. Refuse
-            // with the recovery path rather than guess.
-            if (earliest.kind === 'unknown') {
-                return conflict(
-                    reply,
-                    'This provider was first synced before history-window tracking existed, so how far back it already reaches is unknown — extending it now could double-count existing activity. Declare the known floor with `toprope git set-history-floor` to enable this.',
-                );
-            }
-            const currentEarliest = earliest.watermark;
+            const currentEarliest = getEarliestSyncedWatermark(db, record.type, record.container, now);
             const newTarget = subtractUtcMonths(now, months);
             // subtractUtcMonths returns null only for an unparseable `now`, which we
             // just produced — defensive, should never trip.
             if (newTarget === null) {
                 return serviceUnavailable(reply, 'Could not compute the history window');
             }
-            // Overlap guard: the target must be STRICTLY older than what is already
-            // synced. Otherwise there is nothing to extend and any fetch would
-            // re-cover an already-counted span — a typed 409 no-op, not a silent
-            // success or a double-count.
+            // UX guard: the target must be STRICTLY older than what is already synced.
+            // Otherwise there is nothing to extend — the requested window is entirely inside
+            // the current one, so the run would fetch a span it already holds and import
+            // nothing. A typed 409 no-op rather than a silent success that spends the
+            // operator's rate limit to change no row.
             if (newTarget >= currentEarliest) {
                 return conflict(
                     reply,
