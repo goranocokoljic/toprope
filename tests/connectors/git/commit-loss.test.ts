@@ -715,6 +715,24 @@ describe('unreturned commits are never silent (#275)', () => {
             // cursor instead of lowering it resets the next run to the bounded first-sync window,
             // so the recovery step for anything older has to be part of the remedy.
             expect(churnLine).toContain('sync older history');
+            // …and the OTHER completeness hole, which is the one #316's review caught: this very
+            // line names ai_signature_score and code_churn_rate as damaged, and the rewind it
+            // prescribes is precisely the operation that does NOT repair them. A rewind re-observes
+            // shas already in `raw_commits`, so the cell's COUNT(*) is unchanged, so
+            // `mergeObservedRates` takes its `newCommits <= 0` branch and carries the degraded
+            // stored rates forward. Without this caveat the operator runs the repair, the advisory
+            // clears, and two of the four metrics it names stay wrong forever — a false all-clear
+            // on top of a real defect. `cli/git-cache.ts` already said this for the diffstat purge;
+            // the two surfaces must not drift apart again.
+            expect(churnLine).toContain('PARTIAL REPAIR');
+            expect(churnLine).toContain('NOT code_churn_rate or ai_signature_score');
+            expect(churnLine).toMatch(/rebuilt from empty/);
+            // The second half's own reachability limit — naming a repair a config-file deployment
+            // cannot run, without saying so, is the same rule's REACHABLE arm.
+            expect(churnLine).toContain('no path to that second half');
+            // …and the claim the fix replaced must be gone, not merely supplemented: "lands the
+            // missing detail" asserted a COMPLETE repair, which is the false half.
+            expect(churnLine).not.toContain('lands the missing detail');
             // REACHABILITY. The old remedy was a delete-and-re-add, which the admin route refuses
             // for a config-file provider — so the line had to carry that caveat or send half the
             // deployments to a no-op. The new one edits a sync_state row and touches no

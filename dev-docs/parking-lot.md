@@ -101,6 +101,89 @@ did not touch.
   during the #320 cutover: still walking past 2025-07 after 2h40m on a 3-repo workspace. A `--months`
   flag on `sync git` reusing `parseFirstSyncWindowMonths` is the obvious shape (Medium, out-of-diff).
 
+## 2026-08-11 — #316 (IG1 epic finalize) full five-lens review
+
+Deduped across SO/SEC/OR/TST/DUP. The three High findings (the incomplete `permanentSpanRepair`
+remedy, and the two untested refusal-accounting branches) were FIXED in the review cycle and are
+not listed here. Everything below is Medium/Low, deferred deliberately.
+
+**Out-of-diff observations (never blockers, per the guard):**
+
+- [#316 review SO/SEC] `src/storage/migrations/046_raw_commits.sql` — `raw_commits`' PK carries
+  the mutable short repo name, so a repo RENAMED between the original import and a re-ask stores
+  its commits twice and the cell sums both. Inherited from `commit_diffstats` (#273). Reachability
+  rose with #319: `getEarliestSyncedWatermark` returning `now` makes "sync older history" issue a
+  maximally overlapping backfill by button press rather than by hand-edited SQL. Keying on a stable
+  repo id, or deduping the recompute on `(container, sha)`, is the fix (SO-9/SEC out-of-diff, Low).
+- [#316 review SEC] `src/connectors/git/sync.ts:4385-4398` — `recordRowRefusal`/`clearRowRefusal`
+  stayed inside the complete-only `cursorAdvances` closure while refusal REPORTING moved to both
+  arms, so a permanently-incomplete provider refusing rows every run raises the advisory line but
+  never the durable `doctor` alert. Already parked under #318; re-confirmed here.
+- [#316 review SEC] `src/connectors/git/sync.ts:4470-4471` — the commit-insert loop re-scans the
+  full `commits` array once per login, so it is O(logins x commits) per provider instance; a
+  `Map<login, AnalysisCommit[]>` built once matches the no-fan-out rule the neighbouring burst read
+  cites.
+- [#316 review TST] `tsconfig.json` excludes `tests/`, so TypeScript never checks the suite — the
+  enabling condition for stale test call sites like the 2-arg `toAnalysisCommit` calls in
+  `tests/connectors/git/cross-provider-analysis.test.ts`.
+- [#316 review TST] `src/connectors/git/projection.ts:295-299` — `foldDisjointMetrics`' weighted
+  `avg_time_to_merge_hours` branch has no test; it was untested under `mergeDailyDisjoint` too.
+- [#316 review OR] `src/connectors/git/sync.ts:3883` — `runSync` is a single ~1,065-line method.
+  Pre-existing; this epic added two passes to it rather than being able to split it.
+
+**In-diff Medium/Low, deferred (not reset-recoverable, but non-blocking):**
+
+- [#316 review SO-2/SEC-3] `src/connectors/git/sync.ts:2377` + `dashboard/api/admin/git-providers.ts:1168-1190`
+  — deleting the #233 `unknown` verdict makes "sync older history" on a legacy provider fetch an
+  uncapped `[now - months, now]` window that bypasses `catchUpUntil`, and because the floor is only
+  lowered on `result.complete`, an incomplete run re-issues the identical unbounded window next
+  press. Bound the legacy fallback at `min(now, cursor)`, or apply the catch-up cap to the
+  backfill's `until` (Medium — the highest-value deferred item).
+- [#316 review SEC-2/SO-6] `src/connectors/git/raw-commits.ts:233-240` — the `ON CONFLICT DO UPDATE`
+  clause never updates `raw_author_key` or the identity columns, so an author whose login appears on
+  re-observation strands their commits under the old key while the recompute writes a zeroed cell
+  under the new one. `is_merge` is frozen the same way and is currently hardcoded `0`, so a later
+  child that teaches the adapters merge status cannot backfill it by re-sync (Medium).
+- [#316 review SO-3] `src/connectors/git/sync.ts:4702` — the partial-cell exclusion from
+  `retainedRowCount` is one-sided, so a systematic per-commit defect touching >=5 author-days drives
+  the denominator to 0 and escalates a <1% loss to a failed run. Counting a partial cell in neither
+  side is the only option that yields a 0 denominator; a fractional or separate accounting would not
+  (Medium). Note the guard itself is now tested (this review's TST-1 fix).
+- [#316 review SO-4] `src/connectors/git/sync.ts:4111` — `commitInserts` is run-scoped, so peak RSS
+  now scales with the SUM of all providers' commits rather than the largest one; the failure mode is
+  an OOM before the transaction opens, discarding hours of fetching (Medium).
+- [#316 review SO-5] `src/connectors/git/sync.ts:4532` — `cellObservations.set` is last-write-wins
+  where `mergeDailyDisjoint` folded, affecting the six non-projected fields. **Corrects the #318
+  parking entry**, which claimed the lowercase-email mechanism was unreachable: it is reachable —
+  `toAnalysisCommit` sets `authorLogin = username || email`, so a provider omitting `username` sends
+  two mixed-case spellings of one address into two `metricsMap` groups that collapse to one cell key
+  (Medium).
+- [#316 review OR-1] ~75 IG1-attributed comment sites across 14 `src/` files restate one fact, three
+  of them in already-applied migration files. The next model change repeats this diff. Collapse to
+  one sentence per site with the argument left in the design doc (Medium).
+- [#316 review OR-2/OR-3] `src/connectors/git/sync.ts:4217`/`4227`/`4648-4677` — `recordedSkips` and
+  `cellsWithRefusedCommits` are one map wearing two hats, the 3-part cell key is rebuilt inline at
+  three sites, and `daysByAuthor` is a nested map for a flat key whose `?? [cell.date]` fallback is
+  unreachable (Medium/Low).
+- [#316 review DUP-1] `src/connectors/git/sync.ts:4450` — `aggregateDailyMetrics` still runs a full
+  `detectBurstsByDate` pass whose result is now discarded, so burst detection runs twice per sync and
+  `avg_commit_size` is restated in two places (Medium — cost and drift, not wrong numbers).
+- [#316 review DUP-2/OR-6] `tests/connectors/git/grain-consumers.test.ts:61` and
+  `raw-commits-write-boundary.test.ts:72` — `dumpTables` is a byte-identical clone carrying a
+  hand-maintained 3-table column list on which both files' byte-identity claims depend. Extract it,
+  ideally deriving the columns from `PRAGMA table_info` (Medium).
+- [#316 review TST-3/TST-4] `repo` threading (1/4 of the PK) and the `ai_signature` derivation at
+  `sync.ts:4504` both survive mutation to a constant with 1,474 tests green. Add a same-sha-two-repos
+  row to V6, and read `raw_commits.ai_signature` back after the golden run (Medium).
+- [#316 review TST-5..TST-10, SO-7/SEC-5, SO-8, SEC-4-adjacent, OR-4/OR-5/OR-7] smaller test and
+  clarity items: the skip dedup has no N>1-commits-per-day fixture; `commitWeightedMean` lost its
+  `total === 0` arm; V4's "only extra fetches" half is a tautology; the migration test pins a
+  `DO NOTHING` shape production does not use; the golden re-records itself when absent; the V7
+  citation check matches `.skip`ped cases; `readAuthorBurstsByDay`'s "bounded" docstring does not
+  hold on a first sync; the deleted-cursor remedy overstates the first-sync bound for the
+  config-file path (partially corrected in this cycle); `refusalReports` closures are byte-identical;
+  two new functions return values no production caller reads (Low).
+
 ## Backlog (pre-policy deferrals)
 
 - Deferred Medium/Low findings from before this policy live in PR comments

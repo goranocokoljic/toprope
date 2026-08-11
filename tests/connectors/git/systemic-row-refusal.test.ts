@@ -418,6 +418,117 @@ describe('#306 a systemic row refusal does not report clean', () => {
         });
     });
 
+    /**
+     * IG1 (#316) review, TST-1 — the input class the refusal accounting was built for and no
+     * fixture could reach.
+     *
+     * Every pre-IG1 refusal fixture makes a commit unwritable through a value the AUTHOR-DAY also
+     * carries (`author.login = {}` → `invalid_identity` on both; a 2099 date → `future_date` on
+     * both), so the cell is refused alongside its commits and never reaches the denominator at
+     * all. `cellsWithRefusedCommits` exists for the OTHER shape — a commit refused on a column
+     * only the commit carries, whose author-day survives on its remaining commits — and deleting
+     * the guard left the entire git suite green, because nothing produced that shape.
+     *
+     * `sha` is that column. It is read straight off the response body with no upstream parse (the
+     * validator's own comment says so), it is not an input to `aggregateDailyMetrics`, and it is
+     * refused row-level as `invalid_identity`. A non-string `sha` beside a good commit on the same
+     * day therefore refuses exactly one COMMIT and writes the cell.
+     *
+     * Why it matters rather than being an accounting nicety: `isSystemicRowRefusal` weighs skips
+     * against retained rows, so a day counted on BOTH sides cancels itself out and dilutes the
+     * ratio in the FAIL-OPEN direction — with precisely the input class the guard is there to
+     * catch, a provider refusing most of what it builds.
+     */
+    describe('a cell that lost a commit is not also counted as retained (IG1 TST-1)', () => {
+        const DAY = '2024-01-15';
+
+        /**
+         * One author-day, two commits: one ordinary, one whose `sha` is a non-string. Both slice
+         * to the same `author_day`, so `aggregateDailyMetrics` folds them into ONE cell that is
+         * itself perfectly writable.
+         */
+        function githubOneRefusedCommitRoutes(wholeDays: readonly string[] = []): Route[] {
+            const commitOn = (day: string, sha: unknown): Record<string, unknown> => ({
+                sha,
+                commit: {
+                    author: {name: 'Alice', email: AUTHOR_EMAIL, date: `${day}T10:00:00.000Z`},
+                    message: 'feat: work',
+                },
+                author: {login: 'alice-gh'},
+            });
+            const good = commitOn(DAY, 'sha-good');
+            // `{}` rather than a blank string: the validator puts `typeof` first precisely because
+            // a non-string, non-falsy value would otherwise reach `.trim()` and throw a bare
+            // TypeError, which is NOT a RawAuthorDailyError and would roll the whole run back.
+            const badSha = commitOn(DAY, {});
+            const whole = wholeDays.map((d) => commitOn(d, `sha-${d}`));
+            // Resolved PER SHA, not a fixed body: the detail fetch's `commit.author.date` is what
+            // the analyzer keys the day on, so returning one commit for every sha collapses every
+            // day onto DAY and the "intact day" this control needs never exists.
+            const byS = new Map([good, ...whole].map((c) => [String(c.sha), c]));
+            return [
+                {
+                    match: /\/repos\/test-org\/repo1\/commits\?/,
+                    body: [good, badSha, ...whole],
+                },
+                {
+                    match: /\/repos\/test-org\/repo1\/commits\/[^?]+$/,
+                    bodyFor: (url: string): Record<string, unknown> => ({
+                        ...(byS.get(decodeURIComponent(url.split('/').pop()!)) ?? good),
+                        stats: {additions: 40, deletions: 5, total: 45},
+                        files: [
+                            {filename: 'src/foo.ts', additions: 30, deletions: 5, status: 'modified'},
+                        ],
+                    }),
+                },
+                ...githubRoutes(),
+            ];
+        }
+
+        it('reports the day as skipped and NOT as retained, though the cell was written', async () => {
+            seedAlice(db);
+            vi.stubGlobal('fetch', makeCountingFetch(githubOneRefusedCommitRoutes()).fetchMock);
+
+            const result = await runSync(db, [GITHUB_CONFIG]);
+
+            // NON-VACUITY, and the whole point of the fixture: the author-day row IS in the store.
+            // Without this the assertion below would also pass for a run that wrote nothing, which
+            // is the shape every other fixture in this file already produces.
+            expect(rawRowCount(db, 'github')).toBe(1);
+            // One commit was refused, at the author-day grain the advisory speaks in.
+            expect(skipLineOf(result.errors)).toContain('refused as invalid_identity');
+
+            // THE GUARD. The day is in the numerator, so it must not also be in the denominator:
+            // `retained` is 0, not 1. Deleting the `cellsWithRefusedCommits` check makes this read
+            // `{skipped: 1, retained: 1}` — a day cancelling itself out of the systemic ratio.
+            expect(getProviderRowRefusal(db, 'github', 'test-org')).toMatchObject({
+                skipped: 1,
+                retained: 0,
+            });
+        });
+
+        it('excludes ONLY the damaged cell — an intact day in the same run still counts', async () => {
+            seedAlice(db);
+            vi.stubGlobal(
+                'fetch',
+                makeCountingFetch(githubOneRefusedCommitRoutes(['2024-01-16'])).fetchMock,
+            );
+
+            await runSync(db, [GITHUB_CONFIG]);
+
+            // The positive control for the test above. A guard that excluded EVERY cell once any
+            // refusal occurred would satisfy the first assertion for the wrong reason and quietly
+            // drive the denominator to 0 on every partially-refused run — which is what escalates
+            // an incidental loss into a failed run. Two days, one damaged and one intact: the
+            // damaged one is excluded and the intact one is not.
+            expect(rawRowCount(db, 'github')).toBe(2);
+            expect(getProviderRowRefusal(db, 'github', 'test-org')).toMatchObject({
+                skipped: 1,
+                retained: 1,
+            });
+        });
+    });
+
     describe('the marker survives the retry the error itself provokes', () => {
         it('is NOT cleared by a later run that imported nothing', async () => {
             seedAlice(db);

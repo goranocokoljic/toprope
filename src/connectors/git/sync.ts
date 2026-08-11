@@ -764,24 +764,41 @@ function formatSkippedPRRecords(
  * one operation the codebase documented as corrupting (#262) and is now a no-op on the counters,
  * because `raw_commits` is sha-keyed and the author-day is recomputed from it. REACHABLE: it
  * touches only a `sync_state` row, so unlike the delete-and-re-add it replaces it works for a
- * config-file provider too — the admin delete route 409s those. COMPLETE: deleting the cursor
- * rather than lowering it resets the next run to the bounded first-sync window, so the recovery
- * step for anything older ("sync older history") is named rather than left implicit.
+ * config-file provider too — the admin delete route 409s those. COMPLETE, and this is the arm
+ * that nearly shipped wrong: the rewind repairs the VOLUME columns only. It adds no NEW commit
+ * to the day, so `mergeObservedRates` carries `code_churn_rate` and `ai_signature_score` forward
+ * from the stored value rather than taking the run's fresh observation — and those two are named
+ * as damaged by BOTH advisories that print this string. Prescribing the rewind without that
+ * caveat is the false all-clear the rule exists to prevent: the advisory clears, the volumes
+ * correct, and two of the four named metrics stay degraded. The second half (rebuild the cell
+ * from empty) and its own reachability limit are therefore part of the remedy, not an extra.
+ * `cli/git-cache.ts` states the same split for the diffstat purge; this is the single copy for
+ * the sync advisories, so the two must say the same thing.
  */
 function permanentSpanRepair(): string {
     return (
         'The repair is to move this provider\'s git_last_sync sync_state row BACK to just before ' +
-        'the affected span and re-sync, which re-asks it and lands the missing detail. ' +
+        'the affected span and re-sync, which re-asks it. ' +
         'Re-importing over rows that are already stored is SAFE: commits are keyed by their sha ' +
         'in raw_commits and each author-day is RECOMPUTED from that store rather than added to, ' +
         'so a re-observed commit changes nothing and only API calls are spent (IG1, #316). ' +
-        'DELETING that row rather than lowering it also works, but it makes the next run a FIRST ' +
-        `sync, which reaches back only ${FIRST_SYNC_WINDOW_DEFAULT_MONTHS} months — for anything ` +
-        'older than that, run "sync older history" afterwards. This applies to a config-file ' +
-        'provider exactly as to a DB-connected one, because it touches no git_providers row. It ' +
-        'used to be the one action that was never safe (it permanently doubled every commit ' +
-        'metric in the span, #262), and the repair was a delete-and-re-add the admin route ' +
-        'refuses for config-file providers; neither is true now'
+        'IT IS A PARTIAL REPAIR: it restores lines_added, lines_removed, files_changed and ' +
+        'avg_commit_size, which are summed straight off the re-observed rows, but NOT ' +
+        'code_churn_rate or ai_signature_score — a rewind adds no NEW commit to the day, so those ' +
+        'two are deliberately carried forward from the stored value rather than re-observed ' +
+        '(which is what stops an ordinary PR-only re-sync zeroing an intact day). They stay ' +
+        'degraded until a genuinely new commit lands on that day. Re-deriving them needs the cell ' +
+        'rebuilt from empty: for a provider registered in the admin UI, delete and re-add it, ' +
+        'accepting that this drops every day older than the window a re-added provider starts ' +
+        'from. A config-file provider has no path to that second half. ' +
+        'DELETING the git_last_sync row rather than lowering it also works for the volume half, ' +
+        'but it makes the next run a FIRST sync, which — where the run supplies a first-sync ' +
+        `window, as the admin Sync-now path does — reaches back only ${FIRST_SYNC_WINDOW_DEFAULT_MONTHS} ` +
+        'months; for anything older than that, run "sync older history" afterwards. The rewind ' +
+        'itself applies to a config-file provider exactly as to a DB-connected one, because it ' +
+        'touches no git_providers row. It used to be the one action that was never safe (it ' +
+        'permanently doubled every commit metric in the span, #262), and the repair was a ' +
+        'delete-and-re-add the admin route refuses for config-file providers; neither is true now'
     );
 }
 
@@ -3606,9 +3623,10 @@ async function fetchProviderData(
         // The permanence claim and its remedy, staged. True only if this run's window is
         // recorded as covered — on the three discard paths the commits are re-asked next run
         // and these zeros never land, so making the claim there would send an operator to
-        // rebuild an intact span. The remedy names the delete cascade rather than a bare cursor
-        // purge, which would re-import over surviving raw rows and double every commit metric
-        // in the span (#262).
+        // rebuild an intact span. The remedy is {@link permanentSpanRepair}: since IG1 (#316) it
+        // leads with the cursor rewind, which re-importing over surviving raw rows no longer
+        // double-counts (#262 was the additive merge), and names the delete-and-re-add only as
+        // the second half that re-derives the two carried-forward rates.
         if (fallbackDiffFailures > 0) {
             diffLossAdvisories.push(
                 `${DIFFS_NOT_SUPPLIED_PREFIX} [${providerType}] the ${fallbackDiffFailures} ` +
@@ -4339,8 +4357,10 @@ export class GitSync implements ConnectorInterface {
                 // THIS instance's write-time accounting, finished by the time this closure runs
                 // (inside the write transaction, after both write passes). `retainedRowCount` is
                 // the accepted-row denominator `isSystemicRowRefusal` weighs the refusals against.
+                // PR-record skips are NOT read here: reporting them moved to `refusalReports`,
+                // which runs on both completeness arms. This closure keeps only what the
+                // escalation below weighs — author-day refusals against accepted rows.
                 const skippedRows = skippedRowsByContainer.get(instanceKey) ?? [];
-                const skippedPRRecords = skippedPRRecordsByContainer.get(instanceKey) ?? [];
                 const retainedRowCount = retainedRowCountByContainer.get(instanceKey) ?? 0;
                 // This provider's window IS being recorded as covered, which is the exact
                 // premise of its drop advisories (#275). Staged, not pushed: this closure runs

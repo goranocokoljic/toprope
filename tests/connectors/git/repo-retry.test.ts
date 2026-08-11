@@ -22,6 +22,7 @@ import {runMigrations} from '../../../src/storage/migrator';
 import {addTeam} from '../../../src/registry/teams';
 import {addDeveloper} from '../../../src/registry/developers';
 import {
+    AUTHOR_DAYS_SKIPPED_PREFIX,
     GitSync,
     GIT_REPO_RETRY_DELAYS_MS,
     GIT_RUN_BEST_EFFORT_RETRY_SLEEP_BUDGET_MS,
@@ -340,6 +341,72 @@ describe('in-run repo retry (#272)', () => {
         ).toBe(1);
         // …including the stall counter that drives doctor's "not advancing" alert (#235).
         expect(getProviderStall(db, 'github', 'test-org')?.runs).toBe(1);
+    });
+
+    /**
+     * IG1 (#316) review, TST-2 — the refusal-reporting arm IG1.2 created and nothing exercised.
+     *
+     * Before IG1.2 an incomplete provider `continue`d before writing anything, so it could not
+     * refuse a row: refusal reporting only ever ran for a COMPLETE provider. IG1.2 made the
+     * partial result worth keeping (the test above), which means an incomplete provider now
+     * writes — and therefore refuses — and reporting moved outside the `if (result.complete)`
+     * gate with a DIFFERENT permanence sentence per arm. Gating the report back onto the
+     * complete arm left all 1,610 git/cli tests green.
+     *
+     * The wording is the whole point, not decoration. For a covered window the advisory says
+     * nothing re-asks the refused rows, which is what justifies a repair. Printing that for a
+     * HELD cursor would send an operator to rebuild a span the next run re-fetches by itself —
+     * the graduated "a remedy printed to an operator is executable advice" rule broken in the
+     * direction that causes needless, destructive work.
+     */
+    it('reports refusals for an INCOMPLETE provider, and says the window will be re-asked (IG1)', async () => {
+        seedAlice(db);
+        const createGitProvider = await getCreateGitProvider();
+        createGitProvider.mockReturnValue(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('bad-repo'), makeRepo('good-repo')]),
+                getCommits: vi.fn().mockImplementation(async (repo: string): Promise<GitCommit[]> => {
+                    // The bad repo exhausts its retries, so the run's window is never recorded as
+                    // covered — this is what makes the provider INCOMPLETE.
+                    if (repo === 'bad-repo') {
+                        throw new GitProviderFetchError('GitHub API server error 503: /commits', 503);
+                    }
+                    // …while the good repo delivers one storable commit and one the write boundary
+                    // must refuse. A non-string `sha` is refused row-level as `invalid_identity`:
+                    // it is read straight off the response with no upstream parse, so it reaches
+                    // the boundary rather than being dropped earlier.
+                    return [
+                        makeCommit('c-good'),
+                        {...makeCommit('c-bad'), sha: {} as unknown as string},
+                    ];
+                }),
+            }),
+        );
+
+        const result = await runSync(db);
+
+        // NON-VACUITY on both halves: the provider really is incomplete (cursor held), and it
+        // really did write. Either one alone would let this test pass against the old behavior.
+        expect(readState(db, FORWARD_KEY)).toBeUndefined();
+        expect(
+            (db.prepare('SELECT COUNT(*) AS n FROM raw_commits').get() as {n: number}).n,
+        ).toBe(1);
+
+        const skipLine = result.errors.find((e) => e.startsWith(AUTHOR_DAYS_SKIPPED_PREFIX));
+        // THE REPORT ITSELF. Gate it back behind `result.complete` and this is undefined.
+        expect(skipLine).toBeDefined();
+        expect(skipLine).toContain('[github/test-org]');
+        expect(skipLine).toContain('refused as invalid_identity');
+
+        // THE ARM. A held cursor means the next run re-asks the window, so the line must NOT make
+        // the permanence claim the covered arm makes.
+        expect(skipLine).toContain('did NOT record its window as covered');
+        expect(skipLine).toContain('the next run re-asks this window');
+        expect(skipLine).not.toContain('nothing re-asks them');
+
+        // …and the numeric field the operator surfaces read moves with it, rather than the
+        // refusal being visible only in prose.
+        expect(result.snapshotsSkipped).toBeGreaterThan(0);
     });
 
     it('reports the LAST fault of an exhausted sequence, not the first', async () => {
