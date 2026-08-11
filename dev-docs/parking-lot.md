@@ -59,6 +59,18 @@ epic #316 review as well — parked here so they survive if that review does not
 - [#318 review] `src/aggregation/dates.ts:82` (`isUtcDay`) — shape-only, so `raw_author_daily.date` still accepts calendar-impossible days like `2026-02-31`. #318 added `isComputableUtcDay` beside it, so the write boundary now has a total predicate to adopt; adopting it there is a behavior change this child did not make (out-of-diff).
 - [#318 review] `src/connectors/git/sync.ts` (`fetchProviderData`) — a commit reachable from two repos of one container is counted once per repo, before and after this change (out-of-diff).
 
+## 2026-08-11 — #319 (IG1.3) SEC fast-lens
+
+The one Medium (the unknown-floor fallback bounding a legacy provider's backfill ABOVE
+its real floor, stranding history) was fixed in the commit itself, along with the Low
+that overstated the delete preview's `commits` equality. What is left is out-of-diff.
+
+- [#319 review] `src/dashboard/frontend/src/pages/admin/AdminGitProviders.tsx:1826` — the
+  "Sync older history" button title says "Fetch never-synced older history for this
+  provider", which is now inaccurate for a provider whose floor is a guess: the slice may
+  deliberately re-ask a span already held (out-of-diff; the diff's edit to this file is a
+  different comment).
+
 ## Backlog (pre-policy deferrals)
 
 - Deferred Medium/Low findings from before this policy live in PR comments

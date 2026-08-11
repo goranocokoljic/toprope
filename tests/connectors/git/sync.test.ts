@@ -3086,29 +3086,49 @@ describe('getEarliestSyncedWatermark — the backfill fetch hint (#229/#233, IG1
     // THE INPUT CLASS THE DELETED `unknown` VERDICT OWNED (IG1.3 / #319). A LEGACY provider —
     // forward cursor present, floor absent, i.e. one first synced before #229 recorded floors —
     // used to return `{kind: 'unknown'}` and make the backfill route 409, because under the
-    // additive merge the default guess is systematically too RECENT and the overlap it implies
-    // was permanently double-counted. Commits are sha-keyed now and each author-day is recomputed
-    // from `raw_commits`, so that overlap costs API calls and nothing else: the legacy provider
-    // gets the ordinary guess and the backfill runs. This case is the whole reason the return type
-    // is a plain string — a surviving `.kind` read is a build error, not a runtime fallback.
-    it('a LEGACY provider (cursor, no floor) reads as the default window, not a refusal (#319)', () => {
+    // additive merge any overlap the guess implied was permanently double-counted. Commits are
+    // sha-keyed now, so overlap costs API calls and the backfill runs — but the guess it runs
+    // with must be `now`, NOT the default window.
+    //
+    // WHY THIS IS THE CASE THAT MATTERS. The backfill walks only BELOW this value and records the
+    // slice it asked for as the new floor, so a bound ABOVE the real floor strands everything in
+    // between, permanently and with nothing to report it. The default-window guess is not
+    // "always too recent": true floor = first_sync − window, so it is too OLD whenever
+    // window + age < 6 months — a provider synced days ago with a 3-month window has a true floor
+    // of now − 3mo, and a bound of now − 6mo would fence off three months of real history. `now`
+    // is the only bound that cannot do that. Reverting this branch makes THIS test fail and
+    // leaves the never-synced case below green, which is the pair the two branches disagree on.
+    it('a LEGACY provider (cursor, no floor) is bounded at NOW, not at the default window (#319)', () => {
         const now = '2026-03-15T12:00:00.000Z';
         db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
             syncStateKey('github', 'test-org'),
             '2026-03-01T00:00:00.000Z',
         );
-        expect(getEarliestSyncedWatermark(db, 'github', 'test-org', now)).toBe(
-            firstSyncSince(now, FIRST_SYNC_WINDOW_DEFAULT_MONTHS),
-        );
-        // …and indistinguishable from the never-synced provider above, which is the point:
-        // the two states no longer have different answers, so nothing downstream can branch.
-        const fresh = makeDb();
+        expect(getEarliestSyncedWatermark(db, 'github', 'test-org', now)).toBe(now);
+        // Concretely: the too-old default would have fenced a 3-month-deep provider off above
+        // its own floor. Stated as the comparison the bug turns on, not just as a value.
+        const defaultGuess = firstSyncSince(now, FIRST_SYNC_WINDOW_DEFAULT_MONTHS);
+        const realFloorOfAYoungProvider = firstSyncSince(now, 3);
+        expect(defaultGuess < realFloorOfAYoungProvider).toBe(true);
+        expect(getEarliestSyncedWatermark(db, 'github', 'test-org', now) > realFloorOfAYoungProvider).toBe(true);
+    });
+
+    it('distinguishes the legacy provider from the never-synced one', () => {
+        // The two no-floor states are NOT the same state and must not answer the same: nothing
+        // has been imported for the never-synced one, so the window its first sync will use is
+        // the honest floor and bounding it at `now` would make the backfill re-ask a span the
+        // first sync is about to cover anyway.
+        const now = '2026-03-15T12:00:00.000Z';
+        const legacy = makeDb();
         try {
-            expect(getEarliestSyncedWatermark(fresh, 'github', 'test-org', now)).toBe(
+            legacy
+                .prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)')
+                .run(syncStateKey('github', 'test-org'), '2026-03-01T00:00:00.000Z');
+            expect(getEarliestSyncedWatermark(legacy, 'github', 'test-org', now)).not.toBe(
                 getEarliestSyncedWatermark(db, 'github', 'test-org', now),
             );
         } finally {
-            fresh.close();
+            legacy.close();
         }
     });
 
@@ -3294,11 +3314,10 @@ describe('declareEarliestSyncedFloor — the admin recovery path (#233)', () => 
             ok: false,
             reason: 'invalid_floor',
         });
-        // Still floor-less after a rejected declare — the cursor stands, no floor written,
-        // so the reader falls back to the default window rather than to the rejected value.
-        expect(getEarliestSyncedWatermark(db, 'github', 'test-org', NOW)).toBe(
-            firstSyncSince(NOW, FIRST_SYNC_WINDOW_DEFAULT_MONTHS),
-        );
+        // Still floor-less after a rejected declare — the cursor stands and no floor was
+        // written, so the reader stays on the legacy fallback (`now`) rather than adopting
+        // the rejected value.
+        expect(getEarliestSyncedWatermark(db, 'github', 'test-org', NOW)).toBe(NOW);
         expect(readState(earliestSyncStateKey('github', 'test-org'))).toBeNull();
     });
 

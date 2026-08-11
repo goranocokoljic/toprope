@@ -318,10 +318,11 @@ export function deleteProviderWithCascade(
         //
         // Deliberately NOT reported on {@link ProviderDeleteResult}. The DTO enumerates the
         // history being destroyed in the operator's own terms — author-days and commits — and
-        // the preview's `commits` figure IS this row count restated at the grain the
-        // confirmation dialog speaks in (`raw_author_daily.commits` is `COUNT(*)` over exactly
-        // these rows). A second, finer count of the same facts would read as a second thing
-        // being deleted.
+        // the preview's `commits` figure is the same facts at the cell grain, since
+        // `raw_author_daily.commits` is a `COUNT(*)` over these rows. A second, finer count of
+        // the same facts would read as a second thing being deleted. The two can diverge in one
+        // direction only: a cell refused at the write boundary (#302/#307) leaves its commits
+        // stored with no cell, so the preview UNDERstates by those rows and never overstates.
         deleteContainerRawCommits(db, type, container);
         const rawRows = deleteContainerRawDaily(db, type, container);
         const prRows = db

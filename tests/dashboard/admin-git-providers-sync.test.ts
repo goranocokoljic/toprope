@@ -1409,11 +1409,17 @@ describe('admin git-provider sync-now API (#199)', () => {
             expect(res.statusCode).toBe(202);
             await waitForSyncStatus(id, 'ok');
 
-            // The fallback guess (now - 6mo) became the slice's upper bound…
+            // The slice is bounded at NOW, not at the default-window guess. That is the whole
+            // safety property of removing the 409: how far back this provider already reaches
+            // is unrecoverable, and the default guess is too OLD whenever window + age < 6
+            // months — bounding there would fence the backfill off ABOVE the real floor and
+            // strand the span in between, permanently and silently. `now` re-asks everything,
+            // which the sha-keyed store makes free.
             const until = getCommits.mock.calls[0][2] as string;
-            const expUntil = new Date(before);
-            expUntil.setUTCMonth(expUntil.getUTCMonth() - 6);
-            expect(Math.abs(Date.parse(until) - expUntil.getTime())).toBeLessThan(60_000);
+            expect(Math.abs(Date.parse(until) - before)).toBeLessThan(60_000);
+            const defaultGuess = new Date(before);
+            defaultGuess.setUTCMonth(defaultGuess.getUTCMonth() - 6);
+            expect(Date.parse(until)).toBeGreaterThan(defaultGuess.getTime());
             // …from the requested 60-month target, and the floor now records it.
             const since = getCommits.mock.calls[0][1] as string;
             expect(readState(EARLIEST_KEY)).toBe(since);

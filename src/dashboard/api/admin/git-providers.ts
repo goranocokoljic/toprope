@@ -1168,9 +1168,9 @@ export function registerAdminGitProviderRoutes(
             }
 
             // Compute the older slice from the CURRENT earliest watermark. A legacy provider
-            // with no recorded floor reads as the default first-sync window here — a guess that
-            // is systematically too RECENT, which under the new model means the slice may
-            // re-ask a span already held (extra API calls) and never that it double-counts.
+            // with no recorded floor reads as `now` here — the bound that cannot fence the
+            // backfill off above its real floor — so its slice re-asks the whole held span.
+            // Under the new model that costs API calls and changes no counter.
             const now = new Date().toISOString();
             const currentEarliest = getEarliestSyncedWatermark(db, record.type, record.container, now);
             const newTarget = subtractUtcMonths(now, months);

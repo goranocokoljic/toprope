@@ -2329,22 +2329,31 @@ function setProviderEarliestSyncTime(
  * deleted along with the proof, and the too-recent guess becomes the ordinary answer for a legacy
  * provider — it can only make a backfill ask for MORE than it strictly needed.
  *
- * What the floor still decides is COMPLETENESS, which is why it is worth keeping accurate: the
- * backfill walks only BELOW this value, so a floor that is too OLD strands the span between it and
- * the truth. Nothing in this build can produce one (the value is written by a first sync from the
- * window it actually reached, and lowered by each backfill to the slice it actually asked for);
- * a hand-declared floor can, which is what {@link declareEarliestSyncedFloor} guards.
+ * What the floor still decides is COMPLETENESS, and the two error directions are no longer
+ * symmetric — which is what picks the fallback below. The backfill walks only BELOW this value
+ * and records the slice it asked for as the new floor, so:
+ *  - too RECENT ⇒ the slice re-covers a held span. Costs API calls. Self-correcting.
+ *  - too OLD ⇒ the span between this value and what was really imported is never fetched, by
+ *    this run or any later one, and nothing reports the hole.
+ * So where the value must be guessed, it is guessed at the safe extreme.
  *
- * A provider with NO floor recorded gets the window its first sync would use. Two caveats on that,
- * neither introduced here:
- *  - It is the DEFAULT window. The first sync's window is caller-supplied (1–60 months), so a
- *    backfill run BEFORE that first sync (API-only — the UI hides the control until a provider has
- *    synced) can leave a gap against whatever window the later first sync actually uses.
- *    Pre-existing from #229.
- *  - Renaming a provider's container (a supported PATCH) ORPHANS its cursor and floor rows rather
- *    than re-keying them, so the renamed provider reads as never-synced here while its old activity
- *    is still stored. Pre-existing #228-era: the next forward sync already re-imports its window as
- *    a "first" sync.
+ * THE TWO NO-FLOOR STATES ARE NOT THE SAME STATE, and conflating them is how the first cut of
+ * this function lost data (found by the #319 SEC pass):
+ *  - **No floor AND no cursor** — nothing has been imported, so the window a first sync WOULD use
+ *    is the honest floor. Unchanged from #229.
+ *  - **No floor BUT a cursor** — the LEGACY provider the deleted `unknown` verdict was about. Its
+ *    first sync already happened, with a window this function does not know and cannot recover
+ *    (`sync_state` stores neither the instant nor the window). The default-window guess is NOT
+ *    "systematically too recent": the true floor is `first_sync − window`, so the guess is too OLD
+ *    whenever `window + age < 6 months` — a provider synced last week with a 3-month window has a
+ *    true floor of `now − 3.5mo`, and a backfill bounded at `now − 6mo` would strand ten weeks of
+ *    history permanently. `now` is the only bound that cannot: it makes the slice cover everything,
+ *    which under the sha-keyed store is a re-observation, and leaves the recorded floor honest.
+ *
+ * Remaining caveat, not introduced here: renaming a provider's container (a supported PATCH)
+ * ORPHANS its cursor and floor rows rather than re-keying them, so the renamed provider reads as
+ * never-synced here while its old activity is still stored. Pre-existing #228-era — the next
+ * forward sync already re-imports its window as a "first" sync.
  */
 export function getEarliestSyncedWatermark(
     db: Database.Database,
@@ -2355,10 +2364,13 @@ export function getEarliestSyncedWatermark(
     // Falsy, not just non-null: a blank-valued floor row is no floor at all.
     const stored = getProviderEarliestSyncTime(db, providerType, identifier);
     if (stored) return stored;
-    // No floor recorded — a never-synced provider, or a legacy one whose first sync predates
-    // #229. firstSyncSince returns '' only when `now` is unparseable; fall back to `now` (a
-    // zero-width window the caller's overlap guard rejects) rather than '', which downstream
-    // would read as "walk all history".
+    // A cursor with no floor is the LEGACY state: something WAS imported and how far back is
+    // unrecoverable, so bound the backfill at `now` and let it re-ask rather than risk fencing
+    // it off above the real floor. See the doc above for why this is not symmetric.
+    if (getSyncStateValue(db, syncStateKey(providerType, identifier)) !== null) return now;
+    // Never synced: the window its first sync will use is the honest floor. firstSyncSince
+    // returns '' only when `now` is unparseable; fall back to `now` (a zero-width window the
+    // caller's guard rejects) rather than '', which downstream reads as "walk all history".
     return firstSyncSince(now, FIRST_SYNC_WINDOW_DEFAULT_MONTHS) || now;
 }
 
