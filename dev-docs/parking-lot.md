@@ -92,6 +92,14 @@ did not touch.
   the deleted container's totals, and `pr_review_metrics` / `coaching_signals` have no
   covering command at all. Now carried as an active KB lesson
   (`a-retraction-stops-at-the-grain-it-is-keyed-by`) rather than a code change.
+- [#320 cutover, not a review finding] `src/cli.ts` `sync git` / `sync all` — the CLI path passes
+  no `firstSyncWindowMonths`, so on a provider with no cursor `firstSyncSince` returns `''` and the
+  first sync walks ALL history. Deliberate and documented ("degrades to the legacy behavior rather
+  than importing a wrong window"), and harmless to accuracy now that a cursor is a fetch hint — but
+  it means the ONLY bounded first sync is the admin route, and an operator following 046's notice
+  ("config-file providers sync only via `toprope sync git`") gets the unbounded one. Observed live
+  during the #320 cutover: still walking past 2025-07 after 2h40m on a 3-repo workspace. A `--months`
+  flag on `sync git` reusing `parseFirstSyncWindowMonths` is the obvious shape (Medium, out-of-diff).
 
 ## Backlog (pre-policy deferrals)
 
