@@ -18,6 +18,7 @@ import {
     rowRefusalStateKey,
 } from '../../src/connectors/git/sync';
 import {ROW_LEVEL_REFUSALS} from '../../src/connectors/git/raw-author-daily';
+import {clearGitResetNotice} from '../../src/connectors/git/reset-notice';
 import {createProvider} from '../../src/connectors/git/providers/store';
 import {createCommitDiffstatCache} from '../../src/connectors/git/diffstat-cache';
 import {loadServerKey} from '../../src/connectors/git/providers/secret';
@@ -164,6 +165,35 @@ describe('runDoctor', () => {
         expect(allOutput).toContain('aggregate backfill');
         expect(allOutput).toContain('pr_review_metrics');
         expect(allOutput).toContain('clear-reset-notice');
+    });
+
+    /**
+     * #317: migration 046 raises the SAME marker under a new id, so the doctor gate has to hold
+     * for it too — and it has to keep holding until the operator acknowledges THAT id. The
+     * value-scoped acknowledgement is the point: `clearGitResetNotice` deletes only the exact
+     * value it was handed, so acknowledging the older 043 rebuild can never silently clear the
+     * 046 one (the #235 false all-clear, reached through the command written to close it).
+     */
+    it('FAILS on the 046 reset notice, and passes once THAT id is acknowledged', async () => {
+        db.prepare('INSERT INTO sync_state (key, value) VALUES (?, ?)').run(
+            'git_data_reset_pending',
+            '046',
+        );
+
+        expect(await runDoctor(db, disabledConfig(), tmpConfigPath, MIGRATIONS_DIR)).toBe(false);
+        expect([...output, ...errors].join('\n')).toContain('migration 046 reset the imported git data');
+
+        // Acknowledging the WRONG id leaves the doctor failing.
+        expect(clearGitResetNotice(db, '043')).toBe(false);
+        output.length = 0;
+        errors.length = 0;
+        expect(await runDoctor(db, disabledConfig(), tmpConfigPath, MIGRATIONS_DIR)).toBe(false);
+
+        expect(clearGitResetNotice(db, '046')).toBe(true);
+        output.length = 0;
+        errors.length = 0;
+        expect(await runDoctor(db, disabledConfig(), tmpConfigPath, MIGRATIONS_DIR)).toBe(true);
+        expect(output.join('\n')).toContain('none pending');
     });
 
     it('fails config check when config file missing', async () => {
@@ -804,18 +834,34 @@ describe('runDoctor', () => {
                 ).toBe(1);
             });
 
-            it('does not prescribe purging the cursors, or a fresh sync, to diagnose it', async () => {
+            it('prescribes the SAFE cursor rewind, and not a fresh sync, to diagnose it', async () => {
                 seedCursor('acme', 1);
                 seedRefusal('acme', 40, 0);
 
                 await runDoctor(db, await reachableGitConfig(), tmpConfigPath, MIGRATIONS_DIR);
 
                 const allOutput = [...output, ...errors].join('\n');
-                // The remedy an operator would reach for first is the one that permanently
-                // doubles every commit metric on the rows that DID survive (#262). The hint
-                // must name it as forbidden, not stay silent and let them find it themselves.
+                // The remedy an operator reaches for first — rewind the cursor and re-import —
+                // used to be the one that permanently doubled every commit metric on the rows
+                // that DID survive (#262), so the hint named it as forbidden. Since IG1 (#316)
+                // it is the CORRECT remedy: commits are sha-keyed and each author-day is
+                // recomputed, so a re-observation moves no counter. The hint must now name it as
+                // the repair — and name the first-sync-window bound a delete rather than a
+                // rewind runs into, which is the completeness half of the remedy rule.
                 expect(allOutput).toContain('Author-days skipped as unwritable');
-                expect(allOutput).toMatch(/DOUBLES every commit metric/);
+                expect(allOutput).toMatch(/git_last_sync sync_state row back/);
+                // The COMPLETENESS half, corrected in cycle 3 (SEC3-1). This sentence used to end
+                // "run 'sync older history' for anything beyond that" — the exact instruction the
+                // #316 review proved is a no-op for any provider that already has a history
+                // floor: deleting the cursor does not reset the floor, and a backfill extends
+                // strictly BELOW it, so the span in between is reachable by neither run. The
+                // remedy must therefore steer to LOWERING the row and name the gap, not prescribe
+                // a repair that cannot reach it. `sync.ts` says the same thing in its own two
+                // copies; this is the surface an operator is most likely to read.
+                expect(allOutput).toContain('LOWER that row; do not delete it');
+                expect(allOutput).toContain('cannot rescue what that leaves out');
+                expect(allOutput).not.toMatch(/run "sync older history" for anything beyond that/);
+                expect(allOutput).not.toMatch(/DOUBLES every commit metric on the rows that survived \(#262\) — do not/);
                 // …and it must not open with "run a sync": this alert can be days old, so on a
                 // quiet provider a fresh run prints no advisory at all, and when it does print
                 // one it has just advanced the cursor over another window under the same cause.

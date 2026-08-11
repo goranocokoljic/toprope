@@ -22,7 +22,9 @@ import {runMigrations} from '../../../src/storage/migrator';
 import {addTeam} from '../../../src/registry/teams';
 import {addDeveloper} from '../../../src/registry/developers';
 import {
+    AUTHOR_DAYS_SKIPPED_PREFIX,
     GitSync,
+    PR_RECORDS_SKIPPED_PREFIX,
     GIT_REPO_RETRY_DELAYS_MS,
     GIT_RUN_BEST_EFFORT_RETRY_SLEEP_BUDGET_MS,
     GIT_RUN_RETRY_SLEEP_BUDGET_MS,
@@ -35,6 +37,7 @@ import {
 import {GitProviderFetchError} from '../../../src/connectors/git/providers/http-retry';
 import type {
     GitCommit,
+    GitPR,
     GitFetchProgressListener,
     GitProvider,
     GitProviderConfig,
@@ -301,7 +304,7 @@ describe('in-run repo retry (#272)', () => {
         expect(seen.slice(afterStale + 1)).toContainEqual({done: 0, scanned: null, total: null});
     });
 
-    it('a persistently failing repo behaves exactly as before: cursor held, partials dropped, error recorded', async () => {
+    it('a persistently failing repo holds the cursor and records the error — but KEEPS the good repo’s commits (IG1.2)', async () => {
         seedAlice(db);
         const createGitProvider = await getCreateGitProvider();
         const getCommits = vi.fn().mockImplementation(async (repo: string): Promise<GitCommit[]> => {
@@ -323,13 +326,128 @@ describe('in-run repo retry (#272)', () => {
         expect(getCommits.mock.calls.filter((c) => c[0] === 'bad-repo')).toHaveLength(
             1 + GIT_REPO_RETRY_DELAYS_MS.length,
         );
-        // Then: identical to pre-#272 behavior.
         expect(result.errors.some((e) => /bad-repo.*Failed to fetch commits/.test(e))).toBe(true);
-        expect(result.snapshotsWritten).toBe(0);
-        expect(dayRow(db, '2024-01-15')).toBeUndefined();
+        // THE CURSOR HALF is unchanged: an incomplete window is not recorded as covered, so the
+        // next run re-asks for it.
         expect(readState(db, FORWARD_KEY)).toBeUndefined();
+        // THE DATA HALF is what IG1.2 (#318) inverted. Before it, the good repo's commits were
+        // DISCARDED with the run, because commit counters were ADDED across runs and persisting a
+        // half-covered window would double-count when the held cursor made the next run re-cover
+        // it. `raw_commits` is sha-keyed, so re-observing `c-good` next run inserts nothing and
+        // the cell is recomputed rather than accumulated — the partial result is progress to keep,
+        // not a hazard to drop. (V6.)
+        expect(result.snapshotsWritten).toBe(1);
+        expect(dayRow(db, '2024-01-15')?.commits).toBe(1);
+        expect(
+            (db.prepare('SELECT COUNT(*) AS n FROM raw_commits').get() as {n: number}).n,
+        ).toBe(1);
         // …including the stall counter that drives doctor's "not advancing" alert (#235).
         expect(getProviderStall(db, 'github', 'test-org')?.runs).toBe(1);
+    });
+
+    /**
+     * IG1 (#316) review, TST-2 — the refusal-reporting arm IG1.2 created and nothing exercised.
+     *
+     * Before IG1.2 an incomplete provider `continue`d before writing anything, so it could not
+     * refuse a row: refusal reporting only ever ran for a COMPLETE provider. IG1.2 made the
+     * partial result worth keeping (the test above), which means an incomplete provider now
+     * writes — and therefore refuses — and reporting moved outside the `if (result.complete)`
+     * gate with a DIFFERENT permanence sentence per arm. Gating the report back onto the
+     * complete arm left all 1,610 git/cli tests green.
+     *
+     * The wording is the whole point, not decoration. For a covered window the advisory says
+     * nothing re-asks the refused rows, which is what justifies a repair. Printing that for a
+     * HELD cursor would send an operator to rebuild a span the next run re-fetches by itself —
+     * the graduated "a remedy printed to an operator is executable advice" rule broken in the
+     * direction that causes needless, destructive work.
+     */
+    it('reports refusals for an INCOMPLETE provider, and says the window will be re-asked (IG1)', async () => {
+        seedAlice(db);
+        const createGitProvider = await getCreateGitProvider();
+        createGitProvider.mockReturnValue(
+            makeMockProvider({
+                listRepos: vi.fn().mockResolvedValue([makeRepo('bad-repo'), makeRepo('good-repo')]),
+                getCommits: vi.fn().mockImplementation(async (repo: string): Promise<GitCommit[]> => {
+                    // The bad repo exhausts its retries, so the run's window is never recorded as
+                    // covered — this is what makes the provider INCOMPLETE.
+                    if (repo === 'bad-repo') {
+                        throw new GitProviderFetchError('GitHub API server error 503: /commits', 503);
+                    }
+                    // …while the good repo delivers one storable commit and one the write boundary
+                    // must refuse. A non-string `sha` is refused row-level as `invalid_identity`:
+                    // it is read straight off the response with no upstream parse, so it reaches
+                    // the boundary rather than being dropped earlier.
+                    return [
+                        makeCommit('c-good'),
+                        {...makeCommit('c-bad'), sha: {} as unknown as string},
+                    ];
+                }),
+                // BOTH refusal grains on the same incomplete run. `refusalReports` drains two
+                // formatters, and only one of them was given the completeness arm — so a fixture
+                // that exercised the author-day half alone left the PR-records half asserting
+                // permanence for a held cursor (#316 review cycle 2, TST2-2). `createdAt: null`
+                // cannot bind, which is what `isUnstorablePRFieldError` catches.
+                getPullRequests: vi.fn().mockImplementation(async (repo: string): Promise<GitPR[]> => {
+                    if (repo !== 'good-repo') return [];
+                    return [
+                        {
+                            id: '1',
+                            title: 'feat: work',
+                            author: {name: 'alice', email: 'alice@example.com', username: 'alice'},
+                            state: 'closed',
+                            createdAt: null as unknown as string,
+                            mergedAt: '2024-01-15T12:00:00Z',
+                            closedAt: '2024-01-15T12:00:00Z',
+                            updatedAt: '2024-01-15T12:00:00Z',
+                            reviewers: [],
+                            additions: 10,
+                            deletions: 2,
+                        },
+                    ];
+                }),
+            }),
+        );
+
+        const result = await runSync(db);
+
+        // NON-VACUITY on both halves: the provider really is incomplete (cursor held), and it
+        // really did write. Either one alone would let this test pass against the old behavior.
+        expect(readState(db, FORWARD_KEY)).toBeUndefined();
+        expect(
+            (db.prepare('SELECT COUNT(*) AS n FROM raw_commits').get() as {n: number}).n,
+        ).toBe(1);
+
+        const skipLine = result.errors.find((e) => e.startsWith(AUTHOR_DAYS_SKIPPED_PREFIX));
+        // THE REPORT ITSELF. Gate it back behind `result.complete` and this is undefined.
+        expect(skipLine).toBeDefined();
+        expect(skipLine).toContain('[github/test-org]');
+        expect(skipLine).toContain('refused as invalid_identity');
+
+        // THE ARM. A held cursor means the next run re-asks the window, so the line must NOT make
+        // the permanence claim the covered arm makes.
+        expect(skipLine).toContain('did NOT record its window as covered');
+        expect(skipLine).toContain('the next run re-asks this window');
+        expect(skipLine).not.toContain('nothing re-asks them');
+
+        // THE SECOND FORMATTER on the same arm. `refusalReports` drains both, and only
+        // `formatSkippedAuthorDays` originally took the completeness argument — so this line
+        // claimed "recorded its window as covered — nothing re-asks them" for a HELD cursor, and
+        // closed by saying the PR is never re-delivered. Both are false here: providers page PRs
+        // by `updated_at`, and the next run re-asks this very window.
+        const prLine = result.errors.find((e) => e.startsWith(PR_RECORDS_SKIPPED_PREFIX));
+        expect(prLine).toBeDefined();
+        expect(prLine).toContain('refused as an unstorable field');
+        expect(prLine).toContain('did NOT record its window as covered');
+        expect(prLine).toContain('the same PRs are re-delivered');
+        expect(prLine).not.toContain('recorded its window as covered — nothing re-asks them');
+        expect(prLine).not.toContain('is never re-delivered');
+
+        // …and the numeric field the operator surfaces read moves with it, rather than the
+        // refusal being visible only in prose. EXACT, not a lower bound: this fixture refuses one
+        // commit and one PR record on one author-day, and a `>=` bound had a whole unit of slack —
+        // enough that dropping `skippedPRRecords.length` from `committedRowsSkipped` still
+        // satisfied it, so the comment claimed more than the assertion enforced (cycle 3, TST3-2).
+        expect(result.snapshotsSkipped).toBe(3);
     });
 
     it('reports the LAST fault of an exhausted sequence, not the first', async () => {

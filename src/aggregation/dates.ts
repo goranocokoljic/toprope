@@ -83,6 +83,25 @@ export function isUtcDay(value: string): boolean {
     return DATE_RE.test(value);
 }
 
+/**
+ * Is `value` a UTC day that is BOTH the right shape and a real instant — i.e. safe to hand to
+ * {@link addDays}, {@link subtractMonths} or any other `Date` arithmetic?
+ *
+ * The shape test is not enough for that, and the gap is not exotic: `'0000-00-00'` and
+ * `'2026-13-45'` both satisfy `DATE_RE`, both make `Date.parse` return `NaN`, and `addDays` then
+ * throws `RangeError: Invalid time value` from `toISOString()`. A caller inside a write
+ * transaction pays for that with the whole transaction, so the two questions must not be
+ * conflated — {@link isUtcDay} answers "can I byte-compare this", this answers "can I compute
+ * with it". (`'2026-02-30'` IS parseable — `Date` normalizes it to Mar 1 — and is deliberately
+ * accepted here: it computes fine, which is all this predicate claims.)
+ *
+ * The same expression {@link assertValidDate} enforces, extracted rather than copied so the two
+ * cannot drift.
+ */
+export function isComputableUtcDay(value: string): boolean {
+    return DATE_RE.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00.000Z`));
+}
+
 /** Today as a YYYY-MM-DD key in UTC, matching the daily-snapshot keying. */
 export function todayUtc(now: Date): string {
     return now.toISOString().slice(0, 10);
@@ -118,7 +137,7 @@ export function addDays(date: string, days: number): string {
 }
 
 function assertValidDate(date: string): void {
-    if (!DATE_RE.test(date) || Number.isNaN(Date.parse(`${date}T00:00:00.000Z`))) {
+    if (!isComputableUtcDay(date)) {
         throw new Error(`Invalid date (expected YYYY-MM-DD): ${date}`);
     }
 }

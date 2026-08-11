@@ -1,8 +1,22 @@
-# Idempotent Git Ingestion — design sketch
+# Idempotent Git Ingestion — design
 
-**Status:** proposal (2026-08-09). Written as the structural exit from the
-#262→#313 review loop: instead of defending the disjoint-window/additive-merge
-invariant with one more guard per review cycle, remove the invariant.
+**Status: LANDED (IG1, epic #316) — 2026-08-11.** Written 2026-08-09 as the
+structural exit from the #262→#313 review loop: instead of defending the
+disjoint-window/additive-merge invariant with one more guard per review cycle,
+remove the invariant. Shipped as #317 (schema + reset), #318 (write boundary),
+#319 (grain consumers) and #320 (reset, resync, verify, prune).
+
+This document is no longer a proposal: it describes the code as built, and it
+stays the canonical reference for the model. Two things to read it with:
+
+- **§2 carries an amendment still pending sign-off** (raised by #318). Two of
+  the four derived fields it claims are projected are not derivable from the §1
+  schema and are supplied by the caller instead — the inline note in §2 is the
+  binding description of what landed.
+- **§4 steps 1–4 are all done.** Migration 046 ran, the write tail was
+  rewritten, the dev database was reset and re-synced, and the KB rules the
+  model satisfies by construction were retired (#320). What remains from §4 is
+  history, not a plan.
 
 ## The problem, in one sentence
 
@@ -88,6 +102,26 @@ transaction, replacing the stored value (`INSERT OR REPLACE`, not `+=`).
 `commit_burst_count` are derived in the same recompute — no commit-count
 weighting needed, because the recompute always sees *all* the commits, not a
 delta. PR counters keep their existing `pr_records`-derived path.
+
+> **Amendment pending sign-off (raised by IG1.2 / #318, drift notice on epic #316).**
+> Two of those four are **not derivable from the §1 schema**, so as landed they are
+> supplied by the caller from its own observation of the cell rather than projected:
+> `ai_signature_score` is a 0–100 score read from the commit *message*
+> (`scoreAiSignature`) and §1 stores a 0/1 `ai_signature` flag and no message;
+> `code_churn_rate` needs per-*file* paths and a 48 h cross-day window
+> (`calculateDailyChurnRates`) and §1 stores no paths — which §5 deliberately forbids.
+> `avg_commit_size` and `commit_burst_count` **are** projected, as written.
+> Nothing is additive either way, so the epic's guarantee (a re-observed commit cannot
+> inflate a counter) holds whole, and criterion B (golden equivalence) is met exactly.
+> Making the other two true projections needs a §1 amendment — an `ai_signature_score
+> REAL` column, plus either per-file paths (a §5 privacy-model change) or an accepted
+> semantics change for churn. That is a user decision, not a child's.
+>
+> Two smaller deviations from the same notice: `is_merge` is always `0`, because no
+> in-tree provider exposes a merge flag on `GitCommit` and this epic may not change the
+> adapters; and the `raw_commits` conflict clause is `DO UPDATE … WHERE` a strictly more
+> informative observation arrives, not a bare `DO NOTHING`, so a commit first seen with a
+> degraded diffstat (#288) is not frozen at zero while the later run's advisory clears.
 
 `git_snapshots` stays exactly what it is: a projection of
 `(raw_author_daily, identity map)`.

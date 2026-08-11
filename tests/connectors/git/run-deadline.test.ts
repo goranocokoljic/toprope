@@ -9,9 +9,11 @@
  * connector, and two overlapping git runs read the same forward cursor into an ADDITIVE commit
  * merge: a permanent double-count.
  *
- * These tests pin the sync-level half: the run stops, says so legibly, holds the cursor, drops
- * its partial data — and, because #273's diffstat memo survives the drop, the NEXT run gets
- * further rather than failing identically forever. The request-level half (an expired deadline
+ * These tests pin the sync-level half: the run stops, says so legibly and holds the cursor, so the
+ * window is re-asked — and the NEXT run gets further rather than failing identically forever,
+ * because #273's diffstat memo and (since IG1.2/#318) the run's own `raw_commits` rows both
+ * survive it. Dropping the partial data was #231's rule while the commit merge was additive; the
+ * sha key removed the hazard, so the partial is now kept. The request-level half (an expired deadline
  * refusing a request or a pause) is pinned in `providers/request-policy.test.ts`, and the
  * decisions themselves in `providers/http-retry.test.ts`.
  *
@@ -130,11 +132,15 @@ function readState(db: Database.Database, key: string): string | undefined {
 /**
  * Rows in `git_snapshots` AND in `raw_author_daily`.
  *
- * Both, because `git_snapshots` is a PROJECTION: `raw_author_daily` is the source of record,
- * and it is the table whose additive merge (`upsertRawAuthorDaily`, no dedup guard) turns a
- * partial write into a permanent double-count on the next run. That is the reason #231's
- * drop-partials rule exists at all, so asserting only the projection would leave the table
- * that actually matters unchecked.
+ * Both, because `git_snapshots` is a PROJECTION and `raw_author_daily` is what it is projected
+ * from, so asserting only the projection would leave the source unchecked.
+ *
+ * WHAT THESE COUNTS NOW MEAN. They used to assert 0 on every deadline stop: #231's drop-partials
+ * rule existed because `raw_author_daily`'s merge was ADDITIVE, so a partial write became a
+ * permanent double-count once the held cursor made the next run re-cover the window. IG1.2 (#318)
+ * removed that: commits are stored per sha in `raw_commits` and the cell is recomputed from them,
+ * so a re-covered window inserts nothing new. The partial is now KEPT, and the invariant these
+ * tests guard is the one that did not change — the CURSOR is held, so the window is re-asked.
  */
 function snapshotCount(db: Database.Database): number {
     const snapshots = (db.prepare('SELECT COUNT(*) AS n FROM git_snapshots').get() as {n: number}).n;
@@ -208,7 +214,9 @@ describe('run wall-clock budget (#283)', () => {
         expect(result.errors.filter((e) => e.startsWith(RUN_DEADLINE_PREFIX))).toHaveLength(1);
         // The window was not covered, so #231 applies in full: cursor held, partials dropped.
         expect(readState(db, FORWARD_KEY)).toBeUndefined();
-        expect(snapshotCount(db)).toBe(0);
+        // The window was not covered, so the CURSOR is held (asserted above) — but what the run
+        // did fetch before the clock stopped it is retained, not discarded (IG1.2/#318).
+        expect(snapshotCount(db)).toBe(2);
     });
 
     it('reports the stop as a FAILURE, not an advisory', async () => {
@@ -330,7 +338,9 @@ describe('run wall-clock budget (#283)', () => {
         // already-discarded window is #231's trade, and it is far cheaper than a permanently
         // missing PR day.
         expect(readState(db, FORWARD_KEY)).toBeUndefined();
-        expect(snapshotCount(db)).toBe(0);
+        // The window was not covered, so the CURSOR is held (asserted above) — but what the run
+        // did fetch before the clock stopped it is retained, not discarded (IG1.2/#318).
+        expect(snapshotCount(db)).toBe(2);
     });
 
     it('does NOT hold the cursor when the clock merely ran out on a fully covered window', async () => {
@@ -470,10 +480,12 @@ describe('run wall-clock budget (#283)', () => {
         expectBothWritten(db);
     });
 
-    it('DOES discard the run when the clock is genuinely spent, from the same error type', async () => {
+    it('DOES hold the cursor when the clock is genuinely spent, from the same error type', async () => {
         // The positive control for the discriminant: identical error class, identical call
         // site, opposite `kind` — and the opposite outcome. Without this the test above would
-        // pass against a `deadlineStopped` that was simply deleted.
+        // pass against a `deadlineStopped` that was simply deleted. Since IG1.2 (#318) the
+        // outcome that differs is the CURSOR, not the data: both runs keep what they fetched,
+        // and only this one leaves the window recorded as un-covered.
         seedAlice(db);
         const createGitProvider = await getCreateGitProvider();
         createGitProvider.mockReturnValue(
@@ -493,7 +505,9 @@ describe('run wall-clock budget (#283)', () => {
 
         expect(result.errors).toContain(runDeadlineLine('github', 1, 1));
         expect(readState(db, FORWARD_KEY)).toBeUndefined();
-        expect(snapshotCount(db)).toBe(0);
+        // The window was not covered, so the CURSOR is held (asserted above) — but what the run
+        // did fetch before the clock stopped it is retained, not discarded (IG1.2/#318).
+        expect(snapshotCount(db)).toBe(2);
     });
 
     it('reports a spent clock inside the getCommitDiff fallback as a wall-clock stop', async () => {
@@ -526,7 +540,9 @@ describe('run wall-clock budget (#283)', () => {
         expect(result.errors.some((e) => e.startsWith(RUN_DEADLINE_PREFIX))).toBe(true);
         expect(result.errors.some((e) => e.includes('could not be used'))).toBe(false);
         expect(readState(db, FORWARD_KEY)).toBeUndefined();
-        expect(snapshotCount(db)).toBe(0);
+        // The window was not covered, so the CURSOR is held (asserted above) — but what the run
+        // did fetch before the clock stopped it is retained, not discarded (IG1.2/#318).
+        expect(snapshotCount(db)).toBe(2);
     });
 
     it('labels a clock spent inside listRepos as not-reached, without a "0 of 0" count', async () => {

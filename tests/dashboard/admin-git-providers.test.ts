@@ -460,8 +460,10 @@ describe('admin git-provider CRUD API (#197)', () => {
         // by `type:container`, not by provider id, so this delete leaves them behind and
         // a provider re-added for the same container inherits them. Purging them here in
         // isolation is unsafe: `raw_author_daily` has no container column, so the deleted
-        // provider's rows cannot be retracted, and `mergeDailyAcrossRuns` ADDS the commit
-        // counters — a re-import over the same window would double-count permanently.
+        // provider's rows cannot be retracted, and the cross-run merge ADDED the commit
+        // counters — a re-import over the same window would double-count permanently. (That
+        // merge is gone as of IG1.2 / #318; this paragraph records why the gap was pinned at
+        // the time, not a live exposure.)
         // #264 adds container attribution and flips this expectation; this test exists so
         // that flip is deliberate rather than silent. The UI is protected in the meantime
         // by `first_sync_pending` (see the create-route test above), which reports false

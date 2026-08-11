@@ -407,6 +407,15 @@ describe('#302 an unwritable author-day costs that row, not the run', () => {
             // write, so the reason is one generic literal rather than a per-column code.
             expect(prLine).toContain('refused as an unstorable field');
             expect(prLine).toContain('repo1#1');
+            // THE COVERED ARM of `formatSkippedPRRecords` (#316 review cycle 3, TST3-1). This
+            // provider completed — its cursor advanced above — so these PRs really are gone: no
+            // run re-asks the window, and providers page PRs by updated_at, so an untouched PR is
+            // never re-delivered. Every other assertion on this line is arm-independent, so
+            // hardcoding the parameter to `false` passed all 5,019 tests: the advisory would have
+            // told an operator "no loss yet" over a permanent loss. Its sibling arm is pinned in
+            // `repo-retry.test.ts`; this is the direction that was still free.
+            expect(prLine).toContain('recorded its window as covered — nothing re-asks them');
+            expect(prLine).not.toContain('did NOT record its window as covered');
             expect(countRows(db, 'pr_records')).toBe(0);
         });
 
@@ -911,6 +920,31 @@ describe('#302 an unwritable author-day costs that row, not the run', () => {
         // version of the failure #302 closed. These two drive an unrelated SQLite error through
         // each write and assert the run rolls back loudly instead. Replace either catch's filter
         // with a bare catch and exactly the matching test here goes red.
+        it('rethrows a raised trigger from the raw_commits write and rolls the run back', async () => {
+            // The THIRD narrow catch, added by IG1.2 (#318): pass 1 inserts one row per COMMIT
+            // before the cell projection, and it discriminates on the same rule as the two below.
+            // Without this case the filter could be replaced by a bare `catch {}` — swallowing a
+            // trigger, SQLITE_BUSY or a genuine bug into a "skipped author-day" advisory with the
+            // cursor advanced — and the whole git suite stayed green.
+            seedAlice(db);
+            db.exec(`
+                CREATE TRIGGER raw_commit_boom BEFORE INSERT ON raw_commits
+                BEGIN SELECT RAISE(ABORT, 'commit boom'); END;
+            `);
+            vi.stubGlobal('fetch', makeCountingFetch(githubRoutes()).fetchMock);
+
+            const result = await runSync(db, [GITHUB_CONFIG]);
+
+            expect(result.errors.some((e) => /transaction rolled back/.test(e))).toBe(true);
+            expect(result.errors.some((e) => /commit boom/.test(e))).toBe(true);
+            expect(countRows(db, 'raw_commits')).toBe(0);
+            expect(countRows(db, 'raw_author_daily')).toBe(0);
+            expect(cursorOf(db, GITHUB_CURSOR)).toBeUndefined();
+            // NOT reported as a per-row skip — that would claim a permanent loss over an intact
+            // window and advance the cursor past it.
+            expect(skipLineOf(result.errors)).toBeUndefined();
+        });
+
         it('rethrows a raised trigger from the raw_author_daily write and rolls the run back', async () => {
             seedAlice(db);
             // Not a RawAuthorDailyError and not row-level: RAISE(ABORT) surfaces as a SqliteError

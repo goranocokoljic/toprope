@@ -4,8 +4,6 @@ import path from 'path';
 import {runMigrations} from '../../src/storage/migrator';
 import {
     rawAuthorKeyFor,
-    commitWeightedAvg,
-    mergeDailyAcrossRuns,
     upsertRawAuthorDaily,
     readRawDailyForKeys,
     readRawDailyForDates,
@@ -57,10 +55,6 @@ const ZERO_METRICS: DailyGitMetrics = {
     commit_burst_count: 0,
 };
 
-function metrics(over: Partial<DailyGitMetrics> = {}): DailyGitMetrics {
-    return {...ZERO_METRICS, ...over};
-}
-
 function input(over: Partial<RawAuthorDailyInput> = {}): RawAuthorDailyInput {
     return {
         provider: 'github',
@@ -105,128 +99,18 @@ describe('rawAuthorKeyFor — total key derivation (#252)', () => {
     });
 });
 
-describe('commitWeightedAvg (#252)', () => {
-    it('weights each side by its commit count', () => {
-        // 100 commits at 0.9 vs 1 commit at 0.0 stays near 0.9, not at the 0.45 mean.
-        expect(commitWeightedAvg(0.9, 100, 0.0, 1)).toBeCloseTo(0.8911, 4);
-    });
-
-    it('returns 0 when neither side has commits (the neutral per-commit value)', () => {
-        expect(commitWeightedAvg(5, 0, 9, 0)).toBe(0);
-    });
-
-    it('returns the populated side verbatim when the other has no commits', () => {
-        expect(commitWeightedAvg(0.7, 4, 0.1, 0)).toBeCloseTo(0.7);
-    });
-});
-
-describe('mergeDailyAcrossRuns — the one cross-run rule (#252, ported from the git_snapshots merge tests)', () => {
-    it('ADDS commit-derived deltas across two disjoint commit windows', () => {
-        const merged = mergeDailyAcrossRuns(
-            metrics({commits: 3, lines_added: 100, lines_removed: 10, files_changed: 5, commit_burst_count: 1}),
-            metrics({commits: 2, lines_added: 40, lines_removed: 4, files_changed: 3, commit_burst_count: 2}),
-        );
-        expect(merged.commits).toBe(5);
-        expect(merged.lines_added).toBe(140);
-        expect(merged.lines_removed).toBe(14);
-        expect(merged.files_changed).toBe(8);
-        expect(merged.commit_burst_count).toBe(3);
-    });
-
-    it('does NOT inflate PR/review fields when the same PRs are re-delivered (max, not sum)', () => {
-        const stored = metrics({prs_opened: 2, prs_merged: 1, review_comments_given: 5});
-        const redelivered = metrics({prs_opened: 2, prs_merged: 1, review_comments_given: 5});
-        const merged = mergeDailyAcrossRuns(stored, redelivered);
-        expect(merged.prs_opened).toBe(2);
-        expect(merged.prs_merged).toBe(1);
-        expect(merged.review_comments_given).toBe(5);
-    });
-
-    it('never drops below the stored PR counts when a scoped run reports fewer', () => {
-        const merged = mergeDailyAcrossRuns(
-            metrics({prs_opened: 4, prs_merged: 3, review_comments_given: 9}),
-            metrics({commits: 1}),
-        );
-        expect(merged.prs_opened).toBe(4);
-        expect(merged.prs_merged).toBe(3);
-        expect(merged.review_comments_given).toBe(9);
-    });
-
-    it('raises PR counts when the incoming run genuinely observed more', () => {
-        const merged = mergeDailyAcrossRuns(metrics({prs_merged: 1}), metrics({prs_merged: 4}));
-        expect(merged.prs_merged).toBe(4);
-    });
-
-    it('commit-weights rate fields — a 1-commit delta cannot drag a 100-commit row to a plain mean', () => {
-        const merged = mergeDailyAcrossRuns(
-            metrics({commits: 100, code_churn_rate: 0.9, ai_signature_score: 0.8, avg_commit_size: 50}),
-            metrics({commits: 1, code_churn_rate: 0.0, ai_signature_score: 0.0, avg_commit_size: 1}),
-        );
-        expect(merged.code_churn_rate).toBeCloseTo(0.8911, 4);
-        expect(merged.ai_signature_score).toBeCloseTo(0.7921, 4);
-        expect(merged.avg_commit_size).toBeCloseTo(49.5149, 3);
-        // Sanity: a plain mean would have been 0.45 / 0.40 / 25.5.
-        expect(merged.code_churn_rate).toBeGreaterThan(0.45);
-    });
-
-    it('takes avg_time_to_merge from the side owning the LARGER prs_merged', () => {
-        const merged = mergeDailyAcrossRuns(
-            metrics({prs_merged: 1, avg_time_to_merge_hours: 10}),
-            metrics({prs_merged: 3, avg_time_to_merge_hours: 2}),
-        );
-        expect(merged.avg_time_to_merge_hours).toBe(2);
-    });
-
-    it('keeps the first-observed avg_time_to_merge on a prs_merged tie (same-PR re-delivery)', () => {
-        const merged = mergeDailyAcrossRuns(
-            metrics({prs_merged: 2, avg_time_to_merge_hours: 10}),
-            metrics({prs_merged: 2, avg_time_to_merge_hours: 99}),
-        );
-        expect(merged.avg_time_to_merge_hours).toBe(10);
-    });
-
-    it('falls back across a null avg_time_to_merge on either side', () => {
-        expect(
-            mergeDailyAcrossRuns(
-                metrics({prs_merged: 1, avg_time_to_merge_hours: null}),
-                metrics({prs_merged: 3, avg_time_to_merge_hours: null}),
-            ).avg_time_to_merge_hours,
-        ).toBeNull();
-        expect(
-            mergeDailyAcrossRuns(
-                metrics({prs_merged: 0, avg_time_to_merge_hours: null}),
-                metrics({prs_merged: 1, avg_time_to_merge_hours: 7}),
-            ).avg_time_to_merge_hours,
-        ).toBe(7);
-        expect(
-            mergeDailyAcrossRuns(
-                metrics({prs_merged: 5, avg_time_to_merge_hours: 6}),
-                metrics({prs_merged: 9, avg_time_to_merge_hours: null}),
-            ).avg_time_to_merge_hours,
-        ).toBe(6);
-    });
-
-    it('is associative enough for THREE runs: three disjoint deltas still add, PRs still do not', () => {
-        const a = metrics({commits: 1, lines_added: 10, prs_merged: 2, review_comments_given: 3});
-        const b = metrics({commits: 2, lines_added: 20, prs_merged: 2, review_comments_given: 3});
-        const c = metrics({commits: 4, lines_added: 40, prs_merged: 2, review_comments_given: 3});
-        const merged = mergeDailyAcrossRuns(mergeDailyAcrossRuns(a, b), c);
-        expect(merged.commits).toBe(7);
-        expect(merged.lines_added).toBe(70);
-        expect(merged.prs_merged).toBe(2);
-        expect(merged.review_comments_given).toBe(3);
-    });
-
-    it('merging a zero delta is a no-op on every field (idempotent re-run of an empty window)', () => {
-        const stored = metrics({
-            commits: 9, lines_added: 90, lines_removed: 9, files_changed: 4,
-            prs_opened: 2, prs_merged: 1, review_comments_given: 6,
-            avg_time_to_merge_hours: 3, code_churn_rate: 0.4, ai_signature_score: 0.5,
-            avg_commit_size: 10, commit_burst_count: 2,
-        });
-        expect(mergeDailyAcrossRuns(stored, metrics())).toEqual(stored);
-    });
-});
+/**
+ * The three cross-run merge helpers this file used to exercise here —
+ * `commitWeightedAvg`, `mergeDailyAcrossRuns` and `mergeDailyDisjoint` — were DELETED by IG1.2
+ * (#318, epic criterion C), so their tests went with them rather than being adapted: they asserted
+ * that commit counters ADD across runs, which is now false by construction. `raw_author_daily` is
+ * recomputed from `raw_commits` per cell, so the replacement evidence is
+ * `tests/connectors/git/raw-commits-write-boundary.test.ts` (the recompute and its idempotence)
+ * plus the REPLACE-semantics cases in the suite below.
+ *
+ * The one surviving combination rule — `max()` over the four PR counters, which providers
+ * re-deliver by `updated_at` — is still exercised below, because it is still live.
+ */
 
 describe('upsertRawAuthorDaily + readers (#252)', () => {
     let db: Database.Database;
@@ -256,14 +140,92 @@ describe('upsertRawAuthorDaily + readers (#252)', () => {
         expect(row.last_seen).toBe('2026-07-01T10:00:00.000Z');
     });
 
-    it('accumulates a second run additively and keeps exactly ONE row for the key/day', () => {
+    it('REPLACES the commit counters on a second write and keeps exactly ONE row for the key/day', () => {
+        // The old rule ADDED these (3+2 commits, 60+40 lines). Since IG1.2 the caller hands in the
+        // cell's whole recomputed total, so the write must store exactly what it was given —
+        // adding would double-count every re-observed window, which is the defect the epic removes.
         upsertRawAuthorDaily(db, input({commits: 3, lines_added: 60}), '2026-07-01T10:00:00.000Z');
         upsertRawAuthorDaily(db, input({commits: 2, lines_added: 40}), '2026-07-02T10:00:00.000Z');
         const count = db.prepare('SELECT COUNT(*) AS n FROM raw_author_daily').get() as {n: number};
         expect(count.n).toBe(1);
         const row = stored();
-        expect(row.commits).toBe(5);
-        expect(row.lines_added).toBe(100);
+        expect(row.commits).toBe(2);
+        expect(row.lines_added).toBe(40);
+    });
+
+    it('REPLACES the PROJECTED fields — they arrive as the cell\u2019s whole recomputed total', () => {
+        // `avg_commit_size` and `commit_burst_count` are recomputed from `raw_commits` by the
+        // caller, so whatever arrives IS the answer and must be stored verbatim. Weighting them
+        // against the stored value would be double-counting the history they already contain.
+        upsertRawAuthorDaily(
+            db,
+            input({commits: 100, avg_commit_size: 50, commit_burst_count: 4}),
+            '2026-07-01T10:00:00.000Z',
+        );
+        upsertRawAuthorDaily(
+            db,
+            input({commits: 1, avg_commit_size: 5, commit_burst_count: 1}),
+            '2026-07-02T10:00:00.000Z',
+        );
+        const row = stored();
+        expect(row.commits).toBe(1);
+        expect(row.avg_commit_size).toBe(5);
+        expect(row.commit_burst_count).toBe(1);
+    });
+
+    it('CARRIES FORWARD the two unprojectable rates when a run observed no new commits', () => {
+        // THE #318 review's SO-1/SEC-1 case, at the store level. `code_churn_rate` and
+        // `ai_signature_score` cannot be recomputed from `raw_commits` (no per-file paths, no
+        // commit message), so they arrive as the RUN's observation — and a run legitimately
+        // observes a day it fetched no commits for, because a provider re-lists an old PR by
+        // `updated_at` and `aggregateDailyMetrics` manufactures that day from `emptyMetrics` with
+        // both rates at 0. Replacing would erase a real score with a measurement that was never
+        // taken.
+        upsertRawAuthorDaily(
+            db,
+            input({commits: 4, code_churn_rate: 0.42, ai_signature_score: 68}),
+            '2026-07-01T10:00:00.000Z',
+        );
+        // Same recomputed commit total (no new commits arrived), zeroed rates.
+        upsertRawAuthorDaily(
+            db,
+            input({commits: 4, code_churn_rate: 0, ai_signature_score: 0}),
+            '2026-07-02T10:00:00.000Z',
+        );
+        const row = stored();
+        expect(row.code_churn_rate).toBe(0.42);
+        expect(row.ai_signature_score).toBe(68);
+        // …and the projected counter is still the value handed in, unweighted.
+        expect(row.commits).toBe(4);
+    });
+
+    it('COMMIT-WEIGHTS the two rates when a run genuinely added commits to the cell', () => {
+        upsertRawAuthorDaily(
+            db,
+            input({commits: 100, code_churn_rate: 0.9, ai_signature_score: 80}),
+            '2026-07-01T10:00:00.000Z',
+        );
+        // The recomputed total rose by 1, so the incoming observation covers exactly one commit
+        // and must not drag a 100-commit row to a plain two-way mean.
+        upsertRawAuthorDaily(
+            db,
+            input({commits: 101, code_churn_rate: 0.1, ai_signature_score: 10}),
+            '2026-07-02T10:00:00.000Z',
+        );
+        const row = stored();
+        expect(row.code_churn_rate).toBeCloseTo((0.9 * 100 + 0.1 * 1) / 101, 6);
+        expect(row.ai_signature_score).toBeCloseTo((80 * 100 + 10 * 1) / 101, 6);
+        expect(row.commits).toBe(101);
+    });
+
+    it('REPLACES the two rates outright on the first write of a cell (the single-run golden case)', () => {
+        upsertRawAuthorDaily(
+            db,
+            input({commits: 3, code_churn_rate: 0.66, ai_signature_score: 20}),
+            '2026-07-01T10:00:00.000Z',
+        );
+        expect(stored().code_churn_rate).toBe(0.66);
+        expect(stored().ai_signature_score).toBe(20);
     });
 
     it('does NOT inflate prs/review across runs that re-deliver the same PRs', () => {
@@ -275,7 +237,53 @@ describe('upsertRawAuthorDaily + readers (#252)', () => {
         expect(row.prs_opened).toBe(2);
         expect(row.prs_merged).toBe(1);
         expect(row.review_comments_given).toBe(5);
-        expect(row.commits).toBe(2);
+        // …and the commit counter is the LAST value written, not the sum of the three.
+        expect(row.commits).toBe(1);
+    });
+
+    it('RAISES a PR counter when a later run genuinely observed more, and never lowers it', () => {
+        // The #247 SO-1 shape at the store level: a catch-up-capped later run lists FEWER of a
+        // day's PRs than an earlier one did, because providers list by `updated_at`. `max()` is
+        // what stops that reading as "the day lost a PR".
+        upsertRawAuthorDaily(db, input({prs_opened: 2, prs_merged: 1}), '2026-07-01T10:00:00.000Z');
+        upsertRawAuthorDaily(db, input({prs_opened: 1, prs_merged: 0}), '2026-07-02T10:00:00.000Z');
+        expect(stored().prs_opened).toBe(2);
+        expect(stored().prs_merged).toBe(1);
+
+        upsertRawAuthorDaily(db, input({prs_opened: 5, prs_merged: 3}), '2026-07-03T10:00:00.000Z');
+        expect(stored().prs_opened).toBe(5);
+        expect(stored().prs_merged).toBe(3);
+    });
+
+    it('takes avg_time_to_merge from the side owning the LARGER prs_merged', () => {
+        // The rule survived IG1.2 (#318) inside `mergePRCounters`; its tests went with the
+        // deleted `mergeDailyAcrossRuns` describe block. `prs_merged` is combined with max(), so
+        // pairing it with a mean from the OTHER side would report a count and an average that
+        // never described one observation.
+        upsertRawAuthorDaily(db, input({prs_merged: 1, avg_time_to_merge_hours: 4}), '2026-07-01T10:00:00.000Z');
+        upsertRawAuthorDaily(db, input({prs_merged: 3, avg_time_to_merge_hours: 20}), '2026-07-02T10:00:00.000Z');
+        expect(stored().prs_merged).toBe(3);
+        expect(stored().avg_time_to_merge_hours).toBe(20);
+
+        // …and a LOWER incoming count does not drag the mean with it.
+        upsertRawAuthorDaily(db, input({prs_merged: 1, avg_time_to_merge_hours: 99}), '2026-07-03T10:00:00.000Z');
+        expect(stored().prs_merged).toBe(3);
+        expect(stored().avg_time_to_merge_hours).toBe(20);
+    });
+
+    it('keeps the first-observed avg_time_to_merge on a prs_merged tie (same-PR re-delivery)', () => {
+        upsertRawAuthorDaily(db, input({prs_merged: 2, avg_time_to_merge_hours: 7}), '2026-07-01T10:00:00.000Z');
+        upsertRawAuthorDaily(db, input({prs_merged: 2, avg_time_to_merge_hours: 31}), '2026-07-02T10:00:00.000Z');
+        expect(stored().avg_time_to_merge_hours).toBe(7);
+    });
+
+    it('falls back across a null avg_time_to_merge on either side', () => {
+        upsertRawAuthorDaily(db, input({prs_merged: 1, avg_time_to_merge_hours: null}), '2026-07-01T10:00:00.000Z');
+        upsertRawAuthorDaily(db, input({prs_merged: 2, avg_time_to_merge_hours: 5}), '2026-07-02T10:00:00.000Z');
+        expect(stored().avg_time_to_merge_hours).toBe(5);
+        // A null incoming never erases a known duration.
+        upsertRawAuthorDaily(db, input({prs_merged: 3, avg_time_to_merge_hours: null}), '2026-07-03T10:00:00.000Z');
+        expect(stored().avg_time_to_merge_hours).toBe(5);
     });
 
     it('PRESERVES first_seen and ADVANCES last_seen across runs', () => {
@@ -330,10 +338,10 @@ describe('upsertRawAuthorDaily + readers (#252)', () => {
         expect(count.n).toBe(3);
     });
 
-    it('returns the merged record it wrote', () => {
+    it('returns the record it wrote', () => {
         upsertRawAuthorDaily(db, input({commits: 3}), '2026-07-01T10:00:00.000Z');
         const result = upsertRawAuthorDaily(db, input({commits: 4}), '2026-07-02T10:00:00.000Z');
-        expect(result.commits).toBe(7);
+        expect(result.commits).toBe(4);
         expect(result.first_seen).toBe('2026-07-01T10:00:00.000Z');
         expect(result.last_seen).toBe('2026-07-02T10:00:00.000Z');
     });
@@ -691,12 +699,12 @@ describe('upsertRawAuthorDaily + readers (#252)', () => {
             ]);
         });
 
-        it('still merges ACROSS RUNS within one container', () => {
+        it('keeps ONE row per container across runs, replacing rather than accumulating', () => {
             upsertRawAuthorDaily(db, input({container: 'ws-a', commits: 3}), '2026-07-01T10:00:00.000Z');
             upsertRawAuthorDaily(db, input({container: 'ws-a', commits: 4}), '2026-07-02T10:00:00.000Z');
             const rows = readRawDailyForDates(db, ['2026-07-01']);
             expect(rows).toHaveLength(1);
-            expect(rows[0].commits).toBe(7);
+            expect(rows[0].commits).toBe(4);
         });
 
         it('summarizes, lists dates for, and deletes ONE container without touching a sibling', () => {

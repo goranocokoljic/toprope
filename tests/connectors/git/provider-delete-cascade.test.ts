@@ -10,6 +10,7 @@ import {
     upsertRawAuthorDaily,
     type RawAuthorDailyInput,
 } from '../../../src/connectors/git/raw-author-daily';
+import {insertRawCommit, type RawCommitInput} from '../../../src/connectors/git/raw-commits';
 import {projectSnapshots} from '../../../src/connectors/git/projection';
 import {
     deleteProviderWithCascade,
@@ -64,6 +65,40 @@ function rawRow(over: Partial<RawAuthorDailyInput> & {container: string}): RawAu
         commit_burst_count: 0,
         ...over,
     };
+}
+
+/**
+ * One `raw_commits` row — the SOURCE OF RECORD the cell above is a projection of (IG1.3 / #319).
+ *
+ * Seeded alongside the cells rather than derived from them: this suite writes cells directly, so
+ * without these rows the store is empty and "the cascade retracts the source of record" would be
+ * unfalsifiable. The counts here are deliberately NOT reconciled with the cells' `commits` values
+ * (which the sync would keep in step) — nothing in the cascade reads one to decide the other, and
+ * pinning them together would only hide which of the two a regression dropped.
+ */
+function commitRow(over: Partial<RawCommitInput> & {container: string; sha: string}): RawCommitInput {
+    return {
+        provider: 'bitbucket' as GitProviderType,
+        repo: 'repo1',
+        raw_author_key: 'bitbucket:login:alice',
+        author_login: 'alice',
+        author_email: 'alice@example.com',
+        author_display_name: 'Alice A',
+        author_day: '2026-07-01',
+        committed_at: '2026-07-01T09:00:00.000Z',
+        lines_added: 10,
+        lines_removed: 2,
+        files_changed: 1,
+        is_merge: false,
+        ai_signature: false,
+        ...over,
+    };
+}
+
+function rawCommitsFor(db: Database.Database, container: string): unknown[] {
+    return db
+        .prepare('SELECT * FROM raw_commits WHERE container = ? ORDER BY repo, sha')
+        .all(container);
 }
 
 /** A `git_providers` row for one container. Encryption is irrelevant to the cascade. */
@@ -160,6 +195,26 @@ describe('deleteProviderWithCascade (#264)', () => {
             OBSERVED_AT,
         );
         projectSnapshots(db, {dates: ['2026-07-01', '2026-07-02']});
+
+        // The commits those cells are a projection of. Both workspaces use the SAME repo and
+        // the SAME shas — one workspace can legitimately be a fork or a mirror of the other —
+        // so "retracts exactly one container's rows" is a real assertion about the
+        // (provider, container) scope rather than a coincidence of distinct keys.
+        for (const container of ['ws-a', 'ws-b']) {
+            for (const sha of ['sha-1', 'sha-2']) {
+                insertRawCommit(db, commitRow({container, sha}), OBSERVED_AT);
+            }
+            insertRawCommit(
+                db,
+                commitRow({
+                    container,
+                    sha: 'sha-3',
+                    author_day: '2026-07-02',
+                    committed_at: '2026-07-02T09:00:00.000Z',
+                }),
+                OBSERVED_AT,
+            );
+        }
 
         insertPR(db, devId, 'ws-a', 'a-1');
         insertPR(db, devId, 'ws-b', 'b-1');
@@ -334,6 +389,50 @@ describe('deleteProviderWithCascade (#264)', () => {
         expect(diffstatsFor(db, 'ws-b')).toBe(2);
     });
 
+    // IG1.3 (#319): `raw_commits` is the SOURCE OF RECORD, so retracting only its projection
+    // left the facts on disk — every commit's login, email and display name for a container an
+    // admin explicitly deleted — and left them LIVE, since the projection reads them back by
+    // (provider, container, raw_author_key, author_day). Byte-compared rows on the survivor's
+    // side, not a count: the two containers share repo+sha, so a delete scoped by `provider`
+    // alone would take both, and a count-only assertion on the deleted side would pass while
+    // the sibling's identity columns were rewritten.
+    it('retracts the deleted container’s raw_commits and leaves the sibling’s byte-identical', () => {
+        const survivorBefore = rawCommitsFor(db, 'ws-b');
+        expect(rawCommitsFor(db, 'ws-a')).toHaveLength(3);
+        expect(survivorBefore).toHaveLength(3);
+
+        deleteProviderWithCascade(db, providerA, new Set());
+
+        expect(rawCommitsFor(db, 'ws-a')).toEqual([]);
+        expect(rawCommitsFor(db, 'ws-b')).toEqual(survivorBefore);
+    });
+
+    it('keeps the deleted container’s raw_commits out of a re-added container’s cells', () => {
+        // The consequence of the leak, at the grain an operator sees it. Retract ws-a, then
+        // re-project the day the way a re-added provider's next sync would: the recompute must
+        // find NO commits for that cell. With the rows still on disk it found three and
+        // resurrected counts the admin was told were removed.
+        deleteProviderWithCascade(db, providerA, new Set());
+
+        const totals = db
+            .prepare(
+                `SELECT COUNT(*) AS n FROM raw_commits
+                  WHERE provider = 'bitbucket' AND container = 'ws-a'
+                    AND raw_author_key = 'bitbucket:login:alice' AND author_day = '2026-07-01'`,
+            )
+            .get() as {n: number};
+        expect(totals.n).toBe(0);
+    });
+
+    it('keeps the raw_commits when the cascade is SKIPPED for a config-owned container', () => {
+        // Same reasoning as the diffstats below: the config sibling still owns and syncs this
+        // container, so retracting its source of record would delete history a live owner is
+        // actively maintaining.
+        const before = rawCommitsFor(db, 'ws-a');
+        deleteProviderWithCascade(db, providerA, new Set([containerKeyOf('bitbucket', 'ws-a')]));
+        expect(rawCommitsFor(db, 'ws-a')).toEqual(before);
+    });
+
     it('keeps the cached diffstats when the cascade is SKIPPED for a config-owned container', () => {
         // The config sibling still owns and syncs this container, so nothing of its may go —
         // and a purged cache would silently cost that live owner a full re-fetch.
@@ -416,6 +515,10 @@ describe('deleteProviderWithCascade (#264)', () => {
              BEGIN SELECT RAISE(ABORT, 'boom'); END`,
         );
         const rawBefore = db.prepare(`SELECT ${RAW_COLUMNS} FROM raw_author_daily ORDER BY container, date`).all();
+        // The source of record is inside the same unit (IG1.3 / #319). A half-applied cascade
+        // that dropped the commits but kept the provider row would be the worst outcome of all:
+        // history destroyed for a provider that still exists and will re-sync over the hole.
+        const commitsBefore = db.prepare('SELECT * FROM raw_commits ORDER BY container, repo, sha').all();
         const snapsBefore = db.prepare(`SELECT ${SNAPSHOT_COLUMNS} FROM git_snapshots ORDER BY date`).all();
         const prsBefore = db.prepare('SELECT * FROM pr_records ORDER BY pr_id').all();
         const stateBefore = db.prepare('SELECT * FROM sync_state ORDER BY key').all();
@@ -424,6 +527,7 @@ describe('deleteProviderWithCascade (#264)', () => {
         expect(() => deleteProviderWithCascade(db, providerA, new Set())).toThrow(/boom/);
 
         expect(db.prepare(`SELECT ${RAW_COLUMNS} FROM raw_author_daily ORDER BY container, date`).all()).toEqual(rawBefore);
+        expect(db.prepare('SELECT * FROM raw_commits ORDER BY container, repo, sha').all()).toEqual(commitsBefore);
         expect(db.prepare(`SELECT ${SNAPSHOT_COLUMNS} FROM git_snapshots ORDER BY date`).all()).toEqual(snapsBefore);
         expect(db.prepare('SELECT * FROM pr_records ORDER BY pr_id').all()).toEqual(prsBefore);
         expect(db.prepare('SELECT * FROM sync_state ORDER BY key').all()).toEqual(stateBefore);

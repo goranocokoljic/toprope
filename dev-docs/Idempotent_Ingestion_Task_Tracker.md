@@ -145,6 +145,13 @@ reset behavior test (rows gone, cursors gone, diffstats gone, notice present); g
 - Collect the touched set of `(provider, container, raw_author_key, author_day)` cells; recompute each touched cell
   from `raw_commits` by aggregate and write with `INSERT OR REPLACE` — **never `+=`, never a merge of stored+new**.
   The recompute always sees ALL of the cell's commits, so no commit-count weighting exists anywhere anymore.
+  - **As landed (#318), with a drift notice on the epic and an amendment note in design §2:** `commits`,
+    `lines_added`, `lines_removed`, `files_changed`, `avg_commit_size` and `commit_burst_count` are projected from
+    `raw_commits`; `code_churn_rate` and `ai_signature_score` are **not derivable from the §1 schema** (no commit
+    message, no per-file paths — and §5 forbids adding paths) and are supplied from the run's own observation of
+    the cell, which is what keeps criterion B exact. `is_merge` is always `0` (no provider supplies it). The
+    conflict clause is `DO UPDATE … WHERE` a strictly more informative observation arrives, so a degraded
+    first sighting (#288) is not frozen. Awaiting sign-off; reversing it means amending design §1.
 - PR counters (`prs_opened`, `prs_merged`, `review_comments_given`, `avg_time_to_merge_hours`) keep their existing
   `pr_records`-derived path (`sync.ts` ~3712) — merged into the recomputed cell write, not moved into
   `raw_commits`. `raw_commits` is commits only.
@@ -241,6 +248,84 @@ except `toprope doctor` copy if the 046 notice needs it.
 model-independent.
 
 **Est. diff:** docs + jsonl only. **Review sizing:** skip lenses; the epic finalize review covers the stack.
+
+**LANDED 2026-08-11 (#320).** What was decided, so the next reader does not have to re-derive it:
+
+*KB prune — retired (each verified against the landed code, not against the design's prediction):*
+- `an-additive-merge-may-only-sum-genuinely-disjoint-deltas-com` — the premise is gone:
+  `upsertRawAuthorDaily` is a REPLACE fed by a full recompute over `raw_commits`, and
+  `mergeDailyAcrossRuns` / `mergeDailyDisjoint` / `commitWeightedAvg` no longer exist (a test asserts
+  their absence). **Its surviving half was re-filed**, not dropped — see below.
+- `before-deleting-state-ask-which-invariant-reads-it-as-proof` — retired on its FIRST half only:
+  a cursor licenses nothing now, and `deleteContainerRawCommits` retracts `raw_commits` at the same
+  `(provider, container)` grain the delete acts on. Its second half — "data keyed by a coarser
+  identity than the thing being deleted cannot be retracted alongside it" — is **still live**, and
+  the first pass of this issue wrongly claimed otherwise. `providers/delete-cascade.ts`'s own header
+  says the period-keyed rollups (`weekly_aggregates` and siblings, `pr_review_metrics`) survive the
+  cascade and depend on the single admin route calling `aggregation/retract.ts` afterwards, and
+  `reset-notice.ts` records that `pr_review_metrics` / `coaching_signals` have no covering command
+  at all. So that half is **re-filed**, not dropped, as
+  `a-retraction-stops-at-the-grain-it-is-keyed-by` (active; sources #264 + #320).
+- `a-scoped-single-source-write-into-a-multi-source-aggregated-` — `projectSnapshots` reads *every*
+  provider's raw rows for the touched days and folds them, and `raw_author_daily` is keyed by
+  `(provider, container)` so exactly one source ever writes a cell. A scoped run cannot drop another
+  source's contribution by construction.
+
+*Re-filed (active, so it still reaches the implementer):*
+`a-column-the-projection-cannot-recompute-must-be-combined` — the half of the additive lesson that is
+still load-bearing. `raw_author_daily`'s four PR counters and its two unprojectable rates are NOT
+recomputed, so they are a partial observation: replacing them erases a day the run measured nothing
+about, summing them double-counts a re-delivered window. Combine idempotently, weight by what the
+write actually added. Sources #205 + #318.
+
+*Kept deliberately:* `a-completion-signal-is-not-a-currency-claim` (graduated). Its cursor-proof
+examples aged, but the rule — a run that completes while the data is stale must not read as an
+all-clear, and a partition exclusion must key on state rather than on a display threshold — is not
+made true by the new model. `doctor` still reports lag and stalls off cursors that are now hints, so
+the surface it governs is unchanged. Retiring it would have needed the re-filing the checklist asks
+for, and there was nothing to narrow.
+
+*Beyond the checklist:* the stale-comment sweep. The checklist's item 2 argues that an essay
+describing deleted machinery is a docs-must-match-code violation the moment IG1.2 merges; the same
+argument reaches the JSDoc that justified the deleted machinery in `sync.ts`, `providers/types.ts`,
+`providers/github.ts`, `cli/doctor.ts` and `dashboard/api/admin/git-providers.ts`. Those were
+corrected (comments only, no behavior change). One was more than a comment: `cli/git-cache.ts`
+printed "a config-file provider cannot be deleted and has no supported repair today", which was true
+only while a cursor rewind was corrupting — it now prescribes the rewind, matching the copy #318
+already corrected in `doctor` and `sync.ts`.
+
+*Resync verification (2026-08-11, dev database, Bitbucket workspace `wireless_media`, repos `cmf` /
+`mondo2022fe` / `wm-products-and-services`, 6-month first-sync window).* Recorded here rather than in
+a PR body because a child opens no PR, and rather than in `reports/` because that directory is
+gitignored — the epic finalize lifts these numbers into the epic PR.
+
+- **How it was run.** `toprope sync all` reaches the git connector but passes NO first-sync window,
+  so `firstSyncSince` degrades to `''` = walk ALL history; on this workspace it was still walking
+  (past 2025-07) after 2h40m. The import was completed through the seam the admin "Sync now" button
+  uses (`GitSync.syncProviders` with `firstSyncWindowMonths: 6`) — the bounded cutover 042's header
+  prescribes and 046's notice repeats. Same pipeline and same write path; only the window differs.
+  **The CLI's walk-all default is worth a follow-up on its own; it is not a defect this epic
+  introduced.**
+- **Row counts:** `raw_commits` 2,923 (cmf 1,949 · mondo2022fe 701 · wm-products 273) ·
+  `raw_author_daily` 835 · `git_snapshots` 185 (2 matched developers; 20 authors unmatched, reported
+  as an advisory) · `pr_records` 26 · `commit_diffstats` 5,094 (0 absent). Rollups rebuilt:
+  `toprope aggregate backfill --from 2024-06-01` → 299 rows over 156 periods. Notice acknowledged;
+  `toprope doctor` green on every git check (the 5 remaining failures are the unconfigured
+  Copilot/Claude Code/Windsurf/Cursor tokens, identical before the cutover).
+- **Spot-check, six developer-days, BOTH directions** against the Bitbucket REST API read directly
+  (the provider UI was not reachable from this environment): `manda.mudrinic` @ 2026-02-24 (35
+  commits, +4195/-949), @ 2026-05-26 (29), @ 2026-03-25 (27, +12232/-1286) in `mondo2022fe`;
+  `Strahinja Mirković` (3, +13880/-4166), `Vuk Marjanović` (8, +962/-606) and `Andjelija Vojnović`
+  (3, +77/-53) @ 2026-08-10 in `cmf`. Stored → provider: every sha confirmed with matching author
+  and UTC day (105/105). Provider → stored: for the three cmf days, every commit the API attributes
+  to that author on that day is present in `raw_commits` (0 missing) — the direction that catches an
+  under-import, which the first cannot.
+- **Live idempotence, the epic's central claim, on real data.** The sync cursors were DELETED
+  outright and the whole 6-month window re-fetched, twice. Pre-IG1 this is the operation that
+  permanently double-counts. Result: `raw_commits` 2,923, `raw_author_daily` 835, `git_snapshots`
+  185 and `pr_records` 26 — row counts AND payloads byte-identical across all three runs (hashed
+  over every column but the observation timestamps `first_seen`/`last_seen`/`synced_at` and the
+  random row `id`), with `snapshotsWritten` 185 / `skipped` 0 each time.
 
 ---
 

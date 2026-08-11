@@ -115,10 +115,12 @@ export interface GitCommit {
      *     invalidation, so a row written for it would answer on every later run in place of the
      *     well-formed fetch that would contradict it (#288's central rule). GitHub's `getCommits`
      *     therefore sets this flag and skips its `put` on one condition, in one place.
-     *   - the sync must SAY SO. `raw_author_daily` is additive and append-only with the cursor
-     *     advanced past the window, so once the run's window is recorded as covered the
-     *     developer-day's `lines_added`/`lines_removed` are permanently short — see
-     *     `COMMIT_CHURN_UNKNOWN_PREFIX` in `sync.ts`.
+     *   - the sync must SAY SO. The cursor advances past the window, and nothing re-asks a
+     *     sha behind it, so once the run's window is recorded as covered the developer-day's
+     *     `lines_added`/`lines_removed` stay short until an operator rewinds — see
+     *     `COMMIT_CHURN_UNKNOWN_PREFIX` in `sync.ts`. Since IG1 (#316) that rewind is a
+     *     supported repair rather than a corrupting one (a re-observed sha is upgraded in
+     *     place, never re-added), which is exactly why the advisory names it.
      *
      * Only GitHub can currently set it: its commit-detail response carries `stats`, and GitHub's
      * published schema does not mark that required (see the guard in `providers/github.ts` for
@@ -212,9 +214,11 @@ export interface CommitDiffstat {
  *
  * A commit's diffstat is IMMUTABLE — `(repo, sha) -> file stats` is a property of an object
  * named by the hash of its own content — so there is no staleness, no invalidation, and no
- * integrity concern. The cache sits strictly UPSTREAM of the accumulator: it changes nothing
- * about cursor semantics, #231's drop-partials rule, or the additive-merge proof. Its whole
- * purpose is that a run which dies at commit 4,900 of 5,000 keeps those 4,899 fetches.
+ * integrity concern. The cache sits strictly UPSTREAM of the write boundary: it changes nothing
+ * about cursor semantics. Its whole purpose is that a run which dies at commit 4,900 of 5,000
+ * keeps those 4,899 fetches — the same argument IG1 (#316) later generalized to `raw_commits`
+ * itself, which is why #231's drop-partials rule (the reason this cache had to exist as a
+ * separate ratchet) is gone.
  *
  * Declared HERE, next to the provider interface, rather than beside its SQLite implementation
  * (`../diffstat-cache.ts`): the providers are plain HTTP clients with no database dependency,

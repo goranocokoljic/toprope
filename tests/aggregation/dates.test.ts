@@ -25,6 +25,7 @@ import {
     isoWeekRange,
     priorIsoWeek,
     isUtcDay,
+    isComputableUtcDay,
     isPlainYearInstant,
     isUtcIsoInstant,
 } from '../../src/aggregation/dates';
@@ -56,6 +57,46 @@ describe('isUtcDay', () => {
         ['a non-date word', 'yesterday'],
     ])('rejects %s', (_label, value) => {
         expect(isUtcDay(value)).toBe(false);
+    });
+});
+
+/**
+ * `isComputableUtcDay` is the OTHER question about a day string, split out in #318 because
+ * conflating the two cost a whole write transaction. `isUtcDay` answers "can I byte-compare this";
+ * this answers "can I hand it to `addDays`". The gap between them is not exotic — a shape-valid
+ * day whose calendar values are impossible parses to `NaN`, and `addDays` then throws a
+ * `RangeError` out of whatever frame asked, which for the git sync is its single all-providers
+ * write transaction.
+ */
+describe('isComputableUtcDay', () => {
+    it.each(['2026-07-01', '2024-01-15', '0001-01-01'])('accepts the real day %s', (day) => {
+        expect(isComputableUtcDay(day)).toBe(true);
+    });
+
+    // THE INPUT CLASS ONLY THIS PREDICATE HANDLES: shape-valid, `Date.parse`-hostile. Under
+    // `isUtcDay` every one of these is `true` and `addDays` throws on it — that is the whole
+    // reason the second predicate exists, so it is asserted both ways here.
+    it.each(['0000-00-00', '2026-13-45', '2026-00-01', '2026-01-00', '9999-99-99'])(
+        'rejects the shape-valid but unparseable %s, which isUtcDay accepts',
+        (day) => {
+            expect(isUtcDay(day)).toBe(true);
+            expect(isComputableUtcDay(day)).toBe(false);
+            expect(() => addDays(day, -1)).toThrow(RangeError);
+        },
+    );
+
+    it.each(['', 'yesterday', '2026-7-1', '2026-07-01T10:00:00.000Z'])(
+        'rejects %s on shape, like isUtcDay',
+        (value) => {
+            expect(isComputableUtcDay(value)).toBe(false);
+        },
+    );
+
+    it('accepts a day that Date NORMALIZES rather than rejects, because it computes fine', () => {
+        // `2026-02-30` is not a real calendar day, but `Date` rolls it to Mar 2 — this predicate
+        // claims computability, not calendar truth, and says so.
+        expect(isComputableUtcDay('2026-02-30')).toBe(true);
+        expect(() => addDays('2026-02-30', 1)).not.toThrow();
     });
 });
 
