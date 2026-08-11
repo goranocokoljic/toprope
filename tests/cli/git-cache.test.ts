@@ -381,13 +381,22 @@ describe('toprope git cache clear (#286)', () => {
             const {message} = clearDiffstatCache(db, {provider: 'github'});
             expect(message).toContain('DOES NOT RE-ASK COMMITS ALREADY COVERED');
             expect(message).toContain('forward cursor');
-            // …and names the repair that DOES correct it, which is the one sync.ts already
-            // prescribes for the same permanent understatement — plus the provenance that
-            // has none, rather than sending a config-file operator after a route that would
-            // refuse them.
-            expect(message).toContain('delete it and re-add it');
-            expect(message).toContain('sync older history');
-            expect(message).toContain('config-file provider cannot be deleted');
+            // …and names the repair that DOES correct it. IG1 (#316) changed which repair
+            // that is, and this assertion is what keeps this surface from drifting back:
+            // under the additive merge the ONLY safe re-cover was delete-and-re-add, which a
+            // config-file provider cannot run, so the message had to end by telling half of
+            // all deployments there was no repair. Commits are sha-keyed now, so rewinding
+            // the cursor is safe, cheap and available to every provenance — the same remedy
+            // `doctor` and `sync.ts` print for this class.
+            expect(message).toContain('git_last_sync');
+            expect(message).toContain('re-sync');
+            expect(message).toContain('#316');
+            expect(message).toContain('works for a config-file provider');
+            // The retired advice must be GONE, not merely deprioritized: leaving it would
+            // send an operator to a route that discards every day below the first-sync
+            // window, to repair an understatement of a few.
+            expect(message).not.toContain('delete it and re-add it');
+            expect(message).not.toContain('config-file provider cannot be deleted');
         });
 
         it('explains an empty match by the two columns’ different case rules', () => {

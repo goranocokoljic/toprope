@@ -591,10 +591,11 @@ export function registerAdminGitProviderRoutes(
     //
     // Scoping note (shared model): like the scheduled sync this is incremental — a
     // "Sync now" run advances the per-provider forward cursor; a backfill run lowers
-    // the earliest watermark over a disjoint older slice. The snapshot upsert is
-    // keyed on (developer_id, date) and merges additively, so cross-provider same-day
-    // accuracy is a property of that shared pipeline (owned by the git-sync design),
-    // not of this per-provider trigger.
+    // the earliest watermark over an older slice. `git_snapshots` is keyed on
+    // (developer_id, date) and is RE-PROJECTED from every provider's raw rows for the
+    // days this run touched (IG1 / #316), so cross-provider same-day accuracy is a
+    // property of that shared pipeline (owned by the git-sync design), not of this
+    // per-provider trigger — a scoped run cannot drop another provider's contribution.
     function startScopedSync(
         request: FastifyRequest,
         id: string,

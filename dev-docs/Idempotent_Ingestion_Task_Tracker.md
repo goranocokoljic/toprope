@@ -249,6 +249,47 @@ model-independent.
 
 **Est. diff:** docs + jsonl only. **Review sizing:** skip lenses; the epic finalize review covers the stack.
 
+**LANDED 2026-08-11 (#320).** What was decided, so the next reader does not have to re-derive it:
+
+*KB prune — retired (each verified against the landed code, not against the design's prediction):*
+- `an-additive-merge-may-only-sum-genuinely-disjoint-deltas-com` — the premise is gone:
+  `upsertRawAuthorDaily` is a REPLACE fed by a full recompute over `raw_commits`, and
+  `mergeDailyAcrossRuns` / `mergeDailyDisjoint` / `commitWeightedAvg` no longer exist (a test asserts
+  their absence). **Its surviving half was re-filed**, not dropped — see below.
+- `before-deleting-state-ask-which-invariant-reads-it-as-proof` — a cursor licenses nothing now, and
+  `deleteContainerRawCommits` retracts at the same `(provider, container)` grain the delete acts on,
+  so the "coarser-keyed data cannot be retracted" half has no instance left either.
+- `a-scoped-single-source-write-into-a-multi-source-aggregated-` — `projectSnapshots` reads *every*
+  provider's raw rows for the touched days and folds them, and `raw_author_daily` is keyed by
+  `(provider, container)` so exactly one source ever writes a cell. A scoped run cannot drop another
+  source's contribution by construction.
+
+*Re-filed (active, so it still reaches the implementer):*
+`a-column-the-projection-cannot-recompute-must-be-combined` — the half of the additive lesson that is
+still load-bearing. `raw_author_daily`'s four PR counters and its two unprojectable rates are NOT
+recomputed, so they are a partial observation: replacing them erases a day the run measured nothing
+about, summing them double-counts a re-delivered window. Combine idempotently, weight by what the
+write actually added. Sources #205 + #318.
+
+*Kept deliberately:* `a-completion-signal-is-not-a-currency-claim` (graduated). Its cursor-proof
+examples aged, but the rule — a run that completes while the data is stale must not read as an
+all-clear, and a partition exclusion must key on state rather than on a display threshold — is not
+made true by the new model. `doctor` still reports lag and stalls off cursors that are now hints, so
+the surface it governs is unchanged. Retiring it would have needed the re-filing the checklist asks
+for, and there was nothing to narrow.
+
+*Beyond the checklist:* the stale-comment sweep. The checklist's item 2 argues that an essay
+describing deleted machinery is a docs-must-match-code violation the moment IG1.2 merges; the same
+argument reaches the JSDoc that justified the deleted machinery in `sync.ts`, `providers/types.ts`,
+`providers/github.ts`, `cli/doctor.ts` and `dashboard/api/admin/git-providers.ts`. Those were
+corrected (comments only, no behavior change). One was more than a comment: `cli/git-cache.ts`
+printed "a config-file provider cannot be deleted and has no supported repair today", which was true
+only while a cursor rewind was corrupting — it now prescribes the rewind, matching the copy #318
+already corrected in `doctor` and `sync.ts`.
+
+*Resync verification:* see `reports/issue-320.md` for row counts, the named developer-days, and the
+live idempotence re-run.
+
 ---
 
 ## Dependencies

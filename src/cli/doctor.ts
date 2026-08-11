@@ -656,12 +656,17 @@ function checkGitStalls(
             fail(
                 label,
                 `${health.systemicRefusals.length} provider(s) refused the rows their last run built — cursor advanced over data that was never written: ${detail}`,
-                // Deliberately does NOT prescribe a recovery for the lost span. Purging the
-                // cursors to re-import it re-arms the #262 permanent double-count over the rows
-                // that WERE written, and the delete-and-re-add repair is refused outright for a
-                // config-file provider — so naming either would be advice half the deployments
-                // cannot run and the other half should not. Stopping further loss is the part
-                // that is always both safe and reachable.
+                // SINCE IG1 (#316) IT DOES prescribe a recovery for the lost span — see the
+                // rewind sentence near the end of the message. Until then it deliberately did
+                // not: rewinding the cursor to re-import re-armed the #262 permanent
+                // double-count over the rows that WERE written, and the delete-and-re-add
+                // repair is still refused outright for a config-file provider, so naming
+                // either was advice half the deployments could not run and the other half
+                // should not. Commits are now keyed by sha in `raw_commits` and each
+                // author-day is recomputed from that store, so re-observing an already-stored
+                // commit moves no counter — the rewind costs API calls, which is why it can
+                // finally be named. The remedy still LEADS with stopping further loss,
+                // because that is the part that works before the cause is understood.
                 //
                 // It also does not open with "run a sync". That was the first version and it was
                 // wrong twice: this record can be days old, so on a quiet provider a fresh run

@@ -1,8 +1,22 @@
-# Idempotent Git Ingestion — design sketch
+# Idempotent Git Ingestion — design
 
-**Status:** proposal (2026-08-09). Written as the structural exit from the
-#262→#313 review loop: instead of defending the disjoint-window/additive-merge
-invariant with one more guard per review cycle, remove the invariant.
+**Status: LANDED (IG1, epic #316) — 2026-08-11.** Written 2026-08-09 as the
+structural exit from the #262→#313 review loop: instead of defending the
+disjoint-window/additive-merge invariant with one more guard per review cycle,
+remove the invariant. Shipped as #317 (schema + reset), #318 (write boundary),
+#319 (grain consumers) and #320 (reset, resync, verify, prune).
+
+This document is no longer a proposal: it describes the code as built, and it
+stays the canonical reference for the model. Two things to read it with:
+
+- **§2 carries an amendment still pending sign-off** (raised by #318). Two of
+  the four derived fields it claims are projected are not derivable from the §1
+  schema and are supplied by the caller instead — the inline note in §2 is the
+  binding description of what landed.
+- **§4 steps 1–4 are all done.** Migration 046 ran, the write tail was
+  rewritten, the dev database was reset and re-synced, and the KB rules the
+  model satisfies by construction were retired (#320). What remains from §4 is
+  history, not a plan.
 
 ## The problem, in one sentence
 

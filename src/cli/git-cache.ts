@@ -193,27 +193,30 @@ export function clearDiffstatCache(
     // The second half is the one that matters, and saying it costs nothing while omitting it
     // costs an operator their data. A purge only causes a re-fetch of commits some future
     // sync will WALK AGAIN — and a completed run advances the forward cursor past its window,
-    // with the next run's `since` starting exactly at that cursor (`fetchProviderData`), which
-    // is precisely what licenses the additive commit merge. "Sync older history" walks
-    // strictly BELOW the earliest watermark, so it cannot reach a forward window either.
+    // with the next run's `since` starting exactly at that cursor (`fetchProviderData`).
+    // "Sync older history" walks strictly BELOW the earliest watermark, so it cannot reach a
+    // forward window either.
     //
     // So for the residuals migration 044 names — a permission-revocation 404, a 404 on page
     // >= 2, a truncated 200 — clearing is NECESSARY but not SUFFICIENT once the run that
-    // recorded them completed: their zeros have already merged into `raw_author_daily` and
-    // been projected into `git_snapshots`, and dropping the memo does not un-merge them.
+    // recorded them completed: their zeros are already in `raw_commits` and projected onward
+    // into `raw_author_daily` / `git_snapshots`, and dropping the memo does not re-ask them.
     // Reporting "no metric changed" there is true and utterly misleading — it reads as an
     // all-clear on exactly the run an operator opened this command to repair. That is the
     // graduated #235 rule (a completion signal is not a currency claim) and the graduated
     // "a remedy printed to an operator is executable advice" rule.
     //
-    // The named repair is the one `sync.ts` already prescribes for the same class of
-    // permanent understatement (see DIFFS_NOT_SUPPLIED_PREFIX): delete and re-add the
-    // provider, because the #264 cascade retracts this container's raw rows and re-projects
-    // the affected days BEFORE purging its cursors, so the re-import lands on an empty span.
-    // That cascade clears these very rows too — which is why this command is the right tool
-    // for the case where the window WILL be re-walked (a held or failed run) or where the
-    // point is simply to stop retaining a repo's file inventory, and the wrong one on its own
-    // for a window already recorded as covered.
+    // THE NAMED REPAIR CHANGED WITH IG1 (#316), and this surface is the one that had to be
+    // corrected rather than merely reworded. It used to prescribe delete-and-re-add — the only
+    // safe way to re-cover a span under the additive merge, and one a config-file provider
+    // cannot run, so half of all deployments were told there was no repair at all. Now the
+    // cheap repair is the honest one: move the provider's `git_last_sync` row back before the
+    // affected window and re-sync. Commits are keyed by sha, a re-observed one is upgraded in
+    // place when the new observation is strictly more informative (which is exactly the case
+    // here — a real diffstat replacing a recovered zero), and each author-day is recomputed
+    // from that store. It costs API calls, works for a config-file provider, and is the SAME
+    // remedy `doctor` and `sync.ts` now print for this class. Delete-and-re-add still works
+    // for a DB-registered provider but throws away history below the first-sync window.
     return {
         ok: true,
         removed,
@@ -224,15 +227,15 @@ export function clearDiffstatCache(
             'walks again is simply re-fetched, one API call each. ' +
             'IT DOES NOT RE-ASK COMMITS ALREADY COVERED. A completed run advanced this ' +
             "provider's forward cursor past its window and the next run starts from that " +
-            'cursor, so if the answers you just deleted had already merged into ' +
-            'raw_author_daily, their files_changed / code_churn_rate / ai_signature_score ' +
-            'contribution is unchanged by this purge. Correcting THAT needs the span ' +
-            're-imported: for a provider registered in the admin UI, delete it and re-add it ' +
-            "(the delete cascade retracts this container's raw rows and re-projects the " +
-            'affected days before purging its cursors, so the re-import lands on an empty ' +
-            'span), then run "sync older history" for anything older than the first-sync ' +
-            'window a re-added provider starts from. A config-file provider cannot be deleted ' +
-            'and has no supported repair today.',
+            'cursor, so if the answers you just deleted had already fed raw_commits, the ' +
+            'files_changed / code_churn_rate / ai_signature_score they contributed are ' +
+            'unchanged by this purge. Correcting THAT needs the span re-asked: move this ' +
+            "provider's git_last_sync sync_state row back to before the affected window and " +
+            're-sync. That is safe since IG1 (#316) — commits are keyed by sha in raw_commits, ' +
+            'a re-observed one is upgraded in place only when the new observation is more ' +
+            'informative, and each author-day is recomputed from that store, so re-asking ' +
+            'spends API calls and moves no counter twice. It works for a config-file provider ' +
+            'too, which delete-and-re-add does not.',
     };
 }
 
