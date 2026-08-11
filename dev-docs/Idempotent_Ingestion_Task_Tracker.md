@@ -294,8 +294,38 @@ printed "a config-file provider cannot be deleted and has no supported repair to
 only while a cursor rewind was corrupting — it now prescribes the rewind, matching the copy #318
 already corrected in `doctor` and `sync.ts`.
 
-*Resync verification:* see `reports/issue-320.md` for row counts, the named developer-days, and the
-live idempotence re-run.
+*Resync verification (2026-08-11, dev database, Bitbucket workspace `wireless_media`, repos `cmf` /
+`mondo2022fe` / `wm-products-and-services`, 6-month first-sync window).* Recorded here rather than in
+a PR body because a child opens no PR, and rather than in `reports/` because that directory is
+gitignored — the epic finalize lifts these numbers into the epic PR.
+
+- **How it was run.** `toprope sync all` reaches the git connector but passes NO first-sync window,
+  so `firstSyncSince` degrades to `''` = walk ALL history; on this workspace it was still walking
+  (past 2025-07) after 2h40m. The import was completed through the seam the admin "Sync now" button
+  uses (`GitSync.syncProviders` with `firstSyncWindowMonths: 6`) — the bounded cutover 042's header
+  prescribes and 046's notice repeats. Same pipeline and same write path; only the window differs.
+  **The CLI's walk-all default is worth a follow-up on its own; it is not a defect this epic
+  introduced.**
+- **Row counts:** `raw_commits` 2,923 (cmf 1,949 · mondo2022fe 701 · wm-products 273) ·
+  `raw_author_daily` 835 · `git_snapshots` 185 (2 matched developers; 20 authors unmatched, reported
+  as an advisory) · `pr_records` 26 · `commit_diffstats` 5,094 (0 absent). Rollups rebuilt:
+  `toprope aggregate backfill --from 2024-06-01` → 299 rows over 156 periods. Notice acknowledged;
+  `toprope doctor` green on every git check (the 5 remaining failures are the unconfigured
+  Copilot/Claude Code/Windsurf/Cursor tokens, identical before the cutover).
+- **Spot-check, six developer-days, BOTH directions** against the Bitbucket REST API read directly
+  (the provider UI was not reachable from this environment): `manda.mudrinic` @ 2026-02-24 (35
+  commits, +4195/-949), @ 2026-05-26 (29), @ 2026-03-25 (27, +12232/-1286) in `mondo2022fe`;
+  `Strahinja Mirković` (3, +13880/-4166), `Vuk Marjanović` (8, +962/-606) and `Andjelija Vojnović`
+  (3, +77/-53) @ 2026-08-10 in `cmf`. Stored → provider: every sha confirmed with matching author
+  and UTC day (105/105). Provider → stored: for the three cmf days, every commit the API attributes
+  to that author on that day is present in `raw_commits` (0 missing) — the direction that catches an
+  under-import, which the first cannot.
+- **Live idempotence, the epic's central claim, on real data.** The sync cursors were DELETED
+  outright and the whole 6-month window re-fetched, twice. Pre-IG1 this is the operation that
+  permanently double-counts. Result: `raw_commits` 2,923, `raw_author_daily` 835, `git_snapshots`
+  185 and `pr_records` 26 — row counts AND payloads byte-identical across all three runs (hashed
+  over every column but the observation timestamps `first_seen`/`last_seen`/`synced_at` and the
+  random row `id`), with `snapshotsWritten` 185 / `skipped` 0 each time.
 
 ---
 
